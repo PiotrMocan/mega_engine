@@ -53,6 +53,9 @@ enum class McpInputKey : std::uint8_t {
     digit_1,
     digit_2,
     digit_3,
+    f6,
+    f7,
+    f8,
     arrow_up,
     arrow_down,
 };

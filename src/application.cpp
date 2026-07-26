@@ -42,6 +42,9 @@ using Json = nlohmann::json;
     case SDLK_1: return Key::digit_1;
     case SDLK_2: return Key::digit_2;
     case SDLK_3: return Key::digit_3;
+    case SDLK_F6: return Key::f6;
+    case SDLK_F7: return Key::f7;
+    case SDLK_F8: return Key::f8;
     case SDLK_UP: return Key::arrow_up;
     case SDLK_DOWN: return Key::arrow_down;
     default: return std::nullopt;
@@ -148,6 +151,7 @@ void Application::initialize(const CliOptions& options) {
         options.initial_mode,
         options.instances,
         options.gpu_workload_iterations,
+        options.anti_aliasing,
         options.mcp_stdio);
     const auto now = std::chrono::steady_clock::now();
     last_camera_tick_ = now;
@@ -165,7 +169,8 @@ void Application::initialize(const CliOptions& options) {
         }
         std::cout
             << "Controls: mouse look, WASD move, Shift boost, "
-               "Space/E up, Ctrl/Q down, Esc release/exit\n";
+               "Space/E up, Ctrl/Q down, F6 AA type, "
+               "F7/F8 AA quality, Esc release/exit\n";
     }
 }
 
@@ -304,6 +309,18 @@ void Application::handle_key_action(
         break;
     case McpInputKey::digit_3:
         renderer_.set_mode(RunMode::gpu_saturation);
+        renderer_.reset_metrics();
+        break;
+    case McpInputKey::f6:
+        renderer_.cycle_anti_aliasing();
+        renderer_.reset_metrics();
+        break;
+    case McpInputKey::f7:
+        renderer_.adjust_anti_aliasing_quality(-1);
+        renderer_.reset_metrics();
+        break;
+    case McpInputKey::f8:
+        renderer_.adjust_anti_aliasing_quality(1);
         renderer_.reset_metrics();
         break;
     case McpInputKey::arrow_up:
@@ -486,6 +503,17 @@ void Application::execute_mcp_command(const McpCommand& command) {
                  context_.timestamp_valid_bits() > 0U},
                 {"screenshot_supported",
                  renderer_.screenshot_supported()},
+                {"anti_aliasing", Json{
+                    {"methods", Json::array({"off", "smaa", "fsr3"})},
+                    {"smaa_qualities", Json::array({
+                        "low", "medium", "high", "ultra"})},
+                    {"fsr3_qualities", Json::array({
+                        "native-aa", "quality", "balanced",
+                        "performance", "ultra-performance"})},
+                    {"fsr3_available", renderer_.fsr3_available()},
+                    {"fsr3_version",
+                     std::string(renderer_.fsr3_version())},
+                }},
                 {"present_modes", std::move(present_modes)},
                 {"limits", Json{
                     {"max_instances",
@@ -508,6 +536,8 @@ void Application::execute_mcp_command(const McpCommand& command) {
         const VkExtent2D extent = renderer_.swapchain().extent();
         const glm::vec3 position = camera_.position();
         const glm::vec3 forward = camera_.forward();
+        const AntiAliasingSettings anti_aliasing =
+            renderer_.anti_aliasing();
         succeed(
             "live engine state",
             Json{
@@ -520,6 +550,16 @@ void Application::execute_mcp_command(const McpCommand& command) {
                     {"triangles", renderer_.triangle_count()},
                     {"gpu_workload_iterations",
                      renderer_.gpu_workload_iterations()},
+                    {"anti_aliasing", Json{
+                        {"method", std::string(to_token(
+                            anti_aliasing.method))},
+                        {"display_name", std::string(to_string(
+                            anti_aliasing.method))},
+                        {"quality", std::string(
+                            renderer_.anti_aliasing_quality_name())},
+                        {"fsr3_available",
+                         renderer_.fsr3_available()},
+                    }},
                     {"present_mode",
                      Swapchain::present_mode_name(
                          renderer_.swapchain().present_mode())},
@@ -846,7 +886,7 @@ void Application::update_window_title() {
         sizeof(title),
         "Vulkan Scene | %.0f FPS | avg %.3f ms | CPU %.3f ms | "
         "GPU %.3f ms | cam %.1f %.1f %.1f | %u inst | "
-        "%llu tris | %s/%u | %s",
+        "%llu tris | %s/%u | AA %s/%s | %s",
         stats.one_second_average_fps,
         stats.average.cpu_frame_ms,
         stats.latest.cpu_frame_ms,
@@ -858,6 +898,8 @@ void Application::update_window_title() {
         static_cast<unsigned long long>(renderer_.triangle_count()),
         to_string(renderer_.mode()).data(),
         renderer_.gpu_workload_iterations(),
+        to_string(renderer_.anti_aliasing().method).data(),
+        renderer_.anti_aliasing_quality_name().data(),
         Swapchain::present_mode_name(renderer_.swapchain().present_mode()));
     SDL_SetWindowTitle(window_.get(), title);
 }
@@ -873,12 +915,23 @@ void Application::finish_benchmark() {
         "%ux%u",
         extent.width,
         extent.height);
+    const auto render_extent = renderer_.render_extent();
+    char render_resolution[64]{};
+    std::snprintf(
+        render_resolution,
+        sizeof(render_resolution),
+        "%ux%u",
+        render_extent.width,
+        render_extent.height);
     const auto& properties = context_.properties();
     const auto result = make_benchmark_result(
         properties.deviceName,
         std::to_string(properties.driverVersion),
         resolution,
+        render_resolution,
         Swapchain::present_mode_name(renderer_.swapchain().present_mode()),
+        std::string(to_string(renderer_.anti_aliasing().method)),
+        std::string(renderer_.anti_aliasing_quality_name()),
         renderer_.instance_count(),
         renderer_.gpu_workload_iterations(),
         stats);

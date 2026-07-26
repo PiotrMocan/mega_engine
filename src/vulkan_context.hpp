@@ -55,6 +55,12 @@ public:
     [[nodiscard]] float timestamp_period() const noexcept {
         return properties_.limits.timestampPeriod;
     }
+    [[nodiscard]] bool fsr3_device_compatible() const noexcept {
+        return fsr3_device_compatible_;
+    }
+    [[nodiscard]] bool fsr3_fp16_enabled() const noexcept {
+        return fsr3_fp16_enabled_;
+    }
 
     void set_debug_name(
         VkObjectType type,
@@ -86,6 +92,8 @@ private:
     QueueFamilySelection queue_families_{};
     VkPhysicalDeviceProperties properties_{};
     bool validation_enabled_ = false;
+    bool fsr3_device_compatible_ = false;
+    bool fsr3_fp16_enabled_ = false;
     std::uint32_t timestamp_valid_bits_ = 0;
 };
 

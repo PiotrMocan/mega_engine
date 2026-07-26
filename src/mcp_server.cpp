@@ -468,7 +468,7 @@ private:
                     {"enum", Json::array({
                         "w", "a", "s", "d", "shift", "space", "e",
                         "ctrl", "q", "escape", "v", "f", "r", "p",
-                        "1", "2", "3", "up", "down",
+                        "1", "2", "3", "f6", "f7", "f8", "up", "down",
                     })},
                 }},
                 {"action", action_schema},
@@ -610,6 +610,9 @@ private:
     if (text == "1") return Key::digit_1;
     if (text == "2") return Key::digit_2;
     if (text == "3") return Key::digit_3;
+    if (text == "f6") return Key::f6;
+    if (text == "f7") return Key::f7;
+    if (text == "f8") return Key::f8;
     if (text == "up") return Key::arrow_up;
     if (text == "down") return Key::arrow_down;
     return std::nullopt;

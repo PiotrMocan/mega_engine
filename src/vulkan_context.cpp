@@ -391,27 +391,137 @@ void VulkanContext::create_device() {
         });
     }
 
+    VkPhysicalDeviceVulkan13Features supported13{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+    };
+    VkPhysicalDeviceVulkan12Features supported12{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+        .pNext = &supported13,
+    };
+    VkPhysicalDeviceVulkan11Features supported11{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+        .pNext = &supported12,
+    };
+    VkPhysicalDeviceFeatures2 supported2{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &supported11,
+    };
+    vkGetPhysicalDeviceFeatures2(physical_device_, &supported2);
+
+    std::uint32_t extension_count = 0;
+    VK_CHECK(vkEnumerateDeviceExtensionProperties(
+        physical_device_,
+        nullptr,
+        &extension_count,
+        nullptr));
+    std::vector<VkExtensionProperties> available_extensions(extension_count);
+    VK_CHECK(vkEnumerateDeviceExtensionProperties(
+        physical_device_,
+        nullptr,
+        &extension_count,
+        available_extensions.data()));
+    const auto has_extension = [&available_extensions](const char* name) {
+        return std::ranges::any_of(
+            available_extensions,
+            [name](const VkExtensionProperties& extension) {
+                return std::strcmp(extension.extensionName, name) == 0;
+            });
+    };
+    std::uint32_t queue_family_count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(
+        physical_device_, &queue_family_count, nullptr);
+    std::vector<VkQueueFamilyProperties> queue_family_properties(
+        queue_family_count);
+    vkGetPhysicalDeviceQueueFamilyProperties(
+        physical_device_,
+        &queue_family_count,
+        queue_family_properties.data());
+    const bool graphics_queue_supports_compute =
+        queue_families_.graphics < queue_family_properties.size() &&
+        (queue_family_properties[queue_families_.graphics].queueFlags &
+         VK_QUEUE_COMPUTE_BIT) != 0U;
+    const bool has_fsr_memory_extensions =
+#if VCR_HAS_FSR3
+        has_extension(VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME) &&
+        has_extension(VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME);
+#else
+        false;
+#endif
+    std::vector<const char*> enabled_extensions(
+        kRequiredDeviceExtensions.begin(),
+        kRequiredDeviceExtensions.end());
+    if (has_fsr_memory_extensions) {
+        // The FidelityFX Vulkan backend resolves the KHR entry point names
+        // explicitly even though both extensions are promoted to core.
+        enabled_extensions.push_back(
+            VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME);
+        enabled_extensions.push_back(
+            VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME);
+    }
+
+    // FidelityFX selects FP16 permutations from physical-device support.
+    // Enable both parts required by AMD's Vulkan integration guide, or keep
+    // the backend on its FP32 path. A device exposing shaderFloat16 without
+    // 16-bit storage is rejected for FSR because the SDK would otherwise pick
+    // an invalid permutation.
+    fsr3_fp16_enabled_ =
+        graphics_queue_supports_compute &&
+        has_fsr_memory_extensions &&
+        supported2.features.shaderInt16 == VK_TRUE &&
+        supported12.shaderFloat16 == VK_TRUE &&
+        supported11.storageBuffer16BitAccess == VK_TRUE;
+    fsr3_device_compatible_ =
+        graphics_queue_supports_compute &&
+        has_fsr_memory_extensions &&
+        supported2.features.shaderInt16 == VK_TRUE &&
+        (supported12.shaderFloat16 != VK_TRUE ||
+         supported11.storageBuffer16BitAccess == VK_TRUE);
+
     VkPhysicalDeviceVulkan13Features features13{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-        .synchronization2 = VK_TRUE,
-        .dynamicRendering = VK_TRUE,
     };
-    const VkPhysicalDeviceFeatures2 features2{
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+    features13.subgroupSizeControl = fsr3_device_compatible_
+        ? supported13.subgroupSizeControl
+        : VK_FALSE;
+    features13.computeFullSubgroups = fsr3_device_compatible_
+        ? supported13.computeFullSubgroups
+        : VK_FALSE;
+    features13.synchronization2 = VK_TRUE;
+    features13.dynamicRendering = VK_TRUE;
+    VkPhysicalDeviceVulkan12Features features12{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
         .pNext = &features13,
+        .shaderFloat16 =
+            fsr3_fp16_enabled_ ? VK_TRUE : VK_FALSE,
     };
+    VkPhysicalDeviceVulkan11Features features11{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+        .pNext = &features12,
+        .storageBuffer16BitAccess =
+            fsr3_fp16_enabled_ ? VK_TRUE : VK_FALSE,
+    };
+    VkPhysicalDeviceFeatures2 features2{};
+    features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features2.pNext = &features11;
+    features2.features.shaderInt16 =
+        fsr3_device_compatible_ ? VK_TRUE : VK_FALSE;
     const VkDeviceCreateInfo create_info{
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = &features2,
         .queueCreateInfoCount = static_cast<std::uint32_t>(queue_infos.size()),
         .pQueueCreateInfos = queue_infos.data(),
         .enabledExtensionCount =
-            static_cast<std::uint32_t>(kRequiredDeviceExtensions.size()),
-        .ppEnabledExtensionNames = kRequiredDeviceExtensions.data(),
+            static_cast<std::uint32_t>(enabled_extensions.size()),
+        .ppEnabledExtensionNames = enabled_extensions.data(),
     };
     VK_CHECK(vkCreateDevice(physical_device_, &create_info, nullptr, &device_));
     vkGetDeviceQueue(device_, queue_families_.graphics, 0, &graphics_queue_);
     vkGetDeviceQueue(device_, queue_families_.present, 0, &present_queue_);
+    std::cout << "  FidelityFX FSR 3 device path: "
+              << (fsr3_device_compatible_
+                      ? (fsr3_fp16_enabled_ ? "FP16" : "FP32")
+                      : "unavailable")
+              << '\n';
 }
 
 void VulkanContext::create_allocator() {

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "anti_aliasing.hpp"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -47,6 +49,7 @@ struct CliOptions {
     double benchmark_warmup_seconds = default_benchmark_warmup_seconds;
     RunMode initial_mode = RunMode::scene;
     PresentPreference present = PresentPreference::automatic;
+    AntiAliasingSettings anti_aliasing{};
     bool benchmark = false;
     bool mcp_stdio = false;
     bool validation = default_validation_enabled;

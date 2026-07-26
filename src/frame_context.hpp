@@ -14,7 +14,6 @@ struct FrameContext {
     VkCommandBuffer command_buffer = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     VkSemaphore image_available = VK_NULL_HANDLE;
-    VkSemaphore render_finished = VK_NULL_HANDLE;
     GpuBuffer uniform_buffer{};
     GpuBuffer workload_buffer{};
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;

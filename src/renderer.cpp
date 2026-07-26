@@ -56,6 +56,8 @@ struct alignas(16) FrameUniforms {
     // XY: inverse shadow-map extent. Z: slope-scaled receiver bias.
     // W: minimum receiver bias.
     glm::vec4 shadow_map_parameters{0.0F};
+    glm::mat4 unjittered_view_projection{1.0F};
+    glm::mat4 previous_unjittered_view_projection{1.0F};
 };
 
 struct alignas(16) InstanceData {
@@ -65,10 +67,20 @@ struct alignas(16) InstanceData {
     glm::vec4 color{1.0F};
 };
 
-static_assert(sizeof(FrameUniforms) == 288);
+static_assert(sizeof(FrameUniforms) == 416);
 static_assert(sizeof(InstanceData) == 64);
 
 inline constexpr std::uint32_t shadow_map_resolution = 2048U;
+inline constexpr VkFormat aa_color_format =
+    VK_FORMAT_R16G16B16A16_SFLOAT;
+inline constexpr VkFormat aa_motion_format =
+    VK_FORMAT_R16G16_SFLOAT;
+inline constexpr VkFormat aa_depth_format =
+    VK_FORMAT_R32_SFLOAT;
+inline constexpr VkFormat smaa_edges_format =
+    VK_FORMAT_R8G8_UNORM;
+inline constexpr VkFormat smaa_weights_format =
+    VK_FORMAT_R8G8B8A8_UNORM;
 
 glm::mat4 create_sun_light_view_projection() {
     const glm::vec3 scene_center(0.0F, 2.0F, 0.0F);
@@ -375,6 +387,63 @@ void transition_image(
     vkCmdPipelineBarrier2(command_buffer, &dependency);
 }
 
+void transition_tracked_image(
+    const VkCommandBuffer command_buffer,
+    const GpuTexture& texture,
+    VkImageLayout& current_layout,
+    const VkImageLayout new_layout,
+    const VkPipelineStageFlags2 known_src_stage,
+    const VkAccessFlags2 known_src_access,
+    const VkPipelineStageFlags2 dst_stage,
+    const VkAccessFlags2 dst_access) {
+    const bool has_previous_contents =
+        current_layout != VK_IMAGE_LAYOUT_UNDEFINED;
+    transition_image(
+        command_buffer,
+        texture.image(),
+        texture.aspect_mask(),
+        current_layout,
+        new_layout,
+        has_previous_contents ? known_src_stage : VK_PIPELINE_STAGE_2_NONE,
+        has_previous_contents ? known_src_access : VK_ACCESS_2_NONE,
+        dst_stage,
+        dst_access);
+    current_layout = new_layout;
+}
+
+[[nodiscard]] std::vector<std::byte> load_dds_payload(
+    const std::filesystem::path& path,
+    const std::size_t expected_payload_size) {
+    constexpr std::size_t legacy_dds_header_size = 128U;
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if (!input) {
+        std::cerr << "Unable to open SMAA lookup texture: " << path << '\n';
+        fatal("Missing SMAA lookup texture.");
+    }
+    const std::streamoff file_size = input.tellg();
+    if (file_size < 0 ||
+        static_cast<std::uint64_t>(file_size) !=
+            legacy_dds_header_size + expected_payload_size) {
+        fatal("Unexpected SMAA DDS payload size.");
+    }
+    input.seekg(0);
+    std::array<char, legacy_dds_header_size> header{};
+    input.read(header.data(), static_cast<std::streamsize>(header.size()));
+    if (!input ||
+        header[0] != 'D' || header[1] != 'D' ||
+        header[2] != 'S' || header[3] != ' ') {
+        fatal("Invalid SMAA DDS header.");
+    }
+    std::vector<std::byte> payload(expected_payload_size);
+    input.read(
+        reinterpret_cast<char*>(payload.data()),
+        static_cast<std::streamsize>(payload.size()));
+    if (!input) {
+        fatal("Unable to read SMAA DDS payload.");
+    }
+    return payload;
+}
+
 } // namespace
 
 Renderer::~Renderer() {
@@ -388,6 +457,7 @@ void Renderer::initialize(
     const RunMode initial_mode,
     const std::uint32_t initial_instances,
     const std::uint32_t initial_gpu_workload,
+    const AntiAliasingSettings initial_anti_aliasing,
     const bool enable_screenshot_capture) {
     context_ = &context;
     window_ = window;
@@ -406,6 +476,7 @@ void Renderer::initialize(
     instancing_count_ =
         std::clamp(initial_instances, 1U, max_instance_capacity_);
     gpu_workload_iterations_ = std::min(initial_gpu_workload, 4096U);
+    anti_aliasing_ = initial_anti_aliasing;
     light_view_projection_ = create_sun_light_view_projection();
     set_mode(initial_mode);
     swapchain_.initialize(
@@ -414,11 +485,15 @@ void Renderer::initialize(
         preferred_present_mode,
         enable_screenshot_capture);
     create_frame_contexts();
+    create_present_semaphores();
     create_pipeline_cache();
     create_scene_resources();
+    create_anti_aliasing_resources();
     create_pipeline();
     create_descriptors();
+    create_anti_aliasing_descriptors();
     render_static_shadow_map();
+    last_frame_time_ = std::chrono::steady_clock::now();
 }
 
 void Renderer::shutdown() noexcept {
@@ -430,6 +505,7 @@ void Renderer::shutdown() noexcept {
     completed_screenshot_.reset();
     screenshot_requested_ = false;
     screenshot_in_flight_ = false;
+    destroy_anti_aliasing_resources();
     destroy_scene_resources();
     destroy_pipeline();
     save_pipeline_cache();
@@ -438,6 +514,7 @@ void Renderer::shutdown() noexcept {
             context_->device(), pipeline_cache_, nullptr);
         pipeline_cache_ = VK_NULL_HANDLE;
     }
+    destroy_present_semaphores();
     destroy_frame_contexts();
     swapchain_.shutdown();
     context_ = nullptr;
@@ -478,11 +555,6 @@ void Renderer::create_frame_contexts() {
             &semaphore_info,
             nullptr,
             &frame.image_available));
-        VK_CHECK(vkCreateSemaphore(
-            context_->device(),
-            &semaphore_info,
-            nullptr,
-            &frame.render_finished));
 
         frame.uniform_buffer.create(
             *context_,
@@ -522,9 +594,6 @@ void Renderer::destroy_frame_contexts() noexcept {
             vkDestroyQueryPool(
                 context_->device(), frame.timestamp_queries, nullptr);
         }
-        if (frame.render_finished != VK_NULL_HANDLE) {
-            vkDestroySemaphore(context_->device(), frame.render_finished, nullptr);
-        }
         if (frame.image_available != VK_NULL_HANDLE) {
             vkDestroySemaphore(context_->device(), frame.image_available, nullptr);
         }
@@ -538,6 +607,40 @@ void Renderer::destroy_frame_contexts() noexcept {
         frame.uniform_buffer.destroy();
         frame = {};
     }
+}
+
+void Renderer::create_present_semaphores() {
+    if (!present_complete_semaphores_.empty()) {
+        fatal("Present semaphores were created more than once.");
+    }
+    present_complete_semaphores_.resize(swapchain_.images().size());
+    const VkSemaphoreCreateInfo semaphore_info{
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+    };
+    for (std::size_t index = 0;
+         index < present_complete_semaphores_.size();
+         ++index) {
+        VK_CHECK(vkCreateSemaphore(
+            context_->device(),
+            &semaphore_info,
+            nullptr,
+            &present_complete_semaphores_[index]));
+        const std::string name =
+            "swapchain present semaphore " + std::to_string(index);
+        context_->set_debug_name(
+            VK_OBJECT_TYPE_SEMAPHORE,
+            handle_value(present_complete_semaphores_[index]),
+            name.c_str());
+    }
+}
+
+void Renderer::destroy_present_semaphores() noexcept {
+    for (const VkSemaphore semaphore : present_complete_semaphores_) {
+        if (semaphore != VK_NULL_HANDLE) {
+            vkDestroySemaphore(context_->device(), semaphore, nullptr);
+        }
+    }
+    present_complete_semaphores_.clear();
 }
 
 void Renderer::create_scene_resources() {
@@ -708,7 +811,7 @@ void Renderer::create_sky_texture() {
 
     sky_texture_.create(
         *context_, width, height, sky_format, "sky panorama");
-    upload_to_device_texture(sky_texture_, pixels);
+    upload_to_device_texture(sky_texture_, pixels, 4U, "sky texture");
 }
 
 void Renderer::create_shadow_map() {
@@ -757,6 +860,231 @@ void Renderer::create_shadow_map() {
         "sun shadow map");
 }
 
+void Renderer::create_anti_aliasing_resources() {
+    const auto require_format = [this](
+                                    const VkFormat format,
+                                    const VkFormatFeatureFlags features,
+                                    const std::string_view purpose) {
+        VkFormatProperties properties{};
+        vkGetPhysicalDeviceFormatProperties(
+            context_->physical_device(), format, &properties);
+        if ((properties.optimalTilingFeatures & features) != features) {
+            std::cerr
+                << "Required anti-aliasing format is unsupported for "
+                << purpose << ": " << static_cast<int>(format) << '\n';
+            fatal("GPU does not support the anti-aliasing render targets.");
+        }
+    };
+    require_format(
+        aa_color_format,
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT,
+        "HDR scene color");
+    require_format(
+        aa_color_format,
+        VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT,
+        "FSR 3 output");
+    require_format(
+        aa_motion_format,
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT,
+        "FSR 3 motion vectors");
+    require_format(
+        aa_depth_format,
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT,
+        "FSR 3 depth");
+    require_format(
+        smaa_edges_format,
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT,
+        "SMAA edges");
+    require_format(
+        smaa_weights_format,
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT,
+        "SMAA blend weights");
+
+    if (!smaa_area_texture_ || !smaa_search_texture_) {
+        require_format(
+            VK_FORMAT_R8G8_UNORM,
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                VK_FORMAT_FEATURE_TRANSFER_DST_BIT,
+            "SMAA area lookup");
+        require_format(
+            VK_FORMAT_R8_UNORM,
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                VK_FORMAT_FEATURE_TRANSFER_DST_BIT,
+            "SMAA search lookup");
+
+        const char* const base_path = SDL_GetBasePath();
+        if (base_path == nullptr) {
+            fatal(SDL_GetError());
+        }
+        const std::filesystem::path smaa_asset_path =
+            std::filesystem::path(base_path) / "assets" / "smaa";
+        constexpr std::uint32_t area_width = 160U;
+        constexpr std::uint32_t area_height = 560U;
+        constexpr std::uint32_t search_width = 66U;
+        constexpr std::uint32_t search_height = 33U;
+        auto area_pixels = load_dds_payload(
+            smaa_asset_path / "AreaTexRG8.dds",
+            static_cast<std::size_t>(area_width) * area_height * 2U);
+        auto search_pixels = load_dds_payload(
+            smaa_asset_path / "SearchTexR8.dds",
+            static_cast<std::size_t>(search_width) * search_height);
+
+        smaa_area_texture_.create_sampled(
+            *context_,
+            area_width,
+            area_height,
+            VK_FORMAT_R8G8_UNORM,
+            VK_FILTER_LINEAR,
+            VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            "SMAA area lookup texture");
+        smaa_search_texture_.create_sampled(
+            *context_,
+            search_width,
+            search_height,
+            VK_FORMAT_R8_UNORM,
+            VK_FILTER_NEAREST,
+            VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            "SMAA search lookup texture");
+        upload_to_device_texture(
+            smaa_area_texture_,
+            area_pixels,
+            2U,
+            "SMAA area lookup");
+        upload_to_device_texture(
+            smaa_search_texture_,
+            search_pixels,
+            1U,
+            "SMAA search lookup");
+    }
+
+    create_anti_aliasing_targets();
+    fsr3_upscaler_.initialize(*context_, swapchain_.extent());
+    if (anti_aliasing_.method == AntiAliasingMethod::fsr3 &&
+        !fsr3_upscaler_.available()) {
+        std::cerr
+            << "warning: FSR 3 is unavailable ("
+            << fsr3_upscaler_.unavailable_reason()
+            << "); falling back to SMAA\n";
+        anti_aliasing_.method = AntiAliasingMethod::smaa;
+    }
+    temporal_history_valid_ = false;
+}
+
+void Renderer::create_anti_aliasing_targets() {
+    const VkExtent2D extent = swapchain_.extent();
+    if (extent.width == 0U || extent.height == 0U) {
+        fatal("Cannot create anti-aliasing targets for an empty extent.");
+    }
+    for (auto& resources : anti_aliasing_frames_) {
+        resources.color.create_render_target(
+            *context_,
+            extent.width,
+            extent.height,
+            aa_color_format,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_FILTER_LINEAR,
+            "AA scene color");
+        resources.motion_vectors.create_render_target(
+            *context_,
+            extent.width,
+            extent.height,
+            aa_motion_format,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_FILTER_NEAREST,
+            "FSR 3 motion vectors");
+        resources.depth.create_render_target(
+            *context_,
+            extent.width,
+            extent.height,
+            aa_depth_format,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_FILTER_NEAREST,
+            "FSR 3 depth");
+        resources.depth_attachment.create_render_target(
+            *context_,
+            extent.width,
+            extent.height,
+            swapchain_.depth_format(),
+            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+            VK_IMAGE_ASPECT_DEPTH_BIT,
+            VK_FILTER_NEAREST,
+            "AA depth attachment");
+        resources.smaa_edges.create_render_target(
+            *context_,
+            extent.width,
+            extent.height,
+            smaa_edges_format,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_FILTER_LINEAR,
+            "SMAA edges");
+        resources.smaa_weights.create_render_target(
+            *context_,
+            extent.width,
+            extent.height,
+            smaa_weights_format,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_FILTER_LINEAR,
+            "SMAA blend weights");
+        resources.fsr_output.create_render_target(
+            *context_,
+            extent.width,
+            extent.height,
+            aa_color_format,
+            VK_IMAGE_USAGE_STORAGE_BIT |
+                VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_FILTER_LINEAR,
+            "FSR 3 upscaled output");
+    }
+}
+
+void Renderer::destroy_anti_aliasing_targets() noexcept {
+    for (auto& resources : anti_aliasing_frames_) {
+        resources.fsr_output.destroy();
+        resources.smaa_weights.destroy();
+        resources.smaa_edges.destroy();
+        resources.depth_attachment.destroy();
+        resources.depth.destroy();
+        resources.motion_vectors.destroy();
+        resources.color.destroy();
+        resources.descriptor_set = VK_NULL_HANDLE;
+        resources.color_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        resources.motion_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        resources.depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        resources.depth_attachment_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        resources.edges_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        resources.weights_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        resources.fsr_output_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+}
+
+void Renderer::destroy_anti_aliasing_resources() noexcept {
+    destroy_anti_aliasing_descriptors();
+    fsr3_upscaler_.shutdown();
+    destroy_anti_aliasing_targets();
+    smaa_search_texture_.destroy();
+    smaa_area_texture_.destroy();
+}
+
 void Renderer::destroy_scene_resources() noexcept {
     if (descriptor_pool_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(context_->device(), descriptor_pool_, nullptr);
@@ -768,6 +1096,19 @@ void Renderer::destroy_scene_resources() noexcept {
     instance_buffer_.destroy();
     index_buffer_.destroy();
     vertex_buffer_.destroy();
+}
+
+void Renderer::destroy_anti_aliasing_descriptors() noexcept {
+    if (anti_aliasing_descriptor_pool_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(
+            context_->device(),
+            anti_aliasing_descriptor_pool_,
+            nullptr);
+        anti_aliasing_descriptor_pool_ = VK_NULL_HANDLE;
+    }
+    for (auto& resources : anti_aliasing_frames_) {
+        resources.descriptor_set = VK_NULL_HANDLE;
+    }
 }
 
 void Renderer::create_descriptors() {
@@ -887,6 +1228,98 @@ void Renderer::create_descriptors() {
                 .pTexelBufferView = nullptr,
             },
         };
+        vkUpdateDescriptorSets(
+            context_->device(),
+            static_cast<std::uint32_t>(writes.size()),
+            writes.data(),
+            0,
+            nullptr);
+    }
+}
+
+void Renderer::create_anti_aliasing_descriptors() {
+    destroy_anti_aliasing_descriptors();
+    const VkDescriptorPoolSize pool_size{
+        .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .descriptorCount = max_frames_in_flight * 6U,
+    };
+    const VkDescriptorPoolCreateInfo pool_info{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = max_frames_in_flight,
+        .poolSizeCount = 1,
+        .pPoolSizes = &pool_size,
+    };
+    VK_CHECK(vkCreateDescriptorPool(
+        context_->device(),
+        &pool_info,
+        nullptr,
+        &anti_aliasing_descriptor_pool_));
+
+    std::array<VkDescriptorSetLayout, max_frames_in_flight> layouts{};
+    layouts.fill(anti_aliasing_descriptor_set_layout_);
+    std::array<VkDescriptorSet, max_frames_in_flight> sets{};
+    const VkDescriptorSetAllocateInfo allocate_info{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = anti_aliasing_descriptor_pool_,
+        .descriptorSetCount = max_frames_in_flight,
+        .pSetLayouts = layouts.data(),
+    };
+    VK_CHECK(vkAllocateDescriptorSets(
+        context_->device(),
+        &allocate_info,
+        sets.data()));
+
+    for (std::uint32_t index = 0;
+         index < max_frames_in_flight;
+         ++index) {
+        auto& resources = anti_aliasing_frames_[index];
+        resources.descriptor_set = sets[index];
+        const std::array image_infos{
+            VkDescriptorImageInfo{
+                .sampler = resources.color.sampler(),
+                .imageView = resources.color.view(),
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            },
+            VkDescriptorImageInfo{
+                .sampler = resources.smaa_edges.sampler(),
+                .imageView = resources.smaa_edges.view(),
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            },
+            VkDescriptorImageInfo{
+                .sampler = resources.smaa_weights.sampler(),
+                .imageView = resources.smaa_weights.view(),
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            },
+            VkDescriptorImageInfo{
+                .sampler = smaa_area_texture_.sampler(),
+                .imageView = smaa_area_texture_.view(),
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            },
+            VkDescriptorImageInfo{
+                .sampler = smaa_search_texture_.sampler(),
+                .imageView = smaa_search_texture_.view(),
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            },
+            VkDescriptorImageInfo{
+                .sampler = resources.fsr_output.sampler(),
+                .imageView = resources.fsr_output.view(),
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            },
+        };
+        std::array<VkWriteDescriptorSet, 6> writes{};
+        for (std::size_t binding = 0;
+             binding < image_infos.size();
+             ++binding) {
+            writes[binding] = VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = resources.descriptor_set,
+                .dstBinding = static_cast<std::uint32_t>(binding),
+                .descriptorCount = 1,
+                .descriptorType =
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &image_infos[binding],
+            };
+        }
         vkUpdateDescriptorSets(
             context_->device(),
             static_cast<std::uint32_t>(writes.size()),
@@ -1021,15 +1454,20 @@ void Renderer::upload_to_device_buffer(
 
 void Renderer::upload_to_device_texture(
     GpuTexture& destination,
-    const std::span<const std::byte> rgba_pixels) {
-    constexpr std::uint64_t channels = 4U;
+    const std::span<const std::byte> pixels,
+    const std::uint32_t bytes_per_pixel,
+    const std::string_view debug_name) {
+    if (bytes_per_pixel == 0U) {
+        fatal("Texture upload bytes-per-pixel must be non-zero.");
+    }
     const std::uint64_t expected_bytes =
         static_cast<std::uint64_t>(destination.width()) *
         static_cast<std::uint64_t>(destination.height()) *
-        channels;
-    if (expected_bytes != rgba_pixels.size_bytes() ||
+        bytes_per_pixel;
+    if (expected_bytes != pixels.size_bytes() ||
         expected_bytes > std::numeric_limits<VkDeviceSize>::max()) {
-        fatal("Sky texture upload byte count mismatch.");
+        std::cerr << "Texture upload mismatch for " << debug_name << '\n';
+        fatal("Texture upload byte count mismatch.");
     }
 
     GpuBuffer staging;
@@ -1040,8 +1478,8 @@ void Renderer::upload_to_device_texture(
         VMA_MEMORY_USAGE_AUTO,
         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
             VMA_ALLOCATION_CREATE_MAPPED_BIT,
-        "sky texture staging buffer");
-    staging.write(rgba_pixels);
+        "texture staging buffer");
+    staging.write(pixels);
 
     ImmediateSubmission submission(*context_);
     const VkCommandBuffer command_buffer = submission.command_buffer();
@@ -1095,15 +1533,46 @@ void Renderer::upload_to_device_texture(
 void Renderer::update_frame_uniform(
     FrameContext& frame,
     const glm::mat4& view_matrix) {
-    const auto extent = swapchain_.extent();
+    const VkExtent2D display_extent = swapchain_.extent();
+    current_render_extent_ = display_extent;
+    current_jitter_ = {};
+    if (anti_aliasing_.method == AntiAliasingMethod::fsr3 &&
+        fsr3_upscaler_.available()) {
+        current_render_extent_ = fsr3_upscaler_.render_extent(
+            anti_aliasing_.fsr3_quality,
+            display_extent);
+        current_jitter_ = fsr3_upscaler_.jitter(
+            frame_serial_,
+            current_render_extent_.width,
+            display_extent.width);
+    }
+    const auto extent = current_render_extent_;
     const float aspect =
         static_cast<float>(extent.width) / static_cast<float>(extent.height);
-    glm::mat4 projection =
-        glm::perspective(glm::radians(65.0F), aspect, 0.05F, 500.0F);
-    projection[1][1] *= -1.0F;
+    glm::mat4 unjittered_projection =
+        glm::perspective(glm::radians(65.0F), aspect, 0.1F, 500.0F);
+    unjittered_projection[1][1] *= -1.0F;
+    const glm::mat4 unjittered_view_projection =
+        unjittered_projection * view_matrix;
+    glm::mat4 projection = unjittered_projection;
+    if (anti_aliasing_.method == AntiAliasingMethod::fsr3 &&
+        fsr3_upscaler_.available()) {
+        projection[2][0] +=
+            -2.0F * current_jitter_.x /
+            static_cast<float>(extent.width);
+        projection[2][1] +=
+            2.0F * current_jitter_.y /
+            static_cast<float>(extent.height);
+    }
     const glm::mat4 view_projection = projection * view_matrix;
     FrameUniforms uniforms{};
     uniforms.view_projection = view_projection;
+    uniforms.unjittered_view_projection =
+        unjittered_view_projection;
+    uniforms.previous_unjittered_view_projection =
+        temporal_history_valid_
+            ? previous_unjittered_view_projection_
+            : unjittered_view_projection;
     uniforms.light_view_projection = light_view_projection_;
     uniforms.shadow_map_parameters = glm::vec4(
         1.0F / static_cast<float>(shadow_map_.width()),
@@ -1120,6 +1589,9 @@ void Renderer::update_frame_uniform(
     }
     frame.uniform_buffer.write(
         std::as_bytes(std::span{&uniforms, std::size_t{1}}));
+    previous_unjittered_view_projection_ =
+        unjittered_view_projection;
+    temporal_history_valid_ = true;
 }
 
 VkShaderModule Renderer::load_shader(const std::filesystem::path& path) const {
@@ -1319,6 +1791,65 @@ void Renderer::create_pipeline() {
     VK_CHECK(vkCreatePipelineLayout(
         context_->device(), &layout_info, nullptr, &pipeline_layout_));
 
+    std::array<VkDescriptorSetLayoutBinding, 6>
+        anti_aliasing_bindings{};
+    for (std::size_t binding = 0;
+         binding < anti_aliasing_bindings.size();
+         ++binding) {
+        anti_aliasing_bindings[binding] =
+            VkDescriptorSetLayoutBinding{
+                .binding = static_cast<std::uint32_t>(binding),
+                .descriptorType =
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = 1,
+                .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+                .pImmutableSamplers = nullptr,
+            };
+    }
+    const VkDescriptorSetLayoutCreateInfo
+        anti_aliasing_descriptor_info{
+            .sType =
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .bindingCount = static_cast<std::uint32_t>(
+                anti_aliasing_bindings.size()),
+            .pBindings = anti_aliasing_bindings.data(),
+        };
+    VK_CHECK(vkCreateDescriptorSetLayout(
+        context_->device(),
+        &anti_aliasing_descriptor_info,
+        nullptr,
+        &anti_aliasing_descriptor_set_layout_));
+
+    const VkPushConstantRange post_process_push_constants{
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset = 0,
+        .size = 16,
+    };
+    const VkPipelineLayoutCreateInfo post_process_layout_info{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &anti_aliasing_descriptor_set_layout_,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &post_process_push_constants,
+    };
+    VK_CHECK(vkCreatePipelineLayout(
+        context_->device(),
+        &post_process_layout_info,
+        nullptr,
+        &post_process_pipeline_layout_));
+    const VkPipelineLayoutCreateInfo hud_layout_info{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 0,
+        .pSetLayouts = nullptr,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &post_process_push_constants,
+    };
+    VK_CHECK(vkCreatePipelineLayout(
+        context_->device(),
+        &hud_layout_info,
+        nullptr,
+        &hud_pipeline_layout_));
+
     const VkShaderModule vertex_module = load_shader("cube.vert.spv");
     const VkShaderModule fragment_module = load_shader("cube.frag.spv");
     const std::array stages{
@@ -1479,6 +2010,89 @@ void Renderer::create_pipeline() {
     vkDestroyShaderModule(
         context_->device(), scene_vertex_module, nullptr);
 
+    const std::array aa_color_formats{
+        aa_color_format,
+        aa_motion_format,
+        aa_depth_format,
+    };
+    const std::array aa_blend_attachments{
+        blend_attachment,
+        blend_attachment,
+        blend_attachment,
+    };
+    const VkPipelineColorBlendStateCreateInfo aa_color_blend{
+        .sType =
+            VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .attachmentCount = static_cast<std::uint32_t>(
+            aa_blend_attachments.size()),
+        .pAttachments = aa_blend_attachments.data(),
+    };
+    const VkPipelineRenderingCreateInfo aa_rendering_info{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+        .colorAttachmentCount =
+            static_cast<std::uint32_t>(aa_color_formats.size()),
+        .pColorAttachmentFormats = aa_color_formats.data(),
+        .depthAttachmentFormat = swapchain_.depth_format(),
+    };
+    const auto create_aa_geometry_pipeline =
+        [this,
+         &pipeline_info,
+         &aa_rendering_info,
+         &aa_color_blend](
+            const std::filesystem::path& vertex_path,
+            const std::filesystem::path& fragment_path,
+            const char* const debug_name) {
+            const VkShaderModule vertex = load_shader(vertex_path);
+            const VkShaderModule fragment = load_shader(fragment_path);
+            const std::array shader_stages{
+                VkPipelineShaderStageCreateInfo{
+                    .sType =
+                        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    .stage = VK_SHADER_STAGE_VERTEX_BIT,
+                    .module = vertex,
+                    .pName = "main",
+                },
+                VkPipelineShaderStageCreateInfo{
+                    .sType =
+                        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                    .module = fragment,
+                    .pName = "main",
+                },
+            };
+            VkGraphicsPipelineCreateInfo info = pipeline_info;
+            info.pNext = &aa_rendering_info;
+            info.stageCount =
+                static_cast<std::uint32_t>(shader_stages.size());
+            info.pStages = shader_stages.data();
+            info.pColorBlendState = &aa_color_blend;
+            VkPipeline result = VK_NULL_HANDLE;
+            VK_CHECK(vkCreateGraphicsPipelines(
+                context_->device(),
+                pipeline_cache_,
+                1,
+                &info,
+                nullptr,
+                &result));
+            context_->set_debug_name(
+                VK_OBJECT_TYPE_PIPELINE,
+                handle_value(result),
+                debug_name);
+            vkDestroyShaderModule(
+                context_->device(), fragment, nullptr);
+            vkDestroyShaderModule(
+                context_->device(), vertex, nullptr);
+            return result;
+        };
+    aa_pipeline_ = create_aa_geometry_pipeline(
+        "cube_aa.vert.spv",
+        "cube_aa.frag.spv",
+        "AA instancing graphics pipeline");
+    aa_scene_pipeline_ = create_aa_geometry_pipeline(
+        "scene_aa.vert.spv",
+        "scene_aa.frag.spv",
+        "AA shadowed scene graphics pipeline");
+
     const VkShaderModule sky_vertex_module = load_shader("sky.vert.spv");
     const VkShaderModule sky_fragment_module = load_shader("sky.frag.spv");
     std::array<VkPipelineShaderStageCreateInfo, 2> sky_stages{};
@@ -1522,6 +2136,30 @@ void Renderer::create_pipeline() {
         VK_OBJECT_TYPE_PIPELINE,
         handle_value(sky_pipeline_),
         "sky graphics pipeline");
+
+    const VkShaderModule aa_sky_fragment_module =
+        load_shader("sky_aa.frag.spv");
+    std::array<VkPipelineShaderStageCreateInfo, 2> aa_sky_stages =
+        sky_stages;
+    aa_sky_stages[1].module = aa_sky_fragment_module;
+    VkGraphicsPipelineCreateInfo aa_sky_pipeline_info =
+        sky_pipeline_info;
+    aa_sky_pipeline_info.pNext = &aa_rendering_info;
+    aa_sky_pipeline_info.pStages = aa_sky_stages.data();
+    aa_sky_pipeline_info.pColorBlendState = &aa_color_blend;
+    VK_CHECK(vkCreateGraphicsPipelines(
+        context_->device(),
+        pipeline_cache_,
+        1,
+        &aa_sky_pipeline_info,
+        nullptr,
+        &aa_sky_pipeline_));
+    context_->set_debug_name(
+        VK_OBJECT_TYPE_PIPELINE,
+        handle_value(aa_sky_pipeline_),
+        "AA sky graphics pipeline");
+    vkDestroyShaderModule(
+        context_->device(), aa_sky_fragment_module, nullptr);
     vkDestroyShaderModule(
         context_->device(), sky_fragment_module, nullptr);
     vkDestroyShaderModule(
@@ -1554,10 +2192,14 @@ void Renderer::create_pipeline() {
         .pColorAttachmentFormats = nullptr,
         .depthAttachmentFormat = shadow_map_format_,
     };
+    VkPipelineVertexInputStateCreateInfo shadow_vertex_input =
+        vertex_input;
+    shadow_vertex_input.vertexAttributeDescriptionCount = 1;
     VkGraphicsPipelineCreateInfo shadow_pipeline_info = pipeline_info;
     shadow_pipeline_info.pNext = &shadow_rendering_info;
     shadow_pipeline_info.stageCount = 1;
     shadow_pipeline_info.pStages = &shadow_stage;
+    shadow_pipeline_info.pVertexInputState = &shadow_vertex_input;
     shadow_pipeline_info.pRasterizationState = &shadow_rasterization;
     shadow_pipeline_info.pColorBlendState = &shadow_color_blend;
     VK_CHECK(vkCreateGraphicsPipelines(
@@ -1573,6 +2215,182 @@ void Renderer::create_pipeline() {
         "sun shadow depth pipeline");
     vkDestroyShaderModule(
         context_->device(), shadow_vertex_module, nullptr);
+
+    const VkShaderModule fullscreen_vertex_module =
+        load_shader("fullscreen.vert.spv");
+    const VkPipelineRasterizationStateCreateInfo
+        fullscreen_rasterization{
+            .sType =
+                VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+            .polygonMode = VK_POLYGON_MODE_FILL,
+            .cullMode = VK_CULL_MODE_NONE,
+            .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+            .lineWidth = 1.0F,
+        };
+    const VkPipelineDepthStencilStateCreateInfo no_depth_stencil{
+        .sType =
+            VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .depthTestEnable = VK_FALSE,
+        .depthWriteEnable = VK_FALSE,
+    };
+    const VkPipelineColorBlendAttachmentState post_blend_attachment{
+        .blendEnable = VK_FALSE,
+        .colorWriteMask =
+            VK_COLOR_COMPONENT_R_BIT |
+            VK_COLOR_COMPONENT_G_BIT |
+            VK_COLOR_COMPONENT_B_BIT |
+            VK_COLOR_COMPONENT_A_BIT,
+    };
+    const VkPipelineColorBlendAttachmentState hud_blend_attachment{
+        .blendEnable = VK_TRUE,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+        .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .alphaBlendOp = VK_BLEND_OP_ADD,
+        .colorWriteMask =
+            VK_COLOR_COMPONENT_R_BIT |
+            VK_COLOR_COMPONENT_G_BIT |
+            VK_COLOR_COMPONENT_B_BIT |
+            VK_COLOR_COMPONENT_A_BIT,
+    };
+    const auto create_fullscreen_pipeline =
+        [this,
+         fullscreen_vertex_module,
+         &sky_vertex_input,
+         &input_assembly,
+         &viewport_state,
+         &fullscreen_rasterization,
+         &multisampling,
+         &no_depth_stencil,
+         &dynamic_state](
+            const std::filesystem::path& fragment_path,
+            const VkFormat output_format,
+            const VkPipelineLayout layout,
+            const VkPipelineColorBlendAttachmentState& attachment_blend,
+            const VkFormat depth_format,
+            const char* const debug_name) {
+            const VkShaderModule fullscreen_fragment_module =
+                load_shader(fragment_path);
+            const std::array shader_stages{
+                VkPipelineShaderStageCreateInfo{
+                    .sType =
+                        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    .stage = VK_SHADER_STAGE_VERTEX_BIT,
+                    .module = fullscreen_vertex_module,
+                    .pName = "main",
+                },
+                VkPipelineShaderStageCreateInfo{
+                    .sType =
+                        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                    .module = fullscreen_fragment_module,
+                    .pName = "main",
+                },
+            };
+            const VkPipelineColorBlendStateCreateInfo blend_state{
+                .sType =
+                    VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                .attachmentCount = 1,
+                .pAttachments = &attachment_blend,
+            };
+            const VkPipelineRenderingCreateInfo pass_rendering_info{
+                .sType =
+                    VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+                .colorAttachmentCount = 1,
+                .pColorAttachmentFormats = &output_format,
+                .depthAttachmentFormat = depth_format,
+            };
+            const VkGraphicsPipelineCreateInfo info{
+                .sType =
+                    VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                .pNext = &pass_rendering_info,
+                .stageCount =
+                    static_cast<std::uint32_t>(shader_stages.size()),
+                .pStages = shader_stages.data(),
+                .pVertexInputState = &sky_vertex_input,
+                .pInputAssemblyState = &input_assembly,
+                .pViewportState = &viewport_state,
+                .pRasterizationState = &fullscreen_rasterization,
+                .pMultisampleState = &multisampling,
+                .pDepthStencilState = &no_depth_stencil,
+                .pColorBlendState = &blend_state,
+                .pDynamicState = &dynamic_state,
+                .layout = layout,
+            };
+            VkPipeline result = VK_NULL_HANDLE;
+            VK_CHECK(vkCreateGraphicsPipelines(
+                context_->device(),
+                pipeline_cache_,
+                1,
+                &info,
+                nullptr,
+                &result));
+            context_->set_debug_name(
+                VK_OBJECT_TYPE_PIPELINE,
+                handle_value(result),
+                debug_name);
+            vkDestroyShaderModule(
+                context_->device(), fullscreen_fragment_module, nullptr);
+            return result;
+        };
+
+    constexpr std::array<const char*, 4> edge_shader_paths{
+        "smaa_edge_low.frag.spv",
+        "smaa_edge_medium.frag.spv",
+        "smaa_edge_high.frag.spv",
+        "smaa_edge_ultra.frag.spv",
+    };
+    constexpr std::array<const char*, 4> blend_shader_paths{
+        "smaa_blend_low.frag.spv",
+        "smaa_blend_medium.frag.spv",
+        "smaa_blend_high.frag.spv",
+        "smaa_blend_ultra.frag.spv",
+    };
+    for (std::size_t index = 0;
+         index < smaa_edge_pipelines_.size();
+         ++index) {
+        smaa_edge_pipelines_[index] =
+            create_fullscreen_pipeline(
+                edge_shader_paths[index],
+                smaa_edges_format,
+                post_process_pipeline_layout_,
+                post_blend_attachment,
+                VK_FORMAT_UNDEFINED,
+                "SMAA edge detection pipeline");
+        smaa_blend_pipelines_[index] =
+            create_fullscreen_pipeline(
+                blend_shader_paths[index],
+                smaa_weights_format,
+                post_process_pipeline_layout_,
+                post_blend_attachment,
+                VK_FORMAT_UNDEFINED,
+                "SMAA blend weight pipeline");
+    }
+    smaa_neighborhood_pipeline_ = create_fullscreen_pipeline(
+        "smaa_neighborhood.frag.spv",
+        swapchain_.color_format(),
+        post_process_pipeline_layout_,
+        post_blend_attachment,
+        VK_FORMAT_UNDEFINED,
+        "SMAA neighborhood pipeline");
+    fsr_composite_pipeline_ = create_fullscreen_pipeline(
+        "composite.frag.spv",
+        swapchain_.color_format(),
+        post_process_pipeline_layout_,
+        post_blend_attachment,
+        VK_FORMAT_UNDEFINED,
+        "FSR 3 composite pipeline");
+    hud_pipeline_ = create_fullscreen_pipeline(
+        "hud.frag.spv",
+        swapchain_.color_format(),
+        hud_pipeline_layout_,
+        hud_blend_attachment,
+        swapchain_.depth_format(),
+        "anti-aliasing HUD pipeline");
+    vkDestroyShaderModule(
+        context_->device(), fullscreen_vertex_module, nullptr);
 
     const VkPushConstantRange compute_push_constants{
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
@@ -1622,6 +2440,48 @@ void Renderer::destroy_pipeline() noexcept {
             context_->device(), compute_pipeline_layout_, nullptr);
         compute_pipeline_layout_ = VK_NULL_HANDLE;
     }
+    if (hud_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(context_->device(), hud_pipeline_, nullptr);
+        hud_pipeline_ = VK_NULL_HANDLE;
+    }
+    if (fsr_composite_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(
+            context_->device(), fsr_composite_pipeline_, nullptr);
+        fsr_composite_pipeline_ = VK_NULL_HANDLE;
+    }
+    if (smaa_neighborhood_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(
+            context_->device(),
+            smaa_neighborhood_pipeline_,
+            nullptr);
+        smaa_neighborhood_pipeline_ = VK_NULL_HANDLE;
+    }
+    for (auto& pipeline : smaa_blend_pipelines_) {
+        if (pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(context_->device(), pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+    for (auto& pipeline : smaa_edge_pipelines_) {
+        if (pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(context_->device(), pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+    if (aa_sky_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(
+            context_->device(), aa_sky_pipeline_, nullptr);
+        aa_sky_pipeline_ = VK_NULL_HANDLE;
+    }
+    if (aa_scene_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(
+            context_->device(), aa_scene_pipeline_, nullptr);
+        aa_scene_pipeline_ = VK_NULL_HANDLE;
+    }
+    if (aa_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(context_->device(), aa_pipeline_, nullptr);
+        aa_pipeline_ = VK_NULL_HANDLE;
+    }
     if (sky_pipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(context_->device(), sky_pipeline_, nullptr);
         sky_pipeline_ = VK_NULL_HANDLE;
@@ -1642,6 +2502,25 @@ void Renderer::destroy_pipeline() noexcept {
         vkDestroyPipelineLayout(context_->device(), pipeline_layout_, nullptr);
         pipeline_layout_ = VK_NULL_HANDLE;
     }
+    if (hud_pipeline_layout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(
+            context_->device(), hud_pipeline_layout_, nullptr);
+        hud_pipeline_layout_ = VK_NULL_HANDLE;
+    }
+    if (post_process_pipeline_layout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(
+            context_->device(),
+            post_process_pipeline_layout_,
+            nullptr);
+        post_process_pipeline_layout_ = VK_NULL_HANDLE;
+    }
+    if (anti_aliasing_descriptor_set_layout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(
+            context_->device(),
+            anti_aliasing_descriptor_set_layout_,
+            nullptr);
+        anti_aliasing_descriptor_set_layout_ = VK_NULL_HANDLE;
+    }
     if (descriptor_set_layout_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(
             context_->device(), descriptor_set_layout_, nullptr);
@@ -1657,6 +2536,13 @@ bool Renderer::draw_frame(
                                  const Clock::time_point end) {
         return std::chrono::duration<double, std::milli>(end - begin).count();
     };
+    const auto frame_now = Clock::now();
+    if (last_frame_time_.time_since_epoch().count() != 0) {
+        fsr_frame_time_ms_ = static_cast<float>(
+            std::chrono::duration<double, std::milli>(
+                frame_now - last_frame_time_).count());
+    }
+    last_frame_time_ = frame_now;
 
     auto& frame = frames_[frame_index_];
     auto begin = Clock::now();
@@ -1709,13 +2595,19 @@ bool Renderer::draw_frame(
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
         .commandBuffer = frame.command_buffer,
     };
+    if (image_index >= present_complete_semaphores_.size()) {
+        fatal("Acquired swapchain image has no present semaphore.");
+    }
+    const VkSemaphore present_complete =
+        present_complete_semaphores_[image_index];
     const VkSemaphoreSubmitInfo signal_info{
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-        .semaphore = frame.render_finished,
-        // The exceptional screenshot path includes a transfer copy and its
-        // PRESENT transition. Normal frames retain the narrower graphics
-        // signal scope.
-        .stageMask = frame.screenshot_capture
+        .semaphore = present_complete,
+        // FSR records compute work before the final graphics composite; the
+        // semaphore must include it. Screenshot frames additionally contain
+        // a transfer copy.
+        .stageMask = frame.screenshot_capture ||
+                anti_aliasing_.method == AntiAliasingMethod::fsr3
             ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
             : VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,
     };
@@ -1742,7 +2634,7 @@ bool Renderer::draw_frame(
     const VkPresentInfoKHR present_info{
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
         .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &frame.render_finished,
+        .pWaitSemaphores = &present_complete,
         .swapchainCount = 1,
         .pSwapchains = &swapchain_handle,
         .pImageIndices = &image_index,
@@ -2000,29 +2892,6 @@ void Renderer::record_commands(
         vkCmdPipelineBarrier2(command_buffer, &dependency);
     }
 
-    transition_image(
-        command_buffer,
-        swapchain_.images()[image_index],
-        VK_IMAGE_ASPECT_COLOR_BIT,
-        VK_IMAGE_LAYOUT_UNDEFINED,
-        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        VK_PIPELINE_STAGE_2_NONE,
-        VK_ACCESS_2_NONE,
-        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-    transition_image(
-        command_buffer,
-        swapchain_.depth_target(image_index).image,
-        VK_IMAGE_ASPECT_DEPTH_BIT,
-        VK_IMAGE_LAYOUT_UNDEFINED,
-        VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-        VK_PIPELINE_STAGE_2_NONE,
-        VK_ACCESS_2_NONE,
-        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-            VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
-        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
-
     if (frame.timestamp_queries != VK_NULL_HANDLE) {
         vkCmdWriteTimestamp2(
             command_buffer,
@@ -2030,64 +2899,7 @@ void Renderer::record_commands(
             frame.timestamp_queries,
             timestamp_geometry_begin);
     }
-    const VkRenderingAttachmentInfo color_attachment{
-        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .imageView = swapchain_.image_view(image_index),
-        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-        .clearValue = VkClearValue{
-            .color = VkClearColorValue{{0.015F, 0.025F, 0.055F, 1.0F}},
-        },
-    };
-    const VkRenderingAttachmentInfo depth_attachment{
-        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .imageView = swapchain_.depth_target(image_index).view,
-        .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-        .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-        .clearValue = VkClearValue{.depthStencil = {1.0F, 0}},
-    };
-    const VkRenderingInfo rendering_info{
-        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-        .renderArea = VkRect2D{
-            .offset = {0, 0},
-            .extent = swapchain_.extent(),
-        },
-        .layerCount = 1,
-        .colorAttachmentCount = 1,
-        .pColorAttachments = &color_attachment,
-        .pDepthAttachment = &depth_attachment,
-    };
-    vkCmdBeginRendering(command_buffer, &rendering_info);
-    const auto extent = swapchain_.extent();
-    const VkViewport viewport{
-        .x = 0.0F,
-        .y = 0.0F,
-        .width = static_cast<float>(extent.width),
-        .height = static_cast<float>(extent.height),
-        .minDepth = 0.0F,
-        .maxDepth = 1.0F,
-    };
-    const VkRect2D scissor{{0, 0}, extent};
-    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
-    vkCmdSetScissor(command_buffer, 0, 1, &scissor);
-    const VkDescriptorSet descriptor_set = frame.descriptor_set;
-    vkCmdBindDescriptorSets(
-        command_buffer,
-        VK_PIPELINE_BIND_POINT_GRAPHICS,
-        pipeline_layout_,
-        0,
-        1,
-        &descriptor_set,
-        0,
-        nullptr);
-    const VkPipeline geometry_pipeline =
-        mode_ == RunMode::instancing ? pipeline_ : scene_pipeline_;
-    vkCmdBindPipeline(
-        command_buffer,
-        VK_PIPELINE_BIND_POINT_GRAPHICS,
-        geometry_pipeline);
+
     struct GraphicsPushConstants {
         std::uint32_t workload_elements;
         float workload_mix;
@@ -2100,59 +2912,568 @@ void Renderer::record_commands(
         frame_serial_,
         0,
     };
-    vkCmdPushConstants(
-        command_buffer,
-        pipeline_layout_,
-        VK_SHADER_STAGE_FRAGMENT_BIT,
-        0,
-        sizeof(push_constants),
-        &push_constants);
-    const VkDeviceSize vertex_offset = 0;
-    const VkBuffer vertex_buffer = vertex_buffer_.handle();
-    vkCmdBindVertexBuffers(
-        command_buffer, 0, 1, &vertex_buffer, &vertex_offset);
-    vkCmdBindIndexBuffer(
-        command_buffer, index_buffer_.handle(), 0, VK_INDEX_TYPE_UINT16);
-    if (mode_ == RunMode::instancing) {
-        vkCmdDrawIndexed(
+
+    const auto set_viewport =
+        [command_buffer](const VkExtent2D extent) {
+            const VkViewport viewport{
+                .x = 0.0F,
+                .y = 0.0F,
+                .width = static_cast<float>(extent.width),
+                .height = static_cast<float>(extent.height),
+                .minDepth = 0.0F,
+                .maxDepth = 1.0F,
+            };
+            const VkRect2D scissor{{0, 0}, extent};
+            vkCmdSetViewport(command_buffer, 0, 1, &viewport);
+            vkCmdSetScissor(command_buffer, 0, 1, &scissor);
+        };
+    const auto draw_geometry =
+        [this,
+         command_buffer,
+         &frame,
+         &push_constants,
+         &set_viewport](
+            const VkExtent2D extent,
+            const VkPipeline cube_pipeline,
+            const VkPipeline scene_pipeline,
+            const VkPipeline sky_pipeline) {
+            set_viewport(extent);
+            const VkDescriptorSet descriptor_set = frame.descriptor_set;
+            vkCmdBindDescriptorSets(
+                command_buffer,
+                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                pipeline_layout_,
+                0,
+                1,
+                &descriptor_set,
+                0,
+                nullptr);
+            vkCmdBindPipeline(
+                command_buffer,
+                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                mode_ == RunMode::instancing
+                    ? cube_pipeline
+                    : scene_pipeline);
+            vkCmdPushConstants(
+                command_buffer,
+                pipeline_layout_,
+                VK_SHADER_STAGE_FRAGMENT_BIT,
+                0,
+                sizeof(push_constants),
+                &push_constants);
+            const VkDeviceSize vertex_offset = 0;
+            const VkBuffer vertex_buffer = vertex_buffer_.handle();
+            vkCmdBindVertexBuffers(
+                command_buffer,
+                0,
+                1,
+                &vertex_buffer,
+                &vertex_offset);
+            vkCmdBindIndexBuffer(
+                command_buffer,
+                index_buffer_.handle(),
+                0,
+                VK_INDEX_TYPE_UINT16);
+            if (mode_ == RunMode::instancing) {
+                vkCmdDrawIndexed(
+                    command_buffer,
+                    cube_index_count,
+                    instancing_count_,
+                    0,
+                    0,
+                    0);
+            } else {
+                vkCmdDrawIndexed(
+                    command_buffer,
+                    plane_index_count,
+                    1,
+                    plane_first_index,
+                    plane_vertex_offset,
+                    scene_instance_base_);
+                vkCmdDrawIndexed(
+                    command_buffer,
+                    cube_index_count,
+                    scene_block_count,
+                    0,
+                    0,
+                    scene_instance_base_ + 1U);
+            }
+            if (mode_ != RunMode::instancing) {
+                // The triangle sits at depth 1.0 and is drawn last.
+                vkCmdBindPipeline(
+                    command_buffer,
+                    VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    sky_pipeline);
+                vkCmdDraw(command_buffer, 3, 1, 0, 0);
+            }
+        };
+
+    struct PostProcessPushConstants {
+        float inverse_resolution[2];
+        std::uint32_t method;
+        std::uint32_t quality;
+    };
+    const VkExtent2D display_extent = swapchain_.extent();
+    const PostProcessPushConstants post_process_push{
+        {
+            1.0F / static_cast<float>(display_extent.width),
+            1.0F / static_cast<float>(display_extent.height),
+        },
+        static_cast<std::uint32_t>(anti_aliasing_.method),
+        anti_aliasing_.method == AntiAliasingMethod::smaa
+            ? static_cast<std::uint32_t>(
+                  anti_aliasing_.smaa_quality)
+            : static_cast<std::uint32_t>(
+                  anti_aliasing_.fsr3_quality),
+    };
+    auto& aa_resources = anti_aliasing_frames_[frame_index_];
+    const auto draw_post_process =
+        [this,
+         command_buffer,
+         &aa_resources,
+         &post_process_push](const VkPipeline pipeline) {
+            vkCmdBindPipeline(
+                command_buffer,
+                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                pipeline);
+            vkCmdBindDescriptorSets(
+                command_buffer,
+                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                post_process_pipeline_layout_,
+                0,
+                1,
+                &aa_resources.descriptor_set,
+                0,
+                nullptr);
+            vkCmdPushConstants(
+                command_buffer,
+                post_process_pipeline_layout_,
+                VK_SHADER_STAGE_FRAGMENT_BIT,
+                0,
+                sizeof(post_process_push),
+                &post_process_push);
+            vkCmdDraw(command_buffer, 3, 1, 0, 0);
+        };
+    const auto draw_hud =
+        [this, command_buffer]() {
+            struct HudPushConstants {
+                std::uint32_t method;
+                std::uint32_t quality;
+                std::uint32_t fsr_available;
+                std::uint32_t padding;
+            };
+            const HudPushConstants hud_push{
+                static_cast<std::uint32_t>(anti_aliasing_.method),
+                anti_aliasing_.method == AntiAliasingMethod::smaa
+                    ? static_cast<std::uint32_t>(
+                          anti_aliasing_.smaa_quality)
+                    : static_cast<std::uint32_t>(
+                          anti_aliasing_.fsr3_quality),
+                fsr3_upscaler_.available() ? 1U : 0U,
+                0U,
+            };
+            vkCmdBindPipeline(
+                command_buffer,
+                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                hud_pipeline_);
+            vkCmdPushConstants(
+                command_buffer,
+                hud_pipeline_layout_,
+                VK_SHADER_STAGE_FRAGMENT_BIT,
+                0,
+                sizeof(hud_push),
+                &hud_push);
+            vkCmdDraw(command_buffer, 3, 1, 0, 0);
+        };
+
+    if (anti_aliasing_.method == AntiAliasingMethod::off) {
+        transition_image(
             command_buffer,
-            cube_index_count,
-            instancing_count_,
-            0,
-            0,
-            0);
-    } else {
-        vkCmdDrawIndexed(
-            command_buffer,
-            plane_index_count,
-            1,
-            plane_first_index,
-            plane_vertex_offset,
-            scene_instance_base_);
-        vkCmdDrawIndexed(
-            command_buffer,
-            cube_index_count,
-            scene_block_count,
-            0,
-            0,
-            scene_instance_base_ + 1U);
-    }
-    if (mode_ != RunMode::instancing) {
-        // The triangle sits at depth 1.0 and is drawn last. Early depth
-        // rejection avoids sampling sky pixels already covered by geometry.
-        vkCmdBindPipeline(
-            command_buffer,
-            VK_PIPELINE_BIND_POINT_GRAPHICS,
-            sky_pipeline_);
-        vkCmdDraw(command_buffer, 3, 1, 0, 0);
-    }
-    vkCmdEndRendering(command_buffer);
-    if (frame.timestamp_queries != VK_NULL_HANDLE) {
-        vkCmdWriteTimestamp2(
-            command_buffer,
+            swapchain_.images()[image_index],
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_PIPELINE_STAGE_2_NONE,
+            VK_ACCESS_2_NONE,
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-            frame.timestamp_queries,
-            timestamp_geometry_end);
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        transition_image(
+            command_buffer,
+            swapchain_.depth_target(image_index).image,
+            VK_IMAGE_ASPECT_DEPTH_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            VK_PIPELINE_STAGE_2_NONE,
+            VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+        const VkRenderingAttachmentInfo color_attachment{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = swapchain_.image_view(image_index),
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = VkClearValue{
+                .color = VkClearColorValue{
+                    {0.015F, 0.025F, 0.055F, 1.0F}},
+            },
+        };
+        const VkRenderingAttachmentInfo depth_attachment{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = swapchain_.depth_target(image_index).view,
+            .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .clearValue = VkClearValue{.depthStencil = {1.0F, 0}},
+        };
+        const VkRenderingInfo rendering_info{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea = VkRect2D{
+                .offset = {0, 0},
+                .extent = display_extent,
+            },
+            .layerCount = 1,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &color_attachment,
+            .pDepthAttachment = &depth_attachment,
+        };
+        vkCmdBeginRendering(command_buffer, &rendering_info);
+        draw_geometry(
+            display_extent,
+            pipeline_,
+            scene_pipeline_,
+            sky_pipeline_);
+        if (frame.timestamp_queries != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp2(
+                command_buffer,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                frame.timestamp_queries,
+                timestamp_geometry_end);
+        }
+        draw_hud();
+        vkCmdEndRendering(command_buffer);
+    } else {
+        constexpr VkPipelineStageFlags2 previous_read_stages =
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        transition_tracked_image(
+            command_buffer,
+            aa_resources.color,
+            aa_resources.color_layout,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            previous_read_stages,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        transition_tracked_image(
+            command_buffer,
+            aa_resources.motion_vectors,
+            aa_resources.motion_layout,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            previous_read_stages,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        transition_tracked_image(
+            command_buffer,
+            aa_resources.depth,
+            aa_resources.depth_layout,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            previous_read_stages,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        transition_tracked_image(
+            command_buffer,
+            aa_resources.depth_attachment,
+            aa_resources.depth_attachment_layout,
+            VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+
+        const std::array offscreen_color_attachments{
+            VkRenderingAttachmentInfo{
+                .sType =
+                    VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                .imageView = aa_resources.color.view(),
+                .imageLayout =
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue = VkClearValue{
+                    .color = VkClearColorValue{
+                        {0.015F, 0.025F, 0.055F, 1.0F}},
+                },
+            },
+            VkRenderingAttachmentInfo{
+                .sType =
+                    VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                .imageView = aa_resources.motion_vectors.view(),
+                .imageLayout =
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue = VkClearValue{
+                    .color = VkClearColorValue{
+                        {0.0F, 0.0F, 0.0F, 0.0F}},
+                },
+            },
+            VkRenderingAttachmentInfo{
+                .sType =
+                    VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                .imageView = aa_resources.depth.view(),
+                .imageLayout =
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue = VkClearValue{
+                    .color = VkClearColorValue{
+                        {1.0F, 0.0F, 0.0F, 0.0F}},
+                },
+            },
+        };
+        const VkRenderingAttachmentInfo offscreen_depth_attachment{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = aa_resources.depth_attachment.view(),
+            .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .clearValue = VkClearValue{.depthStencil = {1.0F, 0}},
+        };
+        const VkRenderingInfo offscreen_rendering_info{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea = VkRect2D{
+                .offset = {0, 0},
+                .extent = current_render_extent_,
+            },
+            .layerCount = 1,
+            .colorAttachmentCount = static_cast<std::uint32_t>(
+                offscreen_color_attachments.size()),
+            .pColorAttachments =
+                offscreen_color_attachments.data(),
+            .pDepthAttachment = &offscreen_depth_attachment,
+        };
+        vkCmdBeginRendering(
+            command_buffer, &offscreen_rendering_info);
+        draw_geometry(
+            current_render_extent_,
+            aa_pipeline_,
+            aa_scene_pipeline_,
+            aa_sky_pipeline_);
+        vkCmdEndRendering(command_buffer);
+        if (frame.timestamp_queries != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp2(
+                command_buffer,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                frame.timestamp_queries,
+                timestamp_geometry_end);
+        }
+
+        transition_tracked_image(
+            command_buffer,
+            aa_resources.color,
+            aa_resources.color_layout,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            previous_read_stages,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        transition_tracked_image(
+            command_buffer,
+            aa_resources.motion_vectors,
+            aa_resources.motion_layout,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            previous_read_stages,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        transition_tracked_image(
+            command_buffer,
+            aa_resources.depth,
+            aa_resources.depth_layout,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            previous_read_stages,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+
+        if (anti_aliasing_.method == AntiAliasingMethod::smaa) {
+            transition_tracked_image(
+                command_buffer,
+                aa_resources.smaa_edges,
+                aa_resources.edges_layout,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+            const VkRenderingAttachmentInfo edge_attachment{
+                .sType =
+                    VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                .imageView = aa_resources.smaa_edges.view(),
+                .imageLayout =
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue = VkClearValue{
+                    .color = VkClearColorValue{
+                        {0.0F, 0.0F, 0.0F, 0.0F}},
+                },
+            };
+            const VkRenderingInfo edge_rendering_info{
+                .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+                .renderArea = VkRect2D{
+                    .offset = {0, 0},
+                    .extent = display_extent,
+                },
+                .layerCount = 1,
+                .colorAttachmentCount = 1,
+                .pColorAttachments = &edge_attachment,
+            };
+            vkCmdBeginRendering(
+                command_buffer, &edge_rendering_info);
+            set_viewport(display_extent);
+            draw_post_process(smaa_edge_pipelines_[
+                static_cast<std::size_t>(
+                    anti_aliasing_.smaa_quality)]);
+            vkCmdEndRendering(command_buffer);
+            transition_tracked_image(
+                command_buffer,
+                aa_resources.smaa_edges,
+                aa_resources.edges_layout,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+
+            transition_tracked_image(
+                command_buffer,
+                aa_resources.smaa_weights,
+                aa_resources.weights_layout,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+            const VkRenderingAttachmentInfo weights_attachment{
+                .sType =
+                    VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                .imageView = aa_resources.smaa_weights.view(),
+                .imageLayout =
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue = VkClearValue{
+                    .color = VkClearColorValue{
+                        {0.0F, 0.0F, 0.0F, 0.0F}},
+                },
+            };
+            const VkRenderingInfo weights_rendering_info{
+                .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+                .renderArea = VkRect2D{
+                    .offset = {0, 0},
+                    .extent = display_extent,
+                },
+                .layerCount = 1,
+                .colorAttachmentCount = 1,
+                .pColorAttachments = &weights_attachment,
+            };
+            vkCmdBeginRendering(
+                command_buffer, &weights_rendering_info);
+            set_viewport(display_extent);
+            draw_post_process(smaa_blend_pipelines_[
+                static_cast<std::size_t>(
+                    anti_aliasing_.smaa_quality)]);
+            vkCmdEndRendering(command_buffer);
+            transition_tracked_image(
+                command_buffer,
+                aa_resources.smaa_weights,
+                aa_resources.weights_layout,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        } else {
+            transition_tracked_image(
+                command_buffer,
+                aa_resources.fsr_output,
+                aa_resources.fsr_output_layout,
+                VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+            fsr3_upscaler_.dispatch(Fsr3Dispatch{
+                .command_buffer = command_buffer,
+                .color = &aa_resources.color,
+                .depth = &aa_resources.depth,
+                .motion_vectors = &aa_resources.motion_vectors,
+                .output = &aa_resources.fsr_output,
+                .render_extent = current_render_extent_,
+                .display_extent = display_extent,
+                .jitter = current_jitter_,
+                .frame_time_ms = fsr_frame_time_ms_,
+            });
+            transition_tracked_image(
+                command_buffer,
+                aa_resources.fsr_output,
+                aa_resources.fsr_output_layout,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        }
+
+        transition_image(
+            command_buffer,
+            swapchain_.images()[image_index],
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_PIPELINE_STAGE_2_NONE,
+            VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        const VkRenderingAttachmentInfo final_attachment{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = swapchain_.image_view(image_index),
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = VkClearValue{
+                .color = VkClearColorValue{
+                    {0.015F, 0.025F, 0.055F, 1.0F}},
+            },
+        };
+        const VkRenderingInfo final_rendering_info{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea = VkRect2D{
+                .offset = {0, 0},
+                .extent = display_extent,
+            },
+            .layerCount = 1,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &final_attachment,
+        };
+        vkCmdBeginRendering(
+            command_buffer, &final_rendering_info);
+        set_viewport(display_extent);
+        draw_post_process(
+            anti_aliasing_.method == AntiAliasingMethod::smaa
+                ? smaa_neighborhood_pipeline_
+                : fsr_composite_pipeline_);
+        draw_hud();
+        vkCmdEndRendering(command_buffer);
     }
 
     auto& capture_frame = frames_[frame_index_];
@@ -2257,6 +3578,11 @@ void Renderer::record_commands(
 }
 
 void Renderer::rebuild_swapchain() {
+    recreate_swapchain(swapchain_.present_mode());
+}
+
+void Renderer::recreate_swapchain(
+    const VkPresentModeKHR preferred_mode) {
     int width = 0;
     int height = 0;
     SDL_GetWindowSizeInPixels(window_, &width, &height);
@@ -2267,12 +3593,35 @@ void Renderer::rebuild_swapchain() {
     resize_requested_ = false;
     const VkFormat old_color = swapchain_.color_format();
     const VkFormat old_depth = swapchain_.depth_format();
-    swapchain_.recreate(swapchain_.present_mode());
-    if (old_color != swapchain_.color_format() ||
-        old_depth != swapchain_.depth_format()) {
+    swapchain_.recreate(preferred_mode);
+    destroy_present_semaphores();
+    create_present_semaphores();
+
+    // Swapchain::recreate waits for device idle, so descriptor sets, the FFX
+    // context, and all extent-dependent images can now be retired safely.
+    destroy_anti_aliasing_descriptors();
+    fsr3_upscaler_.shutdown();
+    destroy_anti_aliasing_targets();
+    const bool formats_changed =
+        old_color != swapchain_.color_format() ||
+        old_depth != swapchain_.depth_format();
+    if (formats_changed) {
+        if (descriptor_pool_ != VK_NULL_HANDLE) {
+            vkDestroyDescriptorPool(
+                context_->device(), descriptor_pool_, nullptr);
+            descriptor_pool_ = VK_NULL_HANDLE;
+            for (auto& frame : frames_) {
+                frame.descriptor_set = VK_NULL_HANDLE;
+            }
+        }
         destroy_pipeline();
         create_pipeline();
+        create_descriptors();
     }
+    create_anti_aliasing_resources();
+    create_anti_aliasing_descriptors();
+    temporal_history_valid_ = false;
+    fsr3_upscaler_.request_reset();
 }
 
 void Renderer::toggle_vsync() {
@@ -2297,7 +3646,7 @@ void Renderer::set_present_mode(const PresentPreference preference) {
     const VkPresentModeKHR resolved =
         swapchain_.resolve_present_mode(requested);
     if (resolved != swapchain_.present_mode()) {
-        swapchain_.recreate(resolved);
+        recreate_swapchain(resolved);
     }
 }
 
@@ -2408,6 +3757,60 @@ void Renderer::adjust_load(const int direction) noexcept {
     }
 }
 
+void Renderer::cycle_anti_aliasing() {
+    switch (anti_aliasing_.method) {
+    case AntiAliasingMethod::off:
+        anti_aliasing_.method = AntiAliasingMethod::smaa;
+        break;
+    case AntiAliasingMethod::smaa:
+        anti_aliasing_.method = fsr3_upscaler_.available()
+            ? AntiAliasingMethod::fsr3
+            : AntiAliasingMethod::off;
+        break;
+    case AntiAliasingMethod::fsr3:
+        anti_aliasing_.method = AntiAliasingMethod::off;
+        break;
+    }
+    temporal_history_valid_ = false;
+    fsr3_upscaler_.request_reset();
+    std::cout
+        << "Anti-aliasing: " << to_string(anti_aliasing_.method);
+    if (anti_aliasing_.method == AntiAliasingMethod::smaa) {
+        std::cout << ' ' << to_string(anti_aliasing_.smaa_quality);
+    } else if (anti_aliasing_.method == AntiAliasingMethod::fsr3) {
+        std::cout << ' ' << to_string(anti_aliasing_.fsr3_quality);
+    }
+    std::cout << '\n';
+}
+
+void Renderer::adjust_anti_aliasing_quality(
+    const int direction) noexcept {
+    if (direction == 0) {
+        return;
+    }
+    if (anti_aliasing_.method == AntiAliasingMethod::smaa) {
+        const SmaaQuality adjusted = adjust_quality(
+            anti_aliasing_.smaa_quality,
+            direction);
+        if (adjusted == anti_aliasing_.smaa_quality) {
+            return;
+        }
+        anti_aliasing_.smaa_quality = adjusted;
+    } else if (anti_aliasing_.method == AntiAliasingMethod::fsr3) {
+        const Fsr3Quality adjusted = adjust_quality(
+            anti_aliasing_.fsr3_quality,
+            direction);
+        if (adjusted == anti_aliasing_.fsr3_quality) {
+            return;
+        }
+        anti_aliasing_.fsr3_quality = adjusted;
+    } else {
+        return;
+    }
+    temporal_history_valid_ = false;
+    fsr3_upscaler_.request_reset();
+}
+
 void Renderer::print_metrics() const {
     const auto stats = metrics_.snapshot();
     std::cout << std::fixed << std::setprecision(3)
@@ -2415,6 +3818,9 @@ void Renderer::print_metrics() const {
               << "  mode: " << to_string(mode_) << '\n'
               << "  present: "
               << Swapchain::present_mode_name(swapchain_.present_mode()) << '\n'
+              << "  anti-aliasing: "
+              << to_string(anti_aliasing_.method) << ' '
+              << anti_aliasing_quality_name() << '\n'
               << "  frames: " << stats.frames_rendered << '\n'
               << "  FPS (1 s): " << stats.one_second_average_fps << '\n'
               << "  FPS (average): " << stats.average_fps << '\n'

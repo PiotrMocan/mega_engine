@@ -27,6 +27,10 @@ GpuTexture& GpuTexture::operator=(GpuTexture&& other) noexcept {
     allocation_ = std::exchange(other.allocation_, VK_NULL_HANDLE);
     width_ = std::exchange(other.width_, 0U);
     height_ = std::exchange(other.height_, 0U);
+    format_ = std::exchange(other.format_, VK_FORMAT_UNDEFINED);
+    usage_ = std::exchange(other.usage_, VkImageUsageFlags{0});
+    aspect_mask_ =
+        std::exchange(other.aspect_mask_, VkImageAspectFlags{0});
     return *this;
 }
 
@@ -82,6 +86,53 @@ void GpuTexture::create_shadow_map(
         debug_name);
 }
 
+void GpuTexture::create_sampled(
+    VulkanContext& context,
+    const std::uint32_t width,
+    const std::uint32_t height,
+    const VkFormat format,
+    const VkFilter filter,
+    const VkSamplerAddressMode address_mode,
+    const std::string_view debug_name) {
+    create_impl(
+        context,
+        width,
+        height,
+        format,
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        filter,
+        address_mode,
+        VK_FALSE,
+        VK_COMPARE_OP_ALWAYS,
+        VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK,
+        debug_name);
+}
+
+void GpuTexture::create_render_target(
+    VulkanContext& context,
+    const std::uint32_t width,
+    const std::uint32_t height,
+    const VkFormat format,
+    const VkImageUsageFlags usage,
+    const VkImageAspectFlags aspect_mask,
+    const VkFilter filter,
+    const std::string_view debug_name) {
+    create_impl(
+        context,
+        width,
+        height,
+        format,
+        usage,
+        aspect_mask,
+        filter,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        VK_FALSE,
+        VK_COMPARE_OP_ALWAYS,
+        VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK,
+        debug_name);
+}
+
 void GpuTexture::create_impl(
     VulkanContext& context,
     const std::uint32_t width,
@@ -103,6 +154,9 @@ void GpuTexture::create_impl(
     context_ = &context;
     width_ = width;
     height_ = height;
+    format_ = format;
+    usage_ = usage;
+    aspect_mask_ = aspect_mask;
 
     const VkImageCreateInfo image_info{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -142,6 +196,9 @@ void GpuTexture::create_impl(
         context_ = nullptr;
         width_ = 0;
         height_ = 0;
+        format_ = VK_FORMAT_UNDEFINED;
+        usage_ = 0;
+        aspect_mask_ = 0;
         check_vk(image_result, "vmaCreateImage", __FILE__, __LINE__);
     }
 
@@ -240,6 +297,9 @@ void GpuTexture::destroy() noexcept {
     allocation_ = VK_NULL_HANDLE;
     width_ = 0;
     height_ = 0;
+    format_ = VK_FORMAT_UNDEFINED;
+    usage_ = 0;
+    aspect_mask_ = 0;
 }
 
 } // namespace vcr

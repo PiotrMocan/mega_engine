@@ -47,6 +47,11 @@ int main() {
             "10000",
             "--present",
             "immediate",
+            "--aa",
+            "fsr3",
+            "--fsr-quality=balanced",
+            "--smaa-quality",
+            "ultra",
             "--no-validation",
         };
         const auto parsed = vcr::parse_cli_options(
@@ -62,6 +67,14 @@ int main() {
         expect(
             parsed.options.present == vcr::PresentPreference::immediate,
             "present preference");
+        expect(
+            parsed.options.anti_aliasing.method ==
+                    vcr::AntiAliasingMethod::fsr3 &&
+                parsed.options.anti_aliasing.fsr3_quality ==
+                    vcr::Fsr3Quality::balanced &&
+                parsed.options.anti_aliasing.smaa_quality ==
+                    vcr::SmaaQuality::ultra,
+            "anti-aliasing CLI values");
         expect(!parsed.options.validation, "no-validation flag");
     }
 
@@ -79,6 +92,36 @@ int main() {
         const auto parsed = vcr::parse_cli_options(
             static_cast<int>(std::size(arguments)), arguments);
         expect(!static_cast<bool>(parsed), "zero width is rejected");
+    }
+
+    {
+        const char* arguments[]{"vulkan_cube", "--aa", "txaa"};
+        const auto parsed = vcr::parse_cli_options(
+            static_cast<int>(std::size(arguments)), arguments);
+        expect(
+            !static_cast<bool>(parsed),
+            "unknown anti-aliasing method is rejected");
+    }
+
+    {
+        expect(
+            vcr::adjust_quality(vcr::SmaaQuality::low, -1) ==
+                    vcr::SmaaQuality::low &&
+                vcr::adjust_quality(vcr::SmaaQuality::high, 1) ==
+                    vcr::SmaaQuality::ultra,
+            "SMAA quality adjustment is bounded");
+        expect(
+            vcr::adjust_quality(
+                vcr::Fsr3Quality::ultra_performance, 1) ==
+                    vcr::Fsr3Quality::ultra_performance &&
+                close_to(
+                    vcr::fsr3_scale(vcr::Fsr3Quality::performance),
+                    2.0,
+                    0.0001),
+            "FSR 3 quality adjustment and scale");
+        expect(
+            vcr::to_token(vcr::AntiAliasingMethod::fsr3) == "fsr3",
+            "anti-aliasing method has a stable machine token");
     }
 
     {
@@ -146,6 +189,9 @@ int main() {
     {
         vcr::BenchmarkResult result{};
         result.gpu = "GPU \"quoted\"";
+        result.render_resolution = "1280x720";
+        result.anti_aliasing = "FSR 3.1.4";
+        result.anti_aliasing_quality = "quality";
         result.frames_rendered = 42;
         const std::string json = vcr::benchmark_result_to_json(result);
         expect(
@@ -154,6 +200,12 @@ int main() {
         expect(
             json.find("\"frames_rendered\": 42") != std::string::npos,
             "JSON integer field");
+        expect(
+            json.find("\"anti_aliasing\": \"FSR 3.1.4\"") !=
+                    std::string::npos &&
+                json.find("\"render_resolution\": \"1280x720\"") !=
+                    std::string::npos,
+            "benchmark records anti-aliasing and render resolution");
     }
 
     {

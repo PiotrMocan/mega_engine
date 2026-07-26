@@ -337,7 +337,10 @@ BenchmarkResult make_benchmark_result(
     std::string gpu,
     std::string driver,
     std::string resolution,
+    std::string render_resolution,
     std::string present_mode,
+    std::string anti_aliasing,
+    std::string anti_aliasing_quality,
     std::uint32_t instances,
     std::uint32_t gpu_workload_iterations,
     const PerformanceSnapshot& snapshot) {
@@ -345,7 +348,10 @@ BenchmarkResult make_benchmark_result(
     result.gpu = std::move(gpu);
     result.driver = std::move(driver);
     result.resolution = std::move(resolution);
+    result.render_resolution = std::move(render_resolution);
     result.present_mode = std::move(present_mode);
+    result.anti_aliasing = std::move(anti_aliasing);
+    result.anti_aliasing_quality = std::move(anti_aliasing_quality);
     result.instances = instances;
     result.gpu_workload_iterations = gpu_workload_iterations;
     result.average_fps = snapshot.average_fps;
@@ -369,8 +375,10 @@ BenchmarkResult make_benchmark_result(
 std::string benchmark_result_to_json(const BenchmarkResult& result) {
     std::string output;
     output.reserve(
-        448 + result.gpu.size() + result.driver.size() +
-        result.resolution.size() + result.present_mode.size());
+        544 + result.gpu.size() + result.driver.size() +
+        result.resolution.size() + result.render_resolution.size() +
+        result.present_mode.size() + result.anti_aliasing.size() +
+        result.anti_aliasing_quality.size());
     output.append("{\n");
 
     append_key(output, "gpu");
@@ -382,8 +390,17 @@ std::string benchmark_result_to_json(const BenchmarkResult& result) {
     append_key(output, "resolution");
     append_json_string(output, result.resolution);
     output.append(",\n");
+    append_key(output, "render_resolution");
+    append_json_string(output, result.render_resolution);
+    output.append(",\n");
     append_key(output, "present_mode");
     append_json_string(output, result.present_mode);
+    output.append(",\n");
+    append_key(output, "anti_aliasing");
+    append_json_string(output, result.anti_aliasing);
+    output.append(",\n");
+    append_key(output, "anti_aliasing_quality");
+    append_json_string(output, result.anti_aliasing_quality);
     output.append(",\n");
     append_key(output, "instances");
     append_json_u64(output, result.instances);

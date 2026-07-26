@@ -141,6 +141,71 @@ struct Argument {
     return false;
 }
 
+[[nodiscard]] bool parse_anti_aliasing(
+    std::string_view value, AntiAliasingMethod& method) noexcept {
+    if (value == "off" || value == "none") {
+        method = AntiAliasingMethod::off;
+        return true;
+    }
+    if (value == "smaa") {
+        method = AntiAliasingMethod::smaa;
+        return true;
+    }
+    if (value == "fsr3" || value == "fsr") {
+        method = AntiAliasingMethod::fsr3;
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] bool parse_smaa_quality(
+    std::string_view value, SmaaQuality& quality) noexcept {
+    if (value == "low") {
+        quality = SmaaQuality::low;
+        return true;
+    }
+    if (value == "medium") {
+        quality = SmaaQuality::medium;
+        return true;
+    }
+    if (value == "high") {
+        quality = SmaaQuality::high;
+        return true;
+    }
+    if (value == "ultra") {
+        quality = SmaaQuality::ultra;
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] bool parse_fsr3_quality(
+    std::string_view value, Fsr3Quality& quality) noexcept {
+    if (value == "native" || value == "native-aa" ||
+        value == "native_aa") {
+        quality = Fsr3Quality::native_aa;
+        return true;
+    }
+    if (value == "quality") {
+        quality = Fsr3Quality::quality;
+        return true;
+    }
+    if (value == "balanced") {
+        quality = Fsr3Quality::balanced;
+        return true;
+    }
+    if (value == "performance") {
+        quality = Fsr3Quality::performance;
+        return true;
+    }
+    if (value == "ultra-performance" ||
+        value == "ultra_performance") {
+        quality = Fsr3Quality::ultra_performance;
+        return true;
+    }
+    return false;
+}
+
 } // namespace
 
 CliParseResult parse_cli_options(int argc, const char* const* argv) {
@@ -303,6 +368,42 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
             mode_was_explicit = true;
             continue;
         }
+        if (argument.name == "--aa") {
+            if (!take_value(
+                    argument, index, argc, argv, value, result.error)) {
+                return result;
+            }
+            if (!parse_anti_aliasing(
+                    value, result.options.anti_aliasing.method)) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            continue;
+        }
+        if (argument.name == "--smaa-quality") {
+            if (!take_value(
+                    argument, index, argc, argv, value, result.error)) {
+                return result;
+            }
+            if (!parse_smaa_quality(
+                    value, result.options.anti_aliasing.smaa_quality)) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            continue;
+        }
+        if (argument.name == "--fsr-quality") {
+            if (!take_value(
+                    argument, index, argc, argv, value, result.error)) {
+                return result;
+            }
+            if (!parse_fsr3_quality(
+                    value, result.options.anti_aliasing.fsr3_quality)) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            continue;
+        }
 
         result.error = "unknown command-line option: ";
         result.error.append(raw);
@@ -338,6 +439,10 @@ std::string cli_usage(std::string_view executable_name) {
         "  --gpu-workload N        GPU workload iterations (default: 0)\n"
         "  --present MODE          auto (uncapped), immediate, mailbox, or fifo\n"
         "  --mode MODE             scene, instancing, or gpu-saturation\n"
+        "  --aa MODE               off, smaa, or fsr3 (default: off)\n"
+        "  --smaa-quality MODE     low, medium, high, or ultra\n"
+        "  --fsr-quality MODE      native-aa, quality, balanced, performance,\n"
+        "                          or ultra-performance\n"
         "  --duration SECONDS      Measurement duration (default: 15)\n"
         "  --warmup SECONDS        Warmup duration (default: 5)\n"
         "  --validation            Enable Vulkan validation\n"
@@ -353,6 +458,8 @@ std::string cli_usage(std::string_view executable_name) {
         "  Esc                     Release mouse, then exit\n"
         "  1/2/3                   Scene/instancing/GPU workload mode\n"
         "  Up/Down                 Adjust active benchmark load\n"
+        "  F6                      Cycle off/SMAA/FSR 3 anti-aliasing\n"
+        "  F7/F8                   Decrease/increase AA quality\n"
         "  V/F/R/P                 VSync/fullscreen/reset/print stats\n");
     return result;
 }

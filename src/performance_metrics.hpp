@@ -150,7 +150,10 @@ struct BenchmarkResult {
     std::string gpu;
     std::string driver;
     std::string resolution;
+    std::string render_resolution;
     std::string present_mode;
+    std::string anti_aliasing;
+    std::string anti_aliasing_quality;
     std::uint32_t instances = 0;
     std::uint32_t gpu_workload_iterations = 0;
     double average_fps = 0.0;
@@ -165,7 +168,10 @@ struct BenchmarkResult {
     std::string gpu,
     std::string driver,
     std::string resolution,
+    std::string render_resolution,
     std::string present_mode,
+    std::string anti_aliasing,
+    std::string anti_aliasing_quality,
     std::uint32_t instances,
     std::uint32_t gpu_workload_iterations,
     const PerformanceSnapshot& snapshot);

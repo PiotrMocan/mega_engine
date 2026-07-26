@@ -1,0 +1,13 @@
+#version 450
+
+layout(location = 0) in vec2 inUv;
+layout(location = 0) out vec4 outColor;
+
+layout(set = 0, binding = 5) uniform sampler2D upscaledColor;
+
+void main()
+{
+    // The source and swapchain attachment are both treated as linear here;
+    // the sRGB swapchain format performs the final transfer-function encode.
+    outColor = texture(upscaledColor, inUv);
+}

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "frame_context.hpp"
+#include "fsr3_upscaler.hpp"
 #include "gpu_buffer.hpp"
 #include "gpu_texture.hpp"
 #include "cli_options.hpp"
@@ -13,6 +14,7 @@
 #include <glm/mat4x4.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -47,6 +49,7 @@ public:
         RunMode initial_mode,
         std::uint32_t initial_instances,
         std::uint32_t initial_gpu_workload,
+        AntiAliasingSettings initial_anti_aliasing,
         bool enable_screenshot_capture);
     [[nodiscard]] bool draw_frame(
         FrameTimings& timings,
@@ -64,6 +67,8 @@ public:
     void set_instance_count(std::uint32_t count) noexcept;
     void set_gpu_workload_iterations(std::uint32_t iterations) noexcept;
     void adjust_load(int direction) noexcept;
+    void cycle_anti_aliasing();
+    void adjust_anti_aliasing_quality(int direction) noexcept;
     [[nodiscard]] bool request_screenshot() noexcept;
     [[nodiscard]] std::optional<ScreenshotCapture>
         take_completed_screenshot() noexcept;
@@ -80,6 +85,30 @@ public:
     [[nodiscard]] std::uint64_t triangle_count() const noexcept;
     [[nodiscard]] std::uint32_t gpu_workload_iterations() const noexcept {
         return gpu_workload_iterations_;
+    }
+    [[nodiscard]] AntiAliasingSettings anti_aliasing() const noexcept {
+        return anti_aliasing_;
+    }
+    [[nodiscard]] VkExtent2D render_extent() const noexcept {
+        return current_render_extent_.width > 0U &&
+                current_render_extent_.height > 0U
+            ? current_render_extent_
+            : swapchain_.extent();
+    }
+    [[nodiscard]] bool fsr3_available() const noexcept {
+        return fsr3_upscaler_.available();
+    }
+    [[nodiscard]] std::string_view fsr3_version() const noexcept {
+        return fsr3_upscaler_.version();
+    }
+    [[nodiscard]] std::string_view anti_aliasing_quality_name() const noexcept {
+        if (anti_aliasing_.method == AntiAliasingMethod::smaa) {
+            return to_string(anti_aliasing_.smaa_quality);
+        }
+        if (anti_aliasing_.method == AntiAliasingMethod::fsr3) {
+            return to_string(anti_aliasing_.fsr3_quality);
+        }
+        return "n/a";
     }
     [[nodiscard]] std::uint32_t max_instance_capacity() const noexcept {
         return max_instance_capacity_;
@@ -99,8 +128,28 @@ public:
     }
 
 private:
+    struct AntiAliasingFrameResources {
+        GpuTexture color{};
+        GpuTexture motion_vectors{};
+        GpuTexture depth{};
+        GpuTexture depth_attachment{};
+        GpuTexture smaa_edges{};
+        GpuTexture smaa_weights{};
+        GpuTexture fsr_output{};
+        VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+        VkImageLayout color_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImageLayout motion_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImageLayout depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImageLayout depth_attachment_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImageLayout edges_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImageLayout weights_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImageLayout fsr_output_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    };
+
     void create_frame_contexts();
     void destroy_frame_contexts() noexcept;
+    void create_present_semaphores();
+    void destroy_present_semaphores() noexcept;
     void create_pipeline();
     void destroy_pipeline() noexcept;
     void create_pipeline_cache();
@@ -111,8 +160,14 @@ private:
     void destroy_scene_resources() noexcept;
     void create_sky_texture();
     void create_shadow_map();
+    void create_anti_aliasing_resources();
+    void create_anti_aliasing_targets();
+    void destroy_anti_aliasing_resources() noexcept;
+    void destroy_anti_aliasing_targets() noexcept;
     void render_static_shadow_map();
     void create_descriptors();
+    void create_anti_aliasing_descriptors();
+    void destroy_anti_aliasing_descriptors() noexcept;
     void read_gpu_timestamps(FrameContext& frame, FrameTimings& timings) const;
     void complete_screenshot(FrameContext& frame);
     [[nodiscard]] bool prepare_screenshot_buffer();
@@ -121,18 +176,22 @@ private:
         std::span<const std::byte> bytes);
     void upload_to_device_texture(
         GpuTexture& destination,
-        std::span<const std::byte> rgba_pixels);
+        std::span<const std::byte> pixels,
+        std::uint32_t bytes_per_pixel,
+        std::string_view debug_name);
     void update_frame_uniform(
         FrameContext& frame,
         const glm::mat4& view_matrix);
     void record_commands(VkCommandBuffer command_buffer, std::uint32_t image_index);
     void rebuild_swapchain();
+    void recreate_swapchain(VkPresentModeKHR preferred_mode);
     [[nodiscard]] VkShaderModule load_shader(const std::filesystem::path& path) const;
 
     VulkanContext* context_ = nullptr;
     SDL_Window* window_ = nullptr;
     Swapchain swapchain_{};
     std::array<FrameContext, max_frames_in_flight> frames_{};
+    std::vector<VkSemaphore> present_complete_semaphores_{};
     std::uint32_t frame_index_ = 0;
     bool resize_requested_ = false;
     VkDescriptorSetLayout descriptor_set_layout_ = VK_NULL_HANDLE;
@@ -141,17 +200,38 @@ private:
     VkPipeline scene_pipeline_ = VK_NULL_HANDLE;
     VkPipeline sky_pipeline_ = VK_NULL_HANDLE;
     VkPipeline shadow_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline aa_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline aa_scene_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline aa_sky_pipeline_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout anti_aliasing_descriptor_set_layout_ =
+        VK_NULL_HANDLE;
+    VkPipelineLayout post_process_pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout hud_pipeline_layout_ = VK_NULL_HANDLE;
+    std::array<VkPipeline, 4> smaa_edge_pipelines_{};
+    std::array<VkPipeline, 4> smaa_blend_pipelines_{};
+    VkPipeline smaa_neighborhood_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline fsr_composite_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline hud_pipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout compute_pipeline_layout_ = VK_NULL_HANDLE;
     VkPipeline compute_pipeline_ = VK_NULL_HANDLE;
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
+    VkDescriptorPool anti_aliasing_descriptor_pool_ = VK_NULL_HANDLE;
     GpuBuffer vertex_buffer_{};
     GpuBuffer index_buffer_{};
     GpuBuffer instance_buffer_{};
     GpuTexture sky_texture_{};
     GpuTexture shadow_map_{};
+    GpuTexture smaa_area_texture_{};
+    GpuTexture smaa_search_texture_{};
+    std::array<AntiAliasingFrameResources, max_frames_in_flight>
+        anti_aliasing_frames_{};
+    Fsr3Upscaler fsr3_upscaler_{};
     VkFormat shadow_map_format_ = VK_FORMAT_UNDEFINED;
     glm::mat4 light_view_projection_{1.0F};
+    glm::mat4 previous_unjittered_view_projection_{1.0F};
+    Fsr3Jitter current_jitter_{};
+    VkExtent2D current_render_extent_{};
     GpuBuffer screenshot_readback_{};
     std::uint32_t instancing_count_ = 1;
     std::uint32_t max_instance_capacity_ = 100'000;
@@ -159,9 +239,13 @@ private:
     std::uint32_t gpu_workload_iterations_ = 0;
     std::uint32_t frame_serial_ = 0;
     RunMode mode_ = RunMode::scene;
+    AntiAliasingSettings anti_aliasing_{};
     PerformanceMetrics metrics_{};
     bool screenshot_requested_ = false;
     bool screenshot_in_flight_ = false;
+    bool temporal_history_valid_ = false;
+    float fsr_frame_time_ms_ = 16.6667F;
+    std::chrono::steady_clock::time_point last_frame_time_{};
     std::optional<ScreenshotCapture> completed_screenshot_{};
 };
 
