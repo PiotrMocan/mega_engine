@@ -158,7 +158,7 @@ void VulkanContext::create_instance(SDL_Window* window, const bool validation_re
 
     const VkApplicationInfo app_info{
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-        .pApplicationName = "Vulkan Cube Benchmark",
+        .pApplicationName = "Vulkan Scene",
         .applicationVersion = VK_MAKE_API_VERSION(0, 0, 1, 0),
         .pEngineName = "vcr",
         .engineVersion = VK_MAKE_API_VERSION(0, 0, 1, 0),

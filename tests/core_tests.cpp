@@ -1,11 +1,15 @@
 #include "cli_options.hpp"
+#include "fly_camera.hpp"
 #include "performance_metrics.hpp"
 
 #include <chrono>
 #include <cmath>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <string>
+
+#include <glm/geometric.hpp>
 
 namespace {
 
@@ -59,6 +63,16 @@ int main() {
         const auto parsed = vcr::parse_cli_options(
             static_cast<int>(std::size(arguments)), arguments);
         expect(!static_cast<bool>(parsed), "zero width is rejected");
+    }
+
+    {
+        const char* arguments[]{"vulkan_cube", "--mode", "minimal"};
+        const auto parsed = vcr::parse_cli_options(
+            static_cast<int>(std::size(arguments)), arguments);
+        expect(
+            static_cast<bool>(parsed) &&
+                parsed.options.initial_mode == vcr::RunMode::scene,
+            "legacy minimal mode selects the game scene");
     }
 
     {
@@ -124,6 +138,105 @@ int main() {
         expect(
             json.find("\"frames_rendered\": 42") != std::string::npos,
             "JSON integer field");
+    }
+
+    {
+        vcr::FlyCamera camera(
+            glm::vec3(0.0F),
+            -1.57079632679F,
+            0.0F);
+        const glm::vec3 forward = camera.forward();
+        expect(
+            close_to(forward.x, 0.0, 0.0001) &&
+                close_to(forward.y, 0.0, 0.0001) &&
+                close_to(forward.z, -1.0, 0.0001),
+            "camera initially faces negative Z");
+
+        vcr::FlyCameraInput input{};
+        input.forward = true;
+        camera.update(input, 0.05F);
+        expect(
+            close_to(camera.position().z, -0.3, 0.0001),
+            "camera forward movement uses configured speed");
+
+        vcr::FlyCamera boosted(
+            glm::vec3(0.0F),
+            -1.57079632679F,
+            0.0F);
+        input.boost = true;
+        boosted.update(input, 0.05F);
+        expect(
+            close_to(boosted.position().z, -1.2, 0.0001),
+            "camera shift boost multiplies movement speed");
+    }
+
+    {
+        vcr::FlyCamera forward_only(
+            glm::vec3(0.0F),
+            -1.57079632679F,
+            0.0F);
+        vcr::FlyCamera diagonal(
+            glm::vec3(0.0F),
+            -1.57079632679F,
+            0.0F);
+        vcr::FlyCameraInput input{};
+        input.forward = true;
+        forward_only.update(input, 0.05F);
+        input.right = true;
+        diagonal.update(input, 0.05F);
+        expect(
+            close_to(
+                glm::length(forward_only.position()),
+                glm::length(diagonal.position()),
+                0.0001),
+            "camera diagonal movement is normalized");
+
+        const glm::vec3 before = diagonal.forward();
+        input = {};
+        input.mouse_delta_x = 100.0F;
+        diagonal.update(input, 0.0F);
+        expect(
+            glm::length(diagonal.forward() - before) > 0.01F,
+            "mouse look is independent of frame delta");
+    }
+
+    {
+        vcr::FlyCamera camera(
+            glm::vec3(0.0F),
+            -1.57079632679F,
+            0.0F);
+        vcr::FlyCameraInput input{};
+        input.forward = true;
+        input.backward = true;
+        input.left = true;
+        input.right = true;
+        input.up = true;
+        input.down = true;
+        camera.update(input, 0.05F);
+        expect(
+            glm::length(camera.position()) < 0.0001F,
+            "opposing camera inputs cancel");
+
+        input = {};
+        input.forward = true;
+        camera.update(input, 1.0F);
+        expect(
+            close_to(camera.position().z, -0.3, 0.0001),
+            "camera delta is clamped after a stall");
+        const glm::vec3 position = camera.position();
+        camera.update(input, -1.0F);
+        camera.update(
+            input, std::numeric_limits<float>::quiet_NaN());
+        expect(
+            glm::length(camera.position() - position) < 0.0001F,
+            "invalid camera deltas do not move the camera");
+
+        input = {};
+        input.mouse_delta_y = 100'000.0F;
+        camera.update(input, 0.0F);
+        expect(
+            camera.forward().y < -0.99F,
+            "camera pitch is clamped below the singularity");
     }
 
     if (failures != 0) {

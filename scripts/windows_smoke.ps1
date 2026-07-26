@@ -4,7 +4,7 @@ param(
     [string[]]$AppArguments = @(),
     [int]$Seconds = 3,
     [string]$ScreenshotPath = "",
-    [string]$WindowTitle = "Vulkan Cube"
+    [string]$WindowTitle = "Vulkan Scene"
 )
 
 $ErrorActionPreference = "Stop"
@@ -50,6 +50,25 @@ public static class VulkanCubeWin32 {
     public static extern bool PostMessage(
         IntPtr handle, uint message, IntPtr wParam, IntPtr lParam);
 
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool ShowWindow(IntPtr handle, int command);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetForegroundWindow(IntPtr handle);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetWindowPos(
+        IntPtr handle,
+        IntPtr insertAfter,
+        int x,
+        int y,
+        int width,
+        int height,
+        uint flags);
+
     public static IntPtr FindProcessWindow(int processId, string titlePart) {
         IntPtr result = IntPtr.Zero;
         EnumWindows(delegate(IntPtr handle, IntPtr parameter) {
@@ -93,6 +112,19 @@ while (-not $process.HasExited -and
 if ($windowHandle -eq [IntPtr]::Zero -and -not $process.HasExited) {
     $process.Refresh()
     $windowHandle = $process.MainWindowHandle
+}
+
+if ($windowHandle -ne [IntPtr]::Zero) {
+    [void][VulkanCubeWin32]::ShowWindow($windowHandle, 9)
+    [void][VulkanCubeWin32]::SetWindowPos(
+        $windowHandle,
+        [IntPtr]::Zero,
+        40,
+        40,
+        0,
+        0,
+        0x0001 -bor 0x0004 -bor 0x0040)
+    [void][VulkanCubeWin32]::SetForegroundWindow($windowHandle)
 }
 
 Start-Sleep -Seconds $Seconds

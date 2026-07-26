@@ -9,7 +9,7 @@
 namespace vcr {
 
 enum class RunMode : std::uint8_t {
-    minimal,
+    scene,
     instancing,
     gpu_saturation,
 };
@@ -45,7 +45,7 @@ struct CliOptions {
     std::uint32_t gpu_workload_iterations = 0;
     double benchmark_duration_seconds = default_benchmark_duration_seconds;
     double benchmark_warmup_seconds = default_benchmark_warmup_seconds;
-    RunMode initial_mode = RunMode::minimal;
+    RunMode initial_mode = RunMode::scene;
     PresentPreference present = PresentPreference::automatic;
     bool benchmark = false;
     bool validation = default_validation_enabled;

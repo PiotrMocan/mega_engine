@@ -112,6 +112,94 @@ constexpr std::array<std::uint16_t, 36> kCubeIndices{
     20, 21, 22, 22, 23, 20,
 };
 
+constexpr std::array kPlaneVertices{
+    Vertex{{-1, 0,  1}, {0, 1, 0}},
+    Vertex{{ 1, 0,  1}, {0, 1, 0}},
+    Vertex{{ 1, 0, -1}, {0, 1, 0}},
+    Vertex{{-1, 0, -1}, {0, 1, 0}},
+};
+
+constexpr std::array<std::uint16_t, 6> kPlaneIndices{
+    0, 1, 2, 2, 3, 0,
+};
+
+template <typename T, std::size_t FirstSize, std::size_t SecondSize>
+constexpr std::array<T, FirstSize + SecondSize> concatenate(
+    const std::array<T, FirstSize>& first,
+    const std::array<T, SecondSize>& second) {
+    std::array<T, FirstSize + SecondSize> result{};
+    for (std::size_t index = 0; index < FirstSize; ++index) {
+        result[index] = first[index];
+    }
+    for (std::size_t index = 0; index < SecondSize; ++index) {
+        result[FirstSize + index] = second[index];
+    }
+    return result;
+}
+
+constexpr auto kGeometryVertices =
+    concatenate(kCubeVertices, kPlaneVertices);
+constexpr auto kGeometryIndices =
+    concatenate(kCubeIndices, kPlaneIndices);
+
+struct SceneInstanceSpec {
+    float translation[3];
+    float scale[3];
+    float color[3];
+    float yaw_degrees;
+};
+
+constexpr std::array<SceneInstanceSpec, 15> kSceneInstances{{
+    // Ground plane.
+    {{ 0.0F, 0.0F,  0.0F}, {20.0F, 1.0F, 20.0F},
+     {0.22F, 0.36F, 0.18F}, 0.0F},
+    // Scattered blocks.
+    {{-5.0F, 1.0F, -5.0F}, {1.0F, 1.0F, 1.0F},
+     {0.78F, 0.24F, 0.18F}, 0.0F},
+    {{-2.5F, 0.75F, -3.5F}, {0.75F, 0.75F, 0.75F},
+     {0.92F, 0.58F, 0.15F}, 18.0F},
+    {{ 1.5F, 1.0F, -5.5F}, {1.5F, 1.0F, 1.0F},
+     {0.20F, 0.55F, 0.88F}, -12.0F},
+    {{ 5.0F, 1.5F, -3.0F}, {1.0F, 1.5F, 1.0F},
+     {0.55F, 0.30F, 0.85F}, 9.0F},
+    // A two-block stack near the center.
+    {{ 0.0F, 1.0F, 0.0F}, {1.0F, 1.0F, 1.0F},
+     {0.18F, 0.68F, 1.00F}, 0.0F},
+    {{ 0.0F, 3.0F, 0.0F}, {1.0F, 1.0F, 1.0F},
+     {0.25F, 0.82F, 0.72F}, 22.0F},
+    // Low wall.
+    {{-5.0F, 1.0F, 4.0F}, {0.9F, 1.0F, 0.9F},
+     {0.72F, 0.36F, 0.20F}, 0.0F},
+    {{-2.5F, 1.0F, 4.0F}, {0.9F, 1.0F, 0.9F},
+     {0.78F, 0.43F, 0.22F}, 0.0F},
+    {{ 0.0F, 1.0F, 4.0F}, {0.9F, 1.0F, 0.9F},
+     {0.84F, 0.50F, 0.24F}, 0.0F},
+    {{ 2.5F, 1.0F, 4.0F}, {0.9F, 1.0F, 0.9F},
+     {0.78F, 0.43F, 0.22F}, 0.0F},
+    {{ 5.0F, 1.0F, 4.0F}, {0.9F, 1.0F, 0.9F},
+     {0.72F, 0.36F, 0.20F}, 0.0F},
+    // Tall landmark.
+    {{ 7.0F, 1.0F, 7.0F}, {1.0F, 1.0F, 1.0F},
+     {0.34F, 0.48F, 0.92F}, 0.0F},
+    {{ 7.0F, 3.0F, 7.0F}, {1.0F, 1.0F, 1.0F},
+     {0.42F, 0.56F, 0.96F}, 15.0F},
+    {{ 7.0F, 5.0F, 7.0F}, {1.0F, 1.0F, 1.0F},
+     {0.52F, 0.68F, 1.00F}, 30.0F},
+}};
+
+inline constexpr std::uint32_t cube_index_count =
+    static_cast<std::uint32_t>(kCubeIndices.size());
+inline constexpr std::uint32_t cube_triangle_count = cube_index_count / 3U;
+inline constexpr std::uint32_t plane_first_index = cube_index_count;
+inline constexpr std::int32_t plane_vertex_offset =
+    static_cast<std::int32_t>(kCubeVertices.size());
+inline constexpr std::uint32_t plane_index_count =
+    static_cast<std::uint32_t>(kPlaneIndices.size());
+inline constexpr std::uint32_t plane_triangle_count = plane_index_count / 3U;
+inline constexpr std::uint32_t scene_instance_count =
+    static_cast<std::uint32_t>(kSceneInstances.size());
+inline constexpr std::uint32_t scene_block_count = scene_instance_count - 1U;
+
 template <typename T, std::size_t N>
 std::span<const std::byte> as_bytes(const std::array<T, N>& values) {
     return std::as_bytes(std::span{values});
@@ -172,8 +260,15 @@ void Renderer::initialize(
     const std::uint64_t range_capacity =
         context.properties().limits.maxStorageBufferRange /
         sizeof(InstanceData);
+    if (range_capacity <
+        static_cast<std::uint64_t>(scene_instance_count) + 100'000ULL) {
+        fatal("Storage buffer range is too small for scene and benchmark data.");
+    }
+    const std::uint64_t benchmark_range_capacity =
+        range_capacity - scene_instance_count;
     max_instance_capacity_ = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(
-        range_capacity, 100'000ULL, 1'000'000ULL));
+        benchmark_range_capacity, 100'000ULL, 1'000'000ULL));
+    scene_instance_base_ = max_instance_capacity_;
     instancing_count_ =
         std::clamp(initial_instances, 1U, max_instance_capacity_);
     gpu_workload_iterations_ = std::min(initial_gpu_workload, 4096U);
@@ -184,7 +279,6 @@ void Renderer::initialize(
     create_pipeline();
     create_scene_resources();
     create_descriptors();
-    last_animation_tick_ = std::chrono::steady_clock::now();
 }
 
 void Renderer::shutdown() noexcept {
@@ -305,19 +399,21 @@ void Renderer::destroy_frame_contexts() noexcept {
 void Renderer::create_scene_resources() {
     vertex_buffer_.create(
         *context_,
-        sizeof(kCubeVertices),
+        sizeof(kGeometryVertices),
         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
-        "cube vertex buffer");
+        "scene vertex buffer");
     index_buffer_.create(
         *context_,
-        sizeof(kCubeIndices),
+        sizeof(kGeometryIndices),
         VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
-        "cube index buffer");
-    std::vector<InstanceData> instances(max_instance_capacity_);
+        "scene index buffer");
+    std::vector<InstanceData> instances(
+        static_cast<std::size_t>(max_instance_capacity_) +
+        scene_instance_count);
     instances[0] = InstanceData{
         .translation = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F),
         .rotation = glm::vec4(0.0F, 0.0F, 0.0F, 1.0F),
@@ -345,6 +441,32 @@ void Renderer::create_scene_resources() {
                 1.0F),
         };
     }
+
+    for (std::uint32_t index = 0; index < scene_instance_count; ++index) {
+        const auto& source = kSceneInstances[index];
+        const glm::quat rotation = glm::angleAxis(
+            glm::radians(source.yaw_degrees),
+            glm::vec3(0.0F, 1.0F, 0.0F));
+        instances[scene_instance_base_ + index] = InstanceData{
+            .translation = glm::vec4(
+                source.translation[0],
+                source.translation[1],
+                source.translation[2],
+                0.0F),
+            .rotation =
+                glm::vec4(rotation.x, rotation.y, rotation.z, rotation.w),
+            .scale = glm::vec4(
+                source.scale[0],
+                source.scale[1],
+                source.scale[2],
+                0.0F),
+            .color = glm::vec4(
+                source.color[0],
+                source.color[1],
+                source.color[2],
+                1.0F),
+        };
+    }
     instance_buffer_.create(
         *context_,
         static_cast<VkDeviceSize>(instances.size()) * sizeof(InstanceData),
@@ -353,11 +475,10 @@ void Renderer::create_scene_resources() {
         0,
         "instance buffer");
 
-    upload_to_device_buffer(vertex_buffer_, as_bytes(kCubeVertices));
-    upload_to_device_buffer(index_buffer_, as_bytes(kCubeIndices));
+    upload_to_device_buffer(vertex_buffer_, as_bytes(kGeometryVertices));
+    upload_to_device_buffer(index_buffer_, as_bytes(kGeometryIndices));
     upload_to_device_buffer(
         instance_buffer_, std::as_bytes(std::span{instances}));
-    index_count_ = static_cast<std::uint32_t>(kCubeIndices.size());
 }
 
 void Renderer::destroy_scene_resources() noexcept {
@@ -524,37 +645,18 @@ void Renderer::upload_to_device_buffer(
     vkDestroyCommandPool(context_->device(), command_pool, nullptr);
 }
 
-void Renderer::update_frame_uniform(FrameContext& frame) {
-    const auto now = std::chrono::steady_clock::now();
-    const double delta =
-        std::chrono::duration<double>(now - last_animation_tick_).count();
-    last_animation_tick_ = now;
-    if (!rotation_paused_) {
-        animation_seconds_ += std::clamp(delta, 0.0, 0.1);
-    }
-
+void Renderer::update_frame_uniform(
+    FrameContext& frame,
+    const glm::mat4& view_matrix) {
     const auto extent = swapchain_.extent();
     const float aspect =
         static_cast<float>(extent.width) / static_cast<float>(extent.height);
-    const float camera_distance =
-        mode_ == RunMode::instancing ? 46.0F : 5.0F;
-    const float far_plane =
-        mode_ == RunMode::instancing ? 120.0F : 100.0F;
     glm::mat4 projection =
-        glm::perspective(glm::radians(60.0F), aspect, 0.1F, far_plane);
+        glm::perspective(glm::radians(65.0F), aspect, 0.05F, 500.0F);
     projection[1][1] *= -1.0F;
-    const glm::mat4 view = glm::lookAt(
-        glm::vec3(0.0F, 0.0F, camera_distance),
-        glm::vec3(0.0F),
-        glm::vec3(0.0F, 1.0F, 0.0F));
-    const glm::quat rotation = glm::quat(glm::vec3(
-        static_cast<float>(animation_seconds_ * 0.7),
-        static_cast<float>(animation_seconds_ * 1.1),
-        0.0F));
     const FrameUniforms uniforms{
-        .view_projection = projection * view,
-        .global_rotation =
-            glm::vec4(rotation.x, rotation.y, rotation.z, rotation.w),
+        .view_projection = projection * view_matrix,
+        .global_rotation = glm::vec4(0.0F, 0.0F, 0.0F, 1.0F),
     };
     frame.uniform_buffer.write(
         std::as_bytes(std::span{&uniforms, std::size_t{1}}));
@@ -923,7 +1025,9 @@ void Renderer::destroy_pipeline() noexcept {
     }
 }
 
-bool Renderer::draw_frame(FrameTimings& timings) {
+bool Renderer::draw_frame(
+    FrameTimings& timings,
+    const glm::mat4& view_matrix) {
     using Clock = std::chrono::steady_clock;
     const auto milliseconds = [](const Clock::time_point begin,
                                  const Clock::time_point end) {
@@ -960,7 +1064,7 @@ bool Renderer::draw_frame(FrameTimings& timings) {
         VK_CHECK(acquire);
     }
 
-    update_frame_uniform(frame);
+    update_frame_uniform(frame, view_matrix);
     VK_CHECK(vkResetFences(context_->device(), 1, &frame.fence));
     VK_CHECK(vkResetCommandPool(
         context_->device(), frame.command_pool, 0));
@@ -1278,8 +1382,30 @@ void Renderer::record_commands(
         command_buffer, 0, 1, &vertex_buffer, &vertex_offset);
     vkCmdBindIndexBuffer(
         command_buffer, index_buffer_.handle(), 0, VK_INDEX_TYPE_UINT16);
-    vkCmdDrawIndexed(
-        command_buffer, index_count_, instance_count_, 0, 0, 0);
+    if (mode_ == RunMode::instancing) {
+        vkCmdDrawIndexed(
+            command_buffer,
+            cube_index_count,
+            instancing_count_,
+            0,
+            0,
+            0);
+    } else {
+        vkCmdDrawIndexed(
+            command_buffer,
+            plane_index_count,
+            1,
+            plane_first_index,
+            plane_vertex_offset,
+            scene_instance_base_);
+        vkCmdDrawIndexed(
+            command_buffer,
+            cube_index_count,
+            scene_block_count,
+            0,
+            0,
+            scene_instance_base_ + 1U);
+    }
     vkCmdEndRendering(command_buffer);
     if (frame.timestamp_queries != VK_NULL_HANDLE) {
         vkCmdWriteTimestamp2(
@@ -1345,10 +1471,24 @@ void Renderer::toggle_vsync() {
     swapchain_.recreate(requested);
 }
 
+std::uint32_t Renderer::instance_count() const noexcept {
+    return mode_ == RunMode::instancing
+        ? instancing_count_
+        : scene_instance_count;
+}
+
+std::uint64_t Renderer::triangle_count() const noexcept {
+    if (mode_ == RunMode::instancing) {
+        return static_cast<std::uint64_t>(cube_triangle_count) *
+               instancing_count_;
+    }
+    return plane_triangle_count +
+           static_cast<std::uint64_t>(cube_triangle_count) *
+               scene_block_count;
+}
+
 void Renderer::set_mode(const RunMode mode) noexcept {
     mode_ = mode;
-    instance_count_ =
-        mode_ == RunMode::instancing ? instancing_count_ : 1U;
 }
 
 void Renderer::adjust_load(const int direction) noexcept {
@@ -1381,7 +1521,6 @@ void Renderer::adjust_load(const int direction) noexcept {
         }
         instancing_count_ =
             std::clamp(next, 1U, max_instance_capacity_);
-        instance_count_ = instancing_count_;
     } else if (mode_ == RunMode::gpu_saturation) {
         constexpr std::array levels{0U, 8U, 32U, 128U, 512U};
         std::uint32_t next = gpu_workload_iterations_;
@@ -1425,7 +1564,7 @@ void Renderer::print_metrics() const {
               << "  GPU frame: " << stats.average.gpu_frame_ms << " ms\n"
               << "  GPU geometry: " << stats.average.gpu_geometry_ms << " ms\n"
               << "  GPU workload: " << stats.average.gpu_workload_ms << " ms\n"
-              << "  instances: " << instance_count_ << '\n'
+              << "  instances: " << instance_count() << '\n'
               << "  max instance capacity: " << max_instance_capacity_ << '\n'
               << "  GPU workload iterations: "
               << gpu_workload_iterations_ << '\n'

@@ -9,10 +9,11 @@
 
 #include <SDL3/SDL.h>
 
+#include <glm/mat4x4.hpp>
+
 #include <array>
 #include <cstdint>
 #include <filesystem>
-#include <chrono>
 
 namespace vcr {
 
@@ -31,12 +32,13 @@ public:
         RunMode initial_mode,
         std::uint32_t initial_instances,
         std::uint32_t initial_gpu_workload);
-    [[nodiscard]] bool draw_frame(FrameTimings& timings);
+    [[nodiscard]] bool draw_frame(
+        FrameTimings& timings,
+        const glm::mat4& view_matrix);
     void record_metrics(const FrameTimings& timings) noexcept {
         metrics_.record_frame(timings);
     }
     void request_resize() noexcept { resize_requested_ = true; }
-    void toggle_rotation_pause() noexcept { rotation_paused_ = !rotation_paused_; }
     void toggle_vsync();
     void reset_metrics() noexcept { metrics_.reset(); }
     void print_metrics() const;
@@ -51,12 +53,8 @@ public:
         return metrics_.snapshot();
     }
     [[nodiscard]] RunMode mode() const noexcept { return mode_; }
-    [[nodiscard]] std::uint32_t instance_count() const noexcept {
-        return instance_count_;
-    }
-    [[nodiscard]] std::uint64_t triangle_count() const noexcept {
-        return static_cast<std::uint64_t>(index_count_ / 3U) * instance_count_;
-    }
+    [[nodiscard]] std::uint32_t instance_count() const noexcept;
+    [[nodiscard]] std::uint64_t triangle_count() const noexcept;
     [[nodiscard]] std::uint32_t gpu_workload_iterations() const noexcept {
         return gpu_workload_iterations_;
     }
@@ -80,7 +78,9 @@ private:
     void upload_to_device_buffer(
         GpuBuffer& destination,
         std::span<const std::byte> bytes);
-    void update_frame_uniform(FrameContext& frame);
+    void update_frame_uniform(
+        FrameContext& frame,
+        const glm::mat4& view_matrix);
     void record_commands(VkCommandBuffer command_buffer, std::uint32_t image_index);
     void rebuild_swapchain();
     [[nodiscard]] VkShaderModule load_shader(const std::filesystem::path& path) const;
@@ -101,16 +101,12 @@ private:
     GpuBuffer vertex_buffer_{};
     GpuBuffer index_buffer_{};
     GpuBuffer instance_buffer_{};
-    std::uint32_t index_count_ = 0;
-    std::uint32_t instance_count_ = 1;
     std::uint32_t instancing_count_ = 1;
     std::uint32_t max_instance_capacity_ = 100'000;
+    std::uint32_t scene_instance_base_ = 0;
     std::uint32_t gpu_workload_iterations_ = 0;
     std::uint32_t frame_serial_ = 0;
-    std::chrono::steady_clock::time_point last_animation_tick_{};
-    double animation_seconds_ = 0.0;
-    bool rotation_paused_ = false;
-    RunMode mode_ = RunMode::minimal;
+    RunMode mode_ = RunMode::scene;
     PerformanceMetrics metrics_{};
 };
 

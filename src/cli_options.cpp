@@ -104,8 +104,8 @@ struct Argument {
 
 [[nodiscard]] bool parse_mode(
     std::string_view value, RunMode& mode) noexcept {
-    if (value == "minimal") {
-        mode = RunMode::minimal;
+    if (value == "scene" || value == "minimal") {
+        mode = RunMode::scene;
         return true;
     }
     if (value == "instancing" || value == "instances") {
@@ -328,19 +328,30 @@ std::string cli_usage(std::string_view executable_name) {
         "  --instances N           Cube instance count (default: 1)\n"
         "  --gpu-workload N        GPU workload iterations (default: 0)\n"
         "  --present MODE          auto (uncapped), immediate, mailbox, or fifo\n"
-        "  --mode MODE             minimal, instancing, or gpu-saturation\n"
+        "  --mode MODE             scene, instancing, or gpu-saturation\n"
         "  --duration SECONDS      Measurement duration (default: 15)\n"
         "  --warmup SECONDS        Warmup duration (default: 5)\n"
         "  --validation            Enable Vulkan validation\n"
         "  --no-validation         Disable Vulkan validation\n"
-        "  -h, --help              Show this help\n");
+        "  -h, --help              Show this help\n"
+        "\n"
+        "Controls:\n"
+        "  Mouse                   Look around (left click captures)\n"
+        "  W/A/S/D                 Fly forward/left/back/right\n"
+        "  Shift                   Move four times faster\n"
+        "  Space or E              Fly up\n"
+        "  Ctrl or Q               Fly down\n"
+        "  Esc                     Release mouse, then exit\n"
+        "  1/2/3                   Scene/instancing/GPU workload mode\n"
+        "  Up/Down                 Adjust active benchmark load\n"
+        "  V/F/R/P                 VSync/fullscreen/reset/print stats\n");
     return result;
 }
 
 std::string_view to_string(RunMode mode) noexcept {
     switch (mode) {
-    case RunMode::minimal:
-        return "minimal";
+    case RunMode::scene:
+        return "scene";
     case RunMode::instancing:
         return "instancing";
     case RunMode::gpu_saturation:

@@ -28,7 +28,7 @@ CPU/GPU, низкая задержка, корректная синхрониз�
 
 Текущие режимы:
 
-- `minimal`: один вращающийся куб и измерение минимального CPU overhead;
+- `scene`: ground plane, статические block instances и управляемая fly camera;
 - `instancing`: до 1 000 000 экземпляров одним indexed instanced draw;
 - `gpu-saturation`: регулируемая compute-нагрузка, потребляемая fragment shader.
 
@@ -44,9 +44,10 @@ CPU/GPU, низкая задержка, корректная синхрониз�
 - исходники шейдеров в `shaders/` и runtime SPIR-V в `shaders/spv/`.
 
 Локальная контрольная точка от 2026-07-26 на AMD Radeon RX 6800, Release,
-1280×720, `minimal`, `IMMEDIATE`: около 3667 FPS, CPU frame около 0.273 ms,
-GPU frame около 0.051 ms. Это не универсальная цель для другого железа, а
-ориентир для локального поиска регрессий при неизменных условиях.
+1280×720, `scene`, `IMMEDIATE`: около 2941 FPS, CPU frame около 0.340 ms,
+GPU frame около 0.078 ms. Сцена содержит два draw calls, 15 instances и
+170 triangles. Это не универсальная цель для другого железа, а ориентир для
+локального поиска регрессий при неизменных условиях.
 
 ## 2. Непереговорные законы
 
@@ -200,7 +201,7 @@ Suppression допустим только рядом с кодом, с прич�
 - Размер pool выводится из доступной CPU topology и оставляет ресурсы main/render
   submission thread; oversubscription запрещён без измеренного выигрыша.
 - Работу дробить на достаточно крупные jobs. Порог параллельного пути выбирается
-  benchmark-ом, чтобы minimal mode не платил за dispatch больше самой работы.
+  benchmark-ом, чтобы маленькая scene не платила за dispatch больше самой работы.
 - Frame data передавать immutable frame packet или явно разделённые per-frame
   regions. Изменяемое глобальное состояние запрещено.
 - Для временных данных использовать bounded per-thread/per-frame arenas,

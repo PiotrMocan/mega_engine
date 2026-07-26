@@ -84,6 +84,7 @@ add_executable(vulkan_cube
     src/main.cpp
     src/application.cpp
     src/cli_options.cpp
+    src/fly_camera.cpp
     src/gpu_buffer.cpp
     src/performance_metrics.cpp
     src/renderer.cpp
@@ -148,14 +149,18 @@ if(BUILD_TESTING)
     add_executable(vcr_core_tests
         tests/core_tests.cpp
         src/cli_options.cpp
+        src/fly_camera.cpp
         src/performance_metrics.cpp
     )
     target_include_directories(vcr_core_tests PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
     )
     target_compile_definitions(vcr_core_tests PRIVATE
+        GLM_FORCE_DEPTH_ZERO_TO_ONE
+        GLM_FORCE_RADIANS
         VCR_VALIDATION_DEFAULT=0
     )
+    target_link_libraries(vcr_core_tests PRIVATE glm::glm)
     if(MSVC)
         target_compile_options(vcr_core_tests PRIVATE /W4 /permissive-)
     else()

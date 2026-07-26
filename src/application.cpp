@@ -2,12 +2,18 @@
 
 #include "vulkan_common.hpp"
 
-#include <cstring>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <iostream>
 
 namespace vcr {
+
+void SdlWindowDeleter::operator()(SDL_Window* const window) const noexcept {
+    if (window != nullptr) {
+        SDL_DestroyWindow(window);
+    }
+}
 
 Application::~Application() {
     shutdown();
@@ -35,16 +41,18 @@ void Application::initialize(const CliOptions& options) {
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fatal(SDL_GetError());
     }
-    window_ = SDL_CreateWindow(
-        "Vulkan Cube Benchmark",
+    window_.reset(SDL_CreateWindow(
+        "Vulkan Scene",
         static_cast<int>(options.width),
         static_cast<int>(options.height),
-        SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
-    if (window_ == nullptr) {
+        SDL_WINDOW_VULKAN |
+            SDL_WINDOW_RESIZABLE |
+            SDL_WINDOW_HIGH_PIXEL_DENSITY));
+    if (!window_) {
         fatal(SDL_GetError());
     }
 
-    context_.initialize(window_, options.validation);
+    context_.initialize(window_.get(), options.validation);
     VkPresentModeKHR preferred_present = VK_PRESENT_MODE_IMMEDIATE_KHR;
     switch (options.present) {
     case PresentPreference::automatic:
@@ -64,12 +72,14 @@ void Application::initialize(const CliOptions& options) {
     }
     renderer_.initialize(
         context_,
-        window_,
+        window_.get(),
         preferred_present,
         options.initial_mode,
         options.instances,
         options.gpu_workload_iterations);
-    last_title_update_ = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    last_camera_tick_ = now;
+    last_title_update_ = now;
     if (options.benchmark) {
         benchmark_.configure(
             options.benchmark_warmup_seconds,
@@ -77,12 +87,22 @@ void Application::initialize(const CliOptions& options) {
         benchmark_.start();
     }
     running_ = true;
+    if (!options.benchmark) {
+        set_mouse_capture(true);
+        std::cout
+            << "Controls: mouse look, WASD move, Shift boost, "
+               "Space/E up, Ctrl/Q down, Esc release/exit\n";
+    }
 }
 
 void Application::main_loop() {
     using Clock = std::chrono::steady_clock;
     while (running_) {
         const auto frame_begin = Clock::now();
+        const float camera_delta_seconds = static_cast<float>(
+            std::chrono::duration<double>(
+                frame_begin - last_camera_tick_).count());
+        last_camera_tick_ = frame_begin;
         if (options_.benchmark) {
             const auto tick = benchmark_.tick(frame_begin);
             if (tick.measurement_began) {
@@ -104,13 +124,16 @@ void Application::main_loop() {
         if (!running_) {
             break;
         }
+        update_camera(camera_delta_seconds);
 
         int pixel_width = 0;
         int pixel_height = 0;
-        SDL_GetWindowSizeInPixels(window_, &pixel_width, &pixel_height);
+        SDL_GetWindowSizeInPixels(
+            window_.get(), &pixel_width, &pixel_height);
         if (pixel_width > 0 && pixel_height > 0) {
             FrameTimings timings{};
-            const bool rendered = renderer_.draw_frame(timings);
+            const glm::mat4 view = camera_.view_matrix();
+            const bool rendered = renderer_.draw_frame(timings, view);
             if (rendered) {
                 timings.cpu_frame_ms =
                     std::chrono::duration<double, std::milli>(
@@ -134,15 +157,35 @@ void Application::process_event(const SDL_Event& event) {
         renderer_.request_resize();
         return;
     }
+    if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
+        set_mouse_capture(false);
+        return;
+    }
+    if (event.type == SDL_EVENT_MOUSE_MOTION) {
+        if (mouse_captured_ && !options_.benchmark) {
+            pending_mouse_delta_x_ += event.motion.xrel;
+            pending_mouse_delta_y_ += event.motion.yrel;
+        }
+        return;
+    }
+    if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+        if (!options_.benchmark &&
+            event.button.button == SDL_BUTTON_LEFT &&
+            !mouse_captured_) {
+            set_mouse_capture(true);
+        }
+        return;
+    }
     if (event.type != SDL_EVENT_KEY_DOWN || event.key.repeat) {
         return;
     }
     switch (event.key.key) {
     case SDLK_ESCAPE:
-        running_ = false;
-        break;
-    case SDLK_SPACE:
-        renderer_.toggle_rotation_pause();
+        if (mouse_captured_ && !options_.benchmark) {
+            set_mouse_capture(false);
+        } else {
+            running_ = false;
+        }
         break;
     case SDLK_V:
         renderer_.toggle_vsync();
@@ -150,7 +193,7 @@ void Application::process_event(const SDL_Event& event) {
         break;
     case SDLK_F:
         fullscreen_ = !fullscreen_;
-        if (!SDL_SetWindowFullscreen(window_, fullscreen_)) {
+        if (!SDL_SetWindowFullscreen(window_.get(), fullscreen_)) {
             std::cerr << "Unable to toggle fullscreen: " << SDL_GetError() << '\n';
             fullscreen_ = !fullscreen_;
         }
@@ -162,7 +205,7 @@ void Application::process_event(const SDL_Event& event) {
         renderer_.print_metrics();
         break;
     case SDLK_1:
-        renderer_.set_mode(RunMode::minimal);
+        renderer_.set_mode(RunMode::scene);
         renderer_.reset_metrics();
         break;
     case SDLK_2:
@@ -186,6 +229,52 @@ void Application::process_event(const SDL_Event& event) {
     }
 }
 
+void Application::set_mouse_capture(const bool enabled) noexcept {
+    if (!window_ || mouse_captured_ == enabled) {
+        return;
+    }
+    if (!SDL_SetWindowRelativeMouseMode(window_.get(), enabled)) {
+        std::cerr << "Unable to change relative mouse mode: "
+                  << SDL_GetError() << '\n';
+        return;
+    }
+    mouse_captured_ = enabled;
+    pending_mouse_delta_x_ = 0.0F;
+    pending_mouse_delta_y_ = 0.0F;
+}
+
+void Application::update_camera(const float delta_seconds) noexcept {
+    FlyCameraInput input{};
+    if (mouse_captured_ && !options_.benchmark) {
+        input.mouse_delta_x = pending_mouse_delta_x_;
+        input.mouse_delta_y = pending_mouse_delta_y_;
+
+        int key_count = 0;
+        const bool* const keys = SDL_GetKeyboardState(&key_count);
+        const auto key_down = [keys, key_count](const SDL_Scancode scancode) {
+            const int index = static_cast<int>(scancode);
+            return keys != nullptr && index >= 0 && index < key_count &&
+                   keys[index];
+        };
+        input.forward = key_down(SDL_SCANCODE_W);
+        input.backward = key_down(SDL_SCANCODE_S);
+        input.left = key_down(SDL_SCANCODE_A);
+        input.right = key_down(SDL_SCANCODE_D);
+        input.up =
+            key_down(SDL_SCANCODE_SPACE) || key_down(SDL_SCANCODE_E);
+        input.down =
+            key_down(SDL_SCANCODE_LCTRL) ||
+            key_down(SDL_SCANCODE_RCTRL) ||
+            key_down(SDL_SCANCODE_Q);
+        input.boost =
+            key_down(SDL_SCANCODE_LSHIFT) ||
+            key_down(SDL_SCANCODE_RSHIFT);
+    }
+    pending_mouse_delta_x_ = 0.0F;
+    pending_mouse_delta_y_ = 0.0F;
+    camera_.update(input, delta_seconds);
+}
+
 void Application::update_window_title() {
     using Clock = std::chrono::steady_clock;
     const auto now = Clock::now();
@@ -194,22 +283,27 @@ void Application::update_window_title() {
     }
     last_title_update_ = now;
     const auto stats = renderer_.metrics_snapshot();
+    const glm::vec3 camera_position = camera_.position();
     char title[512]{};
     std::snprintf(
         title,
         sizeof(title),
-        "Vulkan Cube | %.0f FPS | avg %.3f ms | CPU %.3f ms | "
-        "GPU %.3f ms | %u inst | %llu tris | %s/%u | %s",
+        "Vulkan Scene | %.0f FPS | avg %.3f ms | CPU %.3f ms | "
+        "GPU %.3f ms | cam %.1f %.1f %.1f | %u inst | "
+        "%llu tris | %s/%u | %s",
         stats.one_second_average_fps,
         stats.average.cpu_frame_ms,
         stats.latest.cpu_frame_ms,
         stats.latest.gpu_frame_ms,
+        static_cast<double>(camera_position.x),
+        static_cast<double>(camera_position.y),
+        static_cast<double>(camera_position.z),
         renderer_.instance_count(),
         static_cast<unsigned long long>(renderer_.triangle_count()),
         to_string(renderer_.mode()).data(),
         renderer_.gpu_workload_iterations(),
         Swapchain::present_mode_name(renderer_.swapchain().present_mode()));
-    SDL_SetWindowTitle(window_, title);
+    SDL_SetWindowTitle(window_.get(), title);
 }
 
 void Application::finish_benchmark() {
@@ -244,12 +338,10 @@ void Application::finish_benchmark() {
 
 void Application::shutdown() noexcept {
     running_ = false;
+    set_mouse_capture(false);
     renderer_.shutdown();
     context_.shutdown();
-    if (window_ != nullptr) {
-        SDL_DestroyWindow(window_);
-        window_ = nullptr;
-    }
+    window_.reset();
     SDL_Quit();
 }
 
