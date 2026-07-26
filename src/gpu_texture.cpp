@@ -2,6 +2,7 @@
 
 #include "vulkan_common.hpp"
 
+#include <algorithm>
 #include <string>
 #include <utility>
 
@@ -27,6 +28,7 @@ GpuTexture& GpuTexture::operator=(GpuTexture&& other) noexcept {
     allocation_ = std::exchange(other.allocation_, VK_NULL_HANDLE);
     width_ = std::exchange(other.width_, 0U);
     height_ = std::exchange(other.height_, 0U);
+    mip_levels_ = std::exchange(other.mip_levels_, 0U);
     format_ = std::exchange(other.format_, VK_FORMAT_UNDEFINED);
     usage_ = std::exchange(other.usage_, VkImageUsageFlags{0});
     aspect_mask_ =
@@ -44,8 +46,34 @@ void GpuTexture::create(
         context,
         width,
         height,
+        1U,
         format,
         VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+            VK_IMAGE_USAGE_SAMPLED_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        VK_FILTER_LINEAR,
+        VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        VK_FALSE,
+        VK_COMPARE_OP_ALWAYS,
+        VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK,
+        debug_name);
+}
+
+void GpuTexture::create_mipmapped(
+    VulkanContext& context,
+    const std::uint32_t width,
+    const std::uint32_t height,
+    const std::uint32_t mip_levels,
+    const VkFormat format,
+    const std::string_view debug_name) {
+    create_impl(
+        context,
+        width,
+        height,
+        mip_levels,
+        format,
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT |
             VK_IMAGE_USAGE_SAMPLED_BIT,
         VK_IMAGE_ASPECT_COLOR_BIT,
         VK_FILTER_LINEAR,
@@ -74,6 +102,7 @@ void GpuTexture::create_shadow_map(
         context,
         width,
         height,
+        1U,
         format,
         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
             VK_IMAGE_USAGE_SAMPLED_BIT,
@@ -98,6 +127,7 @@ void GpuTexture::create_sampled(
         context,
         width,
         height,
+        1U,
         format,
         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
         VK_IMAGE_ASPECT_COLOR_BIT,
@@ -122,6 +152,7 @@ void GpuTexture::create_render_target(
         context,
         width,
         height,
+        1U,
         format,
         usage,
         aspect_mask,
@@ -137,6 +168,7 @@ void GpuTexture::create_impl(
     VulkanContext& context,
     const std::uint32_t width,
     const std::uint32_t height,
+    const std::uint32_t mip_levels,
     const VkFormat format,
     const VkImageUsageFlags usage,
     const VkImageAspectFlags aspect_mask,
@@ -147,13 +179,23 @@ void GpuTexture::create_impl(
     const VkBorderColor border_color,
     const std::string_view debug_name) {
     destroy();
-    if (width == 0U || height == 0U) {
+    if (width == 0U || height == 0U || mip_levels == 0U) {
         fatal("Attempted to create a zero-sized GPU texture.");
+    }
+    std::uint32_t maximum_mip_levels = 1U;
+    for (std::uint32_t extent = std::max(width, height);
+         extent > 1U;
+         extent >>= 1U) {
+        ++maximum_mip_levels;
+    }
+    if (mip_levels > maximum_mip_levels) {
+        fatal("Requested GPU texture mip count exceeds its dimensions.");
     }
 
     context_ = &context;
     width_ = width;
     height_ = height;
+    mip_levels_ = mip_levels;
     format_ = format;
     usage_ = usage;
     aspect_mask_ = aspect_mask;
@@ -165,7 +207,7 @@ void GpuTexture::create_impl(
         .imageType = VK_IMAGE_TYPE_2D,
         .format = format,
         .extent = VkExtent3D{width, height, 1U},
-        .mipLevels = 1,
+        .mipLevels = mip_levels,
         .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
@@ -196,6 +238,7 @@ void GpuTexture::create_impl(
         context_ = nullptr;
         width_ = 0;
         height_ = 0;
+        mip_levels_ = 0;
         format_ = VK_FORMAT_UNDEFINED;
         usage_ = 0;
         aspect_mask_ = 0;
@@ -218,7 +261,7 @@ void GpuTexture::create_impl(
         .subresourceRange = VkImageSubresourceRange{
             .aspectMask = aspect_mask,
             .baseMipLevel = 0,
-            .levelCount = 1,
+            .levelCount = mip_levels,
             .baseArrayLayer = 0,
             .layerCount = 1,
         },
@@ -236,7 +279,9 @@ void GpuTexture::create_impl(
         .flags = 0,
         .magFilter = filter,
         .minFilter = filter,
-        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .mipmapMode = mip_levels > 1U
+            ? VK_SAMPLER_MIPMAP_MODE_LINEAR
+            : VK_SAMPLER_MIPMAP_MODE_NEAREST,
         .addressModeU = address_mode,
         .addressModeV = address_mode,
         .addressModeW = address_mode,
@@ -246,7 +291,7 @@ void GpuTexture::create_impl(
         .compareEnable = compare_enable,
         .compareOp = compare_op,
         .minLod = 0.0F,
-        .maxLod = 0.0F,
+        .maxLod = static_cast<float>(mip_levels - 1U),
         .borderColor = border_color,
         .unnormalizedCoordinates = VK_FALSE,
     };
@@ -297,6 +342,7 @@ void GpuTexture::destroy() noexcept {
     allocation_ = VK_NULL_HANDLE;
     width_ = 0;
     height_ = 0;
+    mip_levels_ = 0;
     format_ = VK_FORMAT_UNDEFINED;
     usage_ = 0;
     aspect_mask_ = 0;

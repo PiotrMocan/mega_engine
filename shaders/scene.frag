@@ -1,9 +1,14 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "pbr_lighting.glsl"
 
 layout(location = 0) in vec3 inWorldNormal;
-layout(location = 1) in vec4 inColor;
+layout(location = 1) in vec4 inBaseColor;
 layout(location = 2) flat in uint inInstanceIndex;
 layout(location = 3) in vec4 inShadowPosition;
+layout(location = 4) in vec3 inWorldPosition;
+layout(location = 5) in vec4 inMaterialParameters;
 
 layout(location = 0) out vec4 outColor;
 
@@ -26,6 +31,7 @@ layout(set = 0, binding = 2, std430) readonly buffer WorkloadBuffer
     vec4 values[];
 } workload;
 
+layout(set = 0, binding = 3) uniform sampler2D skyTexture;
 layout(set = 0, binding = 4) uniform sampler2DShadow shadowMap;
 
 layout(push_constant) uniform GraphicsPushConstants
@@ -69,21 +75,58 @@ float sunVisibility(vec3 normal, vec3 lightDirection)
     return texture(shadowMap, vec3(shadowUv, receiverDepth));
 }
 
+vec3 sampleEnvironment(
+    vec3 normal,
+    vec3 viewDirection,
+    float roughness)
+{
+    const vec3 reflectionDirection =
+        reflect(-viewDirection, normal);
+    const int levelCount = textureQueryLevels(skyTexture);
+    const float maximumLod =
+        float(max(levelCount - 1, 0));
+    const float lod =
+        clamp(roughness, pbrMinimumRoughness, 1.0)
+        * maximumLod;
+    return textureLod(
+        skyTexture,
+        directionToEquirectangularUv(
+            reflectionDirection,
+            frame.sunColorSkyYaw.w),
+        lod).rgb;
+}
+
 void main()
 {
     const vec3 normal = normalize(inWorldNormal);
+    const vec3 viewDirection =
+        normalize(frame.cameraPosition.xyz - inWorldPosition);
     const vec3 lightDirection =
         normalize(frame.sunDirectionIntensity.xyz);
-    const float diffuse = max(dot(normal, lightDirection), 0.0);
     const float visibility = sunVisibility(normal, lightDirection);
-    const vec3 ambientLight =
+    const vec3 diffuseAmbient =
         frame.skyAmbient.rgb * frame.skyAmbient.a;
-    const vec3 directLight =
+    const vec3 directRadiance =
         frame.sunColorSkyYaw.rgb
-        * frame.sunDirectionIntensity.w
-        * diffuse
-        * visibility;
-    vec3 shadedColor = inColor.rgb * (ambientLight + directLight);
+        * frame.sunDirectionIntensity.w;
+    const float roughness =
+        clamp(
+            inMaterialParameters.y,
+            pbrMinimumRoughness,
+            1.0);
+    const vec3 environmentRadiance =
+        sampleEnvironment(normal, viewDirection, roughness)
+        * frame.skyAmbient.a;
+    vec3 shadedColor = evaluatePbrLighting(
+        clamp(inBaseColor.rgb, vec3(0.0), vec3(1.0)),
+        inMaterialParameters.xyz,
+        normal,
+        viewDirection,
+        lightDirection,
+        directRadiance,
+        diffuseAmbient,
+        environmentRadiance,
+        visibility);
 
     if (pushConstants.workloadElementCount != 0u
         && pushConstants.workloadMix > 0.0)
@@ -104,5 +147,5 @@ void main()
             clamp(pushConstants.workloadMix, 0.0, 1.0));
     }
 
-    outColor = vec4(shadedColor, inColor.a);
+    outColor = vec4(shadedColor, inBaseColor.a);
 }

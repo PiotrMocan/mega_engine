@@ -20,7 +20,8 @@ struct EditorInstanceData
     vec4 modelRow0;
     vec4 modelRow1;
     vec4 modelRow2;
-    vec4 color;
+    vec4 baseColor;
+    vec4 materialParameters;
 };
 
 layout(set = 0, binding = 1, std430) readonly buffer InstanceBuffer
@@ -32,11 +33,13 @@ layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;
 
 layout(location = 0) out vec3 outWorldNormal;
-layout(location = 1) out vec4 outColor;
+layout(location = 1) out vec4 outBaseColor;
 layout(location = 2) flat out uint outInstanceIndex;
 layout(location = 3) out vec4 outShadowPosition;
 layout(location = 4) out vec4 outCurrentClip;
 layout(location = 5) out vec4 outPreviousClip;
+layout(location = 6) out vec3 outWorldPosition;
+layout(location = 7) out vec4 outMaterialParameters;
 
 void main()
 {
@@ -64,11 +67,13 @@ void main()
         cross(column1, column2) * inNormal.x
         + cross(column2, column0) * inNormal.y
         + cross(column0, column1) * inNormal.z);
-    outColor = instance.color;
+    outBaseColor = instance.baseColor;
     outInstanceIndex = gl_InstanceIndex;
     outShadowPosition = frame.lightViewProjection * world;
     outCurrentClip = frame.unjitteredViewProjection * world;
     outPreviousClip =
         frame.previousUnjitteredViewProjection * world;
+    outWorldPosition = worldPosition;
+    outMaterialParameters = instance.materialParameters;
     gl_Position = frame.viewProjection * world;
 }

@@ -849,7 +849,21 @@ void EditorUi::build_inspector(SceneDocument& scene) {
     }
     if (node.kind == SceneNodeKind::cube ||
         node.kind == SceneNodeKind::ground) {
-        changed |= ImGui::ColorEdit4("Color", &node.color.x);
+        ImGui::SeparatorText("PBR material");
+        changed |= ImGui::ColorEdit3(
+            "Base color", &node.material.base_color.x);
+        changed |= ImGui::SliderFloat(
+            "Metallic", &node.material.metallic, 0.0F, 1.0F);
+        changed |= ImGui::SliderFloat(
+            "Roughness",
+            &node.material.roughness,
+            minimum_pbr_roughness,
+            1.0F);
+        changed |= ImGui::SliderFloat(
+            "Ambient occlusion",
+            &node.material.ambient_occlusion,
+            0.0F,
+            1.0F);
     }
     if (changed) {
         constexpr float minimum_scale = 0.0001F;
@@ -859,6 +873,8 @@ void EditorUi::build_inspector(SceneDocument& scene) {
             std::max(node.transform.scale.y, minimum_scale);
         node.transform.scale.z =
             std::max(node.transform.scale.z, minimum_scale);
+        node.material =
+            sanitize_pbr_material(node.material);
         scene.mark_content_changed();
     }
     if (!has_transform) {

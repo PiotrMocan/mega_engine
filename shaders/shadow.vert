@@ -13,17 +13,18 @@ layout(set = 0, binding = 0, std140) uniform FrameUniforms
     vec4 shadowMapParameters;
 } frame;
 
-struct InstanceData
+struct PbrInstanceData
 {
     vec4 translation;
     vec4 rotation;
     vec4 scale;
-    vec4 color;
+    vec4 baseColor;
+    vec4 materialParameters;
 };
 
 layout(set = 0, binding = 1, std430) readonly buffer InstanceBuffer
 {
-    InstanceData instances[];
+    PbrInstanceData instances[];
 };
 
 layout(location = 0) in vec3 inPosition;
@@ -44,7 +45,7 @@ vec3 rotateByQuaternion(vec3 value, vec4 rotation)
 
 void main()
 {
-    const InstanceData instance = instances[gl_InstanceIndex];
+    const PbrInstanceData instance = instances[gl_InstanceIndex];
     const vec4 rotation =
         multiplyQuaternions(frame.globalRotation, instance.rotation);
     const vec3 worldPosition =

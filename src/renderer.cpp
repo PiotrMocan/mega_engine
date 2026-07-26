@@ -1,5 +1,6 @@
 #include "renderer.hpp"
 
+#include "pbr_material.hpp"
 #include "vulkan_common.hpp"
 
 #include <SDL3/SDL.h>
@@ -72,6 +73,13 @@ struct alignas(16) InstanceData {
     glm::vec4 color{1.0F};
 };
 
+struct alignas(16) PbrInstanceData {
+    glm::vec4 translation{0.0F};
+    glm::vec4 rotation{0.0F, 0.0F, 0.0F, 1.0F};
+    glm::vec4 scale{1.0F};
+    PbrMaterial material{};
+};
+
 struct TerrainVertex {
     float position[3];
     std::int16_t normal_x;
@@ -80,6 +88,8 @@ struct TerrainVertex {
 
 static_assert(sizeof(FrameUniforms) == 416);
 static_assert(sizeof(InstanceData) == 64);
+static_assert(sizeof(PbrInstanceData) == 80);
+static_assert(offsetof(PbrInstanceData, material) == 48U);
 static_assert(sizeof(TerrainVertex) == 16);
 
 inline constexpr std::uint32_t shadow_map_resolution = 2048U;
@@ -226,11 +236,11 @@ float hash_unit(const std::uint32_t value) {
            static_cast<float>(0x00ff'ffffU);
 }
 
-// A 2,500 x 2,000 heightfield produces exactly 10,000,000 useful terrain
-// triangles. Triangle strips keep the index stream to roughly one index per
-// triangle while retaining post-transform vertex reuse.
-inline constexpr std::uint32_t terrain_cell_count_x = 2'500U;
-inline constexpr std::uint32_t terrain_cell_count_z = 2'000U;
+// The demo uses a bounded 256 x 192 heightfield. It preserves the landscape
+// silhouette while avoiding the previous 10-million-triangle brute-force
+// mesh. Triangle strips retain post-transform vertex reuse.
+inline constexpr std::uint32_t terrain_cell_count_x = 256U;
+inline constexpr std::uint32_t terrain_cell_count_z = 192U;
 inline constexpr std::uint32_t terrain_vertex_count_x =
     terrain_cell_count_x + 1U;
 inline constexpr std::uint32_t terrain_vertex_count_z =
@@ -250,9 +260,9 @@ inline constexpr float terrain_spacing_z =
     terrain_extent_z / static_cast<float>(terrain_cell_count_z);
 inline constexpr float landscape_base_height = -4.0F;
 inline constexpr float landscape_near_edge_z = 18.0F;
-static_assert(terrain_vertex_count == 5'004'501U);
-static_assert(terrain_triangle_count == 10'000'000U);
-static_assert(terrain_index_count == 10'005'999U);
+static_assert(terrain_vertex_count == 49'601U);
+static_assert(terrain_triangle_count == 98'304U);
+static_assert(terrain_index_count == 98'879U);
 
 float landscape_height(const float x, const float z) noexcept {
     const auto hill =
@@ -343,6 +353,120 @@ constexpr std::array<std::uint16_t, 6> kPlaneIndices{
     0, 1, 2, 2, 3, 0,
 };
 
+inline constexpr std::uint32_t pbr_sample_slices = 48U;
+inline constexpr std::uint32_t pbr_sample_stacks = 24U;
+inline constexpr std::uint32_t pbr_sample_vertex_count =
+    2U + (pbr_sample_stacks - 1U) * pbr_sample_slices;
+inline constexpr std::uint32_t pbr_sample_triangle_count =
+    2U * pbr_sample_slices * (pbr_sample_stacks - 1U);
+inline constexpr std::uint32_t pbr_sample_index_count =
+    pbr_sample_triangle_count * 3U;
+inline constexpr std::uint32_t pbr_sample_count = 10U;
+inline constexpr std::uint32_t demo_instance_count =
+    1U + pbr_sample_count;
+inline constexpr std::uint32_t demo_ground_instance = 0U;
+inline constexpr std::uint32_t demo_sample_first_instance = 1U;
+static_assert(
+    pbr_sample_vertex_count <=
+    std::numeric_limits<std::uint16_t>::max());
+
+struct PbrSampleMesh {
+    std::vector<Vertex> vertices;
+    std::vector<std::uint16_t> indices;
+};
+
+[[nodiscard]] PbrSampleMesh create_pbr_sample_mesh() {
+    PbrSampleMesh mesh;
+    mesh.vertices.reserve(pbr_sample_vertex_count);
+    mesh.indices.reserve(pbr_sample_index_count);
+    mesh.vertices.push_back(Vertex{{0.0F, 1.0F, 0.0F},
+                                   {0.0F, 1.0F, 0.0F}});
+
+    constexpr float pi = 3.14159265358979323846F;
+    constexpr float two_pi = 2.0F * pi;
+    for (std::uint32_t stack = 1U;
+         stack < pbr_sample_stacks;
+         ++stack) {
+        const float polar =
+            pi * static_cast<float>(stack) /
+            static_cast<float>(pbr_sample_stacks);
+        const float ring_radius = std::sin(polar);
+        const float y = std::cos(polar);
+        for (std::uint32_t slice = 0U;
+             slice < pbr_sample_slices;
+             ++slice) {
+            const float azimuth =
+                two_pi * static_cast<float>(slice) /
+                static_cast<float>(pbr_sample_slices);
+            const float x = ring_radius * std::cos(azimuth);
+            const float z = ring_radius * std::sin(azimuth);
+            mesh.vertices.push_back(
+                Vertex{{x, y, z}, {x, y, z}});
+        }
+    }
+    mesh.vertices.push_back(Vertex{{0.0F, -1.0F, 0.0F},
+                                   {0.0F, -1.0F, 0.0F}});
+
+    const auto vertex_index =
+        [](const std::uint32_t stack,
+           const std::uint32_t slice) noexcept {
+            return static_cast<std::uint16_t>(
+                1U +
+                (stack - 1U) * pbr_sample_slices +
+                slice % pbr_sample_slices);
+        };
+    for (std::uint32_t slice = 0U;
+         slice < pbr_sample_slices;
+         ++slice) {
+        const std::uint16_t current = vertex_index(1U, slice);
+        const std::uint16_t next = vertex_index(1U, slice + 1U);
+        mesh.indices.push_back(0U);
+        mesh.indices.push_back(next);
+        mesh.indices.push_back(current);
+    }
+    for (std::uint32_t stack = 1U;
+         stack + 1U < pbr_sample_stacks;
+         ++stack) {
+        for (std::uint32_t slice = 0U;
+             slice < pbr_sample_slices;
+             ++slice) {
+            const std::uint16_t current =
+                vertex_index(stack, slice);
+            const std::uint16_t next =
+                vertex_index(stack, slice + 1U);
+            const std::uint16_t below =
+                vertex_index(stack + 1U, slice);
+            const std::uint16_t below_next =
+                vertex_index(stack + 1U, slice + 1U);
+            mesh.indices.push_back(current);
+            mesh.indices.push_back(next);
+            mesh.indices.push_back(below);
+            mesh.indices.push_back(next);
+            mesh.indices.push_back(below_next);
+            mesh.indices.push_back(below);
+        }
+    }
+    const auto bottom = static_cast<std::uint16_t>(
+        mesh.vertices.size() - 1U);
+    const std::uint32_t last_ring = pbr_sample_stacks - 1U;
+    for (std::uint32_t slice = 0U;
+         slice < pbr_sample_slices;
+         ++slice) {
+        const std::uint16_t current =
+            vertex_index(last_ring, slice);
+        const std::uint16_t next =
+            vertex_index(last_ring, slice + 1U);
+        mesh.indices.push_back(bottom);
+        mesh.indices.push_back(current);
+        mesh.indices.push_back(next);
+    }
+    if (mesh.vertices.size() != pbr_sample_vertex_count ||
+        mesh.indices.size() != pbr_sample_index_count) {
+        fatal("PBR sample sphere generation count mismatch.");
+    }
+    return mesh;
+}
+
 template <typename T, std::size_t FirstSize, std::size_t SecondSize>
 constexpr std::array<T, FirstSize + SecondSize> concatenate(
     const std::array<T, FirstSize>& first,
@@ -375,9 +499,12 @@ inline constexpr std::uint32_t sky_triangle_count = 1U;
 inline constexpr std::uint64_t scene_triangle_count =
     sky_triangle_count +
     plane_triangle_count +
-    terrain_triangle_count;
-inline constexpr std::uint32_t scene_object_count = 2U;
-static_assert(scene_triangle_count == 10'000'003ULL);
+    terrain_triangle_count +
+    static_cast<std::uint64_t>(pbr_sample_triangle_count) *
+        pbr_sample_count;
+inline constexpr std::uint32_t scene_object_count =
+    2U + pbr_sample_count;
+static_assert(scene_triangle_count == 120'387ULL);
 
 template <typename T, std::size_t N>
 std::span<const std::byte> as_bytes(const std::array<T, N>& values) {
@@ -393,7 +520,9 @@ void transition_image(
     const VkPipelineStageFlags2 src_stage,
     const VkAccessFlags2 src_access,
     const VkPipelineStageFlags2 dst_stage,
-    const VkAccessFlags2 dst_access) {
+    const VkAccessFlags2 dst_access,
+    const std::uint32_t base_mip_level = 0U,
+    const std::uint32_t level_count = 1U) {
     const VkImageMemoryBarrier2 barrier{
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
         .srcStageMask = src_stage,
@@ -407,8 +536,8 @@ void transition_image(
         .image = image,
         .subresourceRange = VkImageSubresourceRange{
             .aspectMask = aspect,
-            .baseMipLevel = 0,
-            .levelCount = 1,
+            .baseMipLevel = base_mip_level,
+            .levelCount = level_count,
             .baseArrayLayer = 0,
             .layerCount = 1,
         },
@@ -506,14 +635,11 @@ void Renderer::initialize(
     const std::uint64_t range_capacity =
         context.properties().limits.maxStorageBufferRange /
         sizeof(InstanceData);
-    if (range_capacity < 100'001ULL) {
+    if (range_capacity < 100'000ULL) {
         fatal("Storage buffer range is too small for benchmark data.");
     }
-    const std::uint64_t benchmark_range_capacity =
-        range_capacity - 1ULL;
     max_instance_capacity_ = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(
-        benchmark_range_capacity, 100'000ULL, 1'000'000ULL));
-    scene_instance_base_ = max_instance_capacity_;
+        range_capacity, 100'000ULL, 1'000'000ULL));
     instancing_count_ =
         std::clamp(initial_instances, 1U, max_instance_capacity_);
     gpu_workload_iterations_ = std::min(initial_gpu_workload, 4096U);
@@ -948,7 +1074,7 @@ void Renderer::create_scene_resources() {
         0,
         "scene index buffer");
     std::vector<InstanceData> instances(
-        static_cast<std::size_t>(max_instance_capacity_) + 1U);
+        static_cast<std::size_t>(max_instance_capacity_));
     instances[0] = InstanceData{
         .translation = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F),
         .rotation = glm::vec4(0.0F, 0.0F, 0.0F, 1.0F),
@@ -977,13 +1103,69 @@ void Renderer::create_scene_resources() {
         };
     }
 
-    instances[scene_instance_base_] = InstanceData{
+    std::array<PbrInstanceData, demo_instance_count> demo_instances{};
+    demo_instances[demo_ground_instance] = PbrInstanceData{
         .translation =
             glm::vec4(0.0F, landscape_base_height, -7.0F, 0.0F),
         .rotation = glm::vec4(0.0F, 0.0F, 0.0F, 1.0F),
         .scale = glm::vec4(31.0F, 1.0F, 27.0F, 0.0F),
-        .color = glm::vec4(0.13F, 0.16F, 0.08F, 1.0F),
+        .material = PbrMaterial{
+            .base_color =
+                glm::vec4(0.11F, 0.14F, 0.07F, 1.0F),
+            .metallic = 0.0F,
+            .roughness = 0.94F,
+            .ambient_occlusion = 1.0F,
+        },
     };
+    constexpr std::array<float, 5> sample_roughness{
+        0.08F,
+        0.28F,
+        0.50F,
+        0.72F,
+        0.94F,
+    };
+    constexpr std::array<float, 5> sample_x{
+        -8.0F,
+        -4.0F,
+        0.0F,
+        4.0F,
+        8.0F,
+    };
+    constexpr std::array<float, 2> sample_z{1.0F, -5.0F};
+    constexpr std::array<glm::vec4, 2> sample_colors{
+        glm::vec4(1.0F, 0.71F, 0.29F, 1.0F),
+        glm::vec4(0.08F, 0.32F, 0.80F, 1.0F),
+    };
+    constexpr float sample_radius = 0.9F;
+    for (std::uint32_t row = 0U; row < 2U; ++row) {
+        for (std::uint32_t column = 0U; column < 5U; ++column) {
+            const float x = sample_x[column];
+            const float z = sample_z[row];
+            const std::uint32_t instance =
+                demo_sample_first_instance + row * 5U + column;
+            demo_instances[instance] = PbrInstanceData{
+                .translation = glm::vec4(
+                    x,
+                    landscape_height(x, z) + sample_radius,
+                    z,
+                    0.0F),
+                .rotation =
+                    glm::vec4(0.0F, 0.0F, 0.0F, 1.0F),
+                .scale = glm::vec4(
+                    sample_radius,
+                    sample_radius,
+                    sample_radius,
+                    0.0F),
+                .material = PbrMaterial{
+                    .base_color = sample_colors[row],
+                    .metallic = row == 0U ? 1.0F : 0.0F,
+                    .roughness = sample_roughness[column],
+                    .ambient_occlusion = 1.0F,
+                },
+            };
+        }
+    }
+    const PbrSampleMesh sample_mesh = create_pbr_sample_mesh();
 
     std::vector<float> terrain_heights(terrain_vertex_count);
     constexpr float terrain_min_x = -terrain_extent_x * 0.5F;
@@ -1084,7 +1266,33 @@ void Renderer::create_scene_resources() {
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
-        "instance buffer");
+        "benchmark instance buffer");
+    demo_instance_buffer_.create(
+        *context_,
+        sizeof(demo_instances),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        0,
+        "PBR demo instance buffer");
+    pbr_sample_vertex_buffer_.create(
+        *context_,
+        static_cast<VkDeviceSize>(sample_mesh.vertices.size()) *
+            sizeof(Vertex),
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        0,
+        "PBR sample sphere vertex buffer");
+    pbr_sample_index_buffer_.create(
+        *context_,
+        static_cast<VkDeviceSize>(sample_mesh.indices.size()) *
+            sizeof(std::uint16_t),
+        VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        0,
+        "PBR sample sphere index buffer");
     terrain_vertex_buffer_.create(
         *context_,
         static_cast<VkDeviceSize>(terrain_vertices.size()) *
@@ -1093,7 +1301,7 @@ void Renderer::create_scene_resources() {
             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
-        "indexed heightfield vertex buffer");
+        "simplified heightfield vertex buffer");
     terrain_index_buffer_.create(
         *context_,
         static_cast<VkDeviceSize>(terrain_indices.size()) *
@@ -1102,12 +1310,21 @@ void Renderer::create_scene_resources() {
             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
-        "indexed heightfield strip buffer");
+        "simplified heightfield strip buffer");
 
     upload_to_device_buffer(vertex_buffer_, as_bytes(kGeometryVertices));
     upload_to_device_buffer(index_buffer_, as_bytes(kGeometryIndices));
     upload_to_device_buffer(
         instance_buffer_, std::as_bytes(std::span{instances}));
+    upload_to_device_buffer(
+        demo_instance_buffer_,
+        std::as_bytes(std::span{demo_instances}));
+    upload_to_device_buffer(
+        pbr_sample_vertex_buffer_,
+        std::as_bytes(std::span{sample_mesh.vertices}));
+    upload_to_device_buffer(
+        pbr_sample_index_buffer_,
+        std::as_bytes(std::span{sample_mesh.indices}));
     upload_to_device_buffer(
         terrain_vertex_buffer_,
         std::as_bytes(std::span{terrain_vertices}));
@@ -1197,8 +1414,34 @@ void Renderer::create_sky_texture() {
     }
     SDL_UnlockSurface(rgba.get());
 
-    sky_texture_.create(
-        *context_, width, height, sky_format, "sky panorama");
+    constexpr VkFormatFeatureFlags mipmap_features =
+        VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+        VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+        VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    const bool mipmaps_supported =
+        (format_properties.optimalTilingFeatures & mipmap_features) ==
+        mipmap_features;
+    std::uint32_t mip_levels = 1U;
+    if (mipmaps_supported) {
+        for (std::uint32_t extent = std::max(width, height);
+             extent > 1U;
+             extent >>= 1U) {
+            ++mip_levels;
+        }
+        sky_texture_.create_mipmapped(
+            *context_,
+            width,
+            height,
+            mip_levels,
+            sky_format,
+            "mipmapped sky panorama");
+    } else {
+        std::cerr
+            << "warning: linear panorama blits are unavailable; "
+               "PBR environment reflections will use mip 0\n";
+        sky_texture_.create(
+            *context_, width, height, sky_format, "sky panorama");
+    }
     upload_to_device_texture(sky_texture_, pixels, 4U, "sky texture");
 }
 
@@ -1483,6 +1726,9 @@ void Renderer::destroy_scene_resources() noexcept {
     sky_texture_.destroy();
     terrain_index_buffer_.destroy();
     terrain_vertex_buffer_.destroy();
+    pbr_sample_index_buffer_.destroy();
+    pbr_sample_vertex_buffer_.destroy();
+    demo_instance_buffer_.destroy();
     instance_buffer_.destroy();
     index_buffer_.destroy();
     vertex_buffer_.destroy();
@@ -1502,15 +1748,8 @@ void Renderer::destroy_anti_aliasing_descriptors() noexcept {
 }
 
 void Renderer::create_descriptors() {
-#if VCR_EDITOR_ENABLED
-    const std::uint32_t descriptor_set_count =
-        editor_output_enabled_
-        ? max_frames_in_flight * 2U
-        : max_frames_in_flight;
-#else
     constexpr std::uint32_t descriptor_set_count =
-        max_frames_in_flight;
-#endif
+        max_frames_in_flight * 2U;
     const std::array pool_sizes{
         VkDescriptorPoolSize{
             .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
@@ -1635,75 +1874,81 @@ void Renderer::create_descriptors() {
             writes.data(),
             0,
             nullptr);
+        VkBuffer scene_instance_buffer =
+            demo_instance_buffer_.handle();
+        VkDeviceSize scene_instance_range =
+            demo_instance_buffer_.size();
 #if VCR_EDITOR_ENABLED
         if (editor_output_enabled_) {
-            frames_[index].scene_descriptor_set =
-                sets[max_frames_in_flight + index];
-            const std::array scene_buffer_infos{
-                buffer_infos[0],
-                VkDescriptorBufferInfo{
-                    .buffer =
-                        frames_[index].scene_instance_buffer.handle(),
-                    .offset = 0,
-                    .range =
-                        frames_[index].scene_instance_buffer.size(),
-                },
-                buffer_infos[2],
-            };
-            const VkDescriptorSet scene_set =
-                frames_[index].scene_descriptor_set;
-            const std::array scene_writes{
-                VkWriteDescriptorSet{
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .dstSet = scene_set,
-                    .dstBinding = 0,
-                    .descriptorCount = 1,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                    .pBufferInfo = &scene_buffer_infos[0],
-                },
-                VkWriteDescriptorSet{
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .dstSet = scene_set,
-                    .dstBinding = 1,
-                    .descriptorCount = 1,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    .pBufferInfo = &scene_buffer_infos[1],
-                },
-                VkWriteDescriptorSet{
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .dstSet = scene_set,
-                    .dstBinding = 2,
-                    .descriptorCount = 1,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    .pBufferInfo = &scene_buffer_infos[2],
-                },
-                VkWriteDescriptorSet{
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .dstSet = scene_set,
-                    .dstBinding = 3,
-                    .descriptorCount = 1,
-                    .descriptorType =
-                        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                    .pImageInfo = &sky_info,
-                },
-                VkWriteDescriptorSet{
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .dstSet = scene_set,
-                    .dstBinding = 4,
-                    .descriptorCount = 1,
-                    .descriptorType =
-                        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                    .pImageInfo = &shadow_info,
-                },
-            };
-            vkUpdateDescriptorSets(
-                context_->device(),
-                static_cast<std::uint32_t>(scene_writes.size()),
-                scene_writes.data(),
-                0,
-                nullptr);
+            scene_instance_buffer =
+                frames_[index].scene_instance_buffer.handle();
+            scene_instance_range =
+                frames_[index].scene_instance_buffer.size();
         }
 #endif
+        frames_[index].scene_descriptor_set =
+            sets[max_frames_in_flight + index];
+        const std::array scene_buffer_infos{
+            buffer_infos[0],
+            VkDescriptorBufferInfo{
+                .buffer = scene_instance_buffer,
+                .offset = 0,
+                .range = scene_instance_range,
+            },
+            buffer_infos[2],
+        };
+        const VkDescriptorSet scene_set =
+            frames_[index].scene_descriptor_set;
+        const std::array scene_writes{
+            VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = scene_set,
+                .dstBinding = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .pBufferInfo = &scene_buffer_infos[0],
+            },
+            VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = scene_set,
+                .dstBinding = 1,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pBufferInfo = &scene_buffer_infos[1],
+            },
+            VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = scene_set,
+                .dstBinding = 2,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pBufferInfo = &scene_buffer_infos[2],
+            },
+            VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = scene_set,
+                .dstBinding = 3,
+                .descriptorCount = 1,
+                .descriptorType =
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &sky_info,
+            },
+            VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = scene_set,
+                .dstBinding = 4,
+                .descriptorCount = 1,
+                .descriptorType =
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &shadow_info,
+            },
+        };
+        vkUpdateDescriptorSets(
+            context_->device(),
+            static_cast<std::uint32_t>(scene_writes.size()),
+            scene_writes.data(),
+            0,
+            nullptr);
     }
 }
 
@@ -1861,7 +2106,7 @@ void Renderer::render_static_shadow_map() {
         pipeline_layout_,
         0,
         1,
-        &frames_[0].descriptor_set,
+        &frames_[0].scene_descriptor_set,
         0,
         nullptr);
     const VkDeviceSize vertex_offset = 0;
@@ -1880,6 +2125,35 @@ void Renderer::render_static_shadow_map() {
         0,
         0,
         0);
+#if VCR_EDITOR_ENABLED
+    if (!editor_output_enabled_)
+#endif
+    {
+        vkCmdBindPipeline(
+            command_buffer,
+            VK_PIPELINE_BIND_POINT_GRAPHICS,
+            scene_shadow_pipeline_);
+        const VkBuffer sample_vertex_buffer =
+            pbr_sample_vertex_buffer_.handle();
+        vkCmdBindVertexBuffers(
+            command_buffer,
+            0,
+            1,
+            &sample_vertex_buffer,
+            &vertex_offset);
+        vkCmdBindIndexBuffer(
+            command_buffer,
+            pbr_sample_index_buffer_.handle(),
+            0,
+            VK_INDEX_TYPE_UINT16);
+        vkCmdDrawIndexed(
+            command_buffer,
+            pbr_sample_index_count,
+            pbr_sample_count,
+            0,
+            0,
+            demo_sample_first_instance);
+    }
     vkCmdEndRendering(command_buffer);
 
     transition_image(
@@ -1965,7 +2239,9 @@ void Renderer::upload_to_device_texture(
         VK_PIPELINE_STAGE_2_NONE,
         VK_ACCESS_2_NONE,
         VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-        VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        0U,
+        destination.mip_levels());
     const VkBufferImageCopy copy_region{
         .bufferOffset = 0,
         .bufferRowLength = 0,
@@ -1990,6 +2266,87 @@ void Renderer::upload_to_device_texture(
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         1,
         &copy_region);
+    std::uint32_t mip_width = destination.width();
+    std::uint32_t mip_height = destination.height();
+    for (std::uint32_t level = 1U;
+         level < destination.mip_levels();
+         ++level) {
+        const std::uint32_t source_level = level - 1U;
+        transition_image(
+            command_buffer,
+            destination.image(),
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_READ_BIT,
+            source_level,
+            1U);
+        const std::uint32_t next_width =
+            std::max(mip_width / 2U, 1U);
+        const std::uint32_t next_height =
+            std::max(mip_height / 2U, 1U);
+        const VkImageBlit2 region{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
+            .pNext = nullptr,
+            .srcSubresource = VkImageSubresourceLayers{
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel = source_level,
+                .baseArrayLayer = 0U,
+                .layerCount = 1U,
+            },
+            .srcOffsets = {
+                VkOffset3D{0, 0, 0},
+                VkOffset3D{
+                    static_cast<std::int32_t>(mip_width),
+                    static_cast<std::int32_t>(mip_height),
+                    1},
+            },
+            .dstSubresource = VkImageSubresourceLayers{
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel = level,
+                .baseArrayLayer = 0U,
+                .layerCount = 1U,
+            },
+            .dstOffsets = {
+                VkOffset3D{0, 0, 0},
+                VkOffset3D{
+                    static_cast<std::int32_t>(next_width),
+                    static_cast<std::int32_t>(next_height),
+                    1},
+            },
+        };
+        const VkBlitImageInfo2 blit_info{
+            .sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2,
+            .pNext = nullptr,
+            .srcImage = destination.image(),
+            .srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .dstImage = destination.image(),
+            .dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .regionCount = 1U,
+            .pRegions = &region,
+            .filter = VK_FILTER_LINEAR,
+        };
+        vkCmdBlitImage2(command_buffer, &blit_info);
+        transition_image(
+            command_buffer,
+            destination.image(),
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_READ_BIT,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            source_level,
+            1U);
+        mip_width = next_width;
+        mip_height = next_height;
+    }
+    const std::uint32_t final_level =
+        destination.mip_levels() - 1U;
     transition_image(
         command_buffer,
         destination.image(),
@@ -1999,7 +2356,9 @@ void Renderer::upload_to_device_texture(
         VK_PIPELINE_STAGE_2_TRANSFER_BIT,
         VK_ACCESS_2_TRANSFER_WRITE_BIT,
         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        final_level,
+        1U);
     submission.submit_and_wait();
 }
 
@@ -2789,9 +3148,40 @@ void Renderer::create_pipeline() {
     context_->set_debug_name(
         VK_OBJECT_TYPE_PIPELINE,
         handle_value(terrain_shadow_pipeline_),
-        "indexed heightfield shadow pipeline");
+        "simplified heightfield shadow pipeline");
     vkDestroyShaderModule(
         context_->device(), terrain_shadow_vertex_module, nullptr);
+
+    VkPipelineVertexInputStateCreateInfo scene_shadow_vertex_input =
+        vertex_input;
+    scene_shadow_vertex_input.vertexAttributeDescriptionCount = 1U;
+    const VkShaderModule scene_shadow_vertex_module =
+        load_shader("shadow.vert.spv");
+    const VkPipelineShaderStageCreateInfo scene_shadow_stage{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = VK_SHADER_STAGE_VERTEX_BIT,
+        .module = scene_shadow_vertex_module,
+        .pName = "main",
+    };
+    VkGraphicsPipelineCreateInfo scene_shadow_pipeline_info =
+        shadow_pipeline_info;
+    scene_shadow_pipeline_info.pStages = &scene_shadow_stage;
+    scene_shadow_pipeline_info.pVertexInputState =
+        &scene_shadow_vertex_input;
+    scene_shadow_pipeline_info.pInputAssemblyState = &input_assembly;
+    VK_CHECK(vkCreateGraphicsPipelines(
+        context_->device(),
+        pipeline_cache_,
+        1,
+        &scene_shadow_pipeline_info,
+        nullptr,
+        &scene_shadow_pipeline_));
+    context_->set_debug_name(
+        VK_OBJECT_TYPE_PIPELINE,
+        handle_value(scene_shadow_pipeline_),
+        "PBR demo sample shadow pipeline");
+    vkDestroyShaderModule(
+        context_->device(), scene_shadow_vertex_module, nullptr);
 
     const VkShaderModule fullscreen_vertex_module =
         load_shader("fullscreen.vert.spv");
@@ -3072,6 +3462,11 @@ void Renderer::destroy_pipeline() noexcept {
         vkDestroyPipeline(
             context_->device(), terrain_shadow_pipeline_, nullptr);
         terrain_shadow_pipeline_ = VK_NULL_HANDLE;
+    }
+    if (scene_shadow_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(
+            context_->device(), scene_shadow_pipeline_, nullptr);
+        scene_shadow_pipeline_ = VK_NULL_HANDLE;
     }
     if (scene_pipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(context_->device(), scene_pipeline_, nullptr);
@@ -3551,13 +3946,10 @@ void Renderer::record_commands(
             const VkPipeline terrain_pipeline,
             const VkPipeline sky_pipeline) {
             set_viewport(extent);
-            VkDescriptorSet descriptor_set = frame.descriptor_set;
-#if VCR_EDITOR_ENABLED
-            if (editor_output_enabled_ &&
-                mode_ != RunMode::instancing) {
-                descriptor_set = frame.scene_descriptor_set;
-            }
-#endif
+            const VkDescriptorSet descriptor_set =
+                mode_ == RunMode::instancing
+                ? frame.descriptor_set
+                : frame.scene_descriptor_set;
             vkCmdBindDescriptorSets(
                 command_buffer,
                 VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -3625,13 +4017,33 @@ void Renderer::record_commands(
                 } else
 #endif
                 {
-                vkCmdDrawIndexed(
-                    command_buffer,
-                    plane_index_count,
-                    1,
-                    plane_first_index,
-                    plane_vertex_offset,
-                    scene_instance_base_);
+                    vkCmdDrawIndexed(
+                        command_buffer,
+                        plane_index_count,
+                        1,
+                        plane_first_index,
+                        plane_vertex_offset,
+                        demo_ground_instance);
+                    const VkBuffer sample_vertex_buffer =
+                        pbr_sample_vertex_buffer_.handle();
+                    vkCmdBindVertexBuffers(
+                        command_buffer,
+                        0,
+                        1,
+                        &sample_vertex_buffer,
+                        &vertex_offset);
+                    vkCmdBindIndexBuffer(
+                        command_buffer,
+                        pbr_sample_index_buffer_.handle(),
+                        0,
+                        VK_INDEX_TYPE_UINT16);
+                    vkCmdDrawIndexed(
+                        command_buffer,
+                        pbr_sample_index_count,
+                        pbr_sample_count,
+                        0,
+                        0,
+                        demo_sample_first_instance);
                 }
                 bool draw_terrain = true;
 #if VCR_EDITOR_ENABLED
@@ -4440,9 +4852,7 @@ void Renderer::recreate_swapchain(
             descriptor_pool_ = VK_NULL_HANDLE;
             for (auto& frame : frames_) {
                 frame.descriptor_set = VK_NULL_HANDLE;
-#if VCR_EDITOR_ENABLED
                 frame.scene_descriptor_set = VK_NULL_HANDLE;
-#endif
             }
         }
         destroy_pipeline();

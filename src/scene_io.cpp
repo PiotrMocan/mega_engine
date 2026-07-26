@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -77,6 +78,24 @@ template <std::size_t Size>
         }
         output[index] = static_cast<float>(value);
     }
+    return true;
+}
+
+[[nodiscard]] bool read_bounded_float(
+    const Json& source,
+    const float minimum,
+    const float maximum,
+    float& output) {
+    if (!source.is_number()) {
+        return false;
+    }
+    const double value = source.get<double>();
+    if (!std::isfinite(value) ||
+        value < static_cast<double>(minimum) ||
+        value > static_cast<double>(maximum)) {
+        return false;
+    }
+    output = static_cast<float>(value);
     return true;
 }
 
@@ -162,6 +181,8 @@ bool save_scene_file(
          ++index) {
         const SceneNodeRecord& record = records[index];
         const SceneNode& node = record.value;
+        const PbrMaterial material =
+            sanitize_pbr_material(node.material);
         Json encoded{
             {"name", node.name},
             {"kind", std::string(serialized_kind(node.kind))},
@@ -181,12 +202,19 @@ bool save_scene_file(
                   {node.transform.scale.x,
                    node.transform.scale.y,
                    node.transform.scale.z}},
-             }},
+            }},
             {"color",
-             {node.color.x,
-              node.color.y,
-              node.color.z,
-              node.color.w}},
+             {material.base_color.x,
+              material.base_color.y,
+              material.base_color.z,
+              material.base_color.w}},
+            {"pbr",
+             {
+                 {"metallic", material.metallic},
+                 {"roughness", material.roughness},
+                 {"ambient_occlusion",
+                  material.ambient_occlusion},
+             }},
         };
         encoded["parent"] =
             record.parent_record_index ==
@@ -356,10 +384,48 @@ bool load_scene_file(
                 !read_float_array(encoded["color"], color) ||
                 scale[0] < 0.0001F ||
                 scale[1] < 0.0001F ||
-                scale[2] < 0.0001F) {
+                scale[2] < 0.0001F ||
+                std::ranges::any_of(
+                    color,
+                    [](const float value) {
+                        return value < 0.0F || value > 1.0F;
+                    })) {
                 error =
                     "Scene transform or color contains invalid values.";
                 return false;
+            }
+            PbrMaterial material{
+                .base_color = {
+                    color[0],
+                    color[1],
+                    color[2],
+                    color[3]},
+            };
+            if (encoded.contains("pbr")) {
+                const Json& pbr = encoded["pbr"];
+                if (!pbr.is_object() ||
+                    !pbr.contains("metallic") ||
+                    !pbr.contains("roughness") ||
+                    !pbr.contains("ambient_occlusion") ||
+                    !read_bounded_float(
+                        pbr["metallic"],
+                        0.0F,
+                        1.0F,
+                        material.metallic) ||
+                    !read_bounded_float(
+                        pbr["roughness"],
+                        minimum_pbr_roughness,
+                        1.0F,
+                        material.roughness) ||
+                    !read_bounded_float(
+                        pbr["ambient_occlusion"],
+                        0.0F,
+                        1.0F,
+                        material.ambient_occlusion)) {
+                    error =
+                        "Scene PBR material contains invalid values.";
+                    return false;
+                }
             }
 
             const SceneNodeId id = loaded.create_node(
@@ -391,8 +457,7 @@ bool load_scene_file(
                     scale[1],
                     scale[2]},
             };
-            node->get().color = {
-                color[0], color[1], color[2], color[3]};
+            node->get().material = material;
             ids.push_back(id);
         }
         loaded.mark_content_changed();

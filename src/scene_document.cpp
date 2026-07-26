@@ -363,7 +363,8 @@ SceneRenderView SceneDocument::build_render_view(
                 .model_row_0 = matrix_row(world_matrix, 0),
                 .model_row_1 = matrix_row(world_matrix, 1),
                 .model_row_2 = matrix_row(world_matrix, 2),
-                .color = slot.value.color,
+                .material =
+                    sanitize_pbr_material(slot.value.material),
             };
             if (slot.value.kind == SceneNodeKind::ground) {
                 if (!has_ground) {
@@ -408,7 +409,13 @@ SceneDocument SceneDocument::make_default() {
         value->get().transform.translation =
             glm::vec3(0.0F, -4.0F, -7.0F);
         value->get().transform.scale = glm::vec3(31.0F, 1.0F, 27.0F);
-        value->get().color = glm::vec4(0.13F, 0.16F, 0.08F, 1.0F);
+        value->get().material = PbrMaterial{
+            .base_color =
+                glm::vec4(0.13F, 0.16F, 0.08F, 1.0F),
+            .metallic = 0.0F,
+            .roughness = 0.92F,
+            .ambient_occlusion = 1.0F,
+        };
     }
 
     constexpr std::array<glm::vec3, 15> positions{{
@@ -440,11 +447,22 @@ SceneDocument SceneDocument::make_default() {
             value->get().transform.scale = glm::vec3(scale);
             value->get().transform.rotation_degrees =
                 glm::vec3(0.0F, static_cast<float>(index) * 17.0F, 0.0F);
-            value->get().color = glm::vec4(
-                0.18F + 0.045F * static_cast<float>(index % 5U),
-                0.48F + 0.06F * static_cast<float>(index % 3U),
-                0.82F - 0.04F * static_cast<float>(index % 4U),
-                1.0F);
+            value->get().material = PbrMaterial{
+                .base_color = glm::vec4(
+                    0.18F +
+                        0.045F * static_cast<float>(index % 5U),
+                    0.48F +
+                        0.06F * static_cast<float>(index % 3U),
+                    0.82F -
+                        0.04F * static_cast<float>(index % 4U),
+                    1.0F),
+                .metallic =
+                    index >= positions.size() / 2U ? 1.0F : 0.0F,
+                .roughness =
+                    0.08F +
+                    0.21F * static_cast<float>(index % 5U),
+                .ambient_occlusion = 1.0F,
+            };
         }
     }
     static_cast<void>(scene.create_node(

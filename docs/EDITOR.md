@@ -44,9 +44,10 @@ scripts\run_editor_windows.cmd --no-validation
 - `Scene Hierarchy`: иерархический forest с generational handles,
   drag-and-drop reparenting, защитой от циклов, фильтром и clipped-отрисовкой.
 - `Inspector`: имя и visibility для всех nodes; position/rotation/scale для
-  geometry и иерархических folders; color для cubes/ground. Terrain, sky и sun
-  visibility уже управляет renderer, а неподключённые component controls
-  намеренно не показываются как работающие.
+  geometry и иерархических folders; PBR base color, metallic, roughness и
+  ambient occlusion для cubes/ground. Terrain, sky и sun visibility уже
+  управляет renderer, а неподключённые component controls намеренно не
+  показываются как работающие.
 - `Scene View`: offscreen Vulkan target, изменяемый размер и fly camera
   (`RMB + WASD`, `E/Q`, `Shift`).
 - `Play/Stop` (`F5`): authoring scene сохраняется перед Play, редактирование
@@ -77,7 +78,7 @@ sibling хранятся индексами; обход, удаление subtre
 
 World transforms вычисляются как точные affine matrices. Поэтому
 `non-uniform parent scale + rotated child` сохраняет shear вместо ошибочного
-разложения обратно в TRS; GPU instance остаётся компактным, 64 bytes.
+разложения обратно в TRS; GPU scene instance с PBR material занимает 80 bytes.
 
 GPU scene data имеет фиксированный верхний предел и отдельный
 device-local buffer на каждый `FrameContext`. Изменённый render view копируется

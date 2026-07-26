@@ -49,6 +49,7 @@ function Compile-Shader {
         "--target-env", "vulkan1.3",
         "--target-env", "spirv1.5",
         "--spirv-val",
+        "-I$shaderRoot",
         "-o", $outputPath
     ) + $ExtraArguments + @($sourcePath)
     & $glslang @arguments
@@ -64,8 +65,11 @@ function Compile-Shader {
 }
 
 $regularShaders = @(
+    @("scene.vert", "scene.vert.spv"),
+    @("scene.frag", "scene.frag.spv"),
     @("terrain.vert", "terrain.vert.spv"),
     @("terrain_aa.vert", "terrain_aa.vert.spv"),
+    @("shadow.vert", "shadow.vert.spv"),
     @("terrain_shadow.vert", "terrain_shadow.vert.spv"),
     @("cube_aa.vert", "cube_aa.vert.spv"),
     @("cube_aa.frag", "cube_aa.frag.spv"),

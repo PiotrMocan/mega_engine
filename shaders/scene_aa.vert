@@ -15,28 +15,31 @@ layout(set = 0, binding = 0, std140) uniform FrameUniforms
     mat4 previousUnjitteredViewProjection;
 } frame;
 
-struct InstanceData
+struct PbrInstanceData
 {
     vec4 translation;
     vec4 rotation;
     vec4 scale;
-    vec4 color;
+    vec4 baseColor;
+    vec4 materialParameters;
 };
 
 layout(set = 0, binding = 1, std430) readonly buffer InstanceBuffer
 {
-    InstanceData instances[];
+    PbrInstanceData instances[];
 };
 
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;
 
 layout(location = 0) out vec3 outWorldNormal;
-layout(location = 1) out vec4 outColor;
+layout(location = 1) out vec4 outBaseColor;
 layout(location = 2) flat out uint outInstanceIndex;
 layout(location = 3) out vec4 outShadowPosition;
 layout(location = 4) out vec4 outCurrentClip;
 layout(location = 5) out vec4 outPreviousClip;
+layout(location = 6) out vec3 outWorldPosition;
+layout(location = 7) out vec4 outMaterialParameters;
 
 vec4 multiplyQuaternions(vec4 lhs, vec4 rhs)
 {
@@ -54,7 +57,7 @@ vec3 rotateByQuaternion(vec3 value, vec4 rotation)
 
 void main()
 {
-    const InstanceData instance = instances[gl_InstanceIndex];
+    const PbrInstanceData instance = instances[gl_InstanceIndex];
     const vec4 rotation =
         multiplyQuaternions(frame.globalRotation, instance.rotation);
     const vec3 worldPosition =
@@ -64,10 +67,12 @@ void main()
 
     outWorldNormal = normalize(
         rotateByQuaternion(inNormal / instance.scale.xyz, rotation));
-    outColor = instance.color;
+    outBaseColor = instance.baseColor;
     outInstanceIndex = gl_InstanceIndex;
     outShadowPosition = frame.lightViewProjection * world;
     outCurrentClip = frame.unjitteredViewProjection * world;
     outPreviousClip = frame.previousUnjitteredViewProjection * world;
+    outWorldPosition = worldPosition;
+    outMaterialParameters = instance.materialParameters;
     gl_Position = frame.viewProjection * world;
 }

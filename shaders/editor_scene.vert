@@ -13,14 +13,15 @@ layout(set = 0, binding = 0, std140) uniform FrameUniforms
     vec4 shadowMapParameters;
 } frame;
 
-// Three affine rows plus color keep the std430 stride at 64 bytes while
-// preserving shear produced by a hierarchical transform.
+// Three affine rows plus a 32-byte PBR material preserve hierarchical shear
+// while matching the 80-byte host SceneGpuInstance stride.
 struct EditorInstanceData
 {
     vec4 modelRow0;
     vec4 modelRow1;
     vec4 modelRow2;
-    vec4 color;
+    vec4 baseColor;
+    vec4 materialParameters;
 };
 
 layout(set = 0, binding = 1, std430) readonly buffer InstanceBuffer
@@ -32,9 +33,11 @@ layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;
 
 layout(location = 0) out vec3 outWorldNormal;
-layout(location = 1) out vec4 outColor;
+layout(location = 1) out vec4 outBaseColor;
 layout(location = 2) flat out uint outInstanceIndex;
 layout(location = 3) out vec4 outShadowPosition;
+layout(location = 4) out vec3 outWorldPosition;
+layout(location = 5) out vec4 outMaterialParameters;
 
 void main()
 {
@@ -61,10 +64,12 @@ void main()
         cross(column1, column2) * inNormal.x
         + cross(column2, column0) * inNormal.y
         + cross(column0, column1) * inNormal.z);
-    outColor = instance.color;
+    outBaseColor = instance.baseColor;
     outInstanceIndex = gl_InstanceIndex;
     outShadowPosition =
         frame.lightViewProjection * vec4(worldPosition, 1.0);
+    outWorldPosition = worldPosition;
+    outMaterialParameters = instance.materialParameters;
     gl_Position =
         frame.viewProjection * vec4(worldPosition, 1.0);
 }

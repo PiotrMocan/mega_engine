@@ -21,6 +21,7 @@ struct FrameContext {
     GpuBuffer uniform_buffer{};
     GpuBuffer workload_buffer{};
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    VkDescriptorSet scene_descriptor_set = VK_NULL_HANDLE;
     VkQueryPool timestamp_queries = VK_NULL_HANDLE;
     bool timestamps_valid = false;
     bool workload_was_enabled = false;
@@ -31,7 +32,6 @@ struct FrameContext {
 #if VCR_EDITOR_ENABLED
     GpuBuffer scene_instance_buffer{};
     GpuBuffer scene_upload_buffer{};
-    VkDescriptorSet scene_descriptor_set = VK_NULL_HANDLE;
     std::uint64_t scene_revision = 0U;
     std::uint32_t scene_ground_count = 0U;
     std::uint32_t scene_cube_count = 0U;

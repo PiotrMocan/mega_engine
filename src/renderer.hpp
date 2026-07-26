@@ -254,6 +254,7 @@ private:
     VkPipeline scene_pipeline_ = VK_NULL_HANDLE;
     VkPipeline terrain_pipeline_ = VK_NULL_HANDLE;
     VkPipeline sky_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline scene_shadow_pipeline_ = VK_NULL_HANDLE;
     VkPipeline terrain_shadow_pipeline_ = VK_NULL_HANDLE;
     VkPipeline aa_pipeline_ = VK_NULL_HANDLE;
     VkPipeline aa_scene_pipeline_ = VK_NULL_HANDLE;
@@ -276,6 +277,9 @@ private:
     GpuBuffer vertex_buffer_{};
     GpuBuffer index_buffer_{};
     GpuBuffer instance_buffer_{};
+    GpuBuffer demo_instance_buffer_{};
+    GpuBuffer pbr_sample_vertex_buffer_{};
+    GpuBuffer pbr_sample_index_buffer_{};
     GpuBuffer terrain_vertex_buffer_{};
     GpuBuffer terrain_index_buffer_{};
     GpuTexture sky_texture_{};
@@ -293,7 +297,6 @@ private:
     GpuBuffer screenshot_readback_{};
     std::uint32_t instancing_count_ = 1;
     std::uint32_t max_instance_capacity_ = 100'000;
-    std::uint32_t scene_instance_base_ = 0;
     std::uint32_t gpu_workload_iterations_ = 0;
     std::uint32_t frame_serial_ = 0;
     RunMode mode_ = RunMode::scene;

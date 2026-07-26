@@ -1,5 +1,7 @@
 #pragma once
 
+#include "pbr_material.hpp"
+
 #include <glm/mat4x4.hpp>
 #include <glm/vec3.hpp>
 #include <glm/vec4.hpp>
@@ -52,7 +54,7 @@ struct SceneTransform {
 struct SceneNode {
     std::string name;
     SceneTransform transform{};
-    glm::vec4 color{1.0F};
+    PbrMaterial material{};
     SceneNodeKind kind = SceneNodeKind::folder;
     bool visible = true;
     bool expanded = true;
@@ -74,10 +76,11 @@ struct alignas(16) SceneGpuInstance {
     glm::vec4 model_row_0{1.0F, 0.0F, 0.0F, 0.0F};
     glm::vec4 model_row_1{0.0F, 1.0F, 0.0F, 0.0F};
     glm::vec4 model_row_2{0.0F, 0.0F, 1.0F, 0.0F};
-    glm::vec4 color{1.0F};
+    PbrMaterial material{};
 };
 
-static_assert(sizeof(SceneGpuInstance) == 64U);
+static_assert(sizeof(SceneGpuInstance) == 80U);
+static_assert(offsetof(SceneGpuInstance, material) == 48U);
 
 // Non-owning view into caller-provided instance storage. Consume it before
 // mutating either the SceneDocument or the output vector used to build it.

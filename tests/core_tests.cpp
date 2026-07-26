@@ -45,6 +45,30 @@ bool close_to(const double value, const double expected, const double epsilon) {
 
 int main() {
     {
+        vcr::PbrMaterial material{
+            .base_color = glm::vec4(
+                -1.0F,
+                0.4F,
+                2.0F,
+                std::numeric_limits<float>::quiet_NaN()),
+            .metallic = 4.0F,
+            .roughness = 0.0F,
+            .ambient_occlusion = -2.0F,
+            .reserved = 7.0F,
+        };
+        material = vcr::sanitize_pbr_material(material);
+        expect(
+            material.base_color ==
+                    glm::vec4(0.0F, 0.4F, 1.0F, 1.0F) &&
+                material.metallic == 1.0F &&
+                material.roughness ==
+                    vcr::minimum_pbr_roughness &&
+                material.ambient_occlusion == 0.0F &&
+                material.reserved == 0.0F,
+            "PBR material factors are finite and bounded");
+    }
+
+    {
         const char* arguments[]{
             "vulkan_cube",
             "--benchmark",
@@ -738,8 +762,13 @@ int main() {
                 glm::vec3(10.0F, 20.0F, 30.0F);
             cube->get().transform.scale =
                 glm::vec3(2.0F, 0.5F, 4.0F);
-            cube->get().color =
-                glm::vec4(0.2F, 0.4F, 0.8F, 1.0F);
+            cube->get().material = vcr::PbrMaterial{
+                .base_color =
+                    glm::vec4(0.2F, 0.4F, 0.8F, 1.0F),
+                .metallic = 0.75F,
+                .roughness = 0.24F,
+                .ambient_occlusion = 0.9F,
+            };
             source_scene.mark_content_changed();
         }
         const std::filesystem::path scene_file =
@@ -766,8 +795,64 @@ int main() {
                 close_to(
                     loaded_records[1].value.transform.scale.z,
                     4.0,
+                    0.0001) &&
+                close_to(
+                    loaded_records[1].value.material.metallic,
+                    0.75,
+                    0.0001) &&
+                close_to(
+                    loaded_records[1].value.material.roughness,
+                    0.24,
+                    0.0001) &&
+                close_to(
+                    loaded_records[1]
+                        .value.material.ambient_occlusion,
+                    0.9,
                     0.0001),
-            "scene JSON preserves hierarchy and authored values");
+            "scene JSON preserves hierarchy and PBR material values");
+
+        const std::filesystem::path legacy_scene_file =
+            temporary_root / "legacy.scene.json";
+        {
+            std::ofstream legacy(legacy_scene_file);
+            legacy
+                << "{\"format\":\"vulkan_cube_scene\","
+                   "\"version\":1,\"nodes\":[{"
+                   "\"name\":\"Legacy\",\"kind\":\"cube\","
+                   "\"parent\":null,\"visible\":true,"
+                   "\"expanded\":true,\"transform\":{"
+                   "\"translation\":[0,0,0],"
+                   "\"rotation_degrees\":[0,0,0],"
+                   "\"scale\":[1,1,1]},"
+                   "\"color\":[0.2,0.4,0.8,1]}]}";
+        }
+        vcr::SceneDocument legacy_scene;
+        expect(
+            vcr::load_scene_file(
+                legacy_scene_file, legacy_scene, error),
+            "legacy scene JSON without PBR data remains supported");
+        std::vector<vcr::SceneNodeRecord> legacy_records;
+        legacy_scene.build_node_records(legacy_records);
+        expect(
+            legacy_records.size() == 1U &&
+                close_to(
+                    legacy_records[0].value.material.base_color.b,
+                    0.8,
+                    0.0001) &&
+                close_to(
+                    legacy_records[0].value.material.metallic,
+                    0.0,
+                    0.0001) &&
+                close_to(
+                    legacy_records[0].value.material.roughness,
+                    0.65,
+                    0.0001) &&
+                close_to(
+                    legacy_records[0]
+                        .value.material.ambient_occlusion,
+                    1.0,
+                    0.0001),
+            "legacy scene JSON receives safe PBR defaults");
 
         const std::filesystem::path invalid_scene_file =
             temporary_root / "invalid.scene.json";

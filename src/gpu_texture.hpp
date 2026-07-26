@@ -23,6 +23,13 @@ public:
         std::uint32_t height,
         VkFormat format,
         std::string_view debug_name);
+    void create_mipmapped(
+        VulkanContext& context,
+        std::uint32_t width,
+        std::uint32_t height,
+        std::uint32_t mip_levels,
+        VkFormat format,
+        std::string_view debug_name);
     void create_shadow_map(
         VulkanContext& context,
         std::uint32_t width,
@@ -53,6 +60,9 @@ public:
     [[nodiscard]] VkSampler sampler() const noexcept { return sampler_; }
     [[nodiscard]] std::uint32_t width() const noexcept { return width_; }
     [[nodiscard]] std::uint32_t height() const noexcept { return height_; }
+    [[nodiscard]] std::uint32_t mip_levels() const noexcept {
+        return mip_levels_;
+    }
     [[nodiscard]] VkFormat format() const noexcept { return format_; }
     [[nodiscard]] VkImageUsageFlags usage() const noexcept { return usage_; }
     [[nodiscard]] VkImageAspectFlags aspect_mask() const noexcept {
@@ -66,7 +76,7 @@ public:
             .imageType = VK_IMAGE_TYPE_2D,
             .format = format_,
             .extent = VkExtent3D{width_, height_, 1U},
-            .mipLevels = 1,
+            .mipLevels = mip_levels_,
             .arrayLayers = 1,
             .samples = VK_SAMPLE_COUNT_1_BIT,
             .tiling = VK_IMAGE_TILING_OPTIMAL,
@@ -86,6 +96,7 @@ private:
         VulkanContext& context,
         std::uint32_t width,
         std::uint32_t height,
+        std::uint32_t mip_levels,
         VkFormat format,
         VkImageUsageFlags usage,
         VkImageAspectFlags aspect_mask,
@@ -103,6 +114,7 @@ private:
     VmaAllocation allocation_ = VK_NULL_HANDLE;
     std::uint32_t width_ = 0;
     std::uint32_t height_ = 0;
+    std::uint32_t mip_levels_ = 0;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     VkImageUsageFlags usage_ = 0;
     VkImageAspectFlags aspect_mask_ = 0;
