@@ -37,6 +37,13 @@ Editor Inspector показывает Base color, Metallic, Roughness и Ambient
 occlusion для cubes/ground. Scene JSON сохраняет новый объект `pbr`; старые
 version 1 сцены без него остаются совместимыми и получают безопасные defaults.
 
+Editor asset pipeline дополнительно хранит отдельные versioned
+`*.vcrmaterial.json`. Material Editor изменяет те же bounded factors, а importer
+FBX/OBJ создаёт отдельный material asset для каждого материала source model.
+Imported submeshes используют factors этих material assets в editor scene.
+Editor model shader дополнительно читает base-color texture как sRGB и normal
+map как linear data через отдельный immutable material descriptor set.
+
 ## Direct и environment lighting
 
 Directional sun вычисляется полным BRDF и использует существующую shadow map.
@@ -48,9 +55,9 @@ transfer-source/blit, renderer явно сообщает warning и безопа
 mip 0.
 
 Это практичный real-time IBL approximation, а не полноценная офлайн
-GGX-convolution cubemap. Normal maps, material textures, anisotropy,
-clear-coat, transmission и multiple-scattering compensation пока не входят в
-этот этап.
+GGX-convolution cubemap. Imported model path поддерживает base-color и normal
+textures; metallic/roughness/AO textures, anisotropy, clear-coat, transmission
+и multiple-scattering compensation пока не входят в этот этап.
 
 ## Demo scene
 

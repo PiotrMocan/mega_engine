@@ -1,0 +1,12 @@
+{
+  "color_space": "linear",
+  "decode": "deferred",
+  "kind": "texture",
+  "name": "tree_stump_01_nor_gl_4k",
+  "origin": "external",
+  "schema": "vcr.asset",
+  "source": "textures/1_tree_stump_01_nor_gl_4k.exr",
+  "source_reference": "textures/tree_stump_01_nor_gl_4k.exr",
+  "usage": "normal",
+  "version": 1
+}

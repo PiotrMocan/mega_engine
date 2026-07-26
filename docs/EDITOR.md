@@ -44,8 +44,9 @@ scripts\run_editor_windows.cmd --no-validation
 - `Scene Hierarchy`: иерархический forest с generational handles,
   drag-and-drop reparenting, защитой от циклов, фильтром и clipped-отрисовкой.
 - `Inspector`: имя и visibility для всех nodes; position/rotation/scale для
-  geometry и иерархических folders; PBR base color, metallic, roughness и
-  ambient occlusion для cubes/ground. Terrain, sky и sun visibility уже
+  geometry, imported models и иерархических folders; asset path для model
+  nodes; PBR base color, metallic, roughness и ambient occlusion для
+  cubes/ground. Terrain, sky и sun visibility уже
   управляет renderer, а неподключённые component controls намеренно не
   показываются как работающие.
 - `Scene View`: offscreen Vulkan target, изменяемый размер и fly camera
@@ -63,6 +64,18 @@ scripts\run_editor_windows.cmd --no-validation
 - `Assets`: sandboxed browser исходного project `assets` (с fallback на
   packaged copy), сортировка, типы, drag payload, ручной refresh, явное
   сообщение о truncation и запрет выхода через `..`/symbolic links.
+- `Asset Import`: FBX/OBJ и изображения импортируются через отдельное окно или
+  внешний drag-and-drop в `Assets`. Model cook создаёт versioned mesh,
+  model manifest, отдельные material/texture assets и сохраняет source.
+  Публикация транзакционная и не заменяет существующий asset.
+- `Add to Scene`: model manifest добавляется кнопкой, двойным кликом,
+  context menu или drag-and-drop на `Scene View`. Renderer безопасно проверяет
+  cooked данные, загружает immutable GPU buffers и группирует одинаковые
+  model/submesh instances. Начальный transform явно центрирует model на земле
+  у камеры и равномерно вписывает его в размер 3 world units.
+- `Material Editor`: отдельное dockable окно открывает импортированные
+  `*.vcrmaterial.json`, редактирует PBR factors и сохраняет complete temporary
+  file перед атомарной заменой.
 - `Renderer`: live CPU/GPU timings и управление AA.
 
 Первая раскладка создаётся автоматически: hierarchy слева, inspector справа,
@@ -111,8 +124,14 @@ Resize viewport coalesced с задержкой 140 ms и ограничен `38
 - Asset enumeration синхронна, но запускается только явным navigation/refresh,
   ограничена 100000 entries и не выполняет filesystem I/O каждый frame.
   Навигация транзакционна: ошибка не смешивает новый path со старым listing.
-  Import pipeline, watcher и постоянный background job-system остаются
-  отдельным этапом.
+  Import выполняет постоянный bounded worker и обновляет browser один раз после
+  завершения batch. Watcher и общий engine job-system остаются отдельным этапом.
+- Imported `*.vcrmesh` рисуется в editor scene с material factors из
+  `*.vcrmaterial.json`; base-color и normal textures декодируются при первом
+  использовании, получают mip chain и bind-ятся отдельным material descriptor
+  set. Cooked UV/tangent передаются в dedicated direct/AA model pipelines.
+  Подробности:
+  [ASSET_IMPORT.md](ASSET_IMPORT.md).
 - Save/Open уже сохраняет иерархию и authored properties, но Save As, undo/redo,
   prefabs, component inspector и произвольный node graph ещё не реализованы.
   Текущая иерархия намеренно остаётся tree/forest, чтобы ownership и transform

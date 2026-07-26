@@ -20,6 +20,19 @@ namespace {
     return extension;
 }
 
+[[nodiscard]] std::string lowercase_filename(
+    const std::filesystem::path& path) {
+    std::string filename = path.filename().string();
+    std::transform(
+        filename.begin(),
+        filename.end(),
+        filename.begin(),
+        [](const unsigned char value) {
+            return static_cast<char>(std::tolower(value));
+        });
+    return filename;
+}
+
 [[nodiscard]] bool path_escapes_root(
     const std::filesystem::path& relative) {
     if (relative.is_absolute()) {
@@ -275,9 +288,23 @@ AssetEntryKind AssetBrowser::classify(
     }
     const std::string extension =
         lowercase_extension(entry.path());
+    const std::string filename =
+        lowercase_filename(entry.path());
+    if (filename.ends_with(".vcrmaterial.json")) {
+        return AssetEntryKind::material;
+    }
+    if (filename.ends_with(".vcrasset.json") ||
+        extension == ".fbx" || extension == ".obj" ||
+        extension == ".glb" || extension == ".gltf") {
+        return AssetEntryKind::model;
+    }
+    if (filename.ends_with(".vcrtexture.json")) {
+        return AssetEntryKind::image;
+    }
     if (extension == ".png" || extension == ".jpg" ||
         extension == ".jpeg" || extension == ".dds" ||
-        extension == ".tga" || extension == ".hdr") {
+        extension == ".tga" || extension == ".hdr" ||
+        extension == ".bmp" || extension == ".exr") {
         return AssetEntryKind::image;
     }
     if (extension == ".vert" || extension == ".frag" ||
@@ -287,8 +314,7 @@ AssetEntryKind AssetBrowser::classify(
     if (extension == ".json" || extension == ".scene") {
         return AssetEntryKind::scene;
     }
-    if (extension == ".spv" || extension == ".bin" ||
-        extension == ".glb" || extension == ".gltf") {
+    if (extension == ".spv" || extension == ".bin") {
         return AssetEntryKind::binary;
     }
     return AssetEntryKind::other;
@@ -297,6 +323,8 @@ AssetEntryKind AssetBrowser::classify(
 const char* asset_kind_name(const AssetEntryKind kind) noexcept {
     switch (kind) {
     case AssetEntryKind::directory: return "Folder";
+    case AssetEntryKind::model: return "Model";
+    case AssetEntryKind::material: return "Material";
     case AssetEntryKind::image: return "Image";
     case AssetEntryKind::shader: return "Shader";
     case AssetEntryKind::scene: return "Scene";

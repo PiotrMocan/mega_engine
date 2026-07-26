@@ -28,6 +28,63 @@ namespace {
            transform.scale.z >= minimum_scale;
 }
 
+[[nodiscard]] bool valid_utf8(
+    const std::string_view text) noexcept {
+    std::size_t index = 0U;
+    while (index < text.size()) {
+        const auto first =
+            static_cast<unsigned char>(text[index]);
+        if (first <= 0x7FU) {
+            ++index;
+            continue;
+        }
+
+        std::size_t continuation_count = 0U;
+        std::uint32_t code_point = 0U;
+        if (first >= 0xC2U && first <= 0xDFU) {
+            continuation_count = 1U;
+            code_point = first & 0x1FU;
+        } else if (first >= 0xE0U && first <= 0xEFU) {
+            continuation_count = 2U;
+            code_point = first & 0x0FU;
+        } else if (first >= 0xF0U && first <= 0xF4U) {
+            continuation_count = 3U;
+            code_point = first & 0x07U;
+        } else {
+            return false;
+        }
+        if (continuation_count > text.size() - index - 1U) {
+            return false;
+        }
+        for (std::size_t offset = 1U;
+             offset <= continuation_count;
+             ++offset) {
+            const auto continuation =
+                static_cast<unsigned char>(text[index + offset]);
+            if ((continuation & 0xC0U) != 0x80U) {
+                return false;
+            }
+            code_point =
+                (code_point << 6U) |
+                static_cast<std::uint32_t>(
+                    continuation & 0x3FU);
+        }
+        const bool overlong =
+            (continuation_count == 1U && code_point < 0x80U) ||
+            (continuation_count == 2U && code_point < 0x800U) ||
+            (continuation_count == 3U &&
+             code_point < 0x10000U);
+        if (overlong ||
+            code_point > 0x10FFFFU ||
+            (code_point >= 0xD800U &&
+             code_point <= 0xDFFFU)) {
+            return false;
+        }
+        index += continuation_count + 1U;
+    }
+    return true;
+}
+
 [[nodiscard]] glm::quat rotation_quaternion(
     const glm::vec3& degrees) noexcept {
     return glm::normalize(glm::quat(glm::radians(degrees)));
@@ -106,6 +163,7 @@ SceneNodeId SceneDocument::create_node(
     Slot& slot = slots_[index];
     slot.value = SceneNode{
         .name = std::move(name),
+        .asset_path = {},
         .kind = kind,
     };
     slot.world_matrix = glm::mat4(1.0F);
@@ -312,8 +370,10 @@ void SceneDocument::build_node_records(
 }
 
 SceneRenderView SceneDocument::build_render_view(
-    std::vector<SceneGpuInstance>& cube_output) {
+    std::vector<SceneGpuInstance>& cube_output,
+    std::vector<SceneModelInstance>& model_output) {
     cube_output.clear();
+    model_output.clear();
     SceneGpuInstance ground{};
     bool has_ground = false;
     bool terrain_visible = false;
@@ -374,12 +434,23 @@ SceneRenderView SceneDocument::build_render_view(
             } else if (cube_output.size() < max_scene_nodes) {
                 cube_output.push_back(instance);
             }
+        } else if (world_visible &&
+                   slot.value.kind == SceneNodeKind::model &&
+                   valid_scene_asset_path(slot.value.asset_path) &&
+                   model_output.size() < max_scene_nodes) {
+            model_output.push_back(SceneModelInstance{
+                .model_row_0 = matrix_row(world_matrix, 0),
+                .model_row_1 = matrix_row(world_matrix, 1),
+                .model_row_2 = matrix_row(world_matrix, 2),
+                .asset_path = slot.value.asset_path,
+            });
         }
         index = traversal_next(index, depth, true);
     }
     return SceneRenderView{
         .ground = ground,
         .cubes = cube_output,
+        .models = model_output,
         .revision = content_revision_,
         .has_ground = has_ground,
         .terrain_visible = terrain_visible,
@@ -593,6 +664,7 @@ std::string_view to_string(const SceneNodeKind kind) noexcept {
     switch (kind) {
     case SceneNodeKind::folder: return "Folder";
     case SceneNodeKind::cube: return "Cube";
+    case SceneNodeKind::model: return "Model";
     case SceneNodeKind::ground: return "Ground";
     case SceneNodeKind::terrain: return "Terrain";
     case SceneNodeKind::camera: return "Camera";
@@ -600,6 +672,46 @@ std::string_view to_string(const SceneNodeKind kind) noexcept {
     case SceneNodeKind::environment: return "Environment";
     }
     return "Unknown";
+}
+
+bool valid_scene_asset_path(
+    const std::string_view path) noexcept {
+    constexpr std::string_view extension = ".vcrasset.json";
+    if (path.empty() ||
+        path.size() > max_scene_asset_path_bytes ||
+        !path.ends_with(extension) ||
+        !valid_utf8(path) ||
+        path.front() == '/' ||
+        path.front() == '\\') {
+        return false;
+    }
+
+    std::size_t segment_begin = 0U;
+    for (std::size_t index = 0U; index <= path.size(); ++index) {
+        const bool at_end = index == path.size();
+        if (!at_end) {
+            const auto value =
+                static_cast<unsigned char>(path[index]);
+            if (value == 0U ||
+                value < 0x20U ||
+                path[index] == '\\' ||
+                path[index] == ':') {
+                return false;
+            }
+        }
+        if (!at_end && path[index] != '/') {
+            continue;
+        }
+        const std::string_view segment =
+            path.substr(segment_begin, index - segment_begin);
+        if (segment.empty() ||
+            segment == "." ||
+            segment == "..") {
+            return false;
+        }
+        segment_begin = index + 1U;
+    }
+    return true;
 }
 
 } // namespace vcr

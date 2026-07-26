@@ -1,21 +1,289 @@
 #include "editor_ui.hpp"
 
+#include "asset_importer.hpp"
 #include "renderer.hpp"
 #include "scene_io.hpp"
 #include "vulkan_common.hpp"
 
 #include <imgui_impl_sdl3.h>
 #include <imgui_internal.h>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
+#include <cstdio>
 #include <cstring>
+#include <deque>
+#include <exception>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <limits>
+#include <mutex>
+#include <stop_token>
 #include <string_view>
+#include <thread>
 #include <utility>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 namespace vcr {
+
+inline constexpr std::size_t maximum_import_sources = 128U;
+inline constexpr std::size_t maximum_import_path_bytes = 32U * 1024U;
+
+struct AssetImportUiState {
+    struct Completion {
+        std::filesystem::path source{};
+        std::optional<AssetImportResult> result{};
+        std::optional<AssetImportError> error{};
+    };
+
+    std::vector<std::filesystem::path> sources{};
+    std::filesystem::path destination_directory{};
+    std::vector<Completion> completions{};
+    std::array<char, maximum_import_path_bytes> source_path{};
+    std::string status{};
+    bool import_popup_requested = false;
+    bool import_popup_open = false;
+    bool results_window_open = false;
+};
+
+struct ExternalAssetDropState {
+    ImVec2 minimum{};
+    ImVec2 maximum{};
+    std::vector<std::filesystem::path> sources{};
+    SDL_WindowID window_id = 0U;
+    bool region_valid = false;
+    bool batch_active = false;
+    bool hover = false;
+};
+
+struct MaterialEditorUiState {
+    nlohmann::json document{};
+    std::filesystem::path relative_path{};
+    std::filesystem::path absolute_path{};
+    std::array<char, 256U> name{};
+    PbrMaterial material{};
+    std::string error{};
+    std::string status{};
+    bool open = false;
+    bool loaded = false;
+    bool dirty = false;
+    bool close_confirmation_requested = false;
+};
+
+class AssetImportWorker final {
+public:
+    struct Batch {
+        std::vector<std::filesystem::path> sources{};
+        ImportAssetOptions options{};
+    };
+
+    AssetImportWorker()
+        : worker_([this](const std::stop_token stop_token) {
+              run(stop_token);
+          }) {}
+
+    ~AssetImportWorker() {
+        stop();
+    }
+
+    AssetImportWorker(const AssetImportWorker&) = delete;
+    AssetImportWorker& operator=(const AssetImportWorker&) = delete;
+
+    [[nodiscard]] bool submit(Batch batch) {
+        constexpr std::size_t maximum_pending_batches = 4U;
+        std::lock_guard lock(mutex_);
+        if (stopping_ ||
+            failed_.load(std::memory_order_acquire) ||
+            pending_.size() >= maximum_pending_batches) {
+            return false;
+        }
+        pending_.push_back(std::move(batch));
+        outstanding_batches_.fetch_add(
+            1U, std::memory_order_release);
+        condition_.notify_one();
+        return true;
+    }
+
+    [[nodiscard]] bool drain(
+        std::vector<AssetImportUiState::Completion>& output) {
+        if (!completed_ready_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        std::lock_guard lock(mutex_);
+        if (completed_.empty()) {
+            completed_ready_.store(
+                false, std::memory_order_release);
+            return false;
+        }
+        output.clear();
+        output.reserve(completed_.size());
+        while (!completed_.empty()) {
+            output.push_back(std::move(completed_.front()));
+            completed_.pop_front();
+        }
+        completed_ready_.store(false, std::memory_order_release);
+        return true;
+    }
+
+    [[nodiscard]] bool busy() const noexcept {
+        return outstanding_batches_.load(
+                   std::memory_order_acquire) != 0U;
+    }
+
+    [[nodiscard]] bool failed() const noexcept {
+        return failed_.load(std::memory_order_acquire);
+    }
+
+    void stop() noexcept {
+        {
+            std::lock_guard lock(mutex_);
+            stopping_ = true;
+        }
+        worker_.request_stop();
+        condition_.notify_all();
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+        outstanding_batches_.store(0U, std::memory_order_release);
+    }
+
+private:
+    void run(const std::stop_token stop_token) noexcept {
+        try {
+            run_throwing(stop_token);
+        } catch (const std::exception& exception) {
+            std::fprintf(
+                stderr,
+                "Asset import worker stopped after an exception: %s\n",
+                exception.what());
+            mark_failed();
+        } catch (...) {
+            std::fputs(
+                "Asset import worker stopped after an unknown exception.\n",
+                stderr);
+            mark_failed();
+        }
+    }
+
+    void mark_failed() noexcept {
+        failed_.store(true, std::memory_order_release);
+        try {
+            std::lock_guard lock(mutex_);
+            stopping_ = true;
+            pending_.clear();
+        } catch (...) {
+            // An already-failing worker must never let an exception escape
+            // its noexcept thread boundary.
+        }
+        outstanding_batches_.store(0U, std::memory_order_release);
+        condition_.notify_all();
+    }
+
+    void run_throwing(const std::stop_token stop_token) {
+        while (!stop_token.stop_requested()) {
+            Batch batch;
+            {
+                std::unique_lock lock(mutex_);
+                condition_.wait(
+                    lock,
+                    [this, &stop_token] {
+                        return stopping_ ||
+                            stop_token.stop_requested() ||
+                            !pending_.empty();
+                    });
+                if (stopping_ || stop_token.stop_requested()) {
+                    break;
+                }
+                batch = std::move(pending_.front());
+                pending_.pop_front();
+            }
+
+            std::vector<AssetImportUiState::Completion>
+                batch_completions;
+            batch_completions.reserve(batch.sources.size());
+            for (const std::filesystem::path& source :
+                 batch.sources) {
+                if (stop_token.stop_requested()) {
+                    break;
+                }
+                AssetImportUiState::Completion completion{
+                    .source = source,
+                };
+                try {
+                    auto outcome =
+                        import_asset(source, batch.options);
+                    if (outcome) {
+                        completion.result =
+                            std::move(outcome).value();
+                    } else {
+                        completion.error =
+                            std::move(outcome).error();
+                    }
+                } catch (const std::exception& exception) {
+                    completion.error = AssetImportError{
+                        .code =
+                            AssetImportErrorCode::filesystem_error,
+                        .message =
+                            "Asset importer raised an exception: " +
+                            std::string(exception.what()),
+                        .path = source,
+                    };
+                } catch (...) {
+                    completion.error = AssetImportError{
+                        .code =
+                            AssetImportErrorCode::filesystem_error,
+                        .message =
+                            "Asset importer raised an unknown exception.",
+                        .path = source,
+                    };
+                }
+                batch_completions.push_back(
+                    std::move(completion));
+            }
+
+            {
+                std::lock_guard lock(mutex_);
+                for (auto& completion : batch_completions) {
+                    completed_.push_back(
+                        std::move(completion));
+                }
+                completed_ready_.store(
+                    !completed_.empty(),
+                    std::memory_order_release);
+            }
+            outstanding_batches_.fetch_sub(
+                1U, std::memory_order_release);
+        }
+    }
+
+    mutable std::mutex mutex_{};
+    std::condition_variable condition_{};
+    std::deque<Batch> pending_{};
+    std::deque<AssetImportUiState::Completion> completed_{};
+    std::atomic<std::size_t> outstanding_batches_{0U};
+    std::atomic<bool> completed_ready_{false};
+    std::atomic<bool> failed_{false};
+    bool stopping_ = false;
+    // Must be last: the thread can observe every preceding member as soon
+    // as it starts, and it is joined before those members are destroyed.
+    std::jthread worker_{};
+};
+
 namespace {
 
 void check_imgui_vk_result(const VkResult result) {
@@ -46,11 +314,16 @@ void check_imgui_vk_result(const VkResult result) {
     return "UNKNOWN";
 }
 
-[[nodiscard]] std::optional<std::filesystem::path>
+struct AssetRootLocation {
+    std::filesystem::path path{};
+    bool project_owned = false;
+};
+
+[[nodiscard]] std::optional<AssetRootLocation>
 find_project_asset_root() {
     const auto search_ancestors =
         [](std::filesystem::path candidate)
-            -> std::optional<std::filesystem::path> {
+            -> std::optional<AssetRootLocation> {
             for (std::uint32_t depth = 0U;
                  depth < 16U && !candidate.empty();
                  ++depth) {
@@ -67,7 +340,10 @@ find_project_asset_root() {
                         assets, filesystem_error);
                 if (has_project_file && has_assets &&
                     !filesystem_error) {
-                    return assets;
+                    return AssetRootLocation{
+                        .path = assets,
+                        .project_owned = true,
+                    };
                 }
                 const std::filesystem::path parent =
                     candidate.parent_path();
@@ -99,15 +375,681 @@ find_project_asset_root() {
         if (std::filesystem::is_directory(
                 packaged_assets, filesystem_error) &&
             !filesystem_error) {
-            return packaged_assets;
+            return AssetRootLocation{
+                .path = packaged_assets,
+                .project_owned = false,
+            };
         }
     }
     return std::nullopt;
 }
 
+inline constexpr std::uintmax_t maximum_material_file_bytes =
+    1024U * 1024U;
+
+[[nodiscard]] const char* imported_asset_kind_name(
+    const ImportedAssetKind kind) noexcept {
+    switch (kind) {
+    case ImportedAssetKind::model: return "Model";
+    case ImportedAssetKind::material: return "Material";
+    case ImportedAssetKind::texture: return "Texture";
+    case ImportedAssetKind::mesh_binary: return "Mesh data";
+    case ImportedAssetKind::source: return "Source";
+    }
+    return "Asset";
+}
+
+[[nodiscard]] bool path_escapes_asset_root(
+    const std::filesystem::path& relative) {
+    if (relative.is_absolute() || relative.has_root_name() ||
+        relative.has_root_directory()) {
+        return true;
+    }
+    for (const auto& component : relative.lexically_normal()) {
+        if (component == "..") {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] std::filesystem::path path_from_utf8(
+    const std::string_view text) {
+    std::u8string encoded(text.size(), u8'\0');
+    std::memcpy(encoded.data(), text.data(), text.size());
+    return std::filesystem::path(std::move(encoded));
+}
+
+[[nodiscard]] std::string path_to_utf8(
+    const std::filesystem::path& path) {
+    const std::u8string encoded = path.generic_u8string();
+    return std::string(
+        reinterpret_cast<const char*>(encoded.data()),
+        encoded.size());
+}
+
+[[nodiscard]] bool resolve_material_path(
+    const std::filesystem::path& asset_root,
+    const std::filesystem::path& relative_path,
+    std::filesystem::path& absolute_path,
+    std::string& error) {
+    error.clear();
+    if (asset_root.empty() || relative_path.empty() ||
+        path_escapes_asset_root(relative_path)) {
+        error = "Material path escapes the configured asset root.";
+        return false;
+    }
+
+    std::error_code filesystem_error;
+    const std::filesystem::path canonical_root =
+        std::filesystem::weakly_canonical(
+            asset_root, filesystem_error);
+    if (filesystem_error) {
+        error = "Unable to canonicalize the asset root.";
+        return false;
+    }
+
+    std::filesystem::path component_path = canonical_root;
+    for (const auto& component : relative_path.lexically_normal()) {
+        if (component == ".") {
+            continue;
+        }
+        component_path /= component;
+        const auto status = std::filesystem::symlink_status(
+            component_path, filesystem_error);
+        if (filesystem_error) {
+            error = "Unable to inspect the material path.";
+            return false;
+        }
+        if (std::filesystem::is_symlink(status)) {
+            error = "Symbolic links are not followed for material assets.";
+            return false;
+        }
+    }
+
+    absolute_path = std::filesystem::weakly_canonical(
+        canonical_root / relative_path, filesystem_error);
+    if (filesystem_error) {
+        error = "Unable to canonicalize the material path.";
+        return false;
+    }
+    const std::filesystem::path relative =
+        std::filesystem::relative(
+            absolute_path, canonical_root, filesystem_error);
+    if (filesystem_error ||
+        path_escapes_asset_root(relative) ||
+        !std::filesystem::is_regular_file(
+            absolute_path, filesystem_error) ||
+        filesystem_error) {
+        error = "Material asset is outside the root or inaccessible.";
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] bool read_material_factor(
+    const nlohmann::json& value,
+    const float minimum,
+    const float maximum,
+    float& output) {
+    if (!value.is_number()) {
+        return false;
+    }
+    const double decoded = value.get<double>();
+    if (!std::isfinite(decoded) ||
+        decoded < static_cast<double>(minimum) ||
+        decoded > static_cast<double>(maximum)) {
+        return false;
+    }
+    output = static_cast<float>(decoded);
+    return true;
+}
+
+[[nodiscard]] bool load_material_document(
+    const std::filesystem::path& asset_root,
+    const std::filesystem::path& relative_path,
+    MaterialEditorUiState& state,
+    std::string& error) {
+    std::filesystem::path absolute_path;
+    if (!resolve_material_path(
+            asset_root,
+            relative_path,
+            absolute_path,
+            error)) {
+        return false;
+    }
+
+    std::error_code filesystem_error;
+    const std::uintmax_t file_size =
+        std::filesystem::file_size(
+            absolute_path, filesystem_error);
+    if (filesystem_error || file_size == 0U ||
+        file_size > maximum_material_file_bytes) {
+        error =
+            "Material file is empty or exceeds the 1 MiB safety limit.";
+        return false;
+    }
+    std::ifstream input(absolute_path, std::ios::binary);
+    if (!input) {
+        error = "Unable to open the material asset.";
+        return false;
+    }
+
+    try {
+        nlohmann::json document =
+            nlohmann::json::parse(input, nullptr, false);
+        if (document.is_discarded() ||
+            !document.is_object() ||
+            document.value("schema", std::string{}) != "vcr.asset" ||
+            !document.contains("version") ||
+            !document["version"].is_number_unsigned() ||
+            document["version"].get<std::uint64_t>() != 1U ||
+            document.value("kind", std::string{}) != "material" ||
+            !document.contains("name") ||
+            !document["name"].is_string() ||
+            !document.contains("pbr") ||
+            !document["pbr"].is_object()) {
+            error = "Material schema, kind, or version is invalid.";
+            return false;
+        }
+        const std::string& name =
+            document["name"].get_ref<const std::string&>();
+        if (name.size() >= state.name.size() ||
+            name.find('\0') != std::string::npos) {
+            error = "Material name exceeds 255 UTF-8 bytes.";
+            return false;
+        }
+        const nlohmann::json& pbr = document["pbr"];
+        if (!pbr.contains("base_color") ||
+            !pbr["base_color"].is_array() ||
+            pbr["base_color"].size() != 4U ||
+            !pbr.contains("metallic") ||
+            !pbr.contains("roughness") ||
+            !pbr.contains("ambient_occlusion")) {
+            error = "Material PBR schema is invalid.";
+            return false;
+        }
+
+        PbrMaterial material{};
+        for (std::size_t channel = 0U; channel < 4U; ++channel) {
+            if (!read_material_factor(
+                    pbr["base_color"][channel],
+                    0.0F,
+                    1.0F,
+                    material.base_color[
+                        static_cast<glm::length_t>(channel)])) {
+                error = "Material base color is invalid.";
+                return false;
+            }
+        }
+        if (!read_material_factor(
+                pbr["metallic"],
+                0.0F,
+                1.0F,
+                material.metallic) ||
+            !read_material_factor(
+                pbr["roughness"],
+                minimum_pbr_roughness,
+                1.0F,
+                material.roughness) ||
+            !read_material_factor(
+                pbr["ambient_occlusion"],
+                0.0F,
+                1.0F,
+                material.ambient_occlusion)) {
+            error = "Material PBR factors are invalid.";
+            return false;
+        }
+        if (!document.contains("textures") ||
+            !document["textures"].is_object()) {
+            error = "Material texture references are invalid.";
+            return false;
+        }
+        for (const auto& [semantic, reference] :
+             document["textures"].items()) {
+            constexpr std::array<std::string_view, 6U>
+                supported_semantics{{
+                    "base_color",
+                    "normal",
+                    "metallic",
+                    "roughness",
+                    "ambient_occlusion",
+                    "emissive",
+                }};
+            if (std::ranges::find(
+                    supported_semantics,
+                    std::string_view(semantic)) ==
+                supported_semantics.end()) {
+                error =
+                    "Material contains an unsupported texture semantic.";
+                return false;
+            }
+            if (!reference.is_string()) {
+                error =
+                    "Material texture references must be strings.";
+                return false;
+            }
+            const std::string& reference_text =
+                reference.get_ref<const std::string&>();
+            if (reference_text.empty() ||
+                reference_text.size() > maximum_import_path_bytes ||
+                reference_text.find('\0') != std::string::npos) {
+                error =
+                    "Material texture reference is empty or too long.";
+                return false;
+            }
+            const std::filesystem::path texture_path =
+                path_from_utf8(reference_text);
+            if (path_escapes_asset_root(texture_path)) {
+                error =
+                    "Material texture reference escapes its asset.";
+                return false;
+            }
+        }
+
+        state.name.fill('\0');
+        std::memcpy(state.name.data(), name.data(), name.size());
+        state.document = std::move(document);
+        state.relative_path = relative_path.lexically_normal();
+        state.absolute_path = std::move(absolute_path);
+        state.material = sanitize_pbr_material(material);
+        state.loaded = true;
+        state.dirty = false;
+        state.error.clear();
+        state.status =
+            "Loaded " + path_to_utf8(state.relative_path);
+        return true;
+    } catch (const std::exception&) {
+        error = "Material JSON contains an invalid value.";
+        return false;
+    }
+}
+
+enum class ExclusiveFileWriteResult : std::uint8_t {
+    written,
+    already_exists,
+    failed,
+};
+
+class TemporaryMaterialPath final {
+public:
+    explicit TemporaryMaterialPath(
+        std::filesystem::path path)
+        : path_(std::move(path)) {}
+
+    ~TemporaryMaterialPath() {
+        if (!retain_) {
+            std::error_code ignored;
+            std::filesystem::remove(path_, ignored);
+        }
+    }
+
+    TemporaryMaterialPath(const TemporaryMaterialPath&) = delete;
+    TemporaryMaterialPath& operator=(
+        const TemporaryMaterialPath&) = delete;
+
+    void retain() noexcept {
+        retain_ = true;
+    }
+
+private:
+    std::filesystem::path path_{};
+    bool retain_ = false;
+};
+
+#if defined(_WIN32)
+class UniqueMaterialFile final {
+public:
+    explicit UniqueMaterialFile(const HANDLE handle) noexcept
+        : handle_(handle) {}
+
+    ~UniqueMaterialFile() {
+        if (handle_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle_);
+        }
+    }
+
+    UniqueMaterialFile(const UniqueMaterialFile&) = delete;
+    UniqueMaterialFile& operator=(
+        const UniqueMaterialFile&) = delete;
+
+    [[nodiscard]] HANDLE get() const noexcept {
+        return handle_;
+    }
+
+private:
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+};
+#else
+class UniqueMaterialFile final {
+public:
+    explicit UniqueMaterialFile(const int descriptor) noexcept
+        : descriptor_(descriptor) {}
+
+    ~UniqueMaterialFile() {
+        if (descriptor_ >= 0) {
+            static_cast<void>(::close(descriptor_));
+        }
+    }
+
+    UniqueMaterialFile(const UniqueMaterialFile&) = delete;
+    UniqueMaterialFile& operator=(
+        const UniqueMaterialFile&) = delete;
+
+    [[nodiscard]] int get() const noexcept {
+        return descriptor_;
+    }
+
+private:
+    int descriptor_ = -1;
+};
+#endif
+
+[[nodiscard]] ExclusiveFileWriteResult
+write_exclusive_material_file(
+    const std::filesystem::path& path,
+    const std::string_view contents,
+    const std::filesystem::perms permissions,
+    std::string& error) {
+#if defined(_WIN32)
+    static_cast<void>(permissions);
+    const HANDLE raw_handle = CreateFileW(
+        path.c_str(),
+        GENERIC_WRITE,
+        0U,
+        nullptr,
+        CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (raw_handle == INVALID_HANDLE_VALUE) {
+        const DWORD code = GetLastError();
+        if (code == ERROR_FILE_EXISTS ||
+            code == ERROR_ALREADY_EXISTS) {
+            return ExclusiveFileWriteResult::already_exists;
+        }
+        error =
+            "Unable to create the temporary material file "
+            "(Win32 error " +
+            std::to_string(code) + ").";
+        return ExclusiveFileWriteResult::failed;
+    }
+    UniqueMaterialFile file(raw_handle);
+    std::size_t offset = 0U;
+    while (offset < contents.size()) {
+        const std::size_t remaining = contents.size() - offset;
+        const DWORD chunk = static_cast<DWORD>(
+            std::min<std::size_t>(
+                remaining,
+                static_cast<std::size_t>(
+                    std::numeric_limits<DWORD>::max())));
+        DWORD written = 0U;
+        if (WriteFile(
+                file.get(),
+                contents.data() + offset,
+                chunk,
+                &written,
+                nullptr) == 0 ||
+            written == 0U) {
+            error =
+                "Unable to write the complete temporary material file.";
+            return ExclusiveFileWriteResult::failed;
+        }
+        offset += static_cast<std::size_t>(written);
+    }
+    if (FlushFileBuffers(file.get()) == 0) {
+        error = "Unable to flush the temporary material file.";
+        return ExclusiveFileWriteResult::failed;
+    }
+#else
+    const int descriptor = ::open(
+        path.c_str(),
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+        0600);
+    if (descriptor < 0) {
+        if (errno == EEXIST) {
+            return ExclusiveFileWriteResult::already_exists;
+        }
+        error =
+            "Unable to create the temporary material file "
+            "(errno " +
+            std::to_string(errno) + ").";
+        return ExclusiveFileWriteResult::failed;
+    }
+    UniqueMaterialFile file(descriptor);
+    const mode_t native_permissions =
+        static_cast<mode_t>(permissions) &
+        static_cast<mode_t>(0777);
+    if (::fchmod(file.get(), native_permissions) != 0) {
+        error = "Unable to preserve material file permissions.";
+        return ExclusiveFileWriteResult::failed;
+    }
+    std::size_t offset = 0U;
+    while (offset < contents.size()) {
+        const ssize_t written = ::write(
+            file.get(),
+            contents.data() + offset,
+            contents.size() - offset);
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written <= 0) {
+            error =
+                "Unable to write the complete temporary material file.";
+            return ExclusiveFileWriteResult::failed;
+        }
+        offset += static_cast<std::size_t>(written);
+    }
+    if (::fsync(file.get()) != 0) {
+        error = "Unable to flush the temporary material file.";
+        return ExclusiveFileWriteResult::failed;
+    }
+#endif
+    return ExclusiveFileWriteResult::written;
+}
+
+[[nodiscard]] bool replace_material_file(
+    const std::filesystem::path& temporary,
+    const std::filesystem::path& destination,
+    std::string& error) {
+#if defined(_WIN32)
+    if (MoveFileExW(
+            temporary.c_str(),
+            destination.c_str(),
+            MOVEFILE_REPLACE_EXISTING |
+                MOVEFILE_WRITE_THROUGH) == 0) {
+        error =
+            "Unable to replace the material file (Win32 error " +
+            std::to_string(GetLastError()) +
+            "). The complete temporary file was retained.";
+        return false;
+    }
+    return true;
+#else
+    std::error_code filesystem_error;
+    std::filesystem::rename(
+        temporary, destination, filesystem_error);
+    if (filesystem_error) {
+        error =
+            "Unable to replace the material file. The complete "
+            "temporary file was retained.";
+        return false;
+    }
+    return true;
+#endif
+}
+
+[[nodiscard]] bool save_material_document(
+    MaterialEditorUiState& state,
+    const std::filesystem::path& asset_root,
+    std::string& error) {
+    error.clear();
+    if (!state.loaded || state.absolute_path.empty()) {
+        error = "No material is loaded.";
+        return false;
+    }
+    std::filesystem::path revalidated_path;
+    if (!resolve_material_path(
+            asset_root,
+            state.relative_path,
+            revalidated_path,
+            error) ||
+        revalidated_path != state.absolute_path) {
+        if (error.empty()) {
+            error =
+                "Material path changed after it was opened.";
+        }
+        return false;
+    }
+    std::error_code filesystem_error;
+    const std::filesystem::perms material_permissions =
+        std::filesystem::status(
+            state.absolute_path, filesystem_error).permissions();
+    if (filesystem_error ||
+        material_permissions == std::filesystem::perms::unknown) {
+        error = "Unable to read the material file permissions.";
+        return false;
+    }
+    const std::string_view name(state.name.data());
+    if (name.empty()) {
+        error = "Material name cannot be empty.";
+        return false;
+    }
+
+    try {
+        const PbrMaterial material =
+            sanitize_pbr_material(state.material);
+        state.document["name"] = std::string(name);
+        state.document["pbr"] = {
+            {"base_color",
+             {material.base_color.x,
+              material.base_color.y,
+              material.base_color.z,
+              material.base_color.w}},
+            {"metallic", material.metallic},
+            {"roughness", material.roughness},
+            {"ambient_occlusion", material.ambient_occlusion},
+        };
+        const std::string serialized =
+            state.document.dump(2) + '\n';
+        if (serialized.size() > maximum_material_file_bytes) {
+            error =
+                "Serialized material exceeds the 1 MiB safety limit.";
+            return false;
+        }
+
+        std::filesystem::path temporary;
+        const auto unique_value =
+            std::chrono::steady_clock::now()
+                .time_since_epoch()
+                .count();
+        for (std::uint32_t attempt = 0U;
+             attempt < 32U;
+             ++attempt) {
+            temporary = state.absolute_path;
+            temporary +=
+                ".tmp." + std::to_string(unique_value) +
+                "." + std::to_string(attempt);
+            const ExclusiveFileWriteResult written =
+                write_exclusive_material_file(
+                    temporary,
+                    serialized,
+                    material_permissions,
+                    error);
+            if (written == ExclusiveFileWriteResult::written) {
+                break;
+            }
+            if (written == ExclusiveFileWriteResult::failed) {
+                std::error_code ignored;
+                std::filesystem::remove(temporary, ignored);
+                return false;
+            }
+            temporary.clear();
+        }
+        if (temporary.empty()) {
+            error =
+                "Unable to reserve a unique temporary material path.";
+            return false;
+        }
+        TemporaryMaterialPath temporary_lifetime(temporary);
+        if (!replace_material_file(
+                temporary, state.absolute_path, error)) {
+            temporary_lifetime.retain();
+            return false;
+        }
+        state.material = material;
+        state.dirty = false;
+        state.error.clear();
+        state.status =
+            "Saved " + path_to_utf8(state.relative_path);
+        return true;
+    } catch (const std::exception&) {
+        error = "Unable to encode the material as valid JSON.";
+        return false;
+    }
+}
+
+[[nodiscard]] bool point_inside_asset_drop_region(
+    const SDL_DropEvent& event,
+    const ExternalAssetDropState& state) {
+    if (!state.region_valid ||
+        event.windowID != state.window_id) {
+        return false;
+    }
+    SDL_Window* const dropped_window =
+        SDL_GetWindowFromID(event.windowID);
+    if (dropped_window == nullptr) {
+        return false;
+    }
+    const bool global_coordinates =
+        (ImGui::GetIO().ConfigFlags &
+         ImGuiConfigFlags_ViewportsEnable) != 0;
+    int window_x = 0;
+    int window_y = 0;
+    if (global_coordinates &&
+        !SDL_GetWindowPosition(
+            dropped_window, &window_x, &window_y)) {
+        return false;
+    }
+    const ImVec2 point{
+        event.x +
+            (global_coordinates
+                ? static_cast<float>(window_x)
+                : 0.0F),
+        event.y +
+            (global_coordinates
+                ? static_cast<float>(window_y)
+                : 0.0F),
+    };
+    return point.x >= state.minimum.x &&
+        point.x <= state.maximum.x &&
+        point.y >= state.minimum.y &&
+        point.y <= state.maximum.y;
+}
+
+[[nodiscard]] SDL_Window* viewport_sdl_window(
+    const ImGuiViewport* const viewport) noexcept {
+    if (viewport == nullptr || viewport->PlatformHandle == nullptr) {
+        return nullptr;
+    }
+    const auto encoded = reinterpret_cast<std::uintptr_t>(
+        viewport->PlatformHandle);
+    if (encoded <=
+        static_cast<std::uintptr_t>(
+            std::numeric_limits<SDL_WindowID>::max())) {
+        if (SDL_Window* const by_id =
+                SDL_GetWindowFromID(
+                    static_cast<SDL_WindowID>(encoded))) {
+            return by_id;
+        }
+    }
+    return static_cast<SDL_Window*>(viewport->PlatformHandle);
+}
+
 } // namespace
 
-EditorUi::~EditorUi() {
+EditorUi::EditorUi() = default;
+
+EditorUi::~EditorUi() noexcept {
     shutdown();
 }
 
@@ -120,6 +1062,11 @@ void EditorUi::initialize(
     }
     context_ = &context;
     main_window_ = main_window;
+    import_worker_ = std::make_unique<AssetImportWorker>();
+    import_ui_ = std::make_unique<AssetImportUiState>();
+    external_drop_ = std::make_unique<ExternalAssetDropState>();
+    material_editor_ =
+        std::make_unique<MaterialEditorUiState>();
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -158,7 +1105,9 @@ void EditorUi::initialize(
     hierarchy_rows_.reserve(max_scene_nodes);
     if (const auto asset_root = find_project_asset_root()) {
         if (asset_browser_.initialize(
-                *asset_root, asset_error_)) {
+                asset_root->path, asset_error_)) {
+            asset_import_enabled_ =
+                asset_root->project_owned;
             scene_path_ =
                 asset_browser_.root() /
                 "scenes" /
@@ -167,6 +1116,11 @@ void EditorUi::initialize(
                 scene_path_.filename().string();
             scene_file_status_ =
                 "Default scene; Save writes assets/scenes/editor_scene.json";
+            if (!asset_import_enabled_) {
+                asset_error_ =
+                    "Packaged assets are browse-only. Open the editor "
+                    "from a project checkout to import assets.";
+            }
         }
     } else {
         asset_error_ =
@@ -177,6 +1131,9 @@ void EditorUi::initialize(
 void EditorUi::shutdown() noexcept {
     if (context_ == nullptr) {
         return;
+    }
+    if (import_worker_) {
+        import_worker_->stop();
     }
     const VkResult idle = vkDeviceWaitIdle(context_->device());
     if (idle != VK_SUCCESS) {
@@ -204,13 +1161,20 @@ void EditorUi::shutdown() noexcept {
     save_requested_ = false;
     open_requested_ = false;
     open_confirmation_requested_ = false;
+    import_dialog_requested_ = false;
     scene_replaced_ = false;
+    saved_material_update_.reset();
     saved_content_revision_ = 0U;
     saved_structure_revision_ = 0U;
     selected_asset_.reset();
+    material_editor_.reset();
+    external_drop_.reset();
+    import_ui_.reset();
+    import_worker_.reset();
+    asset_import_enabled_ = false;
 }
 
-void EditorUi::process_event(const SDL_Event& event) noexcept {
+void EditorUi::process_event(const SDL_Event& event) {
     if (context_ != nullptr) {
         static_cast<void>(ImGui_ImplSDL3_ProcessEvent(&event));
         if (event.type == SDL_EVENT_KEY_DOWN &&
@@ -219,6 +1183,75 @@ void EditorUi::process_event(const SDL_Event& event) noexcept {
                 toggle_play_requested_ = true;
             } else if (event.key.key == SDLK_F6) {
                 toggle_external_window_requested_ = true;
+            }
+        }
+        if (external_drop_ != nullptr &&
+            (event.type == SDL_EVENT_DROP_BEGIN ||
+             event.type == SDL_EVENT_DROP_POSITION ||
+             event.type == SDL_EVENT_DROP_FILE ||
+             event.type == SDL_EVENT_DROP_COMPLETE)) {
+            if (play_state_ != EditorPlayState::edit ||
+                !asset_import_enabled_) {
+                external_drop_->sources.clear();
+                external_drop_->batch_active = false;
+                external_drop_->hover = false;
+                asset_error_ =
+                    !asset_import_enabled_
+                    ? "Packaged assets are browse-only; import requires "
+                      "a project checkout."
+                    : "Asset import is available only in Edit mode.";
+                return;
+            }
+            if (event.type == SDL_EVENT_DROP_BEGIN) {
+                external_drop_->sources.clear();
+                external_drop_->batch_active = true;
+                external_drop_->hover = false;
+                return;
+            }
+            if (event.type == SDL_EVENT_DROP_POSITION) {
+                external_drop_->hover =
+                    point_inside_asset_drop_region(
+                        event.drop, *external_drop_);
+                return;
+            }
+            if (event.type == SDL_EVENT_DROP_FILE) {
+                if (!external_drop_->batch_active) {
+                    external_drop_->sources.clear();
+                    external_drop_->batch_active = true;
+                }
+                external_drop_->hover =
+                    point_inside_asset_drop_region(
+                        event.drop, *external_drop_);
+                if (!external_drop_->hover ||
+                    event.drop.data == nullptr) {
+                    return;
+                }
+                if (external_drop_->sources.size() >=
+                    maximum_import_sources) {
+                    asset_error_ =
+                        "A dropped import batch is limited to 128 files.";
+                    return;
+                }
+                const std::string_view path_text(event.drop.data);
+                if (path_text.empty() ||
+                    path_text.size() >
+                        maximum_import_path_bytes) {
+                    asset_error_ =
+                        "A dropped asset path is empty or too long.";
+                    return;
+                }
+                external_drop_->sources.push_back(
+                    path_from_utf8(path_text));
+                return;
+            }
+            if (event.type == SDL_EVENT_DROP_COMPLETE) {
+                external_drop_->batch_active = false;
+                external_drop_->hover = false;
+                if (!external_drop_->sources.empty()) {
+                    queue_import_sources(
+                        std::move(external_drop_->sources));
+                    external_drop_->sources.clear();
+                }
             }
         }
     }
@@ -274,6 +1307,7 @@ void EditorUi::begin_frame(
     camera_input_ = {};
     external_viewport_hovered_ = false;
     external_viewport_focused_ = false;
+    process_import_pipeline();
     if (saved_content_revision_ == 0U) {
         saved_content_revision_ = scene.content_revision();
         saved_structure_revision_ = scene.structure_revision();
@@ -287,6 +1321,10 @@ void EditorUi::begin_frame(
         }
         if (ImGui::IsKeyPressed(ImGuiKey_O, false)) {
             open_requested_ = true;
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_I, false) &&
+            !import_activity_pending()) {
+            import_dialog_requested_ = true;
         }
     }
 
@@ -356,6 +1394,7 @@ void EditorUi::begin_frame(
             ImGui::DockBuilderDockWindow(
                 "Scene Hierarchy", left);
             ImGui::DockBuilderDockWindow("Inspector", right);
+            ImGui::DockBuilderDockWindow("Material Editor", right);
             ImGui::DockBuilderDockWindow("Renderer", right);
             ImGui::DockBuilderDockWindow("Assets", bottom);
             ImGui::DockBuilderDockWindow("Scene View", center);
@@ -367,8 +1406,15 @@ void EditorUi::begin_frame(
     build_toolbar(scene);
     build_hierarchy(scene);
     build_inspector(scene);
-    build_viewport(renderer, now);
-    build_assets();
+    build_viewport(scene, renderer, now);
+    build_assets(scene, renderer);
+    if (import_dialog_requested_) {
+        queue_import_sources({});
+        import_dialog_requested_ = false;
+    }
+    build_import_window();
+    build_import_results();
+    build_material_editor();
     build_performance(renderer, performance);
     build_external_game_window(now);
     process_file_commands(scene);
@@ -549,6 +1595,16 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
                 editable)) {
             open_requested_ = true;
         }
+        if (ImGui::MenuItem(
+                "Import assets...",
+                "Ctrl+I",
+                false,
+                editable && !import_activity_pending() &&
+                    asset_import_enabled_ &&
+                    import_worker_ != nullptr &&
+                    !import_worker_->failed())) {
+            import_dialog_requested_ = true;
+        }
         ImGui::Separator();
         if (ImGui::MenuItem("Exit")) {
             quit_requested_ = true;
@@ -584,6 +1640,42 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
         }
         ImGui::EndMenu();
     }
+    if (ImGui::BeginMenu("Assets")) {
+        if (ImGui::MenuItem(
+                "Import...",
+                "Ctrl+I",
+                false,
+                play_state_ == EditorPlayState::edit &&
+                    !import_activity_pending() &&
+                    asset_import_enabled_ &&
+                    import_worker_ != nullptr &&
+                    !import_worker_->failed())) {
+            import_dialog_requested_ = true;
+        }
+        ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Window")) {
+        bool material_open =
+            material_editor_ != nullptr &&
+            material_editor_->open;
+        if (ImGui::MenuItem(
+                "Material Editor",
+                nullptr,
+                material_open)) {
+            if (material_editor_ != nullptr) {
+                if (!material_open) {
+                    material_editor_->open = true;
+                } else if (material_editor_->dirty) {
+                    material_editor_->open = true;
+                    material_editor_->
+                        close_confirmation_requested = true;
+                } else {
+                    material_editor_->open = false;
+                }
+            }
+        }
+        ImGui::EndMenu();
+    }
     ImGui::EndMainMenuBar();
 }
 
@@ -599,8 +1691,16 @@ void EditorUi::build_toolbar(SceneDocument& scene) {
         return;
     }
     if (play_state_ == EditorPlayState::edit) {
+        ImGui::BeginDisabled(import_activity_pending());
         if (ImGui::Button("Play")) {
             start_play(scene);
+        }
+        ImGui::EndDisabled();
+        if (import_activity_pending() &&
+            ImGui::IsItemHovered(
+                ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(
+                "Close or finish asset import before Play.");
         }
     } else {
         if (ImGui::Button("Stop")) {
@@ -830,7 +1930,12 @@ void EditorUi::build_inspector(SceneDocument& scene) {
     const bool has_transform =
         node.kind == SceneNodeKind::folder ||
         node.kind == SceneNodeKind::cube ||
+        node.kind == SceneNodeKind::model ||
         node.kind == SceneNodeKind::ground;
+    if (node.kind == SceneNodeKind::model) {
+        ImGui::TextWrapped(
+            "Asset: %s", node.asset_path.c_str());
+    }
     if (has_transform) {
         changed |= ImGui::DragFloat3(
             "Position",
@@ -892,6 +1997,7 @@ void EditorUi::build_inspector(SceneDocument& scene) {
 }
 
 void EditorUi::build_viewport(
+    SceneDocument& scene,
     Renderer& renderer,
     const std::chrono::steady_clock::time_point now) {
     ImGui::SetNextWindowSize(
@@ -926,6 +2032,38 @@ void EditorUi::build_viewport(
         ImVec2(0.0F, 0.0F),
         ImVec2(1.0F, 1.0F));
     viewport_hovered_ = ImGui::IsItemHovered();
+    if (ImGui::BeginDragDropTarget()) {
+        if (const ImGuiPayload* payload =
+                ImGui::AcceptDragDropPayload(
+                    "VCR_ASSET_PATH");
+            payload != nullptr) {
+            if (payload->Data == nullptr ||
+                payload->DataSize <= 1 ||
+                static_cast<std::size_t>(payload->DataSize) >
+                    max_scene_asset_path_bytes + 1U) {
+                asset_error_ =
+                    "Dropped asset path is empty or exceeds "
+                    "the scene path limit.";
+            } else {
+                const auto* bytes =
+                    static_cast<const char*>(payload->Data);
+                const std::size_t size =
+                    static_cast<std::size_t>(
+                        payload->DataSize);
+                if (bytes[size - 1U] != '\0') {
+                    asset_error_ =
+                        "Dropped asset path is not terminated.";
+                } else {
+                    const std::string_view relative_path{
+                        bytes, size - 1U};
+                    static_cast<void>(
+                        add_model_asset_to_scene(
+                            scene, renderer, relative_path, {}));
+                }
+            }
+        }
+        ImGui::EndDragDropTarget();
+    }
     viewport_focused_ = ImGui::IsWindowFocused(
         ImGuiFocusedFlags_RootAndChildWindows);
     ImGui::End();
@@ -980,7 +2118,12 @@ void EditorUi::build_external_game_window(
     ImGui::End();
 }
 
-void EditorUi::build_assets() {
+void EditorUi::build_assets(
+    SceneDocument& scene,
+    Renderer& renderer) {
+    if (external_drop_ != nullptr) {
+        external_drop_->region_valid = false;
+    }
     ImGui::SetNextWindowSize(
         ImVec2(720.0F, 270.0F), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Assets")) {
@@ -997,6 +2140,53 @@ void EditorUi::build_assets() {
         if (asset_browser_.refresh(asset_error_)) {
             selected_asset_.reset();
         }
+    }
+    ImGui::SameLine();
+    const bool can_import =
+        play_state_ == EditorPlayState::edit &&
+        !import_activity_pending() &&
+        asset_import_enabled_ &&
+        import_worker_ != nullptr &&
+        !import_worker_->failed();
+    ImGui::BeginDisabled(!can_import);
+    if (ImGui::Button("Import...")) {
+        import_dialog_requested_ = true;
+    }
+    ImGui::EndDisabled();
+    if (!can_import &&
+        ImGui::IsItemHovered(
+            ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip(
+            !asset_import_enabled_
+                ? "Import requires a writable project checkout; "
+                  "packaged assets are browse-only."
+                : (import_worker_ != nullptr &&
+                   import_worker_->failed()
+                    ? "The import worker stopped after an internal "
+                      "error; restart the editor."
+                : (play_state_ == EditorPlayState::edit
+                    ? "Wait for the current import."
+                    : "Asset import is available only in Edit mode.")));
+    }
+    ImGui::SameLine();
+    const bool can_add_selected_model =
+        play_state_ == EditorPlayState::edit &&
+        selected_asset_.has_value() &&
+        selected_asset_->kind == AssetEntryKind::model;
+    ImGui::BeginDisabled(!can_add_selected_model);
+    if (ImGui::Button("Add to Scene")) {
+        static_cast<void>(add_model_asset_to_scene(
+            scene,
+            renderer,
+            selected_asset_->relative_display,
+            selected_asset_->display_name));
+    }
+    ImGui::EndDisabled();
+    if (!can_add_selected_model &&
+        ImGui::IsItemHovered(
+            ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip(
+            "Select an imported .vcrasset.json model.");
     }
     ImGui::SameLine();
     ImGui::TextUnformatted(
@@ -1020,6 +2210,24 @@ void EditorUi::build_assets() {
         "AssetList",
         ImVec2(0.0F, -58.0F),
         ImGuiChildFlags_Borders);
+    if (external_drop_ != nullptr) {
+        external_drop_->minimum = ImGui::GetWindowPos();
+        const ImVec2 child_size = ImGui::GetWindowSize();
+        external_drop_->maximum = ImVec2{
+            external_drop_->minimum.x + child_size.x,
+            external_drop_->minimum.y + child_size.y,
+        };
+        const ImGuiViewport* const viewport =
+            ImGui::GetWindowViewport();
+        SDL_Window* const viewport_window =
+            viewport_sdl_window(viewport);
+        external_drop_->window_id =
+            viewport_window != nullptr
+            ? SDL_GetWindowID(viewport_window)
+            : 0U;
+        external_drop_->region_valid =
+            external_drop_->window_id != 0U;
+    }
     ImGuiListClipper clipper;
     clipper.Begin(static_cast<int>(entry_count));
     while (clipper.Step()) {
@@ -1047,6 +2255,20 @@ void EditorUi::build_assets() {
                     entry.kind == AssetEntryKind::directory) {
                     pending_asset_directory_ =
                         entry.relative_path;
+                } else if (ImGui::IsMouseDoubleClicked(
+                               ImGuiMouseButton_Left) &&
+                           entry.kind ==
+                               AssetEntryKind::material) {
+                    open_material_editor(entry.relative_path);
+                } else if (ImGui::IsMouseDoubleClicked(
+                               ImGuiMouseButton_Left) &&
+                           entry.kind ==
+                               AssetEntryKind::model) {
+                    static_cast<void>(add_model_asset_to_scene(
+                        scene,
+                        renderer,
+                        entry.relative_display,
+                        entry.display_name));
                 }
             }
             if (ImGui::BeginDragDropSource()) {
@@ -1058,8 +2280,50 @@ void EditorUi::build_assets() {
                     entry.relative_display.c_str());
                 ImGui::EndDragDropSource();
             }
+            if (ImGui::BeginPopupContextItem()) {
+                if (entry.kind == AssetEntryKind::material &&
+                    ImGui::MenuItem("Open in Material Editor")) {
+                    open_material_editor(entry.relative_path);
+                }
+                if (entry.kind == AssetEntryKind::model &&
+                    ImGui::MenuItem("Add to Scene")) {
+                    static_cast<void>(add_model_asset_to_scene(
+                        scene,
+                        renderer,
+                        entry.relative_display,
+                        entry.display_name));
+                }
+                ImGui::EndPopup();
+            }
             ImGui::PopID();
         }
+    }
+    if (external_drop_ != nullptr && external_drop_->hover) {
+        ImGui::GetWindowDrawList()->AddRect(
+            external_drop_->minimum,
+            external_drop_->maximum,
+            IM_COL32(71, 225, 199, 255),
+            2.0F,
+            0,
+            3.0F);
+        const char* const message =
+            "Drop files to import into this folder";
+        const ImVec2 text_size = ImGui::CalcTextSize(message);
+        const ImVec2 center{
+            (external_drop_->minimum.x +
+             external_drop_->maximum.x) *
+                0.5F,
+            (external_drop_->minimum.y +
+             external_drop_->maximum.y) *
+                0.5F,
+        };
+        ImGui::GetWindowDrawList()->AddText(
+            ImVec2{
+                center.x - text_size.x * 0.5F,
+                center.y - text_size.y * 0.5F,
+            },
+            IM_COL32(122, 255, 232, 255),
+            message);
     }
     ImGui::EndChild();
     if (pending_asset_directory_) {
@@ -1086,7 +2350,667 @@ void EditorUi::build_assets() {
         "%zu entries | cache high-water %zu",
         entry_count,
         asset_browser_.high_water_mark());
+    if (import_worker_ != nullptr && import_worker_->busy()) {
+        ImGui::SameLine();
+        ImGui::TextColored(
+            ImVec4(0.35F, 0.9F, 0.8F, 1.0F),
+            "| Importing...");
+    }
     ImGui::End();
+}
+
+bool EditorUi::add_model_asset_to_scene(
+    SceneDocument& scene,
+    Renderer& renderer,
+    const std::string_view relative_path,
+    const std::string_view display_name) {
+    if (play_state_ != EditorPlayState::edit) {
+        asset_error_ =
+            "Models can be added to the scene only in Edit mode.";
+        return false;
+    }
+    if (!valid_scene_asset_path(relative_path)) {
+        asset_error_ =
+            "Only an imported .vcrasset.json model can be added "
+            "to the scene.";
+        return false;
+    }
+
+    try {
+        std::error_code filesystem_error;
+        const std::filesystem::path canonical_root =
+            std::filesystem::weakly_canonical(
+                asset_browser_.root(), filesystem_error);
+        if (filesystem_error || canonical_root.empty()) {
+            asset_error_ =
+                "The configured asset root is unavailable.";
+            return false;
+        }
+        const std::filesystem::path relative =
+            path_from_utf8(relative_path);
+        std::filesystem::path component_path = canonical_root;
+        for (const auto& component : relative) {
+            component_path /= component;
+            const auto status =
+                std::filesystem::symlink_status(
+                    component_path, filesystem_error);
+            if (filesystem_error) {
+                asset_error_ =
+                    "Unable to inspect the selected model path.";
+                return false;
+            }
+            if (std::filesystem::is_symlink(status)) {
+                asset_error_ =
+                    "Symbolic links are not followed for scene models.";
+                return false;
+            }
+        }
+        const std::filesystem::path canonical_asset =
+            std::filesystem::weakly_canonical(
+                canonical_root / relative, filesystem_error);
+        if (filesystem_error) {
+            asset_error_ =
+                "The selected model asset is unavailable.";
+            return false;
+        }
+        const std::filesystem::path rooted_relative =
+            std::filesystem::relative(
+                canonical_asset,
+                canonical_root,
+                filesystem_error);
+        if (filesystem_error ||
+            path_escapes_asset_root(rooted_relative) ||
+            !std::filesystem::is_regular_file(
+                canonical_asset, filesystem_error) ||
+            filesystem_error) {
+            asset_error_ =
+                "The selected model is outside Assets or inaccessible.";
+            return false;
+        }
+
+        constexpr std::string_view manifest_suffix =
+            ".vcrasset.json";
+        std::string_view name = display_name;
+        if (name.empty()) {
+            const std::size_t separator =
+                relative_path.find_last_of('/');
+            name = relative_path.substr(
+                separator == std::string_view::npos
+                    ? 0U
+                    : separator + 1U);
+        }
+        if (name.ends_with(manifest_suffix)) {
+            name.remove_suffix(manifest_suffix.size());
+        }
+        if (name.empty() ||
+            name.size() > max_scene_node_name_bytes ||
+            name.find('\0') != std::string_view::npos) {
+            name = "Model";
+        }
+
+        SceneTransform recommended_transform{};
+        if (!renderer.prepare_editor_model(
+                asset_browser_.root(),
+                relative_path,
+                recommended_transform,
+                asset_error_)) {
+            return false;
+        }
+
+        SceneNodeId parent{};
+        if (const auto selected = scene.node(selected_node_);
+            selected &&
+            selected->get().kind == SceneNodeKind::folder) {
+            parent = selected_node_;
+        }
+        const SceneNodeId model = scene.create_node(
+            std::string(name), SceneNodeKind::model, parent);
+        if (!model) {
+            asset_error_ =
+                "Unable to create the model node; "
+                "the scene capacity may be exhausted.";
+            return false;
+        }
+        const auto node = scene.node(model);
+        if (!node) {
+            static_cast<void>(scene.destroy_subtree(model));
+            asset_error_ =
+                "The new model node became invalid.";
+            return false;
+        }
+        node->get().asset_path = std::string(relative_path);
+        // Store the source-space centering explicitly in the scene so
+        // reloading the document preserves the exact placement.
+        node->get().transform = recommended_transform;
+        scene.mark_content_changed();
+        selected_node_ = model;
+        name_buffer_node_ = {};
+        asset_error_.clear();
+        scene_file_status_ =
+            "Added model to scene: " +
+            std::string(relative_path);
+        return true;
+    } catch (const std::exception&) {
+        asset_error_ =
+            "Unable to add the model because its path is invalid.";
+        return false;
+    }
+}
+
+void EditorUi::process_import_pipeline() {
+    if (import_worker_ == nullptr || import_ui_ == nullptr) {
+        return;
+    }
+    std::vector<AssetImportUiState::Completion> completed;
+    if (!import_worker_->drain(completed)) {
+        return;
+    }
+
+    import_ui_->completions = std::move(completed);
+    import_ui_->results_window_open = true;
+    std::size_t succeeded = 0U;
+    for (const auto& completion : import_ui_->completions) {
+        if (completion.result) {
+            ++succeeded;
+        }
+    }
+    import_ui_->status =
+        "Import completed: " + std::to_string(succeeded) +
+        " succeeded, " +
+        std::to_string(
+            import_ui_->completions.size() - succeeded) +
+        " failed.";
+    if (asset_browser_.refresh(asset_error_)) {
+        selected_asset_.reset();
+    }
+}
+
+void EditorUi::queue_import_sources(
+    std::vector<std::filesystem::path> sources) {
+    if (import_ui_ == nullptr) {
+        return;
+    }
+    if (play_state_ != EditorPlayState::edit ||
+        !asset_import_enabled_) {
+        asset_error_ =
+            !asset_import_enabled_
+            ? "Packaged assets are browse-only; import requires "
+              "a project checkout."
+            : "Asset import is available only in Edit mode.";
+        return;
+    }
+    if (import_worker_ == nullptr || import_worker_->failed()) {
+        asset_error_ =
+            "The asset import worker is unavailable; restart the editor.";
+        return;
+    }
+    if (sources.size() > maximum_import_sources) {
+        sources.resize(maximum_import_sources);
+        import_ui_->status =
+            "The import batch was truncated to 128 source files.";
+    } else {
+        import_ui_->status.clear();
+    }
+    import_ui_->sources = std::move(sources);
+    import_ui_->destination_directory =
+        asset_browser_.current_directory();
+    import_ui_->source_path.fill('\0');
+    import_ui_->import_popup_requested = true;
+}
+
+bool EditorUi::import_activity_pending() const noexcept {
+    return (import_worker_ != nullptr && import_worker_->busy()) ||
+        (import_ui_ != nullptr &&
+         (import_ui_->import_popup_requested ||
+          import_ui_->import_popup_open));
+}
+
+void EditorUi::build_import_window() {
+    if (import_ui_ == nullptr || import_worker_ == nullptr) {
+        return;
+    }
+    if (import_ui_->import_popup_requested) {
+        ImGui::OpenPopup("Import Assets");
+        import_ui_->import_popup_requested = false;
+    }
+
+    import_ui_->import_popup_open = ImGui::BeginPopupModal(
+        "Import Assets",
+        nullptr,
+        ImGuiWindowFlags_AlwaysAutoResize);
+    if (!import_ui_->import_popup_open) {
+        return;
+    }
+
+    ImGui::TextUnformatted(
+        "Import FBX, OBJ, or image files into the project.");
+    ImGui::Text(
+        "Destination: /%s",
+        path_to_utf8(
+            import_ui_->destination_directory).c_str());
+    ImGui::SetNextItemWidth(620.0F);
+    static_cast<void>(ImGui::InputText(
+        "Source path",
+        import_ui_->source_path.data(),
+        import_ui_->source_path.size()));
+    ImGui::SameLine();
+    if (ImGui::Button("Add")) {
+        const std::string_view source_text(
+            import_ui_->source_path.data());
+        if (source_text.empty()) {
+            import_ui_->status = "Enter a source file path.";
+        } else if (import_ui_->sources.size() >=
+                   maximum_import_sources) {
+            import_ui_->status =
+                "An import batch is limited to 128 source files.";
+        } else {
+            const std::filesystem::path source =
+                path_from_utf8(source_text);
+            const bool duplicate = std::ranges::any_of(
+                import_ui_->sources,
+                [&source](const std::filesystem::path& existing) {
+                    return existing == source;
+                });
+            if (!duplicate) {
+                import_ui_->sources.push_back(source);
+            }
+            import_ui_->source_path.fill('\0');
+            import_ui_->status.clear();
+        }
+    }
+    ImGui::TextDisabled(
+        "Paste a path here, or drop files directly into the Assets list.");
+
+    ImGui::BeginChild(
+        "ImportSourceList",
+        ImVec2(720.0F, 220.0F),
+        ImGuiChildFlags_Borders);
+    std::optional<std::size_t> remove_source;
+    for (std::size_t index = 0U;
+         index < import_ui_->sources.size();
+         ++index) {
+        const std::filesystem::path& source =
+            import_ui_->sources[index];
+        ImGui::PushID(static_cast<int>(index));
+        const bool supported = asset_source_is_supported(source);
+        ImGui::TextColored(
+            supported
+                ? ImVec4(0.72F, 0.86F, 0.82F, 1.0F)
+                : ImVec4(1.0F, 0.45F, 0.35F, 1.0F),
+            "%s",
+            supported ? "[ready]" : "[unsupported]");
+        ImGui::SameLine();
+        ImGui::TextWrapped(
+            "%s", path_to_utf8(source).c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Remove")) {
+            remove_source = index;
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+    if (remove_source) {
+        import_ui_->sources.erase(
+            import_ui_->sources.begin() +
+            static_cast<std::ptrdiff_t>(*remove_source));
+    }
+
+    const bool all_sources_supported =
+        !import_ui_->sources.empty() &&
+        std::ranges::all_of(
+            import_ui_->sources,
+            [](const std::filesystem::path& source) {
+                return asset_source_is_supported(source);
+            });
+    const bool can_submit =
+        play_state_ == EditorPlayState::edit &&
+        asset_import_enabled_ &&
+        !import_worker_->failed() &&
+        !import_worker_->busy() &&
+        all_sources_supported;
+    ImGui::BeginDisabled(!can_submit);
+    if (ImGui::Button("Import")) {
+        AssetImportWorker::Batch batch{
+            .sources = import_ui_->sources,
+            .options =
+                ImportAssetOptions{
+                    .asset_root = asset_browser_.root(),
+                    .destination_directory =
+                        import_ui_->destination_directory,
+                },
+        };
+        if (import_worker_->submit(std::move(batch))) {
+            import_ui_->status =
+                "Import queued. Source parsing runs outside "
+                "the render thread.";
+            import_ui_->sources.clear();
+            import_ui_->import_popup_open = false;
+            ImGui::CloseCurrentPopup();
+        } else {
+            import_ui_->status =
+                import_worker_->failed()
+                ? "The asset import worker stopped after an internal "
+                  "error. Restart the editor before importing again."
+                : "The bounded import queue is full.";
+        }
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) {
+        import_ui_->sources.clear();
+        import_ui_->status.clear();
+        import_ui_->import_popup_open = false;
+        ImGui::CloseCurrentPopup();
+    }
+    if (!import_ui_->status.empty()) {
+        ImGui::Separator();
+        ImGui::TextWrapped("%s", import_ui_->status.c_str());
+    }
+    ImGui::EndPopup();
+}
+
+void EditorUi::build_import_results() {
+    if (import_ui_ == nullptr ||
+        !import_ui_->results_window_open) {
+        return;
+    }
+    ImGui::SetNextWindowSize(
+        ImVec2(680.0F, 420.0F), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin(
+            "Import Results",
+            &import_ui_->results_window_open)) {
+        ImGui::TextWrapped("%s", import_ui_->status.c_str());
+        for (std::size_t completion_index = 0U;
+             completion_index < import_ui_->completions.size();
+             ++completion_index) {
+            const auto& completion =
+                import_ui_->completions[completion_index];
+            ImGui::PushID(
+                static_cast<int>(completion_index));
+            ImGui::SeparatorText(
+                path_to_utf8(
+                    completion.source.filename()).c_str());
+            ImGui::TextWrapped(
+                "Source: %s",
+                path_to_utf8(completion.source).c_str());
+            if (completion.error) {
+                ImGui::TextColored(
+                    ImVec4(1.0F, 0.45F, 0.35F, 1.0F),
+                    "Failed: %s",
+                    completion.error->message.c_str());
+                if (!completion.error->path.empty()) {
+                    ImGui::TextWrapped(
+                        "Path: %s",
+                        path_to_utf8(
+                            completion.error->path).c_str());
+                }
+                ImGui::PopID();
+                continue;
+            }
+            if (!completion.result) {
+                ImGui::TextDisabled("No import result.");
+                ImGui::PopID();
+                continue;
+            }
+            ImGui::TextWrapped(
+                "Primary: %s",
+                path_to_utf8(
+                    completion.result->primary_asset).c_str());
+            for (std::size_t file_index = 0U;
+                 file_index < completion.result->files.size();
+                 ++file_index) {
+                const ImportedAssetFile& file =
+                    completion.result->files[file_index];
+                ImGui::PushID(static_cast<int>(file_index));
+                ImGui::BulletText(
+                    "%s: %s",
+                    imported_asset_kind_name(file.kind),
+                    path_to_utf8(
+                        file.relative_path).c_str());
+                if (file.kind == ImportedAssetKind::material) {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Open")) {
+                        open_material_editor(file.relative_path);
+                    }
+                }
+                ImGui::PopID();
+            }
+            for (const std::string& warning :
+                 completion.result->warnings) {
+                ImGui::TextColored(
+                    ImVec4(1.0F, 0.72F, 0.25F, 1.0F),
+                    "Warning: %s",
+                    warning.c_str());
+            }
+            ImGui::PopID();
+        }
+    }
+    ImGui::End();
+}
+
+void EditorUi::open_material_editor(
+    const std::filesystem::path& relative_path) {
+    if (material_editor_ == nullptr) {
+        return;
+    }
+    if (material_editor_->loaded &&
+        material_editor_->relative_path == relative_path) {
+        material_editor_->open = true;
+        return;
+    }
+    if (material_editor_->loaded &&
+        material_editor_->dirty &&
+        material_editor_->relative_path != relative_path) {
+        material_editor_->open = true;
+        material_editor_->error =
+            "Save or revert the current material before opening another.";
+        return;
+    }
+    std::string error;
+    if (!load_material_document(
+            asset_browser_.root(),
+            relative_path,
+            *material_editor_,
+            error)) {
+        material_editor_->loaded = false;
+        material_editor_->error =
+            "Unable to open material: " + error;
+    }
+    material_editor_->open = true;
+}
+
+void EditorUi::build_material_editor() {
+    if (material_editor_ == nullptr ||
+        !material_editor_->open) {
+        return;
+    }
+    ImGui::SetNextWindowSize(
+        ImVec2(430.0F, 520.0F), ImGuiCond_FirstUseEver);
+    bool keep_open = material_editor_->open;
+    if (ImGui::Begin("Material Editor", &keep_open)) {
+        if (!material_editor_->loaded) {
+            ImGui::TextDisabled(
+                "Double-click a .vcrmaterial.json asset to edit it.");
+            if (!material_editor_->error.empty()) {
+                ImGui::TextColored(
+                    ImVec4(1.0F, 0.45F, 0.35F, 1.0F),
+                    "%s",
+                    material_editor_->error.c_str());
+            }
+        } else {
+            ImGui::TextWrapped(
+                "%s",
+                path_to_utf8(
+                    material_editor_->relative_path).c_str());
+            const bool editable =
+                play_state_ == EditorPlayState::edit;
+            ImGui::BeginDisabled(!editable);
+            bool changed = ImGui::InputText(
+                "Name",
+                material_editor_->name.data(),
+                material_editor_->name.size());
+            changed |= ImGui::ColorEdit4(
+                "Base color",
+                &material_editor_->material.base_color.x);
+            changed |= ImGui::SliderFloat(
+                "Metallic",
+                &material_editor_->material.metallic,
+                0.0F,
+                1.0F);
+            changed |= ImGui::SliderFloat(
+                "Roughness",
+                &material_editor_->material.roughness,
+                minimum_pbr_roughness,
+                1.0F);
+            changed |= ImGui::SliderFloat(
+                "Ambient occlusion",
+                &material_editor_->material.ambient_occlusion,
+                0.0F,
+                1.0F);
+            if (changed) {
+                material_editor_->material =
+                    sanitize_pbr_material(
+                        material_editor_->material);
+                material_editor_->dirty = true;
+                material_editor_->status =
+                    "Unsaved material changes.";
+            }
+
+            if (ImGui::Button("Save")) {
+                std::string error;
+                if (!save_material_document(
+                        *material_editor_,
+                        asset_browser_.root(),
+                        error)) {
+                    material_editor_->error =
+                        "Save failed: " + error;
+                } else {
+                    saved_material_update_ =
+                        SavedMaterialUpdate{
+                            .relative_path =
+                                material_editor_->relative_path
+                                    .generic_string(),
+                            .material =
+                                material_editor_->material,
+                        };
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Revert")) {
+                const std::filesystem::path relative =
+                    material_editor_->relative_path;
+                std::string error;
+                if (!load_material_document(
+                        asset_browser_.root(),
+                        relative,
+                        *material_editor_,
+                        error)) {
+                    material_editor_->error =
+                        "Revert failed: " + error;
+                }
+            }
+            ImGui::EndDisabled();
+            if (!editable) {
+                ImGui::TextDisabled(
+                    "Material editing is locked during Play.");
+            }
+
+            ImGui::SeparatorText("Texture references");
+            const nlohmann::json& textures =
+                material_editor_->document.at("textures");
+            if (textures.empty()) {
+                ImGui::TextDisabled("No texture references.");
+            } else {
+                for (const auto& [semantic, reference] :
+                     textures.items()) {
+                    ImGui::Text(
+                        "%s:",
+                        semantic.c_str());
+                    ImGui::SameLine();
+                    ImGui::TextWrapped(
+                        "%s",
+                        reference.get_ref<
+                            const std::string&>().c_str());
+                }
+            }
+            if (!material_editor_->error.empty()) {
+                ImGui::TextColored(
+                    ImVec4(1.0F, 0.45F, 0.35F, 1.0F),
+                    "%s",
+                    material_editor_->error.c_str());
+            } else if (!material_editor_->status.empty()) {
+                ImGui::TextWrapped(
+                    "%s",
+                    material_editor_->status.c_str());
+            }
+        }
+    }
+    ImGui::End();
+
+    if (!keep_open) {
+        if (material_editor_->dirty) {
+            material_editor_->open = true;
+            material_editor_->close_confirmation_requested = true;
+        } else {
+            material_editor_->open = false;
+        }
+    }
+    if (material_editor_->close_confirmation_requested) {
+        ImGui::OpenPopup("Discard material changes?");
+        material_editor_->close_confirmation_requested = false;
+    }
+    if (ImGui::BeginPopupModal(
+            "Discard material changes?",
+            nullptr,
+            ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted(
+            "The material has unsaved changes.");
+        if (ImGui::Button("Save and close")) {
+            std::string error;
+            if (save_material_document(
+                    *material_editor_,
+                    asset_browser_.root(),
+                    error)) {
+                saved_material_update_ =
+                    SavedMaterialUpdate{
+                        .relative_path =
+                            material_editor_->relative_path
+                                .generic_string(),
+                        .material =
+                            material_editor_->material,
+                    };
+                material_editor_->open = false;
+                ImGui::CloseCurrentPopup();
+            } else {
+                material_editor_->error =
+                    "Save failed: " + error;
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Discard")) {
+            const std::filesystem::path relative =
+                material_editor_->relative_path;
+            std::string error;
+            if (load_material_document(
+                    asset_browser_.root(),
+                    relative,
+                    *material_editor_,
+                    error)) {
+                material_editor_->open = false;
+                ImGui::CloseCurrentPopup();
+            } else {
+                material_editor_->error =
+                    "Discard failed: " + error;
+                material_editor_->open = true;
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            material_editor_->open = true;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
 }
 
 void EditorUi::build_performance(
@@ -1148,7 +3072,10 @@ void EditorUi::process_file_commands(SceneDocument& scene) {
         if (play_state_ != EditorPlayState::edit) {
             stop_play(scene);
         }
-        if (scene_is_dirty(scene)) {
+        const bool material_dirty =
+            material_editor_ != nullptr &&
+            material_editor_->dirty;
+        if (scene_is_dirty(scene) || material_dirty) {
             quit_confirmation_requested_ = true;
         } else {
             wants_quit_ = true;
@@ -1190,10 +3117,35 @@ void EditorUi::process_file_commands(SceneDocument& scene) {
             nullptr,
             ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextUnformatted(
-            "The scene has unsaved changes.");
+            "The editor has unsaved scene or material changes.");
         if (ImGui::Button("Save and exit")) {
-            save_scene(scene);
-            if (!scene_is_dirty(scene)) {
+            if (scene_is_dirty(scene)) {
+                save_scene(scene);
+            }
+            bool material_saved = true;
+            if (material_editor_ != nullptr &&
+                material_editor_->dirty) {
+                std::string error;
+                material_saved = save_material_document(
+                    *material_editor_,
+                    asset_browser_.root(),
+                    error);
+                if (!material_saved) {
+                    material_editor_->error =
+                        "Save failed: " + error;
+                    material_editor_->open = true;
+                } else {
+                    saved_material_update_ =
+                        SavedMaterialUpdate{
+                            .relative_path =
+                                material_editor_->relative_path
+                                    .generic_string(),
+                            .material =
+                                material_editor_->material,
+                        };
+                }
+            }
+            if (!scene_is_dirty(scene) && material_saved) {
                 wants_quit_ = true;
                 ImGui::CloseCurrentPopup();
             }
@@ -1321,6 +3273,11 @@ void EditorUi::update_camera_input() {
 
 void EditorUi::start_play(SceneDocument& scene) {
     if (play_state_ != EditorPlayState::edit) {
+        return;
+    }
+    if (import_activity_pending()) {
+        asset_error_ =
+            "Close or finish asset import before entering Play.";
         return;
     }
     edit_scene_snapshot_ = scene;

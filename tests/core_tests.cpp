@@ -463,6 +463,35 @@ int main() {
     }
 
     {
+        expect(
+            vcr::valid_scene_asset_path(
+                "models/tree/tree.vcrasset.json") &&
+                vcr::valid_scene_asset_path(
+                    "import/"
+                    "\xD0\xB4\xD0\xB5\xD1\x80\xD0\xB5"
+                    "\xD0\xB2\xD0\xBE.vcrasset.json"),
+            "scene model asset paths accept bounded relative UTF-8 paths");
+        std::string embedded_nul = "model.vcrasset.json";
+        embedded_nul.push_back('\0');
+        embedded_nul += "hidden";
+        std::string invalid_utf8 = "model/";
+        invalid_utf8.append("\xC0\xAF", 2U);
+        invalid_utf8 += ".vcrasset.json";
+        expect(
+            !vcr::valid_scene_asset_path(
+                "../model.vcrasset.json") &&
+                !vcr::valid_scene_asset_path(
+                    "/model.vcrasset.json") &&
+                !vcr::valid_scene_asset_path(
+                    "C:/model.vcrasset.json") &&
+                !vcr::valid_scene_asset_path(
+                    "folder\\model.vcrasset.json") &&
+                !vcr::valid_scene_asset_path(
+                    "model.obj") &&
+                !vcr::valid_scene_asset_path(embedded_nul) &&
+                !vcr::valid_scene_asset_path(invalid_utf8),
+            "scene model asset paths reject escape and malformed values");
+
         vcr::SceneDocument scene;
         const vcr::SceneNodeId root = scene.create_node(
             "Root", vcr::SceneNodeKind::folder);
@@ -533,11 +562,27 @@ int main() {
             "Sun", vcr::SceneNodeKind::directional_light, root));
         static_cast<void>(scene.create_node(
             "Cube", vcr::SceneNodeKind::cube, root));
+        const vcr::SceneNodeId model = scene.create_node(
+            "Model", vcr::SceneNodeKind::model, root);
+        if (auto model_node = scene.node(model)) {
+            model_node->get().asset_path =
+                "models/tree/tree.vcrasset.json";
+            model_node->get().transform.translation =
+                glm::vec3(2.0F, 3.0F, -4.0F);
+            scene.mark_content_changed();
+        }
         std::vector<vcr::SceneGpuInstance> instances;
+        std::vector<vcr::SceneModelInstance> models;
         const vcr::SceneRenderView visible =
-            scene.build_render_view(instances);
+            scene.build_render_view(instances, models);
         expect(
             visible.cubes.size() == 1U &&
+                visible.models.size() == 1U &&
+                visible.models[0].asset_path ==
+                    "models/tree/tree.vcrasset.json" &&
+                visible.models[0].model_row_0.w == 2.0F &&
+                visible.models[0].model_row_1.w == 3.0F &&
+                visible.models[0].model_row_2.w == -4.0F &&
                 visible.terrain_visible &&
                 visible.sky_visible &&
                 visible.sun_visible,
@@ -547,9 +592,10 @@ int main() {
             scene.mark_content_changed();
         }
         const vcr::SceneRenderView hidden =
-            scene.build_render_view(instances);
+            scene.build_render_view(instances, models);
         expect(
             hidden.cubes.empty() &&
+                hidden.models.empty() &&
                 !hidden.terrain_visible &&
                 !hidden.sky_visible &&
                 !hidden.sun_visible,
@@ -584,9 +630,10 @@ int main() {
         }
 
         std::vector<vcr::SceneGpuInstance> instances;
+        std::vector<vcr::SceneModelInstance> models;
         instances.reserve(1U);
         const vcr::SceneRenderView snapshot =
-            scene.build_render_view(instances);
+            scene.build_render_view(instances, models);
         expect(
             snapshot.cubes.size() == 1U,
             "scene transform emits one cube");
@@ -733,7 +780,7 @@ int main() {
                     std::filesystem::path("folder") &&
                 browser.entries().size() == 1U &&
                 browser.entries().front().kind ==
-                    vcr::AssetEntryKind::binary,
+                    vcr::AssetEntryKind::model,
             "asset browser navigates into project assets");
         const std::size_t stable_entry_count =
             browser.entries().size();
@@ -755,6 +802,11 @@ int main() {
         const vcr::SceneNodeId scene_cube =
             source_scene.create_node(
                 "Cube", vcr::SceneNodeKind::cube, scene_root);
+        const vcr::SceneNodeId scene_model =
+            source_scene.create_node(
+                "Imported tree",
+                vcr::SceneNodeKind::model,
+                scene_root);
         if (auto cube = source_scene.node(scene_cube)) {
             cube->get().transform.translation =
                 glm::vec3(3.0F, 2.0F, -7.0F);
@@ -769,6 +821,14 @@ int main() {
                 .roughness = 0.24F,
                 .ambient_occlusion = 0.9F,
             };
+            source_scene.mark_content_changed();
+        }
+        if (auto model = source_scene.node(scene_model)) {
+            model->get().asset_path =
+                "tree_stump_01_4k/"
+                "tree_stump_01_4k.vcrasset.json";
+            model->get().transform.translation =
+                glm::vec3(-2.0F, 0.0F, -5.0F);
             source_scene.mark_content_changed();
         }
         const std::filesystem::path scene_file =
@@ -788,10 +848,15 @@ int main() {
         source_scene.build_node_records(source_records);
         loaded_scene.build_node_records(loaded_records);
         expect(
-            loaded_records.size() == 2U &&
+            loaded_records.size() == 3U &&
                 source_records.size() == loaded_records.size() &&
                 loaded_records[1].parent_record_index == 0U &&
                 loaded_records[1].value.name == "Cube" &&
+                loaded_records[2].value.kind ==
+                    vcr::SceneNodeKind::model &&
+                loaded_records[2].value.asset_path ==
+                    "tree_stump_01_4k/"
+                    "tree_stump_01_4k.vcrasset.json" &&
                 close_to(
                     loaded_records[1].value.transform.scale.z,
                     4.0,
@@ -809,7 +874,18 @@ int main() {
                         .value.material.ambient_occlusion,
                     0.9,
                     0.0001),
-            "scene JSON preserves hierarchy and PBR material values");
+            "scene JSON preserves hierarchy, model asset and PBR values");
+
+        vcr::SceneDocument invalid_model_scene;
+        static_cast<void>(invalid_model_scene.create_node(
+            "Missing asset",
+            vcr::SceneNodeKind::model));
+        expect(
+            !vcr::save_scene_file(
+                invalid_model_scene,
+                temporary_root / "invalid-model.scene.json",
+                error),
+            "scene save rejects a model without an asset path");
 
         const std::filesystem::path legacy_scene_file =
             temporary_root / "legacy.scene.json";
@@ -877,6 +953,28 @@ int main() {
                 invalid_scene_file, unchanged, error) &&
                 unchanged.size() == unchanged_size,
             "invalid scene load leaves the current document unchanged");
+
+        const std::filesystem::path escaping_asset_scene_file =
+            temporary_root / "escaping-asset.scene.json";
+        {
+            std::ofstream invalid(escaping_asset_scene_file);
+            invalid
+                << "{\"format\":\"vulkan_cube_scene\","
+                   "\"version\":1,\"nodes\":[{"
+                   "\"name\":\"Escaping\",\"kind\":\"model\","
+                   "\"asset_path\":\"../outside.vcrasset.json\","
+                   "\"parent\":null,\"visible\":true,"
+                   "\"expanded\":true,\"transform\":{"
+                   "\"translation\":[0,0,0],"
+                   "\"rotation_degrees\":[0,0,0],"
+                   "\"scale\":[1,1,1]},"
+                   "\"color\":[1,1,1,1]}]}";
+        }
+        expect(
+            !vcr::load_scene_file(
+                escaping_asset_scene_file, unchanged, error) &&
+                unchanged.size() == unchanged_size,
+            "scene load rejects an asset-root escape transactionally");
 
         filesystem_error.clear();
         static_cast<void>(std::filesystem::remove_all(

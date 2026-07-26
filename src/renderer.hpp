@@ -12,6 +12,7 @@
 #include <SDL3/SDL.h>
 
 #include <glm/mat4x4.hpp>
+#include <glm/vec3.hpp>
 
 #include <array>
 #include <chrono>
@@ -22,6 +23,8 @@
 #include <vector>
 
 #if VCR_EDITOR_ENABLED
+#include "cooked_model_asset.hpp"
+#include "cooked_texture_asset.hpp"
 #include "scene_document.hpp"
 struct ImDrawData;
 #endif
@@ -138,7 +141,18 @@ public:
         return context_ != nullptr;
     }
 #if VCR_EDITOR_ENABLED
-    void update_editor_scene(const SceneRenderView& view);
+    [[nodiscard]] bool prepare_editor_model(
+        const std::filesystem::path& asset_root,
+        std::string_view relative_path,
+        SceneTransform& recommended_transform,
+        std::string& error);
+    [[nodiscard]] bool update_editor_scene(
+        const SceneRenderView& view,
+        const std::filesystem::path& asset_root,
+        std::string& error);
+    [[nodiscard]] bool apply_editor_material_factors(
+        std::string_view material_relative_path,
+        PbrMaterial material) noexcept;
     void invalidate_editor_scene() noexcept;
     [[nodiscard]] bool prepare_editor_viewport(VkExtent2D extent);
     [[nodiscard]] VkImageView editor_viewport_image_view() const noexcept {
@@ -182,6 +196,42 @@ private:
         GpuTexture depth{};
         VkImageLayout color_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         VkImageLayout depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    };
+
+    struct EditorModelSubmesh {
+        std::string material_relative_path{};
+        PbrMaterial material{};
+        VkDescriptorSet material_descriptor_set = VK_NULL_HANDLE;
+        std::uint32_t first_index = 0U;
+        std::uint32_t index_count = 0U;
+    };
+
+    struct EditorModelAsset {
+        std::string relative_path{};
+        GpuBuffer vertex_buffer{};
+        GpuBuffer index_buffer{};
+        std::vector<EditorModelSubmesh> submeshes{};
+        SceneTransform recommended_transform{};
+        VkDeviceSize gpu_bytes = 0U;
+    };
+
+    struct EditorModelDraw {
+        VkDescriptorSet material_descriptor_set = VK_NULL_HANDLE;
+        std::uint32_t asset_index = 0U;
+        std::uint32_t first_index = 0U;
+        std::uint32_t index_count = 0U;
+        std::uint32_t first_instance = 0U;
+        std::uint32_t instance_count = 0U;
+    };
+
+    struct EditorTextureAsset {
+        std::string relative_path{};
+        GpuTexture texture{};
+        CookedTextureSemantic semantic =
+            CookedTextureSemantic::unspecified;
+        CookedTextureColorSpace color_space =
+            CookedTextureColorSpace::unspecified;
+        VkDeviceSize gpu_bytes = 0U;
     };
 #endif
 
@@ -235,6 +285,22 @@ private:
 #if VCR_EDITOR_ENABLED
     void create_editor_viewport(VkExtent2D extent);
     void destroy_editor_viewport() noexcept;
+    void create_editor_material_resources();
+    [[nodiscard]] std::optional<std::uint32_t>
+        find_or_load_editor_texture(
+            const std::filesystem::path& asset_root,
+            const std::filesystem::path& relative_path,
+            std::string& error);
+    [[nodiscard]] std::optional<VkDescriptorSet>
+        create_editor_material_descriptor(
+        const GpuTexture& base_color,
+        const GpuTexture& normal,
+        std::string& error);
+    [[nodiscard]] std::optional<std::uint32_t>
+        find_or_load_editor_model(
+            const std::filesystem::path& asset_root,
+            std::string_view relative_path,
+            std::string& error);
     void record_editor_scene_upload(
         VkCommandBuffer command_buffer,
         FrameContext& frame);
@@ -258,6 +324,10 @@ private:
     VkPipeline terrain_shadow_pipeline_ = VK_NULL_HANDLE;
     VkPipeline aa_pipeline_ = VK_NULL_HANDLE;
     VkPipeline aa_scene_pipeline_ = VK_NULL_HANDLE;
+#if VCR_EDITOR_ENABLED
+    VkPipeline editor_model_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline aa_editor_model_pipeline_ = VK_NULL_HANDLE;
+#endif
     VkPipeline aa_terrain_pipeline_ = VK_NULL_HANDLE;
     VkPipeline aa_sky_pipeline_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout anti_aliasing_descriptor_set_layout_ =
@@ -310,7 +380,20 @@ private:
     std::optional<ScreenshotCapture> completed_screenshot_{};
 #if VCR_EDITOR_ENABLED
     EditorViewportResources editor_viewport_{};
+    VkDescriptorSetLayout editor_material_descriptor_set_layout_ =
+        VK_NULL_HANDLE;
+    VkDescriptorPool editor_material_descriptor_pool_ =
+        VK_NULL_HANDLE;
     std::vector<SceneGpuInstance> editor_scene_instances_{};
+    std::vector<EditorModelAsset> editor_model_assets_{};
+    std::vector<EditorModelDraw> editor_model_draws_{};
+    std::vector<EditorTextureAsset> editor_texture_assets_{};
+    std::vector<std::uint32_t> editor_model_sort_scratch_{};
+    GpuTexture editor_default_base_color_texture_{};
+    GpuTexture editor_default_normal_texture_{};
+    VkDeviceSize editor_model_gpu_bytes_ = 0U;
+    VkDeviceSize editor_texture_gpu_bytes_ = 0U;
+    std::uint32_t editor_material_descriptor_count_ = 0U;
     std::uint32_t editor_ground_count_ = 0U;
     std::uint32_t editor_cube_count_ = 0U;
     std::uint64_t editor_scene_revision_ = 1U;

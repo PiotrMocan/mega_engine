@@ -40,6 +40,22 @@ struct Vertex {
     float normal[3];
 };
 
+#if VCR_EDITOR_ENABLED
+inline constexpr std::uint32_t maximum_editor_model_assets = 1'024U;
+inline constexpr std::uint32_t maximum_editor_texture_assets = 4'096U;
+inline constexpr std::uint32_t maximum_editor_material_descriptors = 4'096U;
+inline constexpr VkDeviceSize maximum_editor_model_gpu_bytes =
+    2ULL * 1024ULL * 1024ULL * 1024ULL;
+inline constexpr VkDeviceSize maximum_single_editor_model_gpu_bytes =
+    512ULL * 1024ULL * 1024ULL;
+inline constexpr VkDeviceSize maximum_editor_texture_gpu_bytes =
+    2ULL * 1024ULL * 1024ULL * 1024ULL;
+inline constexpr VkDeviceSize maximum_single_editor_texture_gpu_bytes =
+    512ULL * 1024ULL * 1024ULL;
+inline constexpr std::size_t maximum_editor_scene_instances =
+    static_cast<std::size_t>(max_scene_nodes) + 1U;
+#endif
+
 inline constexpr float sun_direction_x = 0.447F;
 inline constexpr float sun_direction_y = 0.707F;
 inline constexpr float sun_direction_z = -0.548F;
@@ -628,7 +644,11 @@ void Renderer::initialize(
 #if VCR_EDITOR_ENABLED
     editor_output_enabled_ = enable_editor_output;
     editor_scene_instances_.reserve(
-        static_cast<std::size_t>(max_scene_nodes) + 1U);
+        maximum_editor_scene_instances);
+    editor_model_assets_.reserve(64U);
+    editor_texture_assets_.reserve(128U);
+    editor_model_draws_.reserve(max_scene_nodes);
+    editor_model_sort_scratch_.reserve(max_scene_nodes);
 #else
     static_cast<void>(enable_editor_output);
 #endif
@@ -681,6 +701,8 @@ void Renderer::shutdown() noexcept {
 #if VCR_EDITOR_ENABLED
     destroy_editor_viewport();
     editor_scene_instances_.clear();
+    editor_model_draws_.clear();
+    editor_model_sort_scratch_.clear();
     editor_ground_count_ = 0U;
     editor_cube_count_ = 0U;
     editor_terrain_visible_ = false;
@@ -690,6 +712,15 @@ void Renderer::shutdown() noexcept {
 #endif
     destroy_scene_resources();
     destroy_pipeline();
+#if VCR_EDITOR_ENABLED
+    if (editor_material_descriptor_set_layout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(
+            context_->device(),
+            editor_material_descriptor_set_layout_,
+            nullptr);
+        editor_material_descriptor_set_layout_ = VK_NULL_HANDLE;
+    }
+#endif
     save_pipeline_cache();
     if (pipeline_cache_ != VK_NULL_HANDLE) {
         vkDestroyPipelineCache(
@@ -949,19 +980,553 @@ bool Renderer::prepare_editor_viewport(VkExtent2D extent) {
     return true;
 }
 
-void Renderer::update_editor_scene(
-    const SceneRenderView& view) {
+void Renderer::create_editor_material_resources() {
+    constexpr std::array<std::uint8_t, 4U> white_pixel{
+        255U, 255U, 255U, 255U};
+    constexpr std::array<std::uint8_t, 4U> flat_normal_pixel{
+        128U, 128U, 255U, 255U};
+    editor_default_base_color_texture_.create(
+        *context_,
+        1U,
+        1U,
+        VK_FORMAT_R8G8B8A8_SRGB,
+        "editor default white base-color texture");
+    upload_to_device_texture(
+        editor_default_base_color_texture_,
+        std::as_bytes(std::span{white_pixel}),
+        4U,
+        "editor default white base-color texture");
+    editor_default_normal_texture_.create(
+        *context_,
+        1U,
+        1U,
+        VK_FORMAT_R8G8B8A8_UNORM,
+        "editor default flat normal texture");
+    upload_to_device_texture(
+        editor_default_normal_texture_,
+        std::as_bytes(std::span{flat_normal_pixel}),
+        4U,
+        "editor default flat normal texture");
+}
+
+std::optional<std::uint32_t> Renderer::find_or_load_editor_texture(
+    const std::filesystem::path& asset_root,
+    const std::filesystem::path& relative_path,
+    std::string& error) {
+    const std::string cache_key =
+        relative_path.lexically_normal().generic_string();
+    for (std::uint32_t index = 0U;
+         index < editor_texture_assets_.size();
+         ++index) {
+        if (editor_texture_assets_[index].relative_path == cache_key) {
+            return index;
+        }
+    }
+    if (editor_texture_assets_.size() >= maximum_editor_texture_assets) {
+        error =
+            "The editor texture cache reached its bounded 4096-asset limit.";
+        return std::nullopt;
+    }
+
+    CookedTextureLoadOptions options{};
+    options.maximum_dimension =
+        std::min(
+            options.maximum_dimension,
+            context_->properties().limits.maxImageDimension2D);
+    options.maximum_decoded_bytes =
+        maximum_single_editor_texture_gpu_bytes;
+    const CookedTextureLoadResult loaded =
+        load_cooked_texture_asset(asset_root, relative_path, options);
+    if (!loaded) {
+        error =
+            "Unable to load texture '" + cache_key +
+            "': " + loaded.error().message;
+        return std::nullopt;
+    }
+    const CookedTextureAsset& texture = loaded.value();
+    if (texture.width == 0U || texture.height == 0U ||
+        texture.row_stride_bytes != texture.width * 4U ||
+        texture.pixels.size() !=
+            static_cast<std::size_t>(texture.row_stride_bytes) *
+                texture.height) {
+        error =
+            "Texture '" + cache_key +
+            "' did not decode to tightly packed RGBA8 pixels.";
+        return std::nullopt;
+    }
+
+    const std::uint64_t base_bytes = texture.pixels.size();
+    if (base_bytes >
+        std::numeric_limits<VkDeviceSize>::max() / 2U) {
+        error = "Texture '" + cache_key + "' exceeds the GPU size range.";
+        return std::nullopt;
+    }
+    // A complete mip chain is less than 4/3 of the base image. The 2x
+    // bound keeps the accounting overflow-free and conservative.
+    const VkDeviceSize gpu_bytes =
+        static_cast<VkDeviceSize>(base_bytes * 2U);
+    if (gpu_bytes > maximum_single_editor_texture_gpu_bytes ||
+        editor_texture_gpu_bytes_ >
+            maximum_editor_texture_gpu_bytes - gpu_bytes) {
+        error =
+            "Texture '" + cache_key +
+            "' exceeds the bounded editor GPU texture cache.";
+        return std::nullopt;
+    }
+
+    const VkFormat format =
+        texture.color_space == CookedTextureColorSpace::srgb
+        ? VK_FORMAT_R8G8B8A8_SRGB
+        : VK_FORMAT_R8G8B8A8_UNORM;
+    VkFormatProperties properties{};
+    vkGetPhysicalDeviceFormatProperties(
+        context_->physical_device(), format, &properties);
+    constexpr VkFormatFeatureFlags required_features =
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+        VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    if ((properties.optimalTilingFeatures & required_features) !=
+        required_features) {
+        error =
+            "The selected GPU cannot sample imported RGBA8 textures.";
+        return std::nullopt;
+    }
+    constexpr VkFormatFeatureFlags mip_features =
+        VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+        VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+        VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    const bool mipmaps_supported =
+        (properties.optimalTilingFeatures & mip_features) ==
+        mip_features;
+
+    EditorTextureAsset gpu_texture{};
+    gpu_texture.relative_path = cache_key;
+    gpu_texture.semantic = texture.semantic;
+    gpu_texture.color_space = texture.color_space;
+    gpu_texture.gpu_bytes = gpu_bytes;
+    if (mipmaps_supported) {
+        std::uint32_t mip_levels = 1U;
+        for (std::uint32_t extent =
+                 std::max(texture.width, texture.height);
+             extent > 1U;
+             extent >>= 1U) {
+            ++mip_levels;
+        }
+        gpu_texture.texture.create_mipmapped(
+            *context_,
+            texture.width,
+            texture.height,
+            mip_levels,
+            format,
+            "editor imported material texture");
+    } else {
+        gpu_texture.texture.create(
+            *context_,
+            texture.width,
+            texture.height,
+            format,
+            "editor imported material texture");
+    }
+    upload_to_device_texture(
+        gpu_texture.texture,
+        std::as_bytes(std::span{texture.pixels}),
+        4U,
+        cache_key);
+
+    editor_texture_assets_.push_back(std::move(gpu_texture));
+    editor_texture_gpu_bytes_ += gpu_bytes;
+    return static_cast<std::uint32_t>(
+        editor_texture_assets_.size() - 1U);
+}
+
+std::optional<VkDescriptorSet>
+Renderer::create_editor_material_descriptor(
+    const GpuTexture& base_color,
+    const GpuTexture& normal,
+    std::string& error) {
+    if (editor_material_descriptor_pool_ == VK_NULL_HANDLE ||
+        editor_material_descriptor_set_layout_ == VK_NULL_HANDLE) {
+        error = "Editor material descriptors are not initialized.";
+        return std::nullopt;
+    }
+    if (editor_material_descriptor_count_ >=
+        maximum_editor_material_descriptors) {
+        error =
+            "The editor material descriptor cache reached its bounded "
+            "4096-set limit.";
+        return std::nullopt;
+    }
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    const VkDescriptorSetAllocateInfo allocate_info{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = editor_material_descriptor_pool_,
+        .descriptorSetCount = 1U,
+        .pSetLayouts = &editor_material_descriptor_set_layout_,
+    };
+    const VkResult result = vkAllocateDescriptorSets(
+        context_->device(), &allocate_info, &descriptor_set);
+    if (result != VK_SUCCESS) {
+        error =
+            "Unable to allocate an editor material descriptor set (VkResult " +
+            std::to_string(static_cast<int>(result)) + ").";
+        return std::nullopt;
+    }
+
+    const std::array image_infos{
+        VkDescriptorImageInfo{
+            .sampler = base_color.sampler(),
+            .imageView = base_color.view(),
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        },
+        VkDescriptorImageInfo{
+            .sampler = normal.sampler(),
+            .imageView = normal.view(),
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        },
+    };
+    const std::array writes{
+        VkWriteDescriptorSet{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = descriptor_set,
+            .dstBinding = 0U,
+            .descriptorCount = 1U,
+            .descriptorType =
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &image_infos[0U],
+        },
+        VkWriteDescriptorSet{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = descriptor_set,
+            .dstBinding = 1U,
+            .descriptorCount = 1U,
+            .descriptorType =
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &image_infos[1U],
+        },
+    };
+    vkUpdateDescriptorSets(
+        context_->device(),
+        static_cast<std::uint32_t>(writes.size()),
+        writes.data(),
+        0U,
+        nullptr);
+    ++editor_material_descriptor_count_;
+    return descriptor_set;
+}
+
+std::optional<std::uint32_t> Renderer::find_or_load_editor_model(
+    const std::filesystem::path& asset_root,
+    const std::string_view relative_path,
+    std::string& error) {
+    for (std::uint32_t index = 0U;
+         index < editor_model_assets_.size();
+         ++index) {
+        if (editor_model_assets_[index].relative_path ==
+            relative_path) {
+            return index;
+        }
+    }
+    if (editor_model_assets_.size() >=
+        maximum_editor_model_assets) {
+        error =
+            "The editor model cache reached its bounded 1024-asset limit.";
+        return std::nullopt;
+    }
+
+    CookedModelLoadOptions options{};
+    options.maximum_mesh_file_bytes =
+        maximum_single_editor_model_gpu_bytes * 2U;
+    options.maximum_submeshes =
+        maximum_editor_material_descriptors;
+    options.maximum_materials =
+        maximum_editor_material_descriptors;
+    const CookedModelLoadResult loaded =
+        load_cooked_model_asset(
+            asset_root,
+            std::filesystem::path(relative_path),
+            options);
+    if (!loaded) {
+        error =
+            "Unable to load model '" + std::string(relative_path) +
+            "': " + loaded.error().message;
+        return std::nullopt;
+    }
+    const CookedModelAsset& model = loaded.value();
+    if (model.vertices.empty() ||
+        model.indices.empty() ||
+        model.submeshes.empty()) {
+        error =
+            "Model '" + std::string(relative_path) +
+            "' contains no renderable geometry.";
+        return std::nullopt;
+    }
+
+    const std::uint64_t vertex_bytes =
+        static_cast<std::uint64_t>(model.vertices.size()) *
+        sizeof(CookedModelVertex);
+    const std::uint64_t index_bytes =
+        static_cast<std::uint64_t>(model.indices.size()) *
+        sizeof(std::uint32_t);
+    if (vertex_bytes >
+            std::numeric_limits<VkDeviceSize>::max() - index_bytes) {
+        error =
+            "Model '" + std::string(relative_path) +
+            "' exceeds the GPU buffer size range.";
+        return std::nullopt;
+    }
+    const VkDeviceSize gpu_bytes =
+        static_cast<VkDeviceSize>(vertex_bytes + index_bytes);
+    if (gpu_bytes > maximum_single_editor_model_gpu_bytes ||
+        editor_model_gpu_bytes_ >
+            maximum_editor_model_gpu_bytes - gpu_bytes) {
+        error =
+            "Model '" + std::string(relative_path) +
+            "' exceeds the bounded editor GPU mesh cache.";
+        return std::nullopt;
+    }
+
+    glm::vec3 minimum(
+        std::numeric_limits<float>::max());
+    glm::vec3 maximum(
+        std::numeric_limits<float>::lowest());
+    for (const CookedModelVertex& source : model.vertices) {
+        const glm::vec3 position{
+            source.position[0U],
+            source.position[1U],
+            source.position[2U],
+        };
+        minimum = glm::min(minimum, position);
+        maximum = glm::max(maximum, position);
+    }
+
+    EditorModelAsset gpu_asset{};
+    gpu_asset.relative_path = relative_path;
+    const glm::vec3 dimensions = maximum - minimum;
+    const float largest_dimension = std::max(
+        dimensions.x, std::max(dimensions.y, dimensions.z));
+    constexpr float target_largest_dimension = 3.0F;
+    const float scale =
+        largest_dimension > std::numeric_limits<float>::epsilon()
+        ? std::clamp(
+              target_largest_dimension / largest_dimension,
+              0.0001F,
+              1000.0F)
+        : 1.0F;
+    gpu_asset.recommended_transform.scale = glm::vec3(scale);
+    gpu_asset.recommended_transform.translation = glm::vec3{
+        -(minimum.x + maximum.x) * 0.5F * scale,
+        -minimum.y * scale,
+        -5.0F - (minimum.z + maximum.z) * 0.5F * scale,
+    };
+    gpu_asset.gpu_bytes = gpu_bytes;
+    gpu_asset.submeshes.reserve(model.submeshes.size());
+
+    const std::size_t descriptor_count =
+        std::max<std::size_t>(model.materials.size(), 1U);
+    if (descriptor_count >
+        maximum_editor_material_descriptors -
+            editor_material_descriptor_count_) {
+        error =
+            "Model '" + std::string(relative_path) +
+            "' exceeds the bounded editor material descriptor cache.";
+        return std::nullopt;
+    }
+    std::vector<VkDescriptorSet> material_descriptors(
+        descriptor_count, VK_NULL_HANDLE);
+    for (std::size_t material_index = 0U;
+         material_index < descriptor_count;
+         ++material_index) {
+        const CookedModelMaterial* material =
+            material_index < model.materials.size()
+            ? &model.materials[material_index]
+            : nullptr;
+        std::optional<std::uint32_t> base_color_index;
+        std::optional<std::uint32_t> normal_index;
+        const auto load_slot =
+            [this,
+             &asset_root,
+             &relative_path](
+                const std::optional<std::filesystem::path>& reference,
+                const CookedTextureSemantic expected_semantic,
+                const CookedTextureColorSpace expected_color_space,
+                std::optional<std::uint32_t>& destination) {
+                if (!reference) {
+                    return;
+                }
+                std::string texture_error;
+                const auto index = find_or_load_editor_texture(
+                    asset_root, *reference, texture_error);
+                if (!index) {
+                    std::cerr
+                        << "warning: model '" << relative_path
+                        << "' uses the fallback texture because "
+                        << texture_error << '\n';
+                    return;
+                }
+                const EditorTextureAsset& texture =
+                    editor_texture_assets_[*index];
+                if (texture.semantic != expected_semantic ||
+                    texture.color_space != expected_color_space) {
+                    std::cerr
+                        << "warning: model '" << relative_path
+                        << "' has a texture semantic/color-space mismatch "
+                           "in '"
+                        << reference->generic_string()
+                        << "'; using the safe fallback\n";
+                    return;
+                }
+                destination = index;
+            };
+        if (material != nullptr) {
+            load_slot(
+                material->base_color_texture,
+                CookedTextureSemantic::base_color,
+                CookedTextureColorSpace::srgb,
+                base_color_index);
+            load_slot(
+                material->normal_texture,
+                CookedTextureSemantic::normal,
+                CookedTextureColorSpace::linear,
+                normal_index);
+        }
+        const GpuTexture& base_color =
+            base_color_index
+            ? editor_texture_assets_[*base_color_index].texture
+            : editor_default_base_color_texture_;
+        const GpuTexture& normal =
+            normal_index
+            ? editor_texture_assets_[*normal_index].texture
+            : editor_default_normal_texture_;
+        const auto descriptor =
+            create_editor_material_descriptor(
+                base_color, normal, error);
+        if (!descriptor) {
+            if (material_index > 0U) {
+                const std::uint32_t allocated_count =
+                    static_cast<std::uint32_t>(material_index);
+                const VkResult free_result = vkFreeDescriptorSets(
+                    context_->device(),
+                    editor_material_descriptor_pool_,
+                    allocated_count,
+                    material_descriptors.data());
+                if (free_result == VK_SUCCESS) {
+                    editor_material_descriptor_count_ -=
+                        allocated_count;
+                } else {
+                    std::cerr
+                        << "warning: unable to roll back partial editor "
+                           "material descriptors (VkResult "
+                        << static_cast<int>(free_result) << ")\n";
+                }
+            }
+            return std::nullopt;
+        }
+        material_descriptors[material_index] = *descriptor;
+    }
+
+    for (const CookedModelSubmesh& source : model.submeshes) {
+        if (source.first_index >
+                std::numeric_limits<std::uint32_t>::max() ||
+            source.index_count >
+                std::numeric_limits<std::uint32_t>::max()) {
+            error =
+                "Model '" + std::string(relative_path) +
+                "' has a draw range outside Vulkan's 32-bit limits.";
+            return std::nullopt;
+        }
+        PbrMaterial material{};
+        std::string material_relative_path;
+        VkDescriptorSet material_descriptor =
+            material_descriptors.front();
+        if (source.material_index < model.materials.size()) {
+            material =
+                model.materials[source.material_index].factors;
+            material_relative_path =
+                model.materials[source.material_index]
+                    .relative_path.generic_string();
+            material_descriptor =
+                material_descriptors[source.material_index];
+        }
+        gpu_asset.submeshes.push_back(EditorModelSubmesh{
+            .material_relative_path =
+                std::move(material_relative_path),
+            .material = sanitize_pbr_material(material),
+            .material_descriptor_set = material_descriptor,
+            .first_index =
+                static_cast<std::uint32_t>(source.first_index),
+            .index_count =
+                static_cast<std::uint32_t>(source.index_count),
+        });
+    }
+
+    gpu_asset.vertex_buffer.create(
+        *context_,
+        static_cast<VkDeviceSize>(vertex_bytes),
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        0,
+        "editor imported model vertex buffer");
+    gpu_asset.index_buffer.create(
+        *context_,
+        static_cast<VkDeviceSize>(index_bytes),
+        VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        0,
+        "editor imported model index buffer");
+    upload_to_device_buffer(
+        gpu_asset.vertex_buffer,
+        std::as_bytes(std::span{model.vertices}));
+    upload_to_device_buffer(
+        gpu_asset.index_buffer,
+        std::as_bytes(std::span{model.indices}));
+
+    editor_model_assets_.push_back(std::move(gpu_asset));
+    editor_model_gpu_bytes_ += gpu_bytes;
+    return static_cast<std::uint32_t>(
+        editor_model_assets_.size() - 1U);
+}
+
+bool Renderer::prepare_editor_model(
+    const std::filesystem::path& asset_root,
+    const std::string_view relative_path,
+    SceneTransform& recommended_transform,
+    std::string& error) {
+    error.clear();
+    if (!editor_output_enabled_ || context_ == nullptr) {
+        error = "The editor renderer is not initialized.";
+        return false;
+    }
+    const auto index = find_or_load_editor_model(
+        asset_root, relative_path, error);
+    if (!index) {
+        return false;
+    }
+    recommended_transform =
+        editor_model_assets_[*index].recommended_transform;
+    return true;
+}
+
+bool Renderer::update_editor_scene(
+    const SceneRenderView& view,
+    const std::filesystem::path& asset_root,
+    std::string& error) {
+    error.clear();
     if (!editor_output_enabled_ ||
         view.revision == editor_scene_revision_) {
-        return;
+        return true;
     }
     const std::size_t ground_count =
         view.has_ground ? 1U : 0U;
     if (view.cubes.size() >
-        static_cast<std::size_t>(max_scene_nodes) - ground_count) {
-        fatal("Editor scene exceeds the bounded GPU instance capacity.");
+        maximum_editor_scene_instances - ground_count) {
+        error =
+            "Editor scene exceeds the bounded GPU instance capacity.";
+        return false;
     }
     editor_scene_instances_.clear();
+    editor_model_draws_.clear();
     if (view.has_ground) {
         editor_scene_instances_.push_back(view.ground);
     }
@@ -969,6 +1534,100 @@ void Renderer::update_editor_scene(
         editor_scene_instances_.end(),
         view.cubes.begin(),
         view.cubes.end());
+
+    bool complete = true;
+    editor_model_sort_scratch_.clear();
+    editor_model_sort_scratch_.reserve(view.models.size());
+    for (std::uint32_t index = 0U;
+         index < view.models.size();
+         ++index) {
+        editor_model_sort_scratch_.push_back(index);
+    }
+    std::sort(
+        editor_model_sort_scratch_.begin(),
+        editor_model_sort_scratch_.end(),
+        [&view](
+            const std::uint32_t lhs,
+            const std::uint32_t rhs) {
+            return view.models[lhs].asset_path <
+                view.models[rhs].asset_path;
+        });
+
+    std::size_t group_begin = 0U;
+    while (group_begin < editor_model_sort_scratch_.size()) {
+        std::size_t group_end = group_begin + 1U;
+        const std::string_view asset_path =
+            view.models[
+                editor_model_sort_scratch_[group_begin]].asset_path;
+        while (group_end < editor_model_sort_scratch_.size() &&
+               view.models[
+                   editor_model_sort_scratch_[group_end]].asset_path ==
+                       asset_path) {
+            ++group_end;
+        }
+
+        std::string load_error;
+        const auto asset_index = find_or_load_editor_model(
+            asset_root, asset_path, load_error);
+        if (!asset_index) {
+            if (error.empty()) {
+                error = std::move(load_error);
+            }
+            complete = false;
+            group_begin = group_end;
+            continue;
+        }
+        const EditorModelAsset& asset =
+            editor_model_assets_[*asset_index];
+        const std::size_t instance_count =
+            group_end - group_begin;
+        if (!asset.submeshes.empty() &&
+            instance_count >
+                (maximum_editor_scene_instances -
+                 editor_scene_instances_.size()) /
+                    asset.submeshes.size()) {
+            if (error.empty()) {
+                error =
+                    "Imported model submeshes exceed the bounded "
+                    "editor draw-instance capacity.";
+            }
+            complete = false;
+            group_begin = group_end;
+            continue;
+        }
+
+        for (const EditorModelSubmesh& submesh : asset.submeshes) {
+            const std::uint32_t first_instance =
+                static_cast<std::uint32_t>(
+                    editor_scene_instances_.size());
+            for (std::size_t model_index = group_begin;
+                 model_index < group_end;
+                ++model_index) {
+                const SceneModelInstance& model =
+                    view.models[
+                        editor_model_sort_scratch_[model_index]];
+                editor_scene_instances_.push_back(SceneGpuInstance{
+                    .model_row_0 = model.model_row_0,
+                    .model_row_1 = model.model_row_1,
+                    .model_row_2 = model.model_row_2,
+                    .material = submesh.material,
+                });
+            }
+            editor_model_draws_.push_back(EditorModelDraw{
+                .material_descriptor_set =
+                    submesh.material_descriptor_set,
+                .asset_index = *asset_index,
+                .first_index = submesh.first_index,
+                .index_count = submesh.index_count,
+                .first_instance = first_instance,
+                .instance_count =
+                    static_cast<std::uint32_t>(instance_count),
+            });
+        }
+        group_begin = group_end;
+    }
+    editor_model_sort_scratch_.clear();
+
     editor_ground_count_ =
         static_cast<std::uint32_t>(ground_count);
     editor_cube_count_ =
@@ -977,6 +1636,28 @@ void Renderer::update_editor_scene(
     editor_sky_visible_ = view.sky_visible;
     editor_sun_visible_ = view.sun_visible;
     editor_scene_revision_ = view.revision;
+    return complete;
+}
+
+bool Renderer::apply_editor_material_factors(
+    const std::string_view material_relative_path,
+    PbrMaterial material) noexcept {
+    if (!editor_output_enabled_ ||
+        material_relative_path.empty()) {
+        return false;
+    }
+    material = sanitize_pbr_material(material);
+    bool updated = false;
+    for (EditorModelAsset& asset : editor_model_assets_) {
+        for (EditorModelSubmesh& submesh : asset.submeshes) {
+            if (submesh.material_relative_path ==
+                material_relative_path) {
+                submesh.material = material;
+                updated = true;
+            }
+        }
+    }
+    return updated;
 }
 
 void Renderer::invalidate_editor_scene() noexcept {
@@ -1333,6 +2014,12 @@ void Renderer::create_scene_resources() {
         std::as_bytes(std::span{terrain_indices}));
     create_sky_texture();
     create_shadow_map();
+#if VCR_EDITOR_ENABLED
+    if (editor_output_enabled_ &&
+        editor_material_descriptor_pool_ == VK_NULL_HANDLE) {
+        create_editor_material_resources();
+    }
+#endif
 }
 
 void Renderer::create_sky_texture() {
@@ -1717,6 +2404,22 @@ void Renderer::destroy_anti_aliasing_resources() noexcept {
 }
 
 void Renderer::destroy_scene_resources() noexcept {
+#if VCR_EDITOR_ENABLED
+    if (editor_material_descriptor_pool_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(
+            context_->device(),
+            editor_material_descriptor_pool_,
+            nullptr);
+        editor_material_descriptor_pool_ = VK_NULL_HANDLE;
+    }
+    editor_material_descriptor_count_ = 0U;
+    editor_model_assets_.clear();
+    editor_texture_assets_.clear();
+    editor_default_normal_texture_.destroy();
+    editor_default_base_color_texture_.destroy();
+    editor_model_gpu_bytes_ = 0U;
+    editor_texture_gpu_bytes_ = 0U;
+#endif
     if (descriptor_pool_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(context_->device(), descriptor_pool_, nullptr);
         descriptor_pool_ = VK_NULL_HANDLE;
@@ -1772,6 +2475,29 @@ void Renderer::create_descriptors() {
     };
     VK_CHECK(vkCreateDescriptorPool(
         context_->device(), &pool_info, nullptr, &descriptor_pool_));
+#if VCR_EDITOR_ENABLED
+    if (editor_output_enabled_ &&
+        editor_material_descriptor_pool_ == VK_NULL_HANDLE) {
+        const VkDescriptorPoolSize material_pool_size{
+            .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount =
+                maximum_editor_material_descriptors * 2U,
+        };
+        const VkDescriptorPoolCreateInfo material_pool_info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .flags =
+                VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+            .maxSets = maximum_editor_material_descriptors,
+            .poolSizeCount = 1U,
+            .pPoolSizes = &material_pool_size,
+        };
+        VK_CHECK(vkCreateDescriptorPool(
+            context_->device(),
+            &material_pool_info,
+            nullptr,
+            &editor_material_descriptor_pool_));
+    }
+#endif
 
     std::array<
         VkDescriptorSetLayout,
@@ -2196,6 +2922,31 @@ void Renderer::upload_to_device_buffer(
         destination.handle(),
         1,
         &copy);
+    const VkBufferMemoryBarrier2 ready_for_device_reads{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dstStageMask =
+            VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT |
+            VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccessMask =
+            VK_ACCESS_2_INDEX_READ_BIT |
+            VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT |
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = destination.handle(),
+        .offset = 0U,
+        .size = copy.size,
+    };
+    const VkDependencyInfo dependency{
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .bufferMemoryBarrierCount = 1U,
+        .pBufferMemoryBarriers = &ready_for_device_reads,
+    };
+    vkCmdPipelineBarrier2(
+        submission.command_buffer(), &dependency);
     submission.submit_and_wait();
 }
 
@@ -2624,16 +3375,63 @@ void Renderer::create_pipeline() {
         &descriptor_info,
         nullptr,
         &descriptor_set_layout_));
+#if VCR_EDITOR_ENABLED
+    if (editor_output_enabled_ &&
+        editor_material_descriptor_set_layout_ == VK_NULL_HANDLE) {
+        const std::array material_bindings{
+            VkDescriptorSetLayoutBinding{
+                .binding = 0U,
+                .descriptorType =
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = 1U,
+                .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+                .pImmutableSamplers = nullptr,
+            },
+            VkDescriptorSetLayoutBinding{
+                .binding = 1U,
+                .descriptorType =
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = 1U,
+                .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+                .pImmutableSamplers = nullptr,
+            },
+        };
+        const VkDescriptorSetLayoutCreateInfo material_layout_info{
+            .sType =
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .bindingCount = static_cast<std::uint32_t>(
+                material_bindings.size()),
+            .pBindings = material_bindings.data(),
+        };
+        VK_CHECK(vkCreateDescriptorSetLayout(
+            context_->device(),
+            &material_layout_info,
+            nullptr,
+            &editor_material_descriptor_set_layout_));
+    }
+#endif
 
     const VkPushConstantRange push_constants{
         .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
         .offset = 0,
         .size = 16,
     };
+    std::array<VkDescriptorSetLayout, 2U> geometry_set_layouts{
+        descriptor_set_layout_,
+        VK_NULL_HANDLE,
+    };
+    std::uint32_t geometry_set_layout_count = 1U;
+#if VCR_EDITOR_ENABLED
+    if (editor_output_enabled_) {
+        geometry_set_layouts[1U] =
+            editor_material_descriptor_set_layout_;
+        geometry_set_layout_count = 2U;
+    }
+#endif
     const VkPipelineLayoutCreateInfo layout_info{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .setLayoutCount = 1,
-        .pSetLayouts = &descriptor_set_layout_,
+        .setLayoutCount = geometry_set_layout_count,
+        .pSetLayouts = geometry_set_layouts.data(),
         .pushConstantRangeCount = 1,
         .pPushConstantRanges = &push_constants,
     };
@@ -2742,6 +3540,52 @@ void Renderer::create_pipeline() {
             static_cast<std::uint32_t>(vertex_attributes.size()),
         .pVertexAttributeDescriptions = vertex_attributes.data(),
     };
+#if VCR_EDITOR_ENABLED
+    const VkVertexInputBindingDescription editor_model_vertex_binding{
+        .binding = 0U,
+        .stride = sizeof(CookedModelVertex),
+        .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+    };
+    const std::array editor_model_vertex_attributes{
+        VkVertexInputAttributeDescription{
+            .location = 0U,
+            .binding = 0U,
+            .format = VK_FORMAT_R32G32B32_SFLOAT,
+            .offset = offsetof(CookedModelVertex, position),
+        },
+        VkVertexInputAttributeDescription{
+            .location = 1U,
+            .binding = 0U,
+            .format = VK_FORMAT_R32G32B32_SFLOAT,
+            .offset = offsetof(CookedModelVertex, normal),
+        },
+        VkVertexInputAttributeDescription{
+            .location = 2U,
+            .binding = 0U,
+            .format = VK_FORMAT_R32G32_SFLOAT,
+            .offset = offsetof(CookedModelVertex, texcoord),
+        },
+        VkVertexInputAttributeDescription{
+            .location = 3U,
+            .binding = 0U,
+            .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+            .offset = offsetof(CookedModelVertex, tangent),
+        },
+    };
+    const VkPipelineVertexInputStateCreateInfo
+        editor_model_vertex_input{
+            .sType =
+                VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+            .vertexBindingDescriptionCount = 1U,
+            .pVertexBindingDescriptions =
+                &editor_model_vertex_binding,
+            .vertexAttributeDescriptionCount =
+                static_cast<std::uint32_t>(
+                    editor_model_vertex_attributes.size()),
+            .pVertexAttributeDescriptions =
+                editor_model_vertex_attributes.data(),
+        };
+#endif
     const VkPipelineInputAssemblyStateCreateInfo input_assembly{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
         .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
@@ -2892,6 +3736,58 @@ void Renderer::create_pipeline() {
         VK_OBJECT_TYPE_PIPELINE,
         handle_value(scene_pipeline_),
         "shadowed scene graphics pipeline");
+#if VCR_EDITOR_ENABLED
+    if (editor_output_enabled_) {
+        const VkShaderModule editor_model_vertex_module =
+            load_shader("editor_model.vert.spv");
+        const VkShaderModule editor_model_fragment_module =
+            load_shader("editor_model.frag.spv");
+        const std::array editor_model_stages{
+            VkPipelineShaderStageCreateInfo{
+                .sType =
+                    VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = VK_SHADER_STAGE_VERTEX_BIT,
+                .module = editor_model_vertex_module,
+                .pName = "main",
+            },
+            VkPipelineShaderStageCreateInfo{
+                .sType =
+                    VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                .module = editor_model_fragment_module,
+                .pName = "main",
+            },
+        };
+        VkGraphicsPipelineCreateInfo editor_model_pipeline_info =
+            pipeline_info;
+        editor_model_pipeline_info.stageCount =
+            static_cast<std::uint32_t>(
+                editor_model_stages.size());
+        editor_model_pipeline_info.pStages =
+            editor_model_stages.data();
+        editor_model_pipeline_info.pVertexInputState =
+            &editor_model_vertex_input;
+        VK_CHECK(vkCreateGraphicsPipelines(
+            context_->device(),
+            pipeline_cache_,
+            1U,
+            &editor_model_pipeline_info,
+            nullptr,
+            &editor_model_pipeline_));
+        context_->set_debug_name(
+            VK_OBJECT_TYPE_PIPELINE,
+            handle_value(editor_model_pipeline_),
+            "textured editor model graphics pipeline");
+        vkDestroyShaderModule(
+            context_->device(),
+            editor_model_fragment_module,
+            nullptr);
+        vkDestroyShaderModule(
+            context_->device(),
+            editor_model_vertex_module,
+            nullptr);
+    }
+#endif
     const VkShaderModule terrain_vertex_module =
         load_shader("terrain.vert.spv");
     std::array<VkPipelineShaderStageCreateInfo, 2> terrain_stages =
@@ -3019,6 +3915,17 @@ void Renderer::create_pipeline() {
         vertex_input,
         input_assembly,
         "AA shadowed scene graphics pipeline");
+#if VCR_EDITOR_ENABLED
+    if (editor_output_enabled_) {
+        aa_editor_model_pipeline_ =
+            create_aa_geometry_pipeline(
+                "editor_model_aa.vert.spv",
+                "editor_model_aa.frag.spv",
+                editor_model_vertex_input,
+                input_assembly,
+                "AA textured editor model graphics pipeline");
+    }
+#endif
     aa_terrain_pipeline_ = create_aa_geometry_pipeline(
         "terrain_aa.vert.spv",
         "scene_aa.frag.spv",
@@ -3440,6 +4347,15 @@ void Renderer::destroy_pipeline() noexcept {
             context_->device(), aa_sky_pipeline_, nullptr);
         aa_sky_pipeline_ = VK_NULL_HANDLE;
     }
+#if VCR_EDITOR_ENABLED
+    if (aa_editor_model_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(
+            context_->device(),
+            aa_editor_model_pipeline_,
+            nullptr);
+        aa_editor_model_pipeline_ = VK_NULL_HANDLE;
+    }
+#endif
     if (aa_scene_pipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(
             context_->device(), aa_scene_pipeline_, nullptr);
@@ -3472,6 +4388,15 @@ void Renderer::destroy_pipeline() noexcept {
         vkDestroyPipeline(context_->device(), scene_pipeline_, nullptr);
         scene_pipeline_ = VK_NULL_HANDLE;
     }
+#if VCR_EDITOR_ENABLED
+    if (editor_model_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(
+            context_->device(),
+            editor_model_pipeline_,
+            nullptr);
+        editor_model_pipeline_ = VK_NULL_HANDLE;
+    }
+#endif
     if (terrain_pipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(context_->device(), terrain_pipeline_, nullptr);
         terrain_pipeline_ = VK_NULL_HANDLE;
@@ -3943,8 +4868,12 @@ void Renderer::record_commands(
             const VkExtent2D extent,
             const VkPipeline cube_pipeline,
             const VkPipeline scene_pipeline,
+            const VkPipeline editor_model_pipeline,
             const VkPipeline terrain_pipeline,
             const VkPipeline sky_pipeline) {
+#if !VCR_EDITOR_ENABLED
+            static_cast<void>(editor_model_pipeline);
+#endif
             set_viewport(extent);
             const VkDescriptorSet descriptor_set =
                 mode_ == RunMode::instancing
@@ -4013,6 +4942,46 @@ void Renderer::record_commands(
                             0U,
                             0,
                             frame.scene_ground_count);
+                    }
+                    if (!editor_model_draws_.empty()) {
+                        vkCmdBindPipeline(
+                            command_buffer,
+                            VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            editor_model_pipeline);
+                    }
+                    for (const EditorModelDraw& draw :
+                         editor_model_draws_) {
+                        vkCmdBindDescriptorSets(
+                            command_buffer,
+                            VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            pipeline_layout_,
+                            1U,
+                            1U,
+                            &draw.material_descriptor_set,
+                            0U,
+                            nullptr);
+                        const EditorModelAsset& asset =
+                            editor_model_assets_[draw.asset_index];
+                        const VkBuffer model_vertex_buffer =
+                            asset.vertex_buffer.handle();
+                        vkCmdBindVertexBuffers(
+                            command_buffer,
+                            0,
+                            1,
+                            &model_vertex_buffer,
+                            &vertex_offset);
+                        vkCmdBindIndexBuffer(
+                            command_buffer,
+                            asset.index_buffer.handle(),
+                            0,
+                            VK_INDEX_TYPE_UINT32);
+                        vkCmdDrawIndexed(
+                            command_buffer,
+                            draw.index_count,
+                            draw.instance_count,
+                            draw.first_index,
+                            0,
+                            draw.first_instance);
                     }
                 } else
 #endif
@@ -4272,6 +5241,13 @@ void Renderer::record_commands(
             display_extent,
             pipeline_,
             scene_pipeline_,
+#if VCR_EDITOR_ENABLED
+            editor_output_enabled_
+                ? editor_model_pipeline_
+                : scene_pipeline_,
+#else
+            scene_pipeline_,
+#endif
             terrain_pipeline_,
             sky_pipeline_);
         if (frame.timestamp_queries != VK_NULL_HANDLE) {
@@ -4408,6 +5384,13 @@ void Renderer::record_commands(
             current_render_extent_,
             aa_pipeline_,
             aa_scene_pipeline_,
+#if VCR_EDITOR_ENABLED
+            editor_output_enabled_
+                ? aa_editor_model_pipeline_
+                : aa_scene_pipeline_,
+#else
+            aa_scene_pipeline_,
+#endif
             aa_terrain_pipeline_,
             aa_sky_pipeline_);
         vkCmdEndRendering(command_buffer);

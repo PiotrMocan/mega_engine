@@ -12,6 +12,8 @@ namespace vcr {
 
 enum class AssetEntryKind : std::uint8_t {
     directory,
+    model,
+    material,
     image,
     shader,
     scene,

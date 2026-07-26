@@ -14,13 +14,19 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace vcr {
 
 class Renderer;
+class AssetImportWorker;
+struct AssetImportUiState;
+struct ExternalAssetDropState;
+struct MaterialEditorUiState;
 
 enum class EditorPlayState : std::uint8_t {
     edit,
@@ -28,10 +34,15 @@ enum class EditorPlayState : std::uint8_t {
     paused,
 };
 
+struct SavedMaterialUpdate {
+    std::string relative_path{};
+    PbrMaterial material{};
+};
+
 class EditorUi final {
 public:
-    EditorUi() = default;
-    ~EditorUi();
+    EditorUi();
+    ~EditorUi() noexcept;
 
     EditorUi(const EditorUi&) = delete;
     EditorUi& operator=(const EditorUi&) = delete;
@@ -41,7 +52,7 @@ public:
         SDL_Window* main_window,
         Renderer& renderer);
     void shutdown() noexcept;
-    void process_event(const SDL_Event& event) noexcept;
+    void process_event(const SDL_Event& event);
     void synchronize_renderer(Renderer& renderer);
     void request_quit() noexcept {
         quit_requested_ = true;
@@ -78,6 +89,17 @@ public:
         scene_replaced_ = false;
         return replaced;
     }
+    [[nodiscard]] std::optional<SavedMaterialUpdate>
+        consume_saved_material_update() noexcept {
+        return std::exchange(saved_material_update_, std::nullopt);
+    }
+    [[nodiscard]] const std::filesystem::path&
+        asset_root() const noexcept {
+        return asset_browser_.root();
+    }
+    void report_asset_error(std::string error) {
+        asset_error_ = std::move(error);
+    }
 
 private:
     void initialize_vulkan_backend(Renderer& renderer);
@@ -90,15 +112,32 @@ private:
     void build_hierarchy(SceneDocument& scene);
     void build_inspector(SceneDocument& scene);
     void build_viewport(
+        SceneDocument& scene,
         Renderer& renderer,
         std::chrono::steady_clock::time_point now);
     void build_external_game_window(
         std::chrono::steady_clock::time_point now);
-    void build_assets();
+    void build_assets(
+        SceneDocument& scene,
+        Renderer& renderer);
+    void build_import_window();
+    void build_import_results();
+    void build_material_editor();
     void build_performance(
         Renderer& renderer,
         const PerformanceSnapshot& performance);
     void process_file_commands(SceneDocument& scene);
+    void process_import_pipeline();
+    void queue_import_sources(
+        std::vector<std::filesystem::path> sources);
+    void open_material_editor(
+        const std::filesystem::path& relative_path);
+    [[nodiscard]] bool add_model_asset_to_scene(
+        SceneDocument& scene,
+        Renderer& renderer,
+        std::string_view relative_path,
+        std::string_view display_name);
+    [[nodiscard]] bool import_activity_pending() const noexcept;
     void save_scene(SceneDocument& scene);
     void open_scene(SceneDocument& scene);
     [[nodiscard]] bool scene_is_dirty(
@@ -140,7 +179,9 @@ private:
     bool save_requested_ = false;
     bool open_requested_ = false;
     bool open_confirmation_requested_ = false;
+    bool import_dialog_requested_ = false;
     bool scene_replaced_ = false;
+    std::optional<SavedMaterialUpdate> saved_material_update_{};
 
     SceneNodeId selected_node_{};
     SceneNodeId pending_delete_{};
@@ -172,6 +213,10 @@ private:
         viewport_extent_changed_at_{};
 
     AssetBrowser asset_browser_{};
+    std::unique_ptr<AssetImportWorker> import_worker_;
+    std::unique_ptr<AssetImportUiState> import_ui_;
+    std::unique_ptr<ExternalAssetDropState> external_drop_;
+    std::unique_ptr<MaterialEditorUiState> material_editor_;
     std::string asset_error_{};
     std::optional<std::filesystem::path>
         pending_asset_directory_{};
@@ -181,6 +226,7 @@ private:
     std::string scene_file_status_{};
     std::uint64_t saved_content_revision_ = 0U;
     std::uint64_t saved_structure_revision_ = 0U;
+    bool asset_import_enabled_ = false;
 };
 
 } // namespace vcr

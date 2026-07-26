@@ -97,6 +97,7 @@ void EditorApplication::initialize(const CliOptions& options) {
 
     scene_ = SceneDocument::make_default();
     scene_instances_.reserve(max_scene_nodes);
+    scene_models_.reserve(max_scene_nodes);
     update_scene_snapshot();
     ui_.initialize(context_, window_.get(), renderer_);
 
@@ -155,6 +156,15 @@ void EditorApplication::main_loop() {
             submitted_scene_revision_ = 0U;
             renderer_.invalidate_editor_scene();
         }
+        if (auto material_update =
+                ui_.consume_saved_material_update()) {
+            if (renderer_.apply_editor_material_factors(
+                    material_update->relative_path,
+                    material_update->material)) {
+                submitted_scene_revision_ = 0U;
+                renderer_.invalidate_editor_scene();
+            }
+        }
         if (ui_.play_state() != EditorPlayState::paused) {
             camera_.update(
                 ui_.camera_input(), delta_seconds);
@@ -212,8 +222,13 @@ void EditorApplication::update_scene_snapshot() {
         return;
     }
     const SceneRenderView view =
-        scene_.build_render_view(scene_instances_);
-    renderer_.update_editor_scene(view);
+        scene_.build_render_view(
+            scene_instances_, scene_models_);
+    std::string asset_error;
+    if (!renderer_.update_editor_scene(
+            view, ui_.asset_root(), asset_error)) {
+        ui_.report_asset_error(std::move(asset_error));
+    }
     submitted_scene_revision_ = view.revision;
 }
 

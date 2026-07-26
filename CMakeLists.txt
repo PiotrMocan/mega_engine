@@ -20,6 +20,7 @@ option(
 )
 option(VCR_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC ON CACHE BOOL "" FORCE)
 set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
@@ -35,6 +36,35 @@ set(SDL_JOYSTICK OFF CACHE BOOL "" FORCE)
 set(SDL_RENDER OFF CACHE BOOL "" FORCE)
 set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
 set(SDL_TRAY OFF CACHE BOOL "" FORCE)
+
+set(ASSIMP_BUILD_ALL_IMPORTERS_BY_DEFAULT OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_FBX_IMPORTER ON CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_OBJ_IMPORTER ON CACHE BOOL "" FORCE)
+set(ASSIMP_NO_EXPORT ON CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_ZLIB ON CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_ASSIMP_TOOLS OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(ASSIMP_INSTALL OFF CACHE BOOL "" FORCE)
+set(ASSIMP_INSTALL_PDB OFF CACHE BOOL "" FORCE)
+set(ASSIMP_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_USE_CCACHE OFF CACHE BOOL "" FORCE)
+set(ASSIMP_IGNORE_GIT_HASH ON CACHE BOOL "" FORCE)
+
+set(OPENEXR_INSTALL OFF CACHE BOOL "" FORCE)
+set(OPENEXR_INSTALL_TOOLS OFF CACHE BOOL "" FORCE)
+set(OPENEXR_INSTALL_DEVELOPER_TOOLS OFF CACHE BOOL "" FORCE)
+set(OPENEXR_INSTALL_PKG_CONFIG OFF CACHE BOOL "" FORCE)
+set(OPENEXR_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(OPENEXR_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(OPENEXR_BUILD_PYTHON OFF CACHE BOOL "" FORCE)
+set(OPENEXR_BUILD_OSS_FUZZ OFF CACHE BOOL "" FORCE)
+set(OPENEXR_TEST_LIBRARIES OFF CACHE BOOL "" FORCE)
+set(OPENEXR_TEST_TOOLS OFF CACHE BOOL "" FORCE)
+set(OPENEXR_FORCE_INTERNAL_IMATH ON CACHE BOOL "" FORCE)
+set(IMATH_INSTALL OFF CACHE BOOL "" FORCE)
+set(IMATH_INSTALL_PKG_CONFIG OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
     VulkanHeaders
@@ -78,6 +108,19 @@ FetchContent_Declare(
     GIT_TAG v1.92.8-docking
     GIT_SHALLOW TRUE
 )
+FetchContent_Declare(
+    assimp
+    GIT_REPOSITORY https://github.com/assimp/assimp.git
+    GIT_TAG v6.0.5
+    GIT_SHALLOW TRUE
+)
+FetchContent_Declare(
+    OpenEXR
+    GIT_REPOSITORY
+        https://github.com/AcademySoftwareFoundation/openexr.git
+    GIT_TAG v3.4.13
+    GIT_SHALLOW TRUE
+)
 if(WIN32 AND MSVC)
     FetchContent_Declare(
         FidelityFXSDK
@@ -93,6 +136,8 @@ FetchContent_MakeAvailable(
     VulkanMemoryAllocator
     glm
     nlohmann_json
+    assimp
+    OpenEXR
 )
 FetchContent_GetProperties(DearImGui)
 if(NOT dearimgui_POPULATED)
@@ -277,6 +322,94 @@ target_link_libraries(vcr_imgui PUBLIC
     volk::volk
 )
 
+add_library(vcr_asset_import STATIC
+    src/asset_importer.cpp
+)
+target_include_directories(vcr_asset_import PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_compile_definitions(vcr_asset_import PRIVATE
+    VCR_HAS_ASSIMP=1
+)
+target_link_libraries(vcr_asset_import PRIVATE
+    assimp::assimp
+    glm::glm
+    nlohmann_json::nlohmann_json
+)
+if(MSVC)
+    target_compile_options(vcr_asset_import PRIVATE
+        /W4 /permissive- /Zc:preprocessor /GR- /EHsc
+    )
+    if(VCR_WARNINGS_AS_ERRORS)
+        target_compile_options(vcr_asset_import PRIVATE /WX)
+    endif()
+else()
+    target_compile_options(vcr_asset_import PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion -Wshadow -fno-rtti
+    )
+    if(VCR_WARNINGS_AS_ERRORS)
+        target_compile_options(vcr_asset_import PRIVATE -Werror)
+    endif()
+endif()
+
+add_library(vcr_cooked_model_asset STATIC
+    src/cooked_model_asset.cpp
+)
+target_include_directories(vcr_cooked_model_asset PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_link_libraries(vcr_cooked_model_asset
+    PUBLIC glm::glm
+    PRIVATE nlohmann_json::nlohmann_json
+)
+if(MSVC)
+    target_compile_options(vcr_cooked_model_asset PRIVATE
+        /W4 /permissive- /Zc:preprocessor /GR- /EHsc
+    )
+    if(VCR_WARNINGS_AS_ERRORS)
+        target_compile_options(vcr_cooked_model_asset PRIVATE /WX)
+    endif()
+else()
+    target_compile_options(vcr_cooked_model_asset PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion -Wshadow -fno-rtti
+    )
+    if(VCR_WARNINGS_AS_ERRORS)
+        target_compile_options(vcr_cooked_model_asset PRIVATE -Werror)
+    endif()
+endif()
+
+add_library(vcr_cooked_texture_asset STATIC
+    src/cooked_texture_asset.cpp
+)
+target_include_directories(vcr_cooked_texture_asset PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_include_directories(vcr_cooked_texture_asset SYSTEM PRIVATE
+    "${assimp_SOURCE_DIR}/contrib/stb"
+    "${openexr_SOURCE_DIR}/src/lib/OpenEXR"
+    "${openexr_BINARY_DIR}/src/lib/OpenEXR"
+    "${openexr_BINARY_DIR}/cmake"
+)
+target_link_libraries(vcr_cooked_texture_asset PRIVATE
+    OpenEXR::OpenEXR
+    nlohmann_json::nlohmann_json
+)
+if(MSVC)
+    target_compile_options(vcr_cooked_texture_asset PRIVATE
+        /W4 /permissive- /Zc:preprocessor /GR- /EHsc
+    )
+    if(VCR_WARNINGS_AS_ERRORS)
+        target_compile_options(vcr_cooked_texture_asset PRIVATE /WX)
+    endif()
+else()
+    target_compile_options(vcr_cooked_texture_asset PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion -Wshadow -fno-rtti
+    )
+    if(VCR_WARNINGS_AS_ERRORS)
+        target_compile_options(vcr_cooked_texture_asset PRIVATE -Werror)
+    endif()
+endif()
+
 set(VCR_RENDERER_SOURCES
     src/cli_options.cpp
     src/fly_camera.cpp
@@ -370,6 +503,12 @@ endfunction()
 vcr_configure_executable(vulkan_cube 0)
 vcr_configure_executable(vulkan_editor 1)
 target_link_libraries(vulkan_editor PRIVATE vcr_imgui)
+target_link_libraries(
+    vulkan_editor PRIVATE
+    vcr_asset_import
+    vcr_cooked_model_asset
+    vcr_cooked_texture_asset
+)
 
 # Both executables share one output directory. A single dependency target
 # prevents parallel post-build copy_directory commands from racing over the
@@ -441,4 +580,103 @@ if(BUILD_TESTING)
         )
     endif()
     add_test(NAME vcr_core_tests COMMAND vcr_core_tests)
+
+    add_executable(vcr_asset_import_tests
+        tests/asset_import_tests.cpp
+    )
+    target_link_libraries(
+        vcr_asset_import_tests PRIVATE
+        vcr_asset_import
+        nlohmann_json::nlohmann_json
+    )
+    if(MSVC)
+        target_compile_options(
+            vcr_asset_import_tests PRIVATE /W4 /permissive- /EHsc
+        )
+    else()
+        target_compile_options(vcr_asset_import_tests PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+        )
+    endif()
+    add_test(
+        NAME vcr_asset_import_tests
+        COMMAND vcr_asset_import_tests
+    )
+    if(UNIX)
+        # WSL can inherit Windows TEMP paths on DrvFs, whose renameat2
+        # implementation does not support RENAME_NOREPLACE. Exercise the
+        # Linux atomic publication path on the native temporary filesystem.
+        set_tests_properties(vcr_asset_import_tests PROPERTIES
+            ENVIRONMENT "TMPDIR=/tmp;TMP=/tmp;TEMP=/tmp"
+        )
+    endif()
+
+    add_executable(vcr_cooked_model_asset_tests
+        tests/cooked_model_asset_tests.cpp
+    )
+    target_link_libraries(
+        vcr_cooked_model_asset_tests PRIVATE
+        vcr_cooked_model_asset
+        nlohmann_json::nlohmann_json
+    )
+    if(MSVC)
+        target_compile_options(
+            vcr_cooked_model_asset_tests PRIVATE
+            /W4 /permissive- /EHsc
+        )
+    else()
+        target_compile_options(
+            vcr_cooked_model_asset_tests PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+        )
+    endif()
+    add_test(
+        NAME vcr_cooked_model_asset_tests
+        COMMAND vcr_cooked_model_asset_tests
+    )
+    if(UNIX)
+        set_tests_properties(vcr_cooked_model_asset_tests PROPERTIES
+            ENVIRONMENT "TMPDIR=/tmp;TMP=/tmp;TEMP=/tmp"
+        )
+    endif()
+
+    add_executable(vcr_cooked_texture_asset_tests
+        tests/cooked_texture_asset_tests.cpp
+        src/png_encoder.cpp
+    )
+    target_include_directories(vcr_cooked_texture_asset_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+    target_include_directories(
+        vcr_cooked_texture_asset_tests SYSTEM PRIVATE
+        "${openexr_SOURCE_DIR}/src/lib/OpenEXR"
+        "${openexr_BINARY_DIR}/src/lib/OpenEXR"
+        "${openexr_BINARY_DIR}/cmake"
+    )
+    target_link_libraries(
+        vcr_cooked_texture_asset_tests PRIVATE
+        vcr_cooked_texture_asset
+        OpenEXR::OpenEXR
+        nlohmann_json::nlohmann_json
+    )
+    if(MSVC)
+        target_compile_options(
+            vcr_cooked_texture_asset_tests PRIVATE
+            /W4 /permissive- /EHsc
+        )
+    else()
+        target_compile_options(
+            vcr_cooked_texture_asset_tests PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+        )
+    endif()
+    add_test(
+        NAME vcr_cooked_texture_asset_tests
+        COMMAND vcr_cooked_texture_asset_tests
+    )
+    if(UNIX)
+        set_tests_properties(vcr_cooked_texture_asset_tests PROPERTIES
+            ENVIRONMENT "TMPDIR=/tmp;TMP=/tmp;TEMP=/tmp"
+        )
+    endif()
 endif()

@@ -45,6 +45,7 @@ private:
     SceneDocument scene_{};
     FlyCamera camera_{};
     std::vector<SceneGpuInstance> scene_instances_{};
+    std::vector<SceneModelInstance> scene_models_{};
     CliOptions options_{};
     std::uint64_t submitted_scene_revision_ = 0U;
     std::uint32_t main_window_id_ = 0U;

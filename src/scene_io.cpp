@@ -31,6 +31,7 @@ using Json = nlohmann::json;
     switch (kind) {
     case SceneNodeKind::folder: return "folder";
     case SceneNodeKind::cube: return "cube";
+    case SceneNodeKind::model: return "model";
     case SceneNodeKind::ground: return "ground";
     case SceneNodeKind::terrain: return "terrain";
     case SceneNodeKind::camera: return "camera";
@@ -45,6 +46,7 @@ using Json = nlohmann::json;
     const std::string_view value) noexcept {
     if (value == "folder") return SceneNodeKind::folder;
     if (value == "cube") return SceneNodeKind::cube;
+    if (value == "model") return SceneNodeKind::model;
     if (value == "ground") return SceneNodeKind::ground;
     if (value == "terrain") return SceneNodeKind::terrain;
     if (value == "camera") return SceneNodeKind::camera;
@@ -161,6 +163,18 @@ bool save_scene_file(
         error = "Scene exceeds the bounded node capacity.";
         return false;
     }
+    for (const SceneNodeRecord& record : records) {
+        const SceneNode& node = record.value;
+        if ((node.kind == SceneNodeKind::model &&
+             !valid_scene_asset_path(node.asset_path)) ||
+            (node.kind != SceneNodeKind::model &&
+             !node.asset_path.empty())) {
+            error =
+                "Scene model asset path is invalid or assigned to "
+                "a non-model node.";
+            return false;
+        }
+    }
 
     std::filesystem::path temporary = destination;
     temporary += ".tmp";
@@ -221,6 +235,9 @@ bool save_scene_file(
                     invalid_scene_node_index
             ? Json(nullptr)
             : Json(record.parent_record_index);
+        if (node.kind == SceneNodeKind::model) {
+            encoded["asset_path"] = node.asset_path;
+        }
         if (index != 0U) {
             output.put(',');
         }
@@ -344,6 +361,31 @@ bool load_scene_file(
                 error = "Scene node kind is unknown.";
                 return false;
             }
+            std::string asset_path;
+            if (*kind == SceneNodeKind::model) {
+                if (!encoded.contains("asset_path") ||
+                    !encoded["asset_path"].is_string()) {
+                    error =
+                        "Scene model asset path is missing.";
+                    return false;
+                }
+                asset_path =
+                    encoded["asset_path"].get<std::string>();
+                if (!valid_scene_asset_path(asset_path)) {
+                    error =
+                        "Scene model asset path is invalid.";
+                    return false;
+                }
+            } else if (encoded.contains("asset_path")) {
+                if (!encoded["asset_path"].is_string() ||
+                    !encoded["asset_path"]
+                         .get_ref<const std::string&>()
+                         .empty()) {
+                    error =
+                        "Scene asset path belongs only to model nodes.";
+                    return false;
+                }
+            }
 
             SceneNodeId parent_id{};
             const Json& parent_value = encoded["parent"];
@@ -458,6 +500,7 @@ bool load_scene_file(
                     scale[2]},
             };
             node->get().material = material;
+            node->get().asset_path = std::move(asset_path);
             ids.push_back(id);
         }
         loaded.mark_content_changed();
