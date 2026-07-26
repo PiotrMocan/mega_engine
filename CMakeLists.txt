@@ -72,6 +72,12 @@ FetchContent_Declare(
     GIT_TAG v3.12.0
     GIT_SHALLOW TRUE
 )
+FetchContent_Declare(
+    DearImGui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG v1.92.8-docking
+    GIT_SHALLOW TRUE
+)
 if(WIN32 AND MSVC)
     FetchContent_Declare(
         FidelityFXSDK
@@ -88,6 +94,90 @@ FetchContent_MakeAvailable(
     glm
     nlohmann_json
 )
+FetchContent_GetProperties(DearImGui)
+if(NOT dearimgui_POPULATED)
+    FetchContent_Populate(DearImGui)
+endif()
+
+# v1.92.8 stores the first secondary viewport's VkFormat address in the
+# long-lived backend InitInfo. That viewport can then be destroyed while the
+# pointer is retained. Generate a reviewable pinned-source patch that moves
+# the format into backend-owned storage. We also keep the renderer contract's
+# IMMEDIATE -> MAILBOX -> FIFO preference for secondary windows.
+set(
+    VCR_IMGUI_GENERATED_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/imgui"
+)
+file(MAKE_DIRECTORY "${VCR_IMGUI_GENERATED_DIR}")
+file(
+    READ
+    "${dearimgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp"
+    VCR_IMGUI_VULKAN_SOURCE
+)
+set(
+    VCR_IMGUI_PIPELINE_MEMBER_MARKER
+    "    VkPipeline                  PipelineForViewports;   // pipeline for secondary viewports (created by backend)"
+)
+set(
+    VCR_IMGUI_FORMAT_POINTER_MARKER
+    "            pipeline_info->PipelineRenderingCreateInfo.pColorAttachmentFormats = &wd->SurfaceFormat.format;"
+)
+set(
+    VCR_IMGUI_PRESENT_MODES_MARKER
+    "    VkPresentModeKHR present_modes[] = { VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_FIFO_KHR };"
+)
+foreach(
+    VCR_IMGUI_PATCH_MARKER IN ITEMS
+    VCR_IMGUI_PIPELINE_MEMBER_MARKER
+    VCR_IMGUI_FORMAT_POINTER_MARKER
+    VCR_IMGUI_PRESENT_MODES_MARKER
+)
+    string(
+        FIND
+        "${VCR_IMGUI_VULKAN_SOURCE}"
+        "${${VCR_IMGUI_PATCH_MARKER}}"
+        VCR_IMGUI_PATCH_MARKER_POSITION
+    )
+    if(VCR_IMGUI_PATCH_MARKER_POSITION EQUAL -1)
+        message(FATAL_ERROR
+            "Pinned Dear ImGui Vulkan backend marker "
+            "${VCR_IMGUI_PATCH_MARKER} was not found"
+        )
+    endif()
+endforeach()
+set(VCR_IMGUI_VULKAN_PATCHED "${VCR_IMGUI_VULKAN_SOURCE}")
+string(
+    REPLACE
+    "${VCR_IMGUI_PIPELINE_MEMBER_MARKER}"
+    "    VkPipeline                  PipelineForViewports;   // pipeline for secondary viewports (created by backend)\n    VkFormat                    PipelineForViewportsColorFormat; // VCR: lifetime owned by backend"
+    VCR_IMGUI_VULKAN_PATCHED
+    "${VCR_IMGUI_VULKAN_PATCHED}"
+)
+string(
+    REPLACE
+    "${VCR_IMGUI_FORMAT_POINTER_MARKER}"
+    "            bd->PipelineForViewportsColorFormat = wd->SurfaceFormat.format;\n            pipeline_info->PipelineRenderingCreateInfo.pColorAttachmentFormats = &bd->PipelineForViewportsColorFormat;"
+    VCR_IMGUI_VULKAN_PATCHED
+    "${VCR_IMGUI_VULKAN_PATCHED}"
+)
+string(
+    REPLACE
+    "${VCR_IMGUI_PRESENT_MODES_MARKER}"
+    "    VkPresentModeKHR present_modes[] = { VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_FIFO_KHR };"
+    VCR_IMGUI_VULKAN_PATCHED
+    "${VCR_IMGUI_VULKAN_PATCHED}"
+)
+if(VCR_IMGUI_VULKAN_PATCHED STREQUAL VCR_IMGUI_VULKAN_SOURCE)
+    message(FATAL_ERROR
+        "Pinned Dear ImGui Vulkan backend patch markers were not found"
+    )
+endif()
+file(
+    WRITE
+    "${VCR_IMGUI_GENERATED_DIR}/imgui_impl_vulkan_vcr.cpp"
+    "${VCR_IMGUI_VULKAN_PATCHED}"
+)
+
 FetchContent_GetProperties(volk)
 if(NOT volk_POPULATED)
     FetchContent_Populate(volk)
@@ -161,15 +251,38 @@ target_include_directories(vcr_volk PUBLIC
 target_link_libraries(vcr_volk PUBLIC ${CMAKE_DL_LIBS})
 add_library(volk::volk ALIAS vcr_volk)
 
-add_executable(vulkan_cube
-    src/main.cpp
-    src/application.cpp
+add_library(vcr_imgui STATIC
+    "${dearimgui_SOURCE_DIR}/imgui.cpp"
+    "${dearimgui_SOURCE_DIR}/imgui_draw.cpp"
+    "${dearimgui_SOURCE_DIR}/imgui_tables.cpp"
+    "${dearimgui_SOURCE_DIR}/imgui_widgets.cpp"
+    "${dearimgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp"
+    src/imgui_vulkan_backend.cpp
+)
+target_include_directories(vcr_imgui PUBLIC
+    "${dearimgui_SOURCE_DIR}"
+    "${dearimgui_SOURCE_DIR}/backends"
+    "${volk_SOURCE_DIR}"
+    "${vulkanheaders_SOURCE_DIR}/include"
+)
+target_include_directories(vcr_imgui PRIVATE
+    "${VCR_IMGUI_GENERATED_DIR}"
+)
+target_compile_definitions(vcr_imgui PRIVATE
+    VK_NO_PROTOTYPES
+    IMGUI_IMPL_VULKAN_USE_VOLK
+)
+target_link_libraries(vcr_imgui PUBLIC
+    SDL3::SDL3-static
+    volk::volk
+)
+
+set(VCR_RENDERER_SOURCES
     src/cli_options.cpp
     src/fly_camera.cpp
     src/fsr3_upscaler.cpp
     src/gpu_buffer.cpp
     src/gpu_texture.cpp
-    src/mcp_server.cpp
     src/performance_metrics.cpp
     src/png_encoder.cpp
     src/renderer.cpp
@@ -178,94 +291,131 @@ add_executable(vulkan_cube
     src/vulkan_context.cpp
 )
 
-target_include_directories(vulkan_cube PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    "${vulkanmemoryallocator_SOURCE_DIR}/include"
-    "${vulkanheaders_SOURCE_DIR}/include"
+add_executable(vulkan_cube
+    src/main.cpp
+    src/application.cpp
+    src/mcp_server.cpp
+    ${VCR_RENDERER_SOURCES}
 )
-if(VCR_HAS_FSR3)
-    target_include_directories(vulkan_cube PRIVATE
-        "${fidelityfxsdk_SOURCE_DIR}/ffx-api/include"
-    )
-endif()
+
+add_executable(vulkan_editor
+    src/editor_main.cpp
+    src/editor_application.cpp
+    src/editor_ui.cpp
+    src/asset_browser.cpp
+    src/scene_document.cpp
+    src/scene_io.cpp
+    ${VCR_RENDERER_SOURCES}
+)
 
 find_package(Threads REQUIRED)
 
-target_link_libraries(vulkan_cube PRIVATE
-    SDL3::SDL3-static
-    volk::volk
-    glm::glm
-    nlohmann_json::nlohmann_json
-    Threads::Threads
-)
-
-target_compile_definitions(vulkan_cube PRIVATE
-    VK_NO_PROTOTYPES
-    VMA_STATIC_VULKAN_FUNCTIONS=0
-    VMA_DYNAMIC_VULKAN_FUNCTIONS=1
-    GLM_FORCE_DEPTH_ZERO_TO_ONE
-    GLM_FORCE_RADIANS
-    "VCR_VALIDATION_DEFAULT=$<IF:$<OR:$<BOOL:${VCR_ENABLE_VALIDATION}>,$<CONFIG:Debug>>,1,0>"
-    "VCR_HAS_FSR3=$<IF:$<BOOL:${VCR_HAS_FSR3}>,1,0>"
-)
-
-if(MSVC)
-    target_compile_options(
-        vulkan_cube PRIVATE /W4 /permissive- /Zc:preprocessor /GR- /EHsc
+function(vcr_configure_executable target editor_enabled)
+    target_include_directories(${target} PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${vulkanmemoryallocator_SOURCE_DIR}/include"
+        "${vulkanheaders_SOURCE_DIR}/include"
     )
-    if(VCR_WARNINGS_AS_ERRORS)
-        target_compile_options(vulkan_cube PRIVATE /WX)
+    if(VCR_HAS_FSR3)
+        target_include_directories(${target} PRIVATE
+            "${fidelityfxsdk_SOURCE_DIR}/ffx-api/include"
+        )
     endif()
-else()
-    target_compile_options(vulkan_cube PRIVATE
-        -Wall -Wextra -Wpedantic -Wconversion -Wshadow -fno-rtti
-        $<$<CONFIG:Release>:-O3>
+
+    target_link_libraries(${target} PRIVATE
+        SDL3::SDL3-static
+        volk::volk
+        glm::glm
+        nlohmann_json::nlohmann_json
+        Threads::Threads
     )
-    if(VCR_WARNINGS_AS_ERRORS)
-        target_compile_options(vulkan_cube PRIVATE -Werror)
+    target_compile_definitions(${target} PRIVATE
+        VK_NO_PROTOTYPES
+        VMA_STATIC_VULKAN_FUNCTIONS=0
+        VMA_DYNAMIC_VULKAN_FUNCTIONS=1
+        GLM_FORCE_DEPTH_ZERO_TO_ONE
+        GLM_FORCE_RADIANS
+        "VCR_EDITOR_ENABLED=${editor_enabled}"
+        "VCR_VALIDATION_DEFAULT=$<IF:$<OR:$<BOOL:${VCR_ENABLE_VALIDATION}>,$<CONFIG:Debug>>,1,0>"
+        "VCR_HAS_FSR3=$<IF:$<BOOL:${VCR_HAS_FSR3}>,1,0>"
+    )
+
+    if(MSVC)
+        target_compile_options(
+            ${target} PRIVATE
+            /W4 /permissive- /Zc:preprocessor /GR- /EHsc
+        )
+        if(VCR_WARNINGS_AS_ERRORS)
+            target_compile_options(${target} PRIVATE /WX)
+        endif()
+    else()
+        target_compile_options(${target} PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -fno-rtti
+            $<$<CONFIG:Release>:-O3>
+        )
+        if(VCR_WARNINGS_AS_ERRORS)
+            target_compile_options(${target} PRIVATE -Werror)
+        endif()
     endif()
-endif()
 
-set_target_properties(vulkan_cube PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
-)
+    set_target_properties(${target} PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
 
-add_custom_command(TARGET vulkan_cube POST_BUILD
+    if(VCR_HAS_FSR3)
+        add_dependencies(${target} vcr_fidelityfx_runtime)
+    endif()
+endfunction()
+
+vcr_configure_executable(vulkan_cube 0)
+vcr_configure_executable(vulkan_editor 1)
+target_link_libraries(vulkan_editor PRIVATE vcr_imgui)
+
+# Both executables share one output directory. A single dependency target
+# prevents parallel post-build copy_directory commands from racing over the
+# same shader and asset files.
+set(VCR_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+add_custom_target(vcr_runtime_assets
     COMMAND "${CMAKE_COMMAND}" -E make_directory
-            "$<TARGET_FILE_DIR:vulkan_cube>/shaders"
+            "${VCR_RUNTIME_OUTPUT_DIRECTORY}/shaders"
     COMMAND "${CMAKE_COMMAND}" -E copy_directory
             "${CMAKE_CURRENT_SOURCE_DIR}/shaders/spv"
-            "$<TARGET_FILE_DIR:vulkan_cube>/shaders"
+            "${VCR_RUNTIME_OUTPUT_DIRECTORY}/shaders"
     COMMAND "${CMAKE_COMMAND}" -E make_directory
-            "$<TARGET_FILE_DIR:vulkan_cube>/assets"
+            "${VCR_RUNTIME_OUTPUT_DIRECTORY}/assets"
     COMMAND "${CMAKE_COMMAND}" -E copy_directory
             "${CMAKE_CURRENT_SOURCE_DIR}/assets"
-            "$<TARGET_FILE_DIR:vulkan_cube>/assets"
+            "${VCR_RUNTIME_OUTPUT_DIRECTORY}/assets"
     COMMAND "${CMAKE_COMMAND}" -E make_directory
-            "$<TARGET_FILE_DIR:vulkan_cube>/LICENSES"
+            "${VCR_RUNTIME_OUTPUT_DIRECTORY}/LICENSES"
     COMMAND "${CMAKE_COMMAND}" -E copy_directory
             "${CMAKE_CURRENT_SOURCE_DIR}/LICENSES"
-            "$<TARGET_FILE_DIR:vulkan_cube>/LICENSES"
-    COMMENT "Copying precompiled SPIR-V shaders and runtime assets"
+            "${VCR_RUNTIME_OUTPUT_DIRECTORY}/LICENSES"
+    COMMENT "Copying shared SPIR-V shaders, assets, and licenses"
 )
 if(VCR_HAS_FSR3)
-    add_dependencies(vulkan_cube vcr_fidelityfx_runtime)
-    add_custom_command(TARGET vulkan_cube POST_BUILD
+    add_dependencies(vcr_runtime_assets vcr_fidelityfx_runtime)
+    add_custom_command(TARGET vcr_runtime_assets POST_BUILD
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
                 "${VCR_FFX_RUNTIME_DLL}"
-                "$<TARGET_FILE_DIR:vulkan_cube>/amd_fidelityfx_vk.dll"
+                "${VCR_RUNTIME_OUTPUT_DIRECTORY}/amd_fidelityfx_vk.dll"
         COMMENT "Copying the source-built FidelityFX Vulkan runtime"
     )
 endif()
+add_dependencies(vulkan_cube vcr_runtime_assets)
+add_dependencies(vulkan_editor vcr_runtime_assets)
 
 include(CTest)
 if(BUILD_TESTING)
     add_executable(vcr_core_tests
         tests/core_tests.cpp
+        src/asset_browser.cpp
         src/cli_options.cpp
         src/fly_camera.cpp
         src/performance_metrics.cpp
         src/png_encoder.cpp
+        src/scene_document.cpp
+        src/scene_io.cpp
     )
     target_include_directories(vcr_core_tests PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -278,6 +428,7 @@ if(BUILD_TESTING)
     target_link_libraries(
         vcr_core_tests PRIVATE
         glm::glm
+        nlohmann_json::nlohmann_json
         Threads::Threads
     )
     if(MSVC)

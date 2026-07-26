@@ -19,6 +19,7 @@ compile_commands.json
 # Runtime-generated renderer data
 /benchmark.json
 /pipeline_cache.bin
+/imgui.ini
 
 # Compiler and linker artifacts outside build directories
 *.o

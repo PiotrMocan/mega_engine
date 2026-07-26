@@ -21,6 +21,11 @@
 #include <string>
 #include <vector>
 
+#if VCR_EDITOR_ENABLED
+#include "scene_document.hpp"
+struct ImDrawData;
+#endif
+
 namespace vcr {
 
 struct ScreenshotCapture {
@@ -50,10 +55,16 @@ public:
         std::uint32_t initial_instances,
         std::uint32_t initial_gpu_workload,
         AntiAliasingSettings initial_anti_aliasing,
-        bool enable_screenshot_capture);
+        bool enable_screenshot_capture,
+        bool enable_editor_output = false);
     [[nodiscard]] bool draw_frame(
         FrameTimings& timings,
-        const glm::mat4& view_matrix);
+        const glm::mat4& view_matrix
+#if VCR_EDITOR_ENABLED
+        ,
+        ImDrawData* editor_draw_data = nullptr
+#endif
+    );
     void record_metrics(const FrameTimings& timings) noexcept {
         metrics_.record_frame(timings);
     }
@@ -93,7 +104,7 @@ public:
         return current_render_extent_.width > 0U &&
                 current_render_extent_.height > 0U
             ? current_render_extent_
-            : swapchain_.extent();
+            : scene_output_extent();
     }
     [[nodiscard]] bool fsr3_available() const noexcept {
         return fsr3_upscaler_.available();
@@ -126,6 +137,26 @@ public:
     [[nodiscard]] bool initialized() const noexcept {
         return context_ != nullptr;
     }
+#if VCR_EDITOR_ENABLED
+    void update_editor_scene(const SceneRenderView& view);
+    void invalidate_editor_scene() noexcept;
+    [[nodiscard]] bool prepare_editor_viewport(VkExtent2D extent);
+    [[nodiscard]] VkImageView editor_viewport_image_view() const noexcept {
+        return editor_viewport_.color.view();
+    }
+    [[nodiscard]] VkExtent2D editor_viewport_extent() const noexcept {
+        return VkExtent2D{
+            editor_viewport_.color.width(),
+            editor_viewport_.color.height(),
+        };
+    }
+    [[nodiscard]] std::uint64_t editor_viewport_generation() const noexcept {
+        return editor_viewport_generation_;
+    }
+    [[nodiscard]] std::uint64_t swapchain_generation() const noexcept {
+        return swapchain_generation_;
+    }
+#endif
 
 private:
     struct AntiAliasingFrameResources {
@@ -145,6 +176,14 @@ private:
         VkImageLayout weights_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         VkImageLayout fsr_output_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     };
+#if VCR_EDITOR_ENABLED
+    struct EditorViewportResources {
+        GpuTexture color{};
+        GpuTexture depth{};
+        VkImageLayout color_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImageLayout depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    };
+#endif
 
     void create_frame_contexts();
     void destroy_frame_contexts() noexcept;
@@ -182,10 +221,25 @@ private:
     void update_frame_uniform(
         FrameContext& frame,
         const glm::mat4& view_matrix);
-    void record_commands(VkCommandBuffer command_buffer, std::uint32_t image_index);
+    void record_commands(
+        VkCommandBuffer command_buffer,
+        std::uint32_t image_index
+#if VCR_EDITOR_ENABLED
+        ,
+        ImDrawData* editor_draw_data
+#endif
+    );
     void rebuild_swapchain();
     void recreate_swapchain(VkPresentModeKHR preferred_mode);
     [[nodiscard]] VkShaderModule load_shader(const std::filesystem::path& path) const;
+#if VCR_EDITOR_ENABLED
+    void create_editor_viewport(VkExtent2D extent);
+    void destroy_editor_viewport() noexcept;
+    void record_editor_scene_upload(
+        VkCommandBuffer command_buffer,
+        FrameContext& frame);
+#endif
+    [[nodiscard]] VkExtent2D scene_output_extent() const noexcept;
 
     VulkanContext* context_ = nullptr;
     SDL_Window* window_ = nullptr;
@@ -251,6 +305,19 @@ private:
     float fsr_frame_time_ms_ = 16.6667F;
     std::chrono::steady_clock::time_point last_frame_time_{};
     std::optional<ScreenshotCapture> completed_screenshot_{};
+#if VCR_EDITOR_ENABLED
+    EditorViewportResources editor_viewport_{};
+    std::vector<SceneGpuInstance> editor_scene_instances_{};
+    std::uint32_t editor_ground_count_ = 0U;
+    std::uint32_t editor_cube_count_ = 0U;
+    std::uint64_t editor_scene_revision_ = 1U;
+    std::uint64_t editor_viewport_generation_ = 0U;
+    std::uint64_t swapchain_generation_ = 1U;
+    bool editor_terrain_visible_ = false;
+    bool editor_sky_visible_ = false;
+    bool editor_sun_visible_ = false;
+    bool editor_output_enabled_ = false;
+#endif
 };
 
 } // namespace vcr

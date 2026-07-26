@@ -70,6 +70,8 @@ $regularShaders = @(
     @("cube_aa.vert", "cube_aa.vert.spv"),
     @("cube_aa.frag", "cube_aa.frag.spv"),
     @("scene_aa.vert", "scene_aa.vert.spv"),
+    @("editor_scene.vert", "editor_scene.vert.spv"),
+    @("editor_scene_aa.vert", "editor_scene_aa.vert.spv"),
     @("scene_aa.frag", "scene_aa.frag.spv"),
     @("sky_aa.frag", "sky_aa.frag.spv"),
     @("fullscreen.vert", "fullscreen.vert.spv"),

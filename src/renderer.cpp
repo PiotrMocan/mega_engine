@@ -26,6 +26,11 @@
 #include <glm/gtc/quaternion.hpp>
 #include <glm/mat3x3.hpp>
 
+#if VCR_EDITOR_ENABLED
+#include <imgui.h>
+#include <imgui_impl_vulkan.h>
+#endif
+
 namespace vcr {
 namespace {
 
@@ -487,9 +492,17 @@ void Renderer::initialize(
     const std::uint32_t initial_instances,
     const std::uint32_t initial_gpu_workload,
     const AntiAliasingSettings initial_anti_aliasing,
-    const bool enable_screenshot_capture) {
+    const bool enable_screenshot_capture,
+    const bool enable_editor_output) {
     context_ = &context;
     window_ = window;
+#if VCR_EDITOR_ENABLED
+    editor_output_enabled_ = enable_editor_output;
+    editor_scene_instances_.reserve(
+        static_cast<std::size_t>(max_scene_nodes) + 1U);
+#else
+    static_cast<void>(enable_editor_output);
+#endif
     const std::uint64_t range_capacity =
         context.properties().limits.maxStorageBufferRange /
         sizeof(InstanceData);
@@ -512,6 +525,11 @@ void Renderer::initialize(
         window,
         preferred_present_mode,
         enable_screenshot_capture);
+#if VCR_EDITOR_ENABLED
+    if (editor_output_enabled_) {
+        create_editor_viewport(swapchain_.extent());
+    }
+#endif
     create_frame_contexts();
     create_present_semaphores();
     create_pipeline_cache();
@@ -534,6 +552,16 @@ void Renderer::shutdown() noexcept {
     screenshot_requested_ = false;
     screenshot_in_flight_ = false;
     destroy_anti_aliasing_resources();
+#if VCR_EDITOR_ENABLED
+    destroy_editor_viewport();
+    editor_scene_instances_.clear();
+    editor_ground_count_ = 0U;
+    editor_cube_count_ = 0U;
+    editor_terrain_visible_ = false;
+    editor_sky_visible_ = false;
+    editor_sun_visible_ = false;
+    editor_output_enabled_ = false;
+#endif
     destroy_scene_resources();
     destroy_pipeline();
     save_pipeline_cache();
@@ -600,6 +628,33 @@ void Renderer::create_frame_contexts() {
             VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
             0,
             "per-frame workload buffer");
+#if VCR_EDITOR_ENABLED
+        if (editor_output_enabled_) {
+            constexpr std::uint64_t scene_instance_capacity =
+                static_cast<std::uint64_t>(max_scene_nodes) + 1ULL;
+            constexpr std::uint64_t scene_buffer_bytes =
+                scene_instance_capacity * sizeof(SceneGpuInstance);
+            static_assert(
+                scene_buffer_bytes <=
+                std::numeric_limits<VkDeviceSize>::max());
+            frame.scene_instance_buffer.create(
+                *context_,
+                static_cast<VkDeviceSize>(scene_buffer_bytes),
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+                0,
+                "editor scene instance buffer");
+            frame.scene_upload_buffer.create(
+                *context_,
+                static_cast<VkDeviceSize>(scene_buffer_bytes),
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                VMA_MEMORY_USAGE_AUTO,
+                VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                    VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                "editor scene upload buffer");
+        }
+#endif
 
         if (context_->timestamp_valid_bits() > 0U) {
             const VkQueryPoolCreateInfo query_info{
@@ -633,6 +688,10 @@ void Renderer::destroy_frame_contexts() noexcept {
         }
         frame.workload_buffer.destroy();
         frame.uniform_buffer.destroy();
+#if VCR_EDITOR_ENABLED
+        frame.scene_upload_buffer.destroy();
+        frame.scene_instance_buffer.destroy();
+#endif
         frame = {};
     }
 }
@@ -669,6 +728,204 @@ void Renderer::destroy_present_semaphores() noexcept {
         }
     }
     present_complete_semaphores_.clear();
+}
+
+#if VCR_EDITOR_ENABLED
+void Renderer::create_editor_viewport(const VkExtent2D extent) {
+    if (!editor_output_enabled_ ||
+        extent.width == 0U || extent.height == 0U) {
+        fatal("Cannot create an empty editor viewport.");
+    }
+    VkFormatProperties color_properties{};
+    vkGetPhysicalDeviceFormatProperties(
+        context_->physical_device(),
+        swapchain_.color_format(),
+        &color_properties);
+    constexpr VkFormatFeatureFlags required_color_features =
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    if ((color_properties.optimalTilingFeatures &
+         required_color_features) != required_color_features) {
+        fatal(
+            "The swapchain color format cannot be sampled by the editor "
+            "viewport.");
+    }
+    editor_viewport_.color.create_render_target(
+        *context_,
+        extent.width,
+        extent.height,
+        swapchain_.color_format(),
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+            VK_IMAGE_USAGE_SAMPLED_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        VK_FILTER_LINEAR,
+        "editor scene viewport color");
+    editor_viewport_.depth.create_render_target(
+        *context_,
+        extent.width,
+        extent.height,
+        swapchain_.depth_format(),
+        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+        VK_IMAGE_ASPECT_DEPTH_BIT,
+        VK_FILTER_NEAREST,
+        "editor scene viewport depth");
+    editor_viewport_.color_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    editor_viewport_.depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ++editor_viewport_generation_;
+}
+
+void Renderer::destroy_editor_viewport() noexcept {
+    editor_viewport_.depth.destroy();
+    editor_viewport_.color.destroy();
+    editor_viewport_.color_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    editor_viewport_.depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+}
+
+bool Renderer::prepare_editor_viewport(VkExtent2D extent) {
+    if (!editor_output_enabled_ || context_ == nullptr ||
+        extent.width == 0U || extent.height == 0U) {
+        return false;
+    }
+    constexpr std::uint32_t maximum_editor_width = 3840U;
+    constexpr std::uint32_t maximum_editor_height = 2160U;
+    const std::uint32_t device_limit =
+        context_->properties().limits.maxImageDimension2D;
+    extent.width = std::clamp(
+        extent.width,
+        64U,
+        std::min(device_limit, maximum_editor_width));
+    extent.height = std::clamp(
+        extent.height,
+        64U,
+        std::min(device_limit, maximum_editor_height));
+    if (extent.width == editor_viewport_.color.width() &&
+        extent.height == editor_viewport_.color.height()) {
+        return false;
+    }
+
+    // The editor coalesces live splitter changes before calling this method.
+    // Waiting here covers the main swapchain plus Dear ImGui platform-window
+    // submissions, whose fences are owned by the upstream backend.
+    VK_CHECK(vkDeviceWaitIdle(context_->device()));
+    destroy_anti_aliasing_descriptors();
+    fsr3_upscaler_.shutdown();
+    destroy_anti_aliasing_targets();
+    destroy_editor_viewport();
+    create_editor_viewport(extent);
+    create_anti_aliasing_targets();
+    fsr3_upscaler_.initialize(*context_, extent);
+    if (anti_aliasing_.method == AntiAliasingMethod::fsr3 &&
+        !fsr3_upscaler_.available()) {
+        anti_aliasing_.method = AntiAliasingMethod::smaa;
+    }
+    create_anti_aliasing_descriptors();
+    temporal_history_valid_ = false;
+    return true;
+}
+
+void Renderer::update_editor_scene(
+    const SceneRenderView& view) {
+    if (!editor_output_enabled_ ||
+        view.revision == editor_scene_revision_) {
+        return;
+    }
+    const std::size_t ground_count =
+        view.has_ground ? 1U : 0U;
+    if (view.cubes.size() >
+        static_cast<std::size_t>(max_scene_nodes) - ground_count) {
+        fatal("Editor scene exceeds the bounded GPU instance capacity.");
+    }
+    editor_scene_instances_.clear();
+    if (view.has_ground) {
+        editor_scene_instances_.push_back(view.ground);
+    }
+    editor_scene_instances_.insert(
+        editor_scene_instances_.end(),
+        view.cubes.begin(),
+        view.cubes.end());
+    editor_ground_count_ =
+        static_cast<std::uint32_t>(ground_count);
+    editor_cube_count_ =
+        static_cast<std::uint32_t>(view.cubes.size());
+    editor_terrain_visible_ = view.terrain_visible;
+    editor_sky_visible_ = view.sky_visible;
+    editor_sun_visible_ = view.sun_visible;
+    editor_scene_revision_ = view.revision;
+}
+
+void Renderer::invalidate_editor_scene() noexcept {
+    editor_scene_revision_ = 0U;
+    for (FrameContext& frame : frames_) {
+        frame.scene_revision = 0U;
+        frame.scene_ground_count = 0U;
+        frame.scene_cube_count = 0U;
+    }
+}
+
+void Renderer::record_editor_scene_upload(
+    const VkCommandBuffer command_buffer,
+    FrameContext& frame) {
+    if (!editor_output_enabled_ ||
+        frame.scene_revision == editor_scene_revision_) {
+        return;
+    }
+    const VkDeviceSize byte_count =
+        static_cast<VkDeviceSize>(editor_scene_instances_.size()) *
+        sizeof(SceneGpuInstance);
+    if (byte_count > frame.scene_upload_buffer.size() ||
+        byte_count > frame.scene_instance_buffer.size()) {
+        fatal("Editor scene upload exceeds its bounded frame buffer.");
+    }
+    if (byte_count > 0U) {
+        frame.scene_upload_buffer.write(std::as_bytes(std::span{
+            editor_scene_instances_.data(),
+            editor_scene_instances_.size()}));
+        const VkBufferCopy copy{
+            .srcOffset = 0U,
+            .dstOffset = 0U,
+            .size = byte_count,
+        };
+        vkCmdCopyBuffer(
+            command_buffer,
+            frame.scene_upload_buffer.handle(),
+            frame.scene_instance_buffer.handle(),
+            1U,
+            &copy);
+        const VkBufferMemoryBarrier2 barrier{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+            .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = frame.scene_instance_buffer.handle(),
+            .offset = 0U,
+            .size = byte_count,
+        };
+        const VkDependencyInfo dependency{
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .bufferMemoryBarrierCount = 1U,
+            .pBufferMemoryBarriers = &barrier,
+        };
+        vkCmdPipelineBarrier2(command_buffer, &dependency);
+    }
+    frame.scene_revision = editor_scene_revision_;
+    frame.scene_ground_count = editor_ground_count_;
+    frame.scene_cube_count = editor_cube_count_;
+}
+#endif
+
+VkExtent2D Renderer::scene_output_extent() const noexcept {
+#if VCR_EDITOR_ENABLED
+    if (editor_output_enabled_ && editor_viewport_.color) {
+        return VkExtent2D{
+            editor_viewport_.color.width(),
+            editor_viewport_.color.height(),
+        };
+    }
+#endif
+    return swapchain_.extent();
 }
 
 void Renderer::create_scene_resources() {
@@ -1098,7 +1355,7 @@ void Renderer::create_anti_aliasing_resources() {
     }
 
     create_anti_aliasing_targets();
-    fsr3_upscaler_.initialize(*context_, swapchain_.extent());
+    fsr3_upscaler_.initialize(*context_, scene_output_extent());
     if (anti_aliasing_.method == AntiAliasingMethod::fsr3 &&
         !fsr3_upscaler_.available()) {
         std::cerr
@@ -1111,7 +1368,7 @@ void Renderer::create_anti_aliasing_resources() {
 }
 
 void Renderer::create_anti_aliasing_targets() {
-    const VkExtent2D extent = swapchain_.extent();
+    const VkExtent2D extent = scene_output_extent();
     if (extent.width == 0U || extent.height == 0U) {
         fatal("Cannot create anti-aliasing targets for an empty extent.");
     }
@@ -1245,36 +1502,47 @@ void Renderer::destroy_anti_aliasing_descriptors() noexcept {
 }
 
 void Renderer::create_descriptors() {
+#if VCR_EDITOR_ENABLED
+    const std::uint32_t descriptor_set_count =
+        editor_output_enabled_
+        ? max_frames_in_flight * 2U
+        : max_frames_in_flight;
+#else
+    constexpr std::uint32_t descriptor_set_count =
+        max_frames_in_flight;
+#endif
     const std::array pool_sizes{
         VkDescriptorPoolSize{
             .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-            .descriptorCount = max_frames_in_flight,
+            .descriptorCount = descriptor_set_count,
         },
         VkDescriptorPoolSize{
             .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .descriptorCount = max_frames_in_flight * 2U,
+            .descriptorCount = descriptor_set_count * 2U,
         },
         VkDescriptorPoolSize{
             .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .descriptorCount = max_frames_in_flight * 2U,
+            .descriptorCount = descriptor_set_count * 2U,
         },
     };
     const VkDescriptorPoolCreateInfo pool_info{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = max_frames_in_flight,
+        .maxSets = descriptor_set_count,
         .poolSizeCount = static_cast<std::uint32_t>(pool_sizes.size()),
         .pPoolSizes = pool_sizes.data(),
     };
     VK_CHECK(vkCreateDescriptorPool(
         context_->device(), &pool_info, nullptr, &descriptor_pool_));
 
-    std::array<VkDescriptorSetLayout, max_frames_in_flight> layouts{};
+    std::array<
+        VkDescriptorSetLayout,
+        max_frames_in_flight * 2U> layouts{};
     layouts.fill(descriptor_set_layout_);
-    std::array<VkDescriptorSet, max_frames_in_flight> sets{};
+    std::array<VkDescriptorSet, max_frames_in_flight * 2U> sets{};
     const VkDescriptorSetAllocateInfo allocate_info{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .descriptorPool = descriptor_pool_,
-        .descriptorSetCount = max_frames_in_flight,
+        .descriptorSetCount = descriptor_set_count,
         .pSetLayouts = layouts.data(),
     };
     VK_CHECK(vkAllocateDescriptorSets(
@@ -1367,6 +1635,75 @@ void Renderer::create_descriptors() {
             writes.data(),
             0,
             nullptr);
+#if VCR_EDITOR_ENABLED
+        if (editor_output_enabled_) {
+            frames_[index].scene_descriptor_set =
+                sets[max_frames_in_flight + index];
+            const std::array scene_buffer_infos{
+                buffer_infos[0],
+                VkDescriptorBufferInfo{
+                    .buffer =
+                        frames_[index].scene_instance_buffer.handle(),
+                    .offset = 0,
+                    .range =
+                        frames_[index].scene_instance_buffer.size(),
+                },
+                buffer_infos[2],
+            };
+            const VkDescriptorSet scene_set =
+                frames_[index].scene_descriptor_set;
+            const std::array scene_writes{
+                VkWriteDescriptorSet{
+                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                    .dstSet = scene_set,
+                    .dstBinding = 0,
+                    .descriptorCount = 1,
+                    .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                    .pBufferInfo = &scene_buffer_infos[0],
+                },
+                VkWriteDescriptorSet{
+                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                    .dstSet = scene_set,
+                    .dstBinding = 1,
+                    .descriptorCount = 1,
+                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                    .pBufferInfo = &scene_buffer_infos[1],
+                },
+                VkWriteDescriptorSet{
+                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                    .dstSet = scene_set,
+                    .dstBinding = 2,
+                    .descriptorCount = 1,
+                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                    .pBufferInfo = &scene_buffer_infos[2],
+                },
+                VkWriteDescriptorSet{
+                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                    .dstSet = scene_set,
+                    .dstBinding = 3,
+                    .descriptorCount = 1,
+                    .descriptorType =
+                        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    .pImageInfo = &sky_info,
+                },
+                VkWriteDescriptorSet{
+                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                    .dstSet = scene_set,
+                    .dstBinding = 4,
+                    .descriptorCount = 1,
+                    .descriptorType =
+                        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    .pImageInfo = &shadow_info,
+                },
+            };
+            vkUpdateDescriptorSets(
+                context_->device(),
+                static_cast<std::uint32_t>(scene_writes.size()),
+                scene_writes.data(),
+                0,
+                nullptr);
+        }
+#endif
     }
 }
 
@@ -1669,7 +2006,7 @@ void Renderer::upload_to_device_texture(
 void Renderer::update_frame_uniform(
     FrameContext& frame,
     const glm::mat4& view_matrix) {
-    const VkExtent2D display_extent = swapchain_.extent();
+    const VkExtent2D display_extent = scene_output_extent();
     current_render_extent_ = display_extent;
     current_jitter_ = {};
     if (anti_aliasing_.method == AntiAliasingMethod::fsr3 &&
@@ -1723,6 +2060,11 @@ void Renderer::update_frame_uniform(
         uniforms.inverse_view_projection = glm::inverse(view_projection);
         uniforms.camera_position = glm::vec4(camera_position, 1.0F);
     }
+#if VCR_EDITOR_ENABLED
+    if (editor_output_enabled_ && !editor_sun_visible_) {
+        uniforms.sun_direction_intensity.w = 0.0F;
+    }
+#endif
     frame.uniform_buffer.write(
         std::as_bytes(std::span{&uniforms, std::size_t{1}}));
     previous_unjittered_view_projection_ =
@@ -2152,8 +2494,14 @@ void Renderer::create_pipeline() {
     vkDestroyShaderModule(context_->device(), fragment_module, nullptr);
     vkDestroyShaderModule(context_->device(), vertex_module, nullptr);
 
+    const char* scene_vertex_shader = "scene.vert.spv";
+#if VCR_EDITOR_ENABLED
+    if (editor_output_enabled_) {
+        scene_vertex_shader = "editor_scene.vert.spv";
+    }
+#endif
     const VkShaderModule scene_vertex_module =
-        load_shader("scene.vert.spv");
+        load_shader(scene_vertex_shader);
     const VkShaderModule scene_fragment_module =
         load_shader("scene.frag.spv");
     const std::array scene_stages{
@@ -2298,8 +2646,16 @@ void Renderer::create_pipeline() {
         vertex_input,
         input_assembly,
         "AA instancing graphics pipeline");
+    const char* aa_scene_vertex_shader =
+        "scene_aa.vert.spv";
+#if VCR_EDITOR_ENABLED
+    if (editor_output_enabled_) {
+        aa_scene_vertex_shader =
+            "editor_scene_aa.vert.spv";
+    }
+#endif
     aa_scene_pipeline_ = create_aa_geometry_pipeline(
-        "scene_aa.vert.spv",
+        aa_scene_vertex_shader,
         "scene_aa.frag.spv",
         vertex_input,
         input_assembly,
@@ -2761,8 +3117,18 @@ void Renderer::destroy_pipeline() noexcept {
 
 bool Renderer::draw_frame(
     FrameTimings& timings,
-    const glm::mat4& view_matrix) {
+    const glm::mat4& view_matrix
+#if VCR_EDITOR_ENABLED
+    ,
+    ImDrawData* const editor_draw_data
+#endif
+) {
     using Clock = std::chrono::steady_clock;
+#if VCR_EDITOR_ENABLED
+    if (editor_output_enabled_ && editor_draw_data == nullptr) {
+        fatal("Editor renderer requires valid Dear ImGui draw data.");
+    }
+#endif
     const auto milliseconds = [](const Clock::time_point begin,
                                  const Clock::time_point end) {
         return std::chrono::duration<double, std::milli>(end - begin).count();
@@ -2814,7 +3180,14 @@ bool Renderer::draw_frame(
         screenshot_requested_ = false;
     }
     begin = Clock::now();
-    record_commands(frame.command_buffer, image_index);
+    record_commands(
+        frame.command_buffer,
+        image_index
+#if VCR_EDITOR_ENABLED
+        ,
+        editor_draw_data
+#endif
+    );
     timings.command_record_ms = milliseconds(begin, Clock::now());
 
     const VkSemaphoreSubmitInfo wait_info{
@@ -3027,7 +3400,12 @@ void Renderer::complete_screenshot(FrameContext& frame) {
 
 void Renderer::record_commands(
     const VkCommandBuffer command_buffer,
-    const std::uint32_t image_index) {
+    const std::uint32_t image_index
+#if VCR_EDITOR_ENABLED
+    ,
+    ImDrawData* const editor_draw_data
+#endif
+) {
     const VkCommandBufferBeginInfo begin_info{
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
@@ -3035,6 +3413,9 @@ void Renderer::record_commands(
     VK_CHECK(vkBeginCommandBuffer(command_buffer, &begin_info));
 
     auto& frame = frames_[frame_index_];
+#if VCR_EDITOR_ENABLED
+    record_editor_scene_upload(command_buffer, frame);
+#endif
     if (frame.timestamp_queries != VK_NULL_HANDLE) {
         vkCmdResetQueryPool(
             command_buffer,
@@ -3170,7 +3551,13 @@ void Renderer::record_commands(
             const VkPipeline terrain_pipeline,
             const VkPipeline sky_pipeline) {
             set_viewport(extent);
-            const VkDescriptorSet descriptor_set = frame.descriptor_set;
+            VkDescriptorSet descriptor_set = frame.descriptor_set;
+#if VCR_EDITOR_ENABLED
+            if (editor_output_enabled_ &&
+                mode_ != RunMode::instancing) {
+                descriptor_set = frame.scene_descriptor_set;
+            }
+#endif
             vkCmdBindDescriptorSets(
                 command_buffer,
                 VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -3215,6 +3602,29 @@ void Renderer::record_commands(
                     0,
                     0);
             } else {
+#if VCR_EDITOR_ENABLED
+                if (editor_output_enabled_) {
+                    if (frame.scene_ground_count > 0U) {
+                        vkCmdDrawIndexed(
+                            command_buffer,
+                            plane_index_count,
+                            frame.scene_ground_count,
+                            plane_first_index,
+                            plane_vertex_offset,
+                            0U);
+                    }
+                    if (frame.scene_cube_count > 0U) {
+                        vkCmdDrawIndexed(
+                            command_buffer,
+                            cube_index_count,
+                            frame.scene_cube_count,
+                            0U,
+                            0,
+                            frame.scene_ground_count);
+                    }
+                } else
+#endif
+                {
                 vkCmdDrawIndexed(
                     command_buffer,
                     plane_index_count,
@@ -3222,32 +3632,48 @@ void Renderer::record_commands(
                     plane_first_index,
                     plane_vertex_offset,
                     scene_instance_base_);
-                vkCmdBindPipeline(
-                    command_buffer,
-                    VK_PIPELINE_BIND_POINT_GRAPHICS,
-                    terrain_pipeline);
-                const VkBuffer terrain_vertex_buffer =
-                    terrain_vertex_buffer_.handle();
-                vkCmdBindVertexBuffers(
-                    command_buffer,
-                    0,
-                    1,
-                    &terrain_vertex_buffer,
-                    &vertex_offset);
-                vkCmdBindIndexBuffer(
-                    command_buffer,
-                    terrain_index_buffer_.handle(),
-                    0,
-                    VK_INDEX_TYPE_UINT32);
-                vkCmdDrawIndexed(
-                    command_buffer,
-                    terrain_index_count,
-                    1,
-                    0,
-                    0,
-                    0);
+                }
+                bool draw_terrain = true;
+#if VCR_EDITOR_ENABLED
+                draw_terrain =
+                    !editor_output_enabled_ ||
+                    editor_terrain_visible_;
+#endif
+                if (draw_terrain) {
+                    vkCmdBindPipeline(
+                        command_buffer,
+                        VK_PIPELINE_BIND_POINT_GRAPHICS,
+                        terrain_pipeline);
+                    const VkBuffer terrain_vertex_buffer =
+                        terrain_vertex_buffer_.handle();
+                    vkCmdBindVertexBuffers(
+                        command_buffer,
+                        0,
+                        1,
+                        &terrain_vertex_buffer,
+                        &vertex_offset);
+                    vkCmdBindIndexBuffer(
+                        command_buffer,
+                        terrain_index_buffer_.handle(),
+                        0,
+                        VK_INDEX_TYPE_UINT32);
+                    vkCmdDrawIndexed(
+                        command_buffer,
+                        terrain_index_count,
+                        1,
+                        0,
+                        0,
+                        0);
+                }
             }
-            if (mode_ != RunMode::instancing) {
+            bool draw_sky = mode_ != RunMode::instancing;
+#if VCR_EDITOR_ENABLED
+            draw_sky =
+                draw_sky &&
+                (!editor_output_enabled_ ||
+                 editor_sky_visible_);
+#endif
+            if (draw_sky) {
                 // The triangle sits at depth 1.0 and is drawn last.
                 vkCmdBindPipeline(
                     command_buffer,
@@ -3262,7 +3688,11 @@ void Renderer::record_commands(
         std::uint32_t method;
         std::uint32_t quality;
     };
-    const VkExtent2D display_extent = swapchain_.extent();
+    const VkExtent2D display_extent = scene_output_extent();
+#if VCR_EDITOR_ENABLED
+    const bool editor_frame =
+        editor_output_enabled_ && editor_draw_data != nullptr;
+#endif
     const PostProcessPushConstants post_process_push{
         {
             1.0F / static_cast<float>(display_extent.width),
@@ -3336,6 +3766,32 @@ void Renderer::record_commands(
         };
 
     if (anti_aliasing_.method == AntiAliasingMethod::off) {
+#if VCR_EDITOR_ENABLED
+        if (editor_frame) {
+            transition_tracked_image(
+                command_buffer,
+                editor_viewport_.color,
+                editor_viewport_.color_layout,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+            transition_tracked_image(
+                command_buffer,
+                editor_viewport_.depth,
+                editor_viewport_.depth_layout,
+                VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+        } else
+#endif
+        {
         transition_image(
             command_buffer,
             swapchain_.images()[image_index],
@@ -3358,9 +3814,20 @@ void Renderer::record_commands(
                 VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
             VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+        }
+        VkImageView scene_color_view =
+            swapchain_.image_view(image_index);
+        VkImageView scene_depth_view =
+            swapchain_.depth_target(image_index).view;
+#if VCR_EDITOR_ENABLED
+        if (editor_frame) {
+            scene_color_view = editor_viewport_.color.view();
+            scene_depth_view = editor_viewport_.depth.view();
+        }
+#endif
         const VkRenderingAttachmentInfo color_attachment{
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .imageView = swapchain_.image_view(image_index),
+            .imageView = scene_color_view,
             .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
@@ -3371,7 +3838,7 @@ void Renderer::record_commands(
         };
         const VkRenderingAttachmentInfo depth_attachment{
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .imageView = swapchain_.depth_target(image_index).view,
+            .imageView = scene_depth_view,
             .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
             .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
             .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
@@ -3404,6 +3871,19 @@ void Renderer::record_commands(
         }
         draw_hud();
         vkCmdEndRendering(command_buffer);
+#if VCR_EDITOR_ENABLED
+        if (editor_frame) {
+            transition_tracked_image(
+                command_buffer,
+                editor_viewport_.color,
+                editor_viewport_.color_layout,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        }
+#endif
     } else {
         constexpr VkPipelineStageFlags2 previous_read_stages =
             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
@@ -3685,19 +4165,41 @@ void Renderer::record_commands(
                 VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         }
 
-        transition_image(
-            command_buffer,
-            swapchain_.images()[image_index],
-            VK_IMAGE_ASPECT_COLOR_BIT,
-            VK_IMAGE_LAYOUT_UNDEFINED,
-            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            VK_PIPELINE_STAGE_2_NONE,
-            VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+#if VCR_EDITOR_ENABLED
+        if (editor_frame) {
+            transition_tracked_image(
+                command_buffer,
+                editor_viewport_.color,
+                editor_viewport_.color_layout,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        } else
+#endif
+        {
+            transition_image(
+                command_buffer,
+                swapchain_.images()[image_index],
+                VK_IMAGE_ASPECT_COLOR_BIT,
+                VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_2_NONE,
+                VK_ACCESS_2_NONE,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        }
+        VkImageView final_image_view =
+            swapchain_.image_view(image_index);
+#if VCR_EDITOR_ENABLED
+        if (editor_frame) {
+            final_image_view = editor_viewport_.color.view();
+        }
+#endif
         const VkRenderingAttachmentInfo final_attachment{
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .imageView = swapchain_.image_view(image_index),
+            .imageView = final_image_view,
             .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
@@ -3725,7 +4227,72 @@ void Renderer::record_commands(
                 : fsr_composite_pipeline_);
         draw_hud();
         vkCmdEndRendering(command_buffer);
+#if VCR_EDITOR_ENABLED
+        if (editor_frame) {
+            transition_tracked_image(
+                command_buffer,
+                editor_viewport_.color,
+                editor_viewport_.color_layout,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        }
+#endif
     }
+
+#if VCR_EDITOR_ENABLED
+    if (editor_frame) {
+        transition_image(
+            command_buffer,
+            swapchain_.images()[image_index],
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_PIPELINE_STAGE_2_NONE,
+            VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        const VkRenderingAttachmentInfo ui_attachment{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = swapchain_.image_view(image_index),
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = VkClearValue{
+                .color = VkClearColorValue{
+                    {0.025F, 0.03F, 0.04F, 1.0F}},
+            },
+        };
+        const VkExtent2D ui_extent = swapchain_.extent();
+        const VkRenderingInfo ui_rendering{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea = VkRect2D{
+                .offset = {0, 0},
+                .extent = ui_extent,
+            },
+            .layerCount = 1U,
+            .colorAttachmentCount = 1U,
+            .pColorAttachments = &ui_attachment,
+        };
+        vkCmdBeginRendering(command_buffer, &ui_rendering);
+        const VkViewport ui_viewport{
+            .x = 0.0F,
+            .y = 0.0F,
+            .width = static_cast<float>(ui_extent.width),
+            .height = static_cast<float>(ui_extent.height),
+            .minDepth = 0.0F,
+            .maxDepth = 1.0F,
+        };
+        const VkRect2D ui_scissor{{0, 0}, ui_extent};
+        vkCmdSetViewport(command_buffer, 0U, 1U, &ui_viewport);
+        vkCmdSetScissor(command_buffer, 0U, 1U, &ui_scissor);
+        ImGui_ImplVulkan_RenderDrawData(
+            editor_draw_data, command_buffer);
+        vkCmdEndRendering(command_buffer);
+    }
+#endif
 
     auto& capture_frame = frames_[frame_index_];
     const bool capture_this_frame =
@@ -3857,12 +4424,25 @@ void Renderer::recreate_swapchain(
         old_color != swapchain_.color_format() ||
         old_depth != swapchain_.depth_format();
     if (formats_changed) {
+#if VCR_EDITOR_ENABLED
+        if (editor_output_enabled_) {
+            const VkExtent2D editor_extent{
+                editor_viewport_.color.width(),
+                editor_viewport_.color.height(),
+            };
+            destroy_editor_viewport();
+            create_editor_viewport(editor_extent);
+        }
+#endif
         if (descriptor_pool_ != VK_NULL_HANDLE) {
             vkDestroyDescriptorPool(
                 context_->device(), descriptor_pool_, nullptr);
             descriptor_pool_ = VK_NULL_HANDLE;
             for (auto& frame : frames_) {
                 frame.descriptor_set = VK_NULL_HANDLE;
+#if VCR_EDITOR_ENABLED
+                frame.scene_descriptor_set = VK_NULL_HANDLE;
+#endif
             }
         }
         destroy_pipeline();
@@ -3873,6 +4453,9 @@ void Renderer::recreate_swapchain(
     create_anti_aliasing_descriptors();
     temporal_history_valid_ = false;
     fsr3_upscaler_.request_reset();
+#if VCR_EDITOR_ENABLED
+    ++swapchain_generation_;
+#endif
 }
 
 void Renderer::toggle_vsync() {

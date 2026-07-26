@@ -5,6 +5,10 @@
 
 #include <cstdint>
 
+#if VCR_EDITOR_ENABLED
+#include "scene_document.hpp"
+#endif
+
 namespace vcr {
 
 inline constexpr std::uint32_t max_frames_in_flight = 2;
@@ -24,6 +28,14 @@ struct FrameContext {
     std::uint32_t screenshot_width = 0;
     std::uint32_t screenshot_height = 0;
     VkFormat screenshot_format = VK_FORMAT_UNDEFINED;
+#if VCR_EDITOR_ENABLED
+    GpuBuffer scene_instance_buffer{};
+    GpuBuffer scene_upload_buffer{};
+    VkDescriptorSet scene_descriptor_set = VK_NULL_HANDLE;
+    std::uint64_t scene_revision = 0U;
+    std::uint32_t scene_ground_count = 0U;
+    std::uint32_t scene_cube_count = 0U;
+#endif
 };
 
 } // namespace vcr

@@ -1,8 +1,11 @@
+#include "asset_browser.hpp"
 #include "cli_options.hpp"
 #include "fly_camera.hpp"
 #include "mcp_control.hpp"
 #include "performance_metrics.hpp"
 #include "png_encoder.hpp"
+#include "scene_document.hpp"
+#include "scene_io.hpp"
 
 #include <algorithm>
 #include <array>
@@ -10,13 +13,18 @@
 #include <chrono>
 #include <cstdint>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <iterator>
 #include <limits>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <glm/geometric.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 namespace {
 
@@ -428,6 +436,369 @@ int main() {
         expect(
             !static_cast<bool>(invalid),
             "PNG encoder rejects zero dimensions");
+    }
+
+    {
+        vcr::SceneDocument scene;
+        const vcr::SceneNodeId root = scene.create_node(
+            "Root", vcr::SceneNodeKind::folder);
+        const vcr::SceneNodeId child = scene.create_node(
+            "Child", vcr::SceneNodeKind::folder, root);
+        const vcr::SceneNodeId cube = scene.create_node(
+            "Cube", vcr::SceneNodeKind::cube, child);
+        expect(
+            scene.valid(root) && scene.valid(child) &&
+                scene.valid(cube) && scene.size() == 3U,
+            "scene creates stable hierarchical nodes");
+        expect(
+            !scene.reparent(root, cube),
+            "scene rejects a hierarchy cycle");
+        expect(
+            !scene.create_node(
+                std::string(
+                    vcr::max_scene_node_name_bytes + 1U,
+                    'x'),
+                vcr::SceneNodeKind::folder),
+            "scene rejects an unbounded node name");
+        const std::uint64_t render_revision =
+            scene.content_revision();
+        const std::uint64_t hierarchy_revision =
+            scene.structure_revision();
+        expect(
+            scene.rename_node(cube, "Renamed cube") &&
+                scene.content_revision() == render_revision &&
+                scene.structure_revision() ==
+                    hierarchy_revision + 1U,
+            "scene rename invalidates hierarchy without GPU content");
+
+        std::vector<vcr::SceneHierarchyRow> rows;
+        rows.reserve(16U);
+        scene.build_hierarchy_rows(rows);
+        expect(
+            rows.size() == 3U &&
+                rows[0].depth == 0U &&
+                rows[1].depth == 1U &&
+                rows[2].depth == 2U,
+            "scene hierarchy cache is iterative preorder");
+
+        expect(
+            scene.destroy_subtree(child) &&
+                !scene.valid(child) &&
+                !scene.valid(cube) &&
+                scene.valid(root) &&
+                scene.size() == 1U,
+            "scene subtree deletion invalidates stale handles");
+        const vcr::SceneNodeId reused = scene.create_node(
+            "Reused", vcr::SceneNodeKind::cube, root);
+        expect(
+            reused.index == child.index &&
+                reused.generation != child.generation &&
+                !scene.valid(child),
+            "scene slot reuse increments generation");
+    }
+
+    {
+        vcr::SceneDocument scene;
+        const vcr::SceneNodeId root = scene.create_node(
+            "Root", vcr::SceneNodeKind::folder);
+        static_cast<void>(scene.create_node(
+            "Terrain", vcr::SceneNodeKind::terrain, root));
+        static_cast<void>(scene.create_node(
+            "Sky", vcr::SceneNodeKind::environment, root));
+        static_cast<void>(scene.create_node(
+            "Sun", vcr::SceneNodeKind::directional_light, root));
+        static_cast<void>(scene.create_node(
+            "Cube", vcr::SceneNodeKind::cube, root));
+        std::vector<vcr::SceneGpuInstance> instances;
+        const vcr::SceneRenderView visible =
+            scene.build_render_view(instances);
+        expect(
+            visible.cubes.size() == 1U &&
+                visible.terrain_visible &&
+                visible.sky_visible &&
+                visible.sun_visible,
+            "scene render view exposes visible component flags");
+        if (auto root_node = scene.node(root)) {
+            root_node->get().visible = false;
+            scene.mark_content_changed();
+        }
+        const vcr::SceneRenderView hidden =
+            scene.build_render_view(instances);
+        expect(
+            hidden.cubes.empty() &&
+                !hidden.terrain_visible &&
+                !hidden.sky_visible &&
+                !hidden.sun_visible,
+            "hidden parent suppresses renderable descendants");
+    }
+
+    {
+        vcr::SceneDocument scene;
+        const vcr::SceneNodeId parent = scene.create_node(
+            "Scaled parent", vcr::SceneNodeKind::folder);
+        const vcr::SceneNodeId cube = scene.create_node(
+            "Rotated child", vcr::SceneNodeKind::cube, parent);
+        auto parent_node = scene.node(parent);
+        auto cube_node = scene.node(cube);
+        expect(
+            parent_node.has_value() && cube_node.has_value(),
+            "scene transform test nodes exist");
+        if (parent_node && cube_node) {
+            parent_node->get().transform.translation =
+                glm::vec3(3.0F, -2.0F, 5.0F);
+            parent_node->get().transform.rotation_degrees =
+                glm::vec3(12.0F, 31.0F, -7.0F);
+            parent_node->get().transform.scale =
+                glm::vec3(2.0F, 3.0F, 0.5F);
+            cube_node->get().transform.translation =
+                glm::vec3(-4.0F, 1.0F, 2.0F);
+            cube_node->get().transform.rotation_degrees =
+                glm::vec3(27.0F, -19.0F, 43.0F);
+            cube_node->get().transform.scale =
+                glm::vec3(0.75F, 1.25F, 1.5F);
+            scene.mark_content_changed();
+        }
+
+        std::vector<vcr::SceneGpuInstance> instances;
+        instances.reserve(1U);
+        const vcr::SceneRenderView snapshot =
+            scene.build_render_view(instances);
+        expect(
+            snapshot.cubes.size() == 1U,
+            "scene transform emits one cube");
+        if (snapshot.cubes.size() == 1U &&
+            parent_node && cube_node) {
+            const auto local = [](const vcr::SceneTransform& value) {
+                return glm::translate(
+                           glm::mat4(1.0F),
+                           value.translation) *
+                       glm::mat4_cast(glm::quat(glm::radians(
+                           value.rotation_degrees))) *
+                       glm::scale(
+                           glm::mat4(1.0F), value.scale);
+            };
+            const glm::mat4 expected =
+                local(parent_node->get().transform) *
+                local(cube_node->get().transform);
+            const vcr::SceneGpuInstance& packed =
+                snapshot.cubes.front();
+            const std::array rows{
+                packed.model_row_0,
+                packed.model_row_1,
+                packed.model_row_2,
+                glm::vec4(0.0F, 0.0F, 0.0F, 1.0F),
+            };
+            bool matches = true;
+            for (glm::length_t column = 0;
+                 column < 4;
+                 ++column) {
+                for (glm::length_t row = 0;
+                     row < 4;
+                     ++row) {
+                    matches =
+                        matches &&
+                        close_to(
+                            rows[static_cast<std::size_t>(row)]
+                                [column],
+                            expected[column][row],
+                            0.0001);
+                }
+            }
+            expect(
+                matches,
+                "hierarchical affine transform preserves shear");
+        }
+    }
+
+    {
+        vcr::SceneDocument scene;
+        vcr::SceneNodeId parent = scene.create_node(
+            "Root", vcr::SceneNodeKind::folder);
+        constexpr std::uint32_t depth = 10'000U;
+        for (std::uint32_t index = 1U; index < depth; ++index) {
+            parent = scene.create_node(
+                "Node", vcr::SceneNodeKind::folder, parent);
+        }
+        std::vector<vcr::SceneHierarchyRow> rows;
+        rows.reserve(depth);
+        scene.build_hierarchy_rows(rows);
+        expect(
+            rows.size() == depth &&
+                rows.back().depth == depth - 1U,
+            "deep hierarchy traversal does not recurse");
+    }
+
+    {
+        vcr::SceneDocument scene;
+        const vcr::SceneNodeId root = scene.create_node(
+            "Root", vcr::SceneNodeKind::folder);
+        for (std::uint32_t index = 1U;
+             index < vcr::max_scene_nodes;
+             ++index) {
+            const vcr::SceneNodeId node = scene.create_node(
+                "Node", vcr::SceneNodeKind::folder, root);
+            if (!node) {
+                break;
+            }
+        }
+        expect(
+            scene.size() == vcr::max_scene_nodes &&
+                !scene.create_node(
+                    "Overflow",
+                    vcr::SceneNodeKind::folder),
+            "scene node capacity is strictly bounded");
+        expect(
+            scene.destroy_subtree(root) &&
+                scene.size() == 0U,
+            "maximum-size subtree destruction is iterative");
+    }
+
+    {
+        std::error_code filesystem_error;
+        const std::filesystem::path temporary_root =
+            std::filesystem::temp_directory_path(filesystem_error) /
+            ("vcr_asset_browser_" +
+             std::to_string(
+                 std::chrono::steady_clock::now()
+                     .time_since_epoch()
+                     .count()));
+        expect(
+            !filesystem_error &&
+                std::filesystem::create_directories(
+                    temporary_root / "folder",
+                    filesystem_error) &&
+                !filesystem_error,
+            "asset browser test directory is created");
+        {
+            std::ofstream image(
+                temporary_root / "image.PNG",
+                std::ios::binary);
+            image.put('x');
+        }
+        {
+            std::ofstream shader(
+                temporary_root / "shader.vert",
+                std::ios::binary);
+            shader.put('x');
+        }
+        {
+            std::ofstream nested(
+                temporary_root / "folder" / "nested.glb",
+                std::ios::binary);
+            nested.put('x');
+        }
+
+        vcr::AssetBrowser browser;
+        std::string error;
+        expect(
+            browser.initialize(temporary_root, error) &&
+                error.empty() &&
+                browser.entries().size() == 3U &&
+                browser.entries().front().kind ==
+                    vcr::AssetEntryKind::directory &&
+                !browser.truncated(),
+            "asset browser enumerates a bounded sorted project root");
+        expect(
+            !browser.navigate_to("..", error) &&
+                browser.current_directory().empty() &&
+                browser.entries().size() == 3U,
+            "asset browser rejects root escape without changing state");
+        expect(
+            browser.navigate_to("folder", error) &&
+                browser.current_directory() ==
+                    std::filesystem::path("folder") &&
+                browser.entries().size() == 1U &&
+                browser.entries().front().kind ==
+                    vcr::AssetEntryKind::binary,
+            "asset browser navigates into project assets");
+        const std::size_t stable_entry_count =
+            browser.entries().size();
+        expect(
+            !browser.navigate_to("missing", error) &&
+                browser.current_directory() ==
+                    std::filesystem::path("folder") &&
+                browser.entries().size() == stable_entry_count,
+            "failed asset navigation is transactional");
+        expect(
+            browser.navigate_up(error) &&
+                browser.current_directory().empty(),
+            "asset browser navigates to its root");
+
+        vcr::SceneDocument source_scene;
+        const vcr::SceneNodeId scene_root =
+            source_scene.create_node(
+                "Root", vcr::SceneNodeKind::folder);
+        const vcr::SceneNodeId scene_cube =
+            source_scene.create_node(
+                "Cube", vcr::SceneNodeKind::cube, scene_root);
+        if (auto cube = source_scene.node(scene_cube)) {
+            cube->get().transform.translation =
+                glm::vec3(3.0F, 2.0F, -7.0F);
+            cube->get().transform.rotation_degrees =
+                glm::vec3(10.0F, 20.0F, 30.0F);
+            cube->get().transform.scale =
+                glm::vec3(2.0F, 0.5F, 4.0F);
+            cube->get().color =
+                glm::vec4(0.2F, 0.4F, 0.8F, 1.0F);
+            source_scene.mark_content_changed();
+        }
+        const std::filesystem::path scene_file =
+            temporary_root / "roundtrip.scene.json";
+        expect(
+            vcr::save_scene_file(
+                source_scene, scene_file, error),
+            "scene JSON saves through a temporary file");
+        vcr::SceneDocument loaded_scene;
+        expect(
+            vcr::load_scene_file(
+                scene_file, loaded_scene, error) &&
+                loaded_scene.size() == source_scene.size(),
+            "scene JSON loads transactionally");
+        std::vector<vcr::SceneNodeRecord> source_records;
+        std::vector<vcr::SceneNodeRecord> loaded_records;
+        source_scene.build_node_records(source_records);
+        loaded_scene.build_node_records(loaded_records);
+        expect(
+            loaded_records.size() == 2U &&
+                source_records.size() == loaded_records.size() &&
+                loaded_records[1].parent_record_index == 0U &&
+                loaded_records[1].value.name == "Cube" &&
+                close_to(
+                    loaded_records[1].value.transform.scale.z,
+                    4.0,
+                    0.0001),
+            "scene JSON preserves hierarchy and authored values");
+
+        const std::filesystem::path invalid_scene_file =
+            temporary_root / "invalid.scene.json";
+        {
+            std::ofstream invalid(invalid_scene_file);
+            invalid
+                << "{\"format\":\"vulkan_cube_scene\","
+                   "\"version\":1,\"nodes\":[{"
+                   "\"name\":\"Invalid\",\"kind\":\"cube\","
+                   "\"parent\":1,\"visible\":true,"
+                   "\"expanded\":true,\"transform\":{"
+                   "\"translation\":[0,0,0],"
+                   "\"rotation_degrees\":[0,0,0],"
+                   "\"scale\":[1,1,1]},"
+                   "\"color\":[1,1,1,1]}]}";
+        }
+        vcr::SceneDocument unchanged =
+            vcr::SceneDocument::make_default();
+        const std::uint32_t unchanged_size = unchanged.size();
+        expect(
+            !vcr::load_scene_file(
+                invalid_scene_file, unchanged, error) &&
+                unchanged.size() == unchanged_size,
+            "invalid scene load leaves the current document unchanged");
+
+        filesystem_error.clear();
+        static_cast<void>(std::filesystem::remove_all(
+            temporary_root, filesystem_error));
+        expect(
+            !filesystem_error,
+            "asset browser test directory is removed");
     }
 
     if (failures != 0) {
