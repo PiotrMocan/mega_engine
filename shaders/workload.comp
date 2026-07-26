@@ -1,0 +1,67 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Shared with cube.frag. The host must insert a COMPUTE_SHADER storage-write
+// -> FRAGMENT_SHADER storage-read barrier before dynamic rendering.
+layout(set = 0, binding = 2, std430) buffer WorkloadBuffer
+{
+    vec4 values[];
+} workload;
+
+// Host ABI: 16 bytes. Dispatch ceil(elementCount / 256) workgroups.
+layout(push_constant) uniform ComputePushConstants
+{
+    uint iterations;
+    uint elementCount;
+    uint frameSeed;
+    uint padding;
+} pushConstants;
+
+uint mixBits(uint value)
+{
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    value ^= value >> 16u;
+    return value;
+}
+
+void main()
+{
+    const uint elementIndex = gl_GlobalInvocationID.x;
+    if (elementIndex >= pushConstants.elementCount)
+    {
+        return;
+    }
+
+    const uint seed0 = mixBits(
+        elementIndex ^ pushConstants.frameSeed ^ 0xa511e9b3u);
+    const uint seed1 = mixBits(seed0 ^ 0x63d83595u);
+    const uint seed2 = mixBits(seed1 ^ 0x9e3779b9u);
+    const uint seed3 = mixBits(seed2 ^ 0xc2b2ae35u);
+
+    const float uintToUnit = 1.0 / 4294967295.0;
+    vec4 state = vec4(seed0, seed1, seed2, seed3) * uintToUnit;
+    state = state * 2.0 - 1.0;
+
+    // Runtime loop count plus a loop-carried transcendental dependency prevents
+    // constant folding. The final state is stored and later sampled by cube.frag.
+    for (uint iteration = 0u;
+         iteration < pushConstants.iterations;
+         ++iteration)
+    {
+        const float phase =
+            float(iteration ^ pushConstants.frameSeed) * 0.000001;
+        const vec4 coupled =
+            state.zwxy * vec4(1.61803399, 1.41421356, 1.73205081, 2.23606798);
+        state = sin(
+            state * vec4(2.71828183, 3.14159265, 1.32471796, 0.57721566)
+            + coupled
+            + phase);
+        state = cos(state.wxyz * vec4(1.113, 1.271, 1.337, 1.499) + state);
+    }
+
+    workload.values[elementIndex] = 0.5 + 0.5 * state;
+}

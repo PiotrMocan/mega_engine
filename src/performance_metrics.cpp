@@ -1,0 +1,459 @@
+#include "performance_metrics.hpp"
+
+#include <algorithm>
+#include <charconv>
+#include <cmath>
+#include <exception>
+#include <fstream>
+#include <limits>
+#include <string_view>
+#include <system_error>
+#include <utility>
+
+namespace vcr {
+namespace {
+
+[[nodiscard]] bool is_available(double value) noexcept {
+    return std::isfinite(value) && value >= 0.0;
+}
+
+[[nodiscard]] double seconds_between(
+    BenchmarkController::TimePoint first,
+    BenchmarkController::TimePoint second) noexcept {
+    return std::chrono::duration<double>(second - first).count();
+}
+
+[[nodiscard]] double clamp_elapsed(double value, double maximum) noexcept {
+    return std::clamp(value, 0.0, maximum);
+}
+
+void append_json_string(std::string& output, std::string_view value) {
+    constexpr char hex[] = "0123456789abcdef";
+    output.push_back('"');
+    for (const char raw_character : value) {
+        const auto character = static_cast<unsigned char>(raw_character);
+        switch (character) {
+        case '"':
+            output.append("\\\"");
+            break;
+        case '\\':
+            output.append("\\\\");
+            break;
+        case '\b':
+            output.append("\\b");
+            break;
+        case '\f':
+            output.append("\\f");
+            break;
+        case '\n':
+            output.append("\\n");
+            break;
+        case '\r':
+            output.append("\\r");
+            break;
+        case '\t':
+            output.append("\\t");
+            break;
+        default:
+            if (character < 0x20) {
+                output.append("\\u00");
+                output.push_back(hex[(character >> 4U) & 0x0fU]);
+                output.push_back(hex[character & 0x0fU]);
+            } else {
+                output.push_back(static_cast<char>(character));
+            }
+            break;
+        }
+    }
+    output.push_back('"');
+}
+
+void append_json_number(std::string& output, double value) {
+    if (!std::isfinite(value) || value < 0.0) {
+        value = 0.0;
+    }
+
+    std::array<char, 64> buffer{};
+    const auto [end, error] = std::to_chars(
+        buffer.data(),
+        buffer.data() + buffer.size(),
+        value,
+        std::chars_format::general,
+        std::numeric_limits<double>::max_digits10);
+    if (error == std::errc{}) {
+        output.append(buffer.data(), end);
+    } else {
+        output.push_back('0');
+    }
+}
+
+void append_json_u64(std::string& output, std::uint64_t value) {
+    std::array<char, 32> buffer{};
+    const auto [end, error] =
+        std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
+    if (error == std::errc{}) {
+        output.append(buffer.data(), end);
+    } else {
+        output.push_back('0');
+    }
+}
+
+void append_key(std::string& output, std::string_view key) {
+    output.append("  ");
+    append_json_string(output, key);
+    output.append(": ");
+}
+
+} // namespace
+
+void PerformanceMetrics::reset() noexcept {
+    window_size_ = 0;
+    next_sample_ = 0;
+    sums_.fill(0.0);
+    counts_.fill(0);
+    latest_ = {};
+    frames_rendered_ = 0;
+}
+
+void PerformanceMetrics::accumulate(
+    TimingIndex index, double value) noexcept {
+    if (!is_available(value) ||
+        (index == TimingIndex::cpu_frame && value == 0.0)) {
+        return;
+    }
+    const std::size_t position = static_cast<std::size_t>(index);
+    sums_[position] += value;
+    ++counts_[position];
+}
+
+double PerformanceMetrics::average(TimingIndex index) const noexcept {
+    const std::size_t position = static_cast<std::size_t>(index);
+    return counts_[position] == 0
+        ? unavailable_timing_ms
+        : sums_[position] / static_cast<double>(counts_[position]);
+}
+
+void PerformanceMetrics::record_frame(const FrameTimings& timings) noexcept {
+    ++frames_rendered_;
+    latest_ = timings;
+
+    accumulate(TimingIndex::cpu_frame, timings.cpu_frame_ms);
+    accumulate(TimingIndex::command_record, timings.command_record_ms);
+    accumulate(TimingIndex::fence_wait, timings.fence_wait_ms);
+    accumulate(TimingIndex::acquire, timings.acquire_ms);
+    accumulate(TimingIndex::queue_submit, timings.queue_submit_ms);
+    accumulate(TimingIndex::present, timings.present_ms);
+    accumulate(TimingIndex::gpu_frame, timings.gpu_frame_ms);
+    accumulate(TimingIndex::gpu_geometry, timings.gpu_geometry_ms);
+    accumulate(TimingIndex::gpu_workload, timings.gpu_workload_ms);
+
+    if (std::isfinite(timings.cpu_frame_ms) &&
+        timings.cpu_frame_ms > 0.0) {
+        frame_times_ms_[next_sample_] = timings.cpu_frame_ms;
+        next_sample_ = (next_sample_ + 1) % frame_window_capacity;
+        window_size_ = std::min(
+            window_size_ + std::size_t{1}, frame_window_capacity);
+    }
+}
+
+PerformanceSnapshot PerformanceMetrics::snapshot() const noexcept {
+    PerformanceSnapshot result{};
+    result.frames_rendered = frames_rendered_;
+    result.timed_frames =
+        counts_[static_cast<std::size_t>(TimingIndex::cpu_frame)];
+    result.samples_in_window = window_size_;
+    result.latest = latest_;
+
+    result.average.cpu_frame_ms = average(TimingIndex::cpu_frame);
+    result.average.command_record_ms = average(TimingIndex::command_record);
+    result.average.fence_wait_ms = average(TimingIndex::fence_wait);
+    result.average.acquire_ms = average(TimingIndex::acquire);
+    result.average.queue_submit_ms = average(TimingIndex::queue_submit);
+    result.average.present_ms = average(TimingIndex::present);
+    result.average.gpu_frame_ms = average(TimingIndex::gpu_frame);
+    result.average.gpu_geometry_ms = average(TimingIndex::gpu_geometry);
+    result.average.gpu_workload_ms = average(TimingIndex::gpu_workload);
+
+    if (window_size_ == 0) {
+        return result;
+    }
+
+    const std::size_t newest =
+        (next_sample_ + frame_window_capacity - 1) % frame_window_capacity;
+    const double latest_frame_ms = frame_times_ms_[newest];
+    result.instantaneous_fps =
+        latest_frame_ms > 0.0 ? 1000.0 / latest_frame_ms : 0.0;
+
+    double one_second_ms = 0.0;
+    std::size_t one_second_frames = 0;
+    for (std::size_t offset = 0; offset < window_size_; ++offset) {
+        const std::size_t sample =
+            (newest + frame_window_capacity - offset) %
+            frame_window_capacity;
+        one_second_ms += frame_times_ms_[sample];
+        ++one_second_frames;
+        if (one_second_ms >= 1000.0) {
+            break;
+        }
+    }
+    if (one_second_ms > 0.0) {
+        result.one_second_average_fps =
+            static_cast<double>(one_second_frames) * 1000.0 / one_second_ms;
+    }
+
+    const double total_frame_ms =
+        sums_[static_cast<std::size_t>(TimingIndex::cpu_frame)];
+    if (total_frame_ms > 0.0) {
+        result.average_fps =
+            static_cast<double>(result.timed_frames) * 1000.0 /
+            total_frame_ms;
+    }
+
+    // Common real-time convention: 1% low FPS is the reciprocal of the mean
+    // duration of the slowest 1% of frames in the bounded rolling window.
+    const std::size_t slow_frame_count =
+        std::max<std::size_t>(1, (window_size_ + 99) / 100);
+
+    // At capacity, one percent is at most twenty values. Keeping only those
+    // values avoids a temporary 2000-element array and makes the no-allocation
+    // behavior independent of the standard library's selection algorithm.
+    constexpr std::size_t maximum_slow_frames =
+        (frame_window_capacity + 99) / 100;
+    std::array<double, maximum_slow_frames> slowest_frame_times{};
+    std::size_t retained_slow_frames = 0;
+    for (std::size_t index = 0; index < window_size_; ++index) {
+        const double candidate = frame_times_ms_[index];
+        if (retained_slow_frames < slow_frame_count) {
+            slowest_frame_times[retained_slow_frames++] = candidate;
+            continue;
+        }
+
+        std::size_t fastest_retained = 0;
+        for (std::size_t retained = 1;
+             retained < retained_slow_frames;
+             ++retained) {
+            if (slowest_frame_times[retained] <
+                slowest_frame_times[fastest_retained]) {
+                fastest_retained = retained;
+            }
+        }
+        if (candidate > slowest_frame_times[fastest_retained]) {
+            slowest_frame_times[fastest_retained] = candidate;
+        }
+    }
+
+    double slow_frame_total_ms = 0.0;
+    for (std::size_t index = 0; index < slow_frame_count; ++index) {
+        slow_frame_total_ms += slowest_frame_times[index];
+    }
+    if (slow_frame_total_ms > 0.0) {
+        result.one_percent_low_fps =
+            static_cast<double>(slow_frame_count) * 1000.0 /
+            slow_frame_total_ms;
+    }
+
+    return result;
+}
+
+BenchmarkController::BenchmarkController(
+    double warmup_seconds, double measurement_seconds) noexcept {
+    configure(warmup_seconds, measurement_seconds);
+}
+
+void BenchmarkController::configure(
+    double warmup_seconds, double measurement_seconds) noexcept {
+    warmup_seconds_ =
+        std::isfinite(warmup_seconds) && warmup_seconds >= 0.0
+        ? warmup_seconds
+        : 0.0;
+    measurement_seconds_ =
+        std::isfinite(measurement_seconds) && measurement_seconds > 0.0
+        ? measurement_seconds
+        : 15.0;
+    phase_ = BenchmarkPhase::idle;
+    measurement_begin_pending_ = false;
+    completion_pending_ = false;
+}
+
+void BenchmarkController::start(TimePoint now) noexcept {
+    start_time_ = now;
+    phase_ = warmup_seconds_ > 0.0
+        ? BenchmarkPhase::warmup
+        : BenchmarkPhase::measurement;
+    measurement_begin_pending_ =
+        phase_ == BenchmarkPhase::measurement;
+    completion_pending_ = false;
+}
+
+BenchmarkTick BenchmarkController::tick(TimePoint now) noexcept {
+    BenchmarkTick result{};
+
+    if (phase_ == BenchmarkPhase::idle) {
+        return result;
+    }
+
+    const double total_elapsed =
+        std::max(0.0, seconds_between(start_time_, now));
+
+    if (phase_ == BenchmarkPhase::warmup &&
+        total_elapsed >= warmup_seconds_) {
+        phase_ = BenchmarkPhase::measurement;
+        measurement_begin_pending_ = true;
+    }
+
+    if (phase_ == BenchmarkPhase::measurement &&
+        total_elapsed >= warmup_seconds_ + measurement_seconds_) {
+        phase_ = BenchmarkPhase::complete;
+        completion_pending_ = true;
+    }
+
+    result.phase = phase_;
+    result.measurement_began = measurement_begin_pending_;
+    result.completed = completion_pending_;
+    measurement_begin_pending_ = false;
+    completion_pending_ = false;
+
+    switch (phase_) {
+    case BenchmarkPhase::idle:
+        break;
+    case BenchmarkPhase::warmup:
+        result.phase_elapsed_seconds =
+            clamp_elapsed(total_elapsed, warmup_seconds_);
+        break;
+    case BenchmarkPhase::measurement:
+        result.phase_elapsed_seconds = clamp_elapsed(
+            total_elapsed - warmup_seconds_, measurement_seconds_);
+        result.measurement_elapsed_seconds = result.phase_elapsed_seconds;
+        break;
+    case BenchmarkPhase::complete:
+        result.phase_elapsed_seconds = measurement_seconds_;
+        result.measurement_elapsed_seconds = measurement_seconds_;
+        break;
+    }
+    return result;
+}
+
+BenchmarkResult make_benchmark_result(
+    std::string gpu,
+    std::string driver,
+    std::string resolution,
+    std::string present_mode,
+    std::uint32_t instances,
+    std::uint32_t gpu_workload_iterations,
+    const PerformanceSnapshot& snapshot) {
+    BenchmarkResult result{};
+    result.gpu = std::move(gpu);
+    result.driver = std::move(driver);
+    result.resolution = std::move(resolution);
+    result.present_mode = std::move(present_mode);
+    result.instances = instances;
+    result.gpu_workload_iterations = gpu_workload_iterations;
+    result.average_fps = snapshot.average_fps;
+    result.one_percent_low_fps = snapshot.one_percent_low_fps;
+    result.average_cpu_frame_ms =
+        is_available(snapshot.average.cpu_frame_ms)
+        ? snapshot.average.cpu_frame_ms
+        : 0.0;
+    result.average_gpu_frame_ms =
+        is_available(snapshot.average.gpu_frame_ms)
+        ? snapshot.average.gpu_frame_ms
+        : 0.0;
+    result.average_fence_wait_ms =
+        is_available(snapshot.average.fence_wait_ms)
+        ? snapshot.average.fence_wait_ms
+        : 0.0;
+    result.frames_rendered = snapshot.frames_rendered;
+    return result;
+}
+
+std::string benchmark_result_to_json(const BenchmarkResult& result) {
+    std::string output;
+    output.reserve(
+        448 + result.gpu.size() + result.driver.size() +
+        result.resolution.size() + result.present_mode.size());
+    output.append("{\n");
+
+    append_key(output, "gpu");
+    append_json_string(output, result.gpu);
+    output.append(",\n");
+    append_key(output, "driver");
+    append_json_string(output, result.driver);
+    output.append(",\n");
+    append_key(output, "resolution");
+    append_json_string(output, result.resolution);
+    output.append(",\n");
+    append_key(output, "present_mode");
+    append_json_string(output, result.present_mode);
+    output.append(",\n");
+    append_key(output, "instances");
+    append_json_u64(output, result.instances);
+    output.append(",\n");
+    append_key(output, "gpu_workload_iterations");
+    append_json_u64(output, result.gpu_workload_iterations);
+    output.append(",\n");
+    append_key(output, "average_fps");
+    append_json_number(output, result.average_fps);
+    output.append(",\n");
+    append_key(output, "one_percent_low_fps");
+    append_json_number(output, result.one_percent_low_fps);
+    output.append(",\n");
+    append_key(output, "average_cpu_frame_ms");
+    append_json_number(output, result.average_cpu_frame_ms);
+    output.append(",\n");
+    append_key(output, "average_gpu_frame_ms");
+    append_json_number(output, result.average_gpu_frame_ms);
+    output.append(",\n");
+    append_key(output, "average_fence_wait_ms");
+    append_json_number(output, result.average_fence_wait_ms);
+    output.append(",\n");
+    append_key(output, "frames_rendered");
+    append_json_u64(output, result.frames_rendered);
+    output.append("\n}\n");
+    return output;
+}
+
+bool write_benchmark_json(
+    const std::filesystem::path& path,
+    const BenchmarkResult& result,
+    std::string* error) noexcept {
+    if (error != nullptr) {
+        error->clear();
+    }
+
+    try {
+        const std::string json = benchmark_result_to_json(result);
+        std::ofstream output{
+            path, std::ios::binary | std::ios::out | std::ios::trunc};
+        if (!output) {
+            if (error != nullptr) {
+                *error = "failed to open benchmark output: ";
+                error->append(path.string());
+            }
+            return false;
+        }
+
+        output.write(json.data(), static_cast<std::streamsize>(json.size()));
+        output.flush();
+        if (!output) {
+            if (error != nullptr) {
+                *error = "failed to write benchmark output: ";
+                error->append(path.string());
+            }
+            return false;
+        }
+        return true;
+    } catch (const std::exception& exception) {
+        if (error != nullptr) {
+            *error = "failed to write benchmark output: ";
+            error->append(exception.what());
+        }
+        return false;
+    } catch (...) {
+        if (error != nullptr) {
+            *error = "failed to write benchmark output";
+        }
+        return false;
+    }
+}
+
+} // namespace vcr

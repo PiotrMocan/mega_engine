@@ -1,0 +1,50 @@
+# CMake and native build output
+/build/
+/out/
+/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+DartConfiguration.tcl
+Makefile
+build.ninja
+.ninja_deps
+.ninja_log
+compile_commands.json
+
+# Locally downloaded build tools
+/.tools/
+
+# Runtime-generated renderer data
+/benchmark.json
+/pipeline_cache.bin
+
+# Compiler and linker artifacts outside build directories
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.idb
+*.exp
+
+# IDE and operating-system metadata
+/.vs/
+/.vscode/
+/.idea/
+*.user
+*.suo
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*~
