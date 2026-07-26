@@ -23,6 +23,12 @@ public:
         std::uint32_t height,
         VkFormat format,
         std::string_view debug_name);
+    void create_shadow_map(
+        VulkanContext& context,
+        std::uint32_t width,
+        std::uint32_t height,
+        VkFormat format,
+        std::string_view debug_name);
     void destroy() noexcept;
 
     [[nodiscard]] VkImage image() const noexcept { return image_; }
@@ -35,6 +41,20 @@ public:
     }
 
 private:
+    void create_impl(
+        VulkanContext& context,
+        std::uint32_t width,
+        std::uint32_t height,
+        VkFormat format,
+        VkImageUsageFlags usage,
+        VkImageAspectFlags aspect_mask,
+        VkFilter filter,
+        VkSamplerAddressMode address_mode,
+        VkBool32 compare_enable,
+        VkCompareOp compare_op,
+        VkBorderColor border_color,
+        std::string_view debug_name);
+
     VulkanContext* context_ = nullptr;
     VkImage image_ = VK_NULL_HANDLE;
     VkImageView view_ = VK_NULL_HANDLE;

@@ -36,6 +36,65 @@ void GpuTexture::create(
     const std::uint32_t height,
     const VkFormat format,
     const std::string_view debug_name) {
+    create_impl(
+        context,
+        width,
+        height,
+        format,
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+            VK_IMAGE_USAGE_SAMPLED_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        VK_FILTER_LINEAR,
+        VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        VK_FALSE,
+        VK_COMPARE_OP_ALWAYS,
+        VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK,
+        debug_name);
+}
+
+void GpuTexture::create_shadow_map(
+    VulkanContext& context,
+    const std::uint32_t width,
+    const std::uint32_t height,
+    const VkFormat format,
+    const std::string_view debug_name) {
+    VkFormatProperties properties{};
+    vkGetPhysicalDeviceFormatProperties(
+        context.physical_device(), format, &properties);
+    const VkFilter filter =
+        (properties.optimalTilingFeatures &
+         VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0
+            ? VK_FILTER_LINEAR
+            : VK_FILTER_NEAREST;
+    create_impl(
+        context,
+        width,
+        height,
+        format,
+        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+            VK_IMAGE_USAGE_SAMPLED_BIT,
+        VK_IMAGE_ASPECT_DEPTH_BIT,
+        filter,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+        VK_TRUE,
+        VK_COMPARE_OP_LESS_OR_EQUAL,
+        VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE,
+        debug_name);
+}
+
+void GpuTexture::create_impl(
+    VulkanContext& context,
+    const std::uint32_t width,
+    const std::uint32_t height,
+    const VkFormat format,
+    const VkImageUsageFlags usage,
+    const VkImageAspectFlags aspect_mask,
+    const VkFilter filter,
+    const VkSamplerAddressMode address_mode,
+    const VkBool32 compare_enable,
+    const VkCompareOp compare_op,
+    const VkBorderColor border_color,
+    const std::string_view debug_name) {
     destroy();
     if (width == 0U || height == 0U) {
         fatal("Attempted to create a zero-sized GPU texture.");
@@ -56,9 +115,7 @@ void GpuTexture::create(
         .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage =
-            VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-            VK_IMAGE_USAGE_SAMPLED_BIT,
+        .usage = usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
@@ -102,7 +159,7 @@ void GpuTexture::create(
             VK_COMPONENT_SWIZZLE_IDENTITY,
         },
         .subresourceRange = VkImageSubresourceRange{
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .aspectMask = aspect_mask,
             .baseMipLevel = 0,
             .levelCount = 1,
             .baseArrayLayer = 0,
@@ -120,20 +177,20 @@ void GpuTexture::create(
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .magFilter = VK_FILTER_LINEAR,
-        .minFilter = VK_FILTER_LINEAR,
+        .magFilter = filter,
+        .minFilter = filter,
         .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
-        .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
-        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeU = address_mode,
+        .addressModeV = address_mode,
+        .addressModeW = address_mode,
         .mipLodBias = 0.0F,
         .anisotropyEnable = VK_FALSE,
         .maxAnisotropy = 1.0F,
-        .compareEnable = VK_FALSE,
-        .compareOp = VK_COMPARE_OP_ALWAYS,
+        .compareEnable = compare_enable,
+        .compareOp = compare_op,
         .minLod = 0.0F,
         .maxLod = 0.0F,
-        .borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK,
+        .borderColor = border_color,
         .unnormalizedCoordinates = VK_FALSE,
     };
     const VkResult sampler_result = vkCreateSampler(

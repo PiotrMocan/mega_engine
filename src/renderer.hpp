@@ -110,6 +110,8 @@ private:
     void create_scene_resources();
     void destroy_scene_resources() noexcept;
     void create_sky_texture();
+    void create_shadow_map();
+    void render_static_shadow_map();
     void create_descriptors();
     void read_gpu_timestamps(FrameContext& frame, FrameTimings& timings) const;
     void complete_screenshot(FrameContext& frame);
@@ -136,7 +138,9 @@ private:
     VkDescriptorSetLayout descriptor_set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
+    VkPipeline scene_pipeline_ = VK_NULL_HANDLE;
     VkPipeline sky_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline shadow_pipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout compute_pipeline_layout_ = VK_NULL_HANDLE;
     VkPipeline compute_pipeline_ = VK_NULL_HANDLE;
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
@@ -145,6 +149,9 @@ private:
     GpuBuffer index_buffer_{};
     GpuBuffer instance_buffer_{};
     GpuTexture sky_texture_{};
+    GpuTexture shadow_map_{};
+    VkFormat shadow_map_format_ = VK_FORMAT_UNDEFINED;
+    glm::mat4 light_view_projection_{1.0F};
     GpuBuffer screenshot_readback_{};
     std::uint32_t instancing_count_ = 1;
     std::uint32_t max_instance_capacity_ = 100'000;
