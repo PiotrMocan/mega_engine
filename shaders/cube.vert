@@ -1,12 +1,22 @@
 #version 450
 
 // Host ABI (std140):
-//   mat4 viewProjection  @ byte 0
-//   vec4 globalRotation @ byte 64, unit quaternion in (x, y, z, w) order
+//   mat4 viewProjection        @ byte 0
+//   mat4 inverseViewProjection @ byte 64
+//   vec4 globalRotation       @ byte 128, unit quaternion (x, y, z, w)
+//   vec4 cameraPosition       @ byte 144
+//   vec4 sunDirectionIntensity @ byte 160
+//   vec4 sunColorSkyYaw       @ byte 176
+//   vec4 skyAmbient           @ byte 192
 layout(set = 0, binding = 0, std140) uniform FrameUniforms
 {
     mat4 viewProjection;
+    mat4 inverseViewProjection;
     vec4 globalRotation;
+    vec4 cameraPosition;
+    vec4 sunDirectionIntensity;
+    vec4 sunColorSkyYaw;
+    vec4 skyAmbient;
 } frame;
 
 // Host ABI (std430): four tightly packed vec4 values, 64-byte array stride.

@@ -6,6 +6,18 @@ layout(location = 2) flat in uint inInstanceIndex;
 
 layout(location = 0) out vec4 outColor;
 
+// Shared per-frame sky and directional-sun lighting state.
+layout(set = 0, binding = 0, std140) uniform FrameUniforms
+{
+    mat4 viewProjection;
+    mat4 inverseViewProjection;
+    vec4 globalRotation;
+    vec4 cameraPosition;
+    vec4 sunDirectionIntensity;
+    vec4 sunColorSkyYaw;
+    vec4 skyAmbient;
+} frame;
+
 // The compute shader writes this buffer. Reading it here makes the adjustable
 // workload observable in the rendered image as well as through its SSBO stores.
 layout(set = 0, binding = 2, std430) readonly buffer WorkloadBuffer
@@ -37,9 +49,16 @@ uint mixBits(uint value)
 void main()
 {
     const vec3 normal = normalize(inWorldNormal);
-    const vec3 lightDirection = normalize(vec3(0.35, 0.75, 0.55));
+    const vec3 lightDirection =
+        normalize(frame.sunDirectionIntensity.xyz);
     const float diffuse = max(dot(normal, lightDirection), 0.0);
-    vec3 shadedColor = inColor.rgb * (0.18 + 0.82 * diffuse);
+    const vec3 ambientLight =
+        frame.skyAmbient.rgb * frame.skyAmbient.a;
+    const vec3 directLight =
+        frame.sunColorSkyYaw.rgb
+        * frame.sunDirectionIntensity.w
+        * diffuse;
+    vec3 shadedColor = inColor.rgb * (ambientLight + directLight);
 
     if (pushConstants.workloadElementCount != 0u
         && pushConstants.workloadMix > 0.0)

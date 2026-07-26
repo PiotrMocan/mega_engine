@@ -98,6 +98,7 @@ add_executable(vulkan_cube
     src/cli_options.cpp
     src/fly_camera.cpp
     src/gpu_buffer.cpp
+    src/gpu_texture.cpp
     src/mcp_server.cpp
     src/performance_metrics.cpp
     src/png_encoder.cpp
@@ -159,7 +160,12 @@ add_custom_command(TARGET vulkan_cube POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E copy_directory
             "${CMAKE_CURRENT_SOURCE_DIR}/shaders/spv"
             "$<TARGET_FILE_DIR:vulkan_cube>/shaders"
-    COMMENT "Copying precompiled SPIR-V shaders"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory
+            "$<TARGET_FILE_DIR:vulkan_cube>/assets"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/sky_clouds.png"
+            "$<TARGET_FILE_DIR:vulkan_cube>/assets/sky_clouds.png"
+    COMMENT "Copying precompiled SPIR-V shaders and runtime assets"
 )
 
 include(CTest)

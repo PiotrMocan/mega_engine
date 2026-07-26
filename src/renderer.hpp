@@ -2,6 +2,7 @@
 
 #include "frame_context.hpp"
 #include "gpu_buffer.hpp"
+#include "gpu_texture.hpp"
 #include "cli_options.hpp"
 #include "performance_metrics.hpp"
 #include "swapchain.hpp"
@@ -108,6 +109,7 @@ private:
         std::span<const std::byte> data) const noexcept;
     void create_scene_resources();
     void destroy_scene_resources() noexcept;
+    void create_sky_texture();
     void create_descriptors();
     void read_gpu_timestamps(FrameContext& frame, FrameTimings& timings) const;
     void complete_screenshot(FrameContext& frame);
@@ -115,6 +117,9 @@ private:
     void upload_to_device_buffer(
         GpuBuffer& destination,
         std::span<const std::byte> bytes);
+    void upload_to_device_texture(
+        GpuTexture& destination,
+        std::span<const std::byte> rgba_pixels);
     void update_frame_uniform(
         FrameContext& frame,
         const glm::mat4& view_matrix);
@@ -131,6 +136,7 @@ private:
     VkDescriptorSetLayout descriptor_set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
+    VkPipeline sky_pipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout compute_pipeline_layout_ = VK_NULL_HANDLE;
     VkPipeline compute_pipeline_ = VK_NULL_HANDLE;
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
@@ -138,6 +144,7 @@ private:
     GpuBuffer vertex_buffer_{};
     GpuBuffer index_buffer_{};
     GpuBuffer instance_buffer_{};
+    GpuTexture sky_texture_{};
     GpuBuffer screenshot_readback_{};
     std::uint32_t instancing_count_ = 1;
     std::uint32_t max_instance_capacity_ = 100'000;

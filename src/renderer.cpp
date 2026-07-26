@@ -16,12 +16,15 @@
 #include <iostream>
 #include <iomanip>
 #include <limits>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/matrix_inverse.hpp>
 #include <glm/gtc/quaternion.hpp>
+#include <glm/mat3x3.hpp>
 
 namespace vcr {
 namespace {
@@ -33,7 +36,14 @@ struct Vertex {
 
 struct alignas(16) FrameUniforms {
     glm::mat4 view_projection{1.0F};
+    glm::mat4 inverse_view_projection{1.0F};
     glm::vec4 global_rotation{0.0F, 0.0F, 0.0F, 1.0F};
+    glm::vec4 camera_position{0.0F, 0.0F, 0.0F, 1.0F};
+    // The panorama sun is centered near (u=0.855, v=0.25). A 0.246-turn
+    // texture yaw maps it to this exact world-space light direction.
+    glm::vec4 sun_direction_intensity{0.447F, 0.707F, -0.548F, 1.0F};
+    glm::vec4 sun_color_sky_yaw{1.0F, 0.91F, 0.74F, 0.246F};
+    glm::vec4 sky_ambient{0.42F, 0.58F, 0.82F, 0.32F};
 };
 
 struct alignas(16) InstanceData {
@@ -43,8 +53,97 @@ struct alignas(16) InstanceData {
     glm::vec4 color{1.0F};
 };
 
-static_assert(sizeof(FrameUniforms) == 80);
+static_assert(sizeof(FrameUniforms) == 208);
 static_assert(sizeof(InstanceData) == 64);
+
+struct SdlSurfaceDeleter {
+    void operator()(SDL_Surface* const surface) const noexcept {
+        SDL_DestroySurface(surface);
+    }
+};
+
+using SdlSurface = std::unique_ptr<SDL_Surface, SdlSurfaceDeleter>;
+
+class ImmediateSubmission final {
+public:
+    explicit ImmediateSubmission(VulkanContext& context)
+        : context_(context) {
+        VkCommandPoolCreateInfo pool_info{};
+        pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+        pool_info.queueFamilyIndex =
+            context_.queue_families().graphics;
+        VK_CHECK(vkCreateCommandPool(
+            context_.device(), &pool_info, nullptr, &command_pool_));
+
+        VkCommandBufferAllocateInfo allocate_info{};
+        allocate_info.sType =
+            VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocate_info.commandPool = command_pool_;
+        allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocate_info.commandBufferCount = 1;
+        VK_CHECK(vkAllocateCommandBuffers(
+            context_.device(), &allocate_info, &command_buffer_));
+
+        VkFenceCreateInfo fence_info{};
+        fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        VK_CHECK(vkCreateFence(
+            context_.device(), &fence_info, nullptr, &fence_));
+
+        VkCommandBufferBeginInfo begin_info{};
+        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin_info.flags =
+            VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VK_CHECK(vkBeginCommandBuffer(command_buffer_, &begin_info));
+    }
+
+    ~ImmediateSubmission() noexcept {
+        if (fence_ != VK_NULL_HANDLE) {
+            vkDestroyFence(context_.device(), fence_, nullptr);
+        }
+        if (command_pool_ != VK_NULL_HANDLE) {
+            vkDestroyCommandPool(
+                context_.device(), command_pool_, nullptr);
+        }
+    }
+
+    ImmediateSubmission(const ImmediateSubmission&) = delete;
+    ImmediateSubmission& operator=(const ImmediateSubmission&) = delete;
+    ImmediateSubmission(ImmediateSubmission&&) = delete;
+    ImmediateSubmission& operator=(ImmediateSubmission&&) = delete;
+
+    [[nodiscard]] VkCommandBuffer command_buffer() const noexcept {
+        return command_buffer_;
+    }
+
+    void submit_and_wait() {
+        if (submitted_) {
+            fatal("Immediate command buffer was submitted more than once.");
+        }
+        VK_CHECK(vkEndCommandBuffer(command_buffer_));
+        VkCommandBufferSubmitInfo command_info{};
+        command_info.sType =
+            VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+        command_info.commandBuffer = command_buffer_;
+        command_info.deviceMask = 1U;
+        VkSubmitInfo2 submit_info{};
+        submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+        submit_info.commandBufferInfoCount = 1;
+        submit_info.pCommandBufferInfos = &command_info;
+        VK_CHECK(vkQueueSubmit2(
+            context_.graphics_queue(), 1, &submit_info, fence_));
+        VK_CHECK(vkWaitForFences(
+            context_.device(), 1, &fence_, VK_TRUE, UINT64_MAX));
+        submitted_ = true;
+    }
+
+private:
+    VulkanContext& context_;
+    VkCommandPool command_pool_ = VK_NULL_HANDLE;
+    VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
+    VkFence fence_ = VK_NULL_HANDLE;
+    bool submitted_ = false;
+};
 
 enum TimestampQuery : std::uint32_t {
     timestamp_frame_begin = 0,
@@ -198,6 +297,7 @@ inline constexpr std::int32_t plane_vertex_offset =
 inline constexpr std::uint32_t plane_index_count =
     static_cast<std::uint32_t>(kPlaneIndices.size());
 inline constexpr std::uint32_t plane_triangle_count = plane_index_count / 3U;
+inline constexpr std::uint32_t sky_triangle_count = 1U;
 inline constexpr std::uint32_t scene_instance_count =
     static_cast<std::uint32_t>(kSceneInstances.size());
 inline constexpr std::uint32_t scene_block_count = scene_instance_count - 1U;
@@ -490,6 +590,91 @@ void Renderer::create_scene_resources() {
     upload_to_device_buffer(index_buffer_, as_bytes(kGeometryIndices));
     upload_to_device_buffer(
         instance_buffer_, std::as_bytes(std::span{instances}));
+    create_sky_texture();
+}
+
+void Renderer::create_sky_texture() {
+    constexpr VkFormat sky_format = VK_FORMAT_R8G8B8A8_SRGB;
+    VkFormatProperties format_properties{};
+    vkGetPhysicalDeviceFormatProperties(
+        context_->physical_device(), sky_format, &format_properties);
+    constexpr VkFormatFeatureFlags required_features =
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+        VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    if ((format_properties.optimalTilingFeatures & required_features) !=
+        required_features) {
+        fatal(
+            "The selected GPU cannot sample the required sRGB sky texture "
+            "with linear filtering.");
+    }
+
+    const char* const base_path = SDL_GetBasePath();
+    if (base_path == nullptr) {
+        fatal(SDL_GetError());
+    }
+    const std::filesystem::path texture_path =
+        std::filesystem::path(base_path) / "assets" / "sky_clouds.png";
+    const std::string texture_path_string = texture_path.string();
+    SdlSurface source(SDL_LoadPNG(texture_path_string.c_str()));
+    if (!source) {
+        std::cerr << "Unable to load sky texture: " << texture_path << '\n';
+        fatal(SDL_GetError());
+    }
+    SdlSurface rgba(
+        SDL_ConvertSurface(source.get(), SDL_PIXELFORMAT_RGBA32));
+    if (!rgba) {
+        fatal(SDL_GetError());
+    }
+    source.reset();
+
+    if (rgba->w <= 0 || rgba->h <= 0 || rgba->pixels == nullptr) {
+        fatal("Sky texture has invalid dimensions or pixel data.");
+    }
+    const auto width = static_cast<std::uint32_t>(rgba->w);
+    const auto height = static_cast<std::uint32_t>(rgba->h);
+    if (width > context_->properties().limits.maxImageDimension2D ||
+        height > context_->properties().limits.maxImageDimension2D) {
+        fatal("Sky texture dimensions exceed the selected GPU limit.");
+    }
+
+    constexpr std::size_t channels = 4U;
+    if (static_cast<std::uint64_t>(width) >
+        std::numeric_limits<std::size_t>::max() / channels) {
+        fatal("Sky texture row size overflow.");
+    }
+    const std::size_t row_bytes =
+        static_cast<std::size_t>(width) * channels;
+    if (static_cast<std::uint64_t>(height) >
+        std::numeric_limits<std::size_t>::max() / row_bytes) {
+        fatal("Sky texture byte size overflow.");
+    }
+    if (row_bytes > static_cast<std::size_t>(
+            std::numeric_limits<int>::max()) ||
+        rgba->pitch < static_cast<int>(row_bytes)) {
+        fatal("Sky texture has an invalid row pitch.");
+    }
+
+    std::vector<std::byte> pixels(
+        row_bytes * static_cast<std::size_t>(height));
+    if (!SDL_LockSurface(rgba.get())) {
+        fatal(SDL_GetError());
+    }
+    const auto* const source_pixels =
+        static_cast<const std::byte*>(rgba->pixels);
+    for (std::uint32_t row = 0; row < height; ++row) {
+        std::memcpy(
+            pixels.data() + static_cast<std::size_t>(row) * row_bytes,
+            source_pixels +
+                static_cast<std::size_t>(row) *
+                    static_cast<std::size_t>(rgba->pitch),
+            row_bytes);
+    }
+    SDL_UnlockSurface(rgba.get());
+
+    sky_texture_.create(
+        *context_, width, height, sky_format, "sky panorama");
+    upload_to_device_texture(sky_texture_, pixels);
 }
 
 void Renderer::destroy_scene_resources() noexcept {
@@ -497,6 +682,7 @@ void Renderer::destroy_scene_resources() noexcept {
         vkDestroyDescriptorPool(context_->device(), descriptor_pool_, nullptr);
         descriptor_pool_ = VK_NULL_HANDLE;
     }
+    sky_texture_.destroy();
     instance_buffer_.destroy();
     index_buffer_.destroy();
     vertex_buffer_.destroy();
@@ -511,6 +697,10 @@ void Renderer::create_descriptors() {
         VkDescriptorPoolSize{
             .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             .descriptorCount = max_frames_in_flight * 2U,
+        },
+        VkDescriptorPoolSize{
+            .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = max_frames_in_flight,
         },
     };
     const VkDescriptorPoolCreateInfo pool_info{
@@ -553,6 +743,11 @@ void Renderer::create_descriptors() {
                 .range = frames_[index].workload_buffer.size(),
             },
         };
+        const VkDescriptorImageInfo sky_info{
+            .sampler = sky_texture_.sampler(),
+            .imageView = sky_texture_.view(),
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
         const std::array writes{
             VkWriteDescriptorSet{
                 .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -578,6 +773,19 @@ void Renderer::create_descriptors() {
                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                 .pBufferInfo = &buffer_infos[2],
             },
+            VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = nullptr,
+                .dstSet = sets[index],
+                .dstBinding = 3,
+                .dstArrayElement = 0,
+                .descriptorCount = 1,
+                .descriptorType =
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &sky_info,
+                .pBufferInfo = nullptr,
+                .pTexelBufferView = nullptr,
+            },
         };
         vkUpdateDescriptorSets(
             context_->device(),
@@ -602,58 +810,92 @@ void Renderer::upload_to_device_buffer(
         "staging buffer");
     staging.write(bytes);
 
-    VkCommandPool command_pool = VK_NULL_HANDLE;
-    const VkCommandPoolCreateInfo pool_info{
-        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-        .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
-        .queueFamilyIndex = context_->queue_families().graphics,
-    };
-    VK_CHECK(vkCreateCommandPool(
-        context_->device(), &pool_info, nullptr, &command_pool));
-    VkCommandBuffer command_buffer = VK_NULL_HANDLE;
-    const VkCommandBufferAllocateInfo allocate_info{
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool = command_pool,
-        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = 1,
-    };
-    VK_CHECK(vkAllocateCommandBuffers(
-        context_->device(), &allocate_info, &command_buffer));
-    const VkCommandBufferBeginInfo begin_info{
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-    };
-    VK_CHECK(vkBeginCommandBuffer(command_buffer, &begin_info));
+    ImmediateSubmission submission(*context_);
     const VkBufferCopy copy{
         .srcOffset = 0,
         .dstOffset = 0,
         .size = static_cast<VkDeviceSize>(bytes.size_bytes()),
     };
     vkCmdCopyBuffer(
-        command_buffer, staging.handle(), destination.handle(), 1, &copy);
-    VK_CHECK(vkEndCommandBuffer(command_buffer));
+        submission.command_buffer(),
+        staging.handle(),
+        destination.handle(),
+        1,
+        &copy);
+    submission.submit_and_wait();
+}
 
-    VkFence fence = VK_NULL_HANDLE;
-    const VkFenceCreateInfo fence_info{
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+void Renderer::upload_to_device_texture(
+    GpuTexture& destination,
+    const std::span<const std::byte> rgba_pixels) {
+    constexpr std::uint64_t channels = 4U;
+    const std::uint64_t expected_bytes =
+        static_cast<std::uint64_t>(destination.width()) *
+        static_cast<std::uint64_t>(destination.height()) *
+        channels;
+    if (expected_bytes != rgba_pixels.size_bytes() ||
+        expected_bytes > std::numeric_limits<VkDeviceSize>::max()) {
+        fatal("Sky texture upload byte count mismatch.");
+    }
+
+    GpuBuffer staging;
+    staging.create(
+        *context_,
+        static_cast<VkDeviceSize>(expected_bytes),
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VMA_MEMORY_USAGE_AUTO,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+            VMA_ALLOCATION_CREATE_MAPPED_BIT,
+        "sky texture staging buffer");
+    staging.write(rgba_pixels);
+
+    ImmediateSubmission submission(*context_);
+    const VkCommandBuffer command_buffer = submission.command_buffer();
+    transition_image(
+        command_buffer,
+        destination.image(),
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        VK_IMAGE_LAYOUT_UNDEFINED,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_PIPELINE_STAGE_2_NONE,
+        VK_ACCESS_2_NONE,
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    const VkBufferImageCopy copy_region{
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource = VkImageSubresourceLayers{
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+        .imageOffset = VkOffset3D{0, 0, 0},
+        .imageExtent = VkExtent3D{
+            destination.width(),
+            destination.height(),
+            1U,
+        },
     };
-    VK_CHECK(vkCreateFence(
-        context_->device(), &fence_info, nullptr, &fence));
-    const VkCommandBufferSubmitInfo command_info{
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-        .commandBuffer = command_buffer,
-    };
-    const VkSubmitInfo2 submit_info{
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-        .commandBufferInfoCount = 1,
-        .pCommandBufferInfos = &command_info,
-    };
-    VK_CHECK(vkQueueSubmit2(
-        context_->graphics_queue(), 1, &submit_info, fence));
-    VK_CHECK(vkWaitForFences(
-        context_->device(), 1, &fence, VK_TRUE, UINT64_MAX));
-    vkDestroyFence(context_->device(), fence, nullptr);
-    vkDestroyCommandPool(context_->device(), command_pool, nullptr);
+    vkCmdCopyBufferToImage(
+        command_buffer,
+        staging.handle(),
+        destination.image(),
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &copy_region);
+    transition_image(
+        command_buffer,
+        destination.image(),
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    submission.submit_and_wait();
 }
 
 void Renderer::update_frame_uniform(
@@ -665,10 +907,17 @@ void Renderer::update_frame_uniform(
     glm::mat4 projection =
         glm::perspective(glm::radians(65.0F), aspect, 0.05F, 500.0F);
     projection[1][1] *= -1.0F;
-    const FrameUniforms uniforms{
-        .view_projection = projection * view_matrix,
-        .global_rotation = glm::vec4(0.0F, 0.0F, 0.0F, 1.0F),
-    };
+    const glm::mat4 view_projection = projection * view_matrix;
+    FrameUniforms uniforms{};
+    uniforms.view_projection = view_projection;
+    if (mode_ != RunMode::instancing) {
+        const glm::mat3 inverse_view_rotation =
+            glm::transpose(glm::mat3(view_matrix));
+        const glm::vec3 camera_position =
+            -(inverse_view_rotation * glm::vec3(view_matrix[3]));
+        uniforms.inverse_view_projection = glm::inverse(view_projection);
+        uniforms.camera_position = glm::vec4(camera_position, 1.0F);
+    }
     frame.uniform_buffer.write(
         std::as_bytes(std::span{&uniforms, std::size_t{1}}));
 }
@@ -809,13 +1058,17 @@ void Renderer::create_pipeline() {
             .binding = 0,
             .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
             .descriptorCount = 1,
-            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+            .stageFlags =
+                VK_SHADER_STAGE_VERTEX_BIT |
+                VK_SHADER_STAGE_FRAGMENT_BIT,
+            .pImmutableSamplers = nullptr,
         },
         VkDescriptorSetLayoutBinding{
             .binding = 1,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             .descriptorCount = 1,
             .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+            .pImmutableSamplers = nullptr,
         },
         VkDescriptorSetLayoutBinding{
             .binding = 2,
@@ -823,6 +1076,14 @@ void Renderer::create_pipeline() {
             .descriptorCount = 1,
             .stageFlags =
                 VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+            .pImmutableSamplers = nullptr,
+        },
+        VkDescriptorSetLayoutBinding{
+            .binding = 3,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .pImmutableSamplers = nullptr,
         },
     };
     const VkDescriptorSetLayoutCreateInfo descriptor_info{
@@ -973,6 +1234,54 @@ void Renderer::create_pipeline() {
     vkDestroyShaderModule(context_->device(), fragment_module, nullptr);
     vkDestroyShaderModule(context_->device(), vertex_module, nullptr);
 
+    const VkShaderModule sky_vertex_module = load_shader("sky.vert.spv");
+    const VkShaderModule sky_fragment_module = load_shader("sky.frag.spv");
+    std::array<VkPipelineShaderStageCreateInfo, 2> sky_stages{};
+    sky_stages[0].sType =
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    sky_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    sky_stages[0].module = sky_vertex_module;
+    sky_stages[0].pName = "main";
+    sky_stages[1].sType =
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    sky_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    sky_stages[1].module = sky_fragment_module;
+    sky_stages[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo sky_vertex_input{};
+    sky_vertex_input.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    VkPipelineRasterizationStateCreateInfo sky_rasterization =
+        rasterization;
+    sky_rasterization.cullMode = VK_CULL_MODE_NONE;
+    VkPipelineDepthStencilStateCreateInfo sky_depth_stencil =
+        depth_stencil;
+    sky_depth_stencil.depthWriteEnable = VK_FALSE;
+    sky_depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    VkGraphicsPipelineCreateInfo sky_pipeline_info = pipeline_info;
+    sky_pipeline_info.stageCount =
+        static_cast<std::uint32_t>(sky_stages.size());
+    sky_pipeline_info.pStages = sky_stages.data();
+    sky_pipeline_info.pVertexInputState = &sky_vertex_input;
+    sky_pipeline_info.pRasterizationState = &sky_rasterization;
+    sky_pipeline_info.pDepthStencilState = &sky_depth_stencil;
+    VK_CHECK(vkCreateGraphicsPipelines(
+        context_->device(),
+        pipeline_cache_,
+        1,
+        &sky_pipeline_info,
+        nullptr,
+        &sky_pipeline_));
+    context_->set_debug_name(
+        VK_OBJECT_TYPE_PIPELINE,
+        handle_value(sky_pipeline_),
+        "sky graphics pipeline");
+    vkDestroyShaderModule(
+        context_->device(), sky_fragment_module, nullptr);
+    vkDestroyShaderModule(
+        context_->device(), sky_vertex_module, nullptr);
+
     const VkPushConstantRange compute_push_constants{
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
         .offset = 0,
@@ -1020,6 +1329,10 @@ void Renderer::destroy_pipeline() noexcept {
         vkDestroyPipelineLayout(
             context_->device(), compute_pipeline_layout_, nullptr);
         compute_pipeline_layout_ = VK_NULL_HANDLE;
+    }
+    if (sky_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(context_->device(), sky_pipeline_, nullptr);
+        sky_pipeline_ = VK_NULL_HANDLE;
     }
     if (pipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(context_->device(), pipeline_, nullptr);
@@ -1459,8 +1772,6 @@ void Renderer::record_commands(
     const VkRect2D scissor{{0, 0}, extent};
     vkCmdSetViewport(command_buffer, 0, 1, &viewport);
     vkCmdSetScissor(command_buffer, 0, 1, &scissor);
-    vkCmdBindPipeline(
-        command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
     const VkDescriptorSet descriptor_set = frame.descriptor_set;
     vkCmdBindDescriptorSets(
         command_buffer,
@@ -1471,6 +1782,8 @@ void Renderer::record_commands(
         &descriptor_set,
         0,
         nullptr);
+    vkCmdBindPipeline(
+        command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
     struct GraphicsPushConstants {
         std::uint32_t workload_elements;
         float workload_mix;
@@ -1519,6 +1832,15 @@ void Renderer::record_commands(
             0,
             0,
             scene_instance_base_ + 1U);
+    }
+    if (mode_ != RunMode::instancing) {
+        // The triangle sits at depth 1.0 and is drawn last. Early depth
+        // rejection avoids sampling sky pixels already covered by geometry.
+        vkCmdBindPipeline(
+            command_buffer,
+            VK_PIPELINE_BIND_POINT_GRAPHICS,
+            sky_pipeline_);
+        vkCmdDraw(command_buffer, 3, 1, 0, 0);
     }
     vkCmdEndRendering(command_buffer);
     if (frame.timestamp_queries != VK_NULL_HANDLE) {
@@ -1693,7 +2015,8 @@ std::uint64_t Renderer::triangle_count() const noexcept {
         return static_cast<std::uint64_t>(cube_triangle_count) *
                instancing_count_;
     }
-    return plane_triangle_count +
+    return sky_triangle_count +
+           plane_triangle_count +
            static_cast<std::uint64_t>(cube_triangle_count) *
                scene_block_count;
 }
