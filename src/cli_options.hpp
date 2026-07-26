@@ -48,6 +48,7 @@ struct CliOptions {
     RunMode initial_mode = RunMode::scene;
     PresentPreference present = PresentPreference::automatic;
     bool benchmark = false;
+    bool mcp_stdio = false;
     bool validation = default_validation_enabled;
     bool show_help = false;
 };

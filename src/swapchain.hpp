@@ -27,7 +27,8 @@ public:
     void initialize(
         VulkanContext& context,
         SDL_Window* window,
-        VkPresentModeKHR preferred_mode);
+        VkPresentModeKHR preferred_mode,
+        bool enable_screenshot_capture);
     void recreate(VkPresentModeKHR preferred_mode);
     void shutdown() noexcept;
 
@@ -37,6 +38,13 @@ public:
     [[nodiscard]] VkExtent2D extent() const noexcept { return extent_; }
     [[nodiscard]] VkPresentModeKHR present_mode() const noexcept {
         return present_mode_;
+    }
+    [[nodiscard]] VkPresentModeKHR resolve_present_mode(
+        VkPresentModeKHR preferred) const {
+        return choose_present_mode(preferred);
+    }
+    [[nodiscard]] bool screenshot_supported() const noexcept {
+        return screenshot_supported_;
     }
     [[nodiscard]] std::span<const VkImage> images() const noexcept { return images_; }
     [[nodiscard]] VkImageView image_view(const std::uint32_t index) const noexcept {
@@ -72,6 +80,8 @@ private:
     VkFormat depth_format_ = VK_FORMAT_UNDEFINED;
     VkExtent2D extent_{};
     VkPresentModeKHR present_mode_ = VK_PRESENT_MODE_FIFO_KHR;
+    bool screenshot_enabled_ = false;
+    bool screenshot_supported_ = false;
     std::vector<VkPresentModeKHR> available_present_modes_;
     std::vector<VkImage> images_;
     std::vector<VkImageView> image_views_;

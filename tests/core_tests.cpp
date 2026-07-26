@@ -1,13 +1,20 @@
 #include "cli_options.hpp"
 #include "fly_camera.hpp"
+#include "mcp_control.hpp"
 #include "performance_metrics.hpp"
+#include "png_encoder.hpp"
 
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cmath>
 #include <iostream>
 #include <iterator>
 #include <limits>
 #include <string>
+#include <thread>
 
 #include <glm/geometric.hpp>
 
@@ -56,6 +63,15 @@ int main() {
             parsed.options.present == vcr::PresentPreference::immediate,
             "present preference");
         expect(!parsed.options.validation, "no-validation flag");
+    }
+
+    {
+        const char* arguments[]{"vulkan_cube", "--mcp-stdio"};
+        const auto parsed = vcr::parse_cli_options(
+            static_cast<int>(std::size(arguments)), arguments);
+        expect(
+            static_cast<bool>(parsed) && parsed.options.mcp_stdio,
+            "MCP stdio flag");
     }
 
     {
@@ -237,6 +253,129 @@ int main() {
         expect(
             camera.forward().y < -0.99F,
             "camera pitch is clamped below the singularity");
+    }
+
+    {
+        vcr::McpControlPlane control;
+        vcr::McpCommand submitted{
+            .token = 42,
+            .type = vcr::McpCommandType::render_set_instances,
+            .value = 10'000,
+        };
+        expect(
+            control.submit(submitted),
+            "MCP command queue accepts a command");
+        vcr::McpCommand received{};
+        expect(
+            control.try_next_command(received) &&
+                received.token == 42 &&
+                received.value == 10'000,
+            "MCP command queue preserves typed payload");
+        expect(
+            control.complete(vcr::McpCommandResult{
+                .token = 42,
+                .success = true,
+                .message = "ok",
+                .structured_json = "{\"ok\":true}",
+            }),
+            "MCP result queue accepts a response");
+        vcr::McpCommandResult result{};
+        expect(
+            control.try_next_result(result) &&
+                result.token == 42 &&
+                result.success &&
+                result.structured_json == "{\"ok\":true}",
+            "MCP result queue preserves ownership and ordering");
+    }
+
+    {
+        constexpr std::uint64_t command_count = 100'000;
+        vcr::McpControlPlane control;
+        std::atomic<bool> producer_failed{false};
+        std::jthread producer([&]() {
+            for (std::uint64_t token = 1;
+                 token <= command_count;
+                 ++token) {
+                vcr::McpCommand command{
+                    .token = token,
+                    .type = vcr::McpCommandType::debug_get_state,
+                };
+                while (!control.submit(command)) {
+                    std::this_thread::yield();
+                }
+                vcr::McpCommandResult result{};
+                while (!control.try_next_result(result)) {
+                    std::this_thread::yield();
+                }
+                if (!result.success || result.token != token) {
+                    producer_failed.store(
+                        true, std::memory_order_relaxed);
+                    return;
+                }
+            }
+        });
+
+        bool ordering_failed = false;
+        for (std::uint64_t expected = 1;
+             expected <= command_count;
+             ++expected) {
+            vcr::McpCommand command{};
+            while (!control.try_next_command(command)) {
+                std::this_thread::yield();
+            }
+            if (command.token != expected) {
+                ordering_failed = true;
+            }
+            vcr::McpCommandResult result{
+                .token = command.token,
+                .success = true,
+                .message = "ok",
+                .structured_json = "{\"ok\":true}",
+            };
+            while (!control.complete(std::move(result))) {
+                std::this_thread::yield();
+            }
+        }
+        producer.join();
+        expect(
+            !ordering_failed &&
+                !producer_failed.load(std::memory_order_relaxed),
+            "MCP SPSC queues preserve ordering under concurrent stress");
+    }
+
+    {
+        constexpr std::array<std::uint8_t, 8> pixels{
+            255U, 0U, 0U, 255U,
+            0U, 255U, 0U, 255U,
+        };
+        const auto png = vcr::encode_png_rgba(pixels, 2, 1);
+        expect(static_cast<bool>(png), "PNG encoder accepts RGBA8 pixels");
+        constexpr std::array<std::uint8_t, 8> signature{
+            0x89U, 0x50U, 0x4eU, 0x47U,
+            0x0dU, 0x0aU, 0x1aU, 0x0aU,
+        };
+        expect(
+            png.bytes.size() > 33U &&
+                std::equal(
+                    signature.begin(),
+                    signature.end(),
+                    png.bytes.begin()),
+            "PNG signature");
+        expect(
+            png.bytes.size() > 24U &&
+                png.bytes[12] == 'I' &&
+                png.bytes[13] == 'H' &&
+                png.bytes[14] == 'D' &&
+                png.bytes[15] == 'R' &&
+                png.bytes[19] == 2U &&
+                png.bytes[23] == 1U &&
+                png.bytes[24] == 8U &&
+                png.bytes[25] == 6U,
+            "PNG IHDR dimensions and RGBA color type");
+        const auto invalid = vcr::encode_png_rgba(pixels, 0, 1);
+        expect(
+            !static_cast<bool>(invalid),
+            "PNG encoder rejects zero dimensions");
     }
 
     if (failures != 0) {

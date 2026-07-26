@@ -14,8 +14,22 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
+#include <string>
+#include <vector>
 
 namespace vcr {
+
+struct ScreenshotCapture {
+    std::vector<std::uint8_t> rgba;
+    std::string error;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return error.empty() && !rgba.empty();
+    }
+};
 
 class Renderer final {
 public:
@@ -31,7 +45,8 @@ public:
         VkPresentModeKHR preferred_present_mode,
         RunMode initial_mode,
         std::uint32_t initial_instances,
-        std::uint32_t initial_gpu_workload);
+        std::uint32_t initial_gpu_workload,
+        bool enable_screenshot_capture);
     [[nodiscard]] bool draw_frame(
         FrameTimings& timings,
         const glm::mat4& view_matrix);
@@ -40,10 +55,17 @@ public:
     }
     void request_resize() noexcept { resize_requested_ = true; }
     void toggle_vsync();
+    void set_present_mode(PresentPreference preference);
+    void set_vsync(bool enabled);
     void reset_metrics() noexcept { metrics_.reset(); }
     void print_metrics() const;
     void set_mode(RunMode mode) noexcept;
+    void set_instance_count(std::uint32_t count) noexcept;
+    void set_gpu_workload_iterations(std::uint32_t iterations) noexcept;
     void adjust_load(int direction) noexcept;
+    [[nodiscard]] bool request_screenshot() noexcept;
+    [[nodiscard]] std::optional<ScreenshotCapture>
+        take_completed_screenshot() noexcept;
     void shutdown() noexcept;
 
     [[nodiscard]] const Swapchain& swapchain() const noexcept {
@@ -61,6 +83,19 @@ public:
     [[nodiscard]] std::uint32_t max_instance_capacity() const noexcept {
         return max_instance_capacity_;
     }
+    [[nodiscard]] static constexpr std::uint32_t
+        max_gpu_workload_iterations() noexcept {
+        return 4096U;
+    }
+    [[nodiscard]] bool screenshot_supported() const noexcept {
+        return swapchain_.screenshot_supported();
+    }
+    [[nodiscard]] bool screenshot_pending() const noexcept {
+        return screenshot_requested_ || screenshot_in_flight_;
+    }
+    [[nodiscard]] bool initialized() const noexcept {
+        return context_ != nullptr;
+    }
 
 private:
     void create_frame_contexts();
@@ -75,6 +110,8 @@ private:
     void destroy_scene_resources() noexcept;
     void create_descriptors();
     void read_gpu_timestamps(FrameContext& frame, FrameTimings& timings) const;
+    void complete_screenshot(FrameContext& frame);
+    [[nodiscard]] bool prepare_screenshot_buffer();
     void upload_to_device_buffer(
         GpuBuffer& destination,
         std::span<const std::byte> bytes);
@@ -101,6 +138,7 @@ private:
     GpuBuffer vertex_buffer_{};
     GpuBuffer index_buffer_{};
     GpuBuffer instance_buffer_{};
+    GpuBuffer screenshot_readback_{};
     std::uint32_t instancing_count_ = 1;
     std::uint32_t max_instance_capacity_ = 100'000;
     std::uint32_t scene_instance_base_ = 0;
@@ -108,6 +146,9 @@ private:
     std::uint32_t frame_serial_ = 0;
     RunMode mode_ = RunMode::scene;
     PerformanceMetrics metrics_{};
+    bool screenshot_requested_ = false;
+    bool screenshot_in_flight_ = false;
+    std::optional<ScreenshotCapture> completed_screenshot_{};
 };
 
 } // namespace vcr

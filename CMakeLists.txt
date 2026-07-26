@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(vulkan_cube_renderer VERSION 0.1.0 LANGUAGES C CXX)
+project(vulkan_cube_renderer VERSION 0.2.0 LANGUAGES C CXX)
 
 include(FetchContent)
 if(POLICY CMP0169)
@@ -65,8 +65,20 @@ FetchContent_Declare(
     GIT_TAG 1.0.1
     GIT_SHALLOW TRUE
 )
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.12.0
+    GIT_SHALLOW TRUE
+)
 
-FetchContent_MakeAvailable(VulkanHeaders SDL3 VulkanMemoryAllocator glm)
+FetchContent_MakeAvailable(
+    VulkanHeaders
+    SDL3
+    VulkanMemoryAllocator
+    glm
+    nlohmann_json
+)
 FetchContent_GetProperties(volk)
 if(NOT volk_POPULATED)
     FetchContent_Populate(volk)
@@ -86,7 +98,9 @@ add_executable(vulkan_cube
     src/cli_options.cpp
     src/fly_camera.cpp
     src/gpu_buffer.cpp
+    src/mcp_server.cpp
     src/performance_metrics.cpp
+    src/png_encoder.cpp
     src/renderer.cpp
     src/swapchain.cpp
     src/vma.cpp
@@ -99,10 +113,14 @@ target_include_directories(vulkan_cube PRIVATE
     "${vulkanheaders_SOURCE_DIR}/include"
 )
 
+find_package(Threads REQUIRED)
+
 target_link_libraries(vulkan_cube PRIVATE
     SDL3::SDL3-static
     volk::volk
     glm::glm
+    nlohmann_json::nlohmann_json
+    Threads::Threads
 )
 
 target_compile_definitions(vulkan_cube PRIVATE
@@ -116,7 +134,7 @@ target_compile_definitions(vulkan_cube PRIVATE
 
 if(MSVC)
     target_compile_options(
-        vulkan_cube PRIVATE /W4 /permissive- /Zc:preprocessor /GR-
+        vulkan_cube PRIVATE /W4 /permissive- /Zc:preprocessor /GR- /EHsc
     )
     if(VCR_WARNINGS_AS_ERRORS)
         target_compile_options(vulkan_cube PRIVATE /WX)
@@ -151,6 +169,7 @@ if(BUILD_TESTING)
         src/cli_options.cpp
         src/fly_camera.cpp
         src/performance_metrics.cpp
+        src/png_encoder.cpp
     )
     target_include_directories(vcr_core_tests PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -160,9 +179,15 @@ if(BUILD_TESTING)
         GLM_FORCE_RADIANS
         VCR_VALIDATION_DEFAULT=0
     )
-    target_link_libraries(vcr_core_tests PRIVATE glm::glm)
+    target_link_libraries(
+        vcr_core_tests PRIVATE
+        glm::glm
+        Threads::Threads
+    )
     if(MSVC)
-        target_compile_options(vcr_core_tests PRIVATE /W4 /permissive-)
+        target_compile_options(
+            vcr_core_tests PRIVATE /W4 /permissive- /EHsc
+        )
     else()
         target_compile_options(vcr_core_tests PRIVATE
             -Wall -Wextra -Wpedantic -Wconversion -Wshadow

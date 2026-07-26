@@ -15,7 +15,9 @@
 #include <fstream>
 #include <iostream>
 #include <iomanip>
+#include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <glm/gtc/matrix_transform.hpp>
@@ -254,7 +256,8 @@ void Renderer::initialize(
     const VkPresentModeKHR preferred_present_mode,
     const RunMode initial_mode,
     const std::uint32_t initial_instances,
-    const std::uint32_t initial_gpu_workload) {
+    const std::uint32_t initial_gpu_workload,
+    const bool enable_screenshot_capture) {
     context_ = &context;
     window_ = window;
     const std::uint64_t range_capacity =
@@ -273,7 +276,11 @@ void Renderer::initialize(
         std::clamp(initial_instances, 1U, max_instance_capacity_);
     gpu_workload_iterations_ = std::min(initial_gpu_workload, 4096U);
     set_mode(initial_mode);
-    swapchain_.initialize(context, window, preferred_present_mode);
+    swapchain_.initialize(
+        context,
+        window,
+        preferred_present_mode,
+        enable_screenshot_capture);
     create_frame_contexts();
     create_pipeline_cache();
     create_pipeline();
@@ -286,6 +293,10 @@ void Renderer::shutdown() noexcept {
         return;
     }
     vkDeviceWaitIdle(context_->device());
+    screenshot_readback_.destroy();
+    completed_screenshot_.reset();
+    screenshot_requested_ = false;
+    screenshot_in_flight_ = false;
     destroy_scene_resources();
     destroy_pipeline();
     save_pipeline_cache();
@@ -1039,6 +1050,7 @@ bool Renderer::draw_frame(
     VK_CHECK(vkWaitForFences(
         context_->device(), 1, &frame.fence, VK_TRUE, UINT64_MAX));
     timings.fence_wait_ms = milliseconds(begin, Clock::now());
+    complete_screenshot(frame);
     read_gpu_timestamps(frame, timings);
 
     if (resize_requested_) {
@@ -1068,6 +1080,9 @@ bool Renderer::draw_frame(
     VK_CHECK(vkResetFences(context_->device(), 1, &frame.fence));
     VK_CHECK(vkResetCommandPool(
         context_->device(), frame.command_pool, 0));
+    if (screenshot_requested_ && !prepare_screenshot_buffer()) {
+        screenshot_requested_ = false;
+    }
     begin = Clock::now();
     record_commands(frame.command_buffer, image_index);
     timings.command_record_ms = milliseconds(begin, Clock::now());
@@ -1084,7 +1099,12 @@ bool Renderer::draw_frame(
     const VkSemaphoreSubmitInfo signal_info{
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
         .semaphore = frame.render_finished,
-        .stageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,
+        // The exceptional screenshot path includes a transfer copy and its
+        // PRESENT transition. Normal frames retain the narrower graphics
+        // signal scope.
+        .stageMask = frame.screenshot_capture
+            ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
+            : VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,
     };
     const VkSubmitInfo2 submit_info{
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
@@ -1173,6 +1193,100 @@ void Renderer::read_gpu_timestamps(
         ? elapsed(timestamp_workload_begin, timestamp_workload_end)
         : unavailable_timing_ms;
     frame.timestamps_valid = false;
+}
+
+bool Renderer::prepare_screenshot_buffer() {
+    const VkExtent2D extent = swapchain_.extent();
+    constexpr std::uint64_t bytes_per_pixel = 4U;
+    constexpr std::uint64_t maximum_capture_bytes =
+        256ULL * 1024ULL * 1024ULL;
+    const std::uint64_t pixel_count =
+        static_cast<std::uint64_t>(extent.width) * extent.height;
+    if (extent.width == 0U || extent.height == 0U ||
+        pixel_count >
+            std::numeric_limits<std::uint64_t>::max() / bytes_per_pixel) {
+        ScreenshotCapture failure{};
+        failure.error = "invalid screenshot extent";
+        completed_screenshot_ = std::move(failure);
+        return false;
+    }
+    const std::uint64_t byte_count = pixel_count * bytes_per_pixel;
+    if (byte_count > maximum_capture_bytes ||
+        byte_count > std::numeric_limits<VkDeviceSize>::max()) {
+        ScreenshotCapture failure{};
+        failure.error =
+            "screenshot exceeds the 256 MiB readback limit";
+        completed_screenshot_ = std::move(failure);
+        return false;
+    }
+    const VkDeviceSize required_size =
+        static_cast<VkDeviceSize>(byte_count);
+    if (screenshot_readback_.size() == required_size) {
+        return true;
+    }
+    screenshot_readback_.create(
+        *context_,
+        required_size,
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+            VMA_ALLOCATION_CREATE_MAPPED_BIT,
+        "MCP screenshot readback");
+    return true;
+}
+
+void Renderer::complete_screenshot(FrameContext& frame) {
+    if (!frame.screenshot_capture) {
+        return;
+    }
+    frame.screenshot_capture = false;
+    screenshot_in_flight_ = false;
+
+    ScreenshotCapture capture{};
+    capture.width = frame.screenshot_width;
+    capture.height = frame.screenshot_height;
+    constexpr std::size_t bytes_per_pixel = 4U;
+    const std::size_t pixel_count =
+        static_cast<std::size_t>(capture.width) * capture.height;
+    const std::size_t byte_count = pixel_count * bytes_per_pixel;
+    if (!screenshot_readback_ ||
+        screenshot_readback_.mapped_data() == nullptr ||
+        static_cast<VkDeviceSize>(byte_count) !=
+            screenshot_readback_.size()) {
+        capture.error = "screenshot readback buffer invariant failed";
+        completed_screenshot_ = std::move(capture);
+        return;
+    }
+    screenshot_readback_.invalidate(
+        0, static_cast<VkDeviceSize>(byte_count));
+    capture.rgba.resize(byte_count);
+    std::memcpy(
+        capture.rgba.data(),
+        screenshot_readback_.mapped_data(),
+        byte_count);
+
+    const bool bgra =
+        frame.screenshot_format == VK_FORMAT_B8G8R8A8_UNORM ||
+        frame.screenshot_format == VK_FORMAT_B8G8R8A8_SRGB;
+    const bool rgba =
+        frame.screenshot_format == VK_FORMAT_R8G8B8A8_UNORM ||
+        frame.screenshot_format == VK_FORMAT_R8G8B8A8_SRGB;
+    if (!bgra && !rgba) {
+        capture.rgba.clear();
+        capture.error = "unsupported screenshot color format";
+        completed_screenshot_ = std::move(capture);
+        return;
+    }
+    if (bgra) {
+        for (std::size_t offset = 0;
+             offset < capture.rgba.size();
+             offset += bytes_per_pixel) {
+            std::swap(
+                capture.rgba[offset],
+                capture.rgba[offset + 2U]);
+        }
+    }
+    completed_screenshot_ = std::move(capture);
 }
 
 void Renderer::record_commands(
@@ -1415,16 +1529,97 @@ void Renderer::record_commands(
             timestamp_geometry_end);
     }
 
-    transition_image(
-        command_buffer,
-        swapchain_.images()[image_index],
-        VK_IMAGE_ASPECT_COLOR_BIT,
-        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-        VK_PIPELINE_STAGE_2_NONE,
-        VK_ACCESS_2_NONE);
+    auto& capture_frame = frames_[frame_index_];
+    const bool capture_this_frame =
+        screenshot_requested_ && static_cast<bool>(screenshot_readback_);
+    if (capture_this_frame) {
+        transition_image(
+            command_buffer,
+            swapchain_.images()[image_index],
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_READ_BIT);
+        const VkBufferImageCopy copy_region{
+            .bufferOffset = 0,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource = VkImageSubresourceLayers{
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = VkExtent3D{
+                swapchain_.extent().width,
+                swapchain_.extent().height,
+                1,
+            },
+        };
+        vkCmdCopyImageToBuffer(
+            command_buffer,
+            swapchain_.images()[image_index],
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            screenshot_readback_.handle(),
+            1,
+            &copy_region);
+        const VkBufferMemoryBarrier2 host_barrier{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+            .pNext = nullptr,
+            .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+            .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = screenshot_readback_.handle(),
+            .offset = 0,
+            .size = screenshot_readback_.size(),
+        };
+        const VkDependencyInfo host_dependency{
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .pNext = nullptr,
+            .dependencyFlags = 0,
+            .memoryBarrierCount = 0,
+            .pMemoryBarriers = nullptr,
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &host_barrier,
+            .imageMemoryBarrierCount = 0,
+            .pImageMemoryBarriers = nullptr,
+        };
+        vkCmdPipelineBarrier2(command_buffer, &host_dependency);
+        transition_image(
+            command_buffer,
+            swapchain_.images()[image_index],
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_READ_BIT,
+            VK_PIPELINE_STAGE_2_NONE,
+            VK_ACCESS_2_NONE);
+        capture_frame.screenshot_capture = true;
+        capture_frame.screenshot_width = swapchain_.extent().width;
+        capture_frame.screenshot_height = swapchain_.extent().height;
+        capture_frame.screenshot_format = swapchain_.color_format();
+        screenshot_requested_ = false;
+        screenshot_in_flight_ = true;
+    } else {
+        transition_image(
+            command_buffer,
+            swapchain_.images()[image_index],
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_NONE,
+            VK_ACCESS_2_NONE);
+    }
     if (frame.timestamp_queries != VK_NULL_HANDLE) {
         vkCmdWriteTimestamp2(
             command_buffer,
@@ -1455,20 +1650,36 @@ void Renderer::rebuild_swapchain() {
 }
 
 void Renderer::toggle_vsync() {
-    const auto current = swapchain_.present_mode();
-    VkPresentModeKHR requested = VK_PRESENT_MODE_FIFO_KHR;
-    if (current == VK_PRESENT_MODE_FIFO_KHR) {
-        const auto modes = swapchain_.available_present_modes();
-        if (std::ranges::find(modes, VK_PRESENT_MODE_IMMEDIATE_KHR) !=
-            modes.end()) {
-            requested = VK_PRESENT_MODE_IMMEDIATE_KHR;
-        } else if (
-            std::ranges::find(modes, VK_PRESENT_MODE_MAILBOX_KHR) !=
-            modes.end()) {
-            requested = VK_PRESENT_MODE_MAILBOX_KHR;
-        }
+    set_vsync(
+        swapchain_.present_mode() != VK_PRESENT_MODE_FIFO_KHR);
+}
+
+void Renderer::set_present_mode(const PresentPreference preference) {
+    VkPresentModeKHR requested = VK_PRESENT_MODE_IMMEDIATE_KHR;
+    switch (preference) {
+    case PresentPreference::automatic:
+    case PresentPreference::immediate:
+        requested = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        break;
+    case PresentPreference::mailbox:
+        requested = VK_PRESENT_MODE_MAILBOX_KHR;
+        break;
+    case PresentPreference::fifo:
+        requested = VK_PRESENT_MODE_FIFO_KHR;
+        break;
     }
-    swapchain_.recreate(requested);
+    const VkPresentModeKHR resolved =
+        swapchain_.resolve_present_mode(requested);
+    if (resolved != swapchain_.present_mode()) {
+        swapchain_.recreate(resolved);
+    }
+}
+
+void Renderer::set_vsync(const bool enabled) {
+    set_present_mode(
+        enabled
+            ? PresentPreference::fifo
+            : PresentPreference::automatic);
 }
 
 std::uint32_t Renderer::instance_count() const noexcept {
@@ -1489,6 +1700,33 @@ std::uint64_t Renderer::triangle_count() const noexcept {
 
 void Renderer::set_mode(const RunMode mode) noexcept {
     mode_ = mode;
+}
+
+void Renderer::set_instance_count(const std::uint32_t count) noexcept {
+    instancing_count_ =
+        std::clamp(count, 1U, max_instance_capacity_);
+}
+
+void Renderer::set_gpu_workload_iterations(
+    const std::uint32_t iterations) noexcept {
+    gpu_workload_iterations_ =
+        std::min(iterations, max_gpu_workload_iterations());
+}
+
+bool Renderer::request_screenshot() noexcept {
+    if (!screenshot_supported() ||
+        screenshot_requested_ ||
+        screenshot_in_flight_ ||
+        completed_screenshot_.has_value()) {
+        return false;
+    }
+    screenshot_requested_ = true;
+    return true;
+}
+
+std::optional<ScreenshotCapture>
+Renderer::take_completed_screenshot() noexcept {
+    return std::exchange(completed_screenshot_, std::nullopt);
 }
 
 void Renderer::adjust_load(const int direction) noexcept {

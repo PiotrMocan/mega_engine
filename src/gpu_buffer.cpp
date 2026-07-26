@@ -85,7 +85,8 @@ void GpuBuffer::destroy() noexcept {
 void GpuBuffer::write(
     const std::span<const std::byte> bytes,
     const VkDeviceSize offset) {
-    if (mapped_data_ == nullptr || offset + bytes.size_bytes() > size_) {
+    if (mapped_data_ == nullptr || offset > size_ ||
+        bytes.size_bytes() > size_ - offset) {
         fatal("Attempted invalid write to GPU buffer.");
     }
     std::memcpy(
@@ -97,6 +98,22 @@ void GpuBuffer::write(
         allocation_,
         offset,
         static_cast<VkDeviceSize>(bytes.size_bytes())));
+}
+
+void GpuBuffer::invalidate(
+    const VkDeviceSize offset,
+    const VkDeviceSize requested_size) {
+    if (mapped_data_ == nullptr || offset > size_) {
+        fatal("Attempted invalid invalidate of GPU buffer.");
+    }
+    const VkDeviceSize size = requested_size == VK_WHOLE_SIZE
+        ? size_ - offset
+        : requested_size;
+    if (size > size_ - offset) {
+        fatal("Attempted invalid invalidate of GPU buffer.");
+    }
+    VK_CHECK(vmaInvalidateAllocation(
+        context_->allocator(), allocation_, offset, size));
 }
 
 } // namespace vcr

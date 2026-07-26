@@ -28,6 +28,9 @@ public:
     void destroy() noexcept;
 
     void write(std::span<const std::byte> bytes, VkDeviceSize offset = 0);
+    void invalidate(
+        VkDeviceSize offset = 0,
+        VkDeviceSize size = VK_WHOLE_SIZE);
 
     [[nodiscard]] VkBuffer handle() const noexcept { return buffer_; }
     [[nodiscard]] VmaAllocation allocation() const noexcept { return allocation_; }

@@ -180,6 +180,14 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
             result.options.benchmark = true;
             continue;
         }
+        if (argument.name == "--mcp-stdio") {
+            if (argument.has_inline_value) {
+                result.error = invalid_value(argument.name, argument.inline_value);
+                return result;
+            }
+            result.options.mcp_stdio = true;
+            continue;
+        }
         if (argument.name == "--validation") {
             if (argument.has_inline_value) {
                 result.error = invalid_value(argument.name, argument.inline_value);
@@ -323,6 +331,7 @@ std::string cli_usage(std::string_view executable_name) {
     result.append(
         " [options]\n"
         "  --benchmark             Run timed benchmark and write benchmark.json\n"
+        "  --mcp-stdio             Expose AI toolsets over MCP stdio\n"
         "  --width N               Initial drawable width (default: 1280)\n"
         "  --height N              Initial drawable height (default: 720)\n"
         "  --instances N           Cube instance count (default: 1)\n"

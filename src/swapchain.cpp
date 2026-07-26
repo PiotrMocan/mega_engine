@@ -16,9 +16,11 @@ Swapchain::~Swapchain() {
 void Swapchain::initialize(
     VulkanContext& context,
     SDL_Window* window,
-    const VkPresentModeKHR preferred_mode) {
+    const VkPresentModeKHR preferred_mode,
+    const bool enable_screenshot_capture) {
     context_ = &context;
     window_ = window;
+    screenshot_enabled_ = enable_screenshot_capture;
     create(preferred_mode, VK_NULL_HANDLE);
 }
 
@@ -41,6 +43,8 @@ void Swapchain::shutdown() noexcept {
     }
     destroy_resources(swapchain_);
     swapchain_ = VK_NULL_HANDLE;
+    screenshot_enabled_ = false;
+    screenshot_supported_ = false;
     context_ = nullptr;
     window_ = nullptr;
 }
@@ -86,6 +90,17 @@ void Swapchain::create(
     present_mode_ = choose_present_mode(preferred_mode);
     extent_ = choose_extent(capabilities);
     depth_format_ = choose_depth_format();
+    VkFormatProperties color_properties{};
+    vkGetPhysicalDeviceFormatProperties(
+        context_->physical_device(),
+        color_format_,
+        &color_properties);
+    screenshot_supported_ =
+        screenshot_enabled_ &&
+        (capabilities.supportedUsageFlags &
+         VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0U &&
+        (color_properties.optimalTilingFeatures &
+         VK_FORMAT_FEATURE_TRANSFER_SRC_BIT) != 0U;
 
     std::uint32_t image_count = capabilities.minImageCount + 1U;
     if (capabilities.maxImageCount > 0U) {
@@ -97,6 +112,12 @@ void Swapchain::create(
         context_->queue_families().present,
     };
     const bool split_queues = family_indices[0] != family_indices[1];
+    const VkImageUsageFlags image_usage =
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+        (screenshot_supported_
+             ? static_cast<VkImageUsageFlags>(
+                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+             : VkImageUsageFlags{0});
     const VkSwapchainCreateInfoKHR create_info{
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
         .surface = context_->surface(),
@@ -105,7 +126,7 @@ void Swapchain::create(
         .imageColorSpace = color_space_,
         .imageExtent = extent_,
         .imageArrayLayers = 1,
-        .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+        .imageUsage = image_usage,
         .imageSharingMode =
             split_queues ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = split_queues ? 2U : 0U,
@@ -195,7 +216,10 @@ void Swapchain::create(
     std::cout << "Swapchain: " << extent_.width << 'x' << extent_.height
               << ", " << actual_image_count << " images, format "
               << static_cast<int>(color_format_) << ", present "
-              << present_mode_name(present_mode_) << '\n' << std::flush;
+              << present_mode_name(present_mode_)
+              << ", screenshot "
+              << (screenshot_supported_ ? "yes" : "no")
+              << '\n' << std::flush;
 }
 
 void Swapchain::destroy_resources(const VkSwapchainKHR swapchain) noexcept {
