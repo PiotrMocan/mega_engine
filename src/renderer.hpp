@@ -198,10 +198,12 @@ private:
     VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
     VkPipeline scene_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline terrain_pipeline_ = VK_NULL_HANDLE;
     VkPipeline sky_pipeline_ = VK_NULL_HANDLE;
-    VkPipeline shadow_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline terrain_shadow_pipeline_ = VK_NULL_HANDLE;
     VkPipeline aa_pipeline_ = VK_NULL_HANDLE;
     VkPipeline aa_scene_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline aa_terrain_pipeline_ = VK_NULL_HANDLE;
     VkPipeline aa_sky_pipeline_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout anti_aliasing_descriptor_set_layout_ =
         VK_NULL_HANDLE;
@@ -220,6 +222,8 @@ private:
     GpuBuffer vertex_buffer_{};
     GpuBuffer index_buffer_{};
     GpuBuffer instance_buffer_{};
+    GpuBuffer terrain_vertex_buffer_{};
+    GpuBuffer terrain_index_buffer_{};
     GpuTexture sky_texture_{};
     GpuTexture shadow_map_{};
     GpuTexture smaa_area_texture_{};

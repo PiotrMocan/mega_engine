@@ -64,6 +64,9 @@ function Compile-Shader {
 }
 
 $regularShaders = @(
+    @("terrain.vert", "terrain.vert.spv"),
+    @("terrain_aa.vert", "terrain_aa.vert.spv"),
+    @("terrain_shadow.vert", "terrain_shadow.vert.spv"),
     @("cube_aa.vert", "cube_aa.vert.spv"),
     @("cube_aa.frag", "cube_aa.frag.spv"),
     @("scene_aa.vert", "scene_aa.vert.spv"),
@@ -104,4 +107,4 @@ Compile-Shader `
 if (-not $spirvVal) {
     Write-Host "Standalone spirv-val was not found; glslang's integrated SPIR-V Tools validator was used."
 }
-Write-Host "All anti-aliasing shaders compiled and validated for Vulkan 1.3 / SPIR-V 1.5."
+Write-Host "All selected shaders compiled and validated for Vulkan 1.3 / SPIR-V 1.5."

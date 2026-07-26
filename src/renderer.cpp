@@ -67,8 +67,15 @@ struct alignas(16) InstanceData {
     glm::vec4 color{1.0F};
 };
 
+struct TerrainVertex {
+    float position[3];
+    std::int16_t normal_x;
+    std::int16_t normal_z;
+};
+
 static_assert(sizeof(FrameUniforms) == 416);
 static_assert(sizeof(InstanceData) == 64);
+static_assert(sizeof(TerrainVertex) == 16);
 
 inline constexpr std::uint32_t shadow_map_resolution = 2048U;
 inline constexpr VkFormat aa_color_format =
@@ -83,18 +90,18 @@ inline constexpr VkFormat smaa_weights_format =
     VK_FORMAT_R8G8B8A8_UNORM;
 
 glm::mat4 create_sun_light_view_projection() {
-    const glm::vec3 scene_center(0.0F, 2.0F, 0.0F);
+    const glm::vec3 scene_center(0.0F, 1.5F, -7.0F);
     const glm::vec3 light_direction =
         glm::normalize(glm::vec3(
             sun_direction_x,
             sun_direction_y,
             sun_direction_z));
     const glm::mat4 light_view = glm::lookAt(
-        scene_center + light_direction * 45.0F,
+        scene_center + light_direction * 90.0F,
         scene_center,
         glm::vec3(0.0F, 1.0F, 0.0F));
     glm::mat4 light_projection =
-        glm::ortho(-31.0F, 31.0F, -31.0F, 31.0F, 1.0F, 90.0F);
+        glm::ortho(-48.0F, 48.0F, -48.0F, 48.0F, 1.0F, 180.0F);
     light_projection[1][1] *= -1.0F;
     return light_projection * light_view;
 }
@@ -214,6 +221,70 @@ float hash_unit(const std::uint32_t value) {
            static_cast<float>(0x00ff'ffffU);
 }
 
+// A 2,500 x 2,000 heightfield produces exactly 10,000,000 useful terrain
+// triangles. Triangle strips keep the index stream to roughly one index per
+// triangle while retaining post-transform vertex reuse.
+inline constexpr std::uint32_t terrain_cell_count_x = 2'500U;
+inline constexpr std::uint32_t terrain_cell_count_z = 2'000U;
+inline constexpr std::uint32_t terrain_vertex_count_x =
+    terrain_cell_count_x + 1U;
+inline constexpr std::uint32_t terrain_vertex_count_z =
+    terrain_cell_count_z + 1U;
+inline constexpr std::uint32_t terrain_vertex_count =
+    terrain_vertex_count_x * terrain_vertex_count_z;
+inline constexpr std::uint32_t terrain_triangle_count =
+    terrain_cell_count_x * terrain_cell_count_z * 2U;
+inline constexpr std::uint32_t terrain_index_count =
+    terrain_vertex_count_x * 2U * terrain_cell_count_z +
+    (terrain_cell_count_z - 1U);
+inline constexpr float terrain_extent_x = 60.0F;
+inline constexpr float terrain_extent_z = 50.0F;
+inline constexpr float terrain_spacing_x =
+    terrain_extent_x / static_cast<float>(terrain_cell_count_x);
+inline constexpr float terrain_spacing_z =
+    terrain_extent_z / static_cast<float>(terrain_cell_count_z);
+inline constexpr float landscape_base_height = -4.0F;
+inline constexpr float landscape_near_edge_z = 18.0F;
+static_assert(terrain_vertex_count == 5'004'501U);
+static_assert(terrain_triangle_count == 10'000'000U);
+static_assert(terrain_index_count == 10'005'999U);
+
+float landscape_height(const float x, const float z) noexcept {
+    const auto hill =
+        [](const float position_x,
+           const float position_z,
+           const float center_x,
+           const float center_z,
+           const float radius_x,
+           const float radius_z,
+           const float height) noexcept {
+            const float normalized_x =
+                (position_x - center_x) / radius_x;
+            const float normalized_z =
+                (position_z - center_z) / radius_z;
+            return height * std::exp(
+                -(normalized_x * normalized_x +
+                  normalized_z * normalized_z));
+        };
+
+    const float rolling_hills =
+        0.65F * std::sin(x * 0.21F) * std::cos(z * 0.17F) +
+        0.35F * std::sin(x * 0.47F + z * 0.29F);
+    const float mountain_range =
+        hill(x, z, -13.0F, -10.0F, 7.5F, 10.5F, 6.8F) +
+        hill(x, z, 12.0F, -17.0F, 6.5F, 8.0F, 4.8F) +
+        hill(x, z, 2.0F, -25.0F, 13.0F, 5.0F, 2.4F);
+    const float valley =
+        hill(x, z, 0.0F, -5.0F, 5.0F, 16.0F, -1.25F);
+    return rolling_hills + mountain_range + valley;
+}
+
+std::int16_t pack_snorm16(const float value) noexcept {
+    const float scaled =
+        std::round(std::clamp(value, -1.0F, 1.0F) * 32767.0F);
+    return static_cast<std::int16_t>(scaled);
+}
+
 constexpr std::array kCubeVertices{
     // +Z
     Vertex{{-1, -1,  1}, { 0,  0,  1}},
@@ -286,51 +357,6 @@ constexpr auto kGeometryVertices =
 constexpr auto kGeometryIndices =
     concatenate(kCubeIndices, kPlaneIndices);
 
-struct SceneInstanceSpec {
-    float translation[3];
-    float scale[3];
-    float color[3];
-    float yaw_degrees;
-};
-
-constexpr std::array<SceneInstanceSpec, 15> kSceneInstances{{
-    // Ground plane.
-    {{ 0.0F, 0.0F,  0.0F}, {20.0F, 1.0F, 20.0F},
-     {0.22F, 0.36F, 0.18F}, 0.0F},
-    // Scattered blocks.
-    {{-5.0F, 1.0F, -5.0F}, {1.0F, 1.0F, 1.0F},
-     {0.78F, 0.24F, 0.18F}, 0.0F},
-    {{-2.5F, 0.75F, -3.5F}, {0.75F, 0.75F, 0.75F},
-     {0.92F, 0.58F, 0.15F}, 18.0F},
-    {{ 1.5F, 1.0F, -5.5F}, {1.5F, 1.0F, 1.0F},
-     {0.20F, 0.55F, 0.88F}, -12.0F},
-    {{ 5.0F, 1.5F, -3.0F}, {1.0F, 1.5F, 1.0F},
-     {0.55F, 0.30F, 0.85F}, 9.0F},
-    // A two-block stack near the center.
-    {{ 0.0F, 1.0F, 0.0F}, {1.0F, 1.0F, 1.0F},
-     {0.18F, 0.68F, 1.00F}, 0.0F},
-    {{ 0.0F, 3.0F, 0.0F}, {1.0F, 1.0F, 1.0F},
-     {0.25F, 0.82F, 0.72F}, 22.0F},
-    // Low wall.
-    {{-5.0F, 1.0F, 4.0F}, {0.9F, 1.0F, 0.9F},
-     {0.72F, 0.36F, 0.20F}, 0.0F},
-    {{-2.5F, 1.0F, 4.0F}, {0.9F, 1.0F, 0.9F},
-     {0.78F, 0.43F, 0.22F}, 0.0F},
-    {{ 0.0F, 1.0F, 4.0F}, {0.9F, 1.0F, 0.9F},
-     {0.84F, 0.50F, 0.24F}, 0.0F},
-    {{ 2.5F, 1.0F, 4.0F}, {0.9F, 1.0F, 0.9F},
-     {0.78F, 0.43F, 0.22F}, 0.0F},
-    {{ 5.0F, 1.0F, 4.0F}, {0.9F, 1.0F, 0.9F},
-     {0.72F, 0.36F, 0.20F}, 0.0F},
-    // Tall landmark.
-    {{ 7.0F, 1.0F, 7.0F}, {1.0F, 1.0F, 1.0F},
-     {0.34F, 0.48F, 0.92F}, 0.0F},
-    {{ 7.0F, 3.0F, 7.0F}, {1.0F, 1.0F, 1.0F},
-     {0.42F, 0.56F, 0.96F}, 15.0F},
-    {{ 7.0F, 5.0F, 7.0F}, {1.0F, 1.0F, 1.0F},
-     {0.52F, 0.68F, 1.00F}, 30.0F},
-}};
-
 inline constexpr std::uint32_t cube_index_count =
     static_cast<std::uint32_t>(kCubeIndices.size());
 inline constexpr std::uint32_t cube_triangle_count = cube_index_count / 3U;
@@ -341,9 +367,12 @@ inline constexpr std::uint32_t plane_index_count =
     static_cast<std::uint32_t>(kPlaneIndices.size());
 inline constexpr std::uint32_t plane_triangle_count = plane_index_count / 3U;
 inline constexpr std::uint32_t sky_triangle_count = 1U;
-inline constexpr std::uint32_t scene_instance_count =
-    static_cast<std::uint32_t>(kSceneInstances.size());
-inline constexpr std::uint32_t scene_block_count = scene_instance_count - 1U;
+inline constexpr std::uint64_t scene_triangle_count =
+    sky_triangle_count +
+    plane_triangle_count +
+    terrain_triangle_count;
+inline constexpr std::uint32_t scene_object_count = 2U;
+static_assert(scene_triangle_count == 10'000'003ULL);
 
 template <typename T, std::size_t N>
 std::span<const std::byte> as_bytes(const std::array<T, N>& values) {
@@ -464,12 +493,11 @@ void Renderer::initialize(
     const std::uint64_t range_capacity =
         context.properties().limits.maxStorageBufferRange /
         sizeof(InstanceData);
-    if (range_capacity <
-        static_cast<std::uint64_t>(scene_instance_count) + 100'000ULL) {
-        fatal("Storage buffer range is too small for scene and benchmark data.");
+    if (range_capacity < 100'001ULL) {
+        fatal("Storage buffer range is too small for benchmark data.");
     }
     const std::uint64_t benchmark_range_capacity =
-        range_capacity - scene_instance_count;
+        range_capacity - 1ULL;
     max_instance_capacity_ = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(
         benchmark_range_capacity, 100'000ULL, 1'000'000ULL));
     scene_instance_base_ = max_instance_capacity_;
@@ -644,6 +672,10 @@ void Renderer::destroy_present_semaphores() noexcept {
 }
 
 void Renderer::create_scene_resources() {
+    if (terrain_vertex_count - 1U >
+        context_->properties().limits.maxDrawIndexedIndexValue) {
+        fatal("Terrain vertex count exceeds maxDrawIndexedIndexValue.");
+    }
     vertex_buffer_.create(
         *context_,
         sizeof(kGeometryVertices),
@@ -659,8 +691,7 @@ void Renderer::create_scene_resources() {
         0,
         "scene index buffer");
     std::vector<InstanceData> instances(
-        static_cast<std::size_t>(max_instance_capacity_) +
-        scene_instance_count);
+        static_cast<std::size_t>(max_instance_capacity_) + 1U);
     instances[0] = InstanceData{
         .translation = glm::vec4(0.0F, 0.0F, 0.0F, 0.0F),
         .rotation = glm::vec4(0.0F, 0.0F, 0.0F, 1.0F),
@@ -689,30 +720,106 @@ void Renderer::create_scene_resources() {
         };
     }
 
-    for (std::uint32_t index = 0; index < scene_instance_count; ++index) {
-        const auto& source = kSceneInstances[index];
-        const glm::quat rotation = glm::angleAxis(
-            glm::radians(source.yaw_degrees),
-            glm::vec3(0.0F, 1.0F, 0.0F));
-        instances[scene_instance_base_ + index] = InstanceData{
-            .translation = glm::vec4(
-                source.translation[0],
-                source.translation[1],
-                source.translation[2],
-                0.0F),
-            .rotation =
-                glm::vec4(rotation.x, rotation.y, rotation.z, rotation.w),
-            .scale = glm::vec4(
-                source.scale[0],
-                source.scale[1],
-                source.scale[2],
-                0.0F),
-            .color = glm::vec4(
-                source.color[0],
-                source.color[1],
-                source.color[2],
-                1.0F),
+    instances[scene_instance_base_] = InstanceData{
+        .translation =
+            glm::vec4(0.0F, landscape_base_height, -7.0F, 0.0F),
+        .rotation = glm::vec4(0.0F, 0.0F, 0.0F, 1.0F),
+        .scale = glm::vec4(31.0F, 1.0F, 27.0F, 0.0F),
+        .color = glm::vec4(0.13F, 0.16F, 0.08F, 1.0F),
+    };
+
+    std::vector<float> terrain_heights(terrain_vertex_count);
+    constexpr float terrain_min_x = -terrain_extent_x * 0.5F;
+    for (std::uint32_t row = 0; row < terrain_vertex_count_z; ++row) {
+        const float z =
+            landscape_near_edge_z -
+            static_cast<float>(row) * terrain_spacing_z;
+        for (std::uint32_t column = 0;
+             column < terrain_vertex_count_x;
+             ++column) {
+            const float x =
+                terrain_min_x +
+                static_cast<float>(column) * terrain_spacing_x;
+            const std::size_t vertex_index =
+                static_cast<std::size_t>(row) * terrain_vertex_count_x +
+                column;
+            terrain_heights[vertex_index] = landscape_height(x, z);
+        }
+    }
+
+    const auto terrain_height_at =
+        [&terrain_heights](
+            const std::uint32_t row,
+            const std::uint32_t column) noexcept {
+            return terrain_heights[
+                static_cast<std::size_t>(row) * terrain_vertex_count_x +
+                column];
         };
+    std::vector<TerrainVertex> terrain_vertices(terrain_vertex_count);
+    for (std::uint32_t row = 0; row < terrain_vertex_count_z; ++row) {
+        const std::uint32_t previous_row = row == 0U ? row : row - 1U;
+        const std::uint32_t next_row =
+            std::min(row + 1U, terrain_vertex_count_z - 1U);
+        const float z =
+            landscape_near_edge_z -
+            static_cast<float>(row) * terrain_spacing_z;
+        for (std::uint32_t column = 0;
+             column < terrain_vertex_count_x;
+             ++column) {
+            const std::uint32_t previous_column =
+                column == 0U ? column : column - 1U;
+            const std::uint32_t next_column =
+                std::min(column + 1U, terrain_vertex_count_x - 1U);
+            const float derivative_x =
+                (terrain_height_at(row, next_column) -
+                 terrain_height_at(row, previous_column)) /
+                (static_cast<float>(next_column - previous_column) *
+                 terrain_spacing_x);
+            const float derivative_z =
+                (terrain_height_at(previous_row, column) -
+                 terrain_height_at(next_row, column)) /
+                (static_cast<float>(next_row - previous_row) *
+                 terrain_spacing_z);
+            const glm::vec3 normal = glm::normalize(
+                glm::vec3(-derivative_x, 1.0F, -derivative_z));
+            const float x =
+                terrain_min_x +
+                static_cast<float>(column) * terrain_spacing_x;
+            const std::size_t vertex_index =
+                static_cast<std::size_t>(row) * terrain_vertex_count_x +
+                column;
+            terrain_vertices[vertex_index] = TerrainVertex{
+                .position = {
+                    x,
+                    terrain_height_at(row, column),
+                    z,
+                },
+                .normal_x = pack_snorm16(normal.x),
+                .normal_z = pack_snorm16(normal.z),
+            };
+        }
+    }
+    std::vector<float>{}.swap(terrain_heights);
+
+    std::vector<std::uint32_t> terrain_indices(terrain_index_count);
+    std::size_t terrain_index = 0;
+    constexpr std::uint32_t primitive_restart =
+        std::numeric_limits<std::uint32_t>::max();
+    for (std::uint32_t row = 0; row < terrain_cell_count_z; ++row) {
+        for (std::uint32_t column = 0;
+             column < terrain_vertex_count_x;
+             ++column) {
+            terrain_indices[terrain_index++] =
+                (row + 1U) * terrain_vertex_count_x + column;
+            terrain_indices[terrain_index++] =
+                row * terrain_vertex_count_x + column;
+        }
+        if (row + 1U < terrain_cell_count_z) {
+            terrain_indices[terrain_index++] = primitive_restart;
+        }
+    }
+    if (terrain_index != terrain_indices.size()) {
+        fatal("Terrain index generation count mismatch.");
     }
     instance_buffer_.create(
         *context_,
@@ -721,11 +828,35 @@ void Renderer::create_scene_resources() {
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
         "instance buffer");
+    terrain_vertex_buffer_.create(
+        *context_,
+        static_cast<VkDeviceSize>(terrain_vertices.size()) *
+            sizeof(TerrainVertex),
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        0,
+        "indexed heightfield vertex buffer");
+    terrain_index_buffer_.create(
+        *context_,
+        static_cast<VkDeviceSize>(terrain_indices.size()) *
+            sizeof(std::uint32_t),
+        VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        0,
+        "indexed heightfield strip buffer");
 
     upload_to_device_buffer(vertex_buffer_, as_bytes(kGeometryVertices));
     upload_to_device_buffer(index_buffer_, as_bytes(kGeometryIndices));
     upload_to_device_buffer(
         instance_buffer_, std::as_bytes(std::span{instances}));
+    upload_to_device_buffer(
+        terrain_vertex_buffer_,
+        std::as_bytes(std::span{terrain_vertices}));
+    upload_to_device_buffer(
+        terrain_index_buffer_,
+        std::as_bytes(std::span{terrain_indices}));
     create_sky_texture();
     create_shadow_map();
 }
@@ -1093,6 +1224,8 @@ void Renderer::destroy_scene_resources() noexcept {
     shadow_map_.destroy();
     shadow_map_format_ = VK_FORMAT_UNDEFINED;
     sky_texture_.destroy();
+    terrain_index_buffer_.destroy();
+    terrain_vertex_buffer_.destroy();
     instance_buffer_.destroy();
     index_buffer_.destroy();
     vertex_buffer_.destroy();
@@ -1384,7 +1517,7 @@ void Renderer::render_static_shadow_map() {
     vkCmdBindPipeline(
         command_buffer,
         VK_PIPELINE_BIND_POINT_GRAPHICS,
-        shadow_pipeline_);
+        terrain_shadow_pipeline_);
     vkCmdBindDescriptorSets(
         command_buffer,
         VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -1395,18 +1528,21 @@ void Renderer::render_static_shadow_map() {
         0,
         nullptr);
     const VkDeviceSize vertex_offset = 0;
-    const VkBuffer vertex_buffer = vertex_buffer_.handle();
+    const VkBuffer vertex_buffer = terrain_vertex_buffer_.handle();
     vkCmdBindVertexBuffers(
         command_buffer, 0, 1, &vertex_buffer, &vertex_offset);
     vkCmdBindIndexBuffer(
-        command_buffer, index_buffer_.handle(), 0, VK_INDEX_TYPE_UINT16);
+        command_buffer,
+        terrain_index_buffer_.handle(),
+        0,
+        VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexed(
         command_buffer,
-        cube_index_count,
-        scene_block_count,
+        terrain_index_count,
+        1,
         0,
         0,
-        scene_instance_base_ + 1U);
+        0);
     vkCmdEndRendering(command_buffer);
 
     transition_image(
@@ -1725,6 +1861,18 @@ void Renderer::save_pipeline_cache() const noexcept {
 }
 
 void Renderer::create_pipeline() {
+    VkFormatProperties terrain_normal_format_properties{};
+    vkGetPhysicalDeviceFormatProperties(
+        context_->physical_device(),
+        VK_FORMAT_R16G16_SNORM,
+        &terrain_normal_format_properties);
+    if ((terrain_normal_format_properties.bufferFeatures &
+         VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) == 0U) {
+        fatal(
+            "The selected GPU cannot use R16G16_SNORM terrain normals "
+            "as vertex input.");
+    }
+
     const std::array bindings{
         VkDescriptorSetLayoutBinding{
             .binding = 0,
@@ -1897,6 +2045,38 @@ void Renderer::create_pipeline() {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
         .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
     };
+    const VkVertexInputBindingDescription terrain_vertex_binding{
+        .binding = 0,
+        .stride = sizeof(TerrainVertex),
+        .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+    };
+    const std::array terrain_vertex_attributes{
+        VkVertexInputAttributeDescription{
+            .location = 0,
+            .binding = 0,
+            .format = VK_FORMAT_R32G32B32_SFLOAT,
+            .offset = offsetof(TerrainVertex, position),
+        },
+        VkVertexInputAttributeDescription{
+            .location = 1,
+            .binding = 0,
+            .format = VK_FORMAT_R16G16_SNORM,
+            .offset = offsetof(TerrainVertex, normal_x),
+        },
+    };
+    const VkPipelineVertexInputStateCreateInfo terrain_vertex_input{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = 1,
+        .pVertexBindingDescriptions = &terrain_vertex_binding,
+        .vertexAttributeDescriptionCount =
+            static_cast<std::uint32_t>(terrain_vertex_attributes.size()),
+        .pVertexAttributeDescriptions = terrain_vertex_attributes.data(),
+    };
+    const VkPipelineInputAssemblyStateCreateInfo terrain_input_assembly{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP,
+        .primitiveRestartEnable = VK_TRUE,
+    };
     const VkPipelineViewportStateCreateInfo viewport_state{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
         .viewportCount = 1,
@@ -2005,6 +2185,30 @@ void Renderer::create_pipeline() {
         VK_OBJECT_TYPE_PIPELINE,
         handle_value(scene_pipeline_),
         "shadowed scene graphics pipeline");
+    const VkShaderModule terrain_vertex_module =
+        load_shader("terrain.vert.spv");
+    std::array<VkPipelineShaderStageCreateInfo, 2> terrain_stages =
+        scene_stages;
+    terrain_stages[0].module = terrain_vertex_module;
+    VkGraphicsPipelineCreateInfo terrain_pipeline_info = pipeline_info;
+    terrain_pipeline_info.stageCount =
+        static_cast<std::uint32_t>(terrain_stages.size());
+    terrain_pipeline_info.pStages = terrain_stages.data();
+    terrain_pipeline_info.pVertexInputState = &terrain_vertex_input;
+    terrain_pipeline_info.pInputAssemblyState = &terrain_input_assembly;
+    VK_CHECK(vkCreateGraphicsPipelines(
+        context_->device(),
+        pipeline_cache_,
+        1,
+        &terrain_pipeline_info,
+        nullptr,
+        &terrain_pipeline_));
+    context_->set_debug_name(
+        VK_OBJECT_TYPE_PIPELINE,
+        handle_value(terrain_pipeline_),
+        "indexed heightfield graphics pipeline");
+    vkDestroyShaderModule(
+        context_->device(), terrain_vertex_module, nullptr);
     vkDestroyShaderModule(
         context_->device(), scene_fragment_module, nullptr);
     vkDestroyShaderModule(
@@ -2041,6 +2245,8 @@ void Renderer::create_pipeline() {
          &aa_color_blend](
             const std::filesystem::path& vertex_path,
             const std::filesystem::path& fragment_path,
+            const VkPipelineVertexInputStateCreateInfo& vertex_input_state,
+            const VkPipelineInputAssemblyStateCreateInfo& input_assembly_state,
             const char* const debug_name) {
             const VkShaderModule vertex = load_shader(vertex_path);
             const VkShaderModule fragment = load_shader(fragment_path);
@@ -2065,6 +2271,8 @@ void Renderer::create_pipeline() {
             info.stageCount =
                 static_cast<std::uint32_t>(shader_stages.size());
             info.pStages = shader_stages.data();
+            info.pVertexInputState = &vertex_input_state;
+            info.pInputAssemblyState = &input_assembly_state;
             info.pColorBlendState = &aa_color_blend;
             VkPipeline result = VK_NULL_HANDLE;
             VK_CHECK(vkCreateGraphicsPipelines(
@@ -2087,11 +2295,21 @@ void Renderer::create_pipeline() {
     aa_pipeline_ = create_aa_geometry_pipeline(
         "cube_aa.vert.spv",
         "cube_aa.frag.spv",
+        vertex_input,
+        input_assembly,
         "AA instancing graphics pipeline");
     aa_scene_pipeline_ = create_aa_geometry_pipeline(
         "scene_aa.vert.spv",
         "scene_aa.frag.spv",
+        vertex_input,
+        input_assembly,
         "AA shadowed scene graphics pipeline");
+    aa_terrain_pipeline_ = create_aa_geometry_pipeline(
+        "terrain_aa.vert.spv",
+        "scene_aa.frag.spv",
+        terrain_vertex_input,
+        terrain_input_assembly,
+        "AA indexed heightfield graphics pipeline");
 
     const VkShaderModule sky_vertex_module = load_shader("sky.vert.spv");
     const VkShaderModule sky_fragment_module = load_shader("sky.frag.spv");
@@ -2168,14 +2386,6 @@ void Renderer::create_pipeline() {
     if (shadow_map_format_ == VK_FORMAT_UNDEFINED) {
         fatal("Shadow-map format was not selected before pipeline creation.");
     }
-    const VkShaderModule shadow_vertex_module =
-        load_shader("shadow.vert.spv");
-    const VkPipelineShaderStageCreateInfo shadow_stage{
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        .stage = VK_SHADER_STAGE_VERTEX_BIT,
-        .module = shadow_vertex_module,
-        .pName = "main",
-    };
     VkPipelineRasterizationStateCreateInfo shadow_rasterization =
         rasterization;
     shadow_rasterization.depthBiasEnable = VK_TRUE;
@@ -2193,28 +2403,39 @@ void Renderer::create_pipeline() {
         .depthAttachmentFormat = shadow_map_format_,
     };
     VkPipelineVertexInputStateCreateInfo shadow_vertex_input =
-        vertex_input;
+        terrain_vertex_input;
     shadow_vertex_input.vertexAttributeDescriptionCount = 1;
     VkGraphicsPipelineCreateInfo shadow_pipeline_info = pipeline_info;
     shadow_pipeline_info.pNext = &shadow_rendering_info;
     shadow_pipeline_info.stageCount = 1;
-    shadow_pipeline_info.pStages = &shadow_stage;
     shadow_pipeline_info.pVertexInputState = &shadow_vertex_input;
+    shadow_pipeline_info.pInputAssemblyState = &terrain_input_assembly;
     shadow_pipeline_info.pRasterizationState = &shadow_rasterization;
     shadow_pipeline_info.pColorBlendState = &shadow_color_blend;
+    const VkShaderModule terrain_shadow_vertex_module =
+        load_shader("terrain_shadow.vert.spv");
+    const VkPipelineShaderStageCreateInfo terrain_shadow_stage{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = VK_SHADER_STAGE_VERTEX_BIT,
+        .module = terrain_shadow_vertex_module,
+        .pName = "main",
+    };
+    VkGraphicsPipelineCreateInfo terrain_shadow_pipeline_info =
+        shadow_pipeline_info;
+    terrain_shadow_pipeline_info.pStages = &terrain_shadow_stage;
     VK_CHECK(vkCreateGraphicsPipelines(
         context_->device(),
         pipeline_cache_,
         1,
-        &shadow_pipeline_info,
+        &terrain_shadow_pipeline_info,
         nullptr,
-        &shadow_pipeline_));
+        &terrain_shadow_pipeline_));
     context_->set_debug_name(
         VK_OBJECT_TYPE_PIPELINE,
-        handle_value(shadow_pipeline_),
-        "sun shadow depth pipeline");
+        handle_value(terrain_shadow_pipeline_),
+        "indexed heightfield shadow pipeline");
     vkDestroyShaderModule(
-        context_->device(), shadow_vertex_module, nullptr);
+        context_->device(), terrain_shadow_vertex_module, nullptr);
 
     const VkShaderModule fullscreen_vertex_module =
         load_shader("fullscreen.vert.spv");
@@ -2478,6 +2699,11 @@ void Renderer::destroy_pipeline() noexcept {
             context_->device(), aa_scene_pipeline_, nullptr);
         aa_scene_pipeline_ = VK_NULL_HANDLE;
     }
+    if (aa_terrain_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(
+            context_->device(), aa_terrain_pipeline_, nullptr);
+        aa_terrain_pipeline_ = VK_NULL_HANDLE;
+    }
     if (aa_pipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(context_->device(), aa_pipeline_, nullptr);
         aa_pipeline_ = VK_NULL_HANDLE;
@@ -2486,13 +2712,18 @@ void Renderer::destroy_pipeline() noexcept {
         vkDestroyPipeline(context_->device(), sky_pipeline_, nullptr);
         sky_pipeline_ = VK_NULL_HANDLE;
     }
-    if (shadow_pipeline_ != VK_NULL_HANDLE) {
-        vkDestroyPipeline(context_->device(), shadow_pipeline_, nullptr);
-        shadow_pipeline_ = VK_NULL_HANDLE;
+    if (terrain_shadow_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(
+            context_->device(), terrain_shadow_pipeline_, nullptr);
+        terrain_shadow_pipeline_ = VK_NULL_HANDLE;
     }
     if (scene_pipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(context_->device(), scene_pipeline_, nullptr);
         scene_pipeline_ = VK_NULL_HANDLE;
+    }
+    if (terrain_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(context_->device(), terrain_pipeline_, nullptr);
+        terrain_pipeline_ = VK_NULL_HANDLE;
     }
     if (pipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(context_->device(), pipeline_, nullptr);
@@ -2936,6 +3167,7 @@ void Renderer::record_commands(
             const VkExtent2D extent,
             const VkPipeline cube_pipeline,
             const VkPipeline scene_pipeline,
+            const VkPipeline terrain_pipeline,
             const VkPipeline sky_pipeline) {
             set_viewport(extent);
             const VkDescriptorSet descriptor_set = frame.descriptor_set;
@@ -2990,13 +3222,30 @@ void Renderer::record_commands(
                     plane_first_index,
                     plane_vertex_offset,
                     scene_instance_base_);
+                vkCmdBindPipeline(
+                    command_buffer,
+                    VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    terrain_pipeline);
+                const VkBuffer terrain_vertex_buffer =
+                    terrain_vertex_buffer_.handle();
+                vkCmdBindVertexBuffers(
+                    command_buffer,
+                    0,
+                    1,
+                    &terrain_vertex_buffer,
+                    &vertex_offset);
+                vkCmdBindIndexBuffer(
+                    command_buffer,
+                    terrain_index_buffer_.handle(),
+                    0,
+                    VK_INDEX_TYPE_UINT32);
                 vkCmdDrawIndexed(
                     command_buffer,
-                    cube_index_count,
-                    scene_block_count,
+                    terrain_index_count,
+                    1,
                     0,
                     0,
-                    scene_instance_base_ + 1U);
+                    0);
             }
             if (mode_ != RunMode::instancing) {
                 // The triangle sits at depth 1.0 and is drawn last.
@@ -3144,6 +3393,7 @@ void Renderer::record_commands(
             display_extent,
             pipeline_,
             scene_pipeline_,
+            terrain_pipeline_,
             sky_pipeline_);
         if (frame.timestamp_queries != VK_NULL_HANDLE) {
             vkCmdWriteTimestamp2(
@@ -3266,6 +3516,7 @@ void Renderer::record_commands(
             current_render_extent_,
             aa_pipeline_,
             aa_scene_pipeline_,
+            aa_terrain_pipeline_,
             aa_sky_pipeline_);
         vkCmdEndRendering(command_buffer);
         if (frame.timestamp_queries != VK_NULL_HANDLE) {
@@ -3660,7 +3911,7 @@ void Renderer::set_vsync(const bool enabled) {
 std::uint32_t Renderer::instance_count() const noexcept {
     return mode_ == RunMode::instancing
         ? instancing_count_
-        : scene_instance_count;
+        : scene_object_count;
 }
 
 std::uint64_t Renderer::triangle_count() const noexcept {
@@ -3668,10 +3919,7 @@ std::uint64_t Renderer::triangle_count() const noexcept {
         return static_cast<std::uint64_t>(cube_triangle_count) *
                instancing_count_;
     }
-    return sky_triangle_count +
-           plane_triangle_count +
-           static_cast<std::uint64_t>(cube_triangle_count) *
-               scene_block_count;
+    return scene_triangle_count;
 }
 
 void Renderer::set_mode(const RunMode mode) noexcept {
