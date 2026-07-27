@@ -45,6 +45,17 @@ bool close_to(const double value, const double expected, const double epsilon) {
 
 int main() {
     {
+        const char* arguments[]{"vulkan_cube"};
+        const auto parsed = vcr::parse_cli_options(
+            static_cast<int>(std::size(arguments)), arguments);
+        expect(
+            static_cast<bool>(parsed) &&
+                parsed.options.width == 2560 &&
+                parsed.options.height == 1440,
+            "default drawable resolution is QHD");
+    }
+
+    {
         vcr::PbrMaterial material{
             .base_color = glm::vec4(
                 -1.0F,
