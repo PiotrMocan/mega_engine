@@ -1,6 +1,7 @@
 #pragma once
 
 #include "asset_browser.hpp"
+#include "editor_ui_kit.hpp"
 #include "fly_camera.hpp"
 #include "performance_metrics.hpp"
 #include "scene_document.hpp"
@@ -106,7 +107,6 @@ private:
     void shutdown_vulkan_backend() noexcept;
     void register_scene_texture(Renderer& renderer);
     void unregister_scene_texture() noexcept;
-    void apply_nuklear_inspired_style();
     void build_main_menu(SceneDocument& scene);
     void build_toolbar(SceneDocument& scene);
     void build_hierarchy(SceneDocument& scene);
@@ -173,6 +173,7 @@ private:
     bool vulkan_backend_initialized_ = false;
     bool platform_windows_enabled_ = false;
     bool default_layout_initialized_ = false;
+    bool reset_layout_requested_ = false;
     bool wants_quit_ = false;
     bool quit_requested_ = false;
     bool quit_confirmation_requested_ = false;
@@ -227,6 +228,7 @@ private:
     std::uint64_t saved_content_revision_ = 0U;
     std::uint64_t saved_structure_revision_ = 0U;
     bool asset_import_enabled_ = false;
+    EditorUiKit ui_kit_{};
 };
 
 } // namespace vcr

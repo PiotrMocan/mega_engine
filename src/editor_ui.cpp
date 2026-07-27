@@ -314,6 +314,38 @@ void check_imgui_vk_result(const VkResult result) {
     return "UNKNOWN";
 }
 
+[[nodiscard]] EditorIcon node_icon(
+    const SceneNodeKind kind) noexcept {
+    switch (kind) {
+    case SceneNodeKind::folder: return EditorIcon::folder;
+    case SceneNodeKind::cube: return EditorIcon::cube;
+    case SceneNodeKind::model: return EditorIcon::model;
+    case SceneNodeKind::ground: return EditorIcon::ground;
+    case SceneNodeKind::terrain: return EditorIcon::terrain;
+    case SceneNodeKind::camera: return EditorIcon::camera;
+    case SceneNodeKind::directional_light:
+        return EditorIcon::light;
+    case SceneNodeKind::environment:
+        return EditorIcon::environment;
+    }
+    return EditorIcon::cube;
+}
+
+[[nodiscard]] EditorIcon asset_icon(
+    const AssetEntryKind kind) noexcept {
+    switch (kind) {
+    case AssetEntryKind::directory: return EditorIcon::folder;
+    case AssetEntryKind::model: return EditorIcon::model;
+    case AssetEntryKind::material: return EditorIcon::material;
+    case AssetEntryKind::image: return EditorIcon::environment;
+    case AssetEntryKind::shader: return EditorIcon::renderer;
+    case AssetEntryKind::scene: return EditorIcon::cube;
+    case AssetEntryKind::binary: return EditorIcon::import_asset;
+    case AssetEntryKind::other: return EditorIcon::import_asset;
+    }
+    return EditorIcon::import_asset;
+}
+
 struct AssetRootLocation {
     std::filesystem::path path{};
     bool project_owned = false;
@@ -1094,7 +1126,7 @@ void EditorUi::initialize(
     if (platform_windows_enabled_) {
         io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
     }
-    apply_nuklear_inspired_style();
+    ui_kit_.initialize();
 
     if (!ImGui_ImplSDL3_InitForVulkan(main_window)) {
         fatal("Unable to initialize Dear ImGui SDL3 backend.");
@@ -1144,6 +1176,7 @@ void EditorUi::shutdown() noexcept {
     unregister_scene_texture();
     shutdown_vulkan_backend();
     ImGui_ImplSDL3_Shutdown();
+    ui_kit_.shutdown();
     ImGui::DestroyContext();
     context_ = nullptr;
     main_window_ = nullptr;
@@ -1155,6 +1188,7 @@ void EditorUi::shutdown() noexcept {
     known_swapchain_image_count_ = 0U;
     platform_windows_enabled_ = false;
     default_layout_initialized_ = false;
+    reset_layout_requested_ = false;
     wants_quit_ = false;
     quit_requested_ = false;
     quit_confirmation_requested_ = false;
@@ -1350,10 +1384,12 @@ void EditorUi::begin_frame(
         ImGui::GetMainViewport();
     const ImGuiID dockspace_id = ImGui::DockSpaceOverViewport(
         0U, ImGui::GetMainViewport(), dock_flags);
-    if (!default_layout_initialized_) {
+    if (!default_layout_initialized_ ||
+        reset_layout_requested_) {
         ImGuiDockNode* const node =
             ImGui::DockBuilderGetNode(dockspace_id);
-        if (node != nullptr && node->IsEmpty()) {
+        if (node != nullptr &&
+            (node->IsEmpty() || reset_layout_requested_)) {
             ImGui::DockBuilderRemoveNode(dockspace_id);
             ImGui::DockBuilderAddNode(
                 dockspace_id,
@@ -1369,27 +1405,35 @@ void EditorUi::begin_frame(
             ImGui::DockBuilderSplitNode(
                 center,
                 ImGuiDir_Left,
-                0.20F,
+                0.22F,
                 &left,
                 &center);
             ImGui::DockBuilderSplitNode(
                 center,
                 ImGuiDir_Right,
-                0.24F,
+                0.32F,
                 &right,
                 &center);
             ImGui::DockBuilderSplitNode(
                 center,
                 ImGuiDir_Down,
-                0.28F,
+                0.30F,
                 &bottom,
                 &center);
             ImGui::DockBuilderSplitNode(
                 center,
                 ImGuiDir_Up,
-                0.09F,
+                0.11F,
                 &top,
                 &center);
+            if (ImGuiDockNode* const toolbar_node =
+                    ImGui::DockBuilderGetNode(top);
+                toolbar_node != nullptr) {
+                toolbar_node->LocalFlags |=
+                    ImGuiDockNodeFlags_NoTabBar |
+                    ImGuiDockNodeFlags_NoWindowMenuButton |
+                    ImGuiDockNodeFlags_NoCloseButton;
+            }
             ImGui::DockBuilderDockWindow("Toolbar", top);
             ImGui::DockBuilderDockWindow(
                 "Scene Hierarchy", left);
@@ -1401,6 +1445,7 @@ void EditorUi::begin_frame(
             ImGui::DockBuilderFinish(dockspace_id);
         }
         default_layout_initialized_ = true;
+        reset_layout_requested_ = false;
     }
     build_main_menu(scene);
     build_toolbar(scene);
@@ -1514,66 +1559,6 @@ void EditorUi::unregister_scene_texture() noexcept {
     scene_texture_ = VK_NULL_HANDLE;
 }
 
-void EditorUi::apply_nuklear_inspired_style() {
-    ImGui::StyleColorsDark();
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowRounding = 1.0F;
-    style.ChildRounding = 1.0F;
-    style.FrameRounding = 2.0F;
-    style.PopupRounding = 2.0F;
-    style.ScrollbarRounding = 2.0F;
-    style.GrabRounding = 2.0F;
-    style.TabRounding = 1.0F;
-    style.WindowBorderSize = 1.0F;
-    style.ChildBorderSize = 1.0F;
-    style.FrameBorderSize = 0.0F;
-    style.WindowPadding = ImVec2(8.0F, 8.0F);
-    style.FramePadding = ImVec2(7.0F, 4.0F);
-    style.ItemSpacing = ImVec2(7.0F, 5.0F);
-    style.IndentSpacing = 16.0F;
-    style.Colors[ImGuiCol_WindowBg] =
-        ImVec4(0.075F, 0.085F, 0.105F, 1.0F);
-    style.Colors[ImGuiCol_ChildBg] =
-        ImVec4(0.065F, 0.075F, 0.095F, 1.0F);
-    style.Colors[ImGuiCol_PopupBg] =
-        ImVec4(0.055F, 0.065F, 0.08F, 0.98F);
-    style.Colors[ImGuiCol_Border] =
-        ImVec4(0.19F, 0.23F, 0.27F, 1.0F);
-    style.Colors[ImGuiCol_FrameBg] =
-        ImVec4(0.11F, 0.13F, 0.16F, 1.0F);
-    style.Colors[ImGuiCol_FrameBgHovered] =
-        ImVec4(0.16F, 0.22F, 0.25F, 1.0F);
-    style.Colors[ImGuiCol_FrameBgActive] =
-        ImVec4(0.13F, 0.30F, 0.31F, 1.0F);
-    style.Colors[ImGuiCol_TitleBg] =
-        ImVec4(0.055F, 0.065F, 0.08F, 1.0F);
-    style.Colors[ImGuiCol_TitleBgActive] =
-        ImVec4(0.08F, 0.11F, 0.13F, 1.0F);
-    style.Colors[ImGuiCol_Header] =
-        ImVec4(0.10F, 0.25F, 0.27F, 1.0F);
-    style.Colors[ImGuiCol_HeaderHovered] =
-        ImVec4(0.12F, 0.40F, 0.40F, 1.0F);
-    style.Colors[ImGuiCol_HeaderActive] =
-        ImVec4(0.10F, 0.52F, 0.49F, 1.0F);
-    style.Colors[ImGuiCol_Button] =
-        ImVec4(0.10F, 0.22F, 0.24F, 1.0F);
-    style.Colors[ImGuiCol_ButtonHovered] =
-        ImVec4(0.11F, 0.43F, 0.42F, 1.0F);
-    style.Colors[ImGuiCol_ButtonActive] =
-        ImVec4(0.08F, 0.56F, 0.52F, 1.0F);
-    style.Colors[ImGuiCol_CheckMark] =
-        ImVec4(0.28F, 0.93F, 0.82F, 1.0F);
-    style.Colors[ImGuiCol_SliderGrab] =
-        ImVec4(0.18F, 0.73F, 0.67F, 1.0F);
-    style.Colors[ImGuiCol_TabSelected] =
-        ImVec4(0.10F, 0.30F, 0.31F, 1.0F);
-    if ((ImGui::GetIO().ConfigFlags &
-         ImGuiConfigFlags_ViewportsEnable) != 0) {
-        style.WindowRounding = 0.0F;
-        style.Colors[ImGuiCol_WindowBg].w = 1.0F;
-    }
-}
-
 void EditorUi::build_main_menu(SceneDocument& scene) {
     if (!ImGui::BeginMainMenuBar()) {
         return;
@@ -1674,6 +1659,10 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
                 }
             }
         }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Reset editor layout")) {
+            reset_layout_requested_ = true;
+        }
         ImGui::EndMenu();
     }
     ImGui::EndMainMenuBar();
@@ -1681,7 +1670,7 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
 
 void EditorUi::build_toolbar(SceneDocument& scene) {
     ImGui::SetNextWindowSize(
-        ImVec2(540.0F, 56.0F), ImGuiCond_FirstUseEver);
+        ImVec2(840.0F, 66.0F), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin(
             "Toolbar",
             nullptr,
@@ -1690,61 +1679,121 @@ void EditorUi::build_toolbar(SceneDocument& scene) {
         ImGui::End();
         return;
     }
+
+    ui_kit_.brand_lockup();
+    ImGui::SameLine(0.0F, 15.0F);
+    ImGui::AlignTextToFramePadding();
+
+    const bool editable = play_state_ == EditorPlayState::edit;
+    if (ui_kit_.icon_button(
+            "SaveScene",
+            EditorIcon::save,
+            editable
+                ? "Save scene  Ctrl+S"
+                : "Scene editing is locked during Play",
+            EditorButtonStyle::quiet,
+            editable)) {
+        save_requested_ = true;
+    }
+    ImGui::SameLine(0.0F, 5.0F);
+    const bool can_import =
+        editable &&
+        !import_activity_pending() &&
+        asset_import_enabled_ &&
+        import_worker_ != nullptr &&
+        !import_worker_->failed();
+    if (ui_kit_.icon_button(
+            "ImportAssets",
+            EditorIcon::import_asset,
+            can_import
+                ? "Import assets  Ctrl+I"
+                : "Asset import is currently unavailable",
+            EditorButtonStyle::quiet,
+            can_import)) {
+        import_dialog_requested_ = true;
+    }
+    ImGui::SameLine(0.0F, 12.0F);
+
     if (play_state_ == EditorPlayState::edit) {
-        ImGui::BeginDisabled(import_activity_pending());
-        if (ImGui::Button("Play")) {
+        const bool can_play = !import_activity_pending();
+        if (ui_kit_.action_button(
+                "Play",
+                EditorIcon::play,
+                "Play",
+                EditorButtonStyle::primary,
+                can_play)) {
             start_play(scene);
         }
-        ImGui::EndDisabled();
-        if (import_activity_pending() &&
+        if (!can_play &&
             ImGui::IsItemHovered(
                 ImGuiHoveredFlags_AllowWhenDisabled)) {
             ImGui::SetTooltip(
                 "Close or finish asset import before Play.");
         }
     } else {
-        if (ImGui::Button("Stop")) {
+        if (ui_kit_.action_button(
+                "Stop",
+                EditorIcon::stop,
+                "Stop",
+                EditorButtonStyle::primary)) {
             stop_play(scene);
         }
         ImGui::SameLine();
         if (play_state_ == EditorPlayState::playing) {
-            if (ImGui::Button("Pause")) {
+            if (ui_kit_.action_button(
+                    "Pause",
+                    EditorIcon::pause,
+                    "Pause")) {
                 play_state_ = EditorPlayState::paused;
             }
-        } else if (ImGui::Button("Resume")) {
-            play_state_ = EditorPlayState::playing;
+        } else {
+            if (ui_kit_.action_button(
+                    "Resume",
+                    EditorIcon::resume,
+                    "Resume",
+                    EditorButtonStyle::secondary,
+                    true,
+                    true)) {
+                play_state_ = EditorPlayState::playing;
+            }
         }
     }
     ImGui::SameLine();
     const bool can_open_external =
         platform_windows_enabled_ &&
         play_state_ != EditorPlayState::edit;
-    ImGui::BeginDisabled(!can_open_external);
-    if (ImGui::Button(
+    if (ui_kit_.icon_button(
+            "ExternalGameWindow",
+            EditorIcon::external_window,
             external_game_window_open_
-                ? "Close game window"
-                : "Game in separate window")) {
+                ? "Close separate game window  F6"
+                : "Open game in a separate window  F6",
+            EditorButtonStyle::secondary,
+            can_open_external,
+            external_game_window_open_)) {
         external_game_window_open_ =
             !external_game_window_open_;
     }
-    ImGui::EndDisabled();
     if (!platform_windows_enabled_ &&
         ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
         ImGui::SetTooltip(
             "Separate platform windows require a shared graphics/present "
             "queue and a supported desktop backend.");
     }
-    ImGui::SameLine();
-    ImGui::TextDisabled(
-        "[%s] F5 Play/Stop | F6 separate window",
-        play_state_name(play_state_));
-    ImGui::SameLine();
-    ImGui::TextDisabled(
-        "| %s%s",
-        scene_is_dirty(scene) ? "* " : "",
-        scene_path_.empty()
-            ? "scene path unavailable"
-            : scene_file_name_.c_str());
+
+    ImGui::SameLine(0.0F, 14.0F);
+    ui_kit_.badge(
+        play_state_name(play_state_),
+        play_state_ == EditorPlayState::edit
+            ? EditorTone::neutral
+            : play_state_ == EditorPlayState::playing
+            ? EditorTone::success
+            : EditorTone::warning);
+    ImGui::SameLine(0.0F, 6.0F);
+    const bool dirty = scene_is_dirty(scene);
+    ui_kit_.badge(
+        dirty ? "UNSAVED" : "SAVED",
+        dirty ? EditorTone::warning : EditorTone::success);
     if (!scene_file_status_.empty() &&
         ImGui::IsItemHovered()) {
         ImGui::SetTooltip("%s", scene_file_status_.c_str());
@@ -1759,9 +1808,14 @@ void EditorUi::build_hierarchy(SceneDocument& scene) {
         ImGui::End();
         return;
     }
+    ui_kit_.panel_header(
+        EditorIcon::folder,
+        "SCENE HIERARCHY",
+        "Objects, collections and visibility");
     ImGui::SetNextItemWidth(-1.0F);
-    static_cast<void>(ImGui::InputText(
+    static_cast<void>(ImGui::InputTextWithHint(
         "##HierarchyFilter",
+        "Search objects...",
         hierarchy_filter_.data(),
         hierarchy_filter_.size()));
     const bool filter_changed =
@@ -1789,27 +1843,23 @@ void EditorUi::build_hierarchy(SceneDocument& scene) {
             SceneNode& node = node_reference->get();
             ImGui::PushID(static_cast<int>(row.id.index));
             ImGui::PushID(static_cast<int>(row.id.generation));
-            const float indent =
-                static_cast<float>(
-                    std::min(row.depth, 32U)) *
-                ImGui::GetStyle().IndentSpacing;
-            ImGui::SetCursorPosX(
-                ImGui::GetCursorPosX() + indent);
-            if (row.has_children && hierarchy_filter_[0] == '\0') {
-                if (ImGui::SmallButton(node.expanded ? "v" : ">")) {
-                    scene.set_expanded(row.id, !node.expanded);
-                }
-            } else {
-                ImGui::Dummy(ImVec2(
-                    ImGui::GetFrameHeight(), 1.0F));
-            }
-            ImGui::SameLine();
             const bool selected = selected_node_ == row.id;
-            if (ImGui::Selectable(
+            const EditorTreeRowResult row_result =
+                ui_kit_.hierarchy_row(
+                    "Node",
+                    node_icon(node.kind),
                     node.name.c_str(),
+                    row.depth,
+                    row.has_children &&
+                        hierarchy_filter_[0] == '\0',
+                    node.expanded,
                     selected,
-                    ImGuiSelectableFlags_AllowDoubleClick)) {
+                    node.visible);
+            if (row_result.selected) {
                 selected_node_ = row.id;
+            }
+            if (row_result.expansion_toggled) {
+                scene.set_expanded(row.id, !node.expanded);
             }
             if (ImGui::BeginDragDropSource()) {
                 ImGui::SetDragDropPayload(
@@ -1883,10 +1933,14 @@ void EditorUi::build_hierarchy(SceneDocument& scene) {
         !ImGui::IsPopupOpen("Delete subtree?")) {
         delete_confirmation_ = {};
     }
-    ImGui::TextDisabled(
-        "%u objects, %zu visible rows",
+    char hierarchy_status[96]{};
+    std::snprintf(
+        hierarchy_status,
+        sizeof(hierarchy_status),
+        "%u OBJECTS  /  %zu VISIBLE",
         scene.size(),
         hierarchy_rows_.size());
+    ui_kit_.badge(hierarchy_status, EditorTone::neutral);
     ImGui::End();
 }
 
@@ -1899,11 +1953,23 @@ void EditorUi::build_inspector(SceneDocument& scene) {
     }
     const auto selected = scene.node(selected_node_);
     if (!selected) {
-        ImGui::TextDisabled("Select an object in the hierarchy.");
+        ui_kit_.panel_header(
+            EditorIcon::eye,
+            "INSPECTOR",
+            "Properties and components");
+        ui_kit_.empty_state(
+            EditorIcon::cube,
+            "Nothing selected",
+            "Choose an object in Scene Hierarchy");
         ImGui::End();
         return;
     }
     SceneNode& node = selected->get();
+    ui_kit_.panel_header(
+        node_icon(node.kind),
+        node.name.c_str(),
+        to_string(node.kind).data());
+
     const bool editable = play_state_ == EditorPlayState::edit;
     ImGui::BeginDisabled(!editable);
     if (name_buffer_node_ != selected_node_) {
@@ -1916,59 +1982,101 @@ void EditorUi::build_inspector(SceneDocument& scene) {
             copy_size);
         name_buffer_node_ = selected_node_;
     }
-    if (ImGui::InputText(
-            "Name",
-            selected_name_buffer_.data(),
-            selected_name_buffer_.size())) {
-        static_cast<void>(scene.rename_node(
-            selected_node_, selected_name_buffer_.data()));
-        hierarchy_revision_ = 0U;
-    }
-    ImGui::Text("Type: %s", to_string(node.kind).data());
     bool changed = false;
-    changed |= ImGui::Checkbox("Visible", &node.visible);
+    if (ui_kit_.begin_property_grid("IdentityProperties")) {
+        ui_kit_.property_row("Name");
+        if (ImGui::InputText(
+                "##Name",
+                selected_name_buffer_.data(),
+                selected_name_buffer_.size())) {
+            static_cast<void>(scene.rename_node(
+                selected_node_, selected_name_buffer_.data()));
+            hierarchy_revision_ = 0U;
+        }
+        ui_kit_.property_row("Type");
+        ui_kit_.badge(
+            to_string(node.kind).data(),
+            EditorTone::info);
+        ui_kit_.property_row("Visible");
+        changed |= ImGui::Checkbox(
+            "##Visible",
+            &node.visible);
+        ImGui::SameLine();
+        ImGui::TextDisabled(
+            node.visible ? "Rendered" : "Hidden");
+        if (node.kind == SceneNodeKind::model) {
+            ui_kit_.property_row("Asset");
+            ImGui::TextWrapped("%s", node.asset_path.c_str());
+        }
+        ui_kit_.end_property_grid();
+    }
+
     const bool has_transform =
         node.kind == SceneNodeKind::folder ||
         node.kind == SceneNodeKind::cube ||
         node.kind == SceneNodeKind::model ||
         node.kind == SceneNodeKind::ground;
-    if (node.kind == SceneNodeKind::model) {
-        ImGui::TextWrapped(
-            "Asset: %s", node.asset_path.c_str());
-    }
     if (has_transform) {
-        changed |= ImGui::DragFloat3(
-            "Position",
-            &node.transform.translation.x,
-            0.05F);
-        changed |= ImGui::DragFloat3(
-            "Rotation",
-            &node.transform.rotation_degrees.x,
-            0.25F);
-        changed |= ImGui::DragFloat3(
-            "Scale",
-            &node.transform.scale.x,
-            0.02F,
-            0.0001F,
-            1000.0F);
+        ui_kit_.section_header(
+            EditorIcon::cube,
+            "Transform");
+        if (ui_kit_.begin_property_grid("TransformProperties")) {
+            changed |= ui_kit_.drag_vec3(
+                "Position",
+                "Position",
+                &node.transform.translation.x,
+                0.05F,
+                0.0F);
+            changed |= ui_kit_.drag_vec3(
+                "Rotation",
+                "Rotation",
+                &node.transform.rotation_degrees.x,
+                0.25F,
+                0.0F);
+            changed |= ui_kit_.drag_vec3(
+                "Scale",
+                "Scale",
+                &node.transform.scale.x,
+                0.02F,
+                1.0F,
+                0.0001F,
+                1000.0F);
+            ui_kit_.end_property_grid();
+        }
     }
     if (node.kind == SceneNodeKind::cube ||
         node.kind == SceneNodeKind::ground) {
-        ImGui::SeparatorText("PBR material");
-        changed |= ImGui::ColorEdit3(
-            "Base color", &node.material.base_color.x);
-        changed |= ImGui::SliderFloat(
-            "Metallic", &node.material.metallic, 0.0F, 1.0F);
-        changed |= ImGui::SliderFloat(
-            "Roughness",
-            &node.material.roughness,
-            minimum_pbr_roughness,
-            1.0F);
-        changed |= ImGui::SliderFloat(
-            "Ambient occlusion",
-            &node.material.ambient_occlusion,
-            0.0F,
-            1.0F);
+        ui_kit_.section_header(
+            EditorIcon::material,
+            "PBR Material");
+        if (ui_kit_.begin_property_grid("MaterialProperties")) {
+            ui_kit_.property_row("Base color");
+            changed |= ImGui::ColorEdit3(
+                "##BaseColor",
+                &node.material.base_color.x);
+            ui_kit_.property_row("Metallic");
+            changed |= ImGui::SliderFloat(
+                "##Metallic",
+                &node.material.metallic,
+                0.0F,
+                1.0F,
+                "%.2f");
+            ui_kit_.property_row("Roughness");
+            changed |= ImGui::SliderFloat(
+                "##Roughness",
+                &node.material.roughness,
+                minimum_pbr_roughness,
+                1.0F,
+                "%.2f");
+            ui_kit_.property_row("Occlusion");
+            changed |= ImGui::SliderFloat(
+                "##AmbientOcclusion",
+                &node.material.ambient_occlusion,
+                0.0F,
+                1.0F,
+                "%.2f");
+            ui_kit_.end_property_grid();
+        }
     }
     if (changed) {
         constexpr float minimum_scale = 0.0001F;
@@ -1983,15 +2091,17 @@ void EditorUi::build_inspector(SceneDocument& scene) {
         scene.mark_content_changed();
     }
     if (!has_transform) {
-        ImGui::TextDisabled(
+        ui_kit_.status_text(
             node.kind == SceneNodeKind::camera
                 ? "Scene View currently uses the editor fly camera."
-                : "This component exposes visibility in this editor stage.");
+                : "This component currently exposes visibility only.",
+            EditorTone::neutral);
     }
     ImGui::EndDisabled();
     if (!editable) {
-        ImGui::TextDisabled(
-            "Authoring changes are locked during Play.");
+        ui_kit_.badge(
+            "AUTHORING LOCKED DURING PLAY",
+            EditorTone::warning);
     }
     ImGui::End();
 }
@@ -2010,10 +2120,6 @@ void EditorUi::build_viewport(
         ImGui::End();
         return;
     }
-    ImGui::TextDisabled(
-        "RMB + WASD to fly | %ux%u",
-        renderer.editor_viewport_extent().width,
-        renderer.editor_viewport_extent().height);
     const ImVec2 available = ImGui::GetContentRegionAvail();
     const float dpi = std::max(
         ImGui::GetWindowViewport()->DpiScale, 0.25F);
@@ -2031,6 +2137,51 @@ void EditorUi::build_viewport(
         available,
         ImVec2(0.0F, 0.0F),
         ImVec2(1.0F, 1.0F));
+    const ImVec2 image_minimum = ImGui::GetItemRectMin();
+    const ImVec2 image_maximum = ImGui::GetItemRectMax();
+    ImGui::GetWindowDrawList()->AddRect(
+        image_minimum,
+        image_maximum,
+        ImGui::ColorConvertFloat4ToU32(
+            EditorUiKit::border_color()),
+        3.0F,
+        0,
+        1.0F);
+    ui_kit_.viewport_badge(
+        ImVec2(
+            image_minimum.x + 10.0F,
+            image_minimum.y + 10.0F),
+        play_state_ == EditorPlayState::edit
+            ? "EDIT CAMERA"
+            : play_state_ == EditorPlayState::playing
+            ? "GAME RUNNING"
+            : "GAME PAUSED",
+        play_state_ == EditorPlayState::edit
+            ? EditorTone::info
+            : play_state_ == EditorPlayState::playing
+            ? EditorTone::success
+            : EditorTone::warning);
+    char resolution_label[64]{};
+    std::snprintf(
+        resolution_label,
+        sizeof(resolution_label),
+        "%u x %u",
+        renderer.editor_viewport_extent().width,
+        renderer.editor_viewport_extent().height);
+    const ImVec2 resolution_size =
+        ImGui::CalcTextSize(resolution_label);
+    ui_kit_.viewport_badge(
+        ImVec2(
+            image_maximum.x - resolution_size.x - 39.0F,
+            image_minimum.y + 10.0F),
+        resolution_label,
+        EditorTone::neutral);
+    ui_kit_.viewport_badge(
+        ImVec2(
+            image_minimum.x + 10.0F,
+            image_maximum.y - 34.0F),
+        "RMB + WASD  /  SHIFT BOOST",
+        EditorTone::purple);
     viewport_hovered_ = ImGui::IsItemHovered();
     if (ImGui::BeginDragDropTarget()) {
         if (const ImGuiPayload* payload =
@@ -2130,13 +2281,19 @@ void EditorUi::build_assets(
         ImGui::End();
         return;
     }
-    if (ImGui::Button("Up")) {
+    if (ui_kit_.icon_button(
+            "AssetsUp",
+            EditorIcon::folder,
+            "Go to parent folder")) {
         if (asset_browser_.navigate_up(asset_error_)) {
             selected_asset_.reset();
         }
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Refresh")) {
+    ImGui::SameLine(0.0F, 5.0F);
+    if (ui_kit_.icon_button(
+            "AssetsRefresh",
+            EditorIcon::refresh,
+            "Refresh current folder")) {
         if (asset_browser_.refresh(asset_error_)) {
             selected_asset_.reset();
         }
@@ -2148,11 +2305,14 @@ void EditorUi::build_assets(
         asset_import_enabled_ &&
         import_worker_ != nullptr &&
         !import_worker_->failed();
-    ImGui::BeginDisabled(!can_import);
-    if (ImGui::Button("Import...")) {
+    if (ui_kit_.action_button(
+            "AssetsImport",
+            EditorIcon::import_asset,
+            "Import",
+            EditorButtonStyle::secondary,
+            can_import)) {
         import_dialog_requested_ = true;
     }
-    ImGui::EndDisabled();
     if (!can_import &&
         ImGui::IsItemHovered(
             ImGuiHoveredFlags_AllowWhenDisabled)) {
@@ -2173,15 +2333,18 @@ void EditorUi::build_assets(
         play_state_ == EditorPlayState::edit &&
         selected_asset_.has_value() &&
         selected_asset_->kind == AssetEntryKind::model;
-    ImGui::BeginDisabled(!can_add_selected_model);
-    if (ImGui::Button("Add to Scene")) {
+    if (ui_kit_.action_button(
+            "AddSelectedAsset",
+            EditorIcon::add,
+            "Add to Scene",
+            EditorButtonStyle::primary,
+            can_add_selected_model)) {
         static_cast<void>(add_model_asset_to_scene(
             scene,
             renderer,
             selected_asset_->relative_display,
             selected_asset_->display_name));
     }
-    ImGui::EndDisabled();
     if (!can_add_selected_model &&
         ImGui::IsItemHovered(
             ImGuiHoveredFlags_AllowWhenDisabled)) {
@@ -2189,17 +2352,17 @@ void EditorUi::build_assets(
             "Select an imported .vcrasset.json model.");
     }
     ImGui::SameLine();
-    ImGui::TextUnformatted(
-        asset_browser_.current_directory_display().data());
+    ui_kit_.badge(
+        asset_browser_.current_directory_display().data(),
+        EditorTone::neutral);
     if (!asset_error_.empty()) {
-        ImGui::TextColored(
-            ImVec4(1.0F, 0.45F, 0.35F, 1.0F),
-            "%s",
-            asset_error_.c_str());
+        ui_kit_.status_text(
+            asset_error_.c_str(),
+            EditorTone::danger);
     }
     if (asset_browser_.truncated()) {
         ImGui::TextColored(
-            ImVec4(1.0F, 0.72F, 0.25F, 1.0F),
+            EditorUiKit::color(EditorTone::warning),
             "Directory contains more than %zu entries; "
             "the bounded view is truncated.",
             AssetBrowser::maximum_entries);
@@ -2208,7 +2371,7 @@ void EditorUi::build_assets(
     const std::size_t entry_count = entries.size();
     ImGui::BeginChild(
         "AssetList",
-        ImVec2(0.0F, -58.0F),
+        ImVec2(0.0F, -34.0F),
         ImGuiChildFlags_Borders);
     if (external_drop_ != nullptr) {
         external_drop_->minimum = ImGui::GetWindowPos();
@@ -2237,17 +2400,14 @@ void EditorUi::build_assets(
             const AssetEntry& entry =
                 entries[static_cast<std::size_t>(index)];
             ImGui::PushID(index);
-            ImGui::TextDisabled(
-                "[%s]", asset_kind_name(entry.kind));
-            ImGui::SameLine(
-                0.0F,
-                ImGui::GetStyle().ItemInnerSpacing.x);
-            const bool activated = ImGui::Selectable(
+            const bool activated = ui_kit_.asset_row(
+                    "Asset",
+                    asset_icon(entry.kind),
                     entry.display_name.c_str(),
+                    asset_kind_name(entry.kind),
                     selected_asset_ &&
                         selected_asset_->relative_path ==
-                            entry.relative_path,
-                    ImGuiSelectableFlags_AllowDoubleClick);
+                            entry.relative_path);
             if (activated) {
                 selected_asset_ = entry;
                 if (ImGui::IsMouseDoubleClicked(
@@ -2302,7 +2462,8 @@ void EditorUi::build_assets(
         ImGui::GetWindowDrawList()->AddRect(
             external_drop_->minimum,
             external_drop_->maximum,
-            IM_COL32(71, 225, 199, 255),
+            ImGui::ColorConvertFloat4ToU32(
+                EditorUiKit::color(EditorTone::primary)),
             2.0F,
             0,
             3.0F);
@@ -2322,7 +2483,8 @@ void EditorUi::build_assets(
                 center.x - text_size.x * 0.5F,
                 center.y - text_size.y * 0.5F,
             },
-            IM_COL32(122, 255, 232, 255),
+            ImGui::ColorConvertFloat4ToU32(
+                EditorUiKit::text_color()),
             message);
     }
     ImGui::EndChild();
@@ -2333,28 +2495,31 @@ void EditorUi::build_assets(
         }
         pending_asset_directory_.reset();
     }
-    if (selected_asset_) {
-        ImGui::Text(
-            "%s | %llu bytes",
-            asset_kind_name(selected_asset_->kind),
-            static_cast<unsigned long long>(
-                selected_asset_->size));
-        ImGui::SameLine();
-        ImGui::TextWrapped(
-            "%s",
-            selected_asset_->relative_display.c_str());
-    } else {
-        ImGui::TextDisabled("Select an asset to inspect its path and size.");
-    }
-    ImGui::TextDisabled(
-        "%zu entries | cache high-water %zu",
+    char asset_status[96]{};
+    std::snprintf(
+        asset_status,
+        sizeof(asset_status),
+        "%zu ITEMS  /  CACHE HIGH-WATER %zu",
         entry_count,
         asset_browser_.high_water_mark());
+    ui_kit_.badge(asset_status, EditorTone::neutral);
+    ImGui::SameLine();
+    if (selected_asset_) {
+        ui_kit_.badge(
+            asset_kind_name(selected_asset_->kind),
+            EditorTone::info);
+        ImGui::SameLine();
+        ImGui::Text(
+            "%s  /  %llu bytes",
+            selected_asset_->relative_display.c_str(),
+            static_cast<unsigned long long>(
+                selected_asset_->size));
+    } else {
+        ImGui::TextDisabled("Select an asset for details.");
+    }
     if (import_worker_ != nullptr && import_worker_->busy()) {
         ImGui::SameLine();
-        ImGui::TextColored(
-            ImVec4(0.35F, 0.9F, 0.8F, 1.0F),
-            "| Importing...");
+        ui_kit_.badge("IMPORTING", EditorTone::info);
     }
     ImGui::End();
 }
@@ -2582,19 +2747,25 @@ void EditorUi::build_import_window() {
         return;
     }
 
-    ImGui::TextUnformatted(
-        "Import FBX, OBJ, or image files into the project.");
-    ImGui::Text(
-        "Destination: /%s",
+    ui_kit_.panel_header(
+        EditorIcon::import_asset,
+        "IMPORT ASSETS",
+        "FBX, OBJ and image sources");
+    ui_kit_.badge(
         path_to_utf8(
-            import_ui_->destination_directory).c_str());
+            import_ui_->destination_directory).c_str(),
+        EditorTone::neutral);
     ImGui::SetNextItemWidth(620.0F);
-    static_cast<void>(ImGui::InputText(
-        "Source path",
+    static_cast<void>(ImGui::InputTextWithHint(
+        "##SourcePath",
+        "Absolute source path...",
         import_ui_->source_path.data(),
         import_ui_->source_path.size()));
     ImGui::SameLine();
-    if (ImGui::Button("Add")) {
+    if (ui_kit_.icon_button(
+            "AddImportSource",
+            EditorIcon::add,
+            "Add source path")) {
         const std::string_view source_text(
             import_ui_->source_path.data());
         if (source_text.empty()) {
@@ -2633,12 +2804,11 @@ void EditorUi::build_import_window() {
             import_ui_->sources[index];
         ImGui::PushID(static_cast<int>(index));
         const bool supported = asset_source_is_supported(source);
-        ImGui::TextColored(
+        ui_kit_.badge(
+            supported ? "READY" : "UNSUPPORTED",
             supported
-                ? ImVec4(0.72F, 0.86F, 0.82F, 1.0F)
-                : ImVec4(1.0F, 0.45F, 0.35F, 1.0F),
-            "%s",
-            supported ? "[ready]" : "[unsupported]");
+                ? EditorTone::success
+                : EditorTone::danger);
         ImGui::SameLine();
         ImGui::TextWrapped(
             "%s", path_to_utf8(source).c_str());
@@ -2668,8 +2838,12 @@ void EditorUi::build_import_window() {
         !import_worker_->failed() &&
         !import_worker_->busy() &&
         all_sources_supported;
-    ImGui::BeginDisabled(!can_submit);
-    if (ImGui::Button("Import")) {
+    if (ui_kit_.action_button(
+            "SubmitImport",
+            EditorIcon::import_asset,
+            "Import",
+            EditorButtonStyle::primary,
+            can_submit)) {
         AssetImportWorker::Batch batch{
             .sources = import_ui_->sources,
             .options =
@@ -2694,17 +2868,23 @@ void EditorUi::build_import_window() {
                 : "The bounded import queue is full.";
         }
     }
-    ImGui::EndDisabled();
     ImGui::SameLine();
-    if (ImGui::Button("Cancel")) {
+    if (ui_kit_.action_button(
+            "CancelImport",
+            EditorIcon::stop,
+            "Cancel",
+            EditorButtonStyle::quiet)) {
         import_ui_->sources.clear();
         import_ui_->status.clear();
         import_ui_->import_popup_open = false;
         ImGui::CloseCurrentPopup();
     }
     if (!import_ui_->status.empty()) {
-        ImGui::Separator();
-        ImGui::TextWrapped("%s", import_ui_->status.c_str());
+        ui_kit_.status_text(
+            import_ui_->status.c_str(),
+            can_submit
+                ? EditorTone::neutral
+                : EditorTone::warning);
     }
     ImGui::EndPopup();
 }
@@ -2719,7 +2899,13 @@ void EditorUi::build_import_results() {
     if (ImGui::Begin(
             "Import Results",
             &import_ui_->results_window_open)) {
-        ImGui::TextWrapped("%s", import_ui_->status.c_str());
+        ui_kit_.panel_header(
+            EditorIcon::import_asset,
+            "IMPORT RESULTS",
+            "Cooked assets and diagnostics");
+        ui_kit_.status_text(
+            import_ui_->status.c_str(),
+            EditorTone::info);
         for (std::size_t completion_index = 0U;
              completion_index < import_ui_->completions.size();
              ++completion_index) {
@@ -2735,7 +2921,7 @@ void EditorUi::build_import_results() {
                 path_to_utf8(completion.source).c_str());
             if (completion.error) {
                 ImGui::TextColored(
-                    ImVec4(1.0F, 0.45F, 0.35F, 1.0F),
+                    EditorUiKit::color(EditorTone::danger),
                     "Failed: %s",
                     completion.error->message.c_str());
                 if (!completion.error->path.empty()) {
@@ -2778,7 +2964,7 @@ void EditorUi::build_import_results() {
             for (const std::string& warning :
                  completion.result->warnings) {
                 ImGui::TextColored(
-                    ImVec4(1.0F, 0.72F, 0.25F, 1.0F),
+                    EditorUiKit::color(EditorTone::warning),
                     "Warning: %s",
                     warning.c_str());
             }
@@ -2828,45 +3014,69 @@ void EditorUi::build_material_editor() {
         ImVec2(430.0F, 520.0F), ImGuiCond_FirstUseEver);
     bool keep_open = material_editor_->open;
     if (ImGui::Begin("Material Editor", &keep_open)) {
+        ui_kit_.panel_header(
+            EditorIcon::material,
+            "MATERIAL EDITOR",
+            "PBR factors and texture references");
         if (!material_editor_->loaded) {
-            ImGui::TextDisabled(
-                "Double-click a .vcrmaterial.json asset to edit it.");
+            ui_kit_.empty_state(
+                EditorIcon::material,
+                "No material loaded",
+                "Open a material from Asset Library");
             if (!material_editor_->error.empty()) {
-                ImGui::TextColored(
-                    ImVec4(1.0F, 0.45F, 0.35F, 1.0F),
-                    "%s",
-                    material_editor_->error.c_str());
+                ui_kit_.status_text(
+                    material_editor_->error.c_str(),
+                    EditorTone::danger);
             }
         } else {
-            ImGui::TextWrapped(
+            ui_kit_.badge(
+                material_editor_->dirty ? "UNSAVED" : "SAVED",
+                material_editor_->dirty
+                    ? EditorTone::warning
+                    : EditorTone::success);
+            ImGui::SameLine();
+            ImGui::Text(
                 "%s",
                 path_to_utf8(
                     material_editor_->relative_path).c_str());
             const bool editable =
                 play_state_ == EditorPlayState::edit;
             ImGui::BeginDisabled(!editable);
-            bool changed = ImGui::InputText(
-                "Name",
-                material_editor_->name.data(),
-                material_editor_->name.size());
-            changed |= ImGui::ColorEdit4(
-                "Base color",
-                &material_editor_->material.base_color.x);
-            changed |= ImGui::SliderFloat(
-                "Metallic",
-                &material_editor_->material.metallic,
-                0.0F,
-                1.0F);
-            changed |= ImGui::SliderFloat(
-                "Roughness",
-                &material_editor_->material.roughness,
-                minimum_pbr_roughness,
-                1.0F);
-            changed |= ImGui::SliderFloat(
-                "Ambient occlusion",
-                &material_editor_->material.ambient_occlusion,
-                0.0F,
-                1.0F);
+            bool changed = false;
+            if (ui_kit_.begin_property_grid(
+                    "MaterialEditorProperties")) {
+                ui_kit_.property_row("Name");
+                changed |= ImGui::InputText(
+                    "##MaterialName",
+                    material_editor_->name.data(),
+                    material_editor_->name.size());
+                ui_kit_.property_row("Base color");
+                changed |= ImGui::ColorEdit4(
+                    "##MaterialBaseColor",
+                    &material_editor_->material.base_color.x);
+                ui_kit_.property_row("Metallic");
+                changed |= ImGui::SliderFloat(
+                    "##MaterialMetallic",
+                    &material_editor_->material.metallic,
+                    0.0F,
+                    1.0F,
+                    "%.2f");
+                ui_kit_.property_row("Roughness");
+                changed |= ImGui::SliderFloat(
+                    "##MaterialRoughness",
+                    &material_editor_->material.roughness,
+                    minimum_pbr_roughness,
+                    1.0F,
+                    "%.2f");
+                ui_kit_.property_row("Occlusion");
+                changed |= ImGui::SliderFloat(
+                    "##MaterialOcclusion",
+                    &material_editor_->material.ambient_occlusion,
+                    0.0F,
+                    1.0F,
+                    "%.2f");
+                ui_kit_.end_property_grid();
+            }
             if (changed) {
                 material_editor_->material =
                     sanitize_pbr_material(
@@ -2876,7 +3086,11 @@ void EditorUi::build_material_editor() {
                     "Unsaved material changes.";
             }
 
-            if (ImGui::Button("Save")) {
+            if (ui_kit_.action_button(
+                    "SaveMaterial",
+                    EditorIcon::save,
+                    "Save",
+                    EditorButtonStyle::primary)) {
                 std::string error;
                 if (!save_material_document(
                         *material_editor_,
@@ -2896,7 +3110,11 @@ void EditorUi::build_material_editor() {
                 }
             }
             ImGui::SameLine();
-            if (ImGui::Button("Revert")) {
+            if (ui_kit_.action_button(
+                    "RevertMaterial",
+                    EditorIcon::revert,
+                    "Revert",
+                    EditorButtonStyle::secondary)) {
                 const std::filesystem::path relative =
                     material_editor_->relative_path;
                 std::string error;
@@ -2911,37 +3129,46 @@ void EditorUi::build_material_editor() {
             }
             ImGui::EndDisabled();
             if (!editable) {
-                ImGui::TextDisabled(
-                    "Material editing is locked during Play.");
+                ui_kit_.badge(
+                    "LOCKED DURING PLAY",
+                    EditorTone::warning);
             }
 
-            ImGui::SeparatorText("Texture references");
+            ui_kit_.section_header(
+                EditorIcon::environment,
+                "Texture References");
             const nlohmann::json& textures =
                 material_editor_->document.at("textures");
             if (textures.empty()) {
-                ImGui::TextDisabled("No texture references.");
+                ui_kit_.empty_state(
+                    EditorIcon::environment,
+                    "No textures",
+                    "This material uses factors only");
             } else {
                 for (const auto& [semantic, reference] :
                      textures.items()) {
-                    ImGui::Text(
-                        "%s:",
-                        semantic.c_str());
-                    ImGui::SameLine();
-                    ImGui::TextWrapped(
-                        "%s",
-                        reference.get_ref<
-                            const std::string&>().c_str());
+                    if (ui_kit_.begin_property_grid(
+                            semantic.c_str())) {
+                        ui_kit_.property_row(
+                            semantic.c_str());
+                        ImGui::TextWrapped(
+                            "%s",
+                            reference.get_ref<
+                                const std::string&>().c_str());
+                        ui_kit_.end_property_grid();
+                    }
                 }
             }
             if (!material_editor_->error.empty()) {
-                ImGui::TextColored(
-                    ImVec4(1.0F, 0.45F, 0.35F, 1.0F),
-                    "%s",
-                    material_editor_->error.c_str());
+                ui_kit_.status_text(
+                    material_editor_->error.c_str(),
+                    EditorTone::danger);
             } else if (!material_editor_->status.empty()) {
-                ImGui::TextWrapped(
-                    "%s",
-                    material_editor_->status.c_str());
+                ui_kit_.status_text(
+                    material_editor_->status.c_str(),
+                    material_editor_->dirty
+                        ? EditorTone::warning
+                        : EditorTone::success);
             }
         }
     }
@@ -3017,36 +3244,118 @@ void EditorUi::build_performance(
     Renderer& renderer,
     const PerformanceSnapshot& performance) {
     ImGui::SetNextWindowSize(
-        ImVec2(360.0F, 230.0F), ImGuiCond_FirstUseEver);
+        ImVec2(380.0F, 360.0F), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Renderer")) {
         ImGui::End();
         return;
     }
-    ImGui::Text(
-        "FPS %.1f | 1%% low %.1f",
-        performance.average_fps,
+    ui_kit_.panel_header(
+        EditorIcon::renderer,
+        "RENDERER",
+        "Live frame health and output settings");
+
+    char average_fps[32]{};
+    char low_fps[32]{};
+    char cpu_time[32]{};
+    char gpu_time[32]{};
+    std::snprintf(
+        average_fps,
+        sizeof(average_fps),
+        "%.1f FPS",
+        performance.average_fps);
+    std::snprintf(
+        low_fps,
+        sizeof(low_fps),
+        "%.1f FPS",
         performance.one_percent_low_fps);
-    ImGui::Text(
-        "CPU %.3f ms | GPU %.3f ms",
-        performance.average.cpu_frame_ms,
-        performance.average.gpu_frame_ms);
-    ImGui::Text(
-        "Present: %s",
-        Swapchain::present_mode_name(
-            renderer.swapchain().present_mode()));
-    ImGui::Text(
-        "AA: %s / %s",
-        to_string(renderer.anti_aliasing().method).data(),
-        renderer.anti_aliasing_quality_name().data());
-    if (ImGui::Button("Cycle AA")) {
+    if (performance.average.cpu_frame_ms >= 0.0) {
+        std::snprintf(
+            cpu_time,
+            sizeof(cpu_time),
+            "%.3f ms",
+            performance.average.cpu_frame_ms);
+    } else {
+        std::snprintf(cpu_time, sizeof(cpu_time), "N/A");
+    }
+    if (performance.average.gpu_frame_ms >= 0.0) {
+        std::snprintf(
+            gpu_time,
+            sizeof(gpu_time),
+            "%.3f ms",
+            performance.average.gpu_frame_ms);
+    } else {
+        std::snprintf(gpu_time, sizeof(gpu_time), "N/A");
+    }
+
+    if (ImGui::BeginTable(
+            "PerformanceCards",
+            2,
+            ImGuiTableFlags_SizingStretchSame |
+                ImGuiTableFlags_NoSavedSettings)) {
+        ImGui::TableNextRow();
+        static_cast<void>(ImGui::TableSetColumnIndex(0));
+        ui_kit_.metric_card(
+            "AverageFps",
+            "AVERAGE",
+            average_fps,
+            EditorTone::success);
+        static_cast<void>(ImGui::TableSetColumnIndex(1));
+        ui_kit_.metric_card(
+            "LowFps",
+            "1% LOW",
+            low_fps,
+            EditorTone::info);
+        ImGui::TableNextRow();
+        static_cast<void>(ImGui::TableSetColumnIndex(0));
+        ui_kit_.metric_card(
+            "CpuTime",
+            "CPU FRAME",
+            cpu_time,
+            EditorTone::warning);
+        static_cast<void>(ImGui::TableSetColumnIndex(1));
+        ui_kit_.metric_card(
+            "GpuTime",
+            "GPU FRAME",
+            gpu_time,
+            EditorTone::purple);
+        ImGui::EndTable();
+    }
+
+    ui_kit_.section_header(
+        EditorIcon::renderer,
+        "Output Pipeline");
+    if (ui_kit_.begin_property_grid("RendererProperties")) {
+        ui_kit_.property_row("Present");
+        ui_kit_.badge(
+            Swapchain::present_mode_name(
+                renderer.swapchain().present_mode()),
+            EditorTone::info);
+        ui_kit_.property_row("Anti-aliasing");
+        ImGui::TextUnformatted(
+            to_string(renderer.anti_aliasing().method).data());
+        ui_kit_.property_row("Quality");
+        ImGui::TextUnformatted(
+            renderer.anti_aliasing_quality_name().data());
+        ui_kit_.end_property_grid();
+    }
+    if (ui_kit_.action_button(
+            "CycleAA",
+            EditorIcon::refresh,
+            "Cycle AA",
+            EditorButtonStyle::secondary)) {
         renderer.cycle_anti_aliasing();
     }
     ImGui::SameLine();
-    if (ImGui::Button("Quality +")) {
+    if (ui_kit_.action_button(
+            "IncreaseAAQuality",
+            EditorIcon::add,
+            "Quality",
+            EditorButtonStyle::secondary)) {
         renderer.adjust_anti_aliasing_quality(1);
     }
-    ImGui::TextDisabled(
-        "Editor UI is isolated from vulkan_cube benchmark target.");
+    ui_kit_.status_text(
+        "Editor metrics are isolated from the benchmark executable.",
+        EditorTone::neutral);
     ImGui::End();
 }
 

@@ -69,7 +69,7 @@ void EditorApplication::initialize(const CliOptions& options) {
         fatal(SDL_GetError());
     }
     window_.reset(SDL_CreateWindow(
-        "Vulkan Editor",
+        "Vulkan Cube Editor",
         static_cast<int>(options.width),
         static_cast<int>(options.height),
         SDL_WINDOW_VULKAN |
@@ -260,7 +260,7 @@ void EditorApplication::update_window_title() {
     std::snprintf(
         title,
         sizeof(title),
-        "Vulkan Editor | %s%s | %.0f FPS | CPU %.3f ms | "
+        "Vulkan Cube Editor | %s%s | %.0f FPS | CPU %.3f ms | "
         "GPU %.3f ms | %u nodes | Scene %ux%u",
         play_state,
         ui_.external_game_window_open() ? " / WINDOW" : "",

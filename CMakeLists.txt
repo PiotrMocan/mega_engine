@@ -435,6 +435,7 @@ add_executable(vulkan_editor
     src/editor_main.cpp
     src/editor_application.cpp
     src/editor_ui.cpp
+    src/editor_ui_kit.cpp
     src/asset_browser.cpp
     src/scene_document.cpp
     src/scene_io.cpp

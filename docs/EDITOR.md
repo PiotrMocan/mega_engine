@@ -9,17 +9,50 @@ Nuklear остаётся хорошим вариантом для компакт
 окон, clipping больших списков и значительную часть editor widgets.
 
 Dear ImGui выбран из-за официальных SDL3/Vulkan backends, docking branch,
-multi-viewport и `ImGuiListClipper`. Визуальный стиль намеренно сделан
-плоским и компактным, ближе к Nuklear. Ссылки:
+multi-viewport и `ImGuiListClipper`. Поверх него редактор использует
+собственный `EditorUiKit`, чтобы стандартные immediate-mode widgets выглядели
+как единый интерфейс движка. Ссылки:
 
 - <https://github.com/ocornut/imgui/tree/v1.92.8-docking>
 - <https://github.com/Immediate-Mode-UI/Nuklear/tree/4.13.3>
+- <https://github.com/Binaryify/OneDark-Pro>
 
 UI не попадает в benchmark/runtime binary: `vulkan_cube` собирается с
 `VCR_EDITOR_ENABLED=0`, а `vulkan_editor` — отдельный executable. ImGui
 использует Vulkan 1.3 dynamic rendering. Узкий adapter переводит три legacy
 submission-вызова upstream backend в `vkQueueSubmit2`, а его barriers — в
 synchronization2, используя только фиксированные stack arrays.
+
+## Визуальный язык EditorUiKit
+
+`src/editor_ui_kit.*` — единая точка определения editor theme и переиспользуемых
+компонентов. Цветовая основа следует One Dark Pro: глубокие графитовые surfaces,
+мягкий серый текст, синий action accent, cyan для информации, green для
+успешного состояния, yellow для предупреждений, red для ошибок и purple как
+вторичный фирменный акцент. Цвета палитры переводятся из sRGB в linear до
+упаковки ImGui vertex color, потому что основной swapchain использует
+`*_SRGB` format.
+
+На Windows редактор загружает системный Segoe UI с Cyrillic glyph range. Linux
+использует первый доступный DejaVu Sans, Liberation Sans или Ubuntu Sans;
+встроенный scalable ImGui font остаётся последним fallback. Шрифт ОС не
+распространяется с приложением и загружается только при создании UI context.
+
+Узнаваемость не зависит от bitmap icon atlas: cube mark и editor icons
+отрисовываются компактными `ImDrawList` primitives. UI kit предоставляет:
+
+- quiet/secondary/primary/danger action buttons и icon buttons;
+- badges и semantic status colors;
+- hierarchy и asset rows с единым selection/hover language;
+- двухколоночный property grid и цветные resettable XYZ controls;
+- panel/section headers, empty states, viewport badges и metric cards.
+
+Новые editor panels SHOULD использовать эти компоненты вместо локальных
+палитр и случайных размеров. Красный и жёлтый MUST оставаться цветами
+диагностики, а яркие accents не должны занимать большие фоновые площади:
+интерфейс рассчитан на длительную работу. Любой GPU-backed preview/cache должен
+оставаться bounded и следовать frame ownership; UI kit сам не владеет Vulkan
+objects и не выполняет per-frame filesystem I/O.
 
 ## Запуск
 
