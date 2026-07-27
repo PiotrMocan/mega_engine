@@ -2400,7 +2400,8 @@ void EditorUi::build_assets(
             const AssetEntry& entry =
                 entries[static_cast<std::size_t>(index)];
             ImGui::PushID(index);
-            const bool activated = ui_kit_.asset_row(
+            const EditorAssetRowResult row_result =
+                ui_kit_.asset_row(
                     "Asset",
                     asset_icon(entry.kind),
                     entry.display_name.c_str(),
@@ -2408,20 +2409,17 @@ void EditorUi::build_assets(
                     selected_asset_ &&
                         selected_asset_->relative_path ==
                             entry.relative_path);
-            if (activated) {
+            if (row_result.activated) {
                 selected_asset_ = entry;
-                if (ImGui::IsMouseDoubleClicked(
-                        ImGuiMouseButton_Left) &&
+                if (row_result.double_clicked &&
                     entry.kind == AssetEntryKind::directory) {
                     pending_asset_directory_ =
                         entry.relative_path;
-                } else if (ImGui::IsMouseDoubleClicked(
-                               ImGuiMouseButton_Left) &&
+                } else if (row_result.double_clicked &&
                            entry.kind ==
                                AssetEntryKind::material) {
                     open_material_editor(entry.relative_path);
-                } else if (ImGui::IsMouseDoubleClicked(
-                               ImGuiMouseButton_Left) &&
+                } else if (row_result.double_clicked &&
                            entry.kind ==
                                AssetEntryKind::model) {
                     static_cast<void>(add_model_asset_to_scene(

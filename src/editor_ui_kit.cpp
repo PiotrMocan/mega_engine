@@ -813,7 +813,7 @@ EditorTreeRowResult EditorUiKit::hierarchy_row(
     return result;
 }
 
-bool EditorUiKit::asset_row(
+EditorAssetRowResult EditorUiKit::asset_row(
     const char* const id,
     const EditorIcon icon,
     const char* const label,
@@ -825,6 +825,10 @@ bool EditorUiKit::asset_row(
     const bool activated = ImGui::InvisibleButton(
         "##asset-row", ImVec2(width, row_height));
     const bool hovered = ImGui::IsItemHovered();
+    const bool double_clicked =
+        hovered &&
+        ImGui::IsMouseDoubleClicked(
+            ImGuiMouseButton_Left);
     const bool focused = ImGui::IsItemFocused();
     const ImVec2 minimum = ImGui::GetItemRectMin();
     const ImVec2 maximum = ImGui::GetItemRectMax();
@@ -896,7 +900,10 @@ bool EditorUiKit::asset_row(
             label_maximum_x - label_minimum.x) {
         ImGui::SetTooltip("%s", label);
     }
-    return activated;
+    return EditorAssetRowResult{
+        .activated = activated || double_clicked,
+        .double_clicked = double_clicked,
+    };
 }
 
 bool EditorUiKit::begin_property_grid(

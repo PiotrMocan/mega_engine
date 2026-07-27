@@ -54,6 +54,11 @@ struct EditorTreeRowResult {
     bool expansion_toggled = false;
 };
 
+struct EditorAssetRowResult {
+    bool activated = false;
+    bool double_clicked = false;
+};
+
 class EditorUiKit final {
 public:
     void initialize();
@@ -106,7 +111,7 @@ public:
         bool expanded,
         bool selected,
         bool visible) const;
-    [[nodiscard]] bool asset_row(
+    [[nodiscard]] EditorAssetRowResult asset_row(
         const char* id,
         EditorIcon icon,
         const char* label,
