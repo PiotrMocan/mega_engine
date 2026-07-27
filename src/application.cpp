@@ -1,5 +1,7 @@
 #include "application.hpp"
 
+#include "runtime_assets.hpp"
+#include "scene_io.hpp"
 #include "vulkan_common.hpp"
 
 #include <nlohmann/json.hpp>
@@ -152,7 +154,10 @@ void Application::initialize(const CliOptions& options) {
         options.instances,
         options.gpu_workload_iterations,
         options.anti_aliasing,
-        options.mcp_stdio);
+        options.mcp_stdio,
+        false,
+        true);
+    load_canonical_scene();
     const auto now = std::chrono::steady_clock::now();
     last_camera_tick_ = now;
     last_title_update_ = now;
@@ -172,6 +177,37 @@ void Application::initialize(const CliOptions& options) {
                "Space/E up, Ctrl/Q down, F6 AA type, "
                "F7/F8 AA quality, Esc release/exit\n";
     }
+}
+
+void Application::load_canonical_scene() {
+    const auto asset_root = find_runtime_asset_root();
+    if (!asset_root) {
+        fatal("Unable to locate the runtime assets directory.");
+    }
+    const std::filesystem::path scene_path =
+        asset_root->path / canonical_scene_relative_path;
+    std::string error;
+    if (!load_scene_file(scene_path, scene_, error)) {
+        std::cerr
+            << "Unable to load canonical editor/game scene: "
+            << scene_path << '\n';
+        fatal(error);
+    }
+
+    scene_instances_.reserve(max_scene_nodes);
+    scene_models_.reserve(max_scene_nodes);
+    const SceneRenderView view =
+        scene_.build_render_view(scene_instances_, scene_models_);
+    if (!renderer_.update_editor_scene(
+            view, asset_root->path, error)) {
+        std::cerr
+            << "Unable to prepare canonical editor/game scene: "
+            << scene_path << '\n';
+        fatal(error);
+    }
+    std::cout
+        << "Loaded scene: " << scene_path
+        << " (" << scene_.size() << " nodes)\n";
 }
 
 void Application::main_loop() {

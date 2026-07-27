@@ -638,11 +638,14 @@ void Renderer::initialize(
     const std::uint32_t initial_gpu_workload,
     const AntiAliasingSettings initial_anti_aliasing,
     const bool enable_screenshot_capture,
-    const bool enable_editor_output) {
+    const bool enable_editor_output,
+    const bool enable_authored_scene) {
     context_ = &context;
     window_ = window;
 #if VCR_EDITOR_ENABLED
     editor_output_enabled_ = enable_editor_output;
+    authored_scene_enabled_ =
+        enable_authored_scene || enable_editor_output;
     editor_scene_instances_.reserve(
         maximum_editor_scene_instances);
     editor_model_assets_.reserve(64U);
@@ -651,6 +654,7 @@ void Renderer::initialize(
     editor_model_sort_scratch_.reserve(max_scene_nodes);
 #else
     static_cast<void>(enable_editor_output);
+    static_cast<void>(enable_authored_scene);
 #endif
     const std::uint64_t range_capacity =
         context.properties().limits.maxStorageBufferRange /
@@ -705,9 +709,12 @@ void Renderer::shutdown() noexcept {
     editor_model_sort_scratch_.clear();
     editor_ground_count_ = 0U;
     editor_cube_count_ = 0U;
+    authored_scene_object_count_ = 0U;
+    authored_scene_triangle_count_ = 0U;
     editor_terrain_visible_ = false;
     editor_sky_visible_ = false;
     editor_sun_visible_ = false;
+    authored_scene_enabled_ = false;
     editor_output_enabled_ = false;
 #endif
     destroy_scene_resources();
@@ -786,7 +793,7 @@ void Renderer::create_frame_contexts() {
             0,
             "per-frame workload buffer");
 #if VCR_EDITOR_ENABLED
-        if (editor_output_enabled_) {
+        if (authored_scene_enabled_) {
             constexpr std::uint64_t scene_instance_capacity =
                 static_cast<std::uint64_t>(max_scene_nodes) + 1ULL;
             constexpr std::uint64_t scene_buffer_bytes =
@@ -1494,8 +1501,8 @@ bool Renderer::prepare_editor_model(
     SceneTransform& recommended_transform,
     std::string& error) {
     error.clear();
-    if (!editor_output_enabled_ || context_ == nullptr) {
-        error = "The editor renderer is not initialized.";
+    if (!authored_scene_enabled_ || context_ == nullptr) {
+        error = "The authored-scene renderer is not initialized.";
         return false;
     }
     const auto index = find_or_load_editor_model(
@@ -1513,7 +1520,7 @@ bool Renderer::update_editor_scene(
     const std::filesystem::path& asset_root,
     std::string& error) {
     error.clear();
-    if (!editor_output_enabled_ ||
+    if (!authored_scene_enabled_ ||
         view.revision == editor_scene_revision_) {
         return true;
     }
@@ -1635,6 +1642,22 @@ bool Renderer::update_editor_scene(
     editor_terrain_visible_ = view.terrain_visible;
     editor_sky_visible_ = view.sky_visible;
     editor_sun_visible_ = view.sun_visible;
+    authored_scene_object_count_ =
+        static_cast<std::uint32_t>(
+            ground_count + view.cubes.size() + view.models.size()) +
+        static_cast<std::uint32_t>(view.terrain_visible);
+    authored_scene_triangle_count_ =
+        static_cast<std::uint64_t>(ground_count) *
+            plane_triangle_count +
+        static_cast<std::uint64_t>(view.cubes.size()) *
+            cube_triangle_count +
+        (view.terrain_visible ? terrain_triangle_count : 0U) +
+        (view.sky_visible ? sky_triangle_count : 0U);
+    for (const EditorModelDraw& draw : editor_model_draws_) {
+        authored_scene_triangle_count_ +=
+            static_cast<std::uint64_t>(draw.index_count / 3U) *
+            draw.instance_count;
+    }
     editor_scene_revision_ = view.revision;
     return complete;
 }
@@ -1642,7 +1665,7 @@ bool Renderer::update_editor_scene(
 bool Renderer::apply_editor_material_factors(
     const std::string_view material_relative_path,
     PbrMaterial material) noexcept {
-    if (!editor_output_enabled_ ||
+    if (!authored_scene_enabled_ ||
         material_relative_path.empty()) {
         return false;
     }
@@ -1672,7 +1695,7 @@ void Renderer::invalidate_editor_scene() noexcept {
 void Renderer::record_editor_scene_upload(
     const VkCommandBuffer command_buffer,
     FrameContext& frame) {
-    if (!editor_output_enabled_ ||
+    if (!authored_scene_enabled_ ||
         frame.scene_revision == editor_scene_revision_) {
         return;
     }
@@ -2015,7 +2038,7 @@ void Renderer::create_scene_resources() {
     create_sky_texture();
     create_shadow_map();
 #if VCR_EDITOR_ENABLED
-    if (editor_output_enabled_ &&
+    if (authored_scene_enabled_ &&
         editor_material_descriptor_pool_ == VK_NULL_HANDLE) {
         create_editor_material_resources();
     }
@@ -2476,7 +2499,7 @@ void Renderer::create_descriptors() {
     VK_CHECK(vkCreateDescriptorPool(
         context_->device(), &pool_info, nullptr, &descriptor_pool_));
 #if VCR_EDITOR_ENABLED
-    if (editor_output_enabled_ &&
+    if (authored_scene_enabled_ &&
         editor_material_descriptor_pool_ == VK_NULL_HANDLE) {
         const VkDescriptorPoolSize material_pool_size{
             .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -2605,7 +2628,7 @@ void Renderer::create_descriptors() {
         VkDeviceSize scene_instance_range =
             demo_instance_buffer_.size();
 #if VCR_EDITOR_ENABLED
-        if (editor_output_enabled_) {
+        if (authored_scene_enabled_) {
             scene_instance_buffer =
                 frames_[index].scene_instance_buffer.handle();
             scene_instance_range =
@@ -2852,7 +2875,7 @@ void Renderer::render_static_shadow_map() {
         0,
         0);
 #if VCR_EDITOR_ENABLED
-    if (!editor_output_enabled_)
+    if (!authored_scene_enabled_)
 #endif
     {
         vkCmdBindPipeline(
@@ -3171,7 +3194,7 @@ void Renderer::update_frame_uniform(
         uniforms.camera_position = glm::vec4(camera_position, 1.0F);
     }
 #if VCR_EDITOR_ENABLED
-    if (editor_output_enabled_ && !editor_sun_visible_) {
+    if (authored_scene_enabled_ && !editor_sun_visible_) {
         uniforms.sun_direction_intensity.w = 0.0F;
     }
 #endif
@@ -3376,7 +3399,7 @@ void Renderer::create_pipeline() {
         nullptr,
         &descriptor_set_layout_));
 #if VCR_EDITOR_ENABLED
-    if (editor_output_enabled_ &&
+    if (authored_scene_enabled_ &&
         editor_material_descriptor_set_layout_ == VK_NULL_HANDLE) {
         const std::array material_bindings{
             VkDescriptorSetLayoutBinding{
@@ -3422,7 +3445,7 @@ void Renderer::create_pipeline() {
     };
     std::uint32_t geometry_set_layout_count = 1U;
 #if VCR_EDITOR_ENABLED
-    if (editor_output_enabled_) {
+    if (authored_scene_enabled_) {
         geometry_set_layouts[1U] =
             editor_material_descriptor_set_layout_;
         geometry_set_layout_count = 2U;
@@ -3699,7 +3722,7 @@ void Renderer::create_pipeline() {
 
     const char* scene_vertex_shader = "scene.vert.spv";
 #if VCR_EDITOR_ENABLED
-    if (editor_output_enabled_) {
+    if (authored_scene_enabled_) {
         scene_vertex_shader = "editor_scene.vert.spv";
     }
 #endif
@@ -3737,7 +3760,7 @@ void Renderer::create_pipeline() {
         handle_value(scene_pipeline_),
         "shadowed scene graphics pipeline");
 #if VCR_EDITOR_ENABLED
-    if (editor_output_enabled_) {
+    if (authored_scene_enabled_) {
         const VkShaderModule editor_model_vertex_module =
             load_shader("editor_model.vert.spv");
         const VkShaderModule editor_model_fragment_module =
@@ -3904,7 +3927,7 @@ void Renderer::create_pipeline() {
     const char* aa_scene_vertex_shader =
         "scene_aa.vert.spv";
 #if VCR_EDITOR_ENABLED
-    if (editor_output_enabled_) {
+    if (authored_scene_enabled_) {
         aa_scene_vertex_shader =
             "editor_scene_aa.vert.spv";
     }
@@ -3916,7 +3939,7 @@ void Renderer::create_pipeline() {
         input_assembly,
         "AA shadowed scene graphics pipeline");
 #if VCR_EDITOR_ENABLED
-    if (editor_output_enabled_) {
+    if (authored_scene_enabled_) {
         aa_editor_model_pipeline_ =
             create_aa_geometry_pipeline(
                 "editor_model_aa.vert.spv",
@@ -4924,7 +4947,7 @@ void Renderer::record_commands(
                     0);
             } else {
 #if VCR_EDITOR_ENABLED
-                if (editor_output_enabled_) {
+                if (authored_scene_enabled_) {
                     if (frame.scene_ground_count > 0U) {
                         vkCmdDrawIndexed(
                             command_buffer,
@@ -5017,7 +5040,7 @@ void Renderer::record_commands(
                 bool draw_terrain = true;
 #if VCR_EDITOR_ENABLED
                 draw_terrain =
-                    !editor_output_enabled_ ||
+                    !authored_scene_enabled_ ||
                     editor_terrain_visible_;
 #endif
                 if (draw_terrain) {
@@ -5051,7 +5074,7 @@ void Renderer::record_commands(
 #if VCR_EDITOR_ENABLED
             draw_sky =
                 draw_sky &&
-                (!editor_output_enabled_ ||
+                (!authored_scene_enabled_ ||
                  editor_sky_visible_);
 #endif
             if (draw_sky) {
@@ -5242,7 +5265,7 @@ void Renderer::record_commands(
             pipeline_,
             scene_pipeline_,
 #if VCR_EDITOR_ENABLED
-            editor_output_enabled_
+            authored_scene_enabled_
                 ? editor_model_pipeline_
                 : scene_pipeline_,
 #else
@@ -5385,7 +5408,7 @@ void Renderer::record_commands(
             aa_pipeline_,
             aa_scene_pipeline_,
 #if VCR_EDITOR_ENABLED
-            editor_output_enabled_
+            authored_scene_enabled_
                 ? aa_editor_model_pipeline_
                 : aa_scene_pipeline_,
 #else
@@ -5885,9 +5908,15 @@ void Renderer::set_vsync(const bool enabled) {
 }
 
 std::uint32_t Renderer::instance_count() const noexcept {
-    return mode_ == RunMode::instancing
-        ? instancing_count_
-        : scene_object_count;
+    if (mode_ == RunMode::instancing) {
+        return instancing_count_;
+    }
+#if VCR_EDITOR_ENABLED
+    if (authored_scene_enabled_) {
+        return authored_scene_object_count_;
+    }
+#endif
+    return scene_object_count;
 }
 
 std::uint64_t Renderer::triangle_count() const noexcept {
@@ -5895,6 +5924,11 @@ std::uint64_t Renderer::triangle_count() const noexcept {
         return static_cast<std::uint64_t>(cube_triangle_count) *
                instancing_count_;
     }
+#if VCR_EDITOR_ENABLED
+    if (authored_scene_enabled_) {
+        return authored_scene_triangle_count_;
+    }
+#endif
     return scene_triangle_count;
 }
 

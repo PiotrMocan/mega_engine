@@ -419,6 +419,7 @@ set(VCR_RENDERER_SOURCES
     src/performance_metrics.cpp
     src/png_encoder.cpp
     src/renderer.cpp
+    src/runtime_assets.cpp
     src/swapchain.cpp
     src/vma.cpp
     src/vulkan_context.cpp
@@ -428,6 +429,8 @@ add_executable(vulkan_cube
     src/main.cpp
     src/application.cpp
     src/mcp_server.cpp
+    src/scene_document.cpp
+    src/scene_io.cpp
     ${VCR_RENDERER_SOURCES}
 )
 
@@ -501,8 +504,14 @@ function(vcr_configure_executable target editor_enabled)
     endif()
 endfunction()
 
-vcr_configure_executable(vulkan_cube 0)
+vcr_configure_executable(vulkan_cube 1)
 vcr_configure_executable(vulkan_editor 1)
+target_link_libraries(vulkan_cube PRIVATE vcr_imgui)
+target_link_libraries(
+    vulkan_cube PRIVATE
+    vcr_cooked_model_asset
+    vcr_cooked_texture_asset
+)
 target_link_libraries(vulkan_editor PRIVATE vcr_imgui)
 target_link_libraries(
     vulkan_editor PRIVATE

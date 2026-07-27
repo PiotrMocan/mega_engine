@@ -4,6 +4,7 @@
 #include "fly_camera.hpp"
 #include "mcp_server.hpp"
 #include "renderer.hpp"
+#include "scene_document.hpp"
 #include "vulkan_context.hpp"
 
 #include <SDL3/SDL.h>
@@ -16,6 +17,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace vcr {
 
@@ -35,6 +37,7 @@ public:
 
 private:
     void initialize(const CliOptions& options);
+    void load_canonical_scene();
     void main_loop();
     void process_event(const SDL_Event& event);
     void process_mcp_commands();
@@ -58,6 +61,9 @@ private:
     std::unique_ptr<SDL_Window, SdlWindowDeleter> window_{};
     VulkanContext context_{};
     Renderer renderer_{};
+    SceneDocument scene_{};
+    std::vector<SceneGpuInstance> scene_instances_{};
+    std::vector<SceneModelInstance> scene_models_{};
     FlyCamera camera_{};
     CliOptions options_{};
     BenchmarkController benchmark_{};

@@ -89,7 +89,8 @@ scripts\run_editor_windows.cmd --no-validation
 - `Save/Open` (`Ctrl+S`/`Ctrl+O`): versioned JSON в
   `assets/scenes/editor_scene.json`, запись через complete temporary file,
   транзакционная загрузка и защита от потери несохранённых изменений при
-  Open/Exit.
+  Open/Exit. Это каноническая game scene: редактор автоматически открывает её
+  при старте, а `vulkan_cube` загружает тот же документ и referenced assets.
 - `Game in separate window` (`F6` во время Play): secondary OS window через
   ImGui multi-viewport. Оно использует тот же scene image и отдельный swapchain
   backend; resize окна меняет реальное scene resolution, а fly-camera input
@@ -159,7 +160,7 @@ Resize viewport coalesced с задержкой 140 ms и ограничен `38
   Навигация транзакционна: ошибка не смешивает новый path со старым listing.
   Import выполняет постоянный bounded worker и обновляет browser один раз после
   завершения batch. Watcher и общий engine job-system остаются отдельным этапом.
-- Imported `*.vcrmesh` рисуется в editor scene с material factors из
+- Imported `*.vcrmesh` рисуется в editor и game scene с material factors из
   `*.vcrmaterial.json`; base-color и normal textures декодируются при первом
   использовании, получают mip chain и bind-ятся отдельным material descriptor
   set. Cooked UV/tangent передаются в dedicated direct/AA model pipelines.
@@ -172,3 +173,20 @@ Resize viewport coalesced с задержкой 140 ms и ограничен `38
 
 Эти ограничения нельзя скрывать при performance-отчёте: FPS `vulkan_editor`
 включает UI и не сравнивается с baseline `vulkan_cube`.
+
+## Единая сцена редактора и игры
+
+Оба executable используют `assets/scenes/editor_scene.json` как единственный
+источник authored scene. Обычный цикл разработки:
+
+1. Изменить сцену в `vulkan_editor` и сохранить через `Ctrl+S`.
+2. Запустить `scripts\run_windows.cmd --no-validation`: в checkout game сразу
+   читает обновлённый project `assets`.
+3. Для переносимой Release-сборки выполнить
+   `scripts\build_windows.cmd Release`. Target `vcr_runtime_assets` копирует
+   scene, model manifests, meshes, materials и textures в
+   `build\windows-release\bin\assets` рядом с `vulkan_cube.exe`.
+
+В packaged окружении без project `CMakeLists.txt` game и editor используют
+копию `assets` рядом со своими executable, поэтому сборка содержит именно
+сохранённую сцену и её зависимости.

@@ -1,5 +1,7 @@
 #include "editor_application.hpp"
 
+#include "runtime_assets.hpp"
+#include "scene_io.hpp"
 #include "vulkan_common.hpp"
 
 #include <algorithm>
@@ -98,8 +100,17 @@ void EditorApplication::initialize(const CliOptions& options) {
     scene_ = SceneDocument::make_default();
     scene_instances_.reserve(max_scene_nodes);
     scene_models_.reserve(max_scene_nodes);
-    update_scene_snapshot();
     ui_.initialize(context_, window_.get(), renderer_);
+    const std::filesystem::path scene_path =
+        ui_.asset_root() / canonical_scene_relative_path;
+    std::string scene_error;
+    if (!load_scene_file(scene_path, scene_, scene_error)) {
+        std::cerr
+            << "Unable to load canonical editor/game scene: "
+            << scene_path << '\n';
+        fatal(scene_error);
+    }
+    update_scene_snapshot();
 
     const auto now = std::chrono::steady_clock::now();
     last_camera_tick_ = now;

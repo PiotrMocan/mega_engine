@@ -2,6 +2,7 @@
 
 #include "asset_importer.hpp"
 #include "renderer.hpp"
+#include "runtime_assets.hpp"
 #include "scene_io.hpp"
 #include "vulkan_common.hpp"
 
@@ -344,76 +345,6 @@ void check_imgui_vk_result(const VkResult result) {
     case AssetEntryKind::other: return EditorIcon::import_asset;
     }
     return EditorIcon::import_asset;
-}
-
-struct AssetRootLocation {
-    std::filesystem::path path{};
-    bool project_owned = false;
-};
-
-[[nodiscard]] std::optional<AssetRootLocation>
-find_project_asset_root() {
-    const auto search_ancestors =
-        [](std::filesystem::path candidate)
-            -> std::optional<AssetRootLocation> {
-            for (std::uint32_t depth = 0U;
-                 depth < 16U && !candidate.empty();
-                 ++depth) {
-                std::error_code filesystem_error;
-                const bool has_project_file =
-                    std::filesystem::is_regular_file(
-                        candidate / "CMakeLists.txt",
-                        filesystem_error);
-                filesystem_error.clear();
-                const std::filesystem::path assets =
-                    candidate / "assets";
-                const bool has_assets =
-                    std::filesystem::is_directory(
-                        assets, filesystem_error);
-                if (has_project_file && has_assets &&
-                    !filesystem_error) {
-                    return AssetRootLocation{
-                        .path = assets,
-                        .project_owned = true,
-                    };
-                }
-                const std::filesystem::path parent =
-                    candidate.parent_path();
-                if (parent == candidate) {
-                    break;
-                }
-                candidate = parent;
-            }
-            return std::nullopt;
-        };
-
-    std::error_code filesystem_error;
-    const std::filesystem::path working_directory =
-        std::filesystem::current_path(filesystem_error);
-    if (!filesystem_error) {
-        if (auto root = search_ancestors(working_directory)) {
-            return root;
-        }
-    }
-    const char* const base_path = SDL_GetBasePath();
-    if (base_path != nullptr) {
-        if (auto root = search_ancestors(
-                std::filesystem::path(base_path))) {
-            return root;
-        }
-        const std::filesystem::path packaged_assets =
-            std::filesystem::path(base_path) / "assets";
-        filesystem_error.clear();
-        if (std::filesystem::is_directory(
-                packaged_assets, filesystem_error) &&
-            !filesystem_error) {
-            return AssetRootLocation{
-                .path = packaged_assets,
-                .project_owned = false,
-            };
-        }
-    }
-    return std::nullopt;
 }
 
 inline constexpr std::uintmax_t maximum_material_file_bytes =
@@ -1135,19 +1066,18 @@ void EditorUi::initialize(
     register_scene_texture(renderer);
 
     hierarchy_rows_.reserve(max_scene_nodes);
-    if (const auto asset_root = find_project_asset_root()) {
+    if (const auto asset_root = find_runtime_asset_root()) {
         if (asset_browser_.initialize(
                 asset_root->path, asset_error_)) {
             asset_import_enabled_ =
                 asset_root->project_owned;
             scene_path_ =
                 asset_browser_.root() /
-                "scenes" /
-                "editor_scene.json";
+                canonical_scene_relative_path;
             scene_file_name_ =
                 scene_path_.filename().string();
             scene_file_status_ =
-                "Default scene; Save writes assets/scenes/editor_scene.json";
+                "Game scene; Save updates assets/scenes/editor_scene.json";
             if (!asset_import_enabled_) {
                 asset_error_ =
                     "Packaged assets are browse-only. Open the editor "

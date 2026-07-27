@@ -59,7 +59,8 @@ public:
         std::uint32_t initial_gpu_workload,
         AntiAliasingSettings initial_anti_aliasing,
         bool enable_screenshot_capture,
-        bool enable_editor_output = false);
+        bool enable_editor_output = false,
+        bool enable_authored_scene = false);
     [[nodiscard]] bool draw_frame(
         FrameTimings& timings,
         const glm::mat4& view_matrix
@@ -396,12 +397,15 @@ private:
     std::uint32_t editor_material_descriptor_count_ = 0U;
     std::uint32_t editor_ground_count_ = 0U;
     std::uint32_t editor_cube_count_ = 0U;
+    std::uint32_t authored_scene_object_count_ = 0U;
+    std::uint64_t authored_scene_triangle_count_ = 0U;
     std::uint64_t editor_scene_revision_ = 1U;
     std::uint64_t editor_viewport_generation_ = 0U;
     std::uint64_t swapchain_generation_ = 1U;
     bool editor_terrain_visible_ = false;
     bool editor_sky_visible_ = false;
     bool editor_sun_visible_ = false;
+    bool authored_scene_enabled_ = false;
     bool editor_output_enabled_ = false;
 #endif
 };
