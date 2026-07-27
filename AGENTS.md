@@ -24,7 +24,26 @@ CPU/GPU, низкая задержка, корректная синхрониз�
 - GLM только для математических типов и операций;
 - GLSL, скомпилированный в SPIR-V;
 - CMake + Ninja;
-- Windows — основная проверенная платформа, Linux — обязательная совместимость.
+- Windows x64 — единственная целевая платформа текущего MVP.
+
+### 1.1 Платформенная политика MVP
+
+- Сейчас продукт разрабатывается, собирается, тестируется и профилируется только
+  нативно под Windows x64.
+- Linux отложен до отдельного решения после оценки пригодности MVP. До такого
+  решения агентам **MUST NOT** конфигурировать CMake под Linux, генерировать
+  Linux build manifests, собирать Linux targets, запускать Linux tests,
+  sanitizers, analyzers или benchmarks.
+- WSL допустим только как оболочка для работы с файлами и запуска нативных
+  Windows-команд через `cmd.exe`/`powershell.exe`. Linux-бинарник, собранный или
+  запущенный из WSL, не является допустимой проверкой.
+- В `build/` разрешены ровно три build tree:
+  `windows-release`, `windows-debug` и `windows-asan`. Другие каталоги сборки,
+  отдельные build manifests и loose build/benchmark artifacts создавать
+  запрещено.
+- Поддерживать переносимые границы и не добавлять ненужных Windows-зависимостей
+  SHOULD, но это не разрешает агенту проверять Linux до явного изменения этой
+  политики пользователем.
 
 Текущие режимы:
 
@@ -69,7 +88,7 @@ GPU frame около 0.078 ms. Сцена содержит два draw calls, 15
 8. **Feature detection обязателен.** Любая optional extension/feature имеет
    runtime-проверку и корректный fallback либо понятную диагностическую ошибку.
 9. **Каждый шаг остаётся собираемым.** Нельзя оставлять основную ветку в состоянии,
-   где Windows Release/Debug не собираются или базовые тесты не проходят.
+   где Windows Release/Debug/ASan не собираются или базовые тесты не проходят.
 10. **Отчётность честная.** Отделять измеренные оптимизации от гипотез, указывать
     конфигурацию, bottleneck, компромиссы и непроверенные платформы.
 
@@ -152,13 +171,13 @@ Build system MUST предоставить отдельные opt-in presets/tar
 - `clang-tidy` как минимум с `clang-analyzer-*`, `bugprone-*`,
   `performance-*`, `concurrency-*`, `cppcoreguidelines-owning-memory`,
   `cppcoreguidelines-pro-bounds-*` и lifetime-релевантными checks;
-- Clang Static Analyzer через `scan-build`;
 - MSVC `/analyze` и C++ Core Check на Windows;
-- warnings уровня `/W4` для MSVC и текущий строгий набор GCC/Clang.
+- warnings уровня `/W4` для MSVC.
 
-На момент фиксации этого контракта sanitizer/analyzer presets ещё не подключены
-к CMake. Это известный инфраструктурный долг и обязательная следующая задача,
-а не повод считать такие проверки выполненными.
+Windows ASan доступен через штатную конфигурацию `windows-asan`. Отдельные
+analyzer targets ещё не подключены к CMake: это известный инфраструктурный долг,
+а не повод считать такие проверки выполненными. Linux-only analyzer workflow
+до завершения MVP запускать запрещено.
 
 Новые high-confidence предупреждения об утечках, lifetime, bounds, integer
 overflow, uninitialized memory и data race блокируют завершение задачи.
@@ -166,13 +185,12 @@ Suppression допустим только рядом с кодом, с прич�
 
 ### 4.2 Dynamic analysis
 
-- Linux memory/lifetime gate: ASan + UBSan + LeakSanitizer.
-- Windows memory gate: MSVC или Clang AddressSanitizer; недоступные leak checks
-  компенсируются отдельным Linux LSan run и resource counters.
-- Изменения многопоточности: отдельный ThreadSanitizer run на Linux. TSan не
-  смешивается с ASan в одном бинарнике.
-- Для сложных CPU lifetime-проблем допустимы Dr. Memory/Valgrind, но они не
-  заменяют sanitizer build.
+- Текущий memory/lifetime gate: нативный Windows MSVC AddressSanitizer в
+  `build/windows-asan` и resource counters.
+- Linux ASan/UBSan/LeakSanitizer/ThreadSanitizer и Valgrind отложены вместе с
+  Linux target и в рамках Windows MVP запускаться не должны.
+- Для сложных CPU lifetime-проблем на Windows допустим Dr. Memory, но он не
+  заменяет `windows-asan`.
 - Должен существовать repeated startup/shutdown и resize/mode-switch soak test.
 
 ### 4.3 Vulkan и GPU memory
@@ -181,7 +199,8 @@ Suppression допустим только рядом с кодом, с прич�
   объектов, если слой установлен.
 - Включать object-lifetime и synchronization validation для соответствующих
   изменений; performance warnings анализировать, а не бездумно подавлять.
-- VMA Debug/recording/statistics режим SHOULD быть доступен отдельной сборкой.
+- VMA Debug/recording/statistics режим SHOULD включаться опцией внутри
+  `windows-debug` или `windows-asan`, не создавая четвёртый build tree.
 - На shutdown Debug-сборка SHOULD проверять live allocation/object counters и
   печатать VMA statistics при ненулевом остатке.
 - Ошибка validation, живой GPU allocation или неуничтоженный Vulkan object
@@ -373,6 +392,11 @@ benchmark без отдельной задачи: они не помогают �
 `build/`, `.tools/`, `benchmark.json` и `pipeline_cache.bin` являются
 генерируемыми и не коммитятся.
 
+Внутри `build/` MUST находиться только `windows-release`, `windows-debug` и
+`windows-asan`. CMake/Ninja manifests хранятся только внутри соответствующего
+build tree; временные build tree, Linux-каталоги, package staging, screenshots и
+benchmark JSON в корне `build/` запрещены.
+
 При изменении shader source обновить соответствующий SPIR-V, выполнить
 `spirv-val` и закоммитить source и binary вместе. Целевой environment:
 Vulkan 1.3 / SPIR-V 1.5.
@@ -383,10 +407,18 @@ Vulkan 1.3 / SPIR-V 1.5.
 
 ```bat
 scripts\configure_windows.cmd Debug
+scripts\configure_windows.cmd Release
+scripts\configure_windows.cmd ASan
 scripts\build_windows.cmd Debug
 scripts\build_windows.cmd Release
+scripts\build_windows.cmd ASan
 scripts\run_windows.cmd --no-validation
 ```
+
+`Debug`, `Release` и `ASan` обязаны использовать соответственно только
+`build\windows-debug`, `build\windows-release` и `build\windows-asan`.
+Конфигурация `ASan` использует MSVC AddressSanitizer поверх
+`RelWithDebInfo`. Создавать четвёртый build tree ради разовой проверки нельзя.
 
 Benchmark без искусственного ограничения:
 
@@ -397,13 +429,10 @@ scripts\run_windows.cmd --benchmark --warmup 5 --duration 15 --present immediate
 Из WSL Windows-скрипт вызывается через `cmd.exe /d /c`; результатом считается
 Windows `.exe`, а не случайно собранный Linux-бинарник.
 
-Linux остаётся обязательной целью:
-
-```bash
-cmake -S . -B build/linux-release -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build/linux-release --parallel
-ctest --test-dir build/linux-release --output-on-failure
-```
+Агенты MUST NOT запускать `cmake`, компилятор, `ctest`, sanitizer, analyzer или
+benchmark как Linux-процесс для этого репозитория. Linux verification не
+является пропущенным gate текущего MVP и не должна предлагаться или выполняться
+без явного изменения платформенной политики пользователем.
 
 Если Vulkan SDK/validation layer, sanitizer или analyzer недоступен, выполнить
 остальные проверки и явно назвать пропущенный gate.
@@ -414,12 +443,13 @@ ctest --test-dir build/linux-release --output-on-failure
 2. Найти реальный bottleneck/bug и записать короткий план.
 3. Сделать минимально целостное изменение.
 4. Проверить lifetime, thread ownership и synchronization вручную.
-5. Собрать затронутые Debug и Release конфигурации.
-6. Запустить unit tests, relevant validation/analyzers/sanitizers.
+5. Собрать затронутые Windows Debug и Release конфигурации.
+6. Запустить Windows unit tests и релевантные validation/analyzer/ASan gates.
 7. Для shader change выполнить shader compile + `spirv-val`.
 8. Для performance change провести контролируемый A/B benchmark.
-9. Выполнить `git diff --check` и просмотреть полный diff.
-10. Сообщить результат, цифры, ограничения и непроверенные gates.
+9. Убедиться, что в `build/` нет ничего кроме трёх разрешённых build tree.
+10. Выполнить `git diff --check` и просмотреть полный diff.
+11. Сообщить результат, цифры, ограничения и непроверенные Windows gates.
 
 Не коммитить и не push-ить без явной просьбы пользователя. Не включать в commit
 build outputs, caches, local tools, screenshots или случайные benchmark results.
@@ -432,8 +462,10 @@ build outputs, caches, local tools, screenshots или случайные benchm
 - не вносит raw owning pointers или неясный cross-thread lifetime;
 - не создаёт data race и не нарушает Vulkan external synchronization;
 - собирается соответствующей Windows-конфигурацией;
-- проходит CTest и релевантные regression tests;
+- проходит Windows CTest и релевантные regression tests;
 - проходит доступные static analysis/sanitizer/validation gates;
+- не создаёт Linux build tree и сохраняет только три разрешённых каталога в
+  `build/`;
 - не добавляет steady-state allocations или скрытый global lock;
 - не ухудшает performance без измеренного и объяснённого компромисса;
 - optional GPU path имеет feature check и fallback;

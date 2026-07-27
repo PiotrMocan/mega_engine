@@ -9,8 +9,10 @@ if /I "%VCR_CONFIG%"=="Debug" (
     set "VCR_BUILD_DIR=%VCR_ROOT%\build\windows-debug"
 ) else if /I "%VCR_CONFIG%"=="Release" (
     set "VCR_BUILD_DIR=%VCR_ROOT%\build\windows-release"
+) else if /I "%VCR_CONFIG%"=="ASan" (
+    set "VCR_BUILD_DIR=%VCR_ROOT%\build\windows-asan"
 ) else (
-    echo Usage: %~nx0 [Debug^|Release]
+    echo Usage: %~nx0 [Debug^|Release^|ASan]
     exit /b 2
 )
 

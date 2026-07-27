@@ -4,15 +4,23 @@ setlocal EnableExtensions
 for %%I in ("%~dp0..") do set "VCR_ROOT=%%~fI"
 set "VCR_CONFIG=%~1"
 if not defined VCR_CONFIG set "VCR_CONFIG=Release"
+set "VCR_ASAN_FLAGS="
 
 if /I "%VCR_CONFIG%"=="Debug" (
     set "VCR_BUILD_DIR=%VCR_ROOT%\build\windows-debug"
+    set "VCR_CMAKE_BUILD_TYPE=Debug"
     set "VCR_VALIDATION=ON"
 ) else if /I "%VCR_CONFIG%"=="Release" (
     set "VCR_BUILD_DIR=%VCR_ROOT%\build\windows-release"
+    set "VCR_CMAKE_BUILD_TYPE=Release"
     set "VCR_VALIDATION=OFF"
+) else if /I "%VCR_CONFIG%"=="ASan" (
+    set "VCR_BUILD_DIR=%VCR_ROOT%\build\windows-asan"
+    set "VCR_CMAKE_BUILD_TYPE=RelWithDebInfo"
+    set "VCR_VALIDATION=ON"
+    set "VCR_ASAN_FLAGS=-DCMAKE_CXX_FLAGS=/fsanitize=address"
 ) else (
-    echo Usage: %~nx0 [Debug^|Release]
+    echo Usage: %~nx0 [Debug^|Release^|ASan]
     exit /b 2
 )
 
@@ -57,8 +65,9 @@ if errorlevel 1 exit /b 1
     -B "%VCR_BUILD_DIR%" ^
     -G Ninja ^
     -DCMAKE_MAKE_PROGRAM="%VCR_NINJA%" ^
-    -DCMAKE_BUILD_TYPE="%VCR_CONFIG%" ^
+    -DCMAKE_BUILD_TYPE="%VCR_CMAKE_BUILD_TYPE%" ^
     -DVCR_ENABLE_VALIDATION="%VCR_VALIDATION%" ^
-    -DBUILD_TESTING=ON
+    -DBUILD_TESTING=ON ^
+    %VCR_ASAN_FLAGS%
 
 exit /b %errorlevel%
