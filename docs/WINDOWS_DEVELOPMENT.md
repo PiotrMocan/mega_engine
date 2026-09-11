@@ -58,6 +58,39 @@ $env:VK_VALIDATION_VALIDATE_SYNC = 'true'
 После проверки переменную можно убрать через
 `Remove-Item Env:VK_VALIDATION_VALIDATE_SYNC`.
 
+Автоматическая проверка повторных startup/shutdown, resize, FIFO/IMMEDIATE,
+off/SMAA/FSR, instancing и compute workload:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\render_validation_windows.ps1 -ExePath "$PWD\build\windows-debug\bin\vulkan_cube.exe" -Startups 3 -Cycles 2
+```
+
+Скрипт сам включает synchronization validation, получает завершённые GPU
+captures, проверяет stderr и нулевой остаток VMA allocations. Логи находятся
+в `render-validation` внутри выбранного build tree. Для ASan используйте
+`windows-asan/bin/vulkan_cube.exe` в окружении `vcvars64.bat`. Это ограниченный
+автоматический soak; minimize/fullscreen и длительный asset churn в него не входят.
+
+## Benchmark JSON
+
+`schema_version: 2` сохраняет workload mode, build type, число triangles,
+фактическое время measurement и подробные CPU/GPU timings. FPS равен числу
+завершённых CPU render iterations за measurement seconds. CPU frame
+измеряется start-to-start, включая window title/metrics work и scheduler gaps.
+Это не display latency и не количество кадров, реально показанных монитором.
+
+`one_percent_low_fps` — обратная величина среднего времени самых медленных
+`ceil(N / 100)` кадров всего measurement interval. До прогрева выделяется
+массив максимум на 1 000 000 samples (8 MB); переполнение делает benchmark
+неуспешным вместо выдачи усечённого percentile. `percentile_scope` и
+`percentile_samples` описывают охват. Старые JSON использовали последние 2000
+samples, поэтому их 1% low напрямую сравнивать нельзя. UI/F2 сохраняют rolling
+window; редактор обновляет snapshot раз в 250 ms.
+
+Недоступные GPU timings записываются как JSON `null`. GPU timestamps читаются
+после frame fence без query WAIT и относятся к более раннему submission;
+первые samples на границе прогрева могут относиться к предыдущему кадру.
+
 ## Шейдеры
 
 ```powershell
@@ -84,11 +117,16 @@ Ninja 1.12.1, AMD Radeon RX 6800. Vulkan SDK 1.4.313.2 восстановлен:
 - MCP smoke прошёл в Release, Debug и ASan; последние два запускались с validation.
 - Все 34 SPIR-V binaries прошли `spirv-val`.
 - `vulkaninfoSDK.exe --summary` обнаружил Khronos validation layer.
-- Расширенная synchronization validation обнаружила `WRITE_AFTER_READ` и
-  `PRESENT_AFTER_WRITE` для swapchain. Это незакрытый blocker корректности
-  renderer; обычный smoke его не выявил. Лог текущего прогона:
-  `build/windows-debug/environment-validation.log` (генерируемый, не в Git).
-- Static analyzer targets пока не подключены к CMake; `/analyze` и clang-tidy
-  не запускались. Полный resize/mode-switch soak не выполнялся.
+- Исходная synchronization validation обнаружила `WRITE_AFTER_READ` и
+  `PRESENT_AFTER_WRITE` для swapchain. В последующем аудите исправлены acquire
+  dependency, present signal scope и depth reuse; Debug/ASan сценарии
+  `render_validation_windows.ps1` проходят без ошибок, с нулевыми VMA allocations.
+- Проверены graceful failure при отсутствующем shader, а также startup/render/
+  shutdown редактора с synchronization validation. Подробности и performance
+  результаты находятся в [аудите renderer](RENDERER_AUDIT.md).
+- Нативный clang-tidy запускался для renderer, application, metrics, FSR,
+  Vulkan context и GPU buffer. Остались общие guideline/style предупреждения;
+  это не полностью чистый static-analysis gate всего проекта. Отдельные
+  analyzer targets пока не подключены к CMake; MSVC `/analyze` не запускался.
 
 Установка SDK: https://vulkan.lunarg.com/doc/view/1.4.313.0/windows/getting_started.html

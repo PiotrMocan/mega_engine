@@ -38,7 +38,9 @@ display и внутренним render resolution. Оба разрешения �
 сначала записываются в общий HDR color target. Поэтому post-process покрывает
 одновременно силуэты объектов, границы материалов и видимые края теней:
 
-- SMAA выполняет color edge detection, blending-weight и neighborhood passes;
+- SMAA пишет только HDR color и обычный depth attachment, затем выполняет
+  color edge detection, blending-weight и neighborhood passes; motion vectors
+  и отдельный R32F depth output этому spatial методу не нужны;
 - FSR получает HDR color, non-jittered motion vectors и depth, выполняет
   temporal upscale/AA, затем результат компонуется в swapchain;
 - HUD добавляется последним и не влияет на изображение, которое анализирует
@@ -51,7 +53,18 @@ filtering. Сглаживание применяется к итоговым в�
 AA targets принадлежат конкретному `FrameContext`, поэтому CPU не перезаписывает
 изображение, пока GPU использует его. Images, samplers, descriptors, pipelines и
 FSR context создаются вне steady-state frame loop и освобождаются после
-`device idle` при resize/shutdown.
+`device idle` при изменении scene extent/formats или shutdown. Смена только
+present mode сохраняет offscreen targets и FSR context. Обе geometry pipeline
+вариации заранее создаются из существующих SPIR-V.
+
+Temporal shaders записывают `previousNdc - currentNdc`. В Vulkan backend
+SDK 1.1.4 это переводится в пиксели через `motionVectorScale = renderSize / 2`:
+внутри SDK scale делится на render size для получения UV offsets. Jitter,
+передаваемый FSR, соответствует фактическому смещению пикселя после projection
+и положительного Vulkan viewport; контракт проверяется CPU-тестом.
+Пока instances не хранят previous object transforms, редактирование сцены
+сбрасывает историю. Корректная temporal reprojection анимированных объектов
+требует следующего этапа runtime scene architecture.
 
 ## Версия FSR и платформы
 

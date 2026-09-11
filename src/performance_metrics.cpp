@@ -5,10 +5,12 @@
 #include <cmath>
 #include <exception>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <stdexcept>
 
 namespace vcr {
 namespace {
@@ -156,7 +158,7 @@ void PerformanceMetrics::record_frame(const FrameTimings& timings) noexcept {
     }
 }
 
-PerformanceSnapshot PerformanceMetrics::snapshot() const noexcept {
+PerformanceSnapshot PerformanceMetrics::snapshot(const bool include_percentile) const noexcept {
     PerformanceSnapshot result{};
     result.frames_rendered = frames_rendered_;
     result.timed_frames =
@@ -209,6 +211,10 @@ PerformanceSnapshot PerformanceMetrics::snapshot() const noexcept {
             total_frame_ms;
     }
 
+    if (!include_percentile) {
+        return result;
+    }
+
     // Common real-time convention: 1% low FPS is the reciprocal of the mean
     // duration of the slowest 1% of frames in the bounded rolling window.
     const std::size_t slow_frame_count =
@@ -253,6 +259,39 @@ PerformanceSnapshot PerformanceMetrics::snapshot() const noexcept {
     }
 
     return result;
+}
+
+void BenchmarkFrameSamples::prepare(const std::size_t capacity) {
+    if (capacity == 0U || capacity > maximum_samples) {
+        throw std::invalid_argument("Invalid benchmark sample capacity.");
+    }
+    samples_.resize(capacity);
+    count_ = 0;
+    incomplete_ = false;
+}
+
+void BenchmarkFrameSamples::record(const double frame_ms) noexcept {
+    if (!std::isfinite(frame_ms) || frame_ms <= 0.0 ||
+        count_ >= samples_.size()) {
+        incomplete_ = true;
+        return;
+    }
+    samples_[count_++] = frame_ms;
+}
+
+double BenchmarkFrameSamples::one_percent_low_fps() {
+    if (incomplete_ || count_ == 0U) {
+        return 0.0;
+    }
+    // Only invoked after measurement has stopped. No work is added to the
+    // frame loop beyond one bounded append.
+    std::sort(samples_.begin(), samples_.begin() + count_, std::greater<double>{});
+    const std::size_t count = (count_ + 99U) / 100U;
+    double total = 0.0;
+    for (std::size_t index = 0; index < count; ++index) {
+        total += samples_[index];
+    }
+    return static_cast<double>(count) * 1000.0 / total;
 }
 
 BenchmarkController::BenchmarkController(
@@ -363,12 +402,18 @@ BenchmarkResult make_benchmark_result(
     result.average_gpu_frame_ms =
         is_available(snapshot.average.gpu_frame_ms)
         ? snapshot.average.gpu_frame_ms
-        : 0.0;
+        : unavailable_timing_ms;
     result.average_fence_wait_ms =
         is_available(snapshot.average.fence_wait_ms)
         ? snapshot.average.fence_wait_ms
         : 0.0;
     result.frames_rendered = snapshot.frames_rendered;
+    result.average_acquire_ms = snapshot.average.acquire_ms;
+    result.average_command_record_ms = snapshot.average.command_record_ms;
+    result.average_queue_submit_ms = snapshot.average.queue_submit_ms;
+    result.average_present_ms = snapshot.average.present_ms;
+    result.average_gpu_geometry_ms = snapshot.average.gpu_geometry_ms;
+    result.average_gpu_workload_ms = snapshot.average.gpu_workload_ms;
     return result;
 }
 
@@ -380,6 +425,44 @@ std::string benchmark_result_to_json(const BenchmarkResult& result) {
         result.present_mode.size() + result.anti_aliasing.size() +
         result.anti_aliasing_quality.size());
     output.append("{\n");
+
+    const auto timing = [&output](const char* key, const double value) {
+        append_key(output, key);
+        if (is_available(value)) {
+            append_json_number(output, value);
+        } else {
+            output.append("null");
+        }
+        output.append(",\n");
+    };
+    append_key(output, "schema_version");
+    append_json_u64(output, 2U);
+    output.append(",\n");
+    append_key(output, "mode");
+    append_json_string(output, result.mode);
+    output.append(",\n");
+    append_key(output, "build_type");
+    append_json_string(output, result.build_type);
+    output.append(",\n");
+    append_key(output, "triangles");
+    append_json_u64(output, result.triangles);
+    output.append(",\n");
+    append_key(output, "measurement_seconds");
+    append_json_number(output, result.measurement_seconds);
+    output.append(",\n");
+    append_key(output, "percentile_samples");
+    append_json_u64(output, result.percentile_samples);
+    output.append(",\n");
+    append_key(output, "percentile_scope");
+    append_json_string(output, result.percentile_samples > 0U
+                                  ? "full_measurement" : "rolling_window");
+    output.append(",\n");
+    timing("average_acquire_ms", result.average_acquire_ms);
+    timing("average_command_record_ms", result.average_command_record_ms);
+    timing("average_queue_submit_ms", result.average_queue_submit_ms);
+    timing("average_present_ms", result.average_present_ms);
+    timing("average_gpu_geometry_ms", result.average_gpu_geometry_ms);
+    timing("average_gpu_workload_ms", result.average_gpu_workload_ms);
 
     append_key(output, "gpu");
     append_json_string(output, result.gpu);
@@ -417,9 +500,7 @@ std::string benchmark_result_to_json(const BenchmarkResult& result) {
     append_key(output, "average_cpu_frame_ms");
     append_json_number(output, result.average_cpu_frame_ms);
     output.append(",\n");
-    append_key(output, "average_gpu_frame_ms");
-    append_json_number(output, result.average_gpu_frame_ms);
-    output.append(",\n");
+    timing("average_gpu_frame_ms", result.average_gpu_frame_ms);
     append_key(output, "average_fence_wait_ms");
     append_json_number(output, result.average_fence_wait_ms);
     output.append(",\n");
@@ -460,14 +541,23 @@ bool write_benchmark_json(
         }
         return true;
     } catch (const std::exception& exception) {
-        if (error != nullptr) {
-            *error = "failed to write benchmark output: ";
-            error->append(exception.what());
+        try {
+            if (error != nullptr) {
+                *error = "failed to write benchmark output: ";
+                error->append(exception.what());
+            }
+        } catch (...) {
+            // Reporting an allocation failure must not allocate again.
+            if (error != nullptr) { error->clear(); }
         }
         return false;
     } catch (...) {
-        if (error != nullptr) {
-            *error = "failed to write benchmark output";
+        try {
+            if (error != nullptr) {
+                *error = "failed to write benchmark output";
+            }
+        } catch (...) {
+            if (error != nullptr) { error->clear(); }
         }
         return false;
     }

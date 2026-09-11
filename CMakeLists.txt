@@ -473,6 +473,7 @@ function(vcr_configure_executable target editor_enabled)
         GLM_FORCE_DEPTH_ZERO_TO_ONE
         GLM_FORCE_RADIANS
         "VCR_EDITOR_ENABLED=${editor_enabled}"
+        "VCR_BUILD_TYPE=\"$<CONFIG>\""
         "VCR_VALIDATION_DEFAULT=$<IF:$<OR:$<BOOL:${VCR_ENABLE_VALIDATION}>,$<CONFIG:Debug>>,1,0>"
         "VCR_HAS_FSR3=$<IF:$<BOOL:${VCR_HAS_FSR3}>,1,0>"
     )

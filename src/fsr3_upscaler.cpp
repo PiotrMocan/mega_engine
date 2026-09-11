@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -162,9 +163,8 @@ void Fsr3Upscaler::shutdown() noexcept {
         const ffxReturnCode_t result =
             destroy_context_(&api_context_, nullptr);
         if (result != FFX_API_RETURN_OK) {
-            std::cerr
-                << "warning: ffxDestroyContext failed with code "
-                << result << '\n';
+            std::fprintf(stderr, "warning: ffxDestroyContext failed with code %u\n",
+                         static_cast<unsigned>(result));
         }
         api_context_ = nullptr;
     }
@@ -179,11 +179,8 @@ void Fsr3Upscaler::shutdown() noexcept {
     backend_description_ = {};
     context_description_ = {};
 #endif
-    version_ = "FSR 3 unavailable";
-    if (unavailable_reason_.empty()) {
-        unavailable_reason_ =
-            "the FidelityFX Vulkan context is not initialized";
-    }
+    // Accessors supply literal fallback text; shutdown never allocates it.
+    version_.clear();
     reset_history_ = true;
 }
 
@@ -306,13 +303,12 @@ void Fsr3Upscaler::dispatch(const Fsr3Dispatch& description) {
     dispatch_description.output = wrap_resource(
         *description.output,
         FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
-    dispatch_description.jitterOffset = {
-        -description.jitter.x,
-        -description.jitter.y,
-    };
+    const auto pixel_jitter = vulkan_pixel_jitter(description.jitter);
+    dispatch_description.jitterOffset = {pixel_jitter.x, pixel_jitter.y};
+    const auto motion_scale = ndc_motion_to_pixel_scale(
+        description.render_extent.width, description.render_extent.height);
     dispatch_description.motionVectorScale = {
-        static_cast<float>(description.render_extent.width),
-        static_cast<float>(description.render_extent.height),
+        motion_scale.x, motion_scale.y,
     };
     dispatch_description.renderSize = {
         description.render_extent.width,
@@ -325,7 +321,7 @@ void Fsr3Upscaler::dispatch(const Fsr3Dispatch& description) {
     dispatch_description.enableSharpening = true;
     dispatch_description.sharpness = 0.2F;
     dispatch_description.frameTimeDelta =
-        std::clamp(description.frame_time_ms, 1.0F, 1000.0F);
+        std::clamp(description.frame_time_ms, 0.001F, 1000.0F);
     dispatch_description.preExposure = 1.0F;
     dispatch_description.reset = reset_history_;
     dispatch_description.cameraNear = 0.1F;

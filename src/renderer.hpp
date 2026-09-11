@@ -1,5 +1,6 @@
 #pragma once
 
+#include "device_object.hpp"
 #include "frame_context.hpp"
 #include "fsr3_upscaler.hpp"
 #include "gpu_buffer.hpp"
@@ -92,8 +93,9 @@ public:
     [[nodiscard]] const Swapchain& swapchain() const noexcept {
         return swapchain_;
     }
-    [[nodiscard]] PerformanceSnapshot metrics_snapshot() const noexcept {
-        return metrics_.snapshot();
+    [[nodiscard]] PerformanceSnapshot metrics_snapshot(
+        bool include_percentile = true) const noexcept {
+        return metrics_.snapshot(include_percentile);
     }
     [[nodiscard]] RunMode mode() const noexcept { return mode_; }
     [[nodiscard]] std::uint32_t instance_count() const noexcept;
@@ -282,7 +284,7 @@ private:
     );
     void rebuild_swapchain();
     void recreate_swapchain(VkPresentModeKHR preferred_mode);
-    [[nodiscard]] VkShaderModule load_shader(const std::filesystem::path& path) const;
+    [[nodiscard]] ShaderModule load_shader(const std::filesystem::path& path) const;
 #if VCR_EDITOR_ENABLED
     void create_editor_viewport(VkExtent2D extent);
     void destroy_editor_viewport() noexcept;
@@ -323,14 +325,23 @@ private:
     VkPipeline sky_pipeline_ = VK_NULL_HANDLE;
     VkPipeline scene_shadow_pipeline_ = VK_NULL_HANDLE;
     VkPipeline terrain_shadow_pipeline_ = VK_NULL_HANDLE;
-    VkPipeline aa_pipeline_ = VK_NULL_HANDLE;
-    VkPipeline aa_scene_pipeline_ = VK_NULL_HANDLE;
+    DeviceObject<VkPipeline> aa_pipeline_{};
+    DeviceObject<VkPipeline> aa_scene_pipeline_{};
 #if VCR_EDITOR_ENABLED
     VkPipeline editor_model_pipeline_ = VK_NULL_HANDLE;
-    VkPipeline aa_editor_model_pipeline_ = VK_NULL_HANDLE;
+    DeviceObject<VkPipeline> aa_editor_model_pipeline_{};
 #endif
-    VkPipeline aa_terrain_pipeline_ = VK_NULL_HANDLE;
-    VkPipeline aa_sky_pipeline_ = VK_NULL_HANDLE;
+    DeviceObject<VkPipeline> aa_terrain_pipeline_{};
+    DeviceObject<VkPipeline> aa_sky_pipeline_{};
+    // Spatial AA needs only HDR color; temporal AA additionally writes motion
+    // and depth. Prewarm both paths so switching methods does not compile.
+    struct SpatialPipelines {
+        DeviceObject<VkPipeline> cubes{};
+        DeviceObject<VkPipeline> scene{};
+        DeviceObject<VkPipeline> models{};
+        DeviceObject<VkPipeline> terrain{};
+        DeviceObject<VkPipeline> sky{};
+    } smaa_geometry_{};
     VkDescriptorSetLayout anti_aliasing_descriptor_set_layout_ =
         VK_NULL_HANDLE;
     VkPipelineLayout post_process_pipeline_layout_ = VK_NULL_HANDLE;

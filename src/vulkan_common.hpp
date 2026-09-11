@@ -2,8 +2,9 @@
 
 #include <volk.h>
 
-#include <cstdlib>
 #include <iostream>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <cstdint>
@@ -11,8 +12,9 @@
 namespace vcr {
 
 [[noreturn]] inline void fatal(const std::string_view message) {
-    std::cerr << "fatal: " << message << '\n';
-    std::exit(EXIT_FAILURE);
+    // Failure is outside the successful hot path. Both executables catch at
+    // main(), allowing application/device resources to unwind first.
+    throw std::runtime_error(std::string(message));
 }
 
 inline void check_vk(
@@ -23,7 +25,9 @@ inline void check_vk(
     if (result != VK_SUCCESS) {
         std::cerr << "Vulkan call failed: " << expression << " -> "
                   << static_cast<int>(result) << " at " << file << ':' << line << '\n';
-        std::exit(EXIT_FAILURE);
+        throw std::runtime_error(
+            std::string(expression) + " failed with VkResult " +
+            std::to_string(static_cast<int>(result)));
     }
 }
 

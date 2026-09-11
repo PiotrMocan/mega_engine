@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -155,12 +156,13 @@ public:
         pool_info.queueFamilyIndex =
             context_.queue_families().graphics;
         VK_CHECK(vkCreateCommandPool(
-            context_.device(), &pool_info, nullptr, &command_pool_));
+            context_.device(), &pool_info, nullptr,
+            command_pool_.put(context_.device(), vkDestroyCommandPool)));
 
         VkCommandBufferAllocateInfo allocate_info{};
         allocate_info.sType =
             VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        allocate_info.commandPool = command_pool_;
+        allocate_info.commandPool = command_pool_.get();
         allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         allocate_info.commandBufferCount = 1;
         VK_CHECK(vkAllocateCommandBuffers(
@@ -169,7 +171,8 @@ public:
         VkFenceCreateInfo fence_info{};
         fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         VK_CHECK(vkCreateFence(
-            context_.device(), &fence_info, nullptr, &fence_));
+            context_.device(), &fence_info, nullptr,
+            fence_.put(context_.device(), vkDestroyFence)));
 
         VkCommandBufferBeginInfo begin_info{};
         begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -179,12 +182,13 @@ public:
     }
 
     ~ImmediateSubmission() noexcept {
-        if (fence_ != VK_NULL_HANDLE) {
-            vkDestroyFence(context_.device(), fence_, nullptr);
-        }
-        if (command_pool_ != VK_NULL_HANDLE) {
-            vkDestroyCommandPool(
-                context_.device(), command_pool_, nullptr);
+        if (pending_) {
+            // A failed wait may leave work pending. Try to retire it before
+            // members (and the caller's staging buffer) are destroyed.
+            const VkResult result = vkDeviceWaitIdle(context_.device());
+            if (result != VK_SUCCESS) {
+                std::fprintf(stderr, "Upload cleanup wait failed: %d\n", result);
+            }
         }
     }
 
@@ -212,18 +216,22 @@ public:
         submit_info.commandBufferInfoCount = 1;
         submit_info.pCommandBufferInfos = &command_info;
         VK_CHECK(vkQueueSubmit2(
-            context_.graphics_queue(), 1, &submit_info, fence_));
-        VK_CHECK(vkWaitForFences(
-            context_.device(), 1, &fence_, VK_TRUE, UINT64_MAX));
+            context_.graphics_queue(), 1, &submit_info, fence_.get()));
         submitted_ = true;
+        pending_ = true;
+        const VkFence fence = fence_.get();
+        VK_CHECK(vkWaitForFences(
+            context_.device(), 1, &fence, VK_TRUE, UINT64_MAX));
+        pending_ = false;
     }
 
 private:
     VulkanContext& context_;
-    VkCommandPool command_pool_ = VK_NULL_HANDLE;
+    DeviceObject<VkCommandPool> command_pool_{};
     VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
-    VkFence fence_ = VK_NULL_HANDLE;
+    DeviceObject<VkFence> fence_{};
     bool submitted_ = false;
+    bool pending_ = false;
 };
 
 enum TimestampQuery : std::uint32_t {
@@ -590,6 +598,19 @@ void transition_tracked_image(
     current_layout = new_layout;
 }
 
+void transition_acquired_image(
+    const VkCommandBuffer command_buffer,
+    const VkImage image) {
+    // Chain the layout transition to the acquire semaphore wait in
+    // draw_frame(). Discarding contents does not remove the WSI dependency.
+    transition_image(
+        command_buffer, image, VK_IMAGE_ASPECT_COLOR_BIT,
+        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_NONE,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+}
+
 [[nodiscard]] std::vector<std::byte> load_dds_payload(
     const std::filesystem::path& path,
     const std::size_t expected_payload_size) {
@@ -696,7 +717,10 @@ void Renderer::shutdown() noexcept {
     if (context_ == nullptr) {
         return;
     }
-    vkDeviceWaitIdle(context_->device());
+    const VkResult idle = vkDeviceWaitIdle(context_->device());
+    if (idle != VK_SUCCESS) {
+        std::fprintf(stderr, "Renderer cleanup wait failed: %d\n", idle);
+    }
     screenshot_readback_.destroy();
     completed_screenshot_.reset();
     screenshot_requested_ = false;
@@ -746,7 +770,9 @@ void Renderer::create_frame_contexts() {
         auto& frame = frames_[index];
         const VkCommandPoolCreateInfo pool_info{
             .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-            .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+            // The entire pool is reset after its frame fence; individual
+            // command-buffer reset support is unnecessary.
+            .flags = 0,
             .queueFamilyIndex = context_->queue_families().graphics,
         };
         VK_CHECK(vkCreateCommandPool(
@@ -1659,6 +1685,10 @@ bool Renderer::update_editor_scene(
             draw.instance_count;
     }
     editor_scene_revision_ = view.revision;
+    // Until runtime instances carry previous transforms, edits invalidate
+    // temporal history rather than reprojecting stale object positions.
+    temporal_history_valid_ = false;
+    fsr3_upscaler_.request_reset();
     return complete;
 }
 
@@ -3163,12 +3193,10 @@ void Renderer::update_frame_uniform(
     glm::mat4 projection = unjittered_projection;
     if (anti_aliasing_.method == AntiAliasingMethod::fsr3 &&
         fsr3_upscaler_.available()) {
-        projection[2][0] +=
-            -2.0F * current_jitter_.x /
-            static_cast<float>(extent.width);
-        projection[2][1] +=
-            2.0F * current_jitter_.y /
-            static_cast<float>(extent.height);
+        const auto projection_jitter = vulkan_projection_jitter(
+            current_jitter_, extent.width, extent.height);
+        projection[2][0] += projection_jitter.x;
+        projection[2][1] += projection_jitter.y;
     }
     const glm::mat4 view_projection = projection * view_matrix;
     FrameUniforms uniforms{};
@@ -3205,7 +3233,7 @@ void Renderer::update_frame_uniform(
     temporal_history_valid_ = true;
 }
 
-VkShaderModule Renderer::load_shader(const std::filesystem::path& path) const {
+ShaderModule Renderer::load_shader(const std::filesystem::path& path) const {
     const char* base_path = SDL_GetBasePath();
     if (base_path == nullptr) {
         fatal(SDL_GetError());
@@ -3236,9 +3264,10 @@ VkShaderModule Renderer::load_shader(const std::filesystem::path& path) const {
         .codeSize = words.size() * sizeof(std::uint32_t),
         .pCode = words.data(),
     };
-    VkShaderModule module = VK_NULL_HANDLE;
+    ShaderModule module;
     VK_CHECK(vkCreateShaderModule(
-        context_->device(), &info, nullptr, &module));
+        context_->device(), &info, nullptr,
+        module.put(context_->device(), vkDestroyShaderModule)));
     return module;
 }
 
@@ -3304,34 +3333,34 @@ void Renderer::save_pipeline_cache() const noexcept {
         return;
     }
     try {
-    std::size_t size = 0;
-    VkResult result = vkGetPipelineCacheData(
-        context_->device(), pipeline_cache_, &size, nullptr);
-    if (result != VK_SUCCESS || size == 0) {
-        std::cerr << "warning: unable to query pipeline cache data\n";
-        return;
-    }
-    std::vector<std::byte> data(size);
-    result = vkGetPipelineCacheData(
-        context_->device(), pipeline_cache_, &size, data.data());
-    if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
-        std::cerr << "warning: unable to read pipeline cache data\n";
-        return;
-    }
-    std::ofstream output(
-        "pipeline_cache.bin", std::ios::binary | std::ios::trunc);
-    if (!output) {
-        std::cerr << "warning: unable to open pipeline_cache.bin\n";
-        return;
-    }
-    output.write(
-        reinterpret_cast<const char*>(data.data()),
-        static_cast<std::streamsize>(size));
-    if (!output) {
-        std::cerr << "warning: unable to save pipeline_cache.bin\n";
-    }
+        std::size_t size = 0;
+        VkResult result = vkGetPipelineCacheData(
+            context_->device(), pipeline_cache_, &size, nullptr);
+        if (result != VK_SUCCESS || size == 0) {
+            std::cerr << "warning: unable to query pipeline cache data\n";
+            return;
+        }
+        std::vector<std::byte> data(size);
+        result = vkGetPipelineCacheData(
+            context_->device(), pipeline_cache_, &size, data.data());
+        if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+            std::cerr << "warning: unable to read pipeline cache data\n";
+            return;
+        }
+        std::ofstream output(
+            "pipeline_cache.bin", std::ios::binary | std::ios::trunc);
+        if (!output) {
+            std::cerr << "warning: unable to open pipeline_cache.bin\n";
+            return;
+        }
+        output.write(
+            reinterpret_cast<const char*>(data.data()),
+            static_cast<std::streamsize>(size));
+        if (!output) {
+            std::cerr << "warning: unable to save pipeline_cache.bin\n";
+        }
     } catch (...) {
-        std::cerr << "warning: exception while saving pipeline cache\n";
+        std::fputs("warning: exception while saving pipeline cache\n", stderr);
     }
 }
 
@@ -3520,19 +3549,21 @@ void Renderer::create_pipeline() {
         nullptr,
         &hud_pipeline_layout_));
 
-    const VkShaderModule vertex_module = load_shader("cube.vert.spv");
-    const VkShaderModule fragment_module = load_shader("cube.frag.spv");
+    const ShaderModule vertex_module =
+        load_shader("cube.vert.spv");
+    const ShaderModule fragment_module =
+        load_shader("cube.frag.spv");
     const std::array stages{
         VkPipelineShaderStageCreateInfo{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .stage = VK_SHADER_STAGE_VERTEX_BIT,
-            .module = vertex_module,
+            .module = vertex_module.get(),
             .pName = "main",
         },
         VkPipelineShaderStageCreateInfo{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-            .module = fragment_module,
+            .module = fragment_module.get(),
             .pName = "main",
         },
     };
@@ -3717,8 +3748,6 @@ void Renderer::create_pipeline() {
         &pipeline_info,
         nullptr,
         &pipeline_));
-    vkDestroyShaderModule(context_->device(), fragment_module, nullptr);
-    vkDestroyShaderModule(context_->device(), vertex_module, nullptr);
 
     const char* scene_vertex_shader = "scene.vert.spv";
 #if VCR_EDITOR_ENABLED
@@ -3726,21 +3755,21 @@ void Renderer::create_pipeline() {
         scene_vertex_shader = "editor_scene.vert.spv";
     }
 #endif
-    const VkShaderModule scene_vertex_module =
+    const ShaderModule scene_vertex_module =
         load_shader(scene_vertex_shader);
-    const VkShaderModule scene_fragment_module =
+    const ShaderModule scene_fragment_module =
         load_shader("scene.frag.spv");
     const std::array scene_stages{
         VkPipelineShaderStageCreateInfo{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .stage = VK_SHADER_STAGE_VERTEX_BIT,
-            .module = scene_vertex_module,
+            .module = scene_vertex_module.get(),
             .pName = "main",
         },
         VkPipelineShaderStageCreateInfo{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-            .module = scene_fragment_module,
+            .module = scene_fragment_module.get(),
             .pName = "main",
         },
     };
@@ -3761,23 +3790,23 @@ void Renderer::create_pipeline() {
         "shadowed scene graphics pipeline");
 #if VCR_EDITOR_ENABLED
     if (authored_scene_enabled_) {
-        const VkShaderModule editor_model_vertex_module =
+        const ShaderModule editor_model_vertex_module =
             load_shader("editor_model.vert.spv");
-        const VkShaderModule editor_model_fragment_module =
+        const ShaderModule editor_model_fragment_module =
             load_shader("editor_model.frag.spv");
         const std::array editor_model_stages{
             VkPipelineShaderStageCreateInfo{
                 .sType =
                     VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                 .stage = VK_SHADER_STAGE_VERTEX_BIT,
-                .module = editor_model_vertex_module,
+                .module = editor_model_vertex_module.get(),
                 .pName = "main",
             },
             VkPipelineShaderStageCreateInfo{
                 .sType =
                     VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                 .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-                .module = editor_model_fragment_module,
+                .module = editor_model_fragment_module.get(),
                 .pName = "main",
             },
         };
@@ -3801,21 +3830,13 @@ void Renderer::create_pipeline() {
             VK_OBJECT_TYPE_PIPELINE,
             handle_value(editor_model_pipeline_),
             "textured editor model graphics pipeline");
-        vkDestroyShaderModule(
-            context_->device(),
-            editor_model_fragment_module,
-            nullptr);
-        vkDestroyShaderModule(
-            context_->device(),
-            editor_model_vertex_module,
-            nullptr);
     }
 #endif
-    const VkShaderModule terrain_vertex_module =
+    const ShaderModule terrain_vertex_module =
         load_shader("terrain.vert.spv");
     std::array<VkPipelineShaderStageCreateInfo, 2> terrain_stages =
         scene_stages;
-    terrain_stages[0].module = terrain_vertex_module;
+    terrain_stages[0].module = terrain_vertex_module.get();
     VkGraphicsPipelineCreateInfo terrain_pipeline_info = pipeline_info;
     terrain_pipeline_info.stageCount =
         static_cast<std::uint32_t>(terrain_stages.size());
@@ -3833,12 +3854,6 @@ void Renderer::create_pipeline() {
         VK_OBJECT_TYPE_PIPELINE,
         handle_value(terrain_pipeline_),
         "indexed heightfield graphics pipeline");
-    vkDestroyShaderModule(
-        context_->device(), terrain_vertex_module, nullptr);
-    vkDestroyShaderModule(
-        context_->device(), scene_fragment_module, nullptr);
-    vkDestroyShaderModule(
-        context_->device(), scene_vertex_module, nullptr);
 
     const std::array aa_color_formats{
         aa_color_format,
@@ -3864,58 +3879,61 @@ void Renderer::create_pipeline() {
         .pColorAttachmentFormats = aa_color_formats.data(),
         .depthAttachmentFormat = swapchain_.depth_format(),
     };
+    VkPipelineRenderingCreateInfo spatial_rendering_info = aa_rendering_info;
+    spatial_rendering_info.colorAttachmentCount = 1U;
     const auto create_aa_geometry_pipeline =
         [this,
          &pipeline_info,
          &aa_rendering_info,
-         &aa_color_blend](
+         &aa_color_blend,
+         &spatial_rendering_info,
+         &color_blend](
             const std::filesystem::path& vertex_path,
             const std::filesystem::path& fragment_path,
             const VkPipelineVertexInputStateCreateInfo& vertex_input_state,
             const VkPipelineInputAssemblyStateCreateInfo& input_assembly_state,
-            const char* const debug_name) {
-            const VkShaderModule vertex = load_shader(vertex_path);
-            const VkShaderModule fragment = load_shader(fragment_path);
+            const char* const debug_name,
+            const bool temporal = true) {
+            const ShaderModule vertex =
+                load_shader(vertex_path);
+            const ShaderModule fragment =
+                load_shader(fragment_path);
             const std::array shader_stages{
                 VkPipelineShaderStageCreateInfo{
                     .sType =
                         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                     .stage = VK_SHADER_STAGE_VERTEX_BIT,
-                    .module = vertex,
+                    .module = vertex.get(),
                     .pName = "main",
                 },
                 VkPipelineShaderStageCreateInfo{
                     .sType =
                         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                     .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-                    .module = fragment,
+                    .module = fragment.get(),
                     .pName = "main",
                 },
             };
             VkGraphicsPipelineCreateInfo info = pipeline_info;
-            info.pNext = &aa_rendering_info;
+            info.pNext = temporal ? &aa_rendering_info : &spatial_rendering_info;
             info.stageCount =
                 static_cast<std::uint32_t>(shader_stages.size());
             info.pStages = shader_stages.data();
             info.pVertexInputState = &vertex_input_state;
             info.pInputAssemblyState = &input_assembly_state;
-            info.pColorBlendState = &aa_color_blend;
-            VkPipeline result = VK_NULL_HANDLE;
+            info.pColorBlendState = temporal ? &aa_color_blend : &color_blend;
+            DeviceObject<VkPipeline> result;
             VK_CHECK(vkCreateGraphicsPipelines(
                 context_->device(),
                 pipeline_cache_,
                 1,
                 &info,
                 nullptr,
-                &result));
+                result.put(context_->device(), vkDestroyPipeline)));
             context_->set_debug_name(
                 VK_OBJECT_TYPE_PIPELINE,
-                handle_value(result),
+                handle_value(result.get()),
                 debug_name);
-            vkDestroyShaderModule(
-                context_->device(), fragment, nullptr);
-            vkDestroyShaderModule(
-                context_->device(), vertex, nullptr);
             return result;
         };
     aa_pipeline_ = create_aa_geometry_pipeline(
@@ -3956,18 +3974,39 @@ void Renderer::create_pipeline() {
         terrain_input_assembly,
         "AA indexed heightfield graphics pipeline");
 
-    const VkShaderModule sky_vertex_module = load_shader("sky.vert.spv");
-    const VkShaderModule sky_fragment_module = load_shader("sky.frag.spv");
+    smaa_geometry_.cubes = create_aa_geometry_pipeline(
+        "cube.vert.spv", "cube.frag.spv", vertex_input, input_assembly,
+        "SMAA color-only instancing pipeline", false);
+    smaa_geometry_.scene = create_aa_geometry_pipeline(
+        scene_vertex_shader, "scene.frag.spv", vertex_input, input_assembly,
+        "SMAA color-only scene pipeline", false);
+#if VCR_EDITOR_ENABLED
+    if (authored_scene_enabled_) {
+        smaa_geometry_.models = create_aa_geometry_pipeline(
+            "editor_model.vert.spv", "editor_model.frag.spv",
+            editor_model_vertex_input, input_assembly,
+            "SMAA color-only model pipeline", false);
+    }
+#endif
+    smaa_geometry_.terrain = create_aa_geometry_pipeline(
+        "terrain.vert.spv", "scene.frag.spv",
+        terrain_vertex_input, terrain_input_assembly,
+        "SMAA color-only terrain pipeline", false);
+
+    const ShaderModule sky_vertex_module =
+        load_shader("sky.vert.spv");
+    const ShaderModule sky_fragment_module =
+        load_shader("sky.frag.spv");
     std::array<VkPipelineShaderStageCreateInfo, 2> sky_stages{};
     sky_stages[0].sType =
         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     sky_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    sky_stages[0].module = sky_vertex_module;
+    sky_stages[0].module = sky_vertex_module.get();
     sky_stages[0].pName = "main";
     sky_stages[1].sType =
         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     sky_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    sky_stages[1].module = sky_fragment_module;
+    sky_stages[1].module = sky_fragment_module.get();
     sky_stages[1].pName = "main";
 
     VkPipelineVertexInputStateCreateInfo sky_vertex_input{};
@@ -4000,11 +4039,20 @@ void Renderer::create_pipeline() {
         handle_value(sky_pipeline_),
         "sky graphics pipeline");
 
-    const VkShaderModule aa_sky_fragment_module =
+    VkGraphicsPipelineCreateInfo spatial_sky_info = sky_pipeline_info;
+    spatial_sky_info.pNext = &spatial_rendering_info;
+    VK_CHECK(vkCreateGraphicsPipelines(
+        context_->device(), pipeline_cache_, 1, &spatial_sky_info,
+        nullptr, smaa_geometry_.sky.put(context_->device(), vkDestroyPipeline)));
+    context_->set_debug_name(
+        VK_OBJECT_TYPE_PIPELINE, handle_value(smaa_geometry_.sky.get()),
+        "SMAA color-only sky pipeline");
+
+    const ShaderModule aa_sky_fragment_module =
         load_shader("sky_aa.frag.spv");
     std::array<VkPipelineShaderStageCreateInfo, 2> aa_sky_stages =
         sky_stages;
-    aa_sky_stages[1].module = aa_sky_fragment_module;
+    aa_sky_stages[1].module = aa_sky_fragment_module.get();
     VkGraphicsPipelineCreateInfo aa_sky_pipeline_info =
         sky_pipeline_info;
     aa_sky_pipeline_info.pNext = &aa_rendering_info;
@@ -4016,17 +4064,11 @@ void Renderer::create_pipeline() {
         1,
         &aa_sky_pipeline_info,
         nullptr,
-        &aa_sky_pipeline_));
+        aa_sky_pipeline_.put(context_->device(), vkDestroyPipeline)));
     context_->set_debug_name(
         VK_OBJECT_TYPE_PIPELINE,
-        handle_value(aa_sky_pipeline_),
+        handle_value(aa_sky_pipeline_.get()),
         "AA sky graphics pipeline");
-    vkDestroyShaderModule(
-        context_->device(), aa_sky_fragment_module, nullptr);
-    vkDestroyShaderModule(
-        context_->device(), sky_fragment_module, nullptr);
-    vkDestroyShaderModule(
-        context_->device(), sky_vertex_module, nullptr);
 
     if (shadow_map_format_ == VK_FORMAT_UNDEFINED) {
         fatal("Shadow-map format was not selected before pipeline creation.");
@@ -4057,12 +4099,12 @@ void Renderer::create_pipeline() {
     shadow_pipeline_info.pInputAssemblyState = &terrain_input_assembly;
     shadow_pipeline_info.pRasterizationState = &shadow_rasterization;
     shadow_pipeline_info.pColorBlendState = &shadow_color_blend;
-    const VkShaderModule terrain_shadow_vertex_module =
+    const ShaderModule terrain_shadow_vertex_module =
         load_shader("terrain_shadow.vert.spv");
     const VkPipelineShaderStageCreateInfo terrain_shadow_stage{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
         .stage = VK_SHADER_STAGE_VERTEX_BIT,
-        .module = terrain_shadow_vertex_module,
+        .module = terrain_shadow_vertex_module.get(),
         .pName = "main",
     };
     VkGraphicsPipelineCreateInfo terrain_shadow_pipeline_info =
@@ -4079,18 +4121,16 @@ void Renderer::create_pipeline() {
         VK_OBJECT_TYPE_PIPELINE,
         handle_value(terrain_shadow_pipeline_),
         "simplified heightfield shadow pipeline");
-    vkDestroyShaderModule(
-        context_->device(), terrain_shadow_vertex_module, nullptr);
 
     VkPipelineVertexInputStateCreateInfo scene_shadow_vertex_input =
         vertex_input;
     scene_shadow_vertex_input.vertexAttributeDescriptionCount = 1U;
-    const VkShaderModule scene_shadow_vertex_module =
+    const ShaderModule scene_shadow_vertex_module =
         load_shader("shadow.vert.spv");
     const VkPipelineShaderStageCreateInfo scene_shadow_stage{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
         .stage = VK_SHADER_STAGE_VERTEX_BIT,
-        .module = scene_shadow_vertex_module,
+        .module = scene_shadow_vertex_module.get(),
         .pName = "main",
     };
     VkGraphicsPipelineCreateInfo scene_shadow_pipeline_info =
@@ -4110,10 +4150,8 @@ void Renderer::create_pipeline() {
         VK_OBJECT_TYPE_PIPELINE,
         handle_value(scene_shadow_pipeline_),
         "PBR demo sample shadow pipeline");
-    vkDestroyShaderModule(
-        context_->device(), scene_shadow_vertex_module, nullptr);
 
-    const VkShaderModule fullscreen_vertex_module =
+    const ShaderModule fullscreen_vertex_module =
         load_shader("fullscreen.vert.spv");
     const VkPipelineRasterizationStateCreateInfo
         fullscreen_rasterization{
@@ -4154,7 +4192,7 @@ void Renderer::create_pipeline() {
     };
     const auto create_fullscreen_pipeline =
         [this,
-         fullscreen_vertex_module,
+         &fullscreen_vertex_module,
          &sky_vertex_input,
          &input_assembly,
          &viewport_state,
@@ -4168,21 +4206,21 @@ void Renderer::create_pipeline() {
             const VkPipelineColorBlendAttachmentState& attachment_blend,
             const VkFormat depth_format,
             const char* const debug_name) {
-            const VkShaderModule fullscreen_fragment_module =
+            const ShaderModule fullscreen_fragment_module =
                 load_shader(fragment_path);
             const std::array shader_stages{
                 VkPipelineShaderStageCreateInfo{
                     .sType =
                         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                     .stage = VK_SHADER_STAGE_VERTEX_BIT,
-                    .module = fullscreen_vertex_module,
+                    .module = fullscreen_vertex_module.get(),
                     .pName = "main",
                 },
                 VkPipelineShaderStageCreateInfo{
                     .sType =
                         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                     .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-                    .module = fullscreen_fragment_module,
+                    .module = fullscreen_fragment_module.get(),
                     .pName = "main",
                 },
             };
@@ -4228,8 +4266,6 @@ void Renderer::create_pipeline() {
                 VK_OBJECT_TYPE_PIPELINE,
                 handle_value(result),
                 debug_name);
-            vkDestroyShaderModule(
-                context_->device(), fullscreen_fragment_module, nullptr);
             return result;
         };
 
@@ -4286,8 +4322,6 @@ void Renderer::create_pipeline() {
         hud_blend_attachment,
         swapchain_.depth_format(),
         "anti-aliasing HUD pipeline");
-    vkDestroyShaderModule(
-        context_->device(), fullscreen_vertex_module, nullptr);
 
     const VkPushConstantRange compute_push_constants{
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
@@ -4306,13 +4340,14 @@ void Renderer::create_pipeline() {
         &compute_layout_info,
         nullptr,
         &compute_pipeline_layout_));
-    const VkShaderModule compute_module = load_shader("workload.comp.spv");
+    const ShaderModule compute_module =
+        load_shader("workload.comp.spv");
     const VkComputePipelineCreateInfo compute_info{
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = VkPipelineShaderStageCreateInfo{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-            .module = compute_module,
+            .module = compute_module.get(),
             .pName = "main",
         },
         .layout = compute_pipeline_layout_,
@@ -4324,10 +4359,15 @@ void Renderer::create_pipeline() {
         &compute_info,
         nullptr,
         &compute_pipeline_));
-    vkDestroyShaderModule(context_->device(), compute_module, nullptr);
 }
 
 void Renderer::destroy_pipeline() noexcept {
+    for (auto* const pipeline : {
+             &smaa_geometry_.cubes, &smaa_geometry_.scene,
+             &smaa_geometry_.models, &smaa_geometry_.terrain,
+             &smaa_geometry_.sky}) {
+        pipeline->reset();
+    }
     if (compute_pipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(context_->device(), compute_pipeline_, nullptr);
         compute_pipeline_ = VK_NULL_HANDLE;
@@ -4365,34 +4405,13 @@ void Renderer::destroy_pipeline() noexcept {
             pipeline = VK_NULL_HANDLE;
         }
     }
-    if (aa_sky_pipeline_ != VK_NULL_HANDLE) {
-        vkDestroyPipeline(
-            context_->device(), aa_sky_pipeline_, nullptr);
-        aa_sky_pipeline_ = VK_NULL_HANDLE;
-    }
+    aa_sky_pipeline_.reset();
 #if VCR_EDITOR_ENABLED
-    if (aa_editor_model_pipeline_ != VK_NULL_HANDLE) {
-        vkDestroyPipeline(
-            context_->device(),
-            aa_editor_model_pipeline_,
-            nullptr);
-        aa_editor_model_pipeline_ = VK_NULL_HANDLE;
-    }
+    aa_editor_model_pipeline_.reset();
 #endif
-    if (aa_scene_pipeline_ != VK_NULL_HANDLE) {
-        vkDestroyPipeline(
-            context_->device(), aa_scene_pipeline_, nullptr);
-        aa_scene_pipeline_ = VK_NULL_HANDLE;
-    }
-    if (aa_terrain_pipeline_ != VK_NULL_HANDLE) {
-        vkDestroyPipeline(
-            context_->device(), aa_terrain_pipeline_, nullptr);
-        aa_terrain_pipeline_ = VK_NULL_HANDLE;
-    }
-    if (aa_pipeline_ != VK_NULL_HANDLE) {
-        vkDestroyPipeline(context_->device(), aa_pipeline_, nullptr);
-        aa_pipeline_ = VK_NULL_HANDLE;
-    }
+    aa_scene_pipeline_.reset();
+    aa_terrain_pipeline_.reset();
+    aa_pipeline_.reset();
     if (sky_pipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(context_->device(), sky_pipeline_, nullptr);
         sky_pipeline_ = VK_NULL_HANDLE;
@@ -4550,13 +4569,10 @@ bool Renderer::draw_frame(
     const VkSemaphoreSubmitInfo signal_info{
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
         .semaphore = present_complete,
-        // FSR records compute work before the final graphics composite; the
-        // semaphore must include it. Screenshot frames additionally contain
-        // a transfer copy.
-        .stageMask = frame.screenshot_capture ||
-                anti_aliasing_.method == AntiAliasingMethod::fsr3
-            ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
-            : VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,
+        // Present must follow the final layout transition (dst stage NONE),
+        // including capture/compute commands. This is the submission's final
+        // signal, not an ALL_COMMANDS barrier between render passes.
+        .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
     };
     const VkSubmitInfo2 submit_info{
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
@@ -5138,7 +5154,7 @@ void Renderer::record_commands(
             vkCmdDraw(command_buffer, 3, 1, 0, 0);
         };
     const auto draw_hud =
-        [this, command_buffer]() {
+        [this, command_buffer, display_extent]() {
             struct HudPushConstants {
                 std::uint32_t method;
                 std::uint32_t quality;
@@ -5166,6 +5182,16 @@ void Renderer::record_commands(
                 0,
                 sizeof(hud_push),
                 &hud_push);
+            // Match hud.frag's pixel rectangle. Raster clipping avoids
+            // shading the full display only to discard outside this panel.
+            const VkRect2D hud_scissor{
+                {12, 12},
+                {std::min(468U, display_extent.width > 12U
+                                   ? display_extent.width - 12U : 0U),
+                 std::min(44U, display_extent.height > 12U
+                                  ? display_extent.height - 12U : 0U)},
+            };
+            vkCmdSetScissor(command_buffer, 0, 1, &hud_scissor);
             vkCmdDraw(command_buffer, 3, 1, 0, 0);
         };
 
@@ -5196,24 +5222,19 @@ void Renderer::record_commands(
         } else
 #endif
         {
-        transition_image(
-            command_buffer,
-            swapchain_.images()[image_index],
-            VK_IMAGE_ASPECT_COLOR_BIT,
-            VK_IMAGE_LAYOUT_UNDEFINED,
-            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            VK_PIPELINE_STAGE_2_NONE,
-            VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        transition_acquired_image(
+            command_buffer, swapchain_.images()[image_index]);
         transition_image(
             command_buffer,
             swapchain_.depth_target(image_index).image,
             VK_IMAGE_ASPECT_DEPTH_BIT,
             VK_IMAGE_LAYOUT_UNDEFINED,
             VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-            VK_PIPELINE_STAGE_2_NONE,
-            VK_ACCESS_2_NONE,
+            // Depth targets follow swapchain images, not frame slots. A
+            // frame fence alone cannot guard reuse of this image's depth.
+            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
             VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
                 VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
             VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
@@ -5296,6 +5317,7 @@ void Renderer::record_commands(
         }
 #endif
     } else {
+        const bool temporal = anti_aliasing_.method == AntiAliasingMethod::fsr3;
         constexpr VkPipelineStageFlags2 previous_read_stages =
             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -5308,24 +5330,26 @@ void Renderer::record_commands(
             VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-        transition_tracked_image(
-            command_buffer,
-            aa_resources.motion_vectors,
-            aa_resources.motion_layout,
-            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            previous_read_stages,
-            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-        transition_tracked_image(
-            command_buffer,
-            aa_resources.depth,
-            aa_resources.depth_layout,
-            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            previous_read_stages,
-            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        if (temporal) {
+            transition_tracked_image(
+                command_buffer,
+                aa_resources.motion_vectors,
+                aa_resources.motion_layout,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                previous_read_stages,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+            transition_tracked_image(
+                command_buffer,
+                aa_resources.depth,
+                aa_resources.depth_layout,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                previous_read_stages,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        }
         transition_tracked_image(
             command_buffer,
             aa_resources.depth_attachment,
@@ -5395,8 +5419,7 @@ void Renderer::record_commands(
                 .extent = current_render_extent_,
             },
             .layerCount = 1,
-            .colorAttachmentCount = static_cast<std::uint32_t>(
-                offscreen_color_attachments.size()),
+            .colorAttachmentCount = temporal ? 3U : 1U,
             .pColorAttachments =
                 offscreen_color_attachments.data(),
             .pDepthAttachment = &offscreen_depth_attachment,
@@ -5405,17 +5428,17 @@ void Renderer::record_commands(
             command_buffer, &offscreen_rendering_info);
         draw_geometry(
             current_render_extent_,
-            aa_pipeline_,
-            aa_scene_pipeline_,
+            (temporal ? aa_pipeline_ : smaa_geometry_.cubes).get(),
+            (temporal ? aa_scene_pipeline_ : smaa_geometry_.scene).get(),
 #if VCR_EDITOR_ENABLED
             authored_scene_enabled_
-                ? aa_editor_model_pipeline_
-                : aa_scene_pipeline_,
+                ? (temporal ? aa_editor_model_pipeline_ : smaa_geometry_.models).get()
+                : (temporal ? aa_scene_pipeline_ : smaa_geometry_.scene).get(),
 #else
-            aa_scene_pipeline_,
+            (temporal ? aa_scene_pipeline_ : smaa_geometry_.scene).get(),
 #endif
-            aa_terrain_pipeline_,
-            aa_sky_pipeline_);
+            (temporal ? aa_terrain_pipeline_ : smaa_geometry_.terrain).get(),
+            (temporal ? aa_sky_pipeline_ : smaa_geometry_.sky).get());
         vkCmdEndRendering(command_buffer);
         if (frame.timestamp_queries != VK_NULL_HANDLE) {
             vkCmdWriteTimestamp2(
@@ -5434,24 +5457,26 @@ void Renderer::record_commands(
             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
             previous_read_stages,
             VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-        transition_tracked_image(
-            command_buffer,
-            aa_resources.motion_vectors,
-            aa_resources.motion_layout,
-            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-            previous_read_stages,
-            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-        transition_tracked_image(
-            command_buffer,
-            aa_resources.depth,
-            aa_resources.depth_layout,
-            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-            previous_read_stages,
-            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        if (temporal) {
+            transition_tracked_image(
+                command_buffer,
+                aa_resources.motion_vectors,
+                aa_resources.motion_layout,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                previous_read_stages,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            transition_tracked_image(
+                command_buffer,
+                aa_resources.depth,
+                aa_resources.depth_layout,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                previous_read_stages,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        }
 
         if (anti_aliasing_.method == AntiAliasingMethod::smaa) {
             transition_tracked_image(
@@ -5597,16 +5622,8 @@ void Renderer::record_commands(
         } else
 #endif
         {
-            transition_image(
-                command_buffer,
-                swapchain_.images()[image_index],
-                VK_IMAGE_ASPECT_COLOR_BIT,
-                VK_IMAGE_LAYOUT_UNDEFINED,
-                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                VK_PIPELINE_STAGE_2_NONE,
-                VK_ACCESS_2_NONE,
-                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+            transition_acquired_image(
+                command_buffer, swapchain_.images()[image_index]);
         }
         VkImageView final_image_view =
             swapchain_.image_view(image_index);
@@ -5662,16 +5679,8 @@ void Renderer::record_commands(
 
 #if VCR_EDITOR_ENABLED
     if (editor_frame) {
-        transition_image(
-            command_buffer,
-            swapchain_.images()[image_index],
-            VK_IMAGE_ASPECT_COLOR_BIT,
-            VK_IMAGE_LAYOUT_UNDEFINED,
-            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            VK_PIPELINE_STAGE_2_NONE,
-            VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        transition_acquired_image(
+            command_buffer, swapchain_.images()[image_index]);
         const VkRenderingAttachmentInfo ui_attachment{
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .imageView = swapchain_.image_view(image_index),
@@ -5829,18 +5838,31 @@ void Renderer::recreate_swapchain(
     resize_requested_ = false;
     const VkFormat old_color = swapchain_.color_format();
     const VkFormat old_depth = swapchain_.depth_format();
+    const VkExtent2D old_scene_extent = scene_output_extent();
     swapchain_.recreate(preferred_mode);
     destroy_present_semaphores();
     create_present_semaphores();
+
+    const VkExtent2D new_scene_extent = scene_output_extent();
+    const bool formats_changed =
+        old_color != swapchain_.color_format() ||
+        old_depth != swapchain_.depth_format();
+#if VCR_EDITOR_ENABLED
+    ++swapchain_generation_;
+#endif
+    if (!formats_changed &&
+        old_scene_extent.width == new_scene_extent.width &&
+        old_scene_extent.height == new_scene_extent.height) {
+        // Present-mode switches (and editor window resizes with unchanged
+        // scene viewport) do not invalidate offscreen images or FSR history.
+        return;
+    }
 
     // Swapchain::recreate waits for device idle, so descriptor sets, the FFX
     // context, and all extent-dependent images can now be retired safely.
     destroy_anti_aliasing_descriptors();
     fsr3_upscaler_.shutdown();
     destroy_anti_aliasing_targets();
-    const bool formats_changed =
-        old_color != swapchain_.color_format() ||
-        old_depth != swapchain_.depth_format();
     if (formats_changed) {
 #if VCR_EDITOR_ENABLED
         if (editor_output_enabled_) {
@@ -5869,9 +5891,6 @@ void Renderer::recreate_swapchain(
     create_anti_aliasing_descriptors();
     temporal_history_valid_ = false;
     fsr3_upscaler_.request_reset();
-#if VCR_EDITOR_ENABLED
-    ++swapchain_generation_;
-#endif
 }
 
 void Renderer::toggle_vsync() {
@@ -5933,12 +5952,20 @@ std::uint64_t Renderer::triangle_count() const noexcept {
 }
 
 void Renderer::set_mode(const RunMode mode) noexcept {
+    if (mode_ != mode) {
+        temporal_history_valid_ = false;
+        fsr3_upscaler_.request_reset();
+    }
     mode_ = mode;
 }
 
 void Renderer::set_instance_count(const std::uint32_t count) noexcept {
-    instancing_count_ =
-        std::clamp(count, 1U, max_instance_capacity_);
+    const std::uint32_t clamped = std::clamp(count, 1U, max_instance_capacity_);
+    if (instancing_count_ != clamped) {
+        temporal_history_valid_ = false;
+        fsr3_upscaler_.request_reset();
+    }
+    instancing_count_ = clamped;
 }
 
 void Renderer::set_gpu_workload_iterations(
@@ -6082,7 +6109,8 @@ void Renderer::print_metrics() const {
               << "  frames: " << stats.frames_rendered << '\n'
               << "  FPS (1 s): " << stats.one_second_average_fps << '\n'
               << "  FPS (average): " << stats.average_fps << '\n'
-              << "  FPS (1% low): " << stats.one_percent_low_fps << '\n'
+              << "  FPS (1% low, rolling window): "
+              << stats.one_percent_low_fps << '\n'
               << "  CPU frame: " << stats.average.cpu_frame_ms << " ms\n"
               << "  fence wait: " << stats.average.fence_wait_ms << " ms\n"
               << "  acquire: " << stats.average.acquire_ms << " ms\n"

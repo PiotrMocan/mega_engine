@@ -52,6 +52,8 @@ private:
     bool running_ = false;
     std::chrono::steady_clock::time_point last_camera_tick_{};
     std::chrono::steady_clock::time_point last_title_update_{};
+    std::chrono::steady_clock::time_point last_metrics_update_{};
+    PerformanceSnapshot ui_metrics_{};
 };
 
 } // namespace vcr

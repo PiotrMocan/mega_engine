@@ -153,10 +153,14 @@ void EditorApplication::main_loop() {
                 renderer_.prepare_editor_viewport(*extent));
         }
         ui_.synchronize_renderer(renderer_);
+        if (frame_begin - last_metrics_update_ >= std::chrono::milliseconds(250)) {
+            ui_metrics_ = renderer_.metrics_snapshot();
+            last_metrics_update_ = frame_begin;
+        }
         ui_.begin_frame(
             scene_,
             renderer_,
-            renderer_.metrics_snapshot(),
+            ui_metrics_,
             frame_begin);
         if (ui_.wants_quit()) {
             static_cast<void>(ui_.end_frame());
@@ -200,11 +204,11 @@ void EditorApplication::main_loop() {
         if (!rendered) {
             continue;
         }
+        update_window_title();
         timings.cpu_frame_ms =
             std::chrono::duration<double, std::milli>(
                 Clock::now() - frame_begin).count();
         renderer_.record_metrics(timings);
-        update_window_title();
     }
 }
 
@@ -251,8 +255,7 @@ void EditorApplication::update_window_title() {
         return;
     }
     last_title_update_ = now;
-    const PerformanceSnapshot stats =
-        renderer_.metrics_snapshot();
+    const auto& stats = ui_metrics_;
     const VkExtent2D scene_extent =
         renderer_.editor_viewport_extent();
     const char* play_state = "EDIT";

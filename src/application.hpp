@@ -67,6 +67,9 @@ private:
     FlyCamera camera_{};
     CliOptions options_{};
     BenchmarkController benchmark_{};
+    BenchmarkFrameSamples benchmark_samples_{};
+    std::chrono::steady_clock::time_point benchmark_measurement_begin_{};
+    double benchmark_measurement_seconds_ = 0.0;
     McpControlPlane mcp_control_{};
     McpServer mcp_server_{mcp_control_};
     std::bitset<32> mcp_keys_down_{};

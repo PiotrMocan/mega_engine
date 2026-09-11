@@ -1105,9 +1105,13 @@ void EditorUi::shutdown() noexcept {
     }
     unregister_scene_texture();
     shutdown_vulkan_backend();
-    ImGui_ImplSDL3_Shutdown();
     ui_kit_.shutdown();
-    ImGui::DestroyContext();
+    if (ImGui::GetCurrentContext() != nullptr) {
+        if (ImGui::GetIO().BackendPlatformUserData != nullptr) {
+            ImGui_ImplSDL3_Shutdown();
+        }
+        ImGui::DestroyContext();
+    }
     context_ = nullptr;
     main_window_ = nullptr;
     imgui_color_format_ = VK_FORMAT_UNDEFINED;
@@ -1464,10 +1468,12 @@ void EditorUi::initialize_vulkan_backend(Renderer& renderer) {
 }
 
 void EditorUi::shutdown_vulkan_backend() noexcept {
-    if (vulkan_backend_initialized_) {
+    // Init may fail after publishing backend data but before returning true.
+    if (ImGui::GetCurrentContext() != nullptr &&
+        ImGui::GetIO().BackendRendererUserData != nullptr) {
         ImGui_ImplVulkan_Shutdown();
-        vulkan_backend_initialized_ = false;
     }
+    vulkan_backend_initialized_ = false;
 }
 
 void EditorUi::register_scene_texture(Renderer& renderer) {

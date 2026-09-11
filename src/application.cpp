@@ -162,6 +162,7 @@ void Application::initialize(const CliOptions& options) {
     last_camera_tick_ = now;
     last_title_update_ = now;
     if (options.benchmark) {
+        benchmark_samples_.prepare();
         benchmark_.configure(
             options.benchmark_warmup_seconds,
             options.benchmark_duration_seconds);
@@ -212,8 +213,23 @@ void Application::load_canonical_scene() {
 
 void Application::main_loop() {
     using Clock = std::chrono::steady_clock;
+    FrameTimings pending_timings{};
+    Clock::time_point pending_begin{};
+    bool pending_frame = false;
     while (running_) {
         const auto frame_begin = Clock::now();
+        if (pending_frame) {
+            // Start-to-start includes metrics/title work and scheduler gaps.
+            // Flush before the benchmark tick resets or completes the run.
+            pending_timings.cpu_frame_ms =
+                std::chrono::duration<double, std::milli>(
+                    frame_begin - pending_begin).count();
+            renderer_.record_metrics(pending_timings);
+            if (options_.benchmark && benchmark_.is_measuring()) {
+                benchmark_samples_.record(pending_timings.cpu_frame_ms);
+            }
+            pending_frame = false;
+        }
         const float camera_delta_seconds = static_cast<float>(
             std::chrono::duration<double>(
                 frame_begin - last_camera_tick_).count());
@@ -222,11 +238,15 @@ void Application::main_loop() {
             const auto tick = benchmark_.tick(frame_begin);
             if (tick.measurement_began) {
                 renderer_.reset_metrics();
+                benchmark_measurement_begin_ = frame_begin;
                 std::cout << "Benchmark measurement started ("
                           << options_.benchmark_duration_seconds
                           << " s)\n" << std::flush;
             }
             if (tick.completed) {
+                benchmark_measurement_seconds_ =
+                    std::chrono::duration<double>(
+                        frame_begin - benchmark_measurement_begin_).count();
                 finish_benchmark();
                 running_ = false;
                 break;
@@ -257,10 +277,9 @@ void Application::main_loop() {
                 complete_mcp_screenshot();
             }
             if (rendered) {
-                timings.cpu_frame_ms =
-                    std::chrono::duration<double, std::milli>(
-                        Clock::now() - frame_begin).count();
-                renderer_.record_metrics(timings);
+                pending_timings = timings;
+                pending_begin = frame_begin;
+                pending_frame = true;
                 update_window_title();
             }
         } else {
@@ -398,8 +417,8 @@ void Application::set_mouse_capture(const bool enabled) noexcept {
         return;
     }
     if (!SDL_SetWindowRelativeMouseMode(window_.get(), enabled)) {
-        std::cerr << "Unable to change relative mouse mode: "
-                  << SDL_GetError() << '\n';
+        std::fprintf(stderr, "Unable to change relative mouse mode: %s\n",
+                     SDL_GetError());
         return;
     }
     mouse_captured_ = enabled;
@@ -914,7 +933,7 @@ void Application::update_window_title() {
         return;
     }
     last_title_update_ = now;
-    const auto stats = renderer_.metrics_snapshot();
+    const auto stats = renderer_.metrics_snapshot(false);
     const glm::vec3 camera_position = camera_.position();
     char title[512]{};
     std::snprintf(
@@ -960,7 +979,7 @@ void Application::finish_benchmark() {
         render_extent.width,
         render_extent.height);
     const auto& properties = context_.properties();
-    const auto result = make_benchmark_result(
+    auto result = make_benchmark_result(
         properties.deviceName,
         std::to_string(properties.driverVersion),
         resolution,
@@ -971,6 +990,21 @@ void Application::finish_benchmark() {
         renderer_.instance_count(),
         renderer_.gpu_workload_iterations(),
         stats);
+    if (!benchmark_samples_.complete() || benchmark_samples_.size() == 0U ||
+        benchmark_measurement_seconds_ <= 0.0) {
+        std::cerr << "Benchmark sample capacity exceeded or invalid samples; "
+                     "no partial percentile is reported. Use a shorter run.\n";
+        exit_code_ = 1;
+        return;
+    }
+    result.one_percent_low_fps = benchmark_samples_.one_percent_low_fps();
+    result.percentile_samples = benchmark_samples_.size();
+    result.measurement_seconds = benchmark_measurement_seconds_;
+    result.average_fps = static_cast<double>(stats.frames_rendered) /
+                         benchmark_measurement_seconds_;
+    result.mode = to_string(renderer_.mode());
+    result.build_type = VCR_BUILD_TYPE;
+    result.triangles = renderer_.triangle_count();
     std::string error;
     if (!write_benchmark_json("benchmark.json", result, &error)) {
         std::cerr << "Unable to write benchmark.json: " << error << '\n';
@@ -993,7 +1027,11 @@ void Application::shutdown() noexcept {
     window_.reset();
     SDL_Quit();
     if (original_stdout_buffer_) {
-        std::cout.rdbuf(&original_stdout_buffer_->get());
+        try {
+            std::cout.rdbuf(&original_stdout_buffer_->get());
+        } catch (...) {
+            std::fputs("Unable to restore stdout stream state\n", stderr);
+        }
         original_stdout_buffer_.reset();
     }
 }

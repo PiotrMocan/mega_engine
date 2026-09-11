@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cstdio>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -106,12 +107,25 @@ void VulkanContext::initialize(SDL_Window* window, const bool validation_request
 }
 
 void VulkanContext::shutdown() noexcept {
+    if (device_ != VK_NULL_HANDLE) {
+        const VkResult idle = vkDeviceWaitIdle(device_);
+        if (idle != VK_SUCCESS) {
+            std::fprintf(stderr, "Device cleanup wait failed: %d\n", idle);
+        }
+    }
     if (allocator_ != VK_NULL_HANDLE) {
+        if (validation_enabled_) {
+            VmaTotalStatistics statistics{};
+            vmaCalculateStatistics(allocator_, &statistics);
+            std::fprintf(stderr, "Live GPU allocations: %u (%llu bytes)\n",
+                         statistics.total.statistics.allocationCount,
+                         static_cast<unsigned long long>(
+                             statistics.total.statistics.allocationBytes));
+        }
         vmaDestroyAllocator(allocator_);
         allocator_ = VK_NULL_HANDLE;
     }
     if (device_ != VK_NULL_HANDLE) {
-        vkDeviceWaitIdle(device_);
         vkDestroyDevice(device_, nullptr);
         device_ = VK_NULL_HANDLE;
     }
@@ -211,7 +225,8 @@ QueueFamilySelection VulkanContext::find_queue_families(
     for (std::uint32_t index = 0; index < count; ++index) {
         const auto& family = properties[index];
         if (family.queueCount > 0 &&
-            (family.queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0U &&
+            (family.queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) ==
+                (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT) &&
             result.graphics == VK_QUEUE_FAMILY_IGNORED) {
             result.graphics = index;
         }
@@ -553,7 +568,10 @@ void VulkanContext::set_debug_name(
         .objectHandle = handle,
         .pObjectName = name,
     };
-    (void)vkSetDebugUtilsObjectNameEXT(device_, &info);
+    const VkResult result = vkSetDebugUtilsObjectNameEXT(device_, &info);
+    if (result != VK_SUCCESS) {
+        std::fprintf(stderr, "Unable to name Vulkan object: %d\n", result);
+    }
 }
 
 } // namespace vcr

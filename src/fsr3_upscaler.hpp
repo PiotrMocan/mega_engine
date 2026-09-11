@@ -1,6 +1,7 @@
 #pragma once
 
 #include "anti_aliasing.hpp"
+#include "temporal_coordinates.hpp"
 #include "gpu_texture.hpp"
 #include "vulkan_context.hpp"
 
@@ -22,10 +23,7 @@
 
 namespace vcr {
 
-struct Fsr3Jitter {
-    float x = 0.0F;
-    float y = 0.0F;
-};
+using Fsr3Jitter = TemporalOffset;
 
 struct Fsr3Dispatch {
     VkCommandBuffer command_buffer = VK_NULL_HANDLE;
@@ -62,10 +60,12 @@ public:
 #endif
     }
     [[nodiscard]] std::string_view version() const noexcept {
-        return version_;
+        return available() ? std::string_view(version_) : "FSR 3 unavailable";
     }
     [[nodiscard]] std::string_view unavailable_reason() const noexcept {
-        return unavailable_reason_;
+        return unavailable_reason_.empty() && !available()
+            ? "the FidelityFX Vulkan context is not initialized"
+            : std::string_view(unavailable_reason_);
     }
     [[nodiscard]] VkExtent2D render_extent(
         Fsr3Quality quality,

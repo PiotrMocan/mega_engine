@@ -6,6 +6,7 @@
 #include "png_encoder.hpp"
 #include "scene_document.hpp"
 #include "scene_io.hpp"
+#include "temporal_coordinates.hpp"
 
 #include <algorithm>
 #include <array>
@@ -44,6 +45,55 @@ bool close_to(const double value, const double expected, const double epsilon) {
 } // namespace
 
 int main() {
+    {
+        vcr::BenchmarkFrameSamples samples;
+        samples.prepare(10'000U);
+        for (std::size_t index = 0; index < 10'000U; ++index) {
+            samples.record(index < 100U ? 100.0 : 1.0);
+        }
+        expect(samples.complete() && samples.size() == 10'000U,
+               "full benchmark sample interval retained");
+        expect(close_to(samples.one_percent_low_fps(), 10.0, 0.001),
+               "early hitches survive past the rolling window");
+        samples.record(1.0);
+        expect(!samples.complete() && samples.size() == 10'000U &&
+                   samples.one_percent_low_fps() == 0.0,
+               "sample overflow invalidates instead of truncating percentile");
+        samples.prepare(4U);
+        samples.record(2.0);
+        samples.record(4.0);
+        expect(samples.complete() && samples.size() == 2U &&
+                   close_to(samples.one_percent_low_fps(), 250.0, 0.001),
+               "sample reset and sub-100-frame percentile");
+        samples.record(std::numeric_limits<double>::quiet_NaN());
+        expect(!samples.complete(), "invalid benchmark sample is rejected");
+    }
+    {
+        constexpr std::uint32_t width = 1920U;
+        constexpr std::uint32_t height = 1080U;
+        const auto scale = vcr::ndc_motion_to_pixel_scale(width, height);
+        // A quarter-width and half-height move in pixels corresponds to
+        // NDC deltas 0.5 and 1.0, not UV deltas of those sizes.
+        expect(close_to(0.5F * scale.x, 480.0, 0.001) &&
+                   close_to(1.0F * scale.y, 540.0, 0.001),
+               "FSR motion vectors convert from NDC to pixels");
+        const vcr::TemporalOffset jitter{0.25F, -0.375F};
+        auto projection = glm::perspective(
+            glm::radians(65.0F), float(width) / float(height), 0.1F, 500.0F);
+        projection[1][1] *= -1.0F;
+        const glm::vec4 point{0.7F, 0.2F, -5.0F, 1.0F};
+        const glm::vec4 before = projection * point;
+        const auto offset = vcr::vulkan_projection_jitter(jitter, width, height);
+        projection[2][0] += offset.x;
+        projection[2][1] += offset.y;
+        const glm::vec4 after = projection * point;
+        const auto expected_pixels = vcr::vulkan_pixel_jitter(jitter);
+        expect(close_to((after.x / after.w - before.x / before.w) * scale.x,
+                        expected_pixels.x, 0.0001) &&
+                   close_to((after.y / after.w - before.y / before.w) * scale.y,
+                            expected_pixels.y, 0.0001),
+               "FSR jitter matches actual Vulkan viewport pixel displacement");
+    }
     {
         const char* arguments[]{"vulkan_cube"};
         const auto parsed = vcr::parse_cli_options(
@@ -236,6 +286,10 @@ int main() {
         result.anti_aliasing = "FSR 3.1.4";
         result.anti_aliasing_quality = "quality";
         result.frames_rendered = 42;
+        result.mode = "scene";
+        result.measurement_seconds = 15.0;
+        result.percentile_samples = 42;
+        result.average_gpu_workload_ms = vcr::unavailable_timing_ms;
         const std::string json = vcr::benchmark_result_to_json(result);
         expect(
             json.find("GPU \\\"quoted\\\"") != std::string::npos,
@@ -249,6 +303,10 @@ int main() {
                 json.find("\"render_resolution\": \"1280x720\"") !=
                     std::string::npos,
             "benchmark records anti-aliasing and render resolution");
+        expect(json.find("\"percentile_scope\": \"full_measurement\"") != std::string::npos &&
+                   json.find("\"average_gpu_workload_ms\": null") != std::string::npos &&
+                   json.find("\"mode\": \"scene\"") != std::string::npos,
+               "benchmark exposes sample scope, workload and unavailable timings");
     }
 
     {

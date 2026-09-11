@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$ExePath,
     [switch]$Validation,
+    [ValidateSet('off', 'smaa', 'fsr3')][string]$AntiAliasing = 'off',
     [string]$ScreenshotPath = ""
 )
 
@@ -15,9 +16,9 @@ $validationArgument = if ($Validation) {
     "--no-validation"
 }
 $startInfo.Arguments =
-    "--mcp-stdio $validationArgument --width 640 --height 360"
+    "--mcp-stdio $validationArgument --aa $AntiAliasing --width 640 --height 360"
 $startInfo.UseShellExecute = $false
-$startInfo.CreateNoWindow = $false
+$startInfo.CreateNoWindow = $true
 $startInfo.RedirectStandardInput = $true
 $startInfo.RedirectStandardOutput = $true
 $startInfo.RedirectStandardError = $true
@@ -162,7 +163,7 @@ try {
     if ($process.ExitCode -ne 0) {
         throw "MCP renderer exited with $($process.ExitCode):`n$stderr"
     }
-    if ($stderr -match "Validation Error|VUID-") {
+    if ($stderr -match '\[Vulkan ERROR\]|Validation Error|VUID-|SYNC-HAZARD|hazard detected|FidelityFX error:|AddressSanitizer|Live GPU allocations: [1-9]') {
         throw "Vulkan validation reported an error:`n$stderr"
     }
 

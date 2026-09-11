@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace vcr {
 
@@ -54,7 +55,8 @@ public:
     void reset() noexcept;
     void record_frame(const FrameTimings& timings) noexcept;
 
-    [[nodiscard]] PerformanceSnapshot snapshot() const noexcept;
+    [[nodiscard]] PerformanceSnapshot snapshot(
+        bool include_percentile = true) const noexcept;
     [[nodiscard]] std::uint64_t frames_rendered() const noexcept {
         return frames_rendered_;
     }
@@ -87,6 +89,23 @@ private:
     std::array<std::uint64_t, timing_count> counts_{};
     FrameTimings latest_{};
     std::uint64_t frames_rendered_ = 0;
+};
+
+// Exact full-run percentile samples; allocation is confined to prepare().
+// Overflow invalidates the result instead of silently dropping early hitches.
+class BenchmarkFrameSamples final {
+public:
+    static constexpr std::size_t maximum_samples = 1'000'000;
+    void prepare(std::size_t capacity = maximum_samples);
+    void record(double frame_ms) noexcept;
+    [[nodiscard]] bool complete() const noexcept { return !incomplete_; }
+    [[nodiscard]] std::size_t size() const noexcept { return count_; }
+    [[nodiscard]] double one_percent_low_fps();
+
+private:
+    std::vector<double> samples_{};
+    std::size_t count_ = 0;
+    bool incomplete_ = false;
 };
 
 enum class BenchmarkPhase : std::uint8_t {
@@ -154,6 +173,9 @@ struct BenchmarkResult {
     std::string present_mode;
     std::string anti_aliasing;
     std::string anti_aliasing_quality;
+    std::string mode;
+    std::string build_type;
+    std::uint64_t triangles = 0;
     std::uint32_t instances = 0;
     std::uint32_t gpu_workload_iterations = 0;
     double average_fps = 0.0;
@@ -161,6 +183,14 @@ struct BenchmarkResult {
     double average_cpu_frame_ms = 0.0;
     double average_gpu_frame_ms = 0.0;
     double average_fence_wait_ms = 0.0;
+    double average_acquire_ms = unavailable_timing_ms;
+    double average_command_record_ms = unavailable_timing_ms;
+    double average_queue_submit_ms = unavailable_timing_ms;
+    double average_present_ms = unavailable_timing_ms;
+    double average_gpu_geometry_ms = unavailable_timing_ms;
+    double average_gpu_workload_ms = unavailable_timing_ms;
+    double measurement_seconds = 0.0;
+    std::uint64_t percentile_samples = 0;
     std::uint64_t frames_rendered = 0;
 };
 
