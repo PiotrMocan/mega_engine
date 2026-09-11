@@ -50,9 +50,9 @@ int main() {
             static_cast<int>(std::size(arguments)), arguments);
         expect(
             static_cast<bool>(parsed) &&
-                parsed.options.width == 2560 &&
-                parsed.options.height == 1440,
-            "default drawable resolution is QHD");
+                parsed.options.width == 1920 &&
+                parsed.options.height == 1080,
+            "default drawable resolution is Full HD");
     }
 
     {

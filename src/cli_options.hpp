@@ -36,8 +36,8 @@ inline constexpr bool default_validation_enabled = true;
 #endif
 
 struct CliOptions {
-    static constexpr std::uint32_t default_width = 2560;
-    static constexpr std::uint32_t default_height = 1440;
+    static constexpr std::uint32_t default_width = 1920;
+    static constexpr std::uint32_t default_height = 1080;
     static constexpr double default_benchmark_duration_seconds = 15.0;
     static constexpr double default_benchmark_warmup_seconds = 5.0;
 
