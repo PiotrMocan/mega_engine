@@ -1,6 +1,7 @@
 #include "renderer.hpp"
 
 #include "pbr_material.hpp"
+#include "model_lod.hpp"
 #include "vulkan_common.hpp"
 
 #include <SDL3/SDL.h>
@@ -241,6 +242,10 @@ enum TimestampQuery : std::uint32_t {
     timestamp_geometry_begin,
     timestamp_geometry_end,
     timestamp_frame_end,
+    timestamp_shadow_begin,
+    timestamp_shadow_end,
+    timestamp_visibility_begin,
+    timestamp_visibility_end,
     timestamp_query_count,
 };
 
@@ -673,6 +678,14 @@ void Renderer::initialize(
     editor_texture_assets_.reserve(128U);
     editor_model_draws_.reserve(max_scene_nodes);
     editor_model_sort_scratch_.reserve(max_scene_nodes);
+    scene_metadata_.reserve(maximum_editor_scene_instances);
+    scene_packet_.reserve(maximum_editor_scene_instances * 2U);
+    visible_model_draws_.reserve(max_scene_nodes * 3U);
+    visible_indices_.reserve(maximum_editor_scene_instances);
+    visibility_scratch_.reserve(maximum_editor_scene_instances);
+    instance_lods_.reserve(maximum_editor_scene_instances);
+    instance_visibility_.reserve(maximum_editor_scene_instances);
+    world_bounds_.reserve(maximum_editor_scene_instances);
 #else
     static_cast<void>(enable_editor_output);
     static_cast<void>(enable_authored_scene);
@@ -707,9 +720,12 @@ void Renderer::initialize(
     create_scene_resources();
     create_anti_aliasing_resources();
     create_pipeline();
+    create_gpu_visibility();
     create_descriptors();
     create_anti_aliasing_descriptors();
-    render_static_shadow_map();
+    if (!authored_scene_enabled_) {
+        render_static_shadow_map();
+    }
     last_frame_time_ = std::chrono::steady_clock::now();
 }
 
@@ -721,6 +737,12 @@ void Renderer::shutdown() noexcept {
     if (idle != VK_SUCCESS) {
         std::fprintf(stderr, "Renderer cleanup wait failed: %d\n", idle);
     }
+    asset_preparation_.stop();
+    asset_upload_.stop();
+    destroy_gpu_visibility();
+    asset_requests_.clear();
+    asset_requests_pending_ = 0;
+    async_assets_ = false;
     screenshot_readback_.destroy();
     completed_screenshot_.reset();
     screenshot_requested_ = false;
@@ -823,7 +845,7 @@ void Renderer::create_frame_contexts() {
             constexpr std::uint64_t scene_instance_capacity =
                 static_cast<std::uint64_t>(max_scene_nodes) + 1ULL;
             constexpr std::uint64_t scene_buffer_bytes =
-                scene_instance_capacity * sizeof(SceneGpuInstance);
+                scene_instance_capacity * 2ULL * sizeof(RuntimeGpuInstance);
             static_assert(
                 scene_buffer_bytes <=
                 std::numeric_limits<VkDeviceSize>::max());
@@ -1042,12 +1064,9 @@ void Renderer::create_editor_material_resources() {
         "editor default flat normal texture");
 }
 
-std::optional<std::uint32_t> Renderer::find_or_load_editor_texture(
-    const std::filesystem::path& asset_root,
-    const std::filesystem::path& relative_path,
-    std::string& error) {
-    const std::string cache_key =
-        relative_path.lexically_normal().generic_string();
+std::optional<std::uint32_t> Renderer::find_or_load_editor_texture(const PreparedTexture &prepared,
+                                                                   std::string &error) {
+    const auto &cache_key = prepared.path;
     for (std::uint32_t index = 0U;
          index < editor_texture_assets_.size();
          ++index) {
@@ -1061,22 +1080,16 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_texture(
         return std::nullopt;
     }
 
-    CookedTextureLoadOptions options{};
-    options.maximum_dimension =
-        std::min(
-            options.maximum_dimension,
-            context_->properties().limits.maxImageDimension2D);
-    options.maximum_decoded_bytes =
-        maximum_single_editor_texture_gpu_bytes;
-    const CookedTextureLoadResult loaded =
-        load_cooked_texture_asset(asset_root, relative_path, options);
-    if (!loaded) {
-        error =
-            "Unable to load texture '" + cache_key +
-            "': " + loaded.error().message;
+    if (!prepared.texture) {
+        error = "Unable to load texture '" + cache_key + "': " + prepared.error;
         return std::nullopt;
     }
-    const CookedTextureAsset& texture = loaded.value();
+    const CookedTextureAsset &texture = *prepared.texture;
+    if (std::max(texture.width, texture.height) >
+        context_->properties().limits.maxImageDimension2D) {
+        error = "Texture exceeds the device's maximum image dimension";
+        return std::nullopt;
+    }
     if (texture.width == 0U || texture.height == 0U ||
         texture.row_stride_bytes != texture.width * 4U ||
         texture.pixels.size() !=
@@ -1247,10 +1260,9 @@ Renderer::create_editor_material_descriptor(
     return descriptor_set;
 }
 
-std::optional<std::uint32_t> Renderer::find_or_load_editor_model(
-    const std::filesystem::path& asset_root,
-    const std::string_view relative_path,
-    std::string& error) {
+std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel &prepared,
+                                                            std::string &error) {
+    const auto &relative_path = prepared.path;
     for (std::uint32_t index = 0U;
          index < editor_model_assets_.size();
          ++index) {
@@ -1266,25 +1278,11 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_model(
         return std::nullopt;
     }
 
-    CookedModelLoadOptions options{};
-    options.maximum_mesh_file_bytes =
-        maximum_single_editor_model_gpu_bytes * 2U;
-    options.maximum_submeshes =
-        maximum_editor_material_descriptors;
-    options.maximum_materials =
-        maximum_editor_material_descriptors;
-    const CookedModelLoadResult loaded =
-        load_cooked_model_asset(
-            asset_root,
-            std::filesystem::path(relative_path),
-            options);
-    if (!loaded) {
-        error =
-            "Unable to load model '" + std::string(relative_path) +
-            "': " + loaded.error().message;
+    if (!prepared.model) {
+        error = "Unable to load model '" + std::string(relative_path) + "': " + prepared.error;
         return std::nullopt;
     }
-    const CookedModelAsset& model = loaded.value();
+    const CookedModelAsset &model = *prepared.model;
     if (model.vertices.empty() ||
         model.indices.empty() ||
         model.submeshes.empty()) {
@@ -1333,6 +1331,7 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_model(
     }
 
     EditorModelAsset gpu_asset{};
+    gpu_asset.bounds = Bounds{(minimum + maximum) * 0.5F, (maximum - minimum) * 0.5F};
     gpu_asset.relative_path = relative_path;
     const glm::vec3 dimensions = maximum - minimum;
     const float largest_dimension = std::max(
@@ -1376,19 +1375,21 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_model(
         std::optional<std::uint32_t> base_color_index;
         std::optional<std::uint32_t> normal_index;
         const auto load_slot =
-            [this,
-             &asset_root,
-             &relative_path](
-                const std::optional<std::filesystem::path>& reference,
-                const CookedTextureSemantic expected_semantic,
-                const CookedTextureColorSpace expected_color_space,
-                std::optional<std::uint32_t>& destination) {
+            [this, &prepared, &relative_path](const std::optional<std::filesystem::path> &reference,
+                                              const CookedTextureSemantic expected_semantic,
+                                              const CookedTextureColorSpace expected_color_space,
+                                              std::optional<std::uint32_t> &destination) {
                 if (!reference) {
                     return;
                 }
                 std::string texture_error;
-                const auto index = find_or_load_editor_texture(
-                    asset_root, *reference, texture_error);
+                const auto key = reference->lexically_normal().generic_string();
+                const auto source = std::ranges::find_if(
+                    prepared.textures, [&](const auto &texture) { return texture.path == key; });
+                if (source == prepared.textures.end()) {
+                    return;
+                }
+                const auto index = find_or_load_editor_texture(*source, texture_error);
                 if (!index) {
                     std::cerr
                         << "warning: model '" << relative_path
@@ -1481,14 +1482,14 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_model(
                 material_descriptors[source.material_index];
         }
         gpu_asset.submeshes.push_back(EditorModelSubmesh{
-            .material_relative_path =
-                std::move(material_relative_path),
+            .material_relative_path = std::move(material_relative_path),
             .material = sanitize_pbr_material(material),
             .material_descriptor_set = material_descriptor,
-            .first_index =
-                static_cast<std::uint32_t>(source.first_index),
-            .index_count =
-                static_cast<std::uint32_t>(source.index_count),
+            .first_index = static_cast<std::uint32_t>(source.first_index),
+            .index_count = static_cast<std::uint32_t>(source.index_count),
+            .lod_first = source.lod_first,
+            .lod_count = source.lod_count,
+            .lod_error = source.lod_error,
         });
     }
 
@@ -1560,13 +1561,19 @@ bool Renderer::update_editor_scene(
     }
     editor_scene_instances_.clear();
     editor_model_draws_.clear();
+    scene_metadata_.clear();
     if (view.has_ground) {
         editor_scene_instances_.push_back(view.ground);
+        scene_metadata_.push_back({view.ground_id, Bounds{{0, 0, 0}, {1, 0, 1}}, false});
     }
     editor_scene_instances_.insert(
         editor_scene_instances_.end(),
         view.cubes.begin(),
         view.cubes.end());
+    for (std::size_t i = 0; i < view.cubes.size(); ++i) {
+        scene_metadata_.push_back({i < view.cube_ids.size() ? view.cube_ids[i] : SceneNodeId{},
+                                   Bounds{{0, 0, 0}, {1, 1, 1}}, true});
+    }
 
     bool complete = true;
     editor_model_sort_scratch_.clear();
@@ -1645,16 +1652,16 @@ bool Renderer::update_editor_scene(
                     .model_row_2 = model.model_row_2,
                     .material = submesh.material,
                 });
+                scene_metadata_.push_back({model.id, asset.bounds, false});
             }
             editor_model_draws_.push_back(EditorModelDraw{
-                .material_descriptor_set =
-                    submesh.material_descriptor_set,
+                .material_descriptor_set = submesh.material_descriptor_set,
                 .asset_index = *asset_index,
                 .first_index = submesh.first_index,
                 .index_count = submesh.index_count,
                 .first_instance = first_instance,
-                .instance_count =
-                    static_cast<std::uint32_t>(instance_count),
+                .instance_count = static_cast<std::uint32_t>(instance_count),
+                .submesh_index = static_cast<std::uint32_t>(&submesh - asset.submeshes.data()),
             });
         }
         group_begin = group_end;
@@ -1685,10 +1692,24 @@ bool Renderer::update_editor_scene(
             draw.instance_count;
     }
     editor_scene_revision_ = view.revision;
-    // Until runtime instances carry previous transforms, edits invalidate
-    // temporal history rather than reprojecting stale object positions.
+    runtime_transforms_.begin_snapshot();
+    for (std::size_t i = 0; i < scene_metadata_.size(); ++i) {
+        const auto &instance = editor_scene_instances_[i];
+        static_cast<void>(runtime_transforms_.set(
+            scene_metadata_[i].id,
+            {instance.model_row_0, instance.model_row_1, instance.model_row_2}));
+    }
+    instance_lods_.assign(scene_metadata_.size(), 0);
+    instance_visibility_.resize(scene_metadata_.size());
+    world_bounds_.resize(scene_metadata_.size());
+    packet_document_revision_ = 0;
+    shadow_dirty_ = true;
+    // Authored snapshots may add/remove geometry or change materials. Only
+    // the runtime transform API can preserve temporal history across updates.
     temporal_history_valid_ = false;
     fsr3_upscaler_.request_reset();
+    build_gpu_visibility_scene(plane_index_count, plane_first_index, plane_vertex_offset,
+                               cube_index_count);
     return complete;
 }
 
@@ -1715,6 +1736,10 @@ bool Renderer::apply_editor_material_factors(
 
 void Renderer::invalidate_editor_scene() noexcept {
     editor_scene_revision_ = 0U;
+    runtime_transforms_.reset();
+    temporal_history_valid_ = false;
+    fsr3_upscaler_.request_reset();
+    shadow_dirty_ = true;
     for (FrameContext& frame : frames_) {
         frame.scene_revision = 0U;
         frame.scene_ground_count = 0U;
@@ -1725,21 +1750,22 @@ void Renderer::invalidate_editor_scene() noexcept {
 void Renderer::record_editor_scene_upload(
     const VkCommandBuffer command_buffer,
     FrameContext& frame) {
-    if (!authored_scene_enabled_ ||
-        frame.scene_revision == editor_scene_revision_) {
+    if (gpu_visibility_active_ && mode_ != RunMode::instancing) {
+        upload_gpu_scene_records(command_buffer, frame);
+        return;
+    }
+    if (!authored_scene_enabled_ || frame.scene_revision == packet_revision_) {
         return;
     }
     const VkDeviceSize byte_count =
-        static_cast<VkDeviceSize>(editor_scene_instances_.size()) *
-        sizeof(SceneGpuInstance);
+        static_cast<VkDeviceSize>(scene_packet_.size()) * sizeof(RuntimeGpuInstance);
     if (byte_count > frame.scene_upload_buffer.size() ||
         byte_count > frame.scene_instance_buffer.size()) {
         fatal("Editor scene upload exceeds its bounded frame buffer.");
     }
     if (byte_count > 0U) {
-        frame.scene_upload_buffer.write(std::as_bytes(std::span{
-            editor_scene_instances_.data(),
-            editor_scene_instances_.size()}));
+        frame.scene_upload_buffer.write(
+            std::as_bytes(std::span{scene_packet_.data(), scene_packet_.size()}));
         const VkBufferCopy copy{
             .srcOffset = 0U,
             .dstOffset = 0U,
@@ -1770,9 +1796,10 @@ void Renderer::record_editor_scene_upload(
         };
         vkCmdPipelineBarrier2(command_buffer, &dependency);
     }
-    frame.scene_revision = editor_scene_revision_;
-    frame.scene_ground_count = editor_ground_count_;
-    frame.scene_cube_count = editor_cube_count_;
+    frame.scene_revision = packet_revision_;
+    frame.scene_ground_count = visible_ground_count_;
+    frame.scene_cube_count = visible_cube_count_;
+    frame.scene_color_first_instance = static_cast<std::uint32_t>(editor_scene_instances_.size());
 }
 #endif
 
@@ -1972,8 +1999,6 @@ void Renderer::create_scene_resources() {
             };
         }
     }
-    std::vector<float>{}.swap(terrain_heights);
-
     std::vector<std::uint32_t> terrain_indices(terrain_index_count);
     std::size_t terrain_index = 0;
     constexpr std::uint32_t primitive_restart =
@@ -1994,6 +2019,44 @@ void Renderer::create_scene_resources() {
     if (terrain_index != terrain_indices.size()) {
         fatal("Terrain index generation count mismatch.");
     }
+    terrain_lod_count_[0] = terrain_index_count;
+    const auto heights = std::minmax_element(terrain_heights.begin(), terrain_heights.end());
+    terrain_bounds_ = {{0, (*heights.first + *heights.second) * 0.5F,
+                        landscape_near_edge_z - terrain_extent_z * 0.5F},
+                       {terrain_extent_x * 0.5F, (*heights.second - *heights.first) * 0.5F,
+                        terrain_extent_z * 0.5F}};
+    for (unsigned level = 1; level < 3; ++level) {
+        const unsigned step = 1U << level;
+        terrain_lod_first_[level] = static_cast<std::uint32_t>(terrain_indices.size());
+        for (unsigned row = 0; row < terrain_cell_count_z; row += step) {
+            for (unsigned col = 0; col < terrain_vertex_count_x; col += step) {
+                terrain_indices.push_back((row + step) * terrain_vertex_count_x + col);
+                terrain_indices.push_back(row * terrain_vertex_count_x + col);
+            }
+            if (row + step < terrain_cell_count_z) {
+                terrain_indices.push_back(primitive_restart);
+            }
+        }
+        terrain_lod_count_[level] =
+            static_cast<std::uint32_t>(terrain_indices.size()) - terrain_lod_first_[level];
+        float maximum_error = 0;
+        for (unsigned row = 0; row < terrain_vertex_count_z; ++row) {
+            for (unsigned col = 0; col < terrain_vertex_count_x; ++col) {
+                const auto x = std::min(col / step * step, terrain_cell_count_x - step);
+                const auto z = std::min(row / step * step, terrain_cell_count_z - step);
+                const float u = float(col - x) / float(step), v = float(row - z) / float(step);
+                const float a = terrain_height_at(z, x), b = terrain_height_at(z, x + step);
+                const float c = terrain_height_at(z + step, x),
+                            d = terrain_height_at(z + step, x + step);
+                const float approximation =
+                    u >= v ? a + (b - a) * u + (d - b) * v : a + (d - c) * u + (c - a) * v;
+                maximum_error =
+                    std::max(maximum_error, std::abs(terrain_height_at(row, col) - approximation));
+            }
+        }
+        terrain_lod_error_[level] = maximum_error;
+    }
+    std::vector<float>{}.swap(terrain_heights);
     instance_buffer_.create(
         *context_,
         static_cast<VkDeviceSize>(instances.size()) * sizeof(InstanceData),
@@ -2186,6 +2249,8 @@ void Renderer::create_sky_texture() {
 }
 
 void Renderer::create_shadow_map() {
+    shadow_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    shadow_dirty_ = true;
     constexpr std::array candidates{
         VK_FORMAT_D32_SFLOAT,
         VK_FORMAT_D16_UNORM,
@@ -2513,7 +2578,7 @@ void Renderer::create_descriptors() {
         },
         VkDescriptorPoolSize{
             .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .descriptorCount = descriptor_set_count * 2U,
+            .descriptorCount = descriptor_set_count * 3U,
         },
         VkDescriptorPoolSize{
             .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -2728,6 +2793,18 @@ void Renderer::create_descriptors() {
             scene_writes.data(),
             0,
             nullptr);
+        const auto &visible = frames_[index].visibility.visible ? frames_[index].visibility.visible
+                                                                : frames_[index].workload_buffer;
+        const VkDescriptorBufferInfo visibility_info{visible.handle(), 0, visible.size()};
+        for (auto set : {sets[index], scene_set}) {
+            const VkWriteDescriptorSet write{.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                             .dstSet = set,
+                                             .dstBinding = 5,
+                                             .descriptorCount = 1,
+                                             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                             .pBufferInfo = &visibility_info};
+            vkUpdateDescriptorSets(context_->device(), 1, &write, 0, nullptr);
+        }
     }
 }
 
@@ -2830,17 +2907,19 @@ void Renderer::render_static_shadow_map() {
         std::as_bytes(std::span{&uniforms, std::size_t{1}}));
 
     ImmediateSubmission submission(*context_);
-    const VkCommandBuffer command_buffer = submission.command_buffer();
+    record_shadow_map(submission.command_buffer(), frames_[0]);
+    submission.submit_and_wait();
+}
+
+void Renderer::record_shadow_map(VkCommandBuffer command_buffer, FrameContext &frame) {
     transition_image(
-        command_buffer,
-        shadow_map_.image(),
-        VK_IMAGE_ASPECT_DEPTH_BIT,
-        VK_IMAGE_LAYOUT_UNDEFINED,
+        command_buffer, shadow_map_.image(), VK_IMAGE_ASPECT_DEPTH_BIT, shadow_layout_,
         VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-        VK_PIPELINE_STAGE_2_NONE,
-        VK_ACCESS_2_NONE,
-        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-            VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+        shadow_layout_ == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_NONE
+                                                    : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        shadow_layout_ == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE
+                                                    : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
 
     const VkRenderingAttachmentInfo depth_attachment{
@@ -2879,15 +2958,8 @@ void Renderer::render_static_shadow_map() {
         command_buffer,
         VK_PIPELINE_BIND_POINT_GRAPHICS,
         terrain_shadow_pipeline_);
-    vkCmdBindDescriptorSets(
-        command_buffer,
-        VK_PIPELINE_BIND_POINT_GRAPHICS,
-        pipeline_layout_,
-        0,
-        1,
-        &frames_[0].scene_descriptor_set,
-        0,
-        nullptr);
+    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1,
+                            &frame.scene_descriptor_set, 0, nullptr);
     const VkDeviceSize vertex_offset = 0;
     const VkBuffer vertex_buffer = terrain_vertex_buffer_.handle();
     vkCmdBindVertexBuffers(
@@ -2897,14 +2969,36 @@ void Renderer::render_static_shadow_map() {
         terrain_index_buffer_.handle(),
         0,
         VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexed(
-        command_buffer,
-        terrain_index_count,
-        1,
-        0,
-        0,
-        0);
+    vkCmdDrawIndexed(command_buffer,
+                     authored_scene_enabled_ && !editor_terrain_visible_ ? 0U : terrain_index_count,
+                     1, 0, 0, 0);
 #if VCR_EDITOR_ENABLED
+    if (authored_scene_enabled_ && visibility_settings_.dynamic_shadows) {
+        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          authored_shadow_pipeline_.get());
+        const VkBuffer cubes = vertex_buffer_.handle();
+        vkCmdBindVertexBuffers(command_buffer, 0, 1, &cubes, &vertex_offset);
+        vkCmdBindIndexBuffer(command_buffer, index_buffer_.handle(), 0, VK_INDEX_TYPE_UINT16);
+        if (editor_ground_count_) {
+            vkCmdDrawIndexed(command_buffer, plane_index_count, 1, plane_first_index,
+                             plane_vertex_offset, 0);
+        }
+        if (editor_cube_count_) {
+            vkCmdDrawIndexed(command_buffer, cube_index_count, editor_cube_count_, 0, 0,
+                             editor_ground_count_);
+        }
+        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          model_shadow_pipeline_.get());
+        for (const auto &draw : editor_model_draws_) {
+            const auto &asset = editor_model_assets_[draw.asset_index];
+            const VkBuffer vertices = asset.vertex_buffer.handle();
+            vkCmdBindVertexBuffers(command_buffer, 0, 1, &vertices, &vertex_offset);
+            vkCmdBindIndexBuffer(command_buffer, asset.index_buffer.handle(), 0,
+                                 VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(command_buffer, draw.index_count, draw.instance_count,
+                             draw.first_index, 0, draw.first_instance);
+        }
+    }
     if (!authored_scene_enabled_)
 #endif
     {
@@ -2946,35 +3040,37 @@ void Renderer::render_static_shadow_map() {
         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-    submission.submit_and_wait();
+    shadow_layout_ = VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL;
+    shadow_dirty_ = false;
 }
 
 void Renderer::upload_to_device_buffer(
     GpuBuffer& destination,
     const std::span<const std::byte> bytes) {
     GpuBuffer staging;
-    staging.create(
-        *context_,
-        static_cast<VkDeviceSize>(bytes.size_bytes()),
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        VMA_MEMORY_USAGE_AUTO,
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-            VMA_ALLOCATION_CREATE_MAPPED_BIT,
-        "staging buffer");
-    staging.write(bytes);
-
-    ImmediateSubmission submission(*context_);
+    std::optional<ImmediateSubmission> submission;
+    VkDeviceSize source_offset = 0;
+    VkBuffer source = asset_upload_.buffer();
+    VkCommandBuffer command_buffer = asset_upload_.command_buffer();
+    if (asset_upload_.recording()) {
+        source_offset = asset_upload_.stage(bytes);
+    } else {
+        staging.create(*context_, static_cast<VkDeviceSize>(bytes.size_bytes()),
+                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_AUTO,
+                       VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                           VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                       "staging buffer");
+        staging.write(bytes);
+        submission.emplace(*context_);
+        source = staging.handle();
+        command_buffer = submission->command_buffer();
+    }
     const VkBufferCopy copy{
-        .srcOffset = 0,
+        .srcOffset = source_offset,
         .dstOffset = 0,
         .size = static_cast<VkDeviceSize>(bytes.size_bytes()),
     };
-    vkCmdCopyBuffer(
-        submission.command_buffer(),
-        staging.handle(),
-        destination.handle(),
-        1,
-        &copy);
+    vkCmdCopyBuffer(command_buffer, source, destination.handle(), 1, &copy);
     const VkBufferMemoryBarrier2 ready_for_device_reads{
         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
         .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
@@ -2998,9 +3094,10 @@ void Renderer::upload_to_device_buffer(
         .bufferMemoryBarrierCount = 1U,
         .pBufferMemoryBarriers = &ready_for_device_reads,
     };
-    vkCmdPipelineBarrier2(
-        submission.command_buffer(), &dependency);
-    submission.submit_and_wait();
+    vkCmdPipelineBarrier2(command_buffer, &dependency);
+    if (submission) {
+        submission->submit_and_wait();
+    }
 }
 
 void Renderer::upload_to_device_texture(
@@ -3022,18 +3119,23 @@ void Renderer::upload_to_device_texture(
     }
 
     GpuBuffer staging;
-    staging.create(
-        *context_,
-        static_cast<VkDeviceSize>(expected_bytes),
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        VMA_MEMORY_USAGE_AUTO,
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-            VMA_ALLOCATION_CREATE_MAPPED_BIT,
-        "texture staging buffer");
-    staging.write(pixels);
-
-    ImmediateSubmission submission(*context_);
-    const VkCommandBuffer command_buffer = submission.command_buffer();
+    std::optional<ImmediateSubmission> submission;
+    VkDeviceSize source_offset = 0;
+    VkBuffer source = asset_upload_.buffer();
+    VkCommandBuffer command_buffer = asset_upload_.command_buffer();
+    if (asset_upload_.recording()) {
+        source_offset = asset_upload_.stage(pixels);
+    } else {
+        staging.create(*context_, static_cast<VkDeviceSize>(expected_bytes),
+                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_AUTO,
+                       VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                           VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                       "texture staging buffer");
+        staging.write(pixels);
+        submission.emplace(*context_);
+        source = staging.handle();
+        command_buffer = submission->command_buffer();
+    }
     transition_image(
         command_buffer,
         destination.image(),
@@ -3047,29 +3149,26 @@ void Renderer::upload_to_device_texture(
         0U,
         destination.mip_levels());
     const VkBufferImageCopy copy_region{
-        .bufferOffset = 0,
+        .bufferOffset = source_offset,
         .bufferRowLength = 0,
         .bufferImageHeight = 0,
-        .imageSubresource = VkImageSubresourceLayers{
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .mipLevel = 0,
-            .baseArrayLayer = 0,
-            .layerCount = 1,
-        },
+        .imageSubresource =
+            VkImageSubresourceLayers{
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
         .imageOffset = VkOffset3D{0, 0, 0},
-        .imageExtent = VkExtent3D{
-            destination.width(),
-            destination.height(),
-            1U,
-        },
+        .imageExtent =
+            VkExtent3D{
+                destination.width(),
+                destination.height(),
+                1U,
+            },
     };
-    vkCmdCopyBufferToImage(
-        command_buffer,
-        staging.handle(),
-        destination.image(),
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        1,
-        &copy_region);
+    vkCmdCopyBufferToImage(command_buffer, source, destination.image(),
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
     std::uint32_t mip_width = destination.width();
     std::uint32_t mip_height = destination.height();
     for (std::uint32_t level = 1U;
@@ -3163,7 +3262,9 @@ void Renderer::upload_to_device_texture(
         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
         final_level,
         1U);
-    submission.submit_and_wait();
+    if (submission) {
+        submission->submit_and_wait();
+    }
 }
 
 void Renderer::update_frame_uniform(
@@ -3190,6 +3291,13 @@ void Renderer::update_frame_uniform(
     unjittered_projection[1][1] *= -1.0F;
     const glm::mat4 unjittered_view_projection =
         unjittered_projection * view_matrix;
+#if VCR_EDITOR_ENABLED
+    if (authored_scene_enabled_ && mode_ != RunMode::instancing) {
+        const auto rotation = glm::transpose(glm::mat3(view_matrix));
+        prepare_scene_packet(unjittered_view_projection, -(rotation * glm::vec3(view_matrix[3])),
+                             extent);
+    }
+#endif
     glm::mat4 projection = unjittered_projection;
     if (anti_aliasing_.method == AntiAliasingMethod::fsr3 &&
         fsr3_upscaler_.available()) {
@@ -3201,6 +3309,12 @@ void Renderer::update_frame_uniform(
     const glm::mat4 view_projection = projection * view_matrix;
     FrameUniforms uniforms{};
     uniforms.view_projection = view_projection;
+    // Authored vertex shaders interpret X as the visibility-indirection flag.
+    // Legacy instancing retains the identity quaternion.
+    uniforms.global_rotation.x =
+        (gpu_visibility_active_ && !gpu_visibility_bypassed_ && mode_ != RunMode::instancing)
+            ? 1.0F
+            : 0.0F;
     uniforms.unjittered_view_projection =
         unjittered_view_projection;
     uniforms.previous_unjittered_view_projection =
@@ -3382,9 +3496,7 @@ void Renderer::create_pipeline() {
             .binding = 0,
             .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
             .descriptorCount = 1,
-            .stageFlags =
-                VK_SHADER_STAGE_VERTEX_BIT |
-                VK_SHADER_STAGE_FRAGMENT_BIT,
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
             .pImmutableSamplers = nullptr,
         },
         VkDescriptorSetLayoutBinding{
@@ -3398,8 +3510,7 @@ void Renderer::create_pipeline() {
             .binding = 2,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             .descriptorCount = 1,
-            .stageFlags =
-                VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
             .pImmutableSamplers = nullptr,
         },
         VkDescriptorSetLayoutBinding{
@@ -3416,6 +3527,10 @@ void Renderer::create_pipeline() {
             .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
             .pImmutableSamplers = nullptr,
         },
+        VkDescriptorSetLayoutBinding{.binding = 5,
+                                     .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                     .descriptorCount = 1,
+                                     .stageFlags = VK_SHADER_STAGE_VERTEX_BIT},
     };
     const VkDescriptorSetLayoutCreateInfo descriptor_info{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -4151,6 +4266,27 @@ void Renderer::create_pipeline() {
         handle_value(scene_shadow_pipeline_),
         "PBR demo sample shadow pipeline");
 
+#if VCR_EDITOR_ENABLED
+    const auto authored_shadow_shader = load_shader("editor_shadow.vert.spv");
+    auto authored_shadow_stage = terrain_shadow_stage;
+    authored_shadow_stage.module = authored_shadow_shader.get();
+    auto authored_shadow_info = scene_shadow_pipeline_info;
+    authored_shadow_info.pStages = &authored_shadow_stage;
+    VK_CHECK(vkCreateGraphicsPipelines(
+        context_->device(), pipeline_cache_, 1, &authored_shadow_info, nullptr,
+        authored_shadow_pipeline_.put(context_->device(), vkDestroyPipeline)));
+    auto model_shadow_input = editor_model_vertex_input;
+    model_shadow_input.vertexAttributeDescriptionCount = 1;
+    authored_shadow_info.pVertexInputState = &model_shadow_input;
+    VK_CHECK(vkCreateGraphicsPipelines(
+        context_->device(), pipeline_cache_, 1, &authored_shadow_info, nullptr,
+        model_shadow_pipeline_.put(context_->device(), vkDestroyPipeline)));
+    context_->set_debug_name(VK_OBJECT_TYPE_PIPELINE, handle_value(authored_shadow_pipeline_.get()),
+                             "authored cube shadow pipeline");
+    context_->set_debug_name(VK_OBJECT_TYPE_PIPELINE, handle_value(model_shadow_pipeline_.get()),
+                             "imported model shadow pipeline");
+#endif
+
     const ShaderModule fullscreen_vertex_module =
         load_shader("fullscreen.vert.spv");
     const VkPipelineRasterizationStateCreateInfo
@@ -4362,6 +4498,8 @@ void Renderer::create_pipeline() {
 }
 
 void Renderer::destroy_pipeline() noexcept {
+    authored_shadow_pipeline_.reset();
+    model_shadow_pipeline_.reset();
     for (auto* const pipeline : {
              &smaa_geometry_.cubes, &smaa_geometry_.scene,
              &smaa_geometry_.models, &smaa_geometry_.terrain,
@@ -4510,6 +4648,7 @@ bool Renderer::draw_frame(
     timings.fence_wait_ms = milliseconds(begin, Clock::now());
     complete_screenshot(frame);
     read_gpu_timestamps(frame, timings);
+    read_gpu_visibility(frame);
 
     if (resize_requested_) {
         rebuild_swapchain();
@@ -4534,7 +4673,9 @@ bool Renderer::draw_frame(
         VK_CHECK(acquire);
     }
 
+    begin = Clock::now();
     update_frame_uniform(frame, view_matrix);
+    timings.scene_prepare_ms = milliseconds(begin, Clock::now());
     VK_CHECK(vkResetFences(context_->device(), 1, &frame.fence));
     VK_CHECK(vkResetCommandPool(
         context_->device(), frame.command_pool, 0));
@@ -4587,6 +4728,11 @@ bool Renderer::draw_frame(
     VK_CHECK(vkQueueSubmit2(
         context_->graphics_queue(), 1, &submit_info, frame.fence));
     timings.queue_submit_ms = milliseconds(begin, Clock::now());
+#if VCR_EDITOR_ENABLED
+    if (authored_scene_enabled_ && mode_ != RunMode::instancing) {
+        runtime_transforms_.commit();
+    }
+#endif
     frame.timestamps_valid = frame.timestamp_queries != VK_NULL_HANDLE;
     frame.workload_was_enabled =
         mode_ == RunMode::gpu_saturation &&
@@ -4626,13 +4772,8 @@ void Renderer::read_gpu_timestamps(
     }
     std::array<std::uint64_t, timestamp_query_count> timestamps{};
     const VkResult result = vkGetQueryPoolResults(
-        context_->device(),
-        frame.timestamp_queries,
-        0,
-        timestamp_query_count,
-        sizeof(timestamps),
-        timestamps.data(),
-        sizeof(std::uint64_t),
+        context_->device(), frame.timestamp_queries, 0, timestamp_shadow_begin,
+        timestamp_shadow_begin * sizeof(std::uint64_t), timestamps.data(), sizeof(std::uint64_t),
         VK_QUERY_RESULT_64_BIT);
     if (result != VK_SUCCESS) {
         if (result != VK_NOT_READY) {
@@ -4657,9 +4798,38 @@ void Renderer::read_gpu_timestamps(
         elapsed(timestamp_frame_begin, timestamp_frame_end);
     timings.gpu_geometry_ms =
         elapsed(timestamp_geometry_begin, timestamp_geometry_end);
+    timings.gpu_shadow_ms = 0.0;
+    if (frame.shadow_was_updated) {
+        const auto shadow_result = vkGetQueryPoolResults(
+            context_->device(), frame.timestamp_queries, timestamp_shadow_begin, 2,
+            2 * sizeof(std::uint64_t), timestamps.data() + timestamp_shadow_begin,
+            sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
+        if (shadow_result == VK_SUCCESS) {
+            timings.gpu_shadow_ms = elapsed(timestamp_shadow_begin, timestamp_shadow_end);
+        } else if (shadow_result == VK_NOT_READY) {
+            timings.gpu_shadow_ms = unavailable_timing_ms;
+        } else {
+            VK_CHECK(shadow_result);
+        }
+    }
     timings.gpu_workload_ms = frame.workload_was_enabled
         ? elapsed(timestamp_workload_begin, timestamp_workload_end)
         : unavailable_timing_ms;
+    timings.gpu_visibility_ms = 0.0;
+    if (frame.visibility_was_updated) {
+        const auto visibility_result = vkGetQueryPoolResults(
+            context_->device(), frame.timestamp_queries, timestamp_visibility_begin, 2,
+            2 * sizeof(std::uint64_t), timestamps.data() + timestamp_visibility_begin,
+            sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
+        if (visibility_result == VK_SUCCESS) {
+            timings.gpu_visibility_ms =
+                elapsed(timestamp_visibility_begin, timestamp_visibility_end);
+        } else if (visibility_result == VK_NOT_READY) {
+            timings.gpu_visibility_ms = unavailable_timing_ms;
+        } else {
+            VK_CHECK(visibility_result);
+        }
+    }
     frame.timestamps_valid = false;
 }
 
@@ -4772,9 +4942,6 @@ void Renderer::record_commands(
     VK_CHECK(vkBeginCommandBuffer(command_buffer, &begin_info));
 
     auto& frame = frames_[frame_index_];
-#if VCR_EDITOR_ENABLED
-    record_editor_scene_upload(command_buffer, frame);
-#endif
     if (frame.timestamp_queries != VK_NULL_HANDLE) {
         vkCmdResetQueryPool(
             command_buffer,
@@ -4786,6 +4953,22 @@ void Renderer::record_commands(
             VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
             frame.timestamp_queries,
             timestamp_frame_begin);
+    }
+#if VCR_EDITOR_ENABLED
+    record_editor_scene_upload(command_buffer, frame);
+    frame.visibility_was_updated = gpu_visibility_active() && !gpu_visibility_bypassed_ &&
+                                   frame.visibility.view_revision != gpu_visibility_revision_;
+    if (frame.visibility_was_updated && frame.timestamp_queries != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                             frame.timestamp_queries, timestamp_visibility_begin);
+    }
+    record_gpu_visibility(command_buffer, frame);
+    if (frame.visibility_was_updated && frame.timestamp_queries != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                             frame.timestamp_queries, timestamp_visibility_end);
+    }
+#endif
+    if (frame.timestamp_queries != VK_NULL_HANDLE) {
         vkCmdWriteTimestamp2(
             command_buffer,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -4863,14 +5046,25 @@ void Renderer::record_commands(
         vkCmdPipelineBarrier2(command_buffer, &dependency);
     }
 
-    if (frame.timestamp_queries != VK_NULL_HANDLE) {
-        vkCmdWriteTimestamp2(
-            command_buffer,
-            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-            frame.timestamp_queries,
-            timestamp_geometry_begin);
+#if VCR_EDITOR_ENABLED
+    frame.shadow_was_updated =
+        authored_scene_enabled_ && shadow_dirty_ && mode_ != RunMode::instancing;
+    if (frame.shadow_was_updated) {
+        if (frame.timestamp_queries != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,
+                                 frame.timestamp_queries, timestamp_shadow_begin);
+        }
+        record_shadow_map(command_buffer, frame);
+        if (frame.timestamp_queries != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,
+                                 frame.timestamp_queries, timestamp_shadow_end);
+        }
     }
-
+#endif
+    if (frame.timestamp_queries != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,
+                             frame.timestamp_queries, timestamp_geometry_begin);
+    }
     struct GraphicsPushConstants {
         std::uint32_t workload_elements;
         float workload_mix;
@@ -4964,32 +5158,43 @@ void Renderer::record_commands(
             } else {
 #if VCR_EDITOR_ENABLED
                 if (authored_scene_enabled_) {
-                    if (frame.scene_ground_count > 0U) {
-                        vkCmdDrawIndexed(
-                            command_buffer,
-                            plane_index_count,
-                            frame.scene_ground_count,
-                            plane_first_index,
-                            plane_vertex_offset,
-                            0U);
+                    if (gpu_visibility_active_ && gpu_visibility_bypassed_) {
+                        if (editor_ground_count_) {
+                            vkCmdDrawIndexed(command_buffer, plane_index_count,
+                                             editor_ground_count_, plane_first_index,
+                                             plane_vertex_offset, 0);
+                        }
+                        if (editor_cube_count_) {
+                            vkCmdDrawIndexed(command_buffer, cube_index_count, editor_cube_count_,
+                                             0, 0, editor_ground_count_);
+                        }
+                    } else if (gpu_visibility_active_) {
+                        vkCmdDrawIndexedIndirect(command_buffer, frame.visibility.indirect.handle(),
+                                                 0, 1, sizeof(VkDrawIndexedIndirectCommand));
+                        vkCmdDrawIndexedIndirect(command_buffer, frame.visibility.indirect.handle(),
+                                                 3 * sizeof(VkDrawIndexedIndirectCommand), 1,
+                                                 sizeof(VkDrawIndexedIndirectCommand));
+                    } else if (frame.scene_ground_count > 0U) {
+                        vkCmdDrawIndexed(command_buffer, plane_index_count,
+                                         frame.scene_ground_count, plane_first_index,
+                                         plane_vertex_offset, frame.scene_color_first_instance);
                     }
-                    if (frame.scene_cube_count > 0U) {
+                    if (!gpu_visibility_active_ && frame.scene_cube_count > 0U) {
                         vkCmdDrawIndexed(
-                            command_buffer,
-                            cube_index_count,
-                            frame.scene_cube_count,
-                            0U,
-                            0,
-                            frame.scene_ground_count);
+                            command_buffer, cube_index_count, frame.scene_cube_count, 0U, 0,
+                            frame.scene_color_first_instance + frame.scene_ground_count);
                     }
-                    if (!editor_model_draws_.empty()) {
+                    const auto &model_draws =
+                        gpu_visibility_active_ ? editor_model_draws_ : visible_model_draws_;
+                    if (!model_draws.empty()) {
                         vkCmdBindPipeline(
                             command_buffer,
                             VK_PIPELINE_BIND_POINT_GRAPHICS,
                             editor_model_pipeline);
                     }
-                    for (const EditorModelDraw& draw :
-                         editor_model_draws_) {
+                    for (std::size_t draw_index = 0; draw_index < model_draws.size();
+                         ++draw_index) {
+                        const auto &draw = model_draws[draw_index];
                         vkCmdBindDescriptorSets(
                             command_buffer,
                             VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -5014,13 +5219,21 @@ void Renderer::record_commands(
                             asset.index_buffer.handle(),
                             0,
                             VK_INDEX_TYPE_UINT32);
-                        vkCmdDrawIndexed(
-                            command_buffer,
-                            draw.index_count,
-                            draw.instance_count,
-                            draw.first_index,
-                            0,
-                            draw.first_instance);
+                        if (gpu_visibility_active_) {
+                            const auto &submesh = asset.submeshes[draw.submesh_index];
+                            for (unsigned lod = 0; lod < 3; ++lod) {
+                                if (submesh.lod_count[lod] > 0) {
+                                    vkCmdDrawIndexedIndirect(
+                                        command_buffer, frame.visibility.indirect.handle(),
+                                        ((draw_index + 2) * 3 + lod) *
+                                            sizeof(VkDrawIndexedIndirectCommand),
+                                        1, sizeof(VkDrawIndexedIndirectCommand));
+                                }
+                            }
+                        } else {
+                            vkCmdDrawIndexed(command_buffer, draw.index_count, draw.instance_count,
+                                             draw.first_index, 0, draw.first_instance);
+                        }
                     }
                 } else
 #endif
@@ -5077,13 +5290,8 @@ void Renderer::record_commands(
                         terrain_index_buffer_.handle(),
                         0,
                         VK_INDEX_TYPE_UINT32);
-                    vkCmdDrawIndexed(
-                        command_buffer,
-                        terrain_index_count,
-                        1,
-                        0,
-                        0,
-                        0);
+                    vkCmdDrawIndexed(command_buffer, terrain_lod_count_[terrain_lod_], 1,
+                                     terrain_lod_first_[terrain_lod_], 0, 0);
                 }
             }
             bool draw_sky = mode_ != RunMode::instancing;
@@ -5945,7 +6153,12 @@ std::uint64_t Renderer::triangle_count() const noexcept {
     }
 #if VCR_EDITOR_ENABLED
     if (authored_scene_enabled_) {
-        return authored_scene_triangle_count_;
+        const std::uint64_t terrain_triangles =
+            editor_terrain_visible_
+                ? static_cast<std::uint64_t>(terrain_triangle_count) / (1ULL << (2U * terrain_lod_))
+                : 0U;
+        return visibility_statistics_.triangles + terrain_triangles +
+               (editor_sky_visible_ ? 1U : 0U);
     }
 #endif
     return scene_triangle_count;

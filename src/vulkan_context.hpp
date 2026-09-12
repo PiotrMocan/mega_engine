@@ -66,35 +66,37 @@ public:
         VkObjectType type,
         std::uint64_t handle,
         const char* name) const noexcept;
+    [[nodiscard]] bool indirect_first_instance() const noexcept {
+        return indirect_first_instance_;
+    }
 
 private:
-    void create_instance(SDL_Window* window, bool validation_requested);
-    void create_debug_messenger();
-    void create_surface(SDL_Window* window);
-    void select_physical_device();
-    void create_device();
-    void create_allocator();
+  bool indirect_first_instance_ = false;
+  void create_instance(SDL_Window *window, bool validation_requested);
+  void create_debug_messenger();
+  void create_surface(SDL_Window *window);
+  void select_physical_device();
+  void create_device();
+  void create_allocator();
 
-    [[nodiscard]] QueueFamilySelection find_queue_families(
-        VkPhysicalDevice device) const;
-    [[nodiscard]] bool supports_required_device_features(
-        VkPhysicalDevice device,
-        QueueFamilySelection& families) const;
+  [[nodiscard]] QueueFamilySelection find_queue_families(VkPhysicalDevice device) const;
+  [[nodiscard]] bool supports_required_device_features(VkPhysicalDevice device,
+                                                       QueueFamilySelection &families) const;
 
-    VkInstance instance_ = VK_NULL_HANDLE;
-    VkDebugUtilsMessengerEXT debug_messenger_ = VK_NULL_HANDLE;
-    VkSurfaceKHR surface_ = VK_NULL_HANDLE;
-    VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
-    VkDevice device_ = VK_NULL_HANDLE;
-    VkQueue graphics_queue_ = VK_NULL_HANDLE;
-    VkQueue present_queue_ = VK_NULL_HANDLE;
-    VmaAllocator allocator_ = VK_NULL_HANDLE;
-    QueueFamilySelection queue_families_{};
-    VkPhysicalDeviceProperties properties_{};
-    bool validation_enabled_ = false;
-    bool fsr3_device_compatible_ = false;
-    bool fsr3_fp16_enabled_ = false;
-    std::uint32_t timestamp_valid_bits_ = 0;
+  VkInstance instance_ = VK_NULL_HANDLE;
+  VkDebugUtilsMessengerEXT debug_messenger_ = VK_NULL_HANDLE;
+  VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+  VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
+  VkDevice device_ = VK_NULL_HANDLE;
+  VkQueue graphics_queue_ = VK_NULL_HANDLE;
+  VkQueue present_queue_ = VK_NULL_HANDLE;
+  VmaAllocator allocator_ = VK_NULL_HANDLE;
+  QueueFamilySelection queue_families_{};
+  VkPhysicalDeviceProperties properties_{};
+  bool validation_enabled_ = false;
+  bool fsr3_device_compatible_ = false;
+  bool fsr3_fp16_enabled_ = false;
+  std::uint32_t timestamp_valid_bits_ = 0;
 };
 
 } // namespace vcr

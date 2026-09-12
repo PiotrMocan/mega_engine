@@ -45,8 +45,10 @@ versioned layout:
 
 Model manifest можно добавить в сцену кнопкой `Add to Scene`, двойным кликом,
 context menu или перетаскиванием на `Scene View`. Перед изменением сцены editor
-повторно проверяет containment/symlinks, полностью загружает и валидирует
-manifest, mesh и материалы, затем создаёт GPU buffers. Начальный transform
+повторно проверяет containment/symlinks. Постоянный worker загружает manifest,
+mesh, материалы и textures, готовит LOD. Submission thread отправляет единый
+upload batch и публикует модель после сигнала fence; UI сохраняет pending
+добавление. Начальный transform
 записывает в scene JSON явные center/ground/fit translation и uniform scale,
 поэтому source-space offset и единицы большого FBX не прячут model от камеры.
 
@@ -104,8 +106,9 @@ submesh material. Cooked position/normal/UV/tangent поступают в отд
 direct/AA model pipelines. Base-color texture использует sRGB view, normal map
 — linear view и TBN; отсутствующая, неподдерживаемая или semantic-mismatched
 texture заменяется белой/flat-normal fallback с warning. Texture/material cache
-editor-only, ограничен по числу assets, descriptors и GPU bytes и живёт до
+общий для editor/game renderer, ограничен по числу assets, descriptors и GPU bytes и живёт до
 shutdown, чтобы не уничтожать resources, которые ещё могут использовать два
 frames in flight. Metallic/roughness/AO texture slots пока используют factors.
-Editor shadow map остаётся статическим: imported models получают освещение и
-тень сцены, но сами пока не добавляются в shadow caster pass.
+Imported models, cubes и terrain участвуют в shadow caster pass. Карта тени
+переиспользуется, пока transforms/состав сцены/настройки не изменились.
+Подробности LOD, visibility и стоимости dynamic shadows: [runtime renderer](ENGINE_EVOLUTION.md).

@@ -2,6 +2,7 @@
 
 #include "vulkan_common.hpp"
 #include "gpu_buffer.hpp"
+#include "gpu_visibility.hpp"
 
 #include <cstdint>
 
@@ -25,6 +26,8 @@ struct FrameContext {
     VkQueryPool timestamp_queries = VK_NULL_HANDLE;
     bool timestamps_valid = false;
     bool workload_was_enabled = false;
+    bool shadow_was_updated = false;
+    bool visibility_was_updated = false;
     bool screenshot_capture = false;
     std::uint32_t screenshot_width = 0;
     std::uint32_t screenshot_height = 0;
@@ -35,6 +38,8 @@ struct FrameContext {
     std::uint64_t scene_revision = 0U;
     std::uint32_t scene_ground_count = 0U;
     std::uint32_t scene_cube_count = 0U;
+    std::uint32_t scene_color_first_instance = 0U;
+    GpuVisibilityFrame visibility{};
 #endif
 };
 

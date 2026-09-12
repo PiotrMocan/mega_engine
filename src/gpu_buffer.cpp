@@ -115,5 +115,10 @@ void GpuBuffer::invalidate(
     VK_CHECK(vmaInvalidateAllocation(
         context_->allocator(), allocation_, offset, size));
 }
+std::span<const std::byte> GpuBuffer::read_completed_bytes(VkDeviceSize size) {
+    size = size == VK_WHOLE_SIZE ? size_ : size;
+    invalidate(0, size);
+    return {static_cast<const std::byte *>(mapped_data_), static_cast<std::size_t>(size)};
+}
 
 } // namespace vcr

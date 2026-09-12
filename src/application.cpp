@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -68,6 +69,9 @@ using Json = nlohmann::json;
         {"gpu_frame_ms", timings.gpu_frame_ms},
         {"gpu_geometry_ms", timings.gpu_geometry_ms},
         {"gpu_workload_ms", timings.gpu_workload_ms},
+        {"gpu_shadow_ms", timings.gpu_shadow_ms},
+        {"gpu_visibility_ms", timings.gpu_visibility_ms},
+        {"scene_prepare_ms", timings.scene_prepare_ms},
     };
 }
 
@@ -158,6 +162,30 @@ void Application::initialize(const CliOptions& options) {
         false,
         true);
     load_canonical_scene();
+    camera_ = FlyCamera({0, 4, static_cast<float>(options.camera_z)});
+    VisibilitySettings visibility{options.frustum_culling, options.occlusion_culling, options.lod,
+                                  options.dynamic_shadows};
+    visibility.backend = options.visibility_backend == "cpu" ? VisibilitySettings::Backend::cpu
+                         : options.visibility_backend == "gpu"
+                             ? VisibilitySettings::Backend::gpu
+                             : VisibilitySettings::Backend::automatic;
+    if (visibility.backend == VisibilitySettings::Backend::gpu &&
+        !renderer_.gpu_visibility_available()) {
+        fatal("GPU visibility requires drawIndirectFirstInstance and sufficient compute/storage "
+              "limits");
+    }
+    renderer_.set_visibility_settings(visibility);
+    renderer_.enable_async_assets();
+    if (!options.stream_asset.empty()) {
+        const auto root = find_runtime_asset_root();
+        SceneTransform ignored;
+        std::string error;
+        static_cast<void>(
+            renderer_.prepare_editor_model(root->path, options.stream_asset, ignored, error));
+        if (!error.empty()) {
+            fatal(error);
+        }
+    }
     const auto now = std::chrono::steady_clock::now();
     last_camera_tick_ = now;
     last_title_update_ = now;
@@ -188,6 +216,58 @@ void Application::load_canonical_scene() {
     const std::filesystem::path scene_path =
         asset_root->path / canonical_scene_relative_path;
     std::string error;
+    if (options_.scene_count > 0) {
+        scene_instances_.reserve(options_.scene_count);
+        scene_models_.reserve(options_.scene_count);
+        auto &ids = stress_cube_ids_;
+        ids.reserve(options_.scene_count);
+        for (std::uint32_t i = 0; i < options_.scene_count; ++i) {
+            SceneGpuInstance instance;
+            instance.model_row_0.w = (static_cast<float>(i % 128) - 64.0F) * 4;
+            instance.model_row_1.w = static_cast<float>((i / 128) % 8) * 4 - 10;
+            instance.model_row_2.w = -20 - static_cast<float>(i / 1024) * 5;
+            // Real opaque wall segments in front of some stress instances.
+            if (options_.scene_walls && i < 8) {
+                instance.model_row_0 = {3, 0, 0, (static_cast<float>(i) - 3.5F) * 6};
+                instance.model_row_1 = {0, 10, 0, 0};
+                instance.model_row_2 = {0, 0, 1, -12};
+            }
+            const SceneNodeId id{i, 1};
+            const auto scale = static_cast<float>(options_.scene_scale);
+            instance.model_row_0 =
+                glm::vec4(glm::vec3(instance.model_row_0) * scale, instance.model_row_0.w);
+            instance.model_row_1 =
+                glm::vec4(glm::vec3(instance.model_row_1) * scale, instance.model_row_1.w);
+            instance.model_row_2 =
+                glm::vec4(glm::vec3(instance.model_row_2) * scale, instance.model_row_2.w);
+            if (options_.scene_asset.empty()) {
+                scene_instances_.push_back(instance);
+                ids.push_back(id);
+            } else {
+                scene_models_.push_back({instance.model_row_0, instance.model_row_1,
+                                         instance.model_row_2, options_.scene_asset, id});
+            }
+        }
+        const SceneRenderView view{.cubes = scene_instances_,
+                                   .models = scene_models_,
+                                   .revision = 2,
+                                   .sky_visible = true,
+                                   .sun_visible = true,
+                                   .cube_ids = ids};
+        if (!renderer_.update_editor_scene(view, asset_root->path, error)) {
+            fatal(error);
+        }
+        animated_node_ = {0, 1};
+        const auto &instance =
+            options_.scene_asset.empty()
+                ? scene_instances_.front()
+                : SceneGpuInstance{.model_row_0 = scene_models_.front().model_row_0,
+                                   .model_row_1 = scene_models_.front().model_row_1,
+                                   .model_row_2 = scene_models_.front().model_row_2};
+        animation_origin_ = {instance.model_row_0, instance.model_row_1, instance.model_row_2};
+        std::cout << "Runtime stress scene: " << options_.scene_count << " objects\n";
+        return;
+    }
     if (!load_scene_file(scene_path, scene_, error)) {
         std::cerr
             << "Unable to load canonical editor/game scene: "
@@ -199,6 +279,15 @@ void Application::load_canonical_scene() {
     scene_models_.reserve(max_scene_nodes);
     const SceneRenderView view =
         scene_.build_render_view(scene_instances_, scene_models_);
+    if (!view.cubes.empty()) {
+        animated_node_ = view.cube_ids.front();
+        const auto &instance = view.cubes.front();
+        animation_origin_ = {instance.model_row_0, instance.model_row_1, instance.model_row_2};
+    } else if (!view.models.empty()) {
+        const auto &instance = view.models.front();
+        animated_node_ = instance.id;
+        animation_origin_ = {instance.model_row_0, instance.model_row_1, instance.model_row_2};
+    }
     if (!renderer_.update_editor_scene(
             view, asset_root->path, error)) {
         std::cerr
@@ -209,6 +298,57 @@ void Application::load_canonical_scene() {
     std::cout
         << "Loaded scene: " << scene_path
         << " (" << scene_.size() << " nodes)\n";
+}
+
+void Application::service_assets() {
+    static_cast<void>(renderer_.poll_assets());
+    if (options_.stream_asset.empty() || stream_asset_placed_ || renderer_.assets_pending()) {
+        return;
+    }
+    const auto root = find_runtime_asset_root();
+    if (!root) {
+        fatal("Runtime assets root disappeared");
+    }
+    SceneTransform transform;
+    std::string error;
+    if (!renderer_.prepare_editor_model(root->path, options_.stream_asset, transform, error)) {
+        if (!error.empty()) {
+            fatal(error);
+        }
+        return;
+    }
+    if (options_.scene_count > 0) {
+        if (options_.scene_count >= max_scene_nodes) {
+            fatal("No node capacity for streamed model");
+        }
+        scene_models_.push_back({{transform.scale.x, 0, 0, transform.translation.x},
+                                 {0, transform.scale.y, 0, transform.translation.y},
+                                 {0, 0, transform.scale.z, transform.translation.z},
+                                 options_.stream_asset,
+                                 {options_.scene_count, 1}});
+        const SceneRenderView view{.cubes = scene_instances_,
+                                   .models = scene_models_,
+                                   .revision = 3,
+                                   .sky_visible = true,
+                                   .sun_visible = true,
+                                   .cube_ids = stress_cube_ids_};
+        if (!renderer_.update_editor_scene(view, root->path, error)) {
+            fatal(error);
+        }
+    } else {
+        const auto id = scene_.create_node("Streamed model", SceneNodeKind::model);
+        if (!id) {
+            fatal("No node capacity for streamed model");
+        }
+        auto &node = scene_.node(id)->get();
+        node.asset_path = options_.stream_asset;
+        node.transform = transform;
+        const auto view = scene_.build_render_view(scene_instances_, scene_models_);
+        if (!renderer_.update_editor_scene(view, root->path, error)) {
+            fatal(error);
+        }
+    }
+    stream_asset_placed_ = true;
 }
 
 void Application::main_loop() {
@@ -264,6 +404,19 @@ void Application::main_loop() {
             break;
         }
         update_camera(camera_delta_seconds);
+        service_assets();
+        if (options_.animate_camera) {
+            camera_animation_time_ += camera_delta_seconds;
+            camera_ = FlyCamera({4.0F * static_cast<float>(std::sin(camera_animation_time_ * .6)),
+                                 4, static_cast<float>(options_.camera_z)});
+        }
+        if (options_.animate_scene && animated_node_) {
+            animation_time_ += camera_delta_seconds;
+            auto transform = animation_origin_;
+            transform.x.w += 2.0F * static_cast<float>(std::sin(animation_time_ * 1.3));
+            transform.y.w += 0.5F * static_cast<float>(std::sin(animation_time_ * 0.7));
+            static_cast<void>(renderer_.set_runtime_transform(animated_node_, transform));
+        }
 
         int pixel_width = 0;
         int pixel_height = 0;
@@ -599,42 +752,50 @@ void Application::execute_mcp_command(const McpCommand& command) {
                 {"running", running_},
                 {"mcp_running", mcp_server_.running()},
                 {"benchmark", options_.benchmark},
-                {"render", Json{
-                    {"mode", std::string(to_string(renderer_.mode()))},
-                    {"instances", renderer_.instance_count()},
-                    {"triangles", renderer_.triangle_count()},
-                    {"gpu_workload_iterations",
-                     renderer_.gpu_workload_iterations()},
-                    {"anti_aliasing", Json{
-                        {"method", std::string(to_token(
-                            anti_aliasing.method))},
-                        {"display_name", std::string(to_string(
-                            anti_aliasing.method))},
-                        {"quality", std::string(
-                            renderer_.anti_aliasing_quality_name())},
-                        {"fsr3_available",
-                         renderer_.fsr3_available()},
-                    }},
-                    {"present_mode",
-                     Swapchain::present_mode_name(
-                         renderer_.swapchain().present_mode())},
-                    {"screenshot_pending",
-                     renderer_.screenshot_pending()},
-                }},
-                {"window", Json{
-                    {"logical_width", window_width},
-                    {"logical_height", window_height},
-                    {"pixel_width", extent.width},
-                    {"pixel_height", extent.height},
-                    {"fullscreen", fullscreen_},
-                    {"mouse_captured", mouse_captured_},
-                }},
-                {"camera", Json{
-                    {"position", Json::array({
-                        position.x, position.y, position.z})},
-                    {"forward", Json::array({
-                        forward.x, forward.y, forward.z})},
-                }},
+                {"render",
+                 Json{
+                     {"mode", std::string(to_string(renderer_.mode()))},
+                     {"instances", renderer_.instance_count()},
+                     {"triangles", renderer_.triangle_count()},
+                     {"assets_pending", renderer_.assets_pending()},
+                     {"visibility_backend", renderer_.visibility_backend()},
+                     {"upload_high_water_bytes", renderer_.upload_high_water()},
+                     {"visibility",
+                      Json{
+                          {"submitted", renderer_.visibility_statistics().submitted},
+                          {"visible", renderer_.visibility_statistics().visible},
+                          {"frustum_rejected", renderer_.visibility_statistics().frustum_rejected},
+                          {"occlusion_rejected",
+                           renderer_.visibility_statistics().occlusion_rejected},
+                          {"lod_instances", renderer_.visibility_statistics().lod_instances},
+                          {"packet_revision", renderer_.visibility_statistics().packet_revision},
+                      }},
+                     {"gpu_workload_iterations", renderer_.gpu_workload_iterations()},
+                     {"anti_aliasing",
+                      Json{
+                          {"method", std::string(to_token(anti_aliasing.method))},
+                          {"display_name", std::string(to_string(anti_aliasing.method))},
+                          {"quality", std::string(renderer_.anti_aliasing_quality_name())},
+                          {"fsr3_available", renderer_.fsr3_available()},
+                      }},
+                     {"present_mode",
+                      Swapchain::present_mode_name(renderer_.swapchain().present_mode())},
+                     {"screenshot_pending", renderer_.screenshot_pending()},
+                 }},
+                {"window",
+                 Json{
+                     {"logical_width", window_width},
+                     {"logical_height", window_height},
+                     {"pixel_width", extent.width},
+                     {"pixel_height", extent.height},
+                     {"fullscreen", fullscreen_},
+                     {"mouse_captured", mouse_captured_},
+                 }},
+                {"camera",
+                 Json{
+                     {"position", Json::array({position.x, position.y, position.z})},
+                     {"forward", Json::array({forward.x, forward.y, forward.z})},
+                 }},
                 {"virtual_keys_held", mcp_keys_down_.count()},
             });
         return;
@@ -1003,6 +1164,35 @@ void Application::finish_benchmark() {
     result.average_fps = static_cast<double>(stats.frames_rendered) /
                          benchmark_measurement_seconds_;
     result.mode = to_string(renderer_.mode());
+    const auto &visibility = renderer_.visibility_statistics();
+    result.visible_instances = visibility.visible;
+    result.frustum_rejected = visibility.frustum_rejected;
+    result.occlusion_rejected = visibility.occlusion_rejected;
+    result.lod_instances = visibility.lod_instances;
+    result.frustum_culling = options_.frustum_culling;
+    result.occlusion_culling = options_.occlusion_culling;
+    result.lod = options_.lod;
+    result.dynamic_shadows = options_.dynamic_shadows;
+    result.animated = options_.animate_scene;
+    result.animated_camera = options_.animate_camera;
+    result.visibility_backend = renderer_.visibility_backend();
+    result.camera_z = options_.camera_z;
+    result.scene_scale = options_.scene_scale;
+    result.scene_walls = options_.scene_walls;
+    result.scene_count = options_.scene_count;
+    result.scene_asset = options_.scene_asset;
+    result.source_instances = visibility.submitted;
+    result.terrain_lod = renderer_.terrain_lod();
+    if (renderer_.mode() == RunMode::instancing) {
+        result.source_instances = result.instances;
+        result.visible_instances = result.instances;
+        result.frustum_rejected = 0;
+        result.occlusion_rejected = 0;
+        result.lod_instances = {result.instances, 0, 0};
+        result.visibility_backend = "direct";
+        result.frustum_culling = result.occlusion_culling = result.lod = result.dynamic_shadows =
+            false;
+    }
     result.build_type = VCR_BUILD_TYPE;
     result.triangles = renderer_.triangle_count();
     std::string error;

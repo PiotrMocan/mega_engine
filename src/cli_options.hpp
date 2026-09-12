@@ -54,6 +54,19 @@ struct CliOptions {
     bool mcp_stdio = false;
     bool validation = default_validation_enabled;
     bool show_help = false;
+    bool frustum_culling = true;
+    bool occlusion_culling = true;
+    bool lod = true;
+    bool dynamic_shadows = true;
+    bool animate_scene = false;
+    std::uint32_t scene_count = 0;
+    std::string scene_asset{};
+    std::string stream_asset{};
+    bool animate_camera = false;
+    std::string visibility_backend = "auto";
+    double camera_z = 12.0;
+    double scene_scale = 1.0;
+    bool scene_walls = true;
 };
 
 struct CliParseResult {

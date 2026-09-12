@@ -520,6 +520,8 @@ void VulkanContext::create_device() {
     features2.pNext = &features11;
     features2.features.shaderInt16 =
         fsr3_device_compatible_ ? VK_TRUE : VK_FALSE;
+    indirect_first_instance_ = supported2.features.drawIndirectFirstInstance == VK_TRUE;
+    features2.features.drawIndirectFirstInstance = indirect_first_instance_ ? VK_TRUE : VK_FALSE;
     const VkDeviceCreateInfo create_info{
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = &features2,

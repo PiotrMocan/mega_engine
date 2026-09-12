@@ -31,6 +31,8 @@ public:
     void invalidate(
         VkDeviceSize offset = 0,
         VkDeviceSize size = VK_WHOLE_SIZE);
+    // Caller owns a completed GPU write (for example via the frame fence).
+    [[nodiscard]] std::span<const std::byte> read_completed_bytes(VkDeviceSize size);
 
     [[nodiscard]] VkBuffer handle() const noexcept { return buffer_; }
     [[nodiscard]] VmaAllocation allocation() const noexcept { return allocation_; }

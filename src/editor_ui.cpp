@@ -1276,6 +1276,17 @@ void EditorUi::begin_frame(
     external_viewport_hovered_ = false;
     external_viewport_focused_ = false;
     process_import_pipeline();
+    if (!pending_model_path_.empty() && !renderer.assets_pending()) {
+        auto path = std::move(pending_model_path_);
+        auto name = std::move(pending_model_name_);
+        pending_model_path_.clear();
+        pending_model_name_.clear();
+        const auto previous_selection = selected_node_;
+        selected_node_ = scene.valid(pending_model_parent_) ? pending_model_parent_ : SceneNodeId{};
+        if (!add_model_asset_to_scene(scene, renderer, path, name)) {
+            selected_node_ = previous_selection;
+        }
+    }
     if (saved_content_revision_ == 0U) {
         saved_content_revision_ = scene.content_revision();
         saved_structure_revision_ = scene.structure_revision();
@@ -2463,6 +2474,10 @@ bool EditorUi::add_model_asset_to_scene(
     Renderer& renderer,
     const std::string_view relative_path,
     const std::string_view display_name) {
+    if (!pending_model_path_.empty()) {
+        asset_error_ = "A model is already being prepared. Wait for it to finish.";
+        return false;
+    }
     if (play_state_ != EditorPlayState::edit) {
         asset_error_ =
             "Models can be added to the scene only in Edit mode.";
@@ -2553,6 +2568,13 @@ bool EditorUi::add_model_asset_to_scene(
                 relative_path,
                 recommended_transform,
                 asset_error_)) {
+            if (asset_error_.empty() && renderer.assets_pending()) {
+                pending_model_path_ = relative_path;
+                pending_model_name_ = name;
+                pending_model_parent_ = selected_node_;
+                scene_file_status_ = "Preparing model...";
+                return true;
+            }
             return false;
         }
 
@@ -3255,9 +3277,28 @@ void EditorUi::build_performance(
         ImGui::EndTable();
     }
 
-    ui_kit_.section_header(
-        EditorIcon::renderer,
-        "Output Pipeline");
+    auto visibility = renderer.visibility_settings();
+    bool visibility_changed = ImGui::Checkbox("Frustum culling", &visibility.frustum);
+    visibility_changed |= ImGui::Checkbox("Occlusion culling", &visibility.occlusion);
+    visibility_changed |= ImGui::Checkbox("Mesh and terrain LOD", &visibility.lod);
+    visibility_changed |= ImGui::Checkbox("Dynamic object shadows", &visibility.dynamic_shadows);
+    if (visibility.lod) {
+        visibility_changed |= ImGui::SliderFloat("LOD error (pixels)", &visibility.lod_pixel_error,
+                                                 .1F, 8.0F, "%.1f");
+    }
+    if (visibility_changed) {
+        renderer.set_visibility_settings(visibility);
+    }
+    const auto &visible = renderer.visibility_statistics();
+    ImGui::Text("Visible: %u / %u (%s)", visible.visible, visible.submitted,
+                renderer.visibility_backend());
+    ImGui::Text("Rejected: %u frustum, %u occlusion", visible.frustum_rejected,
+                visible.occlusion_rejected);
+    ImGui::Text("LOD instances: %u / %u / %u", visible.lod_instances[0], visible.lod_instances[1],
+                visible.lod_instances[2]);
+    ImGui::Text("GPU culling %.3f ms, shadows %.3f ms", performance.average.gpu_visibility_ms,
+                performance.average.gpu_shadow_ms);
+    ui_kit_.section_header(EditorIcon::renderer, "Output Pipeline");
     if (ui_kit_.begin_property_grid("RendererProperties")) {
         ui_kit_.property_row("Present");
         ui_kit_.badge(
@@ -3440,6 +3481,9 @@ void EditorUi::open_scene(SceneDocument& scene) {
         return;
     }
     scene = std::move(loaded);
+    pending_model_path_.clear();
+    pending_model_name_.clear();
+    pending_model_parent_ = {};
     saved_content_revision_ = scene.content_revision();
     saved_structure_revision_ = scene.structure_revision();
     scene_file_status_ =

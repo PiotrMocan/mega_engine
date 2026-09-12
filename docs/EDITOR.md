@@ -1,5 +1,11 @@
 # Vulkan Editor
 
+В `Render` panel доступны frustum/occlusion culling, mesh/terrain LOD,
+dynamic object shadows и бюджет ошибки LOD. Здесь же показаны текущий
+CPU/GPU backend, visible/rejected/LOD counts и GPU timings.
+Runtime-архитектура, ограничения и A/B проверки описаны в
+[ENGINE_EVOLUTION.md](ENGINE_EVOLUTION.md).
+
 ## Почему Dear ImGui, а не Nuklear
 
 Редактор использует Dear ImGui `v1.92.8-docking`, закреплённый в CMake.
@@ -17,8 +23,9 @@ multi-viewport и `ImGuiListClipper`. Поверх него редактор и�
 - <https://github.com/Immediate-Mode-UI/Nuklear/tree/4.13.3>
 - <https://github.com/Binaryify/OneDark-Pro>
 
-UI не попадает в benchmark/runtime binary: `vulkan_cube` собирается с
-`VCR_EDITOR_ENABLED=0`, а `vulkan_editor` — отдельный executable. ImGui
+`vulkan_cube` и `vulkan_editor` используют общий authored-scene renderer
+(`VCR_EDITOR_ENABLED=1`); editor application и editor panels входят только
+в `vulkan_editor`. ImGui
 использует Vulkan 1.3 dynamic rendering. Узкий adapter переводит три legacy
 submission-вызова upstream backend в `vkQueueSubmit2`, а его barriers — в
 synchronization2, используя только фиксированные stack arrays.

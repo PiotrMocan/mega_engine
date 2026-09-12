@@ -97,6 +97,17 @@ void EditorApplication::initialize(const CliOptions& options) {
         false,
         true);
 
+    VisibilitySettings visibility{options.frustum_culling, options.occlusion_culling, options.lod,
+                                  options.dynamic_shadows};
+    visibility.backend = options.visibility_backend == "cpu" ? VisibilitySettings::Backend::cpu
+                         : options.visibility_backend == "gpu"
+                             ? VisibilitySettings::Backend::gpu
+                             : VisibilitySettings::Backend::automatic;
+    if (visibility.backend == VisibilitySettings::Backend::gpu &&
+        !renderer_.gpu_visibility_available()) {
+        fatal("GPU visibility is unavailable on this device");
+    }
+    renderer_.set_visibility_settings(visibility);
     scene_ = SceneDocument::make_default();
     scene_instances_.reserve(max_scene_nodes);
     scene_models_.reserve(max_scene_nodes);
@@ -111,6 +122,7 @@ void EditorApplication::initialize(const CliOptions& options) {
         fatal(scene_error);
     }
     update_scene_snapshot();
+    renderer_.enable_async_assets();
 
     const auto now = std::chrono::steady_clock::now();
     last_camera_tick_ = now;
@@ -153,6 +165,9 @@ void EditorApplication::main_loop() {
                 renderer_.prepare_editor_viewport(*extent));
         }
         ui_.synchronize_renderer(renderer_);
+        if (renderer_.poll_assets()) {
+            submitted_scene_revision_ = 0;
+        }
         if (frame_begin - last_metrics_update_ >= std::chrono::milliseconds(250)) {
             ui_metrics_ = renderer_.metrics_snapshot();
             last_metrics_update_ = frame_begin;

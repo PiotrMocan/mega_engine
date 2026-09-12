@@ -39,6 +39,7 @@ private:
     void initialize(const CliOptions& options);
     void load_canonical_scene();
     void main_loop();
+    void service_assets();
     void process_event(const SDL_Event& event);
     void process_mcp_commands();
     void execute_mcp_command(const McpCommand& command);
@@ -64,12 +65,18 @@ private:
     SceneDocument scene_{};
     std::vector<SceneGpuInstance> scene_instances_{};
     std::vector<SceneModelInstance> scene_models_{};
+    std::vector<SceneNodeId> stress_cube_ids_{};
+    bool stream_asset_placed_ = false;
+    double camera_animation_time_ = 0;
     FlyCamera camera_{};
     CliOptions options_{};
     BenchmarkController benchmark_{};
     BenchmarkFrameSamples benchmark_samples_{};
     std::chrono::steady_clock::time_point benchmark_measurement_begin_{};
     double benchmark_measurement_seconds_ = 0.0;
+    SceneNodeId animated_node_{};
+    TransformRows animation_origin_{};
+    double animation_time_ = 0;
     McpControlPlane mcp_control_{};
     McpServer mcp_server_{mcp_control_};
     std::bitset<32> mcp_keys_down_{};

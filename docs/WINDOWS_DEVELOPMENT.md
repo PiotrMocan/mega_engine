@@ -34,6 +34,18 @@ SDL, Vulkan Headers, volk, VMA и остальные зависимости по
 ASan использует `RelWithDebInfo` и `/fsanitize=address` для C++.
 Это не означает инструментацию всех сторонних C-библиотек и FidelityFX DLL.
 
+Opt-in анализаторы запускаются в том же build tree из MSVC x64 environment:
+
+```powershell
+cmake --build build/windows-debug --target vcr_clang_tidy
+cmake --build build/windows-debug --target vcr_msvc_analyze
+```
+
+Они не заменяют обычную сборку и CTest. `scripts/analyze_windows.ps1 -Sources`
+позволяет ограничить проверку именами translation units. Benchmark suites
+`Compatibility`, `Default`, `Visibility`, `Lod`, `Shadows` и методика результатов
+описаны в [ENGINE_EVOLUTION.md](ENGINE_EVOLUTION.md).
+
 ## Запуск и GPU-проверки
 
 ```powershell
@@ -113,9 +125,10 @@ Get-ChildItem shaders\spv\*.spv | ForEach-Object {
 Ninja 1.12.1, AMD Radeon RX 6800. Vulkan SDK 1.4.313.2 восстановлен:
 до установки переменная окружения и реестр ссылались на отсутствующие файлы.
 
-- Debug, Release и ASan собраны; CTest прошёл 4/4 в каждой конфигурации.
+- Debug, Release и ASan собраны; CTest прошёл 5/5 в каждой конфигурации,
+  включая runtime transforms, visibility, LOD и bounded asset worker.
 - MCP smoke прошёл в Release, Debug и ASan; последние два запускались с validation.
-- Все 34 SPIR-V binaries прошли `spirv-val`.
+- Все SPIR-V binaries, включая новые shadow/visibility shaders, прошли `spirv-val`.
 - `vulkaninfoSDK.exe --summary` обнаружил Khronos validation layer.
 - Исходная synchronization validation обнаружила `WRITE_AFTER_READ` и
   `PRESENT_AFTER_WRITE` для swapchain. В последующем аудите исправлены acquire
@@ -126,7 +139,8 @@ Ninja 1.12.1, AMD Radeon RX 6800. Vulkan SDK 1.4.313.2 восстановлен:
   результаты находятся в [аудите renderer](RENDERER_AUDIT.md).
 - Нативный clang-tidy запускался для renderer, application, metrics, FSR,
   Vulkan context и GPU buffer. Остались общие guideline/style предупреждения;
-  это не полностью чистый static-analysis gate всего проекта. Отдельные
-  analyzer targets пока не подключены к CMake; MSVC `/analyze` не запускался.
+  это не полностью чистый static-analysis gate всего проекта. Для новых runtime
+  translation units дополнительно выполнен MSVC `/analyze:only` с Core Check.
+  Подключены opt-in targets `vcr_clang_tidy`, `vcr_msvc_analyze`.
 
 Установка SDK: https://vulkan.lunarg.com/doc/view/1.4.313.0/windows/getting_started.html

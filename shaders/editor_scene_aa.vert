@@ -22,6 +22,9 @@ struct EditorInstanceData
     vec4 modelRow2;
     vec4 baseColor;
     vec4 materialParameters;
+    vec4 previousRow0;
+    vec4 previousRow1;
+    vec4 previousRow2;
 };
 
 layout(set = 0, binding = 1, std430) readonly buffer InstanceBuffer
@@ -30,6 +33,11 @@ layout(set = 0, binding = 1, std430) readonly buffer InstanceBuffer
 };
 
 layout(location = 0) in vec3 inPosition;
+layout(set = 0, binding = 5, std430) readonly buffer VisibilityBuffer
+{
+    uint visibilityCounters[8];
+    uint visibleIndices[];
+};
 layout(location = 1) in vec3 inNormal;
 
 layout(location = 0) out vec3 outWorldNormal;
@@ -43,7 +51,9 @@ layout(location = 7) out vec4 outMaterialParameters;
 
 void main()
 {
-    const EditorInstanceData instance = instances[gl_InstanceIndex];
+    const uint sourceIndex = frame.globalRotation.x > 0.5
+        ? visibleIndices[gl_InstanceIndex] : gl_InstanceIndex;
+    const EditorInstanceData instance = instances[sourceIndex];
     const vec4 localPosition = vec4(inPosition, 1.0);
     const vec3 worldPosition = vec3(
         dot(instance.modelRow0, localPosition),
@@ -68,11 +78,14 @@ void main()
         + cross(column2, column0) * inNormal.y
         + cross(column0, column1) * inNormal.z);
     outBaseColor = instance.baseColor;
-    outInstanceIndex = gl_InstanceIndex;
+    outInstanceIndex = uint(instance.materialParameters.w);
     outShadowPosition = frame.lightViewProjection * world;
     outCurrentClip = frame.unjitteredViewProjection * world;
     outPreviousClip =
-        frame.previousUnjitteredViewProjection * world;
+        frame.previousUnjitteredViewProjection * vec4(
+            dot(instance.previousRow0, localPosition),
+            dot(instance.previousRow1, localPosition),
+            dot(instance.previousRow2, localPosition), 1.0);
     outWorldPosition = worldPosition;
     outMaterialParameters = instance.materialParameters;
     gl_Position = frame.viewProjection * world;

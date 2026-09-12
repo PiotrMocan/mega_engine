@@ -121,6 +121,13 @@ FetchContent_Declare(
     GIT_TAG v3.4.13
     GIT_SHALLOW TRUE
 )
+set(MESHOPT_BUILD_DEMO OFF CACHE BOOL "" FORCE)
+set(MESHOPT_BUILD_GLTFPACK OFF CACHE BOOL "" FORCE)
+set(MESHOPT_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(meshoptimizer
+    GIT_REPOSITORY https://github.com/zeux/meshoptimizer.git
+    GIT_TAG 6daea4695c48338363b08022d2fb15deaef6ac09
+)
 if(WIN32 AND MSVC)
     FetchContent_Declare(
         FidelityFXSDK
@@ -138,6 +145,7 @@ FetchContent_MakeAvailable(
     nlohmann_json
     assimp
     OpenEXR
+    meshoptimizer
 )
 FetchContent_GetProperties(DearImGui)
 if(NOT dearimgui_POPULATED)
@@ -419,6 +427,14 @@ set(VCR_RENDERER_SOURCES
     src/performance_metrics.cpp
     src/png_encoder.cpp
     src/renderer.cpp
+    src/runtime_scene.cpp
+    src/renderer_scene.cpp
+    src/renderer_gpu_visibility.cpp
+    src/model_lod.cpp
+    src/asset_preparation.cpp
+    src/upload_batch.cpp
+    src/renderer_assets.cpp
+    src/scene_visibility.cpp
     src/runtime_assets.cpp
     src/swapchain.cpp
     src/vma.cpp
@@ -465,6 +481,7 @@ function(vcr_configure_executable target editor_enabled)
         glm::glm
         nlohmann_json::nlohmann_json
         Threads::Threads
+        meshoptimizer
     )
     target_compile_definitions(${target} PRIVATE
         VK_NO_PROTOTYPES
@@ -507,6 +524,20 @@ endfunction()
 
 vcr_configure_executable(vulkan_cube 1)
 vcr_configure_executable(vulkan_editor 1)
+if(WIN32)
+    add_custom_target(vcr_clang_tidy
+        COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass -File
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/analyze_windows.ps1"
+            -Tool ClangTidy -BuildTree "${CMAKE_BINARY_DIR}"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        USES_TERMINAL VERBATIM)
+    add_custom_target(vcr_msvc_analyze
+        COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass -File
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/analyze_windows.ps1"
+            -Tool MSVC -BuildTree "${CMAKE_BINARY_DIR}"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        USES_TERMINAL VERBATIM)
+endif()
 target_link_libraries(vulkan_cube PRIVATE vcr_imgui)
 target_link_libraries(
     vulkan_cube PRIVATE
@@ -557,6 +588,17 @@ add_dependencies(vulkan_editor vcr_runtime_assets)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(vcr_runtime_tests tests/runtime_scene_tests.cpp
+        src/runtime_scene.cpp src/scene_visibility.cpp src/scene_document.cpp
+        src/model_lod.cpp src/asset_preparation.cpp)
+    target_include_directories(vcr_runtime_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(vcr_runtime_tests PRIVATE glm::glm meshoptimizer
+        vcr_cooked_model_asset vcr_cooked_texture_asset Threads::Threads)
+    target_compile_definitions(vcr_runtime_tests PRIVATE GLM_FORCE_DEPTH_ZERO_TO_ONE GLM_FORCE_RADIANS)
+    if(MSVC)
+        target_compile_options(vcr_runtime_tests PRIVATE /W4 /permissive- /EHsc)
+    endif()
+    add_test(NAME vcr_runtime_tests COMMAND vcr_runtime_tests)
     add_executable(vcr_core_tests
         tests/core_tests.cpp
         src/asset_browser.cpp

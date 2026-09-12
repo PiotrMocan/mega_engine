@@ -167,6 +167,7 @@ SceneNodeId SceneDocument::create_node(
         .kind = kind,
     };
     slot.world_matrix = glm::mat4(1.0F);
+    slot.world_revision = 0;
     slot.parent = invalid_scene_node_index;
     slot.first_child = invalid_scene_node_index;
     slot.last_child = invalid_scene_node_index;
@@ -373,7 +374,11 @@ SceneRenderView SceneDocument::build_render_view(
     std::vector<SceneGpuInstance>& cube_output,
     std::vector<SceneModelInstance>& model_output) {
     cube_output.clear();
+    last_transform_updates_ = 0;
     model_output.clear();
+    render_cube_ids_.clear();
+    render_cube_ids_.reserve(max_scene_nodes);
+    SceneNodeId ground_id{};
     SceneGpuInstance ground{};
     bool has_ground = false;
     bool terrain_visible = false;
@@ -383,26 +388,40 @@ SceneRenderView SceneDocument::build_render_view(
     std::uint32_t depth = 0U;
     while (index != invalid_scene_node_index) {
         Slot& slot = slots_[index];
-        bool world_visible = slot.value.visible;
-        glm::mat4 world_matrix(1.0F);
-        if (!finite_transform(slot.value.transform)) {
-            world_visible = false;
-        } else {
-            world_matrix = local_matrix(slot.value.transform);
-            if (slot.parent != invalid_scene_node_index) {
-                const Slot& parent_slot = slots_[slot.parent];
-                world_matrix =
-                    parent_slot.world_matrix * world_matrix;
-                world_visible =
-                    world_visible && parent_slot.world_visible;
-            }
-            if (!finite_matrix(world_matrix)) {
-                world_matrix = glm::mat4(1.0F);
+        const SceneNodeId parent_id = id_for_index(slot.parent);
+        const auto parent_revision = parent_id ? slots_[slot.parent].world_revision : 0;
+        // The public editor API exposes mutable node values. Compare the local
+        // value at this boundary; descendants inherit a parent's new revision.
+        if (slot.world_revision == 0 || slot.cached_transform != slot.value.transform ||
+            slot.cached_visible != slot.value.visible || slot.cached_parent != parent_id ||
+            slot.cached_parent_revision != parent_revision) {
+            bool world_visible = slot.value.visible;
+            glm::mat4 world_matrix(1.0F);
+            if (!finite_transform(slot.value.transform)) {
                 world_visible = false;
+            } else {
+                world_matrix = local_matrix(slot.value.transform);
+                if (slot.parent != invalid_scene_node_index) {
+                    const Slot &parent_slot = slots_[slot.parent];
+                    world_matrix = parent_slot.world_matrix * world_matrix;
+                    world_visible = world_visible && parent_slot.world_visible;
+                }
+                if (!finite_matrix(world_matrix)) {
+                    world_matrix = glm::mat4(1.0F);
+                    world_visible = false;
+                }
             }
+            slot.world_matrix = world_matrix;
+            slot.world_visible = world_visible;
+            slot.cached_transform = slot.value.transform;
+            slot.cached_visible = slot.value.visible;
+            slot.cached_parent = parent_id;
+            slot.cached_parent_revision = parent_revision;
+            ++slot.world_revision;
+            ++last_transform_updates_;
         }
-        slot.world_matrix = world_matrix;
-        slot.world_visible = world_visible;
+        const auto &world_matrix = slot.world_matrix;
+        const bool world_visible = slot.world_visible;
 
         if (world_visible) {
             terrain_visible =
@@ -429,10 +448,12 @@ SceneRenderView SceneDocument::build_render_view(
             if (slot.value.kind == SceneNodeKind::ground) {
                 if (!has_ground) {
                     ground = instance;
+                    ground_id = id_for_index(index);
                     has_ground = true;
                 }
             } else if (cube_output.size() < max_scene_nodes) {
                 cube_output.push_back(instance);
+                render_cube_ids_.push_back(id_for_index(index));
             }
         } else if (world_visible &&
                    slot.value.kind == SceneNodeKind::model &&
@@ -443,6 +464,7 @@ SceneRenderView SceneDocument::build_render_view(
                 .model_row_1 = matrix_row(world_matrix, 1),
                 .model_row_2 = matrix_row(world_matrix, 2),
                 .asset_path = slot.value.asset_path,
+                .id = id_for_index(index),
             });
         }
         index = traversal_next(index, depth, true);
@@ -456,6 +478,8 @@ SceneRenderView SceneDocument::build_render_view(
         .terrain_visible = terrain_visible,
         .sky_visible = sky_visible,
         .sun_visible = sun_visible,
+        .ground_id = ground_id,
+        .cube_ids = render_cube_ids_,
     };
 }
 

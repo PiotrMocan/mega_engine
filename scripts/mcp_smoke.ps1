@@ -3,7 +3,11 @@ param(
     [string]$ExePath,
     [switch]$Validation,
     [ValidateSet('off', 'smaa', 'fsr3')][string]$AntiAliasing = 'off',
-    [string]$ScreenshotPath = ""
+    [string]$ScreenshotPath = "",
+    [string]$ExtraArguments = "",
+    [float]$CameraDeltaX = 0,
+    [float]$CameraDeltaY = 0,
+    [ValidateSet('','cpu','gpu','direct')][string]$ExpectedBackend=''
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,7 +20,7 @@ $validationArgument = if ($Validation) {
     "--no-validation"
 }
 $startInfo.Arguments =
-    "--mcp-stdio $validationArgument --aa $AntiAliasing --width 640 --height 360"
+    "--mcp-stdio $validationArgument --aa $AntiAliasing --width 640 --height 360 $ExtraArguments"
 $startInfo.UseShellExecute = $false
 $startInfo.CreateNoWindow = $true
 $startInfo.RedirectStandardInput = $true
@@ -113,6 +117,12 @@ try {
         throw "MCP runtime self-check failed"
     }
 
+    if ($CameraDeltaX -ne 0 -or $CameraDeltaY -ne 0) {
+        $null = Send-McpMessage @{
+            jsonrpc = '2.0'; id = 30; method = 'tools/call'
+            params = @{ name = 'input.mouse_move'; arguments = @{ delta_x = $CameraDeltaX; delta_y = $CameraDeltaY } }
+        } 30
+    }
     $screenshot = Send-McpMessage @{
         jsonrpc = "2.0"
         id = 4
@@ -141,6 +151,15 @@ try {
     }
     if (-not [string]::IsNullOrWhiteSpace($ScreenshotPath)) {
         [System.IO.File]::WriteAllBytes($ScreenshotPath, $png)
+    }
+
+    $state = Send-McpMessage @{
+        jsonrpc='2.0'; id=31; method='tools/call'
+        params=@{name='debug.get_state'; arguments=@{}}
+    } 31
+    if ($state.isError) { throw 'Unable to read renderer state after capture' }
+    if ($ExpectedBackend -and $state.structuredContent.render.visibility_backend -ne $ExpectedBackend) {
+        throw "Expected $ExpectedBackend visibility backend, got $($state.structuredContent.render.visibility_backend)"
     }
 
     $quit = Send-McpMessage @{
@@ -175,6 +194,8 @@ try {
         screenshot_height = $screenshot.structuredContent.height
         screenshot_bytes = $png.Length
         validation = [bool]$Validation
+        visibility_backend = $state.structuredContent.render.visibility_backend
+        visibility = $state.structuredContent.render.visibility
         exit_code = $process.ExitCode
     } | ConvertTo-Json -Compress
 }

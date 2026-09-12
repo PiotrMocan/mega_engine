@@ -1,0 +1,111 @@
+#version 450
+layout(local_size_x=128) in;
+layout(set=0,binding=0,std140) uniform VisibilityUniforms {
+    mat4 viewProjection;
+    vec4 planes[6];
+    vec4 cameraPixels;
+    vec4 guardError;
+    uvec4 flags;
+    vec4 grid[144];
+} config;
+struct Instance { vec4 row0,row1,row2,color,material,previous0,previous1,previous2; };
+struct Source { vec4 center,extent; };
+struct Group { uvec4 range,counts,firsts; vec4 errors; };
+struct Draw { uint indexCount,instanceCount,firstIndex; int vertexOffset; uint firstInstance; };
+layout(set=0,binding=1,std430) readonly buffer Instances { Instance instances[]; };
+layout(set=0,binding=2,std430) readonly buffer Sources { Source sources[]; };
+layout(set=0,binding=3,std430) readonly buffer Groups { Group groups[]; };
+layout(set=0,binding=4,std430) buffer Visible { uint counters[8]; uint indices[]; };
+layout(set=0,binding=5,std430) buffer Commands { Draw draws[]; };
+layout(set=0,binding=6,std430) buffer History { uint previousLod[]; };
+bool occluded(vec3 center,vec3 extent) {
+    vec2 low=vec2(1e30),high=vec2(-1e30);
+    float nearDepth=1e30;
+    for (uint i=0;i<8;++i) {
+        vec3 sign=vec3((i&1u)!=0u ? 1:-1,(i&2u)!=0u ? 1:-1,(i&4u)!=0u ? 1:-1);
+        vec4 clip=config.viewProjection*vec4(center+extent*sign,1);
+        if (clip.w<=1e-5 || clip.z<=0 || any(isnan(clip)) || any(isinf(clip))) return false;
+        vec3 ndc=clip.xyz/clip.w;
+        vec2 point=ndc.xy*.5+.5;
+        low=min(low,point); high=max(high,point); nearDepth=min(nearDepth,ndc.z);
+    }
+    low-=config.guardError.xy; high+=config.guardError.xy;
+    if (any(lessThan(low,vec2(0))) || any(greaterThanEqual(high,vec2(1)))) return false;
+    uvec2 first=uvec2(low*vec2(32,18)),last=uvec2(high*vec2(32,18));
+    for (uint y=first.y;y<=last.y;++y) {
+        for (uint x=first.x;x<=last.x;++x) {
+            uint cell=y*32+x;
+            if (config.grid[cell/4][cell%4]>=nearDepth-1e-5) return false;
+        }
+    }
+    return true;
+}
+uint classify(uint id,out uint groupIndex,out uint lod) {
+    Instance instance=instances[id];
+    Source source=sources[id];
+    vec4 local=vec4(source.center.xyz,1);
+    vec3 center=vec3(dot(instance.row0,local),dot(instance.row1,local),dot(instance.row2,local));
+    vec3 extent=vec3(dot(abs(instance.row0.xyz),source.extent.xyz),
+        dot(abs(instance.row1.xyz),source.extent.xyz),dot(abs(instance.row2.xyz),source.extent.xyz));
+    if (config.flags.y!=0) {
+        for (uint i=0;i<6;++i) {
+            vec4 plane=config.planes[i];
+            if (dot(plane.xyz,center)+plane.w+dot(abs(plane.xyz),extent)<-1e-4) {
+                return 1;
+            }
+        }
+    }
+    if (config.flags.z!=0 && occluded(center,extent)) return 2;
+    groupIndex=uint(source.center.w);
+    Group group=groups[groupIndex];
+    lod=0;
+    vec4 rowX=vec4(config.viewProjection[0].x,config.viewProjection[1].x,config.viewProjection[2].x,config.viewProjection[3].x);
+    vec4 rowY=vec4(config.viewProjection[0].y,config.viewProjection[1].y,config.viewProjection[2].y,config.viewProjection[3].y);
+    vec4 rowW=vec4(config.viewProjection[0].w,config.viewProjection[1].w,config.viewProjection[2].w,config.viewProjection[3].w);
+    float distance=dot(rowW,vec4(center,1))-dot(abs(rowW.xyz),extent);
+    if (config.flags.w!=0 && distance>0) {
+        float scale=sqrt(dot(instance.row0.xyz,instance.row0.xyz)+dot(instance.row1.xyz,instance.row1.xyz)+dot(instance.row2.xyz,instance.row2.xyz));
+        vec2 maximumClip=vec2(abs(dot(rowX,vec4(center,1)))+dot(abs(rowX.xyz),extent),
+            abs(dot(rowY,vec4(center,1)))+dot(abs(rowY.xyz),extent));
+        vec2 maximumPixels=maximumClip/(config.guardError.xy*(1-config.guardError.xy));
+        float projectedPixels=config.cameraPixels.w+max(maximumPixels.x,maximumPixels.y)/distance;
+        for (uint i=1;i<3;++i) {
+            float budget=config.guardError.z*(i>previousLod[id] ? .8:1);
+            if (group.counts[i]>0 && group.errors[i]*scale*projectedPixels/distance<=budget) lod=i;
+        }
+    }
+    previousLod[id]=lod;
+    return 0;
+}
+shared uint localCounts[5];
+shared uint reservations[3];
+void main() {
+    uint lane=gl_LocalInvocationID.x,id=gl_GlobalInvocationID.x;
+    if (lane<5) localCounts[lane]=0;
+    barrier();
+    uint groupIndex=0,lod=0,offset=0;
+    uint result=id<config.flags.x ? classify(id,groupIndex,lod) : 3;
+    if (result==0) offset=atomicAdd(localCounts[lod],1);
+    else if (result==1) atomicAdd(localCounts[3],1);
+    else if (result==2) atomicAdd(localCounts[4],1);
+    barrier();
+    // Sources are contiguous and sorted by draw group. Usually a whole
+    // workgroup shares one draw; reserve once per LOD instead of serializing
+    // tens of thousands of global atomics on one indirect instanceCount.
+    uint first=gl_WorkGroupID.x*128;
+    uint commonGroup=uint(sources[first].center.w);
+    bool homogeneous=commonGroup==uint(sources[min(first+127,config.flags.x-1)].center.w);
+    if (homogeneous && lane<3 && localCounts[lane]>0)
+        reservations[lane]=atomicAdd(draws[commonGroup*3+lane].instanceCount,localCounts[lane]);
+    if (lane==0) {
+        atomicAdd(counters[0],localCounts[0]+localCounts[1]+localCounts[2]);
+        atomicAdd(counters[1],localCounts[3]); atomicAdd(counters[2],localCounts[4]);
+        atomicAdd(counters[3],localCounts[0]); atomicAdd(counters[4],localCounts[1]); atomicAdd(counters[5],localCounts[2]);
+    }
+    barrier();
+    if (result==0) {
+        uint commandIndex=groupIndex*3+lod;
+        offset=homogeneous ? reservations[lod]+offset : atomicAdd(draws[commandIndex].instanceCount,1);
+        indices[draws[commandIndex].firstInstance+offset]=id;
+    }
+}

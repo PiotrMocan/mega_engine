@@ -31,6 +31,10 @@ struct CookedModelSubmesh {
     std::uint64_t index_count = 0U;
     std::uint32_t material_index = 0U;
     std::string name{};
+    // Runtime-prepared index ranges; the versioned cooked file stays LOD0.
+    std::array<std::uint32_t, 3> lod_first{};
+    std::array<std::uint32_t, 3> lod_count{};
+    std::array<float, 3> lod_error{};
 };
 
 struct CookedModelMaterial {

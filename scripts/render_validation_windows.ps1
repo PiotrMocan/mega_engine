@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$ExePath,
     [ValidateRange(1, 100)][int]$Startups = 3,
-    [ValidateRange(1, 100)][int]$Cycles = 2
+    [ValidateRange(1, 100)][int]$Cycles = 2,
+    [ValidateSet('canonical','animated','stress','streaming')][string]$Scenario='canonical'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -13,7 +14,7 @@ $allowedTrees = @('windows-debug', 'windows-release', 'windows-asan') |
 if ($tree -notin $allowedTrees) {
     throw 'Use an executable in one of the three native Windows build trees.'
 }
-$outputDirectory = Join-Path $tree 'render-validation'
+$outputDirectory = Join-Path $tree "render-validation/$Scenario"
 New-Item -ItemType Directory -Force -Path $outputDirectory | Out-Null
 
 for ($startup = 1; $startup -le $Startups; ++$startup) {
@@ -21,6 +22,11 @@ for ($startup = 1; $startup -le $Startups; ++$startup) {
     $info.FileName = $exe
     $info.WorkingDirectory = $outputDirectory
     $info.Arguments = '--mcp-stdio --validation --aa off --width 640 --height 360'
+    if ($Scenario -eq 'animated') { $info.Arguments += ' --animate-scene --animate-camera' }
+    if ($Scenario -eq 'stress') { $info.Arguments += ' --scene-count 100000 --animate-scene --animate-camera' }
+    if ($Scenario -eq 'streaming') {
+        $info.Arguments += ' --scene-count 2048 --scene-walls off --camera-z 300 --stream-asset tree_stump_01_4k/tree_stump_01_4k.vcrasset.json --animate-scene'
+    }
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
     $info.RedirectStandardInput = $true
@@ -67,6 +73,15 @@ for ($startup = 1; $startup -le $Startups; ++$startup) {
         $process.StandardInput.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}')
         $process.StandardInput.Flush()
         $state = Tool 'debug.get_state'
+        if ($Scenario -eq 'streaming') {
+            $deadline=[DateTime]::UtcNow.AddSeconds(30)
+            while ($state.structuredContent.render.assets_pending -or $state.structuredContent.render.visibility.submitted -lt 2049) {
+                if ([DateTime]::UtcNow -gt $deadline) { throw 'Streamed model was not published.' }
+                Start-Sleep -Milliseconds 30
+                $state = Tool 'debug.get_state'
+            }
+            if ($state.structuredContent.render.upload_high_water_bytes -le 0) { throw 'Upload arena was not used.' }
+        }
         $methods = @('off', 'smaa')
         if ($state.structuredContent.render.anti_aliasing.fsr3_available) {
             $methods += 'fsr3'
@@ -115,6 +130,7 @@ for ($startup = 1; $startup -le $Startups; ++$startup) {
         }
         [pscustomobject]@{
             startup = $startup; cycles = $Cycles; captures = $captures
+            scenario = $Scenario
             aa_methods = $methods
             validation_errors = 0; live_gpu_allocations = 0; exit_code = $process.ExitCode
         } | ConvertTo-Json -Compress

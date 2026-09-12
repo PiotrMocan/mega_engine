@@ -70,6 +70,8 @@ $regularShaders = @(
     @("terrain.vert", "terrain.vert.spv"),
     @("terrain_aa.vert", "terrain_aa.vert.spv"),
     @("shadow.vert", "shadow.vert.spv"),
+    @("editor_shadow.vert", "editor_shadow.vert.spv"),
+    @("scene_visibility.comp", "scene_visibility.comp.spv"),
     @("terrain_shadow.vert", "terrain_shadow.vert.spv"),
     @("cube_aa.vert", "cube_aa.vert.spv"),
     @("cube_aa.frag", "cube_aa.frag.spv"),

@@ -148,6 +148,9 @@ void PerformanceMetrics::record_frame(const FrameTimings& timings) noexcept {
     accumulate(TimingIndex::gpu_frame, timings.gpu_frame_ms);
     accumulate(TimingIndex::gpu_geometry, timings.gpu_geometry_ms);
     accumulate(TimingIndex::gpu_workload, timings.gpu_workload_ms);
+    accumulate(TimingIndex::gpu_shadow, timings.gpu_shadow_ms);
+    accumulate(TimingIndex::gpu_visibility, timings.gpu_visibility_ms);
+    accumulate(TimingIndex::scene_prepare, timings.scene_prepare_ms);
 
     if (std::isfinite(timings.cpu_frame_ms) &&
         timings.cpu_frame_ms > 0.0) {
@@ -175,6 +178,9 @@ PerformanceSnapshot PerformanceMetrics::snapshot(const bool include_percentile) 
     result.average.gpu_frame_ms = average(TimingIndex::gpu_frame);
     result.average.gpu_geometry_ms = average(TimingIndex::gpu_geometry);
     result.average.gpu_workload_ms = average(TimingIndex::gpu_workload);
+    result.average.gpu_shadow_ms = average(TimingIndex::gpu_shadow);
+    result.average.gpu_visibility_ms = average(TimingIndex::gpu_visibility);
+    result.average.scene_prepare_ms = average(TimingIndex::scene_prepare);
 
     if (window_size_ == 0) {
         return result;
@@ -414,6 +420,9 @@ BenchmarkResult make_benchmark_result(
     result.average_present_ms = snapshot.average.present_ms;
     result.average_gpu_geometry_ms = snapshot.average.gpu_geometry_ms;
     result.average_gpu_workload_ms = snapshot.average.gpu_workload_ms;
+    result.average_gpu_shadow_ms = snapshot.average.gpu_shadow_ms;
+    result.average_gpu_visibility_ms = snapshot.average.gpu_visibility_ms;
+    result.average_scene_prepare_ms = snapshot.average.scene_prepare_ms;
     return result;
 }
 
@@ -463,6 +472,42 @@ std::string benchmark_result_to_json(const BenchmarkResult& result) {
     timing("average_present_ms", result.average_present_ms);
     timing("average_gpu_geometry_ms", result.average_gpu_geometry_ms);
     timing("average_gpu_workload_ms", result.average_gpu_workload_ms);
+    timing("average_gpu_shadow_ms", result.average_gpu_shadow_ms);
+    timing("average_gpu_visibility_ms", result.average_gpu_visibility_ms);
+    append_key(output, "visibility_backend");
+    append_json_string(output, result.visibility_backend);
+    output += ",\n";
+    timing("average_scene_prepare_ms", result.average_scene_prepare_ms);
+    const auto integer = [&](std::string_view key, std::uint64_t value) {
+        append_key(output, key);
+        append_json_u64(output, value);
+        output += ",\n";
+    };
+    integer("visible_instances", result.visible_instances);
+    integer("source_instances", result.source_instances);
+    integer("scene_count", result.scene_count);
+    integer("terrain_lod", result.terrain_lod);
+    timing("camera_z", result.camera_z);
+    timing("scene_scale", result.scene_scale);
+    append_key(output, "scene_asset");
+    append_json_string(output, result.scene_asset);
+    output += ",\n";
+    integer("frustum_rejected", result.frustum_rejected);
+    integer("occlusion_rejected", result.occlusion_rejected);
+    integer("lod0_instances", result.lod_instances[0]);
+    integer("lod1_instances", result.lod_instances[1]);
+    integer("lod2_instances", result.lod_instances[2]);
+    const auto boolean = [&](std::string_view key, bool value) {
+        append_key(output, key);
+        output += value ? "true,\n" : "false,\n";
+    };
+    boolean("frustum_culling", result.frustum_culling);
+    boolean("occlusion_culling", result.occlusion_culling);
+    boolean("lod", result.lod);
+    boolean("dynamic_shadows", result.dynamic_shadows);
+    boolean("animated", result.animated);
+    boolean("animated_camera", result.animated_camera);
+    boolean("scene_walls", result.scene_walls);
 
     append_key(output, "gpu");
     append_json_string(output, result.gpu);

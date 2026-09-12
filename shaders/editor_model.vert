@@ -13,7 +13,7 @@ layout(set = 0, binding = 0, std140) uniform FrameUniforms
     vec4 shadowMapParameters;
 } frame;
 
-// This must stay ABI-compatible with the host's 80-byte SceneGpuInstance.
+// This must stay ABI-compatible with the host's 128-byte RuntimeGpuInstance.
 struct EditorInstanceData
 {
     vec4 modelRow0;
@@ -21,6 +21,9 @@ struct EditorInstanceData
     vec4 modelRow2;
     vec4 baseColor;
     vec4 materialParameters;
+    vec4 previousRow0;
+    vec4 previousRow1;
+    vec4 previousRow2;
 };
 
 layout(set = 0, binding = 1, std430) readonly buffer InstanceBuffer
@@ -29,6 +32,11 @@ layout(set = 0, binding = 1, std430) readonly buffer InstanceBuffer
 };
 
 layout(location = 0) in vec3 inPosition;
+layout(set = 0, binding = 5, std430) readonly buffer VisibilityBuffer
+{
+    uint visibilityCounters[8];
+    uint visibleIndices[];
+};
 layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inUv;
 layout(location = 3) in vec4 inTangent;
@@ -56,7 +64,9 @@ vec3 safeNormalize(vec3 value, vec3 fallback)
 
 void main()
 {
-    const EditorInstanceData instance = instances[gl_InstanceIndex];
+    const uint sourceIndex = frame.globalRotation.x > 0.5
+        ? visibleIndices[gl_InstanceIndex] : gl_InstanceIndex;
+    const EditorInstanceData instance = instances[sourceIndex];
     const vec4 localPosition = vec4(inPosition, 1.0);
     const vec3 worldPosition = vec3(
         dot(instance.modelRow0, localPosition),
@@ -120,7 +130,7 @@ void main()
 
     outWorldNormal = worldNormal;
     outBaseColor = instance.baseColor;
-    outInstanceIndex = gl_InstanceIndex;
+    outInstanceIndex = uint(instance.materialParameters.w);
     outShadowPosition =
         frame.lightViewProjection * vec4(worldPosition, 1.0);
     outWorldPosition = worldPosition;

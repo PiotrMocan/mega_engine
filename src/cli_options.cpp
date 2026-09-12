@@ -270,7 +270,82 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
             continue;
         }
 
+        if (argument.name == "--animate-scene" || argument.name == "--animate-camera") {
+            if (argument.has_inline_value) {
+                result.error = invalid_value(argument.name, argument.inline_value);
+                return result;
+            }
+            if (argument.name == "--animate-scene") {
+                result.options.animate_scene = true;
+            } else {
+                result.options.animate_camera = true;
+            }
+            continue;
+        }
         std::string_view value;
+        if (argument.name == "--scene-scale") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) {
+                return result;
+            }
+            if (!parse_nonnegative_double(value, result.options.scene_scale) ||
+                result.options.scene_scale < 0.001 || result.options.scene_scale > 100) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            continue;
+        }
+        if (argument.name == "--camera-z") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) {
+                return result;
+            }
+            if (!parse_nonnegative_double(value, result.options.camera_z) ||
+                result.options.camera_z > 400) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            continue;
+        }
+        if (argument.name == "--culling" || argument.name == "--lod" ||
+            argument.name == "--dynamic-shadows" || argument.name == "--scene-count" ||
+            argument.name == "--scene-asset" || argument.name == "--stream-asset" ||
+            argument.name == "--visibility-backend" || argument.name == "--scene-walls") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) {
+                return result;
+            }
+            bool valid = true;
+            if (argument.name == "--visibility-backend") {
+                valid = value == "auto" || value == "cpu" || value == "gpu";
+                result.options.visibility_backend = value;
+            } else if (argument.name == "--culling") {
+                valid = value == "none" || value == "frustum" || value == "occlusion";
+                result.options.frustum_culling = value != "none";
+                result.options.occlusion_culling = value == "occlusion";
+            } else if (argument.name == "--scene-count") {
+                valid = parse_u32(value, result.options.scene_count) &&
+                        result.options.scene_count > 0 && result.options.scene_count <= 100000;
+            } else if (argument.name == "--scene-asset" || argument.name == "--stream-asset") {
+                valid = !value.empty() && value.size() <= 4096;
+                if (argument.name == "--scene-asset") {
+                    result.options.scene_asset = value;
+                } else {
+                    result.options.stream_asset = value;
+                }
+            } else {
+                valid = value == "on" || value == "off";
+                if (argument.name == "--lod") {
+                    result.options.lod = value == "on";
+                } else if (argument.name == "--scene-walls") {
+                    result.options.scene_walls = value == "on";
+                } else {
+                    result.options.dynamic_shadows = value == "on";
+                }
+            }
+            if (!valid) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            continue;
+        }
         if (argument.name == "--width") {
             if (!take_value(
                     argument, index, argc, argv, value, result.error)) {
@@ -412,6 +487,14 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
 
     // Explicit workload knobs are convenient mode selectors, while --mode
     // always wins when the user supplied it.
+    if (!result.options.scene_asset.empty() && result.options.scene_count == 0) {
+        result.error = "--scene-asset requires --scene-count";
+        return result;
+    }
+    if (!result.options.stream_asset.empty() && result.options.scene_count >= 100000) {
+        result.error = "--stream-asset requires one free scene node";
+        return result;
+    }
     if (!mode_was_explicit) {
         if (workload_was_explicit &&
             result.options.gpu_workload_iterations > 0) {
@@ -429,39 +512,50 @@ std::string cli_usage(std::string_view executable_name) {
     result.append(
         executable_name.empty() ? std::string_view{"vulkan_cube"}
                                 : executable_name);
-    result.append(
-        " [options]\n"
-        "  --benchmark             Run timed benchmark and write benchmark.json\n"
-        "  --mcp-stdio             Expose AI toolsets over MCP stdio\n"
-        "  --width N               Initial drawable width (default: 1920)\n"
-        "  --height N              Initial drawable height (default: 1080)\n"
-        "  --instances N           Cube instance count (default: 1)\n"
-        "  --gpu-workload N        GPU workload iterations (default: 0)\n"
-        "  --present MODE          auto (uncapped), immediate, mailbox, or fifo\n"
-        "  --mode MODE             scene (10M indexed terrain), instancing,\n"
-        "                          or gpu-saturation\n"
-        "  --aa MODE               off, smaa, or fsr3 (default: off)\n"
-        "  --smaa-quality MODE     low, medium, high, or ultra\n"
-        "  --fsr-quality MODE      native-aa, quality, balanced, performance,\n"
-        "                          or ultra-performance\n"
-        "  --duration SECONDS      Measurement duration (default: 15)\n"
-        "  --warmup SECONDS        Warmup duration (default: 5)\n"
-        "  --validation            Enable Vulkan validation\n"
-        "  --no-validation         Disable Vulkan validation\n"
-        "  -h, --help              Show this help\n"
-        "\n"
-        "Controls:\n"
-        "  Mouse                   Look around (left click captures)\n"
-        "  W/A/S/D                 Fly forward/left/back/right\n"
-        "  Shift                   Move four times faster\n"
-        "  Space or E              Fly up\n"
-        "  Ctrl or Q               Fly down\n"
-        "  Esc                     Release mouse, then exit\n"
-        "  1/2/3                   Scene/instancing/GPU workload mode\n"
-        "  Up/Down                 Adjust active benchmark load\n"
-        "  F6                      Cycle off/SMAA/FSR 3 anti-aliasing\n"
-        "  F7/F8                   Decrease/increase AA quality\n"
-        "  V/F/R/P                 VSync/fullscreen/reset/print stats\n");
+    result.append(" [options]\n"
+                  "  --benchmark             Run timed benchmark and write benchmark.json\n"
+                  "  --mcp-stdio             Expose AI toolsets over MCP stdio\n"
+                  "  --width N               Initial drawable width (default: 1920)\n"
+                  "  --height N              Initial drawable height (default: 1080)\n"
+                  "  --instances N           Cube instance count (default: 1)\n"
+                  "  --gpu-workload N        GPU workload iterations (default: 0)\n"
+                  "  --culling MODE          none, frustum, occlusion (default: occlusion)\n"
+                  "  --visibility-backend MODE  auto, cpu, gpu (default: auto)\n"
+                  "  --lod on|off            Screen-error mesh/terrain LOD (default: on)\n"
+                  "  --dynamic-shadows on|off  Authored casters and invalidation (default: on)\n"
+                  "  --animate-scene         Animate one runtime object (game executable)\n"
+                  "  --animate-camera        Repeatable moving-camera benchmark path\n"
+                  "  --camera-z N            Initial camera Z, 0..400 (default: 12)\n"
+                  "  --scene-scale N         Stress object scale, .001..100 (default: 1)\n"
+                  "  --scene-count N         Generated stress scene, 1..100000 objects\n"
+                  "  --scene-walls on|off    Include large occluders in the stress scene\n"
+                  "  --scene-asset PATH      Repeat this cooked model in the stress scene\n"
+                  "  --stream-asset PATH     Load/place a model while rendering\n"
+                  "  --present MODE          auto (uncapped), immediate, mailbox, or fifo\n"
+                  "  --mode MODE             scene, instancing,\n"
+                  "                          or gpu-saturation\n"
+                  "  --aa MODE               off, smaa, or fsr3 (default: off)\n"
+                  "  --smaa-quality MODE     low, medium, high, or ultra\n"
+                  "  --fsr-quality MODE      native-aa, quality, balanced, performance,\n"
+                  "                          or ultra-performance\n"
+                  "  --duration SECONDS      Measurement duration (default: 15)\n"
+                  "  --warmup SECONDS        Warmup duration (default: 5)\n"
+                  "  --validation            Enable Vulkan validation\n"
+                  "  --no-validation         Disable Vulkan validation\n"
+                  "  -h, --help              Show this help\n"
+                  "\n"
+                  "Controls:\n"
+                  "  Mouse                   Look around (left click captures)\n"
+                  "  W/A/S/D                 Fly forward/left/back/right\n"
+                  "  Shift                   Move four times faster\n"
+                  "  Space or E              Fly up\n"
+                  "  Ctrl or Q               Fly down\n"
+                  "  Esc                     Release mouse, then exit\n"
+                  "  1/2/3                   Scene/instancing/GPU workload mode\n"
+                  "  Up/Down                 Adjust active benchmark load\n"
+                  "  F6                      Cycle off/SMAA/FSR 3 anti-aliasing\n"
+                  "  F7/F8                   Decrease/increase AA quality\n"
+                  "  V/F/R/P                 VSync/fullscreen/reset/print stats\n");
     return result;
 }
 

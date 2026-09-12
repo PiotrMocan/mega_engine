@@ -219,6 +219,8 @@ private:
     std::unique_ptr<ExternalAssetDropState> external_drop_;
     std::unique_ptr<MaterialEditorUiState> material_editor_;
     std::string asset_error_{};
+    std::string pending_model_path_{}, pending_model_name_{};
+    SceneNodeId pending_model_parent_{};
     std::optional<std::filesystem::path>
         pending_asset_directory_{};
     std::optional<AssetEntry> selected_asset_{};

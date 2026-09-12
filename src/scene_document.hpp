@@ -51,6 +51,7 @@ struct SceneTransform {
     glm::vec3 translation{0.0F};
     glm::vec3 rotation_degrees{0.0F};
     glm::vec3 scale{1.0F};
+    friend bool operator==(const SceneTransform &, const SceneTransform &) = default;
 };
 
 struct SceneNode {
@@ -94,6 +95,7 @@ struct SceneModelInstance {
     // Refers to SceneNode::asset_path. Consume the render view before
     // mutating the document.
     std::string_view asset_path{};
+    SceneNodeId id{};
 };
 
 // Non-owning view into caller-provided instance storage. Consume it before
@@ -107,6 +109,8 @@ struct SceneRenderView {
     bool terrain_visible = false;
     bool sky_visible = false;
     bool sun_visible = false;
+    SceneNodeId ground_id{};
+    std::span<const SceneNodeId> cube_ids{};
 };
 
 class SceneDocument final {
@@ -134,6 +138,9 @@ public:
     [[nodiscard]] SceneNodeId parent(SceneNodeId id) const noexcept;
 
     void mark_content_changed() noexcept;
+    [[nodiscard]] std::uint32_t last_transform_updates() const noexcept {
+        return last_transform_updates_;
+    }
     void set_expanded(SceneNodeId id, bool expanded) noexcept;
 
     void build_hierarchy_rows(
@@ -161,6 +168,10 @@ private:
     struct Slot {
         SceneNode value{};
         glm::mat4 world_matrix{1.0F};
+        SceneTransform cached_transform{};
+        SceneNodeId cached_parent{};
+        std::uint64_t world_revision = 0, cached_parent_revision = 0;
+        bool cached_visible = false;
         std::uint32_t generation = 1U;
         std::uint32_t parent = invalid_scene_node_index;
         std::uint32_t first_child = invalid_scene_node_index;
@@ -191,9 +202,11 @@ private:
     std::vector<Slot> slots_{};
     std::vector<std::uint32_t> free_indices_{};
     std::vector<std::uint32_t> traversal_scratch_{};
+    std::vector<SceneNodeId> render_cube_ids_{};
     std::uint32_t first_root_ = invalid_scene_node_index;
     std::uint32_t last_root_ = invalid_scene_node_index;
     std::uint32_t live_count_ = 0U;
+    std::uint32_t last_transform_updates_ = 0;
     std::uint64_t structure_revision_ = 1U;
     std::uint64_t content_revision_ = 1U;
 };

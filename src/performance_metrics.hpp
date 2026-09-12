@@ -27,6 +27,9 @@ struct FrameTimings {
     double gpu_frame_ms = unavailable_timing_ms;
     double gpu_geometry_ms = unavailable_timing_ms;
     double gpu_workload_ms = unavailable_timing_ms;
+    double gpu_shadow_ms = unavailable_timing_ms;
+    double gpu_visibility_ms = unavailable_timing_ms;
+    double scene_prepare_ms = unavailable_timing_ms;
 };
 
 struct PerformanceSnapshot {
@@ -62,33 +65,35 @@ public:
     }
 
 private:
-    enum class TimingIndex : std::size_t {
-        cpu_frame,
-        command_record,
-        fence_wait,
-        acquire,
-        queue_submit,
-        present,
-        gpu_frame,
-        gpu_geometry,
-        gpu_workload,
-        count,
-    };
+  enum class TimingIndex : std::size_t {
+      cpu_frame,
+      command_record,
+      fence_wait,
+      acquire,
+      queue_submit,
+      present,
+      gpu_frame,
+      gpu_geometry,
+      gpu_workload,
+      gpu_shadow,
+      gpu_visibility,
+      scene_prepare,
+      count,
+  };
 
-    static constexpr std::size_t timing_count =
-        static_cast<std::size_t>(TimingIndex::count);
+  static constexpr std::size_t timing_count = static_cast<std::size_t>(TimingIndex::count);
 
-    void accumulate(TimingIndex index, double value) noexcept;
-    [[nodiscard]] double average(TimingIndex index) const noexcept;
+  void accumulate(TimingIndex index, double value) noexcept;
+  [[nodiscard]] double average(TimingIndex index) const noexcept;
 
-    std::array<double, frame_window_capacity> frame_times_ms_{};
-    std::size_t window_size_ = 0;
-    std::size_t next_sample_ = 0;
+  std::array<double, frame_window_capacity> frame_times_ms_{};
+  std::size_t window_size_ = 0;
+  std::size_t next_sample_ = 0;
 
-    std::array<double, timing_count> sums_{};
-    std::array<std::uint64_t, timing_count> counts_{};
-    FrameTimings latest_{};
-    std::uint64_t frames_rendered_ = 0;
+  std::array<double, timing_count> sums_{};
+  std::array<std::uint64_t, timing_count> counts_{};
+  FrameTimings latest_{};
+  std::uint64_t frames_rendered_ = 0;
 };
 
 // Exact full-run percentile samples; allocation is confined to prepare().
@@ -189,6 +194,20 @@ struct BenchmarkResult {
     double average_present_ms = unavailable_timing_ms;
     double average_gpu_geometry_ms = unavailable_timing_ms;
     double average_gpu_workload_ms = unavailable_timing_ms;
+    double average_gpu_shadow_ms = unavailable_timing_ms;
+    double average_gpu_visibility_ms = unavailable_timing_ms;
+    std::string visibility_backend = "cpu";
+    double average_scene_prepare_ms = unavailable_timing_ms;
+    std::uint32_t visible_instances = 0, frustum_rejected = 0, occlusion_rejected = 0;
+    std::array<std::uint32_t, 3> lod_instances{};
+    bool frustum_culling = true, occlusion_culling = true, lod = true, dynamic_shadows = true,
+         animated = false;
+    bool animated_camera = false;
+    double camera_z = 12.0;
+    double scene_scale = 1.0;
+    bool scene_walls = true;
+    std::uint32_t scene_count = 0, source_instances = 0, terrain_lod = 0;
+    std::string scene_asset;
     double measurement_seconds = 0.0;
     std::uint64_t percentile_samples = 0;
     std::uint64_t frames_rendered = 0;

@@ -62,9 +62,12 @@ SDK 1.1.4 это переводится в пиксели через `motionVect
 внутри SDK scale делится на render size для получения UV offsets. Jitter,
 передаваемый FSR, соответствует фактическому смещению пикселя после projection
 и положительного Vulkan viewport; контракт проверяется CPU-тестом.
-Пока instances не хранят previous object transforms, редактирование сцены
-сбрасывает историю. Корректная temporal reprojection анимированных объектов
-требует следующего этапа runtime scene architecture.
+Runtime instances теперь хранят current/previous object transforms (128 bytes).
+Previous обновляется только после успешного submission; одноразовое движение
+имеет отдельный settling frame. GPU compaction сохраняет исходный instance ID.
+Структурное редактирование сцены
+сбрасывает историю. Движение rigid objects через runtime transform API
+формирует object motion vectors без такого сброса. Skeletal animation не реализована.
 
 ## Версия FSR и платформы
 

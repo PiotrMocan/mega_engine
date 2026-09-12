@@ -1,6 +1,9 @@
 #pragma once
 
 #include "device_object.hpp"
+#include "runtime_scene.hpp"
+#include "asset_preparation.hpp"
+#include "upload_batch.hpp"
 #include "frame_context.hpp"
 #include "fsr3_upscaler.hpp"
 #include "gpu_buffer.hpp"
@@ -149,10 +152,42 @@ public:
         std::string_view relative_path,
         SceneTransform& recommended_transform,
         std::string& error);
+    void enable_async_assets();
+    // Pump only at the resource/frame boundary, before building draw packets.
+    [[nodiscard]] bool poll_assets();
+    [[nodiscard]] bool assets_pending() const noexcept {
+        return asset_requests_pending_ > 0;
+    }
+    [[nodiscard]] std::size_t upload_high_water() const noexcept {
+        return asset_upload_.high_water();
+    }
     [[nodiscard]] bool update_editor_scene(
         const SceneRenderView& view,
         const std::filesystem::path& asset_root,
         std::string& error);
+    [[nodiscard]] bool set_runtime_transform(SceneNodeId id, TransformRows transform) noexcept;
+    void set_visibility_settings(VisibilitySettings settings) noexcept;
+    [[nodiscard]] const VisibilitySettings &visibility_settings() const noexcept {
+        return visibility_settings_;
+    }
+    [[nodiscard]] bool gpu_visibility_active() const noexcept {
+        return gpu_visibility_active_ && mode_ != RunMode::instancing;
+    }
+    [[nodiscard]] bool gpu_visibility_available() const noexcept {
+        return visibility_pipeline_.get() != VK_NULL_HANDLE;
+    }
+    [[nodiscard]] const char *visibility_backend() const noexcept {
+        if (mode_ == RunMode::instancing) {
+            return "direct";
+        }
+        return gpu_visibility_active_ ? (gpu_visibility_bypassed_ ? "direct" : "gpu") : "cpu";
+    }
+    [[nodiscard]] unsigned terrain_lod() const noexcept {
+        return terrain_lod_;
+    }
+    [[nodiscard]] const VisibilityStatistics &visibility_statistics() const noexcept {
+        return visibility_statistics_;
+    }
     [[nodiscard]] bool apply_editor_material_factors(
         std::string_view material_relative_path,
         PbrMaterial material) noexcept;
@@ -207,6 +242,9 @@ private:
         VkDescriptorSet material_descriptor_set = VK_NULL_HANDLE;
         std::uint32_t first_index = 0U;
         std::uint32_t index_count = 0U;
+        std::array<std::uint32_t, 3> lod_first{};
+        std::array<std::uint32_t, 3> lod_count{};
+        std::array<float, 3> lod_error{};
     };
 
     struct EditorModelAsset {
@@ -216,6 +254,8 @@ private:
         std::vector<EditorModelSubmesh> submeshes{};
         SceneTransform recommended_transform{};
         VkDeviceSize gpu_bytes = 0U;
+        Bounds bounds{};
+        bool ready = true;
     };
 
     struct EditorModelDraw {
@@ -225,6 +265,7 @@ private:
         std::uint32_t index_count = 0U;
         std::uint32_t first_instance = 0U;
         std::uint32_t instance_count = 0U;
+        std::uint32_t submesh_index = 0U;
     };
 
     struct EditorTextureAsset {
@@ -239,6 +280,16 @@ private:
 #endif
 
     void create_frame_contexts();
+    void prepare_scene_packet(const glm::mat4 &view_projection, glm::vec3 camera,
+                              VkExtent2D extent);
+    void create_gpu_visibility();
+    void destroy_gpu_visibility() noexcept;
+    void build_gpu_visibility_scene(std::uint32_t plane_count, std::uint32_t plane_first,
+                                    std::int32_t plane_vertex, std::uint32_t cube_count);
+    void prepare_gpu_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExtent2D extent);
+    void record_gpu_visibility(VkCommandBuffer command, FrameContext &frame);
+    void read_gpu_visibility(FrameContext &frame);
+    void upload_gpu_scene_records(VkCommandBuffer command, FrameContext &frame);
     void destroy_frame_contexts() noexcept;
     void create_present_semaphores();
     void destroy_present_semaphores() noexcept;
@@ -257,6 +308,7 @@ private:
     void destroy_anti_aliasing_resources() noexcept;
     void destroy_anti_aliasing_targets() noexcept;
     void render_static_shadow_map();
+    void record_shadow_map(VkCommandBuffer command_buffer, FrameContext &frame);
     void create_descriptors();
     void create_anti_aliasing_descriptors();
     void destroy_anti_aliasing_descriptors() noexcept;
@@ -290,10 +342,7 @@ private:
     void destroy_editor_viewport() noexcept;
     void create_editor_material_resources();
     [[nodiscard]] std::optional<std::uint32_t>
-        find_or_load_editor_texture(
-            const std::filesystem::path& asset_root,
-            const std::filesystem::path& relative_path,
-            std::string& error);
+    find_or_load_editor_texture(const PreparedTexture &prepared, std::string &error);
     [[nodiscard]] std::optional<VkDescriptorSet>
         create_editor_material_descriptor(
         const GpuTexture& base_color,
@@ -307,6 +356,8 @@ private:
     void record_editor_scene_upload(
         VkCommandBuffer command_buffer,
         FrameContext& frame);
+    [[nodiscard]] std::optional<std::uint32_t> publish_editor_model(const PreparedModel &prepared,
+                                                                    std::string &error);
 #endif
     [[nodiscard]] VkExtent2D scene_output_extent() const noexcept;
 
@@ -325,6 +376,9 @@ private:
     VkPipeline sky_pipeline_ = VK_NULL_HANDLE;
     VkPipeline scene_shadow_pipeline_ = VK_NULL_HANDLE;
     VkPipeline terrain_shadow_pipeline_ = VK_NULL_HANDLE;
+    DeviceObject<VkPipeline> authored_shadow_pipeline_{};
+    DeviceObject<VkPipeline> model_shadow_pipeline_{};
+    VkImageLayout shadow_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     DeviceObject<VkPipeline> aa_pipeline_{};
     DeviceObject<VkPipeline> aa_scene_pipeline_{};
 #if VCR_EDITOR_ENABLED
@@ -364,6 +418,10 @@ private:
     GpuBuffer pbr_sample_index_buffer_{};
     GpuBuffer terrain_vertex_buffer_{};
     GpuBuffer terrain_index_buffer_{};
+    std::array<std::uint32_t, 3> terrain_lod_first_{}, terrain_lod_count_{};
+    std::array<float, 3> terrain_lod_error_{};
+    Bounds terrain_bounds_{};
+    unsigned terrain_lod_ = 0;
     GpuTexture sky_texture_{};
     GpuTexture shadow_map_{};
     GpuTexture smaa_area_texture_{};
@@ -397,6 +455,55 @@ private:
     VkDescriptorPool editor_material_descriptor_pool_ =
         VK_NULL_HANDLE;
     std::vector<SceneGpuInstance> editor_scene_instances_{};
+    struct SceneInstanceMetadata {
+        SceneNodeId id{};
+        Bounds local_bounds{};
+        bool occluder = false;
+    };
+    RuntimeTransforms runtime_transforms_{};
+    std::vector<SceneInstanceMetadata> scene_metadata_{};
+    std::vector<RuntimeGpuInstance> scene_packet_{};
+    std::vector<EditorModelDraw> visible_model_draws_{};
+    std::vector<std::uint32_t> visible_indices_{}, visibility_scratch_{};
+    std::vector<std::uint8_t> instance_lods_{};
+    std::vector<std::uint8_t> instance_visibility_{};
+    std::vector<Bounds> world_bounds_{};
+    VisibilitySettings visibility_settings_{};
+    VisibilityStatistics visibility_statistics_{};
+    glm::mat4 packet_view_projection_{0.0F};
+    VkExtent2D packet_extent_{};
+    std::uint64_t packet_runtime_revision_ = 0, packet_document_revision_ = 0;
+    std::uint64_t packet_revision_ = 1;
+    std::uint32_t visible_ground_count_ = 0, visible_cube_count_ = 0;
+    bool shadow_dirty_ = true;
+    DeviceObject<VkDescriptorSetLayout> visibility_layout_;
+    DeviceObject<VkPipelineLayout> visibility_pipeline_layout_;
+    DeviceObject<VkDescriptorPool> visibility_pool_;
+    DeviceObject<VkPipeline> visibility_pipeline_;
+    GpuBuffer visibility_lod_history_;
+    std::vector<VisibilitySource> visibility_sources_;
+    std::vector<VisibilityGroup> visibility_groups_;
+    std::vector<VkDrawIndexedIndirectCommand> visibility_commands_;
+    std::vector<std::uint32_t> node_record_heads_, node_record_next_;
+    std::array<std::uint32_t, 64> occluder_candidates_{};
+    std::uint32_t occluder_candidate_count_ = 0;
+    std::vector<VkBufferCopy> record_copies_;
+    std::uint64_t gpu_scene_revision_ = 1, gpu_packet_revision_ = 0;
+    std::uint64_t gpu_visibility_revision_ = 1;
+    bool gpu_visibility_active_ = false, reset_lod_history_ = true;
+    bool gpu_visibility_bypassed_ = false;
+    AssetPreparation asset_preparation_;
+    UploadBatch asset_upload_;
+    struct AssetRequest {
+        std::filesystem::path root;
+        std::string path, error;
+        bool queued = false, done = false;
+    };
+    std::vector<AssetRequest> asset_requests_;
+    std::optional<std::uint32_t> uploading_model_;
+    std::optional<std::size_t> uploading_request_;
+    std::size_t asset_requests_pending_ = 0;
+    bool async_assets_ = false;
     std::vector<EditorModelAsset> editor_model_assets_{};
     std::vector<EditorModelDraw> editor_model_draws_{};
     std::vector<EditorTextureAsset> editor_texture_assets_{};
