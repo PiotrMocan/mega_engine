@@ -15,7 +15,8 @@ layout(set = 0, binding = 0, std140) uniform FrameUniforms
 
 layout(location = 0) in vec3 inPosition;
 
+layout(push_constant) uniform ShadowPush { layout(offset=16) mat4 light; } shadowPush;
 void main()
 {
-    gl_Position = frame.lightViewProjection * vec4(inPosition, 1.0);
+    gl_Position = shadowPush.light * vec4(inPosition, 1.0);
 }

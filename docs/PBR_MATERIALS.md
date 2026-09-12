@@ -79,3 +79,7 @@ powershell -NoProfile -ExecutionPolicy Bypass ^
 scripts\build_windows.cmd Debug
 scripts\build_windows.cmd Release
 ```
+
+В режиме `--lighting dynamic` материалы получают динамическое небо, CSM и
+опциональное voxel GI вместо статичного окружения. Описание и границы
+реализации: [DYNAMIC_LIGHTING.md](DYNAMIC_LIGHTING.md).

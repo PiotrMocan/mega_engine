@@ -149,6 +149,8 @@ void PerformanceMetrics::record_frame(const FrameTimings& timings) noexcept {
     accumulate(TimingIndex::gpu_geometry, timings.gpu_geometry_ms);
     accumulate(TimingIndex::gpu_workload, timings.gpu_workload_ms);
     accumulate(TimingIndex::gpu_shadow, timings.gpu_shadow_ms);
+    accumulate(TimingIndex::gpu_voxel_geometry, timings.gpu_voxel_geometry_ms);
+    accumulate(TimingIndex::gpu_voxel_light, timings.gpu_voxel_light_ms);
     accumulate(TimingIndex::gpu_visibility, timings.gpu_visibility_ms);
     accumulate(TimingIndex::scene_prepare, timings.scene_prepare_ms);
 
@@ -179,6 +181,8 @@ PerformanceSnapshot PerformanceMetrics::snapshot(const bool include_percentile) 
     result.average.gpu_geometry_ms = average(TimingIndex::gpu_geometry);
     result.average.gpu_workload_ms = average(TimingIndex::gpu_workload);
     result.average.gpu_shadow_ms = average(TimingIndex::gpu_shadow);
+    result.average.gpu_voxel_geometry_ms = average(TimingIndex::gpu_voxel_geometry);
+    result.average.gpu_voxel_light_ms = average(TimingIndex::gpu_voxel_light);
     result.average.gpu_visibility_ms = average(TimingIndex::gpu_visibility);
     result.average.scene_prepare_ms = average(TimingIndex::scene_prepare);
 
@@ -421,6 +425,8 @@ BenchmarkResult make_benchmark_result(
     result.average_gpu_geometry_ms = snapshot.average.gpu_geometry_ms;
     result.average_gpu_workload_ms = snapshot.average.gpu_workload_ms;
     result.average_gpu_shadow_ms = snapshot.average.gpu_shadow_ms;
+    result.average_gpu_voxel_geometry_ms = snapshot.average.gpu_voxel_geometry_ms;
+    result.average_gpu_voxel_light_ms = snapshot.average.gpu_voxel_light_ms;
     result.average_gpu_visibility_ms = snapshot.average.gpu_visibility_ms;
     result.average_scene_prepare_ms = snapshot.average.scene_prepare_ms;
     return result;
@@ -473,6 +479,8 @@ std::string benchmark_result_to_json(const BenchmarkResult& result) {
     timing("average_gpu_geometry_ms", result.average_gpu_geometry_ms);
     timing("average_gpu_workload_ms", result.average_gpu_workload_ms);
     timing("average_gpu_shadow_ms", result.average_gpu_shadow_ms);
+    timing("average_gpu_voxel_geometry_ms", result.average_gpu_voxel_geometry_ms);
+    timing("average_gpu_voxel_light_ms", result.average_gpu_voxel_light_ms);
     timing("average_gpu_visibility_ms", result.average_gpu_visibility_ms);
     append_key(output, "visibility_backend");
     append_json_string(output, result.visibility_backend);
@@ -508,6 +516,21 @@ std::string benchmark_result_to_json(const BenchmarkResult& result) {
     boolean("animated", result.animated);
     boolean("animated_camera", result.animated_camera);
     boolean("scene_walls", result.scene_walls);
+    boolean("dynamic_lighting", result.lighting.dynamic);
+    boolean("voxel_gi", result.lighting.voxel_gi);
+    boolean("day_cycle", result.lighting.cycle);
+    boolean("lighting_room", result.lighting_room);
+    timing("time_of_day_end", result.lighting.hour);
+    timing("day_length_seconds", result.lighting.day_seconds);
+    timing("gi_extent", result.lighting.gi_extent);
+    timing("gi_strength", result.lighting.gi_strength);
+    timing("gi_update_hz", result.lighting.gi_update_hz);
+    integer("gi_triangle_budget", result.lighting.triangle_budget);
+    integer("gi_geometry_updates_total", result.lighting_statistics.geometry_updates);
+    integer("gi_radiance_updates_total", result.lighting_statistics.radiance_updates);
+    integer("gi_pending_bricks", result.lighting_statistics.pending_bricks);
+    timing("gi_oldest_geometry_ms", result.lighting_statistics.oldest_geometry_ms);
+    integer("gi_mesh_bytes", result.lighting_statistics.mesh_bytes);
 
     append_key(output, "gpu");
     append_json_string(output, result.gpu);

@@ -10,6 +10,7 @@ namespace vcr {
 // Destination resources are owned by the renderer cache, which outlives stop().
 class UploadBatch final {
   public:
+    static constexpr std::size_t alignment = 256;
     ~UploadBatch() noexcept {
         stop();
     }

@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive:require
+#include "lighting_common.glsl"
 
 layout(location = 0) in vec2 inNdc;
 layout(location = 0) out vec4 outColor;
@@ -48,7 +50,7 @@ void main()
         frame.unjitteredViewProjection * vec4(viewDirection, 0.0);
     const vec4 previousClip =
         frame.previousUnjitteredViewProjection * vec4(viewDirection, 0.0);
-    outColor = vec4(sky, 1.0);
+    outColor = vec4(lighting.options.x>0.5?dynamicSky(viewDirection):sky, 1.0);
     outMotionVector =
         previousClip.xy / previousClip.w
         - currentClip.xy / currentClip.w;

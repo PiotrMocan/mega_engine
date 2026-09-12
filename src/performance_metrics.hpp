@@ -1,4 +1,5 @@
 #pragma once
+#include "lighting.hpp"
 
 #include <array>
 #include <chrono>
@@ -28,6 +29,8 @@ struct FrameTimings {
     double gpu_geometry_ms = unavailable_timing_ms;
     double gpu_workload_ms = unavailable_timing_ms;
     double gpu_shadow_ms = unavailable_timing_ms;
+    double gpu_voxel_geometry_ms = unavailable_timing_ms;
+    double gpu_voxel_light_ms = unavailable_timing_ms;
     double gpu_visibility_ms = unavailable_timing_ms;
     double scene_prepare_ms = unavailable_timing_ms;
 };
@@ -76,6 +79,8 @@ private:
       gpu_geometry,
       gpu_workload,
       gpu_shadow,
+      gpu_voxel_geometry,
+      gpu_voxel_light,
       gpu_visibility,
       scene_prepare,
       count,
@@ -171,6 +176,9 @@ private:
 };
 
 struct BenchmarkResult {
+    LightingSettings lighting{};
+    LightingStatistics lighting_statistics{};
+    bool lighting_room = false;
     std::string gpu;
     std::string driver;
     std::string resolution;
@@ -195,6 +203,8 @@ struct BenchmarkResult {
     double average_gpu_geometry_ms = unavailable_timing_ms;
     double average_gpu_workload_ms = unavailable_timing_ms;
     double average_gpu_shadow_ms = unavailable_timing_ms;
+    double average_gpu_voxel_geometry_ms = unavailable_timing_ms;
+    double average_gpu_voxel_light_ms = unavailable_timing_ms;
     double average_gpu_visibility_ms = unavailable_timing_ms;
     std::string visibility_backend = "cpu";
     double average_scene_prepare_ms = unavailable_timing_ms;

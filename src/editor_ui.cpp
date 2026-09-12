@@ -3277,6 +3277,31 @@ void EditorUi::build_performance(
         ImGui::EndTable();
     }
 
+    auto lighting = renderer.lighting_settings();
+    bool lighting_changed = ImGui::Checkbox("Dynamic day and night", &lighting.dynamic);
+    lighting_changed |= ImGui::Checkbox("Advance time", &lighting.cycle);
+    float hour = static_cast<float>(lighting.hour), day = static_cast<float>(lighting.day_seconds);
+    if (ImGui::SliderFloat("Time of day", &hour, 0, 23.999F, "%.2f h")) {
+        lighting.hour = hour;
+        lighting_changed = true;
+    }
+    if (ImGui::SliderFloat("Day duration", &day, 10, 3600, "%.0f s")) {
+        lighting.day_seconds = day;
+        lighting_changed = true;
+    }
+    ImGui::BeginDisabled(!renderer.gi_provisioned() || !lighting.dynamic);
+    lighting_changed |= ImGui::Checkbox("Voxel indirect lighting", &lighting.voxel_gi);
+    lighting_changed |=
+        ImGui::SliderFloat("Indirect intensity", &lighting.gi_strength, 0, 2, "%.2f");
+    ImGui::EndDisabled();
+    if (lighting_changed) {
+        if (!lighting.dynamic)
+            lighting.voxel_gi = false;
+        static_cast<void>(renderer.set_lighting_settings(lighting));
+    }
+    ImGui::Text("GI geometry %.3f ms, lighting %.3f ms", performance.average.gpu_voxel_geometry_ms,
+                performance.average.gpu_voxel_light_ms);
+    ImGui::Text("GI pending regions: %u", renderer.lighting_statistics().pending_bricks);
     auto visibility = renderer.visibility_settings();
     bool visibility_changed = ImGui::Checkbox("Frustum culling", &visibility.frustum);
     visibility_changed |= ImGui::Checkbox("Occlusion culling", &visibility.occlusion);

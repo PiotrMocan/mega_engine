@@ -28,6 +28,7 @@ GpuTexture& GpuTexture::operator=(GpuTexture&& other) noexcept {
     allocation_ = std::exchange(other.allocation_, VK_NULL_HANDLE);
     width_ = std::exchange(other.width_, 0U);
     height_ = std::exchange(other.height_, 0U);
+    depth_ = std::exchange(other.depth_, 1U);
     mip_levels_ = std::exchange(other.mip_levels_, 0U);
     format_ = std::exchange(other.format_, VK_FORMAT_UNDEFINED);
     usage_ = std::exchange(other.usage_, VkImageUsageFlags{0});
@@ -164,20 +165,26 @@ void GpuTexture::create_render_target(
         debug_name);
 }
 
-void GpuTexture::create_impl(
-    VulkanContext& context,
-    const std::uint32_t width,
-    const std::uint32_t height,
-    const std::uint32_t mip_levels,
-    const VkFormat format,
-    const VkImageUsageFlags usage,
-    const VkImageAspectFlags aspect_mask,
-    const VkFilter filter,
-    const VkSamplerAddressMode address_mode,
-    const VkBool32 compare_enable,
-    const VkCompareOp compare_op,
-    const VkBorderColor border_color,
-    const std::string_view debug_name) {
+void GpuTexture::create_volume(VulkanContext &context, std::uint32_t size, std::uint32_t mips,
+                               VkFormat format, std::string_view name) {
+    // Use depth >= 2 so the view remains 3D even for the disabled dummy volume.
+    if (size < 2 || size > context.properties().limits.maxImageDimension3D)
+        fatal("Invalid voxel volume extent");
+    create_impl(context, size, size, mips, format,
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                VK_IMAGE_ASPECT_COLOR_BIT, VK_FILTER_LINEAR,
+                VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, VK_FALSE, VK_COMPARE_OP_ALWAYS,
+                VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK, name, size);
+}
+
+void GpuTexture::create_impl(VulkanContext &context, const std::uint32_t width,
+                             const std::uint32_t height, const std::uint32_t mip_levels,
+                             const VkFormat format, const VkImageUsageFlags usage,
+                             const VkImageAspectFlags aspect_mask, const VkFilter filter,
+                             const VkSamplerAddressMode address_mode, const VkBool32 compare_enable,
+                             const VkCompareOp compare_op, const VkBorderColor border_color,
+                             const std::string_view debug_name, const std::uint32_t depth) {
     destroy();
     if (width == 0U || height == 0U || mip_levels == 0U) {
         fatal("Attempted to create a zero-sized GPU texture.");
@@ -195,6 +202,7 @@ void GpuTexture::create_impl(
     context_ = &context;
     width_ = width;
     height_ = height;
+    depth_ = depth;
     mip_levels_ = mip_levels;
     format_ = format;
     usage_ = usage;
@@ -204,9 +212,9 @@ void GpuTexture::create_impl(
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .imageType = VK_IMAGE_TYPE_2D,
+        .imageType = depth > 1 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D,
         .format = format,
-        .extent = VkExtent3D{width, height, 1U},
+        .extent = VkExtent3D{width, height, depth},
         .mipLevels = mip_levels,
         .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT,
@@ -238,6 +246,7 @@ void GpuTexture::create_impl(
         context_ = nullptr;
         width_ = 0;
         height_ = 0;
+        depth_ = 1;
         mip_levels_ = 0;
         format_ = VK_FORMAT_UNDEFINED;
         usage_ = 0;
@@ -250,21 +259,23 @@ void GpuTexture::create_impl(
         .pNext = nullptr,
         .flags = 0,
         .image = image_,
-        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .viewType = depth > 1 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D,
         .format = format,
-        .components = VkComponentMapping{
-            VK_COMPONENT_SWIZZLE_IDENTITY,
-            VK_COMPONENT_SWIZZLE_IDENTITY,
-            VK_COMPONENT_SWIZZLE_IDENTITY,
-            VK_COMPONENT_SWIZZLE_IDENTITY,
-        },
-        .subresourceRange = VkImageSubresourceRange{
-            .aspectMask = aspect_mask,
-            .baseMipLevel = 0,
-            .levelCount = mip_levels,
-            .baseArrayLayer = 0,
-            .layerCount = 1,
-        },
+        .components =
+            VkComponentMapping{
+                VK_COMPONENT_SWIZZLE_IDENTITY,
+                VK_COMPONENT_SWIZZLE_IDENTITY,
+                VK_COMPONENT_SWIZZLE_IDENTITY,
+                VK_COMPONENT_SWIZZLE_IDENTITY,
+            },
+        .subresourceRange =
+            VkImageSubresourceRange{
+                .aspectMask = aspect_mask,
+                .baseMipLevel = 0,
+                .levelCount = mip_levels,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
     };
     const VkResult view_result = vkCreateImageView(
         context.device(), &view_info, nullptr, &view_);
@@ -342,6 +353,7 @@ void GpuTexture::destroy() noexcept {
     allocation_ = VK_NULL_HANDLE;
     width_ = 0;
     height_ = 0;
+    depth_ = 1;
     mip_levels_ = 0;
     format_ = VK_FORMAT_UNDEFINED;
     usage_ = 0;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "anti_aliasing.hpp"
+#include "lighting.hpp"
 
 #include <array>
 #include <cstddef>
@@ -67,6 +68,8 @@ struct CliOptions {
     double camera_z = 12.0;
     double scene_scale = 1.0;
     bool scene_walls = true;
+    bool lighting_room = false;
+    LightingSettings lighting{};
 };
 
 struct CliParseResult {

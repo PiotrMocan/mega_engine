@@ -23,6 +23,8 @@ enum class McpCommandType : std::uint8_t {
     render_set_mode,
     render_set_instances,
     render_set_gpu_workload,
+    lighting_set,
+    test_set_roof,
     render_set_present_mode,
     window_set_fullscreen,
     window_set_size,
@@ -84,6 +86,7 @@ struct McpCommand {
     float mouse_delta_x = 0.0F;
     float mouse_delta_y = 0.0F;
     bool enabled = false;
+    LightingSettings lighting{};
 };
 
 static_assert(std::is_trivially_copyable_v<McpCommand>);

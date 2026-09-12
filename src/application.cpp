@@ -70,6 +70,8 @@ using Json = nlohmann::json;
         {"gpu_geometry_ms", timings.gpu_geometry_ms},
         {"gpu_workload_ms", timings.gpu_workload_ms},
         {"gpu_shadow_ms", timings.gpu_shadow_ms},
+        {"gpu_voxel_geometry_ms", timings.gpu_voxel_geometry_ms},
+        {"gpu_voxel_light_ms", timings.gpu_voxel_light_ms},
         {"gpu_visibility_ms", timings.gpu_visibility_ms},
         {"scene_prepare_ms", timings.scene_prepare_ms},
     };
@@ -150,17 +152,9 @@ void Application::initialize(const CliOptions& options) {
         preferred_present = VK_PRESENT_MODE_FIFO_KHR;
         break;
     }
-    renderer_.initialize(
-        context_,
-        window_.get(),
-        preferred_present,
-        options.initial_mode,
-        options.instances,
-        options.gpu_workload_iterations,
-        options.anti_aliasing,
-        options.mcp_stdio,
-        false,
-        true);
+    renderer_.initialize(context_, window_.get(), preferred_present, options.initial_mode,
+                         options.instances, options.gpu_workload_iterations, options.anti_aliasing,
+                         options.mcp_stdio, false, true, options.lighting);
     load_canonical_scene();
     camera_ = FlyCamera({0, 4, static_cast<float>(options.camera_z)});
     VisibilitySettings visibility{options.frustum_culling, options.occlusion_culling, options.lod,
@@ -216,6 +210,28 @@ void Application::load_canonical_scene() {
     const std::filesystem::path scene_path =
         asset_root->path / canonical_scene_relative_path;
     std::string error;
+    if (options_.lighting_room) {
+        scene_instances_.reserve(max_scene_nodes);
+        scene_models_.reserve(max_scene_nodes);
+        const auto cube = [&](const char *name, glm::vec3 position, glm::vec3 scale,
+                              glm::vec3 color) {
+            const auto id = scene_.create_node(name, SceneNodeKind::cube);
+            auto &node = scene_.node(id)->get();
+            node.transform.translation = position;
+            node.transform.scale = scale;
+            node.material.base_color = glm::vec4(color, 1);
+            return id;
+        };
+        cube("Floor", {0, -0.25F, -8}, {6, .25F, 6}, {.65F, .65F, .65F});
+        cube("Left red wall", {-6, 3, -8}, {.25F, 3, 6}, {.65F, .07F, .03F});
+        cube("Right wall", {6, 3, -8}, {.25F, 3, 6}, {.6F, .6F, .6F});
+        cube("Back wall", {0, 3, -14}, {6, 3, .25F}, {.6F, .6F, .6F});
+        cube("Receiver", {0, 1, -8}, {1, 1, 1}, {.65F, .65F, .65F});
+        static_cast<void>(scene_.create_node("Sun", SceneNodeKind::directional_light));
+        static_cast<void>(scene_.create_node("Sky", SceneNodeKind::environment));
+        set_lighting_room_roof(true);
+        return;
+    }
     if (options_.scene_count > 0) {
         scene_instances_.reserve(options_.scene_count);
         scene_models_.reserve(options_.scene_count);
@@ -300,6 +316,28 @@ void Application::load_canonical_scene() {
         << " (" << scene_.size() << " nodes)\n";
 }
 
+void Application::set_lighting_room_roof(bool enabled) {
+    if (!options_.lighting_room)
+        return;
+    if (enabled && !scene_.valid(lighting_room_roof_)) {
+        lighting_room_roof_ = scene_.create_node("Removable roof", SceneNodeKind::cube);
+        auto &node = scene_.node(lighting_room_roof_)->get();
+        node.transform.translation = {0, 6.25F, -8};
+        node.transform.scale = {6, .25F, 6};
+        node.material.base_color = {.6F, .6F, .6F, 1};
+    } else if (!enabled && scene_.valid(lighting_room_roof_)) {
+        static_cast<void>(scene_.destroy_subtree(lighting_room_roof_));
+        lighting_room_roof_ = {};
+    }
+    scene_.mark_content_changed();
+    const auto root = find_runtime_asset_root();
+    if (!root)
+        fatal("Unable to locate runtime assets while updating the lighting test room");
+    std::string error;
+    const auto view = scene_.build_render_view(scene_instances_, scene_models_);
+    if (!renderer_.update_editor_scene(view, root->path, error))
+        fatal(error);
+}
 void Application::service_assets() {
     static_cast<void>(renderer_.poll_assets());
     if (options_.stream_asset.empty() || stream_asset_placed_ || renderer_.assets_pending()) {
@@ -757,6 +795,16 @@ void Application::execute_mcp_command(const McpCommand& command) {
                      {"mode", std::string(to_string(renderer_.mode()))},
                      {"instances", renderer_.instance_count()},
                      {"triangles", renderer_.triangle_count()},
+                     {"lighting",
+                      Json{{"dynamic", renderer_.lighting_settings().dynamic},
+                           {"hour", renderer_.lighting_settings().hour},
+                           {"cycle", renderer_.lighting_settings().cycle},
+                           {"voxel_gi", renderer_.lighting_settings().voxel_gi},
+                           {"geometry_updates", renderer_.lighting_statistics().geometry_updates},
+                           {"radiance_updates", renderer_.lighting_statistics().radiance_updates},
+                           {"pending_bricks", renderer_.lighting_statistics().pending_bricks},
+                           {"oldest_geometry_ms",
+                            renderer_.lighting_statistics().oldest_geometry_ms}}},
                      {"assets_pending", renderer_.assets_pending()},
                      {"visibility_backend", renderer_.visibility_backend()},
                      {"upload_high_water_bytes", renderer_.upload_high_water()},
@@ -926,6 +974,27 @@ void Application::execute_mcp_command(const McpCommand& command) {
                 {"max_instances",
                  renderer_.max_instance_capacity()},
             });
+        return;
+    case McpCommandType::lighting_set: {
+        auto settings = renderer_.lighting_settings();
+        settings.hour = command.lighting.hour;
+        settings.cycle = command.lighting.cycle;
+        settings.voxel_gi = command.lighting.voxel_gi;
+        settings.dynamic = true;
+        if (!renderer_.set_lighting_settings(settings)) {
+            fail("GI was not provisioned; restart without --gi off");
+            return;
+        }
+        succeed("Lighting updated", Json::object());
+        return;
+    }
+    case McpCommandType::test_set_roof:
+        if (!options_.lighting_room) {
+            fail("This tool requires --lighting-room");
+            return;
+        }
+        set_lighting_room_roof(command.enabled);
+        succeed("Test-room roof updated", Json::object());
         return;
     case McpCommandType::render_set_gpu_workload:
         if (command.value >
@@ -1176,6 +1245,9 @@ void Application::finish_benchmark() {
     result.animated = options_.animate_scene;
     result.animated_camera = options_.animate_camera;
     result.visibility_backend = renderer_.visibility_backend();
+    result.lighting = renderer_.lighting_settings();
+    result.lighting_statistics = renderer_.lighting_statistics();
+    result.lighting_room = options_.lighting_room;
     result.camera_z = options_.camera_z;
     result.scene_scale = options_.scene_scale;
     result.scene_walls = options_.scene_walls;

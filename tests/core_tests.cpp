@@ -95,9 +95,31 @@ int main() {
                "FSR jitter matches actual Vulkan viewport pixel displacement");
     }
     {
-        const char* arguments[]{"vulkan_cube"};
-        const auto parsed = vcr::parse_cli_options(
-            static_cast<int>(std::size(arguments)), arguments);
+        {
+            const char *lighting_args[]{"vcr",   "--lighting",    "dynamic", "--gi",
+                                        "voxel", "--time-of-day", "0",       "--day-cycle",
+                                        "off",   "--day-length",  "120",     "--gi-triangle-budget",
+                                        "1024"};
+            const auto parsed =
+                vcr::parse_cli_options(static_cast<int>(std::size(lighting_args)), lighting_args);
+            expect(static_cast<bool>(parsed) && parsed.options.lighting.hour == 0 &&
+                       !parsed.options.lighting.cycle &&
+                       parsed.options.lighting.triangle_budget == 1024,
+                   "dynamic lighting CLI controls parse");
+            for (const char *bad :
+                 {"24", "-1", "nan", "inf", "9999999999999999999999999999999999999"}) {
+                const char *args[]{"vcr", "--time-of-day", bad};
+                expect(!vcr::parse_cli_options(3, args), "invalid day hour rejected");
+            }
+            for (const char *bad : {"1023", "262145", "1024.5", "nan", "-1"}) {
+                const char *args[]{"vcr", "--gi-triangle-budget", bad};
+                expect(!vcr::parse_cli_options(3, args),
+                       "invalid geometry budget rejected before cast");
+            }
+        }
+        const char *arguments[]{"vulkan_cube"};
+        const auto parsed =
+            vcr::parse_cli_options(static_cast<int>(std::size(arguments)), arguments);
         expect(
             static_cast<bool>(parsed) &&
                 parsed.options.width == 1920 &&

@@ -1,0 +1,243 @@
+{
+  "geometry": {
+    "vertex_count": 3,
+    "vertex_stride": 48,
+    "index_type": "uint32",
+    "primitive": "triangles",
+    "index_count": 96
+  },
+  "mesh": "mesh/triangles.vcrmesh",
+  "schema": "vcr.asset",
+  "name": "triangles",
+  "submeshes": [
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 0,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "0"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 3,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "1"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 6,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "2"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 9,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "3"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 12,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "4"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 15,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "5"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 18,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "6"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 21,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "7"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 24,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "8"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 27,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "9"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 30,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "10"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 33,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "11"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 36,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "12"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 39,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "13"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 42,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "14"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 45,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "15"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 48,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "16"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 51,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "17"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 54,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "18"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 57,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "19"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 60,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "20"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 63,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "21"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 66,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "22"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 69,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "23"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 72,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "24"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 75,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "25"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 78,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "26"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 81,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "27"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 84,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "28"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 87,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "29"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 90,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "30"
+    },
+    {
+      "index_count": 3,
+      "material_index": 0,
+      "first_index": 93,
+      "material": "materials/white.vcrmaterial.json",
+      "name": "31"
+    }
+  ],
+  "version": 1,
+  "materials": [
+    "materials/white.vcrmaterial.json"
+  ],
+  "kind": "model"
+}

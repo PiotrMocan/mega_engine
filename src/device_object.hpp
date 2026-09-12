@@ -14,6 +14,8 @@ public:
     using Destroy = void (VKAPI_PTR*)(VkDevice, Handle, const VkAllocationCallbacks*);
 
     DeviceObject() noexcept = default;
+    DeviceObject(VkDevice device, Handle handle, Destroy destroy) noexcept
+        : device_(device), handle_(handle), destroy_(destroy) {}
     ~DeviceObject() noexcept { reset(); }
     DeviceObject(const DeviceObject&) = delete;
     DeviceObject& operator=(const DeviceObject&) = delete;

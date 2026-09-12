@@ -38,7 +38,7 @@ using namespace std::chrono_literals;
 
 constexpr std::string_view protocol_version{"2025-11-25"};
 constexpr std::size_t maximum_input_message_bytes = 1024U * 1024U;
-constexpr std::array<std::string_view, 18> tool_names{
+constexpr std::array<std::string_view, 20> tool_names{
     "debug.get_capabilities",
     "debug.get_state",
     "debug.get_metrics",
@@ -48,6 +48,8 @@ constexpr std::array<std::string_view, 18> tool_names{
     "render.set_mode",
     "render.set_instances",
     "render.set_gpu_workload",
+    "lighting.set",
+    "test.set_roof",
     "render.set_present_mode",
     "window.set_fullscreen",
     "window.set_size",
@@ -389,6 +391,20 @@ private:
         false,
         true));
     tools.push_back(tool_definition(
+        "lighting.set", "Set daylight and GI",
+        "Set hour, cycle and GI; GI resources must have been provisioned at startup.",
+        object_schema(
+            Json{{"hour", Json{{"type", "number"}, {"minimum", 0}, {"exclusiveMaximum", 24}}},
+                 {"cycle", Json{{"type", "boolean"}}},
+                 {"gi", Json{{"type", "boolean"}}}},
+            Json::array({"hour", "cycle", "gi"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "test.set_roof", "Set test-room roof",
+        "Create or destroy the roof in --lighting-room; unavailable in ordinary scenes.",
+        object_schema(Json{{"enabled", Json{{"type", "boolean"}}}}, Json::array({"enabled"})),
+        false, true, true));
+    tools.push_back(tool_definition(
         "render.set_gpu_workload",
         "Set GPU workload",
         "Set compute workload iterations from 0 through 4096.",
@@ -697,6 +713,35 @@ private:
         }
         command.type = McpCommandType::render_set_instances;
         command.value = *count;
+        return true;
+    }
+    if (name == "test.set_roof") {
+        if (arguments.size() != 1 || !arguments.contains("enabled") ||
+            !arguments["enabled"].is_boolean()) {
+            error = "enabled must be the only boolean argument";
+            return false;
+        }
+        command.type = McpCommandType::test_set_roof;
+        command.enabled = arguments["enabled"].get<bool>();
+        return true;
+    }
+    if (name == "lighting.set") {
+        if (arguments.size() != 3 || !arguments.contains("hour") ||
+            !arguments["hour"].is_number() || !arguments.contains("cycle") ||
+            !arguments["cycle"].is_boolean() || !arguments.contains("gi") ||
+            !arguments["gi"].is_boolean()) {
+            error = "hour, cycle and gi are required";
+            return false;
+        }
+        const double hour = arguments["hour"].get<double>();
+        if (!std::isfinite(hour) || hour < 0 || hour >= 24) {
+            error = "hour must be in [0,24)";
+            return false;
+        }
+        command.type = McpCommandType::lighting_set;
+        command.lighting.hour = hour;
+        command.lighting.cycle = arguments["cycle"].get<bool>();
+        command.lighting.voxel_gi = arguments["gi"].get<bool>();
         return true;
     }
     if (name == "render.set_gpu_workload") {

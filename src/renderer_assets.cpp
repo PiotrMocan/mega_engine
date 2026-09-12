@@ -41,7 +41,7 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_model(const std::file
         error = prepared.error;
         return {};
     }
-    asset_upload_.begin(*context_, prepared.upload_bytes);
+    asset_upload_.begin(*context_, prepared.upload_bytes + gi_model_upload_bytes(prepared));
     auto index = publish_editor_model(prepared, error);
     asset_upload_.submit();
     asset_upload_.wait();
@@ -78,7 +78,7 @@ bool Renderer::poll_assets() {
             --asset_requests_pending_;
             changed = true;
         } else {
-            asset_upload_.begin(*context_, prepared.upload_bytes);
+            asset_upload_.begin(*context_, prepared.upload_bytes + gi_model_upload_bytes(prepared));
             uploading_model_ = publish_editor_model(prepared, request->error);
             if (uploading_model_) {
                 editor_model_assets_[*uploading_model_].ready = false;

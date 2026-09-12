@@ -197,3 +197,6 @@ Resize viewport coalesced с задержкой 140 ms и ограничен `38
 В packaged окружении без project `CMakeLists.txt` game и editor используют
 копию `assets` рядом со своими executable, поэтому сборка содержит именно
 сохранённую сцену и её зависимости.
+
+Панель renderer также управляет временем суток, скоростью цикла и voxel GI.
+Параметры пока не сохраняются в scene-файл; см. [DYNAMIC_LIGHTING.md](DYNAMIC_LIGHTING.md).

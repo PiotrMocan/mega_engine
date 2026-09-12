@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <glm/vec3.hpp>
 #include <mutex>
 #include <thread>
 
@@ -12,6 +13,7 @@ inline constexpr std::size_t maximum_prepared_asset_bytes = 512ULL * 1024 * 1024
 struct PreparedTexture {
     std::string path, error;
     std::optional<CookedTextureAsset> texture;
+    glm::vec3 average_linear{1};
 };
 struct PreparedModel {
     std::filesystem::path root;

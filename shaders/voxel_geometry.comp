@@ -1,0 +1,76 @@
+#version 450
+#extension GL_GOOGLE_include_directive:require
+#define LIGHTING_SET 0
+#include "lighting_common.glsl"
+layout(local_size_x=64) in;
+layout(set=0,binding=2,std430) buffer Voxels {uint voxels[];};
+struct Triangle {vec4 a;vec4 b;vec4 c;};
+layout(set=0,binding=3,std430) readonly buffer Triangles {Triangle triangles[];};
+struct Job {vec4 row0;vec4 row1;vec4 row2;vec4 color;uvec4 range;};
+layout(set=0,binding=4,std430) readonly buffer Jobs {Job jobs[];};
+layout(set=0,binding=5,std430) readonly buffer Dirty {uint dirty[];};
+layout(push_constant) uniform Push {uint phase;uint triangleCount;uint jobCount;uint reserved;} push;
+uint cellIndex(ivec3 p) {return uint(p.x+64*(p.y+64*p.z));}
+bool dirtyCell(ivec3 p) {ivec3 b=p/8;return dirty[b.x+8*(b.y+8*b.z)]!=0;}
+vec3 transformPoint(Job job,vec3 p) {vec4 v=vec4(p,1);return vec3(dot(job.row0,v),dot(job.row1,v),dot(job.row2,v));}
+bool separates(vec3 axis,vec3 a,vec3 b,vec3 c) {
+    float r=0.5001*(abs(axis.x)+abs(axis.y)+abs(axis.z));
+    vec3 p=vec3(dot(axis,a),dot(axis,b),dot(axis,c));
+    return min(p.x,min(p.y,p.z))>r || max(p.x,max(p.y,p.z)) < -r;
+}
+bool overlaps(vec3 a,vec3 b,vec3 c,vec3 center) {
+    a-=center;b-=center;c-=center;
+    if(separates(cross(b-a,c-a),a,b,c)) return false;
+    vec3 edges[3]=vec3[3](b-a,c-b,a-c);
+    for(int i=0;i<3;++i) {
+        if(separates(cross(edges[i],vec3(1,0,0)),a,b,c) ||
+           separates(cross(edges[i],vec3(0,1,0)),a,b,c) ||
+           separates(cross(edges[i],vec3(0,0,1)),a,b,c)) return false;
+    }
+    return true;
+}
+uint packSurface(vec3 normal,vec3 color) {
+    normal/=abs(normal.x)+abs(normal.y)+abs(normal.z);
+    vec2 oct=normal.xy;
+    if(normal.z<0) oct=(1.0-abs(oct.yx))*mix(vec2(-1),vec2(1),greaterThanEqual(oct,vec2(0)));
+    uvec2 n=uvec2(round(clamp(oct*0.5+0.5,0,1)*255));
+    uvec3 rgb=uvec3(round(clamp(color,0,1)*31));
+    return 0x80000000u|rgb.x|(rgb.y<<5)|(rgb.z<<10)|(n.x<<15)|(n.y<<23);
+}
+void main() {
+    uint invocation=gl_GlobalInvocationID.x;
+    if(push.phase==0) {
+        ivec3 p=ivec3(invocation%64,(invocation/64)%64,invocation/4096);
+        if(dirtyCell(p)) voxels[invocation]=0;
+        return;
+    }
+    if(invocation>=push.triangleCount || push.jobCount==0) return;
+    uint lo=0,hi=push.jobCount;
+    while(lo+1<hi) {uint mid=(lo+hi)/2;if(jobs[mid].range.z<=invocation) lo=mid;else hi=mid;}
+    Job job=jobs[lo];uint local=invocation-job.range.z;
+    if(local>=job.range.y) return;
+    Triangle triangle=triangles[job.range.x+local];
+    vec3 a=(transformPoint(job,triangle.a.xyz)-lighting.volumeOriginCell.xyz)/lighting.volumeOriginCell.w;
+    vec3 b=(transformPoint(job,triangle.b.xyz)-lighting.volumeOriginCell.xyz)/lighting.volumeOriginCell.w;
+    vec3 c=(transformPoint(job,triangle.c.xyz)-lighting.volumeOriginCell.xyz)/lighting.volumeOriginCell.w;
+    // Invalid/overflowing input cannot reach float-to-int conversions or SSBO indices.
+    if(any(isnan(a)) || any(isinf(a)) || any(isnan(b)) || any(isinf(b)) || any(isnan(c)) || any(isinf(c))) return;
+    vec3 normal=cross(b-a,c-a);float squared=dot(normal,normal);if(squared<1e-14 || isnan(squared) || isinf(squared)) return;
+    vec3 low=min(a,min(b,c)),high=max(a,max(b,c));
+    if(any(lessThan(high,vec3(0))) || any(greaterThanEqual(low,vec3(64)))) return;
+    ivec3 first=ivec3(clamp(floor(low-0.001),vec3(0),vec3(63)));
+    ivec3 last=ivec3(clamp(floor(high+0.001),vec3(0),vec3(63)));
+    vec3 absolute=abs(normal);int axis=absolute.x>absolute.y?(absolute.x>absolute.z?0:2):(absolute.y>absolute.z?1:2);
+    int u=(axis+1)%3,v=(axis+2)%3;
+    uint surface=packSurface(normal*inversesqrt(squared),job.color.rgb);
+    // Dominant-axis rasterization bounds each triangle to <= 64*64*5 cell tests.
+    for(int y=first[v];y<=last[v];++y) for(int x=first[u];x<=last[u];++x) {
+        float z=a[axis]-(normal[u]*(float(x)+0.5-a[u])+normal[v]*(float(y)+0.5-a[v]))/normal[axis];
+        if(isnan(z) || isinf(z) || z < -2 || z > 66) continue;
+        int begin=max(first[axis],int(floor(z))-2),end=min(last[axis],int(floor(z))+2);
+        for(int depth=begin;depth<=end;++depth) {
+            ivec3 p;p[u]=x;p[v]=y;p[axis]=depth;
+            if(dirtyCell(p) && overlaps(a,b,c,vec3(p)+0.5)) atomicMax(voxels[cellIndex(p)],surface);
+        }
+    }
+}

@@ -270,6 +270,14 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
             continue;
         }
 
+        if (argument.name == "--lighting-room") {
+            if (argument.has_inline_value) {
+                result.error = invalid_value(argument.name, argument.inline_value);
+                return result;
+            }
+            result.options.lighting_room = true;
+            continue;
+        }
         if (argument.name == "--animate-scene" || argument.name == "--animate-camera") {
             if (argument.has_inline_value) {
                 result.error = invalid_value(argument.name, argument.inline_value);
@@ -283,6 +291,58 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
             continue;
         }
         std::string_view value;
+        if (argument.name == "--lighting" || argument.name == "--gi" ||
+            argument.name == "--day-cycle" || argument.name == "--time-of-day" ||
+            argument.name == "--day-length" || argument.name == "--gi-extent" ||
+            argument.name == "--gi-strength" || argument.name == "--gi-update-hz" ||
+            argument.name == "--gi-triangle-budget") {
+            if (!take_value(argument, index, argc, argv, value, result.error))
+                return result;
+            auto &s = result.options.lighting;
+            bool valid = true;
+            double number = 0;
+            if (argument.name == "--lighting") {
+                valid = value == "dynamic" || value == "legacy";
+                s.dynamic = value == "dynamic";
+                if (!s.dynamic) {
+                    s.voxel_gi = false;
+                    s.cycle = false;
+                }
+            } else if (argument.name == "--gi") {
+                valid = value == "voxel" || value == "off";
+                s.voxel_gi = value == "voxel";
+            } else if (argument.name == "--day-cycle") {
+                valid = value == "on" || value == "off";
+                s.cycle = value == "on";
+            } else {
+                valid = parse_nonnegative_double(value, number);
+                if (argument.name == "--time-of-day") {
+                    valid = valid && number < 24;
+                    s.hour = number;
+                } else if (argument.name == "--day-length") {
+                    valid = valid && number >= 1 && number <= 864000;
+                    s.day_seconds = number;
+                } else if (argument.name == "--gi-extent") {
+                    valid = valid && number >= 16 && number <= 256;
+                    s.gi_extent = static_cast<float>(number);
+                } else if (argument.name == "--gi-strength") {
+                    valid = valid && number <= 4;
+                    s.gi_strength = static_cast<float>(number);
+                } else if (argument.name == "--gi-update-hz") {
+                    valid = valid && number >= 1 && number <= 120;
+                    s.gi_update_hz = static_cast<float>(number);
+                } else {
+                    valid =
+                        valid && number >= 1024 && number <= 262144 && std::floor(number) == number;
+                    s.triangle_budget = valid ? static_cast<std::uint32_t>(number) : 65536;
+                }
+            }
+            if (!valid) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            continue;
+        }
         if (argument.name == "--scene-scale") {
             if (!take_value(argument, index, argc, argv, value, result.error)) {
                 return result;
@@ -553,6 +613,14 @@ std::string cli_usage(std::string_view executable_name) {
                   "  Esc                     Release mouse, then exit\n"
                   "  1/2/3                   Scene/instancing/GPU workload mode\n"
                   "  Up/Down                 Adjust active benchmark load\n"
+                  "  --lighting dynamic|legacy  Lighting path (dynamic by default)\n"
+                  "  --gi voxel|off             Dynamic diffuse GI (voxel by default)\n"
+                  "  --time-of-day 0..24         Initial hour (14)\n"
+                  "  --day-cycle on|off          Advance time (on)\n"
+                  "  --day-length SECONDS        Full day duration (600)\n"
+                  "  --gi-extent 16..256         Volume width in world units (64)\n"
+                  "  --gi-update-hz 1..120       Motion GI/relight frequency (30)\n"
+                  "  --gi-triangle-budget N      Geometry work per frame (65536)\n"
                   "  F6                      Cycle off/SMAA/FSR 3 anti-aliasing\n"
                   "  F7/F8                   Decrease/increase AA quality\n"
                   "  V/F/R/P                 VSync/fullscreen/reset/print stats\n");

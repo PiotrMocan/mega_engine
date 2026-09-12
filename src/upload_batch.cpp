@@ -48,7 +48,7 @@ void UploadBatch::begin(VulkanContext &context, std::size_t capacity) {
     recording_ = true;
 }
 VkDeviceSize UploadBatch::stage(std::span<const std::byte> bytes) {
-    const auto offset = (offset_ + 255U) & ~std::size_t(255U);
+    const auto offset = (offset_ + alignment - 1) & ~(alignment - 1);
     if (!recording_ || offset > staging_.size() || bytes.size() > staging_.size() - offset) {
         throw std::length_error("Asset upload arena overflow");
     }

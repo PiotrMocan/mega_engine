@@ -16,8 +16,9 @@ struct Instance {
 };
 layout(set=0,binding=1,std430) readonly buffer Instances { Instance instances[]; };
 layout(location=0) in vec3 inPosition;
+layout(push_constant) uniform ShadowPush { layout(offset=16) mat4 light; } shadowPush;
 void main() {
     Instance instance=instances[gl_InstanceIndex];
     vec4 p=vec4(inPosition,1);
-    gl_Position=frame.lightViewProjection*vec4(dot(instance.row0,p),dot(instance.row1,p),dot(instance.row2,p),1);
+    gl_Position=shadowPush.light*vec4(dot(instance.row0,p),dot(instance.row1,p),dot(instance.row2,p),1);
 }

@@ -2,6 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 
 #include "pbr_lighting.glsl"
+#include "voxel_sampling.glsl"
 
 // Locations 0..5 intentionally match scene.frag's vertex interface.
 layout(location = 0) in vec3 inWorldNormal;
@@ -108,6 +109,7 @@ vec3 sampleWorldNormal()
 
 float sunVisibility(vec3 normal, vec3 lightDirection)
 {
+    if(lighting.options.x>0.5) return cascadedVisibility(shadowMap,inWorldPosition,normal,lightDirection);
     const vec3 projected =
         inShadowPosition.xyz / inShadowPosition.w;
     const vec2 shadowUv = projected.xy * 0.5 + 0.5;
@@ -133,6 +135,7 @@ vec3 sampleEnvironment(
 {
     const vec3 reflectionDirection =
         reflect(-viewDirection, normal);
+    if(lighting.options.x>0.5) return mix(dynamicSky(reflectionDirection),lighting.skyZenith.rgb*0.5+lighting.skyHorizon.rgb*0.5,roughness*roughness);
     const int levelCount = textureQueryLevels(skyTexture);
     const float maximumLod =
         float(max(levelCount - 1, 0));
@@ -158,8 +161,9 @@ void main()
     const vec3 lightDirection =
         normalize(frame.sunDirectionIntensity.xyz);
     const float visibility = sunVisibility(normal, lightDirection);
-    const vec3 diffuseAmbient =
-        frame.skyAmbient.rgb * frame.skyAmbient.a;
+    vec3 diffuseAmbient=frame.skyAmbient.rgb*frame.skyAmbient.a;
+    if(lighting.options.x>0.5) diffuseAmbient=(lighting.skyZenith.rgb+lighting.skyHorizon.rgb)*0.175;
+    if(voxelGiCompiled && lighting.options.y>0.5) diffuseAmbient=voxelDiffuse(inWorldPosition,normal);
     const vec3 directRadiance =
         frame.sunColorSkyYaw.rgb
         * frame.sunDirectionIntensity.w;

@@ -11,7 +11,7 @@ layout(push_constant) uniform PostProcessPushConstants
 {
     vec2 inverseResolution;
     uint method;
-    uint quality;
+    uint displayMappingEnabled;
 } postProcess;
 
 #define SMAA_PIXEL_SIZE postProcess.inverseResolution

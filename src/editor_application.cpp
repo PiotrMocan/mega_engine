@@ -86,16 +86,9 @@ void EditorApplication::initialize(const CliOptions& options) {
     }
 
     context_.initialize(window_.get(), options.validation);
-    renderer_.initialize(
-        context_,
-        window_.get(),
-        preferred_present_mode(options.present),
-        RunMode::scene,
-        1U,
-        options.gpu_workload_iterations,
-        options.anti_aliasing,
-        false,
-        true);
+    renderer_.initialize(context_, window_.get(), preferred_present_mode(options.present),
+                         RunMode::scene, 1U, options.gpu_workload_iterations, options.anti_aliasing,
+                         false, true, true, options.lighting);
 
     VisibilitySettings visibility{options.frustum_culling, options.occlusion_culling, options.lod,
                                   options.dynamic_shadows};

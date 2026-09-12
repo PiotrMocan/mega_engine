@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory = $true)][string]$ExePath,
     [ValidateRange(1, 100)][int]$Startups = 3,
     [ValidateRange(1, 100)][int]$Cycles = 2,
-    [ValidateSet('canonical','animated','stress','streaming')][string]$Scenario='canonical'
+    [ValidateSet('canonical','animated','stress','streaming','lighting')][string]$Scenario='canonical'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -22,6 +22,7 @@ for ($startup = 1; $startup -le $Startups; ++$startup) {
     $info.FileName = $exe
     $info.WorkingDirectory = $outputDirectory
     $info.Arguments = '--mcp-stdio --validation --aa off --width 640 --height 360'
+    if ($Scenario -eq 'lighting') { $info.Arguments += ' --lighting-room --day-cycle off --time-of-day 12 --gi-extent 48 --camera-z 4' }
     if ($Scenario -eq 'animated') { $info.Arguments += ' --animate-scene --animate-camera' }
     if ($Scenario -eq 'stress') { $info.Arguments += ' --scene-count 100000 --animate-scene --animate-camera' }
     if ($Scenario -eq 'streaming') {
@@ -73,6 +74,22 @@ for ($startup = 1; $startup -le $Startups; ++$startup) {
         $process.StandardInput.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}')
         $process.StandardInput.Flush()
         $state = Tool 'debug.get_state'
+        if ($Scenario -eq 'stress') {
+            # A moving wall must not voxelize at rendering frequency. Allow two
+            # batches of slack for the initial volume and request/frame boundaries.
+            Start-Sleep -Milliseconds 500
+            $before = (Tool 'debug.get_state').structuredContent.render.lighting.geometry_updates
+            $interval = [Diagnostics.Stopwatch]::StartNew()
+            Start-Sleep -Milliseconds 400
+            $after = (Tool 'debug.get_state').structuredContent.render.lighting.geometry_updates
+            $interval.Stop()
+            $updates = $after - $before
+            $limit = [Math]::Ceiling($interval.Elapsed.TotalSeconds * 30) + 2
+            if ($updates -le 0 -or $updates -gt $limit) {
+                throw "Motion GI scheduler: $updates batches in $($interval.Elapsed.TotalSeconds) seconds, limit $limit."
+            }
+            Write-Output "Motion GI scheduler: $updates batches in $($interval.Elapsed.TotalSeconds) seconds."
+        }
         if ($Scenario -eq 'streaming') {
             $deadline=[DateTime]::UtcNow.AddSeconds(30)
             while ($state.structuredContent.render.assets_pending -or $state.structuredContent.render.visibility.submitted -lt 2049) {
@@ -81,6 +98,87 @@ for ($startup = 1; $startup -le $Startups; ++$startup) {
                 $state = Tool 'debug.get_state'
             }
             if ($state.structuredContent.render.upload_high_water_bytes -le 0) { throw 'Upload arena was not used.' }
+        }
+        if ($Scenario -eq 'lighting') {
+            function Settled {
+                $deadline=[DateTime]::UtcNow.AddSeconds(20)
+                do {
+                    Start-Sleep -Milliseconds 40
+                    $s=(Tool 'debug.get_state').structuredContent.render.lighting
+                    if ([DateTime]::UtcNow -gt $deadline) { throw 'Voxel geometry did not settle.' }
+                } while ($s.pending_bricks -gt 0 -or $s.geometry_updates -eq 0)
+                return $s
+            }
+            function CaptureLighting([string]$Name) {
+                $capture=Tool 'capture.screenshot'
+                $image=@($capture.content | Where-Object { $_.type -eq 'image' })[0]
+                [IO.File]::WriteAllBytes((Join-Path $outputDirectory "$startup-$Name.png"),[Convert]::FromBase64String($image.data))
+            }
+            $first=Settled
+            Start-Sleep -Milliseconds 200
+            $cached=Settled
+            if ($cached.geometry_updates -ne $first.geometry_updates -or $cached.radiance_updates -ne $first.radiance_updates) {
+                throw 'Static lighting was recalculated without a change.'
+            }
+            CaptureLighting 'closed-noon'
+            $null=Tool 'lighting.set' @{hour=0;cycle=$false;gi=$true}
+            $night=Settled
+            if ($night.geometry_updates -ne $first.geometry_updates -or $night.radiance_updates -le $first.radiance_updates) {
+                throw 'Time-only edit must update radiance without rebuilding geometry.'
+            }
+            CaptureLighting 'closed-night'
+            $null=Tool 'lighting.set' @{hour=12;cycle=$false;gi=$true}
+            $null=Settled
+            $null=Tool 'test.set_roof' @{enabled=$false}
+            $opened=Settled
+            if ($opened.geometry_updates -le $night.geometry_updates) {throw 'Roof deletion did not invalidate GI.'}
+            CaptureLighting 'open-noon'
+            $null=Tool 'lighting.set' @{hour=12;cycle=$false;gi=$false}
+            CaptureLighting 'open-no-gi'
+            $null=Tool 'lighting.set' @{hour=12;cycle=$false;gi=$true}
+            $null=Tool 'test.set_roof' @{enabled=$true}
+            $restored=Settled
+            if ($restored.geometry_updates -le $opened.geometry_updates) {throw 'Roof restoration did not invalidate GI.'}
+            CaptureLighting 'restored-noon'
+            $null=Tool 'lighting.set' @{hour=6;cycle=$false;gi=$true}
+            $dawn=Settled
+            CaptureLighting 'closed-dawn'
+            if ($dawn.geometry_updates -ne $restored.geometry_updates) {throw 'Dawn rebuilt static geometry.'}
+            [pscustomobject]@{first=$first;cached=$cached;night=$night;opened=$opened;restored=$restored;dawn=$dawn} |
+                ConvertTo-Json -Depth 6 | Set-Content (Join-Path $outputDirectory "$startup-lighting.json")
+            if ((Get-FileHash (Join-Path $outputDirectory "$startup-closed-noon.png")).Hash -ne
+                (Get-FileHash (Join-Path $outputDirectory "$startup-restored-noon.png")).Hash) {
+                throw 'Roof restoration left a visual residue.'
+            }
+            Add-Type -AssemblyName System.Drawing
+            function ReceiverLuminance([string]$Name) {
+                $bitmap=[Drawing.Bitmap]::FromFile((Join-Path $outputDirectory "$startup-$Name.png"))
+                try {
+                    $sum=0.0;$count=0
+                    for($y=180;$y -lt 210;$y+=4) {for($x=304;$x -lt 335;$x+=4) {
+                        $pixel=$bitmap.GetPixel($x,$y)
+                        $sum+=0.2126*$pixel.R+0.7152*$pixel.G+0.0722*$pixel.B;$count++
+                    }}
+                    return $sum/$count
+                } finally {$bitmap.Dispose()}
+            }
+            $openLight=ReceiverLuminance 'open-noon'
+            $closedLight=ReceiverLuminance 'closed-noon'
+            $noGiLight=ReceiverLuminance 'open-no-gi'
+            $nightLight=ReceiverLuminance 'closed-night'
+            if($openLight -le $closedLight*1.15 -or $openLight -le $noGiLight*1.15 -or $nightLight -ge $closedLight*.2) {
+                throw 'The shaded receiver did not respond to GI, the roof opening, or night.'
+            }
+            [pscustomobject]@{open=$openLight;closed=$closedLight;no_gi=$noGiLight;night=$nightLight;restoration_identical=$true} |
+                ConvertTo-Json | Set-Content (Join-Path $outputDirectory "$startup-image-check.json")
+            $null=Tool 'input.key' @{key='shift';action='down'}
+            $null=Tool 'input.key' @{key='s';action='down'}
+            Start-Sleep -Milliseconds 1100
+            $null=Tool 'input.key' @{key='s';action='up'}
+            $null=Tool 'input.key' @{key='shift';action='up'}
+            $recentered=Settled
+            if($recentered.geometry_updates -le $dawn.geometry_updates) {throw 'Camera movement did not rebuild the recentered volume.'}
+            $null=Tool 'lighting.set' @{hour=12;cycle=$true;gi=$true}
         }
         $methods = @('off', 'smaa')
         if ($state.structuredContent.render.anti_aliasing.fsr3_available) {

@@ -1,16 +1,17 @@
 #pragma once
 
-#include "device_object.hpp"
-#include "runtime_scene.hpp"
 #include "asset_preparation.hpp"
-#include "upload_batch.hpp"
+#include "cli_options.hpp"
+#include "device_object.hpp"
 #include "frame_context.hpp"
 #include "fsr3_upscaler.hpp"
 #include "gpu_buffer.hpp"
 #include "gpu_texture.hpp"
-#include "cli_options.hpp"
+#include "lighting.hpp"
 #include "performance_metrics.hpp"
+#include "runtime_scene.hpp"
 #include "swapchain.hpp"
+#include "upload_batch.hpp"
 #include "vulkan_context.hpp"
 
 #include <SDL3/SDL.h>
@@ -54,17 +55,12 @@ public:
     Renderer(const Renderer&) = delete;
     Renderer& operator=(const Renderer&) = delete;
 
-    void initialize(
-        VulkanContext& context,
-        SDL_Window* window,
-        VkPresentModeKHR preferred_present_mode,
-        RunMode initial_mode,
-        std::uint32_t initial_instances,
-        std::uint32_t initial_gpu_workload,
-        AntiAliasingSettings initial_anti_aliasing,
-        bool enable_screenshot_capture,
-        bool enable_editor_output = false,
-        bool enable_authored_scene = false);
+    void initialize(VulkanContext &context, SDL_Window *window,
+                    VkPresentModeKHR preferred_present_mode, RunMode initial_mode,
+                    std::uint32_t initial_instances, std::uint32_t initial_gpu_workload,
+                    AntiAliasingSettings initial_anti_aliasing, bool enable_screenshot_capture,
+                    bool enable_editor_output = false, bool enable_authored_scene = false,
+                    LightingSettings lighting = {});
     [[nodiscard]] bool draw_frame(
         FrameTimings& timings,
         const glm::mat4& view_matrix
@@ -76,6 +72,14 @@ public:
     void record_metrics(const FrameTimings& timings) noexcept {
         metrics_.record_frame(timings);
     }
+    [[nodiscard]] const LightingSettings &lighting_settings() const noexcept {
+        return lighting_settings_;
+    }
+    [[nodiscard]] const LightingStatistics &lighting_statistics() const noexcept {
+        return lighting_statistics_;
+    }
+    [[nodiscard]] bool gi_provisioned() const noexcept { return gi_provisioned_; }
+    [[nodiscard]] bool set_lighting_settings(LightingSettings settings) noexcept;
     void request_resize() noexcept { resize_requested_ = true; }
     void toggle_vsync();
     void set_present_mode(PresentPreference preference);
@@ -242,6 +246,8 @@ private:
         VkDescriptorSet material_descriptor_set = VK_NULL_HANDLE;
         std::uint32_t first_index = 0U;
         std::uint32_t index_count = 0U;
+        std::uint32_t gi_first = 0, gi_count = 0;
+        glm::vec3 gi_albedo{1};
         std::array<std::uint32_t, 3> lod_first{};
         std::array<std::uint32_t, 3> lod_count{};
         std::array<float, 3> lod_error{};
@@ -279,6 +285,16 @@ private:
     };
 #endif
 
+    void create_lighting_resources();
+    void create_lighting_pipelines();
+    void destroy_lighting() noexcept;
+    void prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkExtent2D extent);
+    void record_voxel_geometry(VkCommandBuffer command, FrameContext &frame);
+    void record_voxel_light(VkCommandBuffer command, FrameContext &frame);
+    void start_voxel_job();
+    void snapshot_voxel_scene();
+    [[nodiscard]] std::uint32_t append_gi_triangles(std::span<const GiTriangle> triangles);
+    [[nodiscard]] std::size_t gi_model_upload_bytes(const PreparedModel &model) const;
     void create_frame_contexts();
     void prepare_scene_packet(const glm::mat4 &view_projection, glm::vec3 camera,
                               VkExtent2D extent);
@@ -315,9 +331,8 @@ private:
     void read_gpu_timestamps(FrameContext& frame, FrameTimings& timings) const;
     void complete_screenshot(FrameContext& frame);
     [[nodiscard]] bool prepare_screenshot_buffer();
-    void upload_to_device_buffer(
-        GpuBuffer& destination,
-        std::span<const std::byte> bytes);
+    void upload_to_device_buffer(GpuBuffer &destination, std::span<const std::byte> bytes,
+                                 VkDeviceSize destination_offset = 0);
     void upload_to_device_texture(
         GpuTexture& destination,
         std::span<const std::byte> pixels,
@@ -361,6 +376,43 @@ private:
 #endif
     [[nodiscard]] VkExtent2D scene_output_extent() const noexcept;
 
+    struct alignas(16) GiJob {
+        TransformRows transform{};
+        glm::vec4 color{1};
+        glm::uvec4 range{}; // first triangle, count, batch prefix, reserved
+    };
+    static_assert(sizeof(GiJob) == 80);
+    LightingSettings lighting_settings_{};
+    LightingStatistics lighting_statistics_{};
+    LightingUniforms lighting_uniforms_{};
+    DeviceObject<VkDescriptorSetLayout> lighting_layout_{};
+    DeviceObject<VkDescriptorPool> lighting_pool_{};
+    DeviceObject<VkPipelineLayout> lighting_compute_layout_{};
+    DeviceObject<VkPipeline> voxel_geometry_pipeline_{}, voxel_light_pipeline_{};
+    DeviceObject<VkImageView> voxel_storage_view_{};
+    DeviceObject<VkPipeline> tonemap_pipeline_{};
+    GpuBuffer voxel_geometry_{}, voxel_triangles_{};
+    GpuTexture voxel_radiance_{};
+    VkImageLayout voxel_radiance_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    DirtyVoxelBricks voxel_dirty_{};
+    std::array<std::uint32_t, gi_brick_count> voxel_job_mask_{};
+    std::vector<GiJob> voxel_jobs_{}, voxel_batch_{};
+    VoxelSceneTracker voxel_scene_{};
+    glm::vec4 gi_last_sun_{}, gi_last_sun_color_{};
+    std::uint32_t voxel_job_index_ = 0, voxel_job_triangle_ = 0, voxel_triangle_count_ = 0;
+    std::uint32_t voxel_batch_triangles_ = 0;
+    std::uint32_t gi_cube_first_ = 0, gi_plane_first_ = 0, gi_terrain_first_ = 0,
+                  gi_terrain_count_ = 0;
+    std::uint64_t gi_scene_revision_ = 0;
+    bool gi_provisioned_ = false, voxel_job_active_ = false, voxel_job_start_ = false;
+    bool voxel_ready_ = false, voxel_light_due_ = false, voxel_job_finishes_ = false;
+    bool lighting_shadow_initialized_ = false;
+    glm::mat4 lighting_shadow_view_{1};
+    double lighting_shadow_hour_ = 0;
+    float lighting_shadow_aspect_ = 0;
+    double gi_light_elapsed_ = 1000.0, gi_geometry_elapsed_ = 1000.0;
+    bool gi_geometry_urgent_ = false;
+    std::chrono::steady_clock::time_point gi_dirty_since_{};
     VulkanContext* context_ = nullptr;
     SDL_Window* window_ = nullptr;
     Swapchain swapchain_{};

@@ -34,7 +34,8 @@ display и внутренним render resolution. Оба разрешения �
 
 ## Render path
 
-При включённом сглаживании geometry, sky и уже рассчитанное shadowed lighting
+При динамическом освещении (в том числе с AA off) и при включённом сглаживании
+geometry, sky и уже рассчитанное shadowed lighting
 сначала записываются в общий HDR color target. Поэтому post-process покрывает
 одновременно силуэты объектов, границы материалов и видимые края теней:
 
@@ -43,6 +44,8 @@ display и внутренним render resolution. Оба разрешения �
   и отдельный R32F depth output этому spatial методу не нужны;
 - FSR получает HDR color, non-jittered motion vectors и depth, выполняет
   temporal upscale/AA, затем результат компонуется в swapchain;
+- динамическое освещение проходит fixed-exposure Reinhard после AA/FSR,
+  перед единственным sRGB encode; AA off использует отдельный display pass;
 - HUD добавляется последним и не влияет на изображение, которое анализирует
   алгоритм сглаживания.
 
@@ -95,3 +98,5 @@ FidelityFX находится в `LICENSES/FidelityFX-SDK.txt`.
 powershell -NoProfile -ExecutionPolicy Bypass `
   -File scripts\compile_shaders_windows.ps1
 ```
+
+Детали суток, CSM и GI: [DYNAMIC_LIGHTING.md](DYNAMIC_LIGHTING.md).

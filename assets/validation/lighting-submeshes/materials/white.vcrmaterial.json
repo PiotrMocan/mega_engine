@@ -1,0 +1,18 @@
+{
+  "kind": "material",
+  "textures": {},
+  "pbr": {
+    "metallic": 0,
+    "ambient_occlusion": 1,
+    "base_color": [
+      0.8,
+      0.8,
+      0.8,
+      1
+    ],
+    "roughness": 0.8
+  },
+  "version": 1,
+  "schema": "vcr.asset",
+  "name": "white"
+}

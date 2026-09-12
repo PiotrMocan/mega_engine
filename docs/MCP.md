@@ -33,12 +33,15 @@ MCP-клиент должен запускать этот процесс как 
 | Toolset | Инструменты |
 | --- | --- |
 | `debug` | `get_capabilities`, `get_state`, `get_metrics`, `reset_metrics` |
-| `test` | `run_self_check` |
+| `test` | `run_self_check`, `set_roof` (только `--lighting-room`) |
+| `lighting` | `set` (hour, cycle, gi) |
 | `capture` | `screenshot` |
 | `render` | `set_mode`, `set_instances`, `set_gpu_workload`, `set_present_mode` |
 | `window` | `set_fullscreen`, `set_size`, `set_mouse_capture` |
 | `input` | `key`, `mouse_move`, `mouse_button`, `release_all` |
 | `engine` | `quit` |
+
+Динамические сутки, GI, счётчики и проверочная комната описаны в [DYNAMIC_LIGHTING.md](DYNAMIC_LIGHTING.md).
 
 `tools/list` возвращает JSON Schema и risk annotations для каждого инструмента.
 Результаты содержат одновременно текстовый JSON и `structuredContent`.

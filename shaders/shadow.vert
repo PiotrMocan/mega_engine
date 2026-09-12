@@ -43,6 +43,7 @@ vec3 rotateByQuaternion(vec3 value, vec4 rotation)
                        cross(rotation.xyz, value) + rotation.w * value);
 }
 
+layout(push_constant) uniform ShadowPush { layout(offset=16) mat4 light; } shadowPush;
 void main()
 {
     const PbrInstanceData instance = instances[gl_InstanceIndex];
@@ -52,5 +53,5 @@ void main()
         instance.translation.xyz
         + rotateByQuaternion(inPosition * instance.scale.xyz, rotation);
     gl_Position =
-        frame.lightViewProjection * vec4(worldPosition, 1.0);
+        shadowPush.light * vec4(worldPosition, 1.0);
 }

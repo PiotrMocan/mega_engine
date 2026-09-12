@@ -20,6 +20,10 @@ struct FrameContext {
     VkFence fence = VK_NULL_HANDLE;
     VkSemaphore image_available = VK_NULL_HANDLE;
     GpuBuffer uniform_buffer{};
+    GpuBuffer lighting_uniform_buffer{}, voxel_job_buffer{}, voxel_dirty_buffer{};
+    VkDescriptorSet lighting_descriptor_set = VK_NULL_HANDLE;
+    bool lighting_was_dynamic = false;
+    bool voxel_geometry_was_updated = false, voxel_light_was_updated = false;
     GpuBuffer workload_buffer{};
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
     VkDescriptorSet scene_descriptor_set = VK_NULL_HANDLE;

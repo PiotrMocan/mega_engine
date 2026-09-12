@@ -65,6 +65,8 @@ function Compile-Shader {
 }
 
 $regularShaders = @(
+    @("voxel_geometry.comp", "voxel_geometry.comp.spv"),
+    @("voxel_light.comp", "voxel_light.comp.spv"),
     @("scene.vert", "scene.vert.spv"),
     @("scene.frag", "scene.frag.spv"),
     @("terrain.vert", "terrain.vert.spv"),
@@ -83,9 +85,11 @@ $regularShaders = @(
     @("editor_model_aa.vert", "editor_model_aa.vert.spv"),
     @("editor_model_aa.frag", "editor_model_aa.frag.spv"),
     @("scene_aa.frag", "scene_aa.frag.spv"),
+    @("sky.frag", "sky.frag.spv"),
     @("sky_aa.frag", "sky_aa.frag.spv"),
     @("fullscreen.vert", "fullscreen.vert.spv"),
     @("composite.frag", "composite.frag.spv"),
+    @("tonemap.frag", "tonemap.frag.spv"),
     @("hud.frag", "hud.frag.spv")
 )
 foreach ($shader in $regularShaders) {

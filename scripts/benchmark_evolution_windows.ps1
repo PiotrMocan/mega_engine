@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('Compatibility','Visibility','Lod','Shadows','Default','Adaptive')][string]$Suite='Visibility',
+    [ValidateSet('Compatibility','Visibility','Lod','Shadows','Default','Adaptive','Lighting','LightingStress','LightingVoxel')][string]$Suite='Visibility',
     [ValidateRange(3,20)][int]$Repeats=3,
     [ValidateRange(1,60)][int]$Warmup=5,
     [ValidateRange(2,300)][int]$Duration=15,
@@ -25,6 +25,22 @@ switch ($Suite) {
             Add-Case "before-$aa" "--aa $aa" $baseline
             Add-Case "compat-$aa" "--aa $aa --culling none --lod off --dynamic-shadows off"
         }
+    }
+    'Lighting' {
+        if (-not $BaselineExe) {throw 'Provide the baseline executable and matching shaders/assets.'}
+        Add-Case 'before' '--aa off' (Resolve-Path -LiteralPath $BaselineExe).Path
+        Add-Case 'legacy' '--aa off --lighting legacy'
+        Add-Case 'dynamic-direct' '--aa off --gi off'
+        Add-Case 'dynamic-voxel' '--aa off --gi voxel'
+    }
+    'LightingVoxel' {
+        Add-Case 'dynamic-voxel' '--aa off --gi voxel'
+        Add-Case 'stress-voxel' '--aa off --scene-count 100000 --animate-scene --animate-camera --gi voxel'
+    }
+    'LightingStress' {
+        $scene='--aa off --scene-count 100000 --animate-scene --animate-camera'
+        Add-Case 'stress-direct' "$scene --gi off"
+        Add-Case 'stress-voxel' "$scene --gi voxel"
     }
     'Default' { Add-Case 'default-off' '--aa off' }
     'Adaptive' {

@@ -1,6 +1,7 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 
+#include "display_mapping.glsl"
 #define SMAA_GLSL_4 1
 #define SMAA_PRESET_HIGH 1
 
@@ -8,7 +9,7 @@ layout(push_constant) uniform PostProcessPushConstants
 {
     vec2 inverseResolution;
     uint method;
-    uint quality;
+    uint displayMappingEnabled;
 } postProcess;
 
 #define SMAA_PIXEL_SIZE postProcess.inverseResolution
@@ -35,4 +36,5 @@ void main()
         offsets,
         sceneColor,
         blendTexture);
+    if(postProcess.displayMappingEnabled!=0) outColor.rgb=displayMapping(outColor.rgb);
 }

@@ -1,0 +1,40 @@
+#version 450
+#extension GL_GOOGLE_include_directive:require
+#define LIGHTING_SET 0
+#include "lighting_common.glsl"
+layout(local_size_x=64) in;
+layout(set=0,binding=2,std430) readonly buffer Voxels {uint voxels[];};
+layout(set=0,binding=6,rgba16f) uniform writeonly image3D radiance;
+// World-space voxel visibility also sees occluders behind the camera. It must
+// not depend on a camera cascade: cached radiance survives camera rotation.
+float sunVisibility(ivec3 surface,vec3 normal,vec3 direction) {
+    vec3 origin=vec3(surface)+0.5+normal*1.1;
+    ivec3 cell=ivec3(floor(origin));
+    ivec3 advance=ivec3(sign(direction));
+    vec3 delta=1.0/max(abs(direction),vec3(1e-6));
+    vec3 boundary=mix(origin-vec3(cell),vec3(cell)+1.0-origin,greaterThan(direction,vec3(0)))*delta;
+    for(int step=0;step<192;++step) {
+        if(any(lessThan(cell,ivec3(0))) || any(greaterThanEqual(cell,ivec3(64)))) return 1;
+        if(voxels[cell.x+64*(cell.y+64*cell.z)]!=0) return 0;
+        float nearest=min(boundary.x,min(boundary.y,boundary.z));
+        bvec3 crossed=lessThanEqual(boundary,vec3(nearest));
+        cell+=advance*ivec3(crossed);boundary+=delta*vec3(crossed);
+    }
+    return 1;
+}
+void main() {
+    uint index=gl_GlobalInvocationID.x;
+    ivec3 p=ivec3(index%64,(index/64)%64,index/4096);
+    uint packed=voxels[index];
+    if(packed==0) {imageStore(radiance,p,vec4(0));return;}
+    vec3 albedo=vec3(packed&31u,(packed>>5)&31u,(packed>>10)&31u)/31.0;
+    vec2 oct=vec2((packed>>15)&255u,(packed>>23)&255u)/255.0*2.0-1.0;
+    vec3 normal=vec3(oct,1.0-abs(oct.x)-abs(oct.y));
+    if(normal.z<0) normal.xy=(1.0-abs(normal.yx))*mix(vec2(-1),vec2(1),greaterThanEqual(normal.xy,vec2(0)));
+    normal=normalize(normal);
+    vec3 sun=lighting.sunDirectionIntensity.xyz;
+    float visibility=dot(normal,sun)>0 && lighting.sunDirectionIntensity.w>0?sunVisibility(p,normal,sun):0;
+    vec3 light=lighting.sunColor.rgb*lighting.sunDirectionIntensity.w*max(dot(normal,sun),0)*visibility;
+    // Single diffuse bounce. Sky enters the receiver cones through unoccluded directions.
+    imageStore(radiance,p,vec4(albedo*light*0.31830988618,1));
+}

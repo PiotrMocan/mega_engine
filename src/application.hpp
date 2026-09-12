@@ -38,6 +38,8 @@ public:
 private:
     void initialize(const CliOptions& options);
     void load_canonical_scene();
+    void set_lighting_room_roof(bool enabled);
+    SceneNodeId lighting_room_roof_{};
     void main_loop();
     void service_assets();
     void process_event(const SDL_Event& event);

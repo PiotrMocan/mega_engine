@@ -15,6 +15,8 @@ bool Renderer::set_runtime_transform(SceneNodeId id, TransformRows transform) no
     const bool result = runtime_transforms_.set(id, transform);
     if (revision != runtime_transforms_.revision()) {
         shadow_dirty_ = true;
+        if (gi_provisioned_)
+            voxel_scene_.set_transform(id, transform, voxel_dirty_);
     }
     return result;
 }

@@ -144,3 +144,10 @@ Ninja 1.12.1, AMD Radeon RX 6800. Vulkan SDK 1.4.313.2 восстановлен:
   Подключены opt-in targets `vcr_clang_tidy`, `vcr_msvc_analyze`.
 
 Установка SDK: https://vulkan.lunarg.com/doc/view/1.4.313.0/windows/getting_started.html
+
+## Динамическое освещение
+
+По умолчанию включены динамические сутки, CSM и voxel GI. Для сравнения с
+прежним renderer используйте `--lighting legacy`. Быстрый вариант с
+динамическим солнцем без GI: `--gi off`. Настройки, ограничения, отдельные
+GPU timings и воспроизводимые проверки: [DYNAMIC_LIGHTING.md](DYNAMIC_LIGHTING.md).

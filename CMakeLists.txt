@@ -429,6 +429,8 @@ set(VCR_RENDERER_SOURCES
     src/renderer.cpp
     src/runtime_scene.cpp
     src/renderer_scene.cpp
+    src/lighting.cpp
+    src/renderer_lighting.cpp
     src/renderer_gpu_visibility.cpp
     src/model_lod.cpp
     src/asset_preparation.cpp
@@ -588,6 +590,14 @@ add_dependencies(vulkan_editor vcr_runtime_assets)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(vcr_lighting_tests tests/lighting_tests.cpp src/lighting.cpp src/scene_visibility.cpp)
+    target_include_directories(vcr_lighting_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(vcr_lighting_tests PRIVATE glm::glm)
+    target_compile_definitions(vcr_lighting_tests PRIVATE GLM_FORCE_DEPTH_ZERO_TO_ONE GLM_FORCE_RADIANS)
+    if(MSVC)
+        target_compile_options(vcr_lighting_tests PRIVATE /W4 /permissive- /EHsc)
+    endif()
+    add_test(NAME vcr_lighting_tests COMMAND vcr_lighting_tests)
     add_executable(vcr_runtime_tests tests/runtime_scene_tests.cpp
         src/runtime_scene.cpp src/scene_visibility.cpp src/scene_document.cpp
         src/model_lod.cpp src/asset_preparation.cpp)

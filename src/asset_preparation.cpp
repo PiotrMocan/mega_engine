@@ -2,6 +2,7 @@
 #include "model_lod.hpp"
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <exception>
 
 namespace vcr {
@@ -47,6 +48,23 @@ PreparedModel prepare_model_asset(std::filesystem::path root, std::string path) 
             } else {
                 result.upload_bytes += decoded->pixels.size() + 256;
                 entry.texture = std::move(decoded).value();
+                const auto &pixels = entry.texture->pixels;
+                if (!pixels.empty()) {
+                    glm::vec3 sum(0);
+                    const auto count = std::min<std::size_t>(1024, pixels.size() / 4);
+                    for (std::size_t sample = 0; sample < count; ++sample) {
+                        const auto offset = (sample * (pixels.size() / 4) / count) * 4;
+                        for (unsigned c = 0; c < 3; ++c) {
+                            const float v = static_cast<float>(pixels[offset + c]) / 255.0F;
+                            sum[static_cast<int>(c)] +=
+                                entry.texture->color_space == CookedTextureColorSpace::srgb
+                                    ? (v <= 0.04045F ? v / 12.92F
+                                                     : std::pow((v + 0.055F) / 1.055F, 2.4F))
+                                    : v;
+                        }
+                    }
+                    entry.average_linear = sum / static_cast<float>(count);
+                }
             }
             result.textures.push_back(std::move(entry));
         };
