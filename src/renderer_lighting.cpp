@@ -24,7 +24,8 @@ bool intersects(const Bounds &a, const Bounds &b) noexcept {
 }
 } // namespace
 bool Renderer::set_lighting_settings(LightingSettings settings) noexcept {
-    if (!valid_lighting_settings(settings) || (settings.voxel_gi && !gi_provisioned_))
+    if (!valid_lighting_settings(settings) || (settings.voxel_gi && !gi_provisioned_) ||
+        !supports_shadow_resolution(settings.shadow_resolution))
         return false;
     settings.hour = wrap_day_hour(settings.hour);
     if (settings.dynamic != lighting_settings_.dynamic ||

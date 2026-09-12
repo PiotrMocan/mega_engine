@@ -295,7 +295,7 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
             argument.name == "--day-cycle" || argument.name == "--time-of-day" ||
             argument.name == "--day-length" || argument.name == "--gi-extent" ||
             argument.name == "--gi-strength" || argument.name == "--gi-update-hz" ||
-            argument.name == "--gi-triangle-budget") {
+            argument.name == "--gi-triangle-budget" || argument.name == "--shadow-resolution") {
             if (!take_value(argument, index, argc, argv, value, result.error))
                 return result;
             auto &s = result.options.lighting;
@@ -311,6 +311,9 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
             } else if (argument.name == "--gi") {
                 valid = value == "voxel" || value == "off";
                 s.voxel_gi = value == "voxel";
+            } else if (argument.name == "--shadow-resolution") {
+                valid = parse_u32(value, s.shadow_resolution) &&
+                        valid_shadow_resolution(s.shadow_resolution);
             } else if (argument.name == "--day-cycle") {
                 valid = value == "on" || value == "off";
                 s.cycle = value == "on";
@@ -615,6 +618,7 @@ std::string cli_usage(std::string_view executable_name) {
                   "  Up/Down                 Adjust active benchmark load\n"
                   "  --lighting dynamic|legacy  Lighting path (dynamic by default)\n"
                   "  --gi voxel|off             Dynamic diffuse GI (voxel by default)\n"
+                  "  --shadow-resolution N      Atlas edge: 1024|2048|4096|8192 (2048)\n"
                   "  --time-of-day 0..24         Initial hour (14)\n"
                   "  --day-cycle on|off          Advance time (on)\n"
                   "  --day-length SECONDS        Full day duration (600)\n"

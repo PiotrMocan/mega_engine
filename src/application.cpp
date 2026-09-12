@@ -800,6 +800,8 @@ void Application::execute_mcp_command(const McpCommand& command) {
                            {"hour", renderer_.lighting_settings().hour},
                            {"cycle", renderer_.lighting_settings().cycle},
                            {"voxel_gi", renderer_.lighting_settings().voxel_gi},
+                           {"shadow_resolution", renderer_.shadow_resolution()},
+                           {"shadow_resolution_requested", renderer_.lighting_settings().shadow_resolution},
                            {"geometry_updates", renderer_.lighting_statistics().geometry_updates},
                            {"radiance_updates", renderer_.lighting_statistics().radiance_updates},
                            {"pending_bricks", renderer_.lighting_statistics().pending_bricks},
@@ -975,6 +977,17 @@ void Application::execute_mcp_command(const McpCommand& command) {
                  renderer_.max_instance_capacity()},
             });
         return;
+    case McpCommandType::render_set_shadow_resolution: {
+        auto settings = renderer_.lighting_settings();
+        settings.shadow_resolution = command.value;
+        if (!renderer_.set_lighting_settings(settings)) {
+            fail("Shadow resolution is unsupported by this GPU");
+            return;
+        }
+        succeed("Shadow resolution requested; applies at the next rendered frame",
+                Json{{"resolution", settings.shadow_resolution}});
+        return;
+    }
     case McpCommandType::lighting_set: {
         auto settings = renderer_.lighting_settings();
         settings.hour = command.lighting.hour;

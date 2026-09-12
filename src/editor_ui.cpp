@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -3279,6 +3280,26 @@ void EditorUi::build_performance(
 
     auto lighting = renderer.lighting_settings();
     bool lighting_changed = ImGui::Checkbox("Dynamic day and night", &lighting.dynamic);
+    std::array<char, 32> shadow_label{};
+    std::snprintf(shadow_label.data(), shadow_label.size(), "%u x %u",
+                  lighting.shadow_resolution, lighting.shadow_resolution);
+    if (ImGui::BeginCombo("Shadow resolution", shadow_label.data())) {
+        for (const auto resolution : shadow_resolutions) {
+            std::snprintf(shadow_label.data(), shadow_label.size(), "%u x %u", resolution, resolution);
+            ImGui::BeginDisabled(!renderer.supports_shadow_resolution(resolution));
+            if (ImGui::Selectable(shadow_label.data(), lighting.shadow_resolution == resolution)) {
+                lighting.shadow_resolution = resolution;
+                lighting_changed = true;
+            }
+            ImGui::EndDisabled();
+        }
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
+        ImGui::SetTooltip("Larger maps sharpen shadows and use more GPU memory and rendering time.");
+    if (lighting.dynamic)
+        ImGui::TextDisabled("4 cascades, %u x %u each", lighting.shadow_resolution / 2,
+                            lighting.shadow_resolution / 2);
     lighting_changed |= ImGui::Checkbox("Advance time", &lighting.cycle);
     float hour = static_cast<float>(lighting.hour), day = static_cast<float>(lighting.day_seconds);
     if (ImGui::SliderFloat("Time of day", &hour, 0, 23.999F, "%.2f h")) {

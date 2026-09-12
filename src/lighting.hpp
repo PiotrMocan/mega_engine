@@ -7,6 +7,13 @@
 #include <glm/vec4.hpp>
 
 namespace vcr {
+inline constexpr std::array<std::uint32_t, 4> shadow_resolutions{1024, 2048, 4096, 8192};
+[[nodiscard]] constexpr bool valid_shadow_resolution(std::uint32_t resolution) noexcept {
+    for (const auto preset : shadow_resolutions)
+        if (resolution == preset)
+            return true;
+    return false;
+}
 struct LightingSettings {
     bool dynamic = true;
     bool voxel_gi = true;
@@ -17,6 +24,8 @@ struct LightingSettings {
     float gi_strength = 1.0F;
     std::uint32_t triangle_budget = 65536;
     float gi_update_hz = 30.0F;
+    // Full atlas edge; dynamic lighting uses four tiles of half this size.
+    std::uint32_t shadow_resolution = 2048;
 };
 struct SunState {
     glm::vec4 direction_intensity{};

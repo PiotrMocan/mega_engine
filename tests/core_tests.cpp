@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -115,6 +116,18 @@ int main() {
                 const char *args[]{"vcr", "--gi-triangle-budget", bad};
                 expect(!vcr::parse_cli_options(3, args),
                        "invalid geometry budget rejected before cast");
+            }
+            for (const char *size : {"1024", "2048", "4096", "8192"}) {
+                const char *args[]{"vcr", "--shadow-resolution", size};
+                const auto shadow = vcr::parse_cli_options(3, args);
+                expect(static_cast<bool>(shadow) &&
+                           shadow.options.lighting.shadow_resolution == std::strtoul(size, nullptr, 10),
+                       "shadow atlas resolution parses without losing the requested size");
+            }
+            for (const char *bad : {"0", "512", "1023", "2049", "16384", "2048.5",
+                                    "-1", "nan", "4294967296"}) {
+                const char *args[]{"vcr", "--shadow-resolution", bad};
+                expect(!vcr::parse_cli_options(3, args), "invalid shadow resolution rejected");
             }
         }
         const char *arguments[]{"vulkan_cube"};

@@ -519,6 +519,7 @@ std::string benchmark_result_to_json(const BenchmarkResult& result) {
     boolean("dynamic_lighting", result.lighting.dynamic);
     boolean("voxel_gi", result.lighting.voxel_gi);
     boolean("day_cycle", result.lighting.cycle);
+    integer("shadow_resolution", result.lighting.shadow_resolution);
     boolean("lighting_room", result.lighting_room);
     timing("time_of_day_end", result.lighting.hour);
     timing("day_length_seconds", result.lighting.day_seconds);

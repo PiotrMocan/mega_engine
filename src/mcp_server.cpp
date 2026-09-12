@@ -38,7 +38,7 @@ using namespace std::chrono_literals;
 
 constexpr std::string_view protocol_version{"2025-11-25"};
 constexpr std::size_t maximum_input_message_bytes = 1024U * 1024U;
-constexpr std::array<std::string_view, 20> tool_names{
+constexpr std::array<std::string_view, 21> tool_names{
     "debug.get_capabilities",
     "debug.get_state",
     "debug.get_metrics",
@@ -49,6 +49,7 @@ constexpr std::array<std::string_view, 20> tool_names{
     "render.set_instances",
     "render.set_gpu_workload",
     "lighting.set",
+    "render.set_shadow_resolution",
     "test.set_roof",
     "render.set_present_mode",
     "window.set_fullscreen",
@@ -400,6 +401,13 @@ private:
             Json::array({"hour", "cycle", "gi"})),
         false, false, true));
     tools.push_back(tool_definition(
+        "render.set_shadow_resolution", "Set shadow resolution",
+        "Set full shadow atlas edge; dynamic lighting uses four half-size cascades. "
+        "Applied at the next rendered frame; unsupported GPU sizes are rejected.",
+        object_schema(Json{{"resolution", Json{{"type", "integer"},
+            {"enum", shadow_resolutions}}}}, Json::array({"resolution"})),
+        false, false, true));
+    tools.push_back(tool_definition(
         "test.set_roof", "Set test-room roof",
         "Create or destroy the roof in --lighting-room; unavailable in ordinary scenes.",
         object_schema(Json{{"enabled", Json{{"type", "boolean"}}}}, Json::array({"enabled"})),
@@ -723,6 +731,17 @@ private:
         }
         command.type = McpCommandType::test_set_roof;
         command.enabled = arguments["enabled"].get<bool>();
+        return true;
+    }
+    if (name == "render.set_shadow_resolution") {
+        const auto resolution = get_u32(arguments, "resolution", shadow_resolutions.front(),
+                                         shadow_resolutions.back());
+        if (arguments.size() != 1 || !resolution || !valid_shadow_resolution(*resolution)) {
+            error = "resolution must be 1024, 2048, 4096 or 8192";
+            return false;
+        }
+        command.type = McpCommandType::render_set_shadow_resolution;
+        command.value = *resolution;
         return true;
     }
     if (name == "lighting.set") {

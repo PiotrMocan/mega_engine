@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory = $true)][string]$ExePath,
     [ValidateRange(1, 100)][int]$Startups = 3,
     [ValidateRange(1, 100)][int]$Cycles = 2,
-    [ValidateSet('canonical','animated','stress','streaming','lighting')][string]$Scenario='canonical'
+    [ValidateSet('canonical','animated','stress','streaming','lighting','shadow-resolution')][string]$Scenario='canonical',
+    [ValidateSet('voxel','off','legacy')][string]$ShadowLighting='voxel'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,6 +16,7 @@ if ($tree -notin $allowedTrees) {
     throw 'Use an executable in one of the three native Windows build trees.'
 }
 $outputDirectory = Join-Path $tree "render-validation/$Scenario"
+if ($Scenario -eq 'shadow-resolution') { $outputDirectory += "-$ShadowLighting" }
 New-Item -ItemType Directory -Force -Path $outputDirectory | Out-Null
 
 for ($startup = 1; $startup -le $Startups; ++$startup) {
@@ -22,6 +24,11 @@ for ($startup = 1; $startup -le $Startups; ++$startup) {
     $info.FileName = $exe
     $info.WorkingDirectory = $outputDirectory
     $info.Arguments = '--mcp-stdio --validation --aa off --width 640 --height 360'
+    if ($Scenario -eq 'shadow-resolution') {
+        $info.Arguments += ' --day-cycle off --time-of-day 14'
+        if ($ShadowLighting -eq 'legacy') { $info.Arguments += ' --lighting legacy' }
+        else { $info.Arguments += " --gi $ShadowLighting" }
+    }
     if ($Scenario -eq 'lighting') { $info.Arguments += ' --lighting-room --day-cycle off --time-of-day 12 --gi-extent 48 --camera-z 4' }
     if ($Scenario -eq 'animated') { $info.Arguments += ' --animate-scene --animate-camera' }
     if ($Scenario -eq 'stress') { $info.Arguments += ' --scene-count 100000 --animate-scene --animate-camera' }
@@ -41,7 +48,7 @@ for ($startup = 1; $startup -le $Startups; ++$startup) {
     $script:requestId = 0
     $captures = 0
 
-    function Request([string]$Method, [hashtable]$Arguments) {
+    function Request([string]$Method, [hashtable]$Arguments, [bool]$AllowToolError=$false) {
         $script:requestId += 1
         $request = @{
             jsonrpc = '2.0'; id = $script:requestId
@@ -56,7 +63,7 @@ for ($startup = 1; $startup -le $Startups; ++$startup) {
         if ($response.id -ne $script:requestId -or $null -ne $response.error) {
             throw "Invalid MCP response for $Method"
         }
-        if ($response.result.isError) {
+        if ($response.result.isError -and -not $AllowToolError) {
             throw "Tool failed: $($response.result.content[0].text)"
         }
         return $response.result
@@ -74,6 +81,43 @@ for ($startup = 1; $startup -le $Startups; ++$startup) {
         $process.StandardInput.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}')
         $process.StandardInput.Flush()
         $state = Tool 'debug.get_state'
+        if ($Scenario -eq 'shadow-resolution') {
+            Add-Type -AssemblyName System.Drawing
+            foreach ($bad in @(0,512,2049,16384,2048.5,-1,4294967296,'4096')) {
+                $rejected = Request 'tools/call' @{name='render.set_shadow_resolution';arguments=@{resolution=$bad}} $true
+                if (-not $rejected.isError) { throw "Invalid resolution accepted: $bad" }
+            }
+            if ((Tool 'debug.get_state').structuredContent.render.lighting.shadow_resolution_requested -ne 2048) {
+                throw 'Invalid requests changed shadow settings.'
+            }
+            # Allow initial voxel work to settle before comparing static captures.
+            Start-Sleep -Milliseconds 500
+            function ShadowCapture([int]$Resolution, [string]$Name) {
+                $null = Tool 'render.set_shadow_resolution' @{resolution=$Resolution}
+                $capture = Tool 'capture.screenshot'
+                $light = (Tool 'debug.get_state').structuredContent.render.lighting
+                if ($light.shadow_resolution -ne $Resolution -or $light.shadow_resolution_requested -ne $Resolution) {
+                    throw "Shadow resize was not applied: $Resolution"
+                }
+                $image = @($capture.content | Where-Object {$_.type -eq 'image'})[0]
+                $path = Join-Path $outputDirectory "$startup-$Name.png"
+                [IO.File]::WriteAllBytes($path,[Convert]::FromBase64String($image.data))
+                return $path
+            }
+            function CompareShadows([string]$Before,[string]$After) {
+                $a=[Drawing.Bitmap]::FromFile($Before)
+                $b=[Drawing.Bitmap]::FromFile($After)
+                try {
+                    # Ignore HUD metrics. Static Off/SMAA receivers must survive
+                    # atlas destruction/recreation, including returning to a size.
+                    for($y=72;$y -lt $a.Height;$y+=4){for($x=0;$x -lt $a.Width;$x+=4){
+                        if($a.GetPixel($x,$y).ToArgb() -ne $b.GetPixel($x,$y).ToArgb()) {
+                            throw "Shadow round trip changed the static image: $After ($x,$y)"
+                        }
+                    }}
+                } finally { $a.Dispose();$b.Dispose() }
+            }
+        }
         if ($Scenario -eq 'stress') {
             # A moving wall must not voxelize at rendering frequency. Allow two
             # batches of slack for the initial volume and request/frame boundaries.
@@ -194,6 +238,20 @@ for ($startup = 1; $startup -le $Startups; ++$startup) {
                     throw "AA switch did not select $aa"
                 }
                 $null = Tool 'input.mouse_move' @{ delta_x = 3; delta_y = -1 }
+                if ($Scenario -eq 'shadow-resolution') {
+                    Start-Sleep -Milliseconds 200
+                    $before = ShadowCapture 2048 "$cycle-$aa-before"
+                    foreach($resolution in @(1024,4096,8192)) {
+                        $null = ShadowCapture $resolution "$cycle-$aa-$resolution"
+                    }
+                    $after = ShadowCapture 2048 "$cycle-$aa-after"
+                    $same = ShadowCapture 2048 "$cycle-$aa-same"
+                    if ($aa -ne 'fsr3') {
+                        CompareShadows $before $after
+                        CompareShadows $after $same
+                    }
+                    $captures += 6
+                }
                 $capture = Tool 'capture.screenshot'
                 if ($capture.structuredContent.width -le 0 -or
                     $capture.structuredContent.height -le 0) {
@@ -204,13 +262,24 @@ for ($startup = 1; $startup -le $Startups; ++$startup) {
             }
             $null = Tool 'render.set_instances' @{ count = 100000 }
             $null = Tool 'render.set_mode' @{ mode = 'instancing' }
+            if ($Scenario -eq 'shadow-resolution') { $null = ShadowCapture 1024 "$cycle-instancing" }
             $null = Tool 'capture.screenshot'
             $null = Tool 'render.set_gpu_workload' @{ iterations = 8 }
             $null = Tool 'render.set_mode' @{ mode = 'gpu-saturation' }
+            if ($Scenario -eq 'shadow-resolution') { $null = ShadowCapture 4096 "$cycle-saturation" }
             $null = Tool 'capture.screenshot'
             $captures += 2
             $null = Tool 'render.set_gpu_workload' @{ iterations = 0 }
             $null = Tool 'render.set_mode' @{ mode = 'scene' }
+            if ($Scenario -eq 'shadow-resolution') { $null = ShadowCapture 2048 "$cycle-scene"; $captures += 3 }
+        }
+        if ($Scenario -eq 'shadow-resolution' -and $ShadowLighting -ne 'legacy') {
+            $null = Tool 'lighting.set' @{hour=14;cycle=$true;gi=($ShadowLighting -eq 'voxel')}
+            $null = ShadowCapture 4096 'running-day'
+            $captures += 1
+            if ((Tool 'debug.get_state').structuredContent.render.lighting.hour -le 14) {
+                throw 'Time stopped after changing shadow resolution.'
+            }
         }
         $null = Tool 'engine.quit'
         $process.StandardInput.Close()

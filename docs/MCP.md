@@ -36,7 +36,7 @@ MCP-клиент должен запускать этот процесс как 
 | `test` | `run_self_check`, `set_roof` (только `--lighting-room`) |
 | `lighting` | `set` (hour, cycle, gi) |
 | `capture` | `screenshot` |
-| `render` | `set_mode`, `set_instances`, `set_gpu_workload`, `set_present_mode` |
+| `render` | `set_mode`, `set_instances`, `set_gpu_workload`, `set_present_mode`, `set_shadow_resolution` |
 | `window` | `set_fullscreen`, `set_size`, `set_mouse_capture` |
 | `input` | `key`, `mouse_move`, `mouse_button`, `release_all` |
 | `engine` | `quit` |

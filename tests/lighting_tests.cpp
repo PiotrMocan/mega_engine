@@ -30,6 +30,16 @@ int main() {
     }
     LightingSettings settings;
     expect(valid_lighting_settings(settings), "defaults valid");
+    expect(settings.shadow_resolution == 2048, "default atlas size preserves existing rendering");
+    for (const auto resolution : shadow_resolutions) {
+        settings.shadow_resolution = resolution;
+        expect(valid_lighting_settings(settings), "all shadow presets accepted");
+    }
+    for (const auto invalid : {0U, 512U, 2049U, 16384U, 0xffffffffU}) {
+        settings.shadow_resolution = invalid;
+        expect(!valid_lighting_settings(settings), "invalid shadow sizes rejected");
+    }
+    settings.shadow_resolution = 2048;
     const double initial_hour = settings.hour;
     for (bool gi : {false, true}) {
         settings.voxel_gi = gi;
@@ -123,43 +133,49 @@ int main() {
     const auto view = glm::lookAt(glm::vec3(13, 7, 21), glm::vec3(3, 2, -5), glm::vec3(0, 1, 0));
     const auto inverse = glm::inverse(view);
     constexpr float depths[]{0.1F, 12, 32, 80, 192};
-    for (float aspect : {0.5F, 16.0F / 9, 4.0F})
-        for (auto direction :
-             {glm::vec3(0, 1, 0), glm::vec3(0, -1, 0), glm::normalize(glm::vec3(1, .01F, -.35F))}) {
-            const auto matrices = shadow_cascades(view, aspect, direction);
-            for (int cascade = 0; cascade < 4; ++cascade)
-                for (float z :
-                     {cascade == 0 ? depths[0] : depths[cascade] * 0.9F, depths[cascade + 1]})
-                    for (float x : {-1.0F, 1.0F})
-                        for (float y : {-1.0F, 1.0F}) {
-                            const float tangent = std::tan(glm::radians(65.0F) * .5F);
-                            auto clip = matrices[cascade] * inverse *
-                                        glm::vec4(x * z * tangent * aspect, y * z * tangent, -z, 1);
-                            clip /= clip.w;
-                            expect(std::isfinite(clip.x) &&
-                                       std::abs(clip.x) <= 1.0F - 4.0F / 1024 &&
-                                       std::abs(clip.y) <= 1.0F - 4.0F / 1024 && clip.z >= 0 &&
-                                       clip.z <= 1,
-                                   "cascade covers receiver frustum even at vertical sun/extreme "
-                                   "aspect");
-                        }
-        }
-    const auto direction = glm::normalize(glm::vec3(1, 2, -1));
-    const auto reference = shadow_cascades(view, 16.0F / 9, direction);
-    for (unsigned pose = 0; pose < 100; ++pose) {
-        const auto position =
-            glm::vec3(static_cast<float>(pose) * 2.17F, 7, -static_cast<float>(pose));
-        const auto moved_view =
-            glm::lookAt(position, position + glm::vec3(0.1F * pose, -1, -10), glm::vec3(0, 1, 0));
-        const auto moved = shadow_cascades(moved_view, 16.0F / 9, direction);
-        for (unsigned cascade = 0; cascade < 4; ++cascade) {
-            for (unsigned column = 0; column < 3; ++column)
-                expect(glm::length(moved[cascade][column] - reference[cascade][column]) < 1e-7F,
-                       "camera pose cannot change shadow scale or light basis");
-            for (unsigned axis = 0; axis < 2; ++axis) {
-                const float shift = (moved[cascade][3][axis] - reference[cascade][3][axis]) * 512;
-                expect(std::abs(shift - std::round(shift)) < 0.002F,
-                       "camera moves shadows by integer texels only");
+    for (const auto resolution : shadow_resolutions) {
+        const auto tile = resolution / 2;
+        for (float aspect : {0.5F, 16.0F / 9, 4.0F})
+            for (auto direction : {glm::vec3(0, 1, 0), glm::vec3(0, -1, 0),
+                                   glm::normalize(glm::vec3(1, .01F, -.35F))}) {
+                const auto matrices = shadow_cascades(view, aspect, direction, tile);
+                for (int cascade = 0; cascade < 4; ++cascade)
+                    for (float z :
+                         {cascade == 0 ? depths[0] : depths[cascade] * 0.9F, depths[cascade + 1]})
+                        for (float x : {-1.0F, 1.0F})
+                            for (float y : {-1.0F, 1.0F}) {
+                                const float tangent = std::tan(glm::radians(65.0F) * .5F);
+                                auto clip =
+                                    matrices[cascade] * inverse *
+                                    glm::vec4(x * z * tangent * aspect, y * z * tangent, -z, 1);
+                                clip /= clip.w;
+                                expect(
+                                    std::isfinite(clip.x) &&
+                                        std::abs(clip.x) <= 1.0F - 4.0F / tile &&
+                                        std::abs(clip.y) <= 1.0F - 4.0F / tile && clip.z >= 0 &&
+                                        clip.z <= 1,
+                                    "cascade covers receiver frustum even at vertical sun/extreme "
+                                    "aspect");
+                            }
+            }
+        const auto direction = glm::normalize(glm::vec3(1, 2, -1));
+        const auto reference = shadow_cascades(view, 16.0F / 9, direction, tile);
+        for (unsigned pose = 0; pose < 100; ++pose) {
+            const auto position =
+                glm::vec3(static_cast<float>(pose) * 2.17F, 7, -static_cast<float>(pose));
+            const auto moved_view = glm::lookAt(
+                position, position + glm::vec3(0.1F * pose, -1, -10), glm::vec3(0, 1, 0));
+            const auto moved = shadow_cascades(moved_view, 16.0F / 9, direction, tile);
+            for (unsigned cascade = 0; cascade < 4; ++cascade) {
+                for (unsigned column = 0; column < 3; ++column)
+                    expect(glm::length(moved[cascade][column] - reference[cascade][column]) < 1e-7F,
+                           "camera pose cannot change shadow scale or light basis");
+                for (unsigned axis = 0; axis < 2; ++axis) {
+                    const float shift =
+                        (moved[cascade][3][axis] - reference[cascade][3][axis]) * (tile / 2);
+                    expect(std::abs(shift - std::round(shift)) < 0.002F,
+                           "camera moves shadows by integer texels only");
+                }
             }
         }
     }

@@ -18,7 +18,7 @@ bool valid_lighting_settings(const LightingSettings &s) noexcept {
            s.gi_extent >= 16 && s.gi_extent <= 256 && std::isfinite(s.gi_strength) &&
            s.gi_strength >= 0 && s.gi_strength <= 4 && s.triangle_budget >= 1024 &&
            s.triangle_budget <= 262144 && std::isfinite(s.gi_update_hz) && s.gi_update_hz >= 1 &&
-           s.gi_update_hz <= 120;
+           s.gi_update_hz <= 120 && valid_shadow_resolution(s.shadow_resolution);
 }
 void advance_lighting_clock(LightingSettings &settings, double seconds, bool paused) noexcept {
     if (!paused && settings.dynamic && settings.cycle && std::isfinite(seconds) && seconds > 0)

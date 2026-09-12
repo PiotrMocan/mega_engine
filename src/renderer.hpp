@@ -80,6 +80,10 @@ public:
     }
     [[nodiscard]] bool gi_provisioned() const noexcept { return gi_provisioned_; }
     [[nodiscard]] bool set_lighting_settings(LightingSettings settings) noexcept;
+    [[nodiscard]] std::uint32_t shadow_resolution() const noexcept { return shadow_map_.width(); }
+    [[nodiscard]] bool supports_shadow_resolution(std::uint32_t resolution) const noexcept {
+        return valid_shadow_resolution(resolution) && resolution <= max_shadow_resolution_;
+    }
     void set_lighting_paused(bool paused) noexcept { lighting_paused_ = paused; }
     void request_resize() noexcept { resize_requested_ = true; }
     void toggle_vsync();
@@ -320,6 +324,7 @@ private:
     void destroy_scene_resources() noexcept;
     void create_sky_texture();
     void create_shadow_map();
+    void apply_shadow_resolution();
     void create_anti_aliasing_resources();
     void create_anti_aliasing_targets();
     void destroy_anti_aliasing_resources() noexcept;
@@ -484,6 +489,7 @@ private:
         anti_aliasing_frames_{};
     Fsr3Upscaler fsr3_upscaler_{};
     VkFormat shadow_map_format_ = VK_FORMAT_UNDEFINED;
+    std::uint32_t max_shadow_resolution_ = 0;
     glm::mat4 light_view_projection_{1.0F};
     glm::mat4 previous_unjittered_view_projection_{1.0F};
     Fsr3Jitter current_jitter_{};

@@ -111,7 +111,6 @@ static_assert(sizeof(PbrInstanceData) == 80);
 static_assert(offsetof(PbrInstanceData, material) == 48U);
 static_assert(sizeof(TerrainVertex) == 16);
 
-inline constexpr std::uint32_t shadow_map_resolution = 2048U;
 inline constexpr VkFormat aa_color_format =
     VK_FORMAT_R16G16B16A16_SFLOAT;
 inline constexpr VkFormat aa_motion_format =
@@ -2300,30 +2299,77 @@ void Renderer::create_shadow_map() {
         };
         vkGetPhysicalDeviceFormatProperties2(
             context_->physical_device(), candidate, &properties2);
-        if ((properties3.optimalTilingFeatures & required_features) ==
-            required_features) {
+        VkImageFormatProperties image_properties{};
+        const auto support = vkGetPhysicalDeviceImageFormatProperties(
+            context_->physical_device(), candidate, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            0, &image_properties);
+        if (support != VK_SUCCESS && support != VK_ERROR_FORMAT_NOT_SUPPORTED)
+            VK_CHECK(support);
+        const auto &limits = context_->properties().limits;
+        const auto maximum = std::min({image_properties.maxExtent.width,
+                                       image_properties.maxExtent.height,
+                                       limits.maxImageDimension2D, limits.maxFramebufferWidth,
+                                       limits.maxFramebufferHeight, limits.maxViewportDimensions[0],
+                                       limits.maxViewportDimensions[1], shadow_resolutions.back()});
+        if (support == VK_SUCCESS &&
+            (image_properties.sampleCounts & VK_SAMPLE_COUNT_1_BIT) != 0 &&
+            (properties3.optimalTilingFeatures & required_features) == required_features &&
+            maximum >= lighting_settings_.shadow_resolution) {
             shadow_map_format_ = candidate;
+            max_shadow_resolution_ = maximum;
             break;
         }
     }
     if (shadow_map_format_ == VK_FORMAT_UNDEFINED) {
         fatal(
-            "No supported sampled depth format is available for shadow "
-            "mapping.");
+            "Requested shadow resolution is unsupported by this GPU; "
+            "try --shadow-resolution 1024.");
     }
 
-    const std::uint32_t resolution = std::min(
-        shadow_map_resolution,
-        context_->properties().limits.maxImageDimension2D);
-    if (resolution == 0U) {
-        fatal("The selected GPU reports a zero 2D image dimension limit.");
-    }
+    const std::uint32_t resolution = lighting_settings_.shadow_resolution;
     shadow_map_.create_shadow_map(
         *context_,
         resolution,
         resolution,
         shadow_map_format_,
         "sun shadow map");
+}
+
+void Renderer::apply_shadow_resolution() {
+    // The atlas and binding 4 in both scene/instancing sets are shared by all
+    // frame submissions. Retire those users before replacing any descriptor.
+    // Called only at a frame boundary when the requested size actually changes.
+    std::array<VkFence, max_frames_in_flight> fences{};
+    std::transform(frames_.begin(), frames_.end(), fences.begin(),
+                   [](const FrameContext &frame) noexcept { return frame.fence; });
+    VK_CHECK(vkWaitForFences(context_->device(), static_cast<std::uint32_t>(fences.size()),
+                            fences.data(), VK_TRUE, UINT64_MAX));
+    GpuTexture replacement;
+    replacement.create_shadow_map(*context_, lighting_settings_.shadow_resolution,
+                                  lighting_settings_.shadow_resolution, shadow_map_format_,
+                                  "sun shadow map");
+    const VkDescriptorImageInfo image_info{replacement.sampler(), replacement.view(),
+                                           VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL};
+    for (const auto &frame : frames_) {
+        for (const auto set : {frame.descriptor_set, frame.scene_descriptor_set}) {
+            const VkWriteDescriptorSet write{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = set,
+                .dstBinding = 4,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &image_info,
+            };
+            vkUpdateDescriptorSets(context_->device(), 1, &write, 0, nullptr);
+        }
+    }
+    shadow_map_ = std::move(replacement);
+    shadow_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    shadow_dirty_ = true;
+    lighting_shadow_initialized_ = false;
+    temporal_history_valid_ = false;
+    fsr3_upscaler_.request_reset();
 }
 
 void Renderer::create_anti_aliasing_resources() {
@@ -2574,6 +2620,7 @@ void Renderer::destroy_scene_resources() noexcept {
     }
     shadow_map_.destroy();
     shadow_map_format_ = VK_FORMAT_UNDEFINED;
+    max_shadow_resolution_ = 0;
     sky_texture_.destroy();
     terrain_index_buffer_.destroy();
     terrain_vertex_buffer_.destroy();
@@ -4659,6 +4706,11 @@ bool Renderer::draw_frame(
         rebuild_swapchain();
         return false;
     }
+
+    // Resource reconfiguration is reflected in total CPU frame time, outside
+    // the ordinary fence/acquire timings (which must not include allocation).
+    if (shadow_map_.width() != lighting_settings_.shadow_resolution)
+        apply_shadow_resolution();
 
     std::uint32_t image_index = 0;
     begin = Clock::now();
