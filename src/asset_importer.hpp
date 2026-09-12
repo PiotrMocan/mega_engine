@@ -14,6 +14,12 @@ enum class AssetSourceKind : std::uint8_t {
     unsupported,
     model_fbx,
     model_obj,
+    model_gltf,
+    model_glb,
+    model_collada,
+    model_ply,
+    model_stl,
+    model_3ds,
     image,
 };
 

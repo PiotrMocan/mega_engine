@@ -295,7 +295,9 @@ AssetEntryKind AssetBrowser::classify(
     }
     if (filename.ends_with(".vcrasset.json") ||
         extension == ".fbx" || extension == ".obj" ||
-        extension == ".glb" || extension == ".gltf") {
+        extension == ".glb" || extension == ".gltf" ||
+        extension == ".dae" || extension == ".ply" ||
+        extension == ".stl" || extension == ".3ds") {
         return AssetEntryKind::model;
     }
     if (filename.ends_with(".vcrtexture.json")) {

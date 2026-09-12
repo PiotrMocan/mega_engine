@@ -10,7 +10,7 @@
 
 Поддерживаемые source formats:
 
-- models: FBX и OBJ;
+- models: FBX, OBJ, glTF, GLB, Collada DAE, PLY, STL и 3DS;
 - images: PNG, JPEG, TGA, HDR, BMP, DDS и EXR.
 
 Импорт выполняет постоянный editor worker. Render thread только ставит bounded
@@ -19,7 +19,10 @@ steady-state frame не читает filesystem и не запускает parse
 
 ## Model asset
 
-FBX и OBJ нормализуются через статически связанную, закреплённую версию Assimp.
+Model sources нормализуются через статически связанную, закреплённую версию
+Assimp. Для OBJ дополнительно сохраняются безопасно разрешённые MTL dependencies;
+для glTF внешние buffers сначала копируются в sandboxed snapshot. GLB, DAE, PLY,
+STL и 3DS проходят тот же bounded cook в единый runtime mesh.
 Для каждого source создаётся отдельный каталог:
 
 ```text

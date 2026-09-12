@@ -8,10 +8,17 @@
 
 namespace vcr {
 
+enum class McpServerProfile : std::uint8_t {
+    runtime,
+    editor,
+};
+
 class McpServer final {
 public:
-    explicit McpServer(McpControlPlane& control) noexcept
-        : control_(control) {}
+    explicit McpServer(
+        McpControlPlane& control,
+        const McpServerProfile profile = McpServerProfile::runtime) noexcept
+        : control_(control), profile_(profile) {}
     ~McpServer();
 
     McpServer(const McpServer&) = delete;
@@ -28,6 +35,7 @@ private:
     void run(std::stop_token stop_token) noexcept;
 
     std::reference_wrapper<McpControlPlane> control_;
+    McpServerProfile profile_ = McpServerProfile::runtime;
     std::jthread thread_{};
     std::atomic<bool> running_{false};
 };

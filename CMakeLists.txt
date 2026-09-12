@@ -40,6 +40,11 @@ set(SDL_TRAY OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_ALL_IMPORTERS_BY_DEFAULT OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_FBX_IMPORTER ON CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_OBJ_IMPORTER ON CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_GLTF_IMPORTER ON CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_COLLADA_IMPORTER ON CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_PLY_IMPORTER ON CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_STL_IMPORTER ON CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_3DS_IMPORTER ON CACHE BOOL "" FORCE)
 set(ASSIMP_NO_EXPORT ON CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_ZLIB ON CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -455,8 +460,10 @@ add_executable(vulkan_cube
 add_executable(vulkan_editor
     src/editor_main.cpp
     src/editor_application.cpp
+    src/editor_scene_tools.cpp
     src/editor_ui.cpp
     src/editor_ui_kit.cpp
+    src/mcp_server.cpp
     src/asset_browser.cpp
     src/scene_document.cpp
     src/scene_io.cpp
@@ -613,6 +620,7 @@ if(BUILD_TESTING)
         tests/core_tests.cpp
         src/asset_browser.cpp
         src/cli_options.cpp
+        src/editor_scene_tools.cpp
         src/fly_camera.cpp
         src/performance_metrics.cpp
         src/png_encoder.cpp

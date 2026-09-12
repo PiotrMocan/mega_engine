@@ -74,10 +74,16 @@ Release-запуск с автоматической сборкой:
 scripts\run_editor_windows.cmd --no-validation
 ```
 
+AI authoring через live editor MCP:
+
+```bat
+build\windows-debug\bin\vulkan_editor.exe --mcp-stdio --no-validation
+```
+
 Поддерживаются общие параметры окна, present mode, validation и AA из
-`vulkan_cube`. `--benchmark` и `--mcp-stdio` редактор намеренно отклоняет:
-для воспроизводимого benchmark и automation используется изолированный
-`vulkan_cube`.
+`vulkan_cube`. `--benchmark` редактор намеренно отклоняет: для воспроизводимого
+performance benchmark используется изолированный `vulkan_cube`. `--mcp-stdio`
+в редакторе включает live authoring profile, описанный в [MCP.md](MCP.md).
 
 ## Возможности
 
@@ -105,7 +111,8 @@ scripts\run_editor_windows.cmd --no-validation
 - `Assets`: sandboxed browser исходного project `assets` (с fallback на
   packaged copy), сортировка, типы, drag payload, ручной refresh, явное
   сообщение о truncation и запрет выхода через `..`/symbolic links.
-- `Asset Import`: FBX/OBJ и изображения импортируются через отдельное окно или
+- `Asset Import`: FBX, OBJ, glTF/GLB, DAE, PLY, STL, 3DS и изображения
+  импортируются через отдельное окно или
   внешний drag-and-drop в `Assets`. Model cook создаёт versioned mesh,
   model manifest, отдельные material/texture assets и сохраняет source.
   Публикация транзакционная и не заменяет существующий asset.
@@ -117,6 +124,10 @@ scripts\run_editor_windows.cmd --no-validation
 - `Material Editor`: отдельное dockable окно открывает импортированные
   `*.vcrmaterial.json`, редактирует PBR factors и сохраняет complete temporary
   file перед атомарной заменой.
+- `Landscape`: создание плоского authored ground и deterministic scatter
+  выбранного imported model с count, seed, area и scale range.
+- `Undo/Redo`: bounded history на 32 scene transactions, `Ctrl+Z/Ctrl+Y`;
+  structural actions, Inspector edits и landscape batches входят в историю.
 - `Renderer`: live CPU/GPU timings и управление AA.
 
 Первая раскладка создаётся автоматически: hierarchy слева, inspector справа,
@@ -173,8 +184,10 @@ Resize viewport coalesced с задержкой 140 ms и ограничен `38
   set. Cooked UV/tangent передаются в dedicated direct/AA model pipelines.
   Подробности:
   [ASSET_IMPORT.md](ASSET_IMPORT.md).
-- Save/Open уже сохраняет иерархию и authored properties, но Save As, undo/redo,
-  prefabs, component inspector и произвольный node graph ещё не реализованы.
+- Save/Open уже сохраняет иерархию и authored properties. Undo/Redo использует
+  bounded full-scene snapshots; для очень больших сцен следующий этап — delta
+  history с byte budget. Save As, prefabs, component inspector и произвольный
+  node graph ещё не реализованы.
   Текущая иерархия намеренно остаётся tree/forest, чтобы ownership и transform
   propagation были однозначными; Delete требует подтверждения.
 

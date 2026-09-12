@@ -1,6 +1,7 @@
 #include "editor_ui.hpp"
 
 #include "asset_importer.hpp"
+#include "editor_scene_tools.hpp"
 #include "renderer.hpp"
 #include "runtime_assets.hpp"
 #include "scene_io.hpp"
@@ -1031,6 +1032,14 @@ void EditorUi::initialize(
     external_drop_ = std::make_unique<ExternalAssetDropState>();
     material_editor_ =
         std::make_unique<MaterialEditorUiState>();
+    constexpr std::string_view default_scatter_name{"Plant"};
+    std::memcpy(
+        scatter_name_prefix_.data(),
+        default_scatter_name.data(),
+        default_scatter_name.size());
+    undo_history_.reserve(maximum_history_entries);
+    redo_history_.reserve(maximum_history_entries);
+    scatter_created_.reserve(maximum_scatter_instances);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -1141,6 +1150,10 @@ void EditorUi::shutdown() noexcept {
     import_ui_.reset();
     import_worker_.reset();
     asset_import_enabled_ = false;
+    undo_history_.clear();
+    redo_history_.clear();
+    inspector_edit_snapshot_.reset();
+    scatter_created_.clear();
 }
 
 void EditorUi::process_event(const SDL_Event& event) {
@@ -1306,6 +1319,12 @@ void EditorUi::begin_frame(
             !import_activity_pending()) {
             import_dialog_requested_ = true;
         }
+        if (ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
+            static_cast<void>(undo_scene(scene));
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Y, false)) {
+            static_cast<void>(redo_scene(scene));
+        }
     }
 
     if (toggle_play_requested_) {
@@ -1386,6 +1405,7 @@ void EditorUi::begin_frame(
             ImGui::DockBuilderDockWindow("Inspector", right);
             ImGui::DockBuilderDockWindow("Material Editor", right);
             ImGui::DockBuilderDockWindow("Renderer", right);
+            ImGui::DockBuilderDockWindow("Landscape", right);
             ImGui::DockBuilderDockWindow("Assets", bottom);
             ImGui::DockBuilderDockWindow("Scene View", center);
             ImGui::DockBuilderFinish(dockspace_id);
@@ -1399,6 +1419,7 @@ void EditorUi::begin_frame(
     build_inspector(scene);
     build_viewport(scene, renderer, now);
     build_assets(scene, renderer);
+    build_landscape(scene, renderer);
     if (import_dialog_requested_) {
         queue_import_sources({});
         import_dialog_requested_ = false;
@@ -1544,6 +1565,24 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
         }
         ImGui::EndMenu();
     }
+    if (ImGui::BeginMenu("Edit")) {
+        const bool editable = play_state_ == EditorPlayState::edit;
+        if (ImGui::MenuItem(
+                "Undo",
+                "Ctrl+Z",
+                false,
+                editable && can_undo())) {
+            static_cast<void>(undo_scene(scene));
+        }
+        if (ImGui::MenuItem(
+                "Redo",
+                "Ctrl+Y",
+                false,
+                editable && can_redo())) {
+            static_cast<void>(redo_scene(scene));
+        }
+        ImGui::EndMenu();
+    }
     if (ImGui::BeginMenu("Scene")) {
         const SceneNodeId parent =
             scene.valid(selected_node_)
@@ -1554,6 +1593,7 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
                 nullptr,
                 false,
                 play_state_ == EditorPlayState::edit)) {
+            checkpoint_scene(scene);
             selected_node_ = scene.create_node(
                 "Folder", SceneNodeKind::folder, parent);
         }
@@ -1562,6 +1602,7 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
                 nullptr,
                 false,
                 play_state_ == EditorPlayState::edit)) {
+            checkpoint_scene(scene);
             const SceneNodeId cube = scene.create_node(
                 "Cube", SceneNodeKind::cube, parent);
             if (auto node = scene.node(cube)) {
@@ -1860,7 +1901,7 @@ void EditorUi::build_hierarchy(SceneDocument& scene) {
                 "Delete \"%s\" and all of its children?",
                 candidate->get().name.c_str());
             ImGui::TextDisabled(
-                "This editor stage does not have undo/redo.");
+                "The deleted subtree can be restored with Undo.");
             if (ImGui::Button("Delete")) {
                 pending_delete_ = delete_confirmation_;
                 delete_confirmation_ = {};
@@ -1913,6 +1954,7 @@ void EditorUi::build_inspector(SceneDocument& scene) {
         return;
     }
     SceneNode& node = selected->get();
+    const SceneNode node_before_edit = node;
     ui_kit_.panel_header(
         node_icon(node.kind),
         node.name.c_str(),
@@ -1937,9 +1979,17 @@ void EditorUi::build_inspector(SceneDocument& scene) {
                 "##Name",
                 selected_name_buffer_.data(),
                 selected_name_buffer_.size())) {
-            static_cast<void>(scene.rename_node(
-                selected_node_, selected_name_buffer_.data()));
-            hierarchy_revision_ = 0U;
+            if (!inspector_edit_snapshot_) {
+                // InputText mutates the temporary buffer first, so the full
+                // document can still be captured before rename_node advances
+                // the structure revision. This keeps dirty state correct
+                // after undoing a rename.
+                inspector_edit_snapshot_ = scene;
+            }
+            if (scene.rename_node(
+                    selected_node_, selected_name_buffer_.data())) {
+                hierarchy_revision_ = 0U;
+            }
         }
         ui_kit_.property_row("Type");
         ui_kit_.badge(
@@ -2026,6 +2076,13 @@ void EditorUi::build_inspector(SceneDocument& scene) {
             ui_kit_.end_property_grid();
         }
     }
+    if (changed && !inspector_edit_snapshot_) {
+        inspector_edit_snapshot_ = scene;
+        if (auto previous =
+                inspector_edit_snapshot_->node(selected_node_)) {
+            previous->get() = node_before_edit;
+        }
+    }
     if (changed) {
         constexpr float minimum_scale = 0.0001F;
         node.transform.scale.x =
@@ -2037,6 +2094,10 @@ void EditorUi::build_inspector(SceneDocument& scene) {
         node.material =
             sanitize_pbr_material(node.material);
         scene.mark_content_changed();
+    }
+    if (inspector_edit_snapshot_ && !ImGui::IsAnyItemActive()) {
+        push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+        inspector_edit_snapshot_.reset();
     }
     if (!has_transform) {
         ui_kit_.status_text(
@@ -2470,6 +2531,190 @@ void EditorUi::build_assets(
     ImGui::End();
 }
 
+void EditorUi::build_landscape(
+    SceneDocument& scene,
+    Renderer& renderer) {
+    ImGui::SetNextWindowSize(
+        ImVec2(360.0F, 470.0F), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Landscape")) {
+        ImGui::End();
+        return;
+    }
+    ui_kit_.panel_header(
+        EditorIcon::terrain,
+        "LANDSCAPE",
+        "Flat terrain and deterministic vegetation scatter");
+    const bool editable = play_state_ == EditorPlayState::edit;
+    ImGui::BeginDisabled(!editable);
+
+    ui_kit_.section_header(EditorIcon::ground, "Flat terrain");
+    if (ui_kit_.begin_property_grid("FlatTerrainProperties")) {
+        ui_kit_.property_row("Size X/Z");
+        static_cast<void>(ImGui::DragFloat2(
+            "##FlatTerrainSize",
+            flat_ground_size_,
+            0.5F,
+            1.0F,
+            8192.0F,
+            "%.1f"));
+        ui_kit_.property_row("Height");
+        static_cast<void>(ImGui::DragFloat(
+            "##FlatTerrainHeight",
+            &flat_ground_height_,
+            0.1F,
+            -4096.0F,
+            4096.0F,
+            "%.2f"));
+        ui_kit_.end_property_grid();
+    }
+    if (ui_kit_.action_button(
+            "CreateFlatTerrain",
+            EditorIcon::add,
+            "Create flat terrain",
+            EditorButtonStyle::primary,
+            editable)) {
+        SceneNodeId parent{};
+        if (const auto selected = scene.node(selected_node_);
+            selected && selected->get().kind == SceneNodeKind::folder) {
+            parent = selected_node_;
+        }
+        SceneDocument before = scene;
+        std::string error;
+        const SceneNodeId ground = create_flat_ground(
+            scene,
+            FlatGroundOptions{
+                .parent = parent,
+                .height = flat_ground_height_,
+                .width = flat_ground_size_[0],
+                .depth = flat_ground_size_[1],
+            },
+            error);
+        if (ground) {
+            push_undo_snapshot(std::move(before));
+            selected_node_ = ground;
+            hierarchy_revision_ = 0U;
+            scene_file_status_ = "Created flat terrain.";
+        } else {
+            asset_error_ = std::move(error);
+        }
+    }
+
+    ui_kit_.section_header(EditorIcon::model, "Vegetation scatter");
+    const bool selected_model = selected_asset_.has_value() &&
+        selected_asset_->kind == AssetEntryKind::model &&
+        valid_scene_asset_path(selected_asset_->relative_display);
+    if (selected_model) {
+        ImGui::TextWrapped(
+            "Asset: %s", selected_asset_->relative_display.c_str());
+    } else {
+        ui_kit_.status_text(
+            "Select an imported *.vcrasset.json model in Assets.",
+            EditorTone::neutral);
+    }
+    if (ui_kit_.begin_property_grid("ScatterProperties")) {
+        ui_kit_.property_row("Name prefix");
+        static_cast<void>(ImGui::InputText(
+            "##ScatterName",
+            scatter_name_prefix_.data(),
+            scatter_name_prefix_.size()));
+        ui_kit_.property_row("Count");
+        static_cast<void>(ImGui::DragScalar(
+            "##ScatterCount",
+            ImGuiDataType_U32,
+            &scatter_count_,
+            1.0F,
+            nullptr,
+            nullptr,
+            "%u"));
+        scatter_count_ = std::clamp(
+            scatter_count_, 1U, maximum_scatter_instances);
+        ui_kit_.property_row("Seed");
+        static_cast<void>(ImGui::InputScalar(
+            "##ScatterSeed", ImGuiDataType_U32, &scatter_seed_));
+        ui_kit_.property_row("Center X/Y/Z");
+        static_cast<void>(ImGui::DragFloat3(
+            "##ScatterCenter", scatter_center_, 0.1F));
+        ui_kit_.property_row("Area X/Z");
+        static_cast<void>(ImGui::DragFloat2(
+            "##ScatterArea",
+            scatter_size_,
+            0.5F,
+            0.1F,
+            8192.0F,
+            "%.1f"));
+        ui_kit_.property_row("Scale min/max");
+        static_cast<void>(ImGui::DragFloat2(
+            "##ScatterScale",
+            scatter_scale_,
+            0.01F,
+            0.01F,
+            100.0F,
+            "%.2f"));
+        ui_kit_.end_property_grid();
+    }
+    const bool can_scatter = editable && selected_model &&
+        scatter_scale_[0] <= scatter_scale_[1];
+    if (ui_kit_.action_button(
+            "ScatterVegetation",
+            EditorIcon::add,
+            "Scatter selected model",
+            EditorButtonStyle::secondary,
+            can_scatter) &&
+        selected_asset_) {
+        SceneTransform base_transform{};
+        std::string error;
+        if (!renderer.prepare_editor_model(
+                asset_browser_.root(),
+                selected_asset_->relative_display,
+                base_transform,
+                error)) {
+            asset_error_ = error.empty()
+                ? "Model preparation started; retry scatter when it completes."
+                : std::move(error);
+        } else {
+            SceneNodeId parent{};
+            if (const auto selected = scene.node(selected_node_);
+                selected && selected->get().kind == SceneNodeKind::folder) {
+                parent = selected_node_;
+            }
+            SceneDocument before = scene;
+            const bool scattered = scatter_model_instances(
+                scene,
+                ModelScatterOptions{
+                    .asset_path = selected_asset_->relative_display,
+                    .name_prefix = scatter_name_prefix_.data(),
+                    .parent = parent,
+                    .base_transform = base_transform,
+                    .center_x = scatter_center_[0],
+                    .height = scatter_center_[1],
+                    .center_z = scatter_center_[2],
+                    .width = scatter_size_[0],
+                    .depth = scatter_size_[1],
+                    .minimum_scale = scatter_scale_[0],
+                    .maximum_scale = scatter_scale_[1],
+                    .count = scatter_count_,
+                    .seed = scatter_seed_,
+                },
+                scatter_created_,
+                error);
+            if (scattered) {
+                push_undo_snapshot(std::move(before));
+                hierarchy_revision_ = 0U;
+                scene_file_status_ =
+                    "Scattered " + std::to_string(scatter_created_.size()) +
+                    " model instances.";
+            } else {
+                asset_error_ = std::move(error);
+            }
+        }
+    }
+    ImGui::EndDisabled();
+    if (!editable) {
+        ui_kit_.badge("LOCKED DURING PLAY", EditorTone::warning);
+    }
+    ImGui::End();
+}
+
 bool EditorUi::add_model_asset_to_scene(
     SceneDocument& scene,
     Renderer& renderer,
@@ -2585,6 +2830,7 @@ bool EditorUi::add_model_asset_to_scene(
             selected->get().kind == SceneNodeKind::folder) {
             parent = selected_node_;
         }
+        checkpoint_scene(scene);
         const SceneNodeId model = scene.create_node(
             std::string(name), SceneNodeKind::model, parent);
         if (!model) {
@@ -2707,7 +2953,7 @@ void EditorUi::build_import_window() {
     ui_kit_.panel_header(
         EditorIcon::import_asset,
         "IMPORT ASSETS",
-        "FBX, OBJ and image sources");
+        "FBX, OBJ, glTF/GLB, DAE, PLY, STL, 3DS and images");
     ui_kit_.badge(
         path_to_utf8(
             import_ui_->destination_directory).c_str(),
@@ -3498,20 +3744,8 @@ void EditorUi::process_file_commands(SceneDocument& scene) {
 }
 
 void EditorUi::save_scene(SceneDocument& scene) {
-    if (scene_path_.empty()) {
-        scene_file_status_ =
-            "Save failed: scene path is unavailable.";
-        return;
-    }
     std::string error;
-    if (!save_scene_file(scene, scene_path_, error)) {
-        scene_file_status_ = "Save failed: " + error;
-        return;
-    }
-    saved_content_revision_ = scene.content_revision();
-    saved_structure_revision_ = scene.structure_revision();
-    scene_file_status_ =
-        "Saved " + scene_path_.string();
+    static_cast<void>(save_scene_external(scene, error));
 }
 
 void EditorUi::open_scene(SceneDocument& scene) {
@@ -3541,6 +3775,9 @@ void EditorUi::open_scene(SceneDocument& scene) {
     pending_reparent_child_ = {};
     pending_reparent_parent_ = {};
     edit_scene_snapshot_.reset();
+    inspector_edit_snapshot_.reset();
+    undo_history_.clear();
+    redo_history_.clear();
     play_state_ = EditorPlayState::edit;
     external_game_window_open_ = false;
     hierarchy_revision_ = 0U;
@@ -3555,11 +3792,126 @@ bool EditorUi::scene_is_dirty(
              saved_structure_revision_);
 }
 
+void EditorUi::push_undo_snapshot(SceneDocument snapshot) {
+    if (undo_history_.size() == maximum_history_entries) {
+        undo_history_.erase(undo_history_.begin());
+    }
+    undo_history_.push_back(std::move(snapshot));
+    redo_history_.clear();
+}
+
+void EditorUi::checkpoint_scene(const SceneDocument& scene) {
+    push_undo_snapshot(scene);
+}
+
+bool EditorUi::undo_scene(SceneDocument& scene) {
+    if (play_state_ != EditorPlayState::edit || undo_history_.empty()) {
+        return false;
+    }
+    if (redo_history_.size() == maximum_history_entries) {
+        redo_history_.erase(redo_history_.begin());
+    }
+    redo_history_.push_back(std::move(scene));
+    scene = std::move(undo_history_.back());
+    undo_history_.pop_back();
+    scene_replaced_ = true;
+    inspector_edit_snapshot_.reset();
+    selected_node_ = {};
+    hierarchy_revision_ = 0U;
+    name_buffer_node_ = {};
+    scene_file_status_ = "Undid scene edit.";
+    return true;
+}
+
+bool EditorUi::redo_scene(SceneDocument& scene) {
+    if (play_state_ != EditorPlayState::edit || redo_history_.empty()) {
+        return false;
+    }
+    if (undo_history_.size() == maximum_history_entries) {
+        undo_history_.erase(undo_history_.begin());
+    }
+    undo_history_.push_back(std::move(scene));
+    scene = std::move(redo_history_.back());
+    redo_history_.pop_back();
+    scene_replaced_ = true;
+    inspector_edit_snapshot_.reset();
+    selected_node_ = {};
+    hierarchy_revision_ = 0U;
+    name_buffer_node_ = {};
+    scene_file_status_ = "Redid scene edit.";
+    return true;
+}
+
+bool EditorUi::save_scene_external(
+    SceneDocument& scene,
+    std::string& error) {
+    error.clear();
+    if (play_state_ != EditorPlayState::edit) {
+        error = "Scene save is available only in Edit mode.";
+    } else if (scene_path_.empty()) {
+        error = "Scene path is unavailable.";
+    } else if (!save_scene_file(scene, scene_path_, error)) {
+        // save_scene_file supplies a detailed error.
+    } else {
+        saved_content_revision_ = scene.content_revision();
+        saved_structure_revision_ = scene.structure_revision();
+        scene_file_status_ = "Saved " + scene_path_.string();
+        return true;
+    }
+    scene_file_status_ = "Save failed: " + error;
+    return false;
+}
+
+bool EditorUi::queue_import_external(
+    const std::filesystem::path& source,
+    const std::filesystem::path& destination_directory,
+    std::string& error) {
+    error.clear();
+    if (play_state_ != EditorPlayState::edit) {
+        error = "Asset import is available only in Edit mode.";
+        return false;
+    }
+    if (!asset_import_enabled_) {
+        error = "Asset import requires a writable project checkout.";
+        return false;
+    }
+    if (import_worker_ == nullptr || import_worker_->failed()) {
+        error = "The asset import worker is unavailable.";
+        return false;
+    }
+    if (!asset_source_is_supported(source)) {
+        error = "The source format is not supported by the asset importer.";
+        return false;
+    }
+    AssetImportWorker::Batch batch{
+        .sources = {source},
+        .options = ImportAssetOptions{
+            .asset_root = asset_browser_.root(),
+            .destination_directory = destination_directory,
+        },
+    };
+    if (!import_worker_->submit(std::move(batch))) {
+        error = "The bounded asset import queue is full.";
+        return false;
+    }
+    if (import_ui_ != nullptr) {
+        import_ui_->status = "MCP asset import queued: " + source.string();
+    }
+    return true;
+}
+
+std::string_view EditorUi::asset_import_status() const noexcept {
+    return import_ui_ != nullptr
+        ? std::string_view(import_ui_->status)
+        : std::string_view{};
+}
+
 void EditorUi::apply_deferred_scene_commands(
     SceneDocument& scene) {
     if (play_state_ == EditorPlayState::edit &&
         pending_reparent_child_ &&
         pending_reparent_parent_) {
+        checkpoint_scene(scene);
         static_cast<void>(scene.reparent(
             pending_reparent_child_,
             pending_reparent_parent_));
@@ -3568,6 +3920,7 @@ void EditorUi::apply_deferred_scene_commands(
     pending_reparent_parent_ = {};
     if (play_state_ == EditorPlayState::edit &&
         pending_delete_) {
+        checkpoint_scene(scene);
         static_cast<void>(scene.destroy_subtree(pending_delete_));
         if (!scene.valid(selected_node_)) {
             selected_node_ = {};

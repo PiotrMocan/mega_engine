@@ -3,9 +3,12 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -79,6 +82,16 @@ void expect(const bool condition, const std::string_view message) {
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     output.write(
         text.data(), static_cast<std::streamsize>(text.size()));
+    return static_cast<bool>(output);
+}
+
+[[nodiscard]] bool write_binary(
+    const std::filesystem::path& path,
+    const std::span<const std::byte> bytes) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output.write(
+        reinterpret_cast<const char*>(bytes.data()),
+        static_cast<std::streamsize>(bytes.size()));
     return static_cast<bool>(output);
 }
 
@@ -195,6 +208,18 @@ int main() {
                 AssetSourceKind::model_fbx &&
             vcr::classify_asset_source("mesh.obj") ==
                 AssetSourceKind::model_obj &&
+            vcr::classify_asset_source("scene.gltf") ==
+                AssetSourceKind::model_gltf &&
+            vcr::classify_asset_source("scene.GLB") ==
+                AssetSourceKind::model_glb &&
+            vcr::classify_asset_source("mesh.dae") ==
+                AssetSourceKind::model_collada &&
+            vcr::classify_asset_source("scan.ply") ==
+                AssetSourceKind::model_ply &&
+            vcr::classify_asset_source("solid.stl") ==
+                AssetSourceKind::model_stl &&
+            vcr::classify_asset_source("legacy.3DS") ==
+                AssetSourceKind::model_3ds &&
             vcr::classify_asset_source("albedo.JpEg") ==
                 AssetSourceKind::image &&
             vcr::classify_asset_source("readme.txt") ==
@@ -422,6 +447,64 @@ int main() {
             painted_material_found,
             "OBJ MTL is emitted as a separate authored material asset");
     }
+
+    const std::filesystem::path gltf_buffer_source =
+        source_root / "portable_triangle.bin";
+    std::array<std::byte, 42U> gltf_buffer{};
+    constexpr std::array<float, 9U> gltf_positions{
+        0.0F, 0.0F, 0.0F,
+        1.0F, 0.0F, 0.0F,
+        0.0F, 1.0F, 0.0F,
+    };
+    constexpr std::array<std::uint16_t, 3U> gltf_indices{0U, 1U, 2U};
+    std::memcpy(
+        gltf_buffer.data(),
+        gltf_positions.data(),
+        sizeof(gltf_positions));
+    std::memcpy(
+        gltf_buffer.data() + sizeof(gltf_positions),
+        gltf_indices.data(),
+        sizeof(gltf_indices));
+    const std::filesystem::path gltf_source =
+        source_root / "portable_triangle.gltf";
+    constexpr std::string_view gltf_text = R"json({
+  "asset": {"version": "2.0"},
+  "buffers": [{"uri": "portable_triangle.bin", "byteLength": 42}],
+  "bufferViews": [
+    {"buffer": 0, "byteOffset": 0, "byteLength": 36, "target": 34962},
+    {"buffer": 0, "byteOffset": 36, "byteLength": 6, "target": 34963}
+  ],
+  "accessors": [
+    {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0]},
+    {"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"}
+  ],
+  "meshes": [{"primitives": [{"attributes": {"POSITION": 0}, "indices": 1}]}],
+  "nodes": [{"mesh": 0}],
+  "scenes": [{"nodes": [0]}],
+  "scene": 0
+})json";
+    expect(
+        write_binary(gltf_buffer_source, gltf_buffer) &&
+            write_text(gltf_source, gltf_text),
+        "authored glTF and external buffer fixtures are written");
+    const auto gltf_import = vcr::import_asset(gltf_source, options);
+    if (!gltf_import) {
+        std::cerr
+            << "glTF import error: "
+            << gltf_import.error().message << " ["
+            << gltf_import.error().path.string() << "]\n";
+    }
+    expect(
+        gltf_import &&
+            gltf_import->source_kind == AssetSourceKind::model_gltf &&
+            result_has_kind(*gltf_import, ImportedAssetKind::model) &&
+            std::count_if(
+                gltf_import->files.begin(),
+                gltf_import->files.end(),
+                [](const vcr::ImportedAssetFile& file) {
+                    return file.kind == ImportedAssetKind::source;
+                }) == 2,
+        "glTF with a sandboxed external buffer imports transactionally");
 
     const std::filesystem::path fallback_material_source =
         source_root / "fallback.mtl";

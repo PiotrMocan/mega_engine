@@ -929,6 +929,100 @@ copy_obj_material_libraries(
     return {};
 }
 
+[[nodiscard]] AssetImportOutcome<void>
+copy_gltf_buffer_dependencies(
+    ImportContext& context,
+    const std::filesystem::path& original_source,
+    const std::filesystem::path& snapshot_source) {
+    std::ifstream input(snapshot_source, std::ios::binary);
+    if (!input) {
+        return make_unexpected_asset_import_error(make_error(
+            AssetImportErrorCode::filesystem_error,
+            "Unable to inspect the glTF import snapshot.",
+            snapshot_source));
+    }
+    const Json document = Json::parse(input, nullptr, false);
+    if (document.is_discarded() || !document.is_object()) {
+        return make_unexpected_asset_import_error(make_error(
+            AssetImportErrorCode::invalid_asset_data,
+            "glTF source is not valid JSON.",
+            original_source));
+    }
+    const auto buffers = document.find("buffers");
+    if (buffers == document.end() || !buffers->is_array()) {
+        return {};
+    }
+
+    std::unordered_set<std::string> copied_dependencies;
+    for (const Json& buffer : *buffers) {
+        if (!buffer.is_object()) {
+            return make_unexpected_asset_import_error(make_error(
+                AssetImportErrorCode::invalid_asset_data,
+                "glTF buffer entry must be an object.",
+                original_source));
+        }
+        const auto uri = buffer.find("uri");
+        if (uri == buffer.end()) {
+            continue;
+        }
+        if (!uri->is_string()) {
+            return make_unexpected_asset_import_error(make_error(
+                AssetImportErrorCode::invalid_asset_data,
+                "glTF buffer URI must be a string.",
+                original_source));
+        }
+        const std::string reported_path = uri->get<std::string>();
+        if (reported_path.starts_with("data:")) {
+            continue;
+        }
+        if (reported_path.empty() ||
+            reported_path.find_first_of("?#") != std::string::npos) {
+            return make_unexpected_asset_import_error(make_error(
+                AssetImportErrorCode::invalid_asset_data,
+                "glTF external buffer URI must be a plain relative file path.",
+                reported_path));
+        }
+        const std::size_t colon = reported_path.find(':');
+        const std::size_t slash = reported_path.find_first_of("/\\");
+        if (colon != std::string::npos &&
+            (slash == std::string::npos || colon < slash)) {
+            return make_unexpected_asset_import_error(make_error(
+                AssetImportErrorCode::invalid_asset_data,
+                "glTF external buffer URI schemes are not allowed.",
+                reported_path));
+        }
+
+        std::string normalized_reported_path = reported_path;
+        std::replace(
+            normalized_reported_path.begin(),
+            normalized_reported_path.end(),
+            '\\', '/');
+        const std::filesystem::path relative =
+            path_from_utf8(normalized_reported_path).lexically_normal();
+        const std::string key = relative.generic_string();
+        if (!copied_dependencies.insert(key).second) {
+            continue;
+        }
+        const auto resolved = resolve_external_dependency(
+            original_source, normalized_reported_path);
+        if (!resolved) {
+            return make_unexpected_asset_import_error(resolved.error());
+        }
+        const auto copied = copy_source_file(
+            context,
+            *resolved,
+            snapshot_source.parent_path() / relative);
+        if (!copied) {
+            return copied;
+        }
+        record_file(
+            context,
+            ImportedAssetKind::source,
+            std::filesystem::path("source") / relative);
+    }
+    return {};
+}
+
 [[nodiscard]] AssetImportOutcome<ImportedTextureReference>
 import_material_texture(
     ImportContext& context,
@@ -1440,6 +1534,15 @@ import_model(
             return make_unexpected_asset_import_error(
                 dependencies_copied.error());
         }
+    } else if (context.result.source_kind ==
+               AssetSourceKind::model_gltf) {
+        const auto dependencies_copied =
+            copy_gltf_buffer_dependencies(
+                context, source, source_snapshot);
+        if (!dependencies_copied) {
+            return make_unexpected_asset_import_error(
+                dependencies_copied.error());
+        }
     }
 
     Assimp::Importer importer;
@@ -1799,6 +1902,24 @@ AssetSourceKind classify_asset_source(
     if (extension == ".obj") {
         return AssetSourceKind::model_obj;
     }
+    if (extension == ".gltf") {
+        return AssetSourceKind::model_gltf;
+    }
+    if (extension == ".glb") {
+        return AssetSourceKind::model_glb;
+    }
+    if (extension == ".dae") {
+        return AssetSourceKind::model_collada;
+    }
+    if (extension == ".ply") {
+        return AssetSourceKind::model_ply;
+    }
+    if (extension == ".stl") {
+        return AssetSourceKind::model_stl;
+    }
+    if (extension == ".3ds") {
+        return AssetSourceKind::model_3ds;
+    }
     if (extension == ".png" || extension == ".jpg" ||
         extension == ".jpeg" || extension == ".tga" ||
         extension == ".hdr" || extension == ".bmp" ||
@@ -1823,8 +1944,8 @@ import_asset(
     if (source_kind == AssetSourceKind::unsupported) {
         return make_unexpected_asset_import_error(make_error(
             AssetImportErrorCode::unsupported_format,
-            "Supported import formats are FBX, OBJ, PNG, JPEG, TGA, "
-            "HDR, BMP, DDS, and EXR.",
+            "Supported import formats are FBX, OBJ, glTF, GLB, DAE, PLY, "
+            "STL, 3DS, PNG, JPEG, TGA, HDR, BMP, DDS, and EXR.",
             source));
     }
     auto context = prepare_import(source, options, source_kind);

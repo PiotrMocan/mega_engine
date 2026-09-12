@@ -1,5 +1,47 @@
 # MCP control plane
 
+## Editor authoring profile
+
+`vulkan_editor` использует тот же bounded stdio transport, но публикует отдельный
+набор authoring tools:
+
+```bat
+build\windows-debug\bin\vulkan_editor.exe --mcp-stdio --no-validation
+```
+
+| Toolset | Инструменты |
+| --- | --- |
+| `editor` | `get_state` |
+| `editor.scene` | `list_nodes`, `get_node`, `create_node`, `update_node`, `delete_node`, `reparent_node`, `save` |
+| `editor.history` | `undo`, `redo` |
+| `editor.assets` | `list`, `import` |
+| `editor.landscape` | `create_flat_ground`, `scatter_model` |
+| `capture` | `screenshot` |
+| `engine` | `quit` |
+
+Hierarchy и asset listing пагинируются (`offset`, `limit`, максимум 1000).
+Node handles содержат `index` и `generation`; после delete/undo/redo старый
+handle нужно считать недействительным и снова получить через list/get. Import
+ставится в background queue, а его состояние возвращает `editor.get_state`.
+`create_node`/`update_node` принимают transform и visibility; для cube/ground
+также доступны `base_color`, `metallic`, `roughness` и `ambient_occlusion`.
+`scatter_model` принимает cooked `*.vcrasset.json`, count до 10 000, seed,
+центр/размер XZ-области и scale range. Повторный вызов с теми же параметрами
+создаёт те же transforms, но новые nodes.
+
+Нативный smoke editor-profile:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File `
+  scripts\editor_mcp_smoke.ps1 `
+  -ExePath build\windows-debug\bin\vulkan_editor.exe
+```
+
+Editor MCP изменяет только текущий authoring document. Запись canonical JSON
+происходит исключительно через явный `editor.scene.save`.
+
+## Runtime profile
+
 `vulkan_cube` может работать как локальный MCP stdio server. Режим запускается
 явно, поэтому обычный renderer и benchmark не получают фонового потока, JSON
 parser, queue polling или screenshot usage flag:

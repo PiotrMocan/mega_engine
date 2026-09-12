@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <initializer_list>
 #include <limits>
 #include <optional>
 #include <span>
@@ -38,7 +39,7 @@ using namespace std::chrono_literals;
 
 constexpr std::string_view protocol_version{"2025-11-25"};
 constexpr std::size_t maximum_input_message_bytes = 1024U * 1024U;
-constexpr std::array<std::string_view, 21> tool_names{
+constexpr std::array<std::string_view, 21> runtime_tool_names{
     "debug.get_capabilities",
     "debug.get_state",
     "debug.get_metrics",
@@ -59,6 +60,25 @@ constexpr std::array<std::string_view, 21> tool_names{
     "input.mouse_move",
     "input.mouse_button",
     "input.release_all",
+    "engine.quit",
+};
+
+constexpr std::array<std::string_view, 16> editor_tool_names{
+    "editor.get_state",
+    "editor.scene.list_nodes",
+    "editor.scene.get_node",
+    "editor.scene.create_node",
+    "editor.scene.update_node",
+    "editor.scene.delete_node",
+    "editor.scene.reparent_node",
+    "editor.scene.save",
+    "editor.history.undo",
+    "editor.history.redo",
+    "editor.assets.list",
+    "editor.assets.import",
+    "editor.landscape.create_flat_ground",
+    "editor.landscape.scatter_model",
+    "capture.screenshot",
     "engine.quit",
 };
 
@@ -307,7 +327,7 @@ private:
     };
 }
 
-[[nodiscard]] Json make_tools() {
+[[nodiscard]] Json make_runtime_tools() {
     const Json action_schema{
         {"type", "string"},
         {"enum", Json::array({"down", "up", "press"})},
@@ -549,9 +569,212 @@ private:
     return tools;
 }
 
-[[nodiscard]] bool is_known_tool(const std::string_view name) noexcept {
-    return std::find(tool_names.begin(), tool_names.end(), name) !=
-           tool_names.end();
+[[nodiscard]] Json make_editor_tools() {
+    const Json handle_schema = object_schema(
+        Json{
+            {"index", Json{{"type", "integer"}, {"minimum", 0}}},
+            {"generation", Json{{"type", "integer"}, {"minimum", 1}}},
+        },
+        Json::array({"index", "generation"}));
+    const Json optional_parent_schema{
+        {"anyOf", Json::array({handle_schema, Json{{"type", "null"}}})},
+    };
+    const Json vec3_schema{
+        {"type", "array"},
+        {"items", Json{{"type", "number"}}},
+        {"minItems", 3},
+        {"maxItems", 3},
+    };
+    const Json color_schema{
+        {"type", "array"},
+        {"items", Json{
+            {"type", "number"}, {"minimum", 0.0}, {"maximum", 1.0}}},
+        {"minItems", 4},
+        {"maxItems", 4},
+    };
+    const Json kind_schema{
+        {"type", "string"},
+        {"enum", Json::array({
+            "folder", "cube", "ground", "terrain", "camera",
+            "directional_light", "environment", "model",
+        })},
+    };
+    Json tools = Json::array();
+    tools.push_back(tool_definition(
+        "editor.get_state", "Get editor state",
+        "Return the live authoring state, revisions, history, asset root, and import status.",
+        object_schema(), true, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.list_nodes", "List scene nodes",
+        "Return a stable preorder page of authored nodes and generational handles.",
+        object_schema(Json{
+            {"offset", Json{{"type", "integer"}, {"minimum", 0}}},
+            {"limit", Json{{"type", "integer"}, {"minimum", 1}, {"maximum", 1000}}},
+        }), true, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.get_node", "Get scene node",
+        "Return all authored properties for one generational node handle.",
+        object_schema(Json{{"id", handle_schema}}, Json::array({"id"})),
+        true, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.create_node", "Create scene node",
+        "Create a node with an optional parent, transform, visibility, and model asset path.",
+        object_schema(
+            Json{
+                {"name", Json{{"type", "string"}, {"minLength", 1},
+                               {"maxLength", max_scene_node_name_bytes}}},
+                {"kind", kind_schema},
+                {"parent", optional_parent_schema},
+                {"asset_path", Json{{"type", "string"},
+                                      {"maxLength", max_scene_asset_path_bytes}}},
+                {"visible", Json{{"type", "boolean"}}},
+                {"translation", vec3_schema},
+                {"rotation_degrees", vec3_schema},
+                {"scale", vec3_schema},
+                {"base_color", color_schema},
+                {"metallic", Json{{"type", "number"}, {"minimum", 0.0},
+                                     {"maximum", 1.0}}},
+                {"roughness", Json{{"type", "number"},
+                                      {"minimum", minimum_pbr_roughness},
+                                      {"maximum", 1.0}}},
+                {"ambient_occlusion", Json{{"type", "number"},
+                                              {"minimum", 0.0},
+                                              {"maximum", 1.0}}},
+            },
+            Json::array({"name", "kind"})),
+        false, false, false));
+    tools.push_back(tool_definition(
+        "editor.scene.update_node", "Update scene node",
+        "Patch authored node identity, visibility, transform, or model asset reference.",
+        object_schema(Json{
+            {"id", handle_schema},
+            {"name", Json{{"type", "string"}, {"minLength", 1},
+                           {"maxLength", max_scene_node_name_bytes}}},
+            {"asset_path", Json{{"type", "string"},
+                                  {"maxLength", max_scene_asset_path_bytes}}},
+            {"visible", Json{{"type", "boolean"}}},
+            {"translation", vec3_schema},
+            {"rotation_degrees", vec3_schema},
+            {"scale", vec3_schema},
+            {"base_color", color_schema},
+            {"metallic", Json{{"type", "number"}, {"minimum", 0.0},
+                                 {"maximum", 1.0}}},
+            {"roughness", Json{{"type", "number"},
+                                  {"minimum", minimum_pbr_roughness},
+                                  {"maximum", 1.0}}},
+            {"ambient_occlusion", Json{{"type", "number"},
+                                          {"minimum", 0.0},
+                                          {"maximum", 1.0}}},
+        }, Json::array({"id"})), false, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.delete_node", "Delete scene subtree",
+        "Delete one node and all descendants. The operation can be undone in editor history.",
+        object_schema(Json{{"id", handle_schema}}, Json::array({"id"})),
+        false, true, true));
+    tools.push_back(tool_definition(
+        "editor.scene.reparent_node", "Reparent scene node",
+        "Move a node below another node or to the scene root; hierarchy cycles are rejected.",
+        object_schema(
+            Json{{"id", handle_schema}, {"parent", optional_parent_schema}},
+            Json::array({"id", "parent"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.save", "Save authored scene",
+        "Atomically save the canonical editor/game scene JSON.",
+        object_schema(), false, false, true));
+    tools.push_back(tool_definition(
+        "editor.history.undo", "Undo scene edit",
+        "Undo the latest bounded editor scene transaction.",
+        object_schema(), false, false, false));
+    tools.push_back(tool_definition(
+        "editor.history.redo", "Redo scene edit",
+        "Redo the latest undone editor scene transaction.",
+        object_schema(), false, false, false));
+    tools.push_back(tool_definition(
+        "editor.assets.list", "List assets",
+        "List one sandboxed directory below the project asset root.",
+        object_schema(Json{
+            {"directory", Json{{"type", "string"},
+                               {"maxLength", max_scene_asset_path_bytes}}},
+            {"offset", Json{{"type", "integer"}, {"minimum", 0}}},
+            {"limit", Json{{"type", "integer"}, {"minimum", 1}, {"maximum", 1000}}},
+        }),
+        true, false, true));
+    tools.push_back(tool_definition(
+        "editor.assets.import", "Import source asset",
+        "Queue a transactional background import into a directory below the asset root.",
+        object_schema(
+            Json{
+                {"source_path", Json{{"type", "string"}, {"minLength", 1},
+                                      {"maxLength", max_scene_asset_path_bytes}}},
+                {"destination_directory", Json{{"type", "string"},
+                                                {"maxLength", McpCommand::secondary_text_capacity - 1U}}},
+            },
+            Json::array({"source_path"})),
+        false, false, false));
+    tools.push_back(tool_definition(
+        "editor.landscape.create_flat_ground", "Create flat terrain",
+        "Create an explicitly sized flat authored ground plane.",
+        object_schema(
+            Json{
+                {"name", Json{{"type", "string"}, {"minLength", 1},
+                               {"maxLength", max_scene_node_name_bytes}}},
+                {"parent", optional_parent_schema},
+                {"center", vec3_schema},
+                {"width", Json{{"type", "number"}, {"exclusiveMinimum", 0}}},
+                {"depth", Json{{"type", "number"}, {"exclusiveMinimum", 0}}},
+            },
+            Json::array({"width", "depth"})),
+        false, false, false));
+    tools.push_back(tool_definition(
+        "editor.landscape.scatter_model", "Scatter model instances",
+        "Deterministically scatter an imported model over a flat XZ area using a seed.",
+        object_schema(
+            Json{
+                {"asset_path", Json{{"type", "string"}, {"minLength", 1},
+                                     {"maxLength", max_scene_asset_path_bytes}}},
+                {"name_prefix", Json{{"type", "string"}, {"minLength", 1},
+                                     {"maxLength", max_scene_node_name_bytes - 11U}}},
+                {"parent", optional_parent_schema},
+                {"center", vec3_schema},
+                {"width", Json{{"type", "number"}, {"exclusiveMinimum", 0}}},
+                {"depth", Json{{"type", "number"}, {"exclusiveMinimum", 0}}},
+                {"minimum_scale", Json{{"type", "number"}, {"exclusiveMinimum", 0}}},
+                {"maximum_scale", Json{{"type", "number"}, {"exclusiveMinimum", 0}}},
+                {"count", Json{{"type", "integer"}, {"minimum", 1}, {"maximum", 10000}}},
+                {"seed", Json{{"type", "integer"}, {"minimum", 0},
+                               {"maximum", std::numeric_limits<std::uint32_t>::max()}}},
+            },
+            Json::array({"asset_path", "count", "seed", "width", "depth"})),
+        false, false, false));
+    tools.push_back(tool_definition(
+        "capture.screenshot", "Capture editor window",
+        "Capture the next completed editor swapchain image as PNG image content.",
+        object_schema(), true, false, false));
+    tools.push_back(tool_definition(
+        "engine.quit", "Quit the editor",
+        "Gracefully stop the editor after this tool response is delivered.",
+        object_schema(), false, true, true));
+    return tools;
+}
+
+[[nodiscard]] Json make_tools(const McpServerProfile profile) {
+    return profile == McpServerProfile::editor
+        ? make_editor_tools()
+        : make_runtime_tools();
+}
+
+[[nodiscard]] bool is_known_tool(
+    const McpServerProfile profile,
+    const std::string_view name) noexcept {
+    if (profile == McpServerProfile::editor) {
+        return std::find(
+                   editor_tool_names.begin(), editor_tool_names.end(), name) !=
+            editor_tool_names.end();
+    }
+    return std::find(
+               runtime_tool_names.begin(), runtime_tool_names.end(), name) !=
+        runtime_tool_names.end();
 }
 
 [[nodiscard]] std::optional<std::uint32_t> get_u32(
@@ -642,7 +865,561 @@ private:
     return std::nullopt;
 }
 
+[[nodiscard]] bool copy_command_text(
+    const std::string_view source,
+    const std::span<char> destination,
+    std::string& error,
+    const std::string_view field_name) {
+    if (source.size() >= destination.size() ||
+        source.find('\0') != std::string_view::npos) {
+        error = std::string(field_name) + " exceeds the bounded UTF-8 payload";
+        return false;
+    }
+    std::memcpy(destination.data(), source.data(), source.size());
+    destination[source.size()] = '\0';
+    return true;
+}
+
+[[nodiscard]] bool only_keys(
+    const Json& arguments,
+    const std::initializer_list<std::string_view> allowed) {
+    for (const auto& [key, value] : arguments.items()) {
+        static_cast<void>(value);
+        if (std::find(allowed.begin(), allowed.end(), key) == allowed.end()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] bool parse_node_handle(
+    const Json& value,
+    SceneNodeId& output) {
+    if (!value.is_object() || value.size() != 2U) {
+        return false;
+    }
+    const auto index = get_u32(
+        value, "index", 0U, std::numeric_limits<std::uint32_t>::max());
+    const auto generation = get_u32(
+        value, "generation", 1U, std::numeric_limits<std::uint32_t>::max());
+    if (!index || !generation) {
+        return false;
+    }
+    output = SceneNodeId{.index = *index, .generation = *generation};
+    return true;
+}
+
+[[nodiscard]] bool parse_optional_parent(
+    const Json& arguments,
+    McpCommand& command,
+    const bool required,
+    std::string& error) {
+    const auto iterator = arguments.find("parent");
+    if (iterator == arguments.end()) {
+        if (required) {
+            error = "parent must be a node handle or null";
+            return false;
+        }
+        return true;
+    }
+    command.parent_supplied = true;
+    if (iterator->is_null()) {
+        command.parent_id = {};
+        return true;
+    }
+    if (!parse_node_handle(*iterator, command.parent_id)) {
+        error = "parent must contain uint32 index and nonzero generation";
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] bool parse_vec3(
+    const Json& arguments,
+    const std::string_view name,
+    glm::vec3& output) {
+    const auto iterator = arguments.find(name);
+    if (iterator == arguments.end() || !iterator->is_array() ||
+        iterator->size() != 3U) {
+        return false;
+    }
+    glm::vec3 parsed{};
+    for (std::size_t index = 0U; index < 3U; ++index) {
+        if (!(*iterator)[index].is_number()) {
+            return false;
+        }
+        const double value = (*iterator)[index].get<double>();
+        if (!std::isfinite(value) ||
+            std::abs(value) > static_cast<double>(std::numeric_limits<float>::max())) {
+            return false;
+        }
+        parsed[static_cast<glm::length_t>(index)] = static_cast<float>(value);
+    }
+    output = parsed;
+    return true;
+}
+
+[[nodiscard]] bool parse_color(
+    const Json& arguments,
+    const std::string_view name,
+    glm::vec4& output) {
+    const auto iterator = arguments.find(name);
+    if (iterator == arguments.end() || !iterator->is_array() ||
+        iterator->size() != 4U) {
+        return false;
+    }
+    glm::vec4 parsed{};
+    for (std::size_t index = 0U; index < 4U; ++index) {
+        if (!(*iterator)[index].is_number()) {
+            return false;
+        }
+        const double value = (*iterator)[index].get<double>();
+        if (!std::isfinite(value) || value < 0.0 || value > 1.0) {
+            return false;
+        }
+        parsed[static_cast<glm::length_t>(index)] = static_cast<float>(value);
+    }
+    output = parsed;
+    return true;
+}
+
+[[nodiscard]] std::optional<float> get_finite_float(
+    const Json& arguments,
+    const std::string_view name,
+    const float minimum,
+    const float maximum) {
+    const auto iterator = arguments.find(name);
+    if (iterator == arguments.end() || !iterator->is_number()) {
+        return std::nullopt;
+    }
+    const double value = iterator->get<double>();
+    if (!std::isfinite(value) || value < minimum || value > maximum) {
+        return std::nullopt;
+    }
+    return static_cast<float>(value);
+}
+
+[[nodiscard]] std::optional<SceneNodeKind> parse_node_kind(
+    const std::string_view value) noexcept {
+    if (value == "folder") return SceneNodeKind::folder;
+    if (value == "cube") return SceneNodeKind::cube;
+    if (value == "ground") return SceneNodeKind::ground;
+    if (value == "terrain") return SceneNodeKind::terrain;
+    if (value == "camera") return SceneNodeKind::camera;
+    if (value == "directional_light") return SceneNodeKind::directional_light;
+    if (value == "environment") return SceneNodeKind::environment;
+    if (value == "model") return SceneNodeKind::model;
+    return std::nullopt;
+}
+
+[[nodiscard]] bool parse_optional_material_fields(
+    const Json& arguments,
+    McpCommand& command,
+    std::string& error) {
+    if (arguments.contains("base_color")) {
+        if (!parse_color(
+                arguments, "base_color", command.material.base_color)) {
+            error = "base_color must contain four finite values from 0 through 1";
+            return false;
+        }
+        command.edit_mask |= McpCommand::edit_base_color;
+    }
+    const auto parse_factor = [&](const std::string_view key,
+                                  float& output,
+                                  const float minimum,
+                                  const std::uint32_t mask) {
+        if (!arguments.contains(key)) {
+            return true;
+        }
+        const auto value = get_finite_float(
+            arguments, key, minimum, 1.0F);
+        if (!value) {
+            error = std::string(key) + " must be finite and within its PBR range";
+            return false;
+        }
+        output = *value;
+        command.edit_mask |= mask;
+        return true;
+    };
+    return parse_factor(
+               "metallic", command.material.metallic, 0.0F,
+               McpCommand::edit_metallic) &&
+        parse_factor(
+               "roughness", command.material.roughness,
+               minimum_pbr_roughness, McpCommand::edit_roughness) &&
+        parse_factor(
+               "ambient_occlusion", command.material.ambient_occlusion, 0.0F,
+               McpCommand::edit_ambient_occlusion);
+}
+
+[[nodiscard]] bool command_from_editor_tool(
+    const std::string_view name,
+    const Json& arguments,
+    McpCommand& command,
+    std::string& error) {
+    const auto require_empty = [&]() {
+        if (!arguments.empty()) {
+            error = "this tool accepts no arguments";
+            return false;
+        }
+        return true;
+    };
+    if (name == "editor.get_state") {
+        command.type = McpCommandType::editor_get_state;
+        return require_empty();
+    }
+    if (name == "capture.screenshot") {
+        command.type = McpCommandType::capture_screenshot;
+        return require_empty();
+    }
+    if (name == "engine.quit") {
+        command.type = McpCommandType::engine_request_quit;
+        return require_empty();
+    }
+    if (name == "editor.scene.save") {
+        command.type = McpCommandType::editor_save_scene;
+        return require_empty();
+    }
+    if (name == "editor.history.undo" || name == "editor.history.redo") {
+        command.type = name == "editor.history.undo"
+            ? McpCommandType::editor_undo
+            : McpCommandType::editor_redo;
+        return require_empty();
+    }
+    if (name == "editor.scene.list_nodes") {
+        if (!only_keys(arguments, {"offset", "limit"})) {
+            error = "only offset and limit are accepted";
+            return false;
+        }
+        command.type = McpCommandType::editor_list_nodes;
+        command.value = 0U;
+        command.count = 200U;
+        if (arguments.contains("offset")) {
+            const auto offset = get_u32(
+                arguments, "offset", 0U,
+                std::numeric_limits<std::uint32_t>::max());
+            if (!offset) {
+                error = "offset must be a uint32";
+                return false;
+            }
+            command.value = *offset;
+        }
+        if (arguments.contains("limit")) {
+            const auto limit = get_u32(arguments, "limit", 1U, 1000U);
+            if (!limit) {
+                error = "limit must be from 1 through 1000";
+                return false;
+            }
+            command.count = *limit;
+        }
+        return true;
+    }
+    if (name == "editor.scene.get_node" ||
+        name == "editor.scene.delete_node") {
+        if (arguments.size() != 1U || !arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "id must be the only argument and contain index/generation";
+            return false;
+        }
+        command.type = name == "editor.scene.get_node"
+            ? McpCommandType::editor_get_node
+            : McpCommandType::editor_delete_node;
+        return true;
+    }
+    if (name == "editor.scene.reparent_node") {
+        if (!only_keys(arguments, {"id", "parent"}) ||
+            arguments.size() != 2U || !arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id) ||
+            !parse_optional_parent(arguments, command, true, error)) {
+            if (error.empty()) {
+                error = "id and parent are required node handles; parent may be null";
+            }
+            return false;
+        }
+        command.type = McpCommandType::editor_reparent_node;
+        return true;
+    }
+    if (name == "editor.scene.create_node") {
+        if (!only_keys(arguments, {
+                "name", "kind", "parent", "asset_path", "visible",
+                "translation", "rotation_degrees", "scale", "base_color",
+                "metallic", "roughness", "ambient_occlusion"})) {
+            error = "create_node contains an unknown argument";
+            return false;
+        }
+        const auto node_name = get_string(arguments, "name");
+        const auto kind_text = get_string(arguments, "kind");
+        const auto kind = kind_text ? parse_node_kind(*kind_text) : std::nullopt;
+        if (!node_name || node_name->empty() || !kind ||
+            !copy_command_text(*node_name, command.name, error, "name") ||
+            !parse_optional_parent(arguments, command, false, error)) {
+            if (error.empty()) {
+                error = "name and a supported kind are required";
+            }
+            return false;
+        }
+        command.type = McpCommandType::editor_create_node;
+        command.node_kind = *kind;
+        if (arguments.contains("asset_path")) {
+            const auto path = get_string(arguments, "asset_path");
+            if (!path || !copy_command_text(*path, command.text, error, "asset_path")) {
+                return false;
+            }
+            command.edit_mask |= McpCommand::edit_asset_path;
+        }
+        if (arguments.contains("visible")) {
+            const auto visible = get_bool(arguments, "visible");
+            if (!visible) {
+                error = "visible must be a boolean";
+                return false;
+            }
+            command.enabled = *visible;
+            command.edit_mask |= McpCommand::edit_visible;
+        }
+        const auto parse_optional_vec = [&](const std::string_view key,
+                                             glm::vec3& output,
+                                             const std::uint32_t mask) {
+            if (!arguments.contains(key)) return true;
+            if (!parse_vec3(arguments, key, output)) {
+                error = std::string(key) + " must contain three finite numbers";
+                return false;
+            }
+            command.edit_mask |= mask;
+            return true;
+        };
+        return parse_optional_vec("translation", command.transform.translation,
+                                  McpCommand::edit_translation) &&
+            parse_optional_vec("rotation_degrees", command.transform.rotation_degrees,
+                               McpCommand::edit_rotation) &&
+            parse_optional_vec("scale", command.transform.scale,
+                               McpCommand::edit_scale) &&
+            parse_optional_material_fields(arguments, command, error);
+    }
+    if (name == "editor.scene.update_node") {
+        if (!only_keys(arguments, {
+                "id", "name", "asset_path", "visible", "translation",
+                "rotation_degrees", "scale", "base_color", "metallic",
+                "roughness", "ambient_occlusion"}) ||
+            !arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "update_node requires a valid id and known patch fields";
+            return false;
+        }
+        command.type = McpCommandType::editor_update_node;
+        if (arguments.contains("name")) {
+            const auto value = get_string(arguments, "name");
+            if (!value || value->empty() ||
+                !copy_command_text(*value, command.name, error, "name")) {
+                return false;
+            }
+            command.edit_mask |= McpCommand::edit_name;
+        }
+        if (arguments.contains("asset_path")) {
+            const auto value = get_string(arguments, "asset_path");
+            if (!value || !copy_command_text(*value, command.text, error, "asset_path")) {
+                return false;
+            }
+            command.edit_mask |= McpCommand::edit_asset_path;
+        }
+        if (arguments.contains("visible")) {
+            const auto value = get_bool(arguments, "visible");
+            if (!value) {
+                error = "visible must be a boolean";
+                return false;
+            }
+            command.enabled = *value;
+            command.edit_mask |= McpCommand::edit_visible;
+        }
+        const auto parse_optional_vec = [&](const std::string_view key,
+                                             glm::vec3& output,
+                                             const std::uint32_t mask) {
+            if (!arguments.contains(key)) return true;
+            if (!parse_vec3(arguments, key, output)) {
+                error = std::string(key) + " must contain three finite numbers";
+                return false;
+            }
+            command.edit_mask |= mask;
+            return true;
+        };
+        if (!parse_optional_vec("translation", command.transform.translation,
+                                McpCommand::edit_translation) ||
+            !parse_optional_vec("rotation_degrees", command.transform.rotation_degrees,
+                                McpCommand::edit_rotation) ||
+            !parse_optional_vec("scale", command.transform.scale,
+                                McpCommand::edit_scale) ||
+            !parse_optional_material_fields(arguments, command, error)) {
+            return false;
+        }
+        if (command.edit_mask == 0U) {
+            error = "update_node requires at least one patch field";
+            return false;
+        }
+        return true;
+    }
+    if (name == "editor.assets.list") {
+        if (!only_keys(arguments, {"directory", "offset", "limit"})) {
+            error = "only directory, offset, and limit are accepted";
+            return false;
+        }
+        command.type = McpCommandType::editor_list_assets;
+        command.value = 0U;
+        command.count = 200U;
+        if (arguments.contains("directory")) {
+            const auto directory = get_string(arguments, "directory");
+            if (!directory ||
+                !copy_command_text(*directory, command.text, error, "directory")) {
+                return false;
+            }
+        }
+        if (arguments.contains("offset")) {
+            const auto offset = get_u32(
+                arguments, "offset", 0U,
+                std::numeric_limits<std::uint32_t>::max());
+            if (!offset) {
+                error = "offset must be a uint32";
+                return false;
+            }
+            command.value = *offset;
+        }
+        if (arguments.contains("limit")) {
+            const auto limit = get_u32(arguments, "limit", 1U, 1000U);
+            if (!limit) {
+                error = "limit must be from 1 through 1000";
+                return false;
+            }
+            command.count = *limit;
+        }
+        return true;
+    }
+    if (name == "editor.assets.import") {
+        if (!only_keys(arguments, {"source_path", "destination_directory"})) {
+            error = "only source_path and destination_directory are accepted";
+            return false;
+        }
+        const auto source = get_string(arguments, "source_path");
+        if (!source || source->empty() ||
+            !copy_command_text(*source, command.text, error, "source_path")) {
+            return false;
+        }
+        if (arguments.contains("destination_directory")) {
+            const auto destination = get_string(arguments, "destination_directory");
+            if (!destination || !copy_command_text(
+                    *destination, command.secondary_text, error,
+                    "destination_directory")) {
+                return false;
+            }
+        }
+        command.type = McpCommandType::editor_import_asset;
+        return true;
+    }
+    if (name == "editor.landscape.create_flat_ground") {
+        if (!only_keys(arguments, {"name", "parent", "center", "width", "depth"}) ||
+            !parse_optional_parent(arguments, command, false, error)) {
+            if (error.empty()) error = "flat-ground arguments are invalid";
+            return false;
+        }
+        const auto width = get_finite_float(arguments, "width", 0.001F, 8192.0F);
+        const auto depth = get_finite_float(arguments, "depth", 0.001F, 8192.0F);
+        if (!width || !depth) {
+            error = "width and depth must be finite positive values up to 8192";
+            return false;
+        }
+        if (arguments.contains("center") &&
+            !parse_vec3(arguments, "center", command.transform.translation)) {
+            error = "center must contain three finite numbers";
+            return false;
+        }
+        const auto optional_name = get_string(arguments, "name");
+        if (arguments.contains("name") && !optional_name) {
+            error = "name must be a string";
+            return false;
+        }
+        const std::string_view ground_name = optional_name
+            ? *optional_name
+            : std::string_view{"Flat Terrain"};
+        if (ground_name.empty() ||
+            !copy_command_text(ground_name, command.name, error, "name")) {
+            return false;
+        }
+        command.type = McpCommandType::editor_create_flat_ground;
+        command.extent_x = *width;
+        command.extent_z = *depth;
+        return true;
+    }
+    if (name == "editor.landscape.scatter_model") {
+        if (!only_keys(arguments, {
+                "asset_path", "name_prefix", "parent", "center", "width",
+                "depth", "minimum_scale", "maximum_scale", "count", "seed"}) ||
+            !parse_optional_parent(arguments, command, false, error)) {
+            if (error.empty()) error = "scatter arguments are invalid";
+            return false;
+        }
+        const auto asset_path = get_string(arguments, "asset_path");
+        const auto count = get_u32(arguments, "count", 1U, 10'000U);
+        const auto seed = get_u32(
+            arguments, "seed", 0U, std::numeric_limits<std::uint32_t>::max());
+        const auto width = get_finite_float(arguments, "width", 0.001F, 8192.0F);
+        const auto depth = get_finite_float(arguments, "depth", 0.001F, 8192.0F);
+        if (!asset_path || !count || !seed || !width || !depth ||
+            !copy_command_text(*asset_path, command.text, error, "asset_path")) {
+            if (error.empty()) error = "asset_path, count, seed, width, and depth are required";
+            return false;
+        }
+        const auto optional_prefix = get_string(arguments, "name_prefix");
+        if (arguments.contains("name_prefix") && !optional_prefix) {
+            error = "name_prefix must be a string";
+            return false;
+        }
+        const std::string_view prefix = optional_prefix
+            ? *optional_prefix
+            : std::string_view{"Plant"};
+        if (prefix.empty() ||
+            !copy_command_text(prefix, command.name, error, "name_prefix")) {
+            return false;
+        }
+        if (arguments.contains("center") &&
+            !parse_vec3(arguments, "center", command.transform.translation)) {
+            error = "center must contain three finite numbers";
+            return false;
+        }
+        command.minimum_scale = 0.8F;
+        command.maximum_scale = 1.2F;
+        if (arguments.contains("minimum_scale")) {
+            const auto value = get_finite_float(
+                arguments, "minimum_scale", 0.001F, 100.0F);
+            if (!value) {
+                error = "minimum_scale must be positive and at most 100";
+                return false;
+            }
+            command.minimum_scale = *value;
+        }
+        if (arguments.contains("maximum_scale")) {
+            const auto value = get_finite_float(
+                arguments, "maximum_scale", 0.001F, 100.0F);
+            if (!value) {
+                error = "maximum_scale must be positive and at most 100";
+                return false;
+            }
+            command.maximum_scale = *value;
+        }
+        if (command.minimum_scale > command.maximum_scale) {
+            error = "minimum_scale must not exceed maximum_scale";
+            return false;
+        }
+        command.type = McpCommandType::editor_scatter_model;
+        command.count = *count;
+        command.seed = *seed;
+        command.extent_x = *width;
+        command.extent_z = *depth;
+        return true;
+    }
+
+    error = "unknown editor tool";
+    return false;
+}
+
 [[nodiscard]] bool command_from_tool(
+    const McpServerProfile profile,
     const std::string_view name,
     const Json& arguments,
     const std::uint64_t token,
@@ -650,6 +1427,10 @@ private:
     std::string& error) {
     command = {};
     command.token = token;
+
+    if (profile == McpServerProfile::editor) {
+        return command_from_editor_tool(name, arguments, command, error);
+    }
 
     const auto require_empty = [&]() {
         if (!arguments.empty()) {
@@ -1118,23 +1899,36 @@ void McpServer::run(const std::stop_token stop_token) noexcept {
                     }
                     continue;
                 }
+                const bool editor_profile =
+                    profile_ == McpServerProfile::editor;
                 const Json result{
                     {"protocolVersion", protocol_version},
                     {"capabilities", Json{
                         {"tools", Json{{"listChanged", false}}},
                     }},
                     {"serverInfo", Json{
-                        {"name", "vulkan-cube-renderer"},
-                        {"title", "Vulkan Cube AI Control Plane"},
-                        {"version", "0.2.0"},
+                        {"name", editor_profile
+                            ? "vulkan-cube-editor"
+                            : "vulkan-cube-renderer"},
+                        {"title", editor_profile
+                            ? "Vulkan Cube AI Level Editor"
+                            : "Vulkan Cube AI Control Plane"},
+                        {"version", "0.3.0"},
                         {"description",
-                         "Low-overhead MCP control plane for the Vulkan renderer"},
+                         editor_profile
+                            ? "Live MCP authoring plane for static game levels"
+                            : "Low-overhead MCP control plane for the Vulkan renderer"},
                     }},
                     {"instructions",
-                     "Use debug and test tools to inspect state, render/window "
-                     "tools for idempotent controls, capture.screenshot for "
-                     "visual verification, and input tools for deterministic "
-                     "engine-local input injection."},
+                     editor_profile
+                        ? "Inspect nodes and assets before editing. Use generational "
+                          "handles returned by list/get, batch vegetation through "
+                          "landscape.scatter_model, save explicitly, and visually "
+                          "verify with capture.screenshot."
+                        : "Use debug and test tools to inspect state, render/window "
+                          "tools for idempotent controls, capture.screenshot for "
+                          "visual verification, and input tools for deterministic "
+                          "engine-local input injection."},
                 };
                 if (!write_message(rpc_response(id, result))) {
                     break;
@@ -1157,7 +1951,7 @@ void McpServer::run(const std::stop_token stop_token) noexcept {
             }
             if (method == "tools/list") {
                 if (!write_message(rpc_response(
-                        id, Json{{"tools", make_tools()}}))) {
+                        id, Json{{"tools", make_tools(profile_)}}))) {
                     break;
                 }
                 continue;
@@ -1206,7 +2000,7 @@ void McpServer::run(const std::stop_token stop_token) noexcept {
             }
             const std::string& tool_name =
                 name_iterator->get_ref<const std::string&>();
-            if (!is_known_tool(tool_name)) {
+            if (!is_known_tool(profile_, tool_name)) {
                 if (!write_message(rpc_error(
                         id, -32602, "unknown tool"))) {
                     break;
@@ -1218,6 +2012,7 @@ void McpServer::run(const std::stop_token stop_token) noexcept {
             std::string command_error;
             const std::uint64_t token = next_token++;
             if (!command_from_tool(
+                    profile_,
                     tool_name,
                     *arguments,
                     token,

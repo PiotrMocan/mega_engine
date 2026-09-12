@@ -1123,6 +1123,22 @@ void Application::execute_mcp_command(const McpCommand& command) {
             "all virtual input released",
             Json{{"released", true}});
         return;
+    case McpCommandType::editor_get_state:
+    case McpCommandType::editor_list_nodes:
+    case McpCommandType::editor_get_node:
+    case McpCommandType::editor_create_node:
+    case McpCommandType::editor_update_node:
+    case McpCommandType::editor_delete_node:
+    case McpCommandType::editor_reparent_node:
+    case McpCommandType::editor_save_scene:
+    case McpCommandType::editor_undo:
+    case McpCommandType::editor_redo:
+    case McpCommandType::editor_list_assets:
+    case McpCommandType::editor_import_asset:
+    case McpCommandType::editor_create_flat_ground:
+    case McpCommandType::editor_scatter_model:
+        fail("editor-only MCP command is unavailable in the runtime profile");
+        return;
     case McpCommandType::engine_request_quit:
         succeed(
             "engine shutdown accepted",

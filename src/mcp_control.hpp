@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cli_options.hpp"
+#include "scene_document.hpp"
 
 #include <array>
 #include <atomic>
@@ -34,6 +35,20 @@ enum class McpCommandType : std::uint8_t {
     input_mouse_move,
     input_mouse_button,
     input_release_all,
+    editor_get_state,
+    editor_list_nodes,
+    editor_get_node,
+    editor_create_node,
+    editor_update_node,
+    editor_delete_node,
+    editor_reparent_node,
+    editor_save_scene,
+    editor_undo,
+    editor_redo,
+    editor_list_assets,
+    editor_import_asset,
+    editor_create_flat_ground,
+    editor_scatter_model,
     engine_request_quit,
     engine_commit_quit,
 };
@@ -74,6 +89,20 @@ enum class McpMouseButton : std::uint8_t {
 };
 
 struct McpCommand {
+    static constexpr std::size_t text_capacity =
+        max_scene_asset_path_bytes + 1U;
+    static constexpr std::size_t secondary_text_capacity = 1'024U;
+    static constexpr std::uint32_t edit_name = 1U << 0U;
+    static constexpr std::uint32_t edit_visible = 1U << 1U;
+    static constexpr std::uint32_t edit_translation = 1U << 2U;
+    static constexpr std::uint32_t edit_rotation = 1U << 3U;
+    static constexpr std::uint32_t edit_scale = 1U << 4U;
+    static constexpr std::uint32_t edit_asset_path = 1U << 5U;
+    static constexpr std::uint32_t edit_base_color = 1U << 6U;
+    static constexpr std::uint32_t edit_metallic = 1U << 7U;
+    static constexpr std::uint32_t edit_roughness = 1U << 8U;
+    static constexpr std::uint32_t edit_ambient_occlusion = 1U << 9U;
+
     std::uint64_t token = 0;
     McpCommandType type = McpCommandType::debug_get_state;
     RunMode mode = RunMode::scene;
@@ -88,6 +117,25 @@ struct McpCommand {
     float mouse_delta_y = 0.0F;
     bool enabled = false;
     LightingSettings lighting{};
+    SceneNodeId node_id{};
+    SceneNodeId parent_id{};
+    SceneNodeKind node_kind = SceneNodeKind::folder;
+    SceneTransform transform{};
+    PbrMaterial material{};
+    std::array<char, max_scene_node_name_bytes + 1U> name{};
+    std::array<char, text_capacity> text{};
+    std::array<char, secondary_text_capacity> secondary_text{};
+    std::uint32_t edit_mask = 0U;
+    std::uint32_t count = 0U;
+    std::uint32_t seed = 0U;
+    float center_x = 0.0F;
+    float center_y = 0.0F;
+    float center_z = 0.0F;
+    float extent_x = 0.0F;
+    float extent_z = 0.0F;
+    float minimum_scale = 1.0F;
+    float maximum_scale = 1.0F;
+    bool parent_supplied = false;
 };
 
 static_assert(std::is_trivially_copyable_v<McpCommand>);

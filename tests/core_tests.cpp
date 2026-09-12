@@ -1,4 +1,5 @@
 #include "asset_browser.hpp"
+#include "editor_scene_tools.hpp"
 #include "cli_options.hpp"
 #include "fly_camera.hpp"
 #include "mcp_control.hpp"
@@ -826,6 +827,95 @@ int main() {
             scene.destroy_subtree(root) &&
                 scene.size() == 0U,
             "maximum-size subtree destruction is iterative");
+    }
+
+    {
+        vcr::SceneDocument scene;
+        const vcr::SceneNodeId root = scene.create_node(
+            "Landscape", vcr::SceneNodeKind::folder);
+        std::string error;
+        const vcr::SceneNodeId ground = vcr::create_flat_ground(
+            scene,
+            vcr::FlatGroundOptions{
+                .name = "Playable Ground",
+                .parent = root,
+                .center_x = 4.0F,
+                .height = -2.0F,
+                .center_z = -6.0F,
+                .width = 80.0F,
+                .depth = 40.0F,
+            },
+            error);
+        const auto ground_node = scene.node(ground);
+        expect(
+            ground && error.empty() && ground_node &&
+                ground_node->get().kind == vcr::SceneNodeKind::ground &&
+                close_to(ground_node->get().transform.translation.y, -2.0, 0.0001) &&
+                close_to(ground_node->get().transform.scale.x, 40.0, 0.0001) &&
+                close_to(ground_node->get().transform.scale.z, 20.0, 0.0001),
+            "flat terrain tool creates an explicitly sized ground plane");
+
+        vcr::ModelScatterOptions scatter{
+            .asset_path = "plants/fern/fern.vcrasset.json",
+            .name_prefix = "Fern",
+            .parent = root,
+            .base_transform = vcr::SceneTransform{
+                .translation = glm::vec3(0.25F, 0.5F, -0.25F),
+                .rotation_degrees = glm::vec3(0.0F, 15.0F, 0.0F),
+                .scale = glm::vec3(0.5F),
+            },
+            .center_x = 3.0F,
+            .height = -2.0F,
+            .center_z = -4.0F,
+            .width = 20.0F,
+            .depth = 12.0F,
+            .minimum_scale = 0.75F,
+            .maximum_scale = 1.25F,
+            .count = 32U,
+            .seed = 42U,
+        };
+        std::vector<vcr::SceneNodeId> first;
+        expect(
+            vcr::scatter_model_instances(scene, scatter, first, error) &&
+                error.empty() && first.size() == scatter.count,
+            "model scatter creates the requested bounded batch");
+        std::vector<vcr::SceneTransform> first_transforms;
+        first_transforms.reserve(first.size());
+        for (const vcr::SceneNodeId id : first) {
+            const auto node = scene.node(id);
+            if (node) {
+                first_transforms.push_back(node->get().transform);
+            }
+        }
+
+        vcr::SceneDocument repeat;
+        const vcr::SceneNodeId repeat_root = repeat.create_node(
+            "Landscape", vcr::SceneNodeKind::folder);
+        scatter.parent = repeat_root;
+        std::vector<vcr::SceneNodeId> second;
+        expect(
+            vcr::scatter_model_instances(repeat, scatter, second, error) &&
+                second.size() == first_transforms.size(),
+            "scatter can be reproduced in a fresh scene");
+        bool deterministic = second.size() == first_transforms.size();
+        for (std::size_t index = 0U;
+             deterministic && index < second.size(); ++index) {
+            const auto node = repeat.node(second[index]);
+            deterministic = node &&
+                node->get().transform == first_transforms[index] &&
+                node->get().asset_path == scatter.asset_path;
+        }
+        expect(
+            deterministic,
+            "scatter seed produces stable transforms independent of the STL RNG");
+
+        const std::uint32_t size_before_invalid = repeat.size();
+        scatter.minimum_scale = 2.0F;
+        scatter.maximum_scale = 1.0F;
+        expect(
+            !vcr::scatter_model_instances(repeat, scatter, second, error) &&
+                repeat.size() == size_before_invalid && second.empty(),
+            "invalid scatter is rejected without a partial scene mutation");
     }
 
     {

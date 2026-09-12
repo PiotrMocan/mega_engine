@@ -18,6 +18,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -101,6 +102,28 @@ public:
     void report_asset_error(std::string error) {
         asset_error_ = std::move(error);
     }
+    [[nodiscard]] bool scene_is_dirty(
+        const SceneDocument& scene) const noexcept;
+    void checkpoint_scene(const SceneDocument& scene);
+    [[nodiscard]] bool undo_scene(SceneDocument& scene);
+    [[nodiscard]] bool redo_scene(SceneDocument& scene);
+    [[nodiscard]] bool can_undo() const noexcept {
+        return !undo_history_.empty();
+    }
+    [[nodiscard]] bool can_redo() const noexcept {
+        return !redo_history_.empty();
+    }
+    [[nodiscard]] bool save_scene_external(
+        SceneDocument& scene,
+        std::string& error);
+    [[nodiscard]] bool queue_import_external(
+        const std::filesystem::path& source,
+        const std::filesystem::path& destination_directory,
+        std::string& error);
+    [[nodiscard]] bool asset_import_pending() const noexcept {
+        return import_activity_pending();
+    }
+    [[nodiscard]] std::string_view asset_import_status() const noexcept;
 
 private:
     void initialize_vulkan_backend(Renderer& renderer);
@@ -118,6 +141,9 @@ private:
     void build_external_game_window(
         std::chrono::steady_clock::time_point now);
     void build_assets(
+        SceneDocument& scene,
+        Renderer& renderer);
+    void build_landscape(
         SceneDocument& scene,
         Renderer& renderer);
     void build_import_window();
@@ -140,8 +166,7 @@ private:
     [[nodiscard]] bool import_activity_pending() const noexcept;
     void save_scene(SceneDocument& scene);
     void open_scene(SceneDocument& scene);
-    [[nodiscard]] bool scene_is_dirty(
-        const SceneDocument& scene) const noexcept;
+    void push_undo_snapshot(SceneDocument snapshot);
     void apply_deferred_scene_commands(SceneDocument& scene);
     void update_camera_input();
     void start_play(SceneDocument& scene);
@@ -190,6 +215,10 @@ private:
     SceneNodeId pending_reparent_child_{};
     SceneNodeId pending_reparent_parent_{};
     std::optional<SceneDocument> edit_scene_snapshot_{};
+    std::optional<SceneDocument> inspector_edit_snapshot_{};
+    static constexpr std::size_t maximum_history_entries = 32U;
+    std::vector<SceneDocument> undo_history_{};
+    std::vector<SceneDocument> redo_history_{};
     EditorPlayState play_state_ = EditorPlayState::edit;
     bool external_game_window_open_ = false;
     bool viewport_hovered_ = false;
@@ -224,6 +253,15 @@ private:
     std::optional<std::filesystem::path>
         pending_asset_directory_{};
     std::optional<AssetEntry> selected_asset_{};
+    std::array<char, 128> scatter_name_prefix_{};
+    std::vector<SceneNodeId> scatter_created_{};
+    std::uint32_t scatter_count_ = 100U;
+    std::uint32_t scatter_seed_ = 1U;
+    float scatter_center_[3]{0.0F, 0.0F, 0.0F};
+    float scatter_size_[2]{32.0F, 32.0F};
+    float scatter_scale_[2]{0.8F, 1.2F};
+    float flat_ground_size_[2]{64.0F, 64.0F};
+    float flat_ground_height_ = 0.0F;
     std::filesystem::path scene_path_{};
     std::string scene_file_name_{"editor_scene.json"};
     std::string scene_file_status_{};
