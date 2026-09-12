@@ -1,9 +1,10 @@
 param(
-    [ValidateSet('Compatibility','Visibility','Lod','Shadows','Default','Adaptive','Lighting','LightingStress','LightingVoxel')][string]$Suite='Visibility',
+    [ValidateSet('Compatibility','Visibility','Lod','Shadows','Default','Adaptive','Lighting','LightingStress','LightingVoxel','LightingQuality','LightingQualityStress')][string]$Suite='Visibility',
     [ValidateRange(3,20)][int]$Repeats=3,
     [ValidateRange(1,60)][int]$Warmup=5,
     [ValidateRange(2,300)][int]$Duration=15,
     [string]$BaselineExe='',
+    [ValidateSet('legacy','direct','voxel')][string[]]$LightingModes=@('legacy','direct','voxel'),
     [string]$OutputName='evolution-benchmark'
 )
 $ErrorActionPreference='Stop'
@@ -18,6 +19,22 @@ function Add-Case([string]$Name,[string]$Arguments,[string]$Executable=$exe) {
     $script:cases+=@{Name=$Name; Arguments=$Arguments; Executable=$Executable}
 }
 switch ($Suite) {
+    {$_ -in @('LightingQuality','LightingQualityStress')} {
+        if (-not $BaselineExe) {throw 'Provide the baseline executable and matching shaders/assets.'}
+        $baseline=(Resolve-Path -LiteralPath $BaselineExe).Path
+        foreach ($mode in $LightingModes) {
+            $arguments=switch($mode) {
+                'legacy' {'--aa off --lighting legacy'}
+                'direct' {'--aa off --lighting dynamic --gi off'}
+                'voxel' {'--aa off --lighting dynamic --gi voxel'}
+            }
+            if($Suite -eq 'LightingQualityStress') {
+                $arguments+=' --scene-count 100000 --animate-scene --animate-camera'
+            }
+            Add-Case "before-$mode" $arguments $baseline
+            Add-Case "after-$mode" $arguments
+        }
+    }
     'Compatibility' {
         if (-not $BaselineExe) { throw 'Provide the baseline executable with its matching shaders and runtime DLL.' }
         $baseline=(Resolve-Path -LiteralPath $BaselineExe).Path

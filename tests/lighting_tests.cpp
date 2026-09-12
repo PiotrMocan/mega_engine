@@ -30,6 +30,22 @@ int main() {
     }
     LightingSettings settings;
     expect(valid_lighting_settings(settings), "defaults valid");
+    const double initial_hour = settings.hour;
+    for (bool gi : {false, true}) {
+        settings.voxel_gi = gi;
+        settings.hour = initial_hour;
+        advance_lighting_clock(settings, 10.0, true);
+        expect(settings.hour == initial_hour && settings.cycle,
+               "pause freezes time without disabling cycle, with GI on and off");
+        advance_lighting_clock(settings, 10.0, false);
+        expect(settings.hour > initial_hour, "resume advances the same lighting clock");
+        settings.cycle = false;
+        const auto stopped_hour = settings.hour;
+        advance_lighting_clock(settings, 10.0, false);
+        expect(settings.hour == stopped_hour, "Advance time off stays stopped after resume");
+        settings.cycle = true;
+    }
+    settings.hour = initial_hour;
     settings.dynamic = false;
     expect(!valid_lighting_settings(settings), "voxel GI requires dynamic lighting");
     settings.voxel_gi = false;
@@ -112,18 +128,40 @@ int main() {
              {glm::vec3(0, 1, 0), glm::vec3(0, -1, 0), glm::normalize(glm::vec3(1, .01F, -.35F))}) {
             const auto matrices = shadow_cascades(view, aspect, direction);
             for (int cascade = 0; cascade < 4; ++cascade)
-                for (float z : {depths[cascade], depths[cascade + 1]})
+                for (float z :
+                     {cascade == 0 ? depths[0] : depths[cascade] * 0.9F, depths[cascade + 1]})
                     for (float x : {-1.0F, 1.0F})
                         for (float y : {-1.0F, 1.0F}) {
                             const float tangent = std::tan(glm::radians(65.0F) * .5F);
                             auto clip = matrices[cascade] * inverse *
                                         glm::vec4(x * z * tangent * aspect, y * z * tangent, -z, 1);
                             clip /= clip.w;
-                            expect(std::isfinite(clip.x) && std::abs(clip.x) <= 1.001F &&
-                                       std::abs(clip.y) <= 1.001F && clip.z >= 0 && clip.z <= 1,
+                            expect(std::isfinite(clip.x) &&
+                                       std::abs(clip.x) <= 1.0F - 4.0F / 1024 &&
+                                       std::abs(clip.y) <= 1.0F - 4.0F / 1024 && clip.z >= 0 &&
+                                       clip.z <= 1,
                                    "cascade covers receiver frustum even at vertical sun/extreme "
                                    "aspect");
                         }
         }
+    const auto direction = glm::normalize(glm::vec3(1, 2, -1));
+    const auto reference = shadow_cascades(view, 16.0F / 9, direction);
+    for (unsigned pose = 0; pose < 100; ++pose) {
+        const auto position =
+            glm::vec3(static_cast<float>(pose) * 2.17F, 7, -static_cast<float>(pose));
+        const auto moved_view =
+            glm::lookAt(position, position + glm::vec3(0.1F * pose, -1, -10), glm::vec3(0, 1, 0));
+        const auto moved = shadow_cascades(moved_view, 16.0F / 9, direction);
+        for (unsigned cascade = 0; cascade < 4; ++cascade) {
+            for (unsigned column = 0; column < 3; ++column)
+                expect(glm::length(moved[cascade][column] - reference[cascade][column]) < 1e-7F,
+                       "camera pose cannot change shadow scale or light basis");
+            for (unsigned axis = 0; axis < 2; ++axis) {
+                const float shift = (moved[cascade][3][axis] - reference[cascade][3][axis]) * 512;
+                expect(std::abs(shift - std::round(shift)) < 0.002F,
+                       "camera moves shadows by integer texels only");
+            }
+        }
+    }
     std::puts("Lighting invariants passed");
 }

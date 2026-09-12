@@ -27,6 +27,7 @@ struct SunState {
 [[nodiscard]] double wrap_day_hour(double hour) noexcept;
 [[nodiscard]] SunState evaluate_sun(double hour) noexcept;
 [[nodiscard]] bool valid_lighting_settings(const LightingSettings &settings) noexcept;
+void advance_lighting_clock(LightingSettings &settings, double seconds, bool paused) noexcept;
 inline constexpr unsigned gi_resolution = 64, gi_brick_size = 8, gi_bricks_axis = 8;
 inline constexpr unsigned gi_brick_count = 512;
 inline constexpr unsigned gi_max_triangles = 1'000'000;
@@ -37,6 +38,7 @@ struct alignas(16) LightingUniforms {
     std::array<glm::mat4, 4> shadow_matrices{};
     glm::mat4 camera_view{1.0F};
     glm::vec4 shadow_splits{12, 32, 80, 192};
+    glm::vec4 shadow_texel_depth{};
     glm::vec4 sun_direction_intensity{};
     glm::vec4 sun_color{};
     glm::vec4 sky_zenith{};
@@ -46,7 +48,7 @@ struct alignas(16) LightingUniforms {
     glm::vec4 options{};
     glm::vec4 volume_parameters{};
 };
-static_assert(sizeof(LightingUniforms) == 448);
+static_assert(sizeof(LightingUniforms) == 464);
 static_assert(sizeof(GiTriangle) == 48);
 struct LightingStatistics {
     std::uint64_t geometry_updates = 0, radiance_updates = 0;
@@ -101,5 +103,6 @@ class VoxelSceneTracker {
     std::vector<Bounds> world_bounds_{};
 };
 [[nodiscard]] std::array<glm::mat4, 4> shadow_cascades(const glm::mat4 &view, float aspect,
-                                                       glm::vec3 light_direction) noexcept;
+                                                       glm::vec3 light_direction,
+                                                       unsigned tile_resolution = 1024) noexcept;
 } // namespace vcr

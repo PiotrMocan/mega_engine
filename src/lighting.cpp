@@ -20,6 +20,10 @@ bool valid_lighting_settings(const LightingSettings &s) noexcept {
            s.triangle_budget <= 262144 && std::isfinite(s.gi_update_hz) && s.gi_update_hz >= 1 &&
            s.gi_update_hz <= 120;
 }
+void advance_lighting_clock(LightingSettings &settings, double seconds, bool paused) noexcept {
+    if (!paused && settings.dynamic && settings.cycle && std::isfinite(seconds) && seconds > 0)
+        settings.hour = wrap_day_hour(settings.hour + seconds * 24.0 / settings.day_seconds);
+}
 SunState evaluate_sun(double hour) noexcept {
     const float angle = static_cast<float>((wrap_day_hour(hour) - 6.0) * 3.141592653589793 / 12.0);
     const glm::vec3 d = glm::normalize(glm::vec3(std::cos(angle), std::sin(angle), -0.35F));
@@ -129,38 +133,37 @@ void VoxelSceneTracker::set_transform(SceneNodeId id, TransformRows transform,
             dirty.mark(bounds);
         }
 }
-std::array<glm::mat4, 4> shadow_cascades(const glm::mat4 &view, float aspect,
-                                         glm::vec3 direction) noexcept {
+std::array<glm::mat4, 4> shadow_cascades(const glm::mat4 &view, float aspect, glm::vec3 direction,
+                                         unsigned tile_resolution) noexcept {
+    assert(tile_resolution > 8);
     const glm::mat4 inverse = glm::inverse(view);
     constexpr std::array<float, 5> splits{0.1F, 12, 32, 80, 192};
     std::array<glm::mat4, 4> result{};
     const glm::vec3 up = std::abs(direction.y) > 0.98F ? glm::vec3(0, 0, 1) : glm::vec3(0, 1, 0);
     const float tangent = std::tan(glm::radians(65.0F) * 0.5F);
-    for (unsigned cascade = 0; cascade < 4; ++cascade) {
-        std::array<glm::vec3, 8> corners{};
-        glm::vec3 center(0);
-        unsigned index = 0;
-        for (float z : {splits[cascade], splits[cascade + 1]})
-            for (float y : {-1.0F, 1.0F})
-                for (float x : {-1.0F, 1.0F}) {
-                    corners[index] = glm::vec3(
-                        inverse * glm::vec4(x * z * tangent * aspect, y * z * tangent, -z, 1));
-                    center += corners[index++];
-                }
-        center /= 8.0F;
-        float radius = 0;
-        for (const auto &corner : corners)
-            radius = std::max(radius, glm::length(corner - center));
+    // The light basis must not depend on subtraction of two large world positions.
+    const auto light_rotation = glm::lookAt(glm::vec3(0), -direction, up);
+    for (std::size_t cascade = 0; cascade < result.size(); ++cascade) {
+        // The shader starts blending before the preceding split. Both maps must
+        // cover that receiver band, including their complete PCF footprints.
+        const float near_depth = cascade == 0 ? splits[0] : splits[cascade] * 0.9F;
+        const float far_depth = splits[cascade + 1];
+        const auto center = inverse * glm::vec4(0, 0, -(near_depth + far_depth) * 0.5F, 1);
+        // Compute the radius in camera space so translation/rotation cannot change it.
+        float radius = glm::length(glm::vec3(far_depth * tangent * aspect, far_depth * tangent,
+                                             (far_depth - near_depth) * 0.5F));
         radius = std::ceil(radius * 16.0F) / 16.0F;
-        const auto light_view = glm::lookAt(center + direction * (radius + 192.0F), center, up);
+        const float resolution = static_cast<float>(tile_resolution);
+        radius *= resolution / (resolution - 6.0F);
+        const float texel = 2.0F * radius / resolution;
+        auto light_center = glm::vec3(light_rotation * center);
+        light_center = glm::round(light_center / texel) * texel;
+        auto light_view = light_rotation;
+        light_view[3] =
+            glm::vec4(-light_center.x, -light_center.y, -light_center.z - radius - 192.0F, 1);
         auto projection =
             glm::ortho(-radius, radius, -radius, radius, 0.1F, 2.0F * radius + 384.0F);
         projection[1][1] *= -1;
-        auto matrix = projection * light_view;
-        const auto origin = matrix * glm::vec4(0, 0, 0, 1);
-        const auto rounded = glm::round(glm::vec2(origin) * 512.0F);
-        projection[3][0] += (rounded.x - origin.x * 512.0F) / 512.0F;
-        projection[3][1] += (rounded.y - origin.y * 512.0F) / 512.0F;
         result[cascade] = projection * light_view;
     }
     return result;

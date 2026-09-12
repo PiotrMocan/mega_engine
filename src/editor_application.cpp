@@ -192,6 +192,7 @@ void EditorApplication::main_loop() {
             camera_.update(
                 ui_.camera_input(), delta_seconds);
         }
+        renderer_.set_lighting_paused(ui_.play_state() == EditorPlayState::paused);
         update_scene_snapshot();
         ImDrawData* const draw_data = ui_.end_frame();
 

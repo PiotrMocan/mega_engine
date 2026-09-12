@@ -84,7 +84,8 @@ vec3 sampleEnvironment(
 {
     const vec3 reflectionDirection =
         reflect(-viewDirection, normal);
-    if(lighting.options.x>0.5) return mix(dynamicSky(reflectionDirection),lighting.skyZenith.rgb*0.5+lighting.skyHorizon.rgb*0.5,roughness*roughness);
+    // The solar disk is represented by the shadowed direct BRDF, not unoccluded IBL.
+    if(lighting.options.x>0.5) return mix(dynamicSkyBackground(reflectionDirection),lighting.skyZenith.rgb*0.5+lighting.skyHorizon.rgb*0.5,roughness*roughness);
     const int levelCount = textureQueryLevels(skyTexture);
     const float maximumLod =
         float(max(levelCount - 1, 0));

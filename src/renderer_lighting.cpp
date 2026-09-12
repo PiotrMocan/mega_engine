@@ -326,9 +326,7 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
     }
     frame.lighting_was_dynamic = true;
     const double dt = std::max(0.0, static_cast<double>(fsr_frame_time_ms_) * 0.001);
-    if (lighting_settings_.dynamic && lighting_settings_.cycle)
-        lighting_settings_.hour =
-            wrap_day_hour(lighting_settings_.hour + dt * 24.0 / lighting_settings_.day_seconds);
+    advance_lighting_clock(lighting_settings_, dt, lighting_paused_);
     const auto sun = evaluate_sun(lighting_settings_.hour);
     auto &u = lighting_uniforms_;
     u.sun_direction_intensity = sun.direction_intensity;
@@ -338,17 +336,28 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
     u.camera_view = view;
     if (authored_scene_enabled_ && !editor_sun_visible_)
         u.sun_direction_intensity.w = 0;
-    const double shadow_hour = std::floor(lighting_settings_.hour * 240.0) / 240.0;
+    const double shadow_hour = std::floor(lighting_settings_.hour * 3600.0) / 3600.0;
     const float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
     if (mode_ != RunMode::instancing &&
         (!lighting_shadow_initialized_ || lighting_shadow_view_ != view ||
          lighting_shadow_hour_ != shadow_hour || lighting_shadow_aspect_ != aspect)) {
-        // Quantize shadow updates to 15 in-game seconds; direct illumination remains continuous.
+        // One in-game second bounds solar stepping to a much smaller angle than
+        // the old 15-second interval; paused lighting reuses the exact same atlas.
         const auto shadow_sun = evaluate_sun(shadow_hour);
-        const auto matrices =
-            shadow_cascades(view, aspect, glm::vec3(shadow_sun.direction_intensity));
+        const auto tile_resolution = shadow_map_.width() / 2;
+        const auto matrices = shadow_cascades(view, aspect, glm::vec3(shadow_sun.direction_intensity),
+                                               tile_resolution);
         if (!lighting_shadow_initialized_ || matrices != u.shadow_matrices) {
             u.shadow_matrices = matrices;
+            for (unsigned i = 0; i < matrices.size(); ++i) {
+                const auto &matrix = matrices[i];
+                // Convert a world-space shadow texel to depth once per matrix
+                // update, instead of multiplying two uniform arrays per fragment.
+                u.shadow_texel_depth[static_cast<int>(i)] =
+                    2.0F * glm::length(glm::vec3(matrix[0][2], matrix[1][2], matrix[2][2])) /
+                    (static_cast<float>(tile_resolution) *
+                     glm::length(glm::vec3(matrix[0][0], matrix[1][0], matrix[2][0])));
+            }
             shadow_dirty_ = true;
         }
         lighting_shadow_initialized_ = true;

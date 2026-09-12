@@ -31,7 +31,7 @@ vec3 voxelDiffuse(vec3 position,vec3 normal) {
     vec3 indirect=vec3(0);float cell=lighting.volumeOriginCell.w;
     for(int i=0;i<5;++i) {
         vec4 cone=voxelCone(position+normal*cell,directions[i],cell);
-        indirect+=cone.rgb*3.14159265359*lighting.options.z+dynamicSky(directions[i])*cone.a*0.35;
+        indirect+=cone.rgb*3.14159265359*lighting.options.z+dynamicSkyBackground(directions[i])*cone.a*0.35;
     }
     return mix(fallback,indirect*0.2,smoothstep(0,2.0/lighting.volumeParameters.y,edgeDistance));
 }

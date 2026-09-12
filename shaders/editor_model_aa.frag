@@ -139,7 +139,8 @@ vec3 sampleEnvironment(
 {
     const vec3 reflectionDirection =
         reflect(-viewDirection, normal);
-    if(lighting.options.x>0.5) return mix(dynamicSky(reflectionDirection),lighting.skyZenith.rgb*0.5+lighting.skyHorizon.rgb*0.5,roughness*roughness);
+    // The solar disk is represented by the shadowed direct BRDF, not unoccluded IBL.
+    if(lighting.options.x>0.5) return mix(dynamicSkyBackground(reflectionDirection),lighting.skyZenith.rgb*0.5+lighting.skyHorizon.rgb*0.5,roughness*roughness);
     const int levelCount = textureQueryLevels(skyTexture);
     const float maximumLod =
         float(max(levelCount - 1, 0));
@@ -164,7 +165,7 @@ void main()
         normalize(frame.cameraPosition.xyz - inWorldPosition);
     const vec3 lightDirection =
         normalize(frame.sunDirectionIntensity.xyz);
-    const float visibility = sunVisibility(normal, lightDirection);
+    const float visibility = sunVisibility(normalize(inWorldNormal), lightDirection);
     vec3 diffuseAmbient=frame.skyAmbient.rgb*frame.skyAmbient.a;
     if(lighting.options.x>0.5) diffuseAmbient=(lighting.skyZenith.rgb+lighting.skyHorizon.rgb)*0.175;
     if(voxelGiCompiled && lighting.options.y>0.5) diffuseAmbient=voxelDiffuse(inWorldPosition,normal);

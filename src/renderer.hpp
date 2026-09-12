@@ -80,6 +80,7 @@ public:
     }
     [[nodiscard]] bool gi_provisioned() const noexcept { return gi_provisioned_; }
     [[nodiscard]] bool set_lighting_settings(LightingSettings settings) noexcept;
+    void set_lighting_paused(bool paused) noexcept { lighting_paused_ = paused; }
     void request_resize() noexcept { resize_requested_ = true; }
     void toggle_vsync();
     void set_present_mode(PresentPreference preference);
@@ -383,6 +384,7 @@ private:
     };
     static_assert(sizeof(GiJob) == 80);
     LightingSettings lighting_settings_{};
+    bool lighting_paused_ = false;
     LightingStatistics lighting_statistics_{};
     LightingUniforms lighting_uniforms_{};
     DeviceObject<VkDescriptorSetLayout> lighting_layout_{};
