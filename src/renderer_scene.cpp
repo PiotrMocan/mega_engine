@@ -171,7 +171,8 @@ void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExt
                     ? select_lod(submesh.lod_error, scale, lod_view.nearest_depth, lod_view.pixels,
                                  instance_lods_[i], visibility_settings_.lod_pixel_error)
                     : 0;
-            const auto usable = submesh.lod_count[lod] > 0 ? lod : 0;
+            // Finite error also represents intentional removal in authored LODs.
+            const auto usable = std::isfinite(submesh.lod_error[lod]) ? lod : 0;
             lod_changed |= instance_lods_[i] != usable;
             instance_lods_[i] = static_cast<std::uint8_t>(usable);
         }

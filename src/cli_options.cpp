@@ -299,44 +299,56 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
             if (!take_value(argument, index, argc, argv, value, result.error))
                 return result;
             auto &s = result.options.lighting;
+            auto &overrides = result.options.lighting_overrides;
             bool valid = true;
             double number = 0;
             if (argument.name == "--lighting") {
                 valid = value == "dynamic" || value == "legacy";
+                overrides.dynamic = true;
                 s.dynamic = value == "dynamic";
                 if (!s.dynamic) {
+                    overrides.voxel_gi = overrides.cycle = true;
                     s.voxel_gi = false;
                     s.cycle = false;
                 }
             } else if (argument.name == "--gi") {
                 valid = value == "voxel" || value == "off";
+                overrides.voxel_gi = true;
                 s.voxel_gi = value == "voxel";
             } else if (argument.name == "--shadow-resolution") {
+                overrides.shadow_resolution = true;
                 valid = parse_u32(value, s.shadow_resolution) &&
                         valid_shadow_resolution(s.shadow_resolution);
             } else if (argument.name == "--day-cycle") {
                 valid = value == "on" || value == "off";
+                overrides.cycle = true;
                 s.cycle = value == "on";
             } else {
                 valid = parse_nonnegative_double(value, number);
                 if (argument.name == "--time-of-day") {
                     valid = valid && number < 24;
+                    overrides.hour = true;
                     s.hour = number;
                 } else if (argument.name == "--day-length") {
                     valid = valid && number >= 1 && number <= 864000;
+                    overrides.day_seconds = true;
                     s.day_seconds = number;
                 } else if (argument.name == "--gi-extent") {
                     valid = valid && number >= 16 && number <= 256;
+                    overrides.gi_extent = true;
                     s.gi_extent = static_cast<float>(number);
                 } else if (argument.name == "--gi-strength") {
                     valid = valid && number <= 4;
+                    overrides.gi_strength = true;
                     s.gi_strength = static_cast<float>(number);
                 } else if (argument.name == "--gi-update-hz") {
                     valid = valid && number >= 1 && number <= 120;
+                    overrides.gi_update_hz = true;
                     s.gi_update_hz = static_cast<float>(number);
                 } else {
                     valid =
                         valid && number >= 1024 && number <= 262144 && std::floor(number) == number;
+                    overrides.triangle_budget = true;
                     s.triangle_budget = valid ? static_cast<std::uint32_t>(number) : 65536;
                 }
             }
@@ -358,6 +370,7 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
             continue;
         }
         if (argument.name == "--camera-z") {
+            result.options.camera_z_explicit = true;
             if (!take_value(argument, index, argc, argv, value, result.error)) {
                 return result;
             }
@@ -570,6 +583,27 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
     return result;
 }
 
+LightingSettings resolve_scene_lighting(
+    const CliOptions &options, const std::optional<LightingSettings> &authored) noexcept {
+    auto result = authored.value_or(options.lighting);
+    if (options.lighting_overrides.dynamic) result.dynamic = options.lighting.dynamic;
+    if (options.lighting_overrides.voxel_gi) result.voxel_gi = options.lighting.voxel_gi;
+    if (options.lighting_overrides.cycle) result.cycle = options.lighting.cycle;
+    if (options.lighting_overrides.hour) result.hour = options.lighting.hour;
+    if (options.lighting_overrides.day_seconds) result.day_seconds = options.lighting.day_seconds;
+    if (options.lighting_overrides.gi_extent) result.gi_extent = options.lighting.gi_extent;
+    if (options.lighting_overrides.gi_strength) result.gi_strength = options.lighting.gi_strength;
+    if (options.lighting_overrides.triangle_budget) result.triangle_budget = options.lighting.triangle_budget;
+    if (options.lighting_overrides.gi_update_hz) result.gi_update_hz = options.lighting.gi_update_hz;
+    if (options.lighting_overrides.shadow_resolution) result.shadow_resolution = options.lighting.shadow_resolution;
+    // Selecting legacy lighting disables features that require the dynamic path.
+    if (!result.dynamic) {
+        result.voxel_gi = false;
+        result.cycle = false;
+    }
+    return result;
+}
+
 std::string cli_usage(std::string_view executable_name) {
     std::string result{"Usage: "};
     result.append(
@@ -588,7 +622,7 @@ std::string cli_usage(std::string_view executable_name) {
                   "  --dynamic-shadows on|off  Authored casters and invalidation (default: on)\n"
                   "  --animate-scene         Animate one runtime object (game executable)\n"
                   "  --animate-camera        Repeatable moving-camera benchmark path\n"
-                  "  --camera-z N            Initial camera Z, 0..400 (default: 12)\n"
+                  "  --camera-z N            Legacy camera pose with Z, 0..400 (default: scene or 12)\n"
                   "  --scene-scale N         Stress object scale, .001..100 (default: 1)\n"
                   "  --scene-count N         Generated stress scene, 1..100000 objects\n"
                   "  --scene-walls on|off    Include large occluders in the stress scene\n"

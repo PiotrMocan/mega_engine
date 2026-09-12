@@ -3,10 +3,14 @@ param(
     [ValidateRange(1, 100)][int]$Startups = 3,
     [ValidateRange(1, 100)][int]$Cycles = 2,
     [ValidateSet('canonical','animated','stress','streaming','lighting','shadow-resolution')][string]$Scenario='canonical',
-    [ValidateSet('voxel','off','legacy')][string]$ShadowLighting='voxel'
+    [ValidateSet('voxel','off','legacy')][string]$ShadowLighting='voxel',
+    [string]$StreamAsset='validation/lighting-submeshes/triangles.vcrasset.json'
 )
 
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($StreamAsset) -or $StreamAsset.Contains('"')) {
+    throw 'StreamAsset must be a nonempty asset-relative path without double quotes.'
+}
 $exe = (Resolve-Path -LiteralPath $ExePath).Path
 $tree = Split-Path (Split-Path $exe -Parent) -Parent
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -33,7 +37,7 @@ for ($startup = 1; $startup -le $Startups; ++$startup) {
     if ($Scenario -eq 'animated') { $info.Arguments += ' --animate-scene --animate-camera' }
     if ($Scenario -eq 'stress') { $info.Arguments += ' --scene-count 100000 --animate-scene --animate-camera' }
     if ($Scenario -eq 'streaming') {
-        $info.Arguments += ' --scene-count 2048 --scene-walls off --camera-z 300 --stream-asset tree_stump_01_4k/tree_stump_01_4k.vcrasset.json --animate-scene'
+        $info.Arguments += " --scene-count 2048 --scene-walls off --camera-z 300 --stream-asset `"$StreamAsset`" --animate-scene"
     }
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true

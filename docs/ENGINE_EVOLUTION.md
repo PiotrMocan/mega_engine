@@ -137,6 +137,10 @@ scene на GPU с поддержкой нового пути. Это явный 
 
 ## Запуск
 
+Примеры с `tree_stump_01_4k` требуют локального игрового пакета: он исключён
+из Git. Можно указать собственную модель относительно `assets/`;
+см. [GAME_CONTENT.md](GAME_CONTENT.md).
+
 ```powershell
 .\scripts\run_windows.cmd --culling occlusion --lod on --dynamic-shadows on
 .\scripts\run_windows.cmd --scene-count 100000 --animate-camera --visibility-backend gpu
@@ -203,7 +207,7 @@ Generated artifacts не входят в Git.
 .\scripts\compile_shaders_windows.ps1
 .\scripts\render_validation_windows.ps1 -ExePath C:/GDF/vk_test/build/windows-debug/bin/vulkan_cube.exe -Scenario stress
 .\scripts\benchmark_evolution_windows.ps1 -Suite Visibility -OutputName visibility-check
-.\scripts\benchmark_evolution_windows.ps1 -Suite Lod -OutputName lod-check
+.\scripts\benchmark_evolution_windows.ps1 -Suite Lod -ModelAsset tree_stump_01_4k/tree_stump_01_4k.vcrasset.json -OutputName lod-check
 .\scripts\benchmark_evolution_windows.ps1 -Suite Shadows -OutputName shadows-check
 .\scripts\benchmark_evolution_windows.ps1 -Suite Adaptive -OutputName adaptive-check
 ```

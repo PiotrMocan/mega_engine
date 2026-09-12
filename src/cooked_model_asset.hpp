@@ -43,6 +43,15 @@ struct CookedModelMaterial {
     PbrMaterial factors{};
     std::optional<std::filesystem::path> base_color_texture{};
     std::optional<std::filesystem::path> normal_texture{};
+    // Linear glTF packing: G roughness, B metallic; multiplied by factors.
+    std::optional<std::filesystem::path> metallic_roughness_texture{};
+};
+
+struct CookedModelLodReference {
+    // Relative to asset_root, unlike mesh/material references within a model.
+    std::filesystem::path model{};
+    // Conservative deviation from LOD0 in model-local units, including removals.
+    float geometric_error = 0;
 };
 
 struct CookedModelAsset {
@@ -52,6 +61,7 @@ struct CookedModelAsset {
     std::vector<std::uint32_t> indices{};
     std::vector<CookedModelSubmesh> submeshes{};
     std::vector<CookedModelMaterial> materials{};
+    std::vector<CookedModelLodReference> lods{};
 };
 
 enum class CookedModelLoadErrorCode : std::uint8_t {

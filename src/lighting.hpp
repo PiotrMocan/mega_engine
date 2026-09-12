@@ -1,5 +1,6 @@
 #pragma once
 #include "runtime_scene.hpp"
+#include "lighting_settings.hpp"
 #include <array>
 #include <bitset>
 #include <cstdint>
@@ -7,26 +8,6 @@
 #include <glm/vec4.hpp>
 
 namespace vcr {
-inline constexpr std::array<std::uint32_t, 4> shadow_resolutions{1024, 2048, 4096, 8192};
-[[nodiscard]] constexpr bool valid_shadow_resolution(std::uint32_t resolution) noexcept {
-    for (const auto preset : shadow_resolutions)
-        if (resolution == preset)
-            return true;
-    return false;
-}
-struct LightingSettings {
-    bool dynamic = true;
-    bool voxel_gi = true;
-    bool cycle = true;
-    double hour = 14.0;
-    double day_seconds = 600.0;
-    float gi_extent = 64.0F;
-    float gi_strength = 1.0F;
-    std::uint32_t triangle_budget = 65536;
-    float gi_update_hz = 30.0F;
-    // Full atlas edge; dynamic lighting uses four tiles of half this size.
-    std::uint32_t shadow_resolution = 2048;
-};
 struct SunState {
     glm::vec4 direction_intensity{};
     glm::vec4 color{};
@@ -35,7 +16,6 @@ struct SunState {
 };
 [[nodiscard]] double wrap_day_hour(double hour) noexcept;
 [[nodiscard]] SunState evaluate_sun(double hour) noexcept;
-[[nodiscard]] bool valid_lighting_settings(const LightingSettings &settings) noexcept;
 void advance_lighting_clock(LightingSettings &settings, double seconds, bool paused) noexcept;
 inline constexpr unsigned gi_resolution = 64, gi_brick_size = 8, gi_bricks_axis = 8;
 inline constexpr unsigned gi_brick_count = 512;

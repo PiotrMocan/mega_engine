@@ -681,6 +681,7 @@ parse_material(
 
     std::optional<std::filesystem::path> base_color_texture;
     std::optional<std::filesystem::path> normal_texture;
+    std::optional<std::filesystem::path> metallic_roughness_texture;
     if (auto error = read_texture_reference(
             "base_color", base_color_texture)) {
         return error;
@@ -689,12 +690,17 @@ parse_material(
             "normal", normal_texture)) {
         return error;
     }
+    if (auto error = read_texture_reference(
+            "metallic_roughness", metallic_roughness_texture)) {
+        return error;
+    }
     output = CookedModelMaterial{
         .relative_path = file.relative,
         .name = std::move(name),
         .factors = factors,
         .base_color_texture = std::move(base_color_texture),
         .normal_texture = std::move(normal_texture),
+        .metallic_roughness_texture = std::move(metallic_roughness_texture),
     };
     return std::nullopt;
 }
@@ -982,6 +988,38 @@ CookedModelLoadResult load_cooked_model_asset(
     CookedModelAsset asset{
         .metadata_relative_path = model_file.relative,
     };
+    if (const auto lods = metadata.find("lods"); lods != metadata.end()) {
+        if (!lods->is_array() || (!lods->empty() && lods->size() != 2)) {
+            return fail(CookedModelLoadErrorCode::invalid_json,
+                        "Authored lods must be empty or contain exactly LOD1 and LOD2.",
+                        model_file.absolute);
+        }
+        float previous_error = 0;
+        for (const auto& lod : *lods) {
+            std::string reference;
+            float geometric_error = 0;
+            if (!lod.is_object() ||
+                !json_string(lod, "model", options.maximum_reference_bytes, reference) ||
+                reference.find('\0') != std::string::npos ||
+                !json_float_in_range(lod, "geometric_error", 0,
+                                     std::numeric_limits<float>::max(), geometric_error) ||
+                geometric_error <= previous_error) {
+                return fail(CookedModelLoadErrorCode::invalid_json,
+                            "Authored LOD needs a model and finite, strictly increasing positive error.",
+                            model_file.absolute);
+            }
+            ResolvedAssetFile lod_file;
+            if (auto error = resolve_asset_file(canonical_root, reference, lod_file)) {
+                return CookedModelLoadResult(std::move(*error));
+            }
+            if (!has_suffix(lod_file.relative, ".vcrasset.json")) {
+                return fail(CookedModelLoadErrorCode::invalid_path,
+                            "Authored LOD model must use .vcrasset.json.", lod_file.relative);
+            }
+            asset.lods.push_back({lod_file.relative, geometric_error});
+            previous_error = geometric_error;
+        }
+    }
     const std::filesystem::path asset_directory =
         model_file.relative.parent_path();
     std::uintmax_t total_material_bytes = 0U;

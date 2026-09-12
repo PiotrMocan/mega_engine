@@ -5,9 +5,14 @@ param(
     [ValidateRange(2,300)][int]$Duration=15,
     [string]$BaselineExe='',
     [ValidateSet('legacy','direct','voxel')][string[]]$LightingModes=@('legacy','direct','voxel'),
-    [string]$OutputName='evolution-benchmark'
+    [string]$OutputName='evolution-benchmark',
+    [string]$ModelAsset=''
 )
 $ErrorActionPreference='Stop'
+if ($Suite -eq 'Lod' -and [string]::IsNullOrWhiteSpace($ModelAsset)) {
+    throw 'The Lod suite requires -ModelAsset with a local model path relative to assets/.'
+}
+if ($ModelAsset.Contains('"')) { throw 'ModelAsset must not contain double quotes.' }
 $root=(Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $tree=Join-Path $root 'build/windows-release'
 $exe=(Resolve-Path (Join-Path $tree 'bin/vulkan_cube.exe')).Path
@@ -85,7 +90,7 @@ switch ($Suite) {
         Add-Case 'open-occlusion' "$scene --scene-walls off --visibility-backend gpu --culling occlusion"
     }
     'Lod' {
-        $scene='--aa off --scene-count 1024 --scene-walls off --scene-asset tree_stump_01_4k/tree_stump_01_4k.vcrasset.json --scene-scale .02 --camera-z 300 --culling frustum'
+        $scene="--aa off --scene-count 1024 --scene-walls off --scene-asset `"$ModelAsset`" --scene-scale .02 --camera-z 300 --culling frustum"
         Add-Case 'lod-off' "$scene --lod off"
         Add-Case 'lod-on' "$scene --lod on"
     }

@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -35,6 +36,19 @@ inline constexpr bool default_validation_enabled = false;
 #else
 inline constexpr bool default_validation_enabled = true;
 #endif
+
+struct LightingOverrides {
+    bool dynamic = false;
+    bool voxel_gi = false;
+    bool cycle = false;
+    bool hour = false;
+    bool day_seconds = false;
+    bool gi_extent = false;
+    bool gi_strength = false;
+    bool triangle_budget = false;
+    bool gi_update_hz = false;
+    bool shadow_resolution = false;
+};
 
 struct CliOptions {
     static constexpr std::uint32_t default_width = 1920;
@@ -66,11 +80,16 @@ struct CliOptions {
     bool animate_camera = false;
     std::string visibility_backend = "auto";
     double camera_z = 12.0;
+    bool camera_z_explicit = false;
     double scene_scale = 1.0;
     bool scene_walls = true;
     bool lighting_room = false;
     LightingSettings lighting{};
+    LightingOverrides lighting_overrides{};
 };
+
+[[nodiscard]] LightingSettings resolve_scene_lighting(
+    const CliOptions &options, const std::optional<LightingSettings> &authored) noexcept;
 
 struct CliParseResult {
     CliOptions options{};

@@ -152,11 +152,21 @@ void Application::initialize(const CliOptions& options) {
         preferred_present = VK_PRESENT_MODE_FIFO_KHR;
         break;
     }
+    if (!options.lighting_room && options.scene_count == 0) {
+        const auto asset_root = find_runtime_asset_root();
+        if (!asset_root) fatal("Unable to locate the runtime assets directory.");
+        std::string error;
+        if (!load_startup_scene(asset_root->path / canonical_scene_relative_path, scene_, error))
+            fatal(error);
+    }
+    const auto lighting = resolve_scene_lighting(options, scene_.lighting);
     renderer_.initialize(context_, window_.get(), preferred_present, options.initial_mode,
                          options.instances, options.gpu_workload_iterations, options.anti_aliasing,
-                         options.mcp_stdio, false, true, options.lighting);
+                         options.mcp_stdio, false, true, lighting);
     load_canonical_scene();
-    camera_ = FlyCamera({0, 4, static_cast<float>(options.camera_z)});
+    camera_ = scene_startup_camera(scene_,
+        options.camera_z_explicit || options.animate_camera
+            ? std::optional<double>(options.camera_z) : std::nullopt);
     VisibilitySettings visibility{options.frustum_culling, options.occlusion_culling, options.lod,
                                   options.dynamic_shadows};
     visibility.backend = options.visibility_backend == "cpu" ? VisibilitySettings::Backend::cpu
@@ -284,13 +294,6 @@ void Application::load_canonical_scene() {
         std::cout << "Runtime stress scene: " << options_.scene_count << " objects\n";
         return;
     }
-    if (!load_scene_file(scene_path, scene_, error)) {
-        std::cerr
-            << "Unable to load canonical editor/game scene: "
-            << scene_path << '\n';
-        fatal(error);
-    }
-
     scene_instances_.reserve(max_scene_nodes);
     scene_models_.reserve(max_scene_nodes);
     const SceneRenderView view =

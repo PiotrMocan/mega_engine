@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pbr_material.hpp"
+#include "lighting_settings.hpp"
 
 #include <glm/mat4x4.hpp>
 #include <glm/vec3.hpp>
@@ -66,6 +67,11 @@ struct SceneNode {
     bool expanded = true;
 };
 
+enum class SceneHierarchyScope : std::uint8_t {
+    expanded,
+    all,
+};
+
 struct SceneHierarchyRow {
     SceneNodeId id{};
     std::uint32_t depth = 0U;
@@ -73,6 +79,7 @@ struct SceneHierarchyRow {
 };
 
 struct SceneNodeRecord {
+    SceneNodeId id{};
     SceneNode value{};
     std::uint32_t parent_record_index =
         invalid_scene_node_index;
@@ -113,9 +120,20 @@ struct SceneRenderView {
     std::span<const SceneNodeId> cube_ids{};
 };
 
+struct SceneCameraPose {
+    glm::vec3 position{};
+    float yaw_radians = 0;
+    float pitch_radians = 0;
+};
+
 class SceneDocument final {
 public:
     SceneDocument();
+
+    // Explicit opt-in preserves legacy documents containing placeholder camera nodes.
+    SceneNodeId startup_camera{};
+    std::optional<LightingSettings> lighting{};
+    [[nodiscard]] std::optional<SceneCameraPose> startup_camera_pose() const noexcept;
 
     [[nodiscard]] SceneNodeId create_node(
         std::string name,
@@ -145,7 +163,8 @@ public:
 
     void build_hierarchy_rows(
         std::vector<SceneHierarchyRow>& output,
-        std::string_view filter = {}) const;
+        std::string_view filter = {},
+        SceneHierarchyScope scope = SceneHierarchyScope::expanded) const;
     void build_node_records(
         std::vector<SceneNodeRecord>& output) const;
     [[nodiscard]] SceneRenderView build_render_view(

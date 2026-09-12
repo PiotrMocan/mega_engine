@@ -321,6 +321,29 @@ int main() {
         vcr::load_cooked_model_asset(
             asset_root, valid.metadata_relative);
     expect(static_cast<bool>(loaded), "valid cooked model loads");
+    expect(loaded && !loaded->materials[0].metallic_roughness_texture,
+           "legacy material without packed texture preserves scalar factors");
+    Fixture packed = create_fixture(asset_root, "packed");
+    packed.material["textures"]["metallic_roughness"] = "packed.vcrtexture.json";
+    expect(write_json(asset_root / "packed/packed.vcrtexture.json", Json::object()) &&
+               write_json(packed.material_absolute, packed.material),
+           "packed material reference fixture is written");
+    const auto packed_loaded = vcr::load_cooked_model_asset(asset_root, packed.metadata_relative);
+    expect(packed_loaded && packed_loaded->materials[0].metallic_roughness_texture ==
+               std::filesystem::path("packed/packed.vcrtexture.json") &&
+               packed_loaded->materials[0].factors.metallic == 0.6F &&
+               packed_loaded->materials[0].factors.roughness == 0.25F,
+           "packed reference resolves relative to asset and retains factors");
+    packed.material["textures"]["metallic_roughness"] = "../outside.vcrtexture.json";
+    expect(write_json(packed.material_absolute, packed.material), "escaping packed fixture written");
+    expect(has_error(vcr::load_cooked_model_asset(asset_root, packed.metadata_relative),
+                     CookedModelLoadErrorCode::invalid_path),
+           "packed texture cannot escape asset sandbox");
+    packed.material["textures"]["metallic_roughness"] = 7;
+    expect(write_json(packed.material_absolute, packed.material), "invalid packed fixture written");
+    expect(has_error(vcr::load_cooked_model_asset(asset_root, packed.metadata_relative),
+                     CookedModelLoadErrorCode::invalid_material),
+           "packed texture rejects non-string reference");
     if (loaded) {
         expect(
             loaded->metadata_relative_path ==
@@ -554,6 +577,57 @@ int main() {
             oversized_metadata,
             CookedModelLoadErrorCode::file_too_large),
         "model metadata byte limit is enforced");
+
+    auto authored = create_fixture(asset_root, "authored");
+    const auto lod1 = create_fixture(asset_root, "authored_lod1");
+    const auto lod2 = create_fixture(asset_root, "authored_lod2");
+    const Json valid_lods = Json::array({
+        {{"model", lod1.metadata_relative.generic_string()}, {"geometric_error", .05}},
+        {{"model", lod2.metadata_relative.generic_string()}, {"geometric_error", .2}},
+    });
+    authored.metadata["lods"] = valid_lods;
+    expect(write_json(authored.metadata_absolute, authored.metadata), "authored LOD metadata written");
+    const auto authored_result = vcr::load_cooked_model_asset(asset_root, authored.metadata_relative);
+    expect(static_cast<bool>(authored_result), "root-relative sibling authored LOD references load");
+    if (authored_result) {
+        expect(authored_result->lods.size() == 2 &&
+                   authored_result->lods[0].model == lod1.metadata_relative &&
+                   authored_result->lods[1].geometric_error == .2F &&
+                   authored_result->indices.size() == 3,
+               "loader preserves authored references and leaves geometry at LOD0 until preparation");
+    }
+    const auto check_lods = [&](const Json &lods, CookedModelLoadErrorCode code,
+                                std::string_view message) {
+        authored.metadata["lods"] = lods;
+        expect(write_json(authored.metadata_absolute, authored.metadata), "LOD test metadata written");
+        expect(has_error(vcr::load_cooked_model_asset(asset_root, authored.metadata_relative), code),
+               message);
+    };
+    auto invalid_lods = valid_lods;
+    invalid_lods[0]["model"] = "../outside.vcrasset.json";
+    check_lods(invalid_lods, CookedModelLoadErrorCode::invalid_path, "LOD traversal rejected");
+    invalid_lods = valid_lods;
+    invalid_lods[0]["model"] = lod1.metadata_absolute.string();
+    check_lods(invalid_lods, CookedModelLoadErrorCode::invalid_path, "absolute LOD path rejected");
+    invalid_lods = valid_lods;
+    invalid_lods[0]["model"] = "missing/unknown.vcrasset.json";
+    check_lods(invalid_lods, CookedModelLoadErrorCode::file_not_found, "missing authored LOD rejected");
+    invalid_lods = valid_lods;
+    invalid_lods[0]["geometric_error"] = 0;
+    check_lods(invalid_lods, CookedModelLoadErrorCode::invalid_json, "zero authored error rejected");
+    invalid_lods = valid_lods;
+    invalid_lods[1]["geometric_error"] = .01;
+    check_lods(invalid_lods, CookedModelLoadErrorCode::invalid_json, "decreasing authored error rejected");
+    invalid_lods = valid_lods;
+    invalid_lods[1]["geometric_error"] = 1e100;
+    check_lods(invalid_lods, CookedModelLoadErrorCode::invalid_json, "overflowing authored error rejected");
+    check_lods(Json::array({valid_lods[0]}), CookedModelLoadErrorCode::invalid_json,
+               "partial authored chain rejected");
+    check_lods(Json::object(), CookedModelLoadErrorCode::invalid_json, "non-array LOD rejected");
+    authored.metadata["lods"] = Json::array();
+    expect(write_json(authored.metadata_absolute, authored.metadata), "empty LOD metadata written");
+    const auto empty_lods = vcr::load_cooked_model_asset(asset_root, authored.metadata_relative);
+    expect(empty_lods && empty_lods->lods.empty(), "empty authored list preserves automatic LOD fallback");
 
     if (failures != 0) {
         std::cerr << failures << " cooked model test(s) failed\n";

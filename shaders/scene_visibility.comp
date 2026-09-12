@@ -71,7 +71,10 @@ uint classify(uint id,out uint groupIndex,out uint lod) {
         float projectedPixels=config.cameraPixels.w+max(maximumPixels.x,maximumPixels.y)/distance;
         for (uint i=1;i<3;++i) {
             float budget=config.guardError.z*(i>previousLod[id] ? .8:1);
-            if (group.counts[i]>0 && group.errors[i]*scale*projectedPixels/distance<=budget) lod=i;
+            // Positive authored error permits intentional empty geometry. Built-in
+            // cube/ground groups have zero counts AND zero errors for absent LODs.
+            if ((group.counts[i]>0 || group.errors[i]>0) &&
+                group.errors[i]*scale*projectedPixels/distance<=budget) lod=i;
         }
     }
     previousLod[id]=lod;

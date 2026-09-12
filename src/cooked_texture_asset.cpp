@@ -354,6 +354,9 @@ parse_semantic(const std::string_view value) {
     if (value == "metallic") {
         return CookedTextureSemantic::metallic;
     }
+    if (value == "metallic_roughness") {
+        return CookedTextureSemantic::metallic_roughness;
+    }
     if (value == "roughness") {
         return CookedTextureSemantic::roughness;
     }

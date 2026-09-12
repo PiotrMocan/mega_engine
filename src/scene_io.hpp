@@ -23,4 +23,11 @@ inline constexpr std::uintmax_t maximum_scene_file_bytes =
     SceneDocument& output,
     std::string& error);
 
+// A checkout without a local game starts with the built-in technical scene.
+// Existing but invalid/unreadable files remain errors, as with explicit Open.
+[[nodiscard]] bool load_startup_scene(
+    const std::filesystem::path& source,
+    SceneDocument& output,
+    std::string& error);
+
 } // namespace vcr

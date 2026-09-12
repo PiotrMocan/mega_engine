@@ -91,6 +91,9 @@ public:
         scene_replaced_ = false;
         return replaced;
     }
+    [[nodiscard]] bool consume_startup_camera_requested() noexcept {
+        return std::exchange(startup_camera_requested_, false);
+    }
     [[nodiscard]] std::optional<SavedMaterialUpdate>
         consume_saved_material_update() noexcept {
         return std::exchange(saved_material_update_, std::nullopt);
@@ -150,6 +153,7 @@ private:
     void build_import_results();
     void build_material_editor();
     void build_performance(
+        SceneDocument& scene,
         Renderer& renderer,
         const PerformanceSnapshot& performance);
     void process_file_commands(SceneDocument& scene);
@@ -207,6 +211,7 @@ private:
     bool open_confirmation_requested_ = false;
     bool import_dialog_requested_ = false;
     bool scene_replaced_ = false;
+    bool startup_camera_requested_ = false;
     std::optional<SavedMaterialUpdate> saved_material_update_{};
 
     SceneNodeId selected_node_{};

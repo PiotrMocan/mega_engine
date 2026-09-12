@@ -125,6 +125,30 @@ namespace {
 
 } // namespace
 
+std::optional<SceneCameraPose> SceneDocument::startup_camera_pose() const noexcept {
+    if (!valid(startup_camera) || node(startup_camera)->get().kind != SceneNodeKind::camera)
+        return std::nullopt;
+    glm::mat4 world(1.0F);
+    for (auto id = startup_camera; id; id = parent(id)) {
+        const auto &value = node(id)->get();
+        if (!finite_transform(value.transform))
+            return std::nullopt;
+        world = local_matrix(value.transform) * world;
+    }
+    if (!finite_matrix(world))
+        return std::nullopt;
+    // Double precision avoids overflow while normalizing large valid scene transforms.
+    const glm::dvec3 direction = -glm::dvec3(world[2]);
+    const double length = glm::length(direction);
+    if (!std::isfinite(length) || length <= 0)
+        return std::nullopt;
+    const auto forward = direction / length;
+    return SceneCameraPose{
+        glm::vec3(world[3]),
+        static_cast<float>(std::atan2(forward.z, forward.x)),
+        static_cast<float>(std::asin(std::clamp(forward.y, -1.0, 1.0)))};
+}
+
 SceneDocument::SceneDocument() {
     slots_.reserve(max_scene_nodes);
     free_indices_.reserve(max_scene_nodes);
@@ -317,7 +341,8 @@ void SceneDocument::set_expanded(
 
 void SceneDocument::build_hierarchy_rows(
     std::vector<SceneHierarchyRow>& output,
-    const std::string_view filter) const {
+    const std::string_view filter,
+    const SceneHierarchyScope scope) const {
     output.clear();
     const bool filtering = !filter.empty();
     std::uint32_t index = first_root_;
@@ -335,7 +360,7 @@ void SceneDocument::build_hierarchy_rows(
                     slot.first_child != invalid_scene_node_index,
             });
         }
-        const bool descend = filtering || slot.value.expanded;
+        const bool descend = filtering || scope == SceneHierarchyScope::all || slot.value.expanded;
         index = traversal_next(index, depth, descend);
     }
 }
@@ -358,6 +383,7 @@ void SceneDocument::build_node_records(
             : ancestor_records[
                   static_cast<std::size_t>(depth - 1U)];
         output.push_back(SceneNodeRecord{
+            .id = id_for_index(index),
             .value = slots_[index].value,
             .parent_record_index = parent_record,
         });

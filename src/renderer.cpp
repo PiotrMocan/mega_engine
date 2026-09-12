@@ -1030,6 +1030,17 @@ void Renderer::create_editor_material_resources() {
         std::as_bytes(std::span{flat_normal_pixel}),
         4U,
         "editor default flat normal texture");
+    editor_default_metallic_roughness_texture_.create(
+        *context_,
+        1U,
+        1U,
+        VK_FORMAT_R8G8B8A8_UNORM,
+        "editor default white metallic-roughness texture");
+    upload_to_device_texture(
+        editor_default_metallic_roughness_texture_,
+        std::as_bytes(std::span{white_pixel}),
+        4U,
+        "editor default white metallic-roughness texture");
 }
 
 std::optional<std::uint32_t> Renderer::find_or_load_editor_texture(const PreparedTexture &prepared,
@@ -1157,6 +1168,7 @@ std::optional<VkDescriptorSet>
 Renderer::create_editor_material_descriptor(
     const GpuTexture& base_color,
     const GpuTexture& normal,
+    const GpuTexture& metallic_roughness,
     std::string& error) {
     if (editor_material_descriptor_pool_ == VK_NULL_HANDLE ||
         editor_material_descriptor_set_layout_ == VK_NULL_HANDLE) {
@@ -1197,6 +1209,11 @@ Renderer::create_editor_material_descriptor(
             .imageView = normal.view(),
             .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         },
+        VkDescriptorImageInfo{
+            .sampler = metallic_roughness.sampler(),
+            .imageView = metallic_roughness.view(),
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        },
     };
     const std::array writes{
         VkWriteDescriptorSet{
@@ -1216,6 +1233,14 @@ Renderer::create_editor_material_descriptor(
             .descriptorType =
                 VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
             .pImageInfo = &image_infos[1U],
+        },
+        VkWriteDescriptorSet{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = descriptor_set,
+            .dstBinding = 2U,
+            .descriptorCount = 1U,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &image_infos[2U],
         },
     };
     vkUpdateDescriptorSets(
@@ -1350,6 +1375,7 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
             : nullptr;
         std::optional<std::uint32_t> base_color_index;
         std::optional<std::uint32_t> normal_index;
+        std::optional<std::uint32_t> metallic_roughness_index;
         const auto load_slot =
             [this, &prepared, &relative_path](const std::optional<std::filesystem::path> &reference,
                                               const CookedTextureSemantic expected_semantic,
@@ -1398,6 +1424,11 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
                 CookedTextureSemantic::normal,
                 CookedTextureColorSpace::linear,
                 normal_index);
+            load_slot(
+                material->metallic_roughness_texture,
+                CookedTextureSemantic::metallic_roughness,
+                CookedTextureColorSpace::linear,
+                metallic_roughness_index);
         }
         const GpuTexture& base_color =
             base_color_index
@@ -1407,9 +1438,13 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
             normal_index
             ? editor_texture_assets_[*normal_index].texture
             : editor_default_normal_texture_;
+        const GpuTexture& metallic_roughness =
+            metallic_roughness_index
+            ? editor_texture_assets_[*metallic_roughness_index].texture
+            : editor_default_metallic_roughness_texture_;
         const auto descriptor =
             create_editor_material_descriptor(
-                base_color, normal, error);
+                base_color, normal, metallic_roughness, error);
         if (!descriptor) {
             if (material_index > 0U) {
                 const std::uint32_t allocated_count =
@@ -2609,6 +2644,7 @@ void Renderer::destroy_scene_resources() noexcept {
     editor_material_descriptor_count_ = 0U;
     editor_model_assets_.clear();
     editor_texture_assets_.clear();
+    editor_default_metallic_roughness_texture_.destroy();
     editor_default_normal_texture_.destroy();
     editor_default_base_color_texture_.destroy();
     editor_model_gpu_bytes_ = 0U;
@@ -2676,7 +2712,7 @@ void Renderer::create_descriptors() {
         const VkDescriptorPoolSize material_pool_size{
             .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
             .descriptorCount =
-                maximum_editor_material_descriptors * 2U,
+                maximum_editor_material_descriptors * 3U,
         };
         const VkDescriptorPoolCreateInfo material_pool_info{
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -3629,6 +3665,13 @@ void Renderer::create_pipeline() {
                 .binding = 1U,
                 .descriptorType =
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = 1U,
+                .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+                .pImmutableSamplers = nullptr,
+            },
+            VkDescriptorSetLayoutBinding{
+                .binding = 2U,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                 .descriptorCount = 1U,
                 .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
                 .pImmutableSamplers = nullptr,
@@ -6134,11 +6177,17 @@ void Renderer::recreate_swapchain(
         resize_requested_ = true;
         return;
     }
-    resize_requested_ = false;
     const VkFormat old_color = swapchain_.color_format();
     const VkFormat old_depth = swapchain_.depth_format();
     const VkExtent2D old_scene_extent = scene_output_extent();
-    swapchain_.recreate(preferred_mode);
+    if (!swapchain_.recreate(preferred_mode)) {
+        resize_requested_ = true;
+        // SDL may still report the pre-minimize size for an empty surface.
+        // Defer acquisition and resource retirement without busy-spinning.
+        SDL_WaitEventTimeout(nullptr, 50);
+        return;
+    }
+    resize_requested_ = false;
     destroy_present_semaphores();
     create_present_semaphores();
 

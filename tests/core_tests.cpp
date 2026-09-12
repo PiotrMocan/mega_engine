@@ -25,6 +25,8 @@
 #include <thread>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include <glm/geometric.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
@@ -788,6 +790,50 @@ int main() {
 
     {
         vcr::SceneDocument scene;
+        const auto root = scene.create_node("Collapsed root", vcr::SceneNodeKind::folder);
+        const auto child = scene.create_node("Collapsed child", vcr::SceneNodeKind::folder, root);
+        const auto leaf = scene.create_node("Hidden leaf", vcr::SceneNodeKind::cube, child);
+        const auto sibling = scene.create_node("Sibling", vcr::SceneNodeKind::cube, root);
+        const auto other_root = scene.create_node("Other root", vcr::SceneNodeKind::folder);
+        scene.set_expanded(root, false);
+        scene.set_expanded(child, false);
+        scene.node(leaf)->get().visible = false;
+        const auto structure_revision = scene.structure_revision();
+        const auto content_revision = scene.content_revision();
+        std::vector<vcr::SceneHierarchyRow> rows;
+        scene.build_hierarchy_rows(rows);
+        expect(rows.size() == 2 && rows[0].id == root && rows[1].id == other_root,
+               "UI traversal still hides descendants of collapsed groups");
+        scene.build_hierarchy_rows(rows, {}, vcr::SceneHierarchyScope::all);
+        const std::array expected_ids{root, child, leaf, sibling, other_root};
+        const std::array expected_depths{0U, 1U, 2U, 1U, 0U};
+        bool complete = rows.size() == scene.size() && rows.size() == expected_ids.size();
+        for (std::size_t i = 0; complete && i < rows.size(); ++i)
+            complete = rows[i].id == expected_ids[i] && rows[i].depth == expected_depths[i];
+        expect(complete, "MCP traversal includes collapsed and invisible descendants in preorder");
+        expect(rows.size() >= 3 && rows[0].has_children && rows[1].has_children && !rows[2].has_children,
+               "full traversal retains hierarchy metadata for paginated node responses");
+        scene.set_expanded(root, true);
+        scene.set_expanded(child, true);
+        std::vector<vcr::SceneHierarchyRow> expanded;
+        scene.build_hierarchy_rows(expanded, {}, vcr::SceneHierarchyScope::all);
+        bool stable = expanded.size() == rows.size();
+        for (std::size_t i = 0; stable && i < rows.size(); ++i)
+            stable = expanded[i].id == rows[i].id && expanded[i].depth == rows[i].depth;
+        expect(stable, "expanding the UI does not shift MCP pagination offsets or total");
+        scene.set_expanded(root, false);
+        scene.set_expanded(child, false);
+        const auto collapsed_revision = scene.structure_revision();
+        scene.build_hierarchy_rows(rows, {}, vcr::SceneHierarchyScope::all);
+        scene.build_hierarchy_rows(expanded);
+        expect(expanded.size() == 2 && scene.structure_revision() == collapsed_revision &&
+                   scene.content_revision() == content_revision &&
+                   collapsed_revision == structure_revision + 4,
+               "full enumeration is read-only and does not expand editor groups");
+    }
+
+    {
+        vcr::SceneDocument scene;
         vcr::SceneNodeId parent = scene.create_node(
             "Root", vcr::SceneNodeKind::folder);
         constexpr std::uint32_t depth = 10'000U;
@@ -989,6 +1035,15 @@ int main() {
                 browser.current_directory().empty(),
             "asset browser navigates to its root");
 
+        vcr::SceneDocument startup_scene;
+        const auto missing_startup = temporary_root / "local-game" / "scene.json";
+        expect(vcr::load_startup_scene(missing_startup, startup_scene, error) &&
+                   error.empty() && startup_scene.size() > 0U &&
+                   !std::filesystem::exists(missing_startup),
+               "missing local game starts a technical scene without writing game files");
+        expect(!vcr::load_scene_file(missing_startup, startup_scene, error),
+               "explicit Open still rejects a missing scene");
+
         vcr::SceneDocument source_scene;
         const vcr::SceneNodeId scene_root =
             source_scene.create_node(
@@ -1070,6 +1125,92 @@ int main() {
                     0.0001),
             "scene JSON preserves hierarchy, model asset and PBR values");
 
+        // A placeholder camera in a version-1 document must not change its old view.
+        const auto camera_parent = source_scene.create_node("Camera rig", vcr::SceneNodeKind::folder);
+        const auto camera_id = source_scene.create_node("Start", vcr::SceneNodeKind::camera, camera_parent);
+        source_scene.node(camera_parent)->get().transform = {
+            .translation = {10, 2, 3}, .rotation_degrees = {0, 90, 0}, .scale = {2, 2, 2}};
+        source_scene.node(camera_id)->get().transform = {
+            .translation = {0, 1, -3}, .rotation_degrees = {-12, 0, 0}};
+        expect(!source_scene.startup_camera_pose() &&
+                   vcr::scene_startup_camera(source_scene).position() == glm::vec3(0, 4, 12),
+               "legacy placeholder camera keeps original startup pose");
+        source_scene.startup_camera = camera_id;
+        const auto authored_camera = vcr::scene_startup_camera(source_scene);
+        expect(glm::length(authored_camera.position() - glm::vec3(4, 4, 3)) < .0001F &&
+                   close_to(authored_camera.forward().x, -std::cos(glm::radians(12.0F)), .0001) &&
+                   close_to(authored_camera.forward().y, -std::sin(glm::radians(12.0F)), .0001),
+               "startup camera inherits rig translation scale and Euler orientation");
+        expect(vcr::scene_startup_camera(source_scene, 12.0).position() == glm::vec3(0, 4, 12),
+               "explicit default CLI Z still overrides authored pose");
+        source_scene.lighting = vcr::LightingSettings{.cycle = false, .hour = 17.2};
+        const auto startup_file = temporary_root / "startup.scene.json";
+        expect(vcr::save_scene_file(source_scene, startup_file, error) &&
+                   vcr::load_scene_file(startup_file, loaded_scene, error),
+               "authored startup settings round trip");
+        expect(loaded_scene.lighting && !loaded_scene.lighting->cycle &&
+                   close_to(loaded_scene.lighting->hour, 17.2, .0001) &&
+                   glm::length(vcr::scene_startup_camera(loaded_scene).position() -
+                               authored_camera.position()) < .0001F,
+               "round trip preserves camera node reference and fixed evening");
+        expect(source_scene.reparent(scene_cube, camera_parent) &&
+                   vcr::save_scene_file(source_scene, startup_file, error) &&
+                   vcr::load_scene_file(startup_file, loaded_scene, error) &&
+                   glm::length(vcr::scene_startup_camera(loaded_scene).position() -
+                               authored_camera.position()) < .0001F,
+               "save remaps selected camera to serialized traversal index");
+        const char *override_args[]{"test", "--time-of-day=14", "--gi", "off", "--camera-z=12"};
+        const auto overrides = vcr::parse_cli_options(5, override_args);
+        const auto merged = vcr::resolve_scene_lighting(overrides.options, source_scene.lighting);
+        expect(overrides && overrides.options.camera_z_explicit && merged.hour == 14 &&
+                   !merged.cycle && !merged.voxel_gi,
+               "CLI overrides individual authored fields even at their default values");
+        const char *legacy_args[]{"test", "--lighting=legacy"};
+        const auto legacy_options = vcr::parse_cli_options(2, legacy_args);
+        const auto legacy_lighting = vcr::resolve_scene_lighting(legacy_options.options, source_scene.lighting);
+        expect(!legacy_lighting.dynamic && !legacy_lighting.voxel_gi && !legacy_lighting.cycle,
+               "CLI legacy lighting disables dependent GI and clock");
+        nlohmann::json startup_json;
+        { std::ifstream input(startup_file); input >> startup_json; }
+        const auto original_json = startup_json;
+        const auto write_startup = [&] {
+            std::ofstream output(startup_file);
+            output << startup_json.dump();
+        };
+        for (const auto &bad : std::array<nlohmann::json, 4>{-1, 0, 999999, "camera"}) {
+            startup_json = original_json;
+            startup_json["startup_camera"] = bad;
+            write_startup();
+            const auto previous_size = loaded_scene.size();
+            expect(!vcr::load_scene_file(startup_file, loaded_scene, error) &&
+                       loaded_scene.size() == previous_size && loaded_scene.lighting->hour == 17.2,
+                   "invalid startup camera rejects transaction without changing document");
+        }
+        for (const auto &bad : std::array<nlohmann::json, 6>{
+                 nlohmann::json{{"hour", 24}}, nlohmann::json{{"cycle", "off"}},
+                 nlohmann::json{{"triangle_budget", 2048.5}},
+                 nlohmann::json{{"shadow_resolution", 3072}},
+                 nlohmann::json{{"dynamic", false}, {"voxel_gi", true}},
+                 nlohmann::json{{"gi_extent", 1e100}}}) {
+            startup_json = original_json;
+            startup_json["lighting"] = bad;
+            write_startup();
+            expect(!vcr::load_scene_file(startup_file, loaded_scene, error),
+                   "invalid lighting types ranges and combinations are rejected");
+        }
+        startup_json = original_json;
+        startup_json["lighting"] = {{"hour", 17.2}, {"cycle", false}};
+        write_startup();
+        expect(vcr::load_scene_file(startup_file, loaded_scene, error) &&
+                   loaded_scene.lighting->dynamic && loaded_scene.lighting->voxel_gi &&
+                   loaded_scene.lighting->shadow_resolution == 2048,
+               "partial lighting gets current safe defaults");
+        expect(source_scene.destroy_subtree(camera_parent), "delete authored camera rig");
+        expect(vcr::save_scene_file(source_scene, startup_file, error) &&
+                   vcr::load_scene_file(startup_file, loaded_scene, error) &&
+                   !loaded_scene.startup_camera,
+               "deleted camera selection is omitted rather than binding a reused slot");
+
         vcr::SceneDocument invalid_model_scene;
         static_cast<void>(invalid_model_scene.create_node(
             "Missing asset",
@@ -1142,6 +1283,9 @@ int main() {
         vcr::SceneDocument unchanged =
             vcr::SceneDocument::make_default();
         const std::uint32_t unchanged_size = unchanged.size();
+        expect(!vcr::load_startup_scene(invalid_scene_file, unchanged, error) &&
+                   !error.empty() && unchanged.size() == unchanged_size,
+               "invalid local game is not silently replaced by the technical scene");
         expect(
             !vcr::load_scene_file(
                 invalid_scene_file, unchanged, error) &&

@@ -19,7 +19,40 @@ PreparedModel prepare_model_asset(std::filesystem::path root, std::string path) 
             return result;
         }
         auto model = std::move(loaded).value();
-        prepare_model_lods(model);
+        if (model.lods.empty()) {
+            prepare_model_lods(model);
+        } else {
+            std::array<CookedModelAsset, 2> levels;
+            std::size_t geometry_bytes = model.vertices.size() * sizeof(CookedModelVertex) +
+                                         model.indices.size() * sizeof(std::uint32_t);
+            constexpr auto geometry_budget = maximum_prepared_asset_bytes - 512;
+            for (std::size_t i = 0; i < levels.size(); ++i) {
+                if (geometry_bytes > geometry_budget) {
+                    result.error = "Authored LOD exceeds the 512 MiB upload budget";
+                    return result;
+                }
+                const auto remaining = geometry_budget - geometry_bytes;
+                auto lod_options = options;
+                lod_options.maximum_mesh_file_bytes = remaining;
+                lod_options.maximum_vertices = std::min<std::uint64_t>(
+                    options.maximum_vertices, remaining / sizeof(CookedModelVertex));
+                lod_options.maximum_indices = std::min<std::uint64_t>(
+                    options.maximum_indices, remaining / sizeof(std::uint32_t));
+                auto lod = load_cooked_model_asset(result.root, model.lods[i].model, lod_options);
+                if (!lod) {
+                    result.error = "Authored LOD: " + lod.error().message;
+                    return result;
+                }
+                if (!lod->lods.empty()) {
+                    result.error = "Authored LOD cannot reference further LODs";
+                    return result;
+                }
+                geometry_bytes += lod->vertices.size() * sizeof(CookedModelVertex) +
+                                  lod->indices.size() * sizeof(std::uint32_t);
+                levels[i] = std::move(lod).value();
+            }
+            prepare_authored_model_lods(model, levels, geometry_budget);
+        }
         result.upload_bytes = model.vertices.size() * sizeof(CookedModelVertex) +
                               model.indices.size() * sizeof(std::uint32_t) + 512;
         if (result.upload_bytes > maximum_prepared_asset_bytes) {
@@ -71,6 +104,7 @@ PreparedModel prepare_model_asset(std::filesystem::path root, std::string path) 
         for (const auto &material : model.materials) {
             texture(material.base_color_texture);
             texture(material.normal_texture);
+            texture(material.metallic_roughness_texture);
         }
         result.model = std::move(model);
     } catch (const std::exception &e) {

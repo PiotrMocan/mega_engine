@@ -506,6 +506,80 @@ int main() {
                 }) == 2,
         "glTF with a sandboxed external buffer imports transactionally");
 
+    // glTF exports one image for both channels; Assimp exposes three aliases.
+    // Check both external .gltf and the embedded GLB path used by Blender.
+    auto packed_gltf = nlohmann::json::parse(gltf_text);
+    packed_gltf["images"] = {{{"uri", "Painted Texture.PNG"}}};
+    packed_gltf["textures"] = {{{"source", 0}}};
+    packed_gltf["materials"] = {{{"name", "Packed"}, {"pbrMetallicRoughness", {
+        {"metallicFactor", 0.8}, {"roughnessFactor", 0.6},
+        {"metallicRoughnessTexture", {{"index", 0}}}}}}};
+    packed_gltf["meshes"][0]["primitives"][0]["material"] = 0;
+    const auto check_packed_import = [&](const auto &result) {
+        expect(static_cast<bool>(result), "packed PBR model imports");
+        if (!result) {
+            std::cerr << result.error().message << '\n';
+            return;
+        }
+        std::size_t texture_count = 0;
+        bool found_packed = false;
+        for (const auto &file : result->files) {
+            if (file.kind == ImportedAssetKind::texture) {
+                ++texture_count;
+                const auto metadata = read_json(asset_root / file.relative_path);
+                expect(metadata.value("usage", std::string{}) == "metallic_roughness" &&
+                           metadata.value("color_space", std::string{}) == "linear",
+                       "packed import has explicit linear glTF channel semantic");
+            }
+            if (file.kind == ImportedAssetKind::material) {
+                const auto metadata = read_json(asset_root / file.relative_path);
+                const auto &textures = metadata.at("textures");
+                if (textures.contains("metallic_roughness")) {
+                    found_packed = true;
+                    expect(textures.size() == 1 &&
+                               std::abs(metadata["pbr"]["metallic"].get<float>() - 0.8F) < 0.0001F &&
+                               std::abs(metadata["pbr"]["roughness"].get<float>() - 0.6F) < 0.0001F,
+                           "packed aliases deduplicate while preserving multiplicative factors");
+                }
+            }
+        }
+        expect(found_packed && texture_count == 1, "one packed image produces one cooked texture");
+    };
+    const auto packed_source = source_root / "packed_triangle.gltf";
+    expect(write_text(packed_source, packed_gltf.dump()), "packed glTF fixture written");
+    check_packed_import(vcr::import_asset(packed_source, options));
+
+    std::vector<std::byte> packed_buffer(gltf_buffer.begin(), gltf_buffer.end());
+    while (packed_buffer.size() % 4 != 0) packed_buffer.push_back(std::byte{});
+    const auto image_offset = packed_buffer.size();
+    const auto image_bytes = read_bytes(image_source);
+    packed_buffer.insert(packed_buffer.end(), image_bytes.begin(), image_bytes.end());
+    packed_gltf["buffers"][0].erase("uri");
+    packed_gltf["buffers"][0]["byteLength"] = packed_buffer.size();
+    packed_gltf["bufferViews"].push_back({{"buffer", 0}, {"byteOffset", image_offset},
+                                         {"byteLength", image_bytes.size()}});
+    packed_gltf["images"] = {{{"bufferView", 2}, {"mimeType", "image/png"}}};
+    auto packed_json = packed_gltf.dump();
+    while (packed_json.size() % 4 != 0) packed_json.push_back(' ');
+    while (packed_buffer.size() % 4 != 0) packed_buffer.push_back(std::byte{});
+    std::vector<std::byte> glb;
+    const auto append_u32 = [&](std::uint32_t value) {
+        for (unsigned shift = 0; shift < 32; shift += 8)
+            glb.push_back(static_cast<std::byte>((value >> shift) & 255U));
+    };
+    append_u32(0x46546C67U);
+    append_u32(2);
+    append_u32(static_cast<std::uint32_t>(28 + packed_json.size() + packed_buffer.size()));
+    append_u32(static_cast<std::uint32_t>(packed_json.size()));
+    append_u32(0x4E4F534AU);
+    for (const char value : packed_json) glb.push_back(static_cast<std::byte>(value));
+    append_u32(static_cast<std::uint32_t>(packed_buffer.size()));
+    append_u32(0x004E4942U);
+    glb.insert(glb.end(), packed_buffer.begin(), packed_buffer.end());
+    const auto packed_glb_source = source_root / "embedded_packed_triangle.glb";
+    expect(write_binary(packed_glb_source, glb), "packed GLB fixture written");
+    check_packed_import(vcr::import_asset(packed_glb_source, options));
+
     const std::filesystem::path fallback_material_source =
         source_root / "fallback.mtl";
     const std::filesystem::path fallback_model_source =

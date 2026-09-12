@@ -1,5 +1,7 @@
 #pragma once
 
+#include "scene_document.hpp"
+
 #include <glm/mat4x4.hpp>
 #include <glm/vec3.hpp>
 
@@ -52,5 +54,15 @@ private:
     float pitch_radians_ = 0.0F;
     FlyCameraConfig config_{};
 };
+
+// An explicit CLI Z requests the legacy benchmark pose; otherwise use the authored camera.
+[[nodiscard]] inline FlyCamera scene_startup_camera(
+    const SceneDocument &scene, std::optional<double> camera_z = std::nullopt) noexcept {
+    if (!camera_z) {
+        if (const auto pose = scene.startup_camera_pose())
+            return FlyCamera(pose->position, pose->yaw_radians, pose->pitch_radians);
+    }
+    return FlyCamera({0, 4, static_cast<float>(camera_z.value_or(12.0))});
+}
 
 } // namespace vcr

@@ -12,6 +12,7 @@
 #include <optional>
 #include <string_view>
 #include <utility>
+#include <type_traits>
 #include <vector>
 
 #if defined(_WIN32)
@@ -101,6 +102,52 @@ template <std::size_t Size>
     return true;
 }
 
+template <typename T>
+[[nodiscard]] bool read_setting(const Json &source, const char *key, T &output,
+                                double minimum, double maximum) {
+    if (!source.contains(key)) return true;
+    const auto &value = source[key];
+    if (!value.is_number()) return false;
+    const double number = value.get<double>();
+    if (!std::isfinite(number) || number < minimum || number > maximum) return false;
+    if constexpr (std::is_integral_v<T>) {
+        if (!value.is_number_integer()) return false;
+    }
+    output = static_cast<T>(number);
+    return true;
+}
+
+[[nodiscard]] bool read_lighting(const Json &source, LightingSettings &s) {
+    if (!source.is_object()) return false;
+    for (const auto &[key, target] : std::array{
+             std::pair{"dynamic", &s.dynamic}, std::pair{"voxel_gi", &s.voxel_gi},
+             std::pair{"cycle", &s.cycle}}) {
+        if (source.contains(key)) {
+            if (!source[key].is_boolean()) return false;
+            *target = source[key].get<bool>();
+        }
+    }
+    if (!s.dynamic) {
+        if (!source.contains("voxel_gi")) s.voxel_gi = false;
+        if (!source.contains("cycle")) s.cycle = false;
+    }
+    return read_setting(source, "hour", s.hour, 0, 24) && s.hour < 24 &&
+        read_setting(source, "day_seconds", s.day_seconds, 1, 864000) &&
+        read_setting(source, "gi_extent", s.gi_extent, 16, 256) &&
+        read_setting(source, "gi_strength", s.gi_strength, 0, 4) &&
+        read_setting(source, "triangle_budget", s.triangle_budget, 1024, 262144) &&
+        read_setting(source, "gi_update_hz", s.gi_update_hz, 1, 120) &&
+        read_setting(source, "shadow_resolution", s.shadow_resolution, 1024, 8192) &&
+        valid_lighting_settings(s);
+}
+
+[[nodiscard]] Json lighting_json(const LightingSettings &s) {
+    return Json{{"dynamic", s.dynamic}, {"voxel_gi", s.voxel_gi}, {"cycle", s.cycle},
+                {"hour", s.hour}, {"day_seconds", s.day_seconds}, {"gi_extent", s.gi_extent},
+                {"gi_strength", s.gi_strength}, {"triangle_budget", s.triangle_budget},
+                {"gi_update_hz", s.gi_update_hz}, {"shadow_resolution", s.shadow_resolution}};
+}
+
 [[nodiscard]] bool replace_scene_file(
     const std::filesystem::path& temporary,
     const std::filesystem::path& destination,
@@ -176,6 +223,27 @@ bool save_scene_file(
         }
     }
 
+    Json metadata{{"format", "vulkan_cube_scene"}, {"version", scene_file_version}};
+    if (scene.startup_camera) {
+        // Deleting the selected camera restores the legacy start, never a reused slot.
+        if (scene.valid(scene.startup_camera)) {
+            if (!scene.startup_camera_pose()) {
+                error = "Scene startup camera must reference a camera with a finite world pose.";
+                return false;
+            }
+            for (std::size_t index = 0; index < records.size(); ++index)
+                if (records[index].id == scene.startup_camera) metadata["startup_camera"] = index;
+        }
+    }
+    if (scene.lighting) {
+        if (!valid_lighting_settings(*scene.lighting) || scene.lighting->hour < 0 ||
+            scene.lighting->hour >= 24) {
+            error = "Scene lighting settings are invalid.";
+            return false;
+        }
+        metadata["lighting"] = lighting_json(*scene.lighting);
+    }
+
     std::filesystem::path temporary = destination;
     temporary += ".tmp";
     std::ofstream output(
@@ -186,10 +254,9 @@ bool save_scene_file(
         return false;
     }
 
-    output
-        << "{\"format\":\"vulkan_cube_scene\",\"version\":"
-        << scene_file_version
-        << ",\"nodes\":[";
+    auto header = metadata.dump();
+    header.pop_back();
+    output << header << ",\"nodes\":[";
     for (std::size_t index = 0U;
          index < records.size();
          ++index) {
@@ -278,6 +345,24 @@ bool save_scene_file(
             "Unable to encode the scene as valid UTF-8 JSON.";
         return false;
     }
+}
+
+bool load_startup_scene(
+    const std::filesystem::path& source,
+    SceneDocument& output,
+    std::string& error) {
+    std::error_code filesystem_error;
+    const bool exists = std::filesystem::exists(source, filesystem_error);
+    if (filesystem_error) {
+        error = "Unable to inspect startup scene: " + filesystem_error.message();
+        return false;
+    }
+    if (exists) {
+        return load_scene_file(source, output, error);
+    }
+    output = SceneDocument::make_default();
+    error.clear();
+    return true;
 }
 
 bool load_scene_file(
@@ -502,6 +587,26 @@ bool load_scene_file(
             node->get().material = material;
             node->get().asset_path = std::move(asset_path);
             ids.push_back(id);
+        }
+        if (root.contains("startup_camera")) {
+            const auto &camera = root["startup_camera"];
+            if (!camera.is_number_unsigned() || camera.get<std::uint64_t>() >= ids.size()) {
+                error = "Scene startup_camera must be a valid node index.";
+                return false;
+            }
+            loaded.startup_camera = ids[camera.get<std::size_t>()];
+            if (!loaded.startup_camera_pose()) {
+                error = "Scene startup_camera must reference a camera with a finite world pose.";
+                return false;
+            }
+        }
+        if (root.contains("lighting")) {
+            LightingSettings settings;
+            if (!read_lighting(root["lighting"], settings)) {
+                error = "Scene lighting settings are invalid.";
+                return false;
+            }
+            loaded.lighting = settings;
         }
         loaded.mark_content_changed();
         output = std::move(loaded);

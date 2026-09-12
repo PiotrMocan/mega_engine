@@ -264,6 +264,17 @@ int main() {
             "embedded raw RGBA8 bytes are preserved exactly");
     }
 
+    Json packed_metadata = raw_metadata;
+    packed_metadata["usage"] = "metallic_roughness";
+    expect(write_json(textures / "packed.vcrtexture.json", packed_metadata),
+           "packed metallic-roughness metadata written");
+    const auto packed = vcr::load_cooked_texture_asset(
+        asset_root, "painted/textures/packed.vcrtexture.json");
+    expect(packed && packed->semantic == vcr::CookedTextureSemantic::metallic_roughness &&
+               packed->color_space == vcr::CookedTextureColorSpace::linear &&
+               packed->pixels == std::vector<std::uint8_t>(raw_pixels.begin(), raw_pixels.end()),
+           "packed G/B channels remain linear and are not swizzled or gamma converted");
+
     const std::filesystem::path exr_path = textures / "normal.exr";
     try {
         Imf::Header header(2, 1);

@@ -18,7 +18,8 @@ if /I "%VCR_CONFIG%"=="Debug" (
     set "VCR_BUILD_DIR=%VCR_ROOT%\build\windows-asan"
     set "VCR_CMAKE_BUILD_TYPE=RelWithDebInfo"
     set "VCR_VALIDATION=ON"
-    set "VCR_ASAN_FLAGS=-DCMAKE_CXX_FLAGS=/fsanitize=address"
+    rem Preserve MSVC defaults: dependency RAII must unwind on C++ exceptions.
+    set VCR_ASAN_FLAGS="-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /EHsc /fsanitize=address"
 ) else (
     echo Usage: %~nx0 [Debug^|Release^|ASan]
     exit /b 2

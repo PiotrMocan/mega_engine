@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <fstream>
 #include <limits>
@@ -62,6 +63,40 @@ constexpr std::uint64_t mesh_vertex_stride = 48U;
 constexpr std::uint64_t mesh_header_bytes = 40U;
 constexpr std::uint64_t mesh_submesh_bytes = 24U;
 
+#if defined(_WIN32)
+[[nodiscard]] std::string windows_file_error_message(const DWORD error) {
+    std::array<char, 512U> buffer{};
+    const DWORD length = FormatMessageA(
+        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr, error, MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US),
+        buffer.data(), static_cast<DWORD>(buffer.size()), nullptr);
+    if (length == 0U) {
+        return "system message unavailable";
+    }
+    std::string message(buffer.data(), length);
+    while (!message.empty() && (message.back() == '\r' || message.back() == '\n')) {
+        message.pop_back();
+    }
+    return message;
+}
+
+// Scanner/watcher handles can temporarily deny directory rename or deletion.
+// This runs only on the import worker/error cleanup, never in the render loop.
+// Retries add at most 500 ms sleep per operation; publication never replaces data.
+[[nodiscard]] bool wait_for_windows_file_retry(
+    const DWORD error, const std::size_t attempt) noexcept {
+    constexpr std::array<DWORD, 7U> delays{10U, 20U, 40U, 80U, 100U, 100U, 150U};
+    if (attempt >= delays.size() ||
+        (error != ERROR_ACCESS_DENIED &&
+         error != ERROR_SHARING_VIOLATION &&
+         error != ERROR_LOCK_VIOLATION)) {
+        return false;
+    }
+    Sleep(delays[attempt]);
+    return true;
+}
+#endif
+
 class StagingDirectory final {
 public:
     StagingDirectory() = default;
@@ -79,8 +114,23 @@ public:
 
     ~StagingDirectory() noexcept {
         if (!committed_ && !path_.empty()) {
-            std::error_code ignored;
-            std::filesystem::remove_all(path_, ignored);
+            std::error_code error;
+            for (std::size_t attempt = 0U;; ++attempt) {
+                std::filesystem::remove_all(path_, error);
+                if (!error) {
+                    break;
+                }
+#if defined(_WIN32)
+                if (wait_for_windows_file_retry(
+                        static_cast<DWORD>(error.value()), attempt)) {
+                    continue;
+                }
+                std::fprintf(stderr,
+                    "Asset import staging cleanup failed: '%ls' (Win32 error %d).\n",
+                    path_.c_str(), error.value());
+#endif
+                break;
+            }
         }
     }
 
@@ -570,11 +620,19 @@ void record_file(
 [[nodiscard]] AssetImportOutcome<AssetImportResult>
 commit_import(ImportContext& context) {
 #if defined(_WIN32)
-    const BOOL moved = MoveFileExW(
-        context.staging_directory.c_str(),
-        context.final_directory.c_str(),
-        MOVEFILE_WRITE_THROUGH);
-    if (moved == 0) {
+    for (std::size_t attempt = 0U;; ++attempt) {
+        const BOOL moved = MoveFileExW(
+            context.staging_directory.c_str(),
+            context.final_directory.c_str(),
+            MOVEFILE_WRITE_THROUGH);
+        if (moved != 0) {
+            if (attempt != 0U) {
+                std::fprintf(stderr,
+                    "Asset import publication recovered after %zu retries: '%ls'.\n",
+                    attempt, context.final_directory.c_str());
+            }
+            break;
+        }
         const DWORD error = GetLastError();
         if (error == ERROR_ALREADY_EXISTS ||
             error == ERROR_FILE_EXISTS) {
@@ -584,9 +642,20 @@ commit_import(ImportContext& context) {
                 "was being staged.",
                 context.final_directory));
         }
+        if (attempt == 0U) {
+            std::fprintf(stderr,
+                "Asset import MoveFileExW denied: '%ls' -> '%ls' (Win32 error %lu).\n",
+                context.staging_directory.c_str(), context.final_directory.c_str(), error);
+        }
+        if (wait_for_windows_file_retry(error, attempt)) {
+            continue;
+        }
         return make_unexpected_asset_import_error(make_error(
             AssetImportErrorCode::filesystem_error,
-            "Unable to publish the staged imported asset.",
+            "Unable to publish the staged imported asset from '" +
+                path_to_utf8(context.staging_directory) + "' (MoveFileExW, Win32 error " +
+                std::to_string(error) + ": " +
+                windows_file_error_message(error) + ").",
             context.final_directory));
     }
 #elif defined(__linux__)
@@ -698,6 +767,7 @@ struct ImportedTextureReference {
     case aiTextureType_NORMAL_CAMERA: return "normal";
     case aiTextureType_METALNESS: return "metallic";
     case aiTextureType_DIFFUSE_ROUGHNESS: return "roughness";
+    case aiTextureType_GLTF_METALLIC_ROUGHNESS: return "metallic_roughness";
     case aiTextureType_AMBIENT_OCCLUSION: return "ambient_occlusion";
     case aiTextureType_EMISSIVE: return "emissive";
     case aiTextureType_EMISSION_COLOR: return "emissive";
@@ -1257,11 +1327,12 @@ import_materials(
     std::unordered_set<std::string> attempted_texture_keys;
     std::uint32_t texture_index = 0U;
 
-    constexpr std::array<aiTextureType, 8U> texture_types{
+    constexpr std::array<aiTextureType, 9U> texture_types{
         aiTextureType_BASE_COLOR,
         aiTextureType_DIFFUSE,
         aiTextureType_NORMALS,
         aiTextureType_NORMAL_CAMERA,
+        aiTextureType_GLTF_METALLIC_ROUGHNESS,
         aiTextureType_METALNESS,
         aiTextureType_DIFFUSE_ROUGHNESS,
         aiTextureType_AMBIENT_OCCLUSION,
@@ -1343,6 +1414,19 @@ import_materials(
             if (material_observer->GetTexture(
                     type, 0U, &reported_texture) != AI_SUCCESS) {
                 continue;
+            }
+            // Assimp exposes the glTF packed image in three slots. Import it
+            // once under its explicit channel contract, never infer packing
+            // from unrelated scalar metallic/roughness maps in other formats.
+            if (type == aiTextureType_METALNESS ||
+                type == aiTextureType_DIFFUSE_ROUGHNESS) {
+                aiString packed_texture;
+                if (material_observer->GetTexture(
+                        aiTextureType_GLTF_METALLIC_ROUGHNESS,
+                        0U, &packed_texture) == AI_SUCCESS &&
+                    packed_texture == reported_texture) {
+                    continue;
+                }
             }
             const std::string key =
                 std::string(reported_texture.C_Str()) + "|" + semantic;

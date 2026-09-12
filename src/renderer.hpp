@@ -368,6 +368,7 @@ private:
         create_editor_material_descriptor(
         const GpuTexture& base_color,
         const GpuTexture& normal,
+        const GpuTexture& metallic_roughness,
         std::string& error);
     [[nodiscard]] std::optional<std::uint32_t>
         find_or_load_editor_model(
@@ -570,6 +571,7 @@ private:
     std::vector<std::uint32_t> editor_model_sort_scratch_{};
     GpuTexture editor_default_base_color_texture_{};
     GpuTexture editor_default_normal_texture_{};
+    GpuTexture editor_default_metallic_roughness_texture_{};
     VkDeviceSize editor_model_gpu_bytes_ = 0U;
     VkDeviceSize editor_texture_gpu_bytes_ = 0U;
     std::uint32_t editor_material_descriptor_count_ = 0U;

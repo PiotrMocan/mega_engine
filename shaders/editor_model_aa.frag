@@ -46,6 +46,8 @@ layout(set = 0, binding = 4) uniform sampler2DShadow shadowMap;
 // decode. Normal data must use a linear UNORM image view.
 layout(set = 1, binding = 0) uniform sampler2D materialBaseColorTexture;
 layout(set = 1, binding = 1) uniform sampler2D materialNormalTexture;
+// Linear glTF data: G roughness, B metallic; white preserves scalar factors.
+layout(set = 1, binding = 2) uniform sampler2D materialMetallicRoughnessTexture;
 
 layout(push_constant) uniform GraphicsPushConstants
 {
@@ -172,9 +174,15 @@ void main()
     const vec3 directRadiance =
         frame.sunColorSkyYaw.rgb
         * frame.sunDirectionIntensity.w;
+    const vec4 sampledMetallicRoughness =
+        texture(materialMetallicRoughnessTexture, inUv);
+    const vec3 materialParameters = vec3(
+        inMaterialParameters.x * sampledMetallicRoughness.b,
+        inMaterialParameters.y * sampledMetallicRoughness.g,
+        inMaterialParameters.z);
     const float roughness =
         clamp(
-            inMaterialParameters.y,
+            materialParameters.y,
             pbrMinimumRoughness,
             1.0);
     const vec3 environmentRadiance =
@@ -182,7 +190,7 @@ void main()
         * frame.skyAmbient.a;
     vec3 shadedColor = evaluatePbrLighting(
         clamp(baseColor.rgb, vec3(0.0), vec3(1.0)),
-        inMaterialParameters.xyz,
+        materialParameters,
         normal,
         viewDirection,
         lightDirection,

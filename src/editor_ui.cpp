@@ -1141,6 +1141,7 @@ void EditorUi::shutdown() noexcept {
     open_confirmation_requested_ = false;
     import_dialog_requested_ = false;
     scene_replaced_ = false;
+    startup_camera_requested_ = false;
     saved_material_update_.reset();
     saved_content_revision_ = 0U;
     saved_structure_revision_ = 0U;
@@ -1427,7 +1428,7 @@ void EditorUi::begin_frame(
     build_import_window();
     build_import_results();
     build_material_editor();
-    build_performance(renderer, performance);
+    build_performance(scene, renderer, performance);
     build_external_game_window(now);
     process_file_commands(scene);
     apply_deferred_scene_commands(scene);
@@ -2880,6 +2881,10 @@ void EditorUi::process_import_pipeline() {
     for (const auto& completion : import_ui_->completions) {
         if (completion.result) {
             ++succeeded;
+        } else if (completion.error) {
+            std::cerr << "Asset import failed: '" << path_to_utf8(completion.source)
+                      << "': " << completion.error->message
+                      << " [" << path_to_utf8(completion.error->path) << "]\n";
         }
     }
     import_ui_->status =
@@ -3444,6 +3449,7 @@ void EditorUi::build_material_editor() {
 }
 
 void EditorUi::build_performance(
+    SceneDocument& scene,
     Renderer& renderer,
     const PerformanceSnapshot& performance) {
     ImGui::SetNextWindowSize(
@@ -3564,7 +3570,11 @@ void EditorUi::build_performance(
     if (lighting_changed) {
         if (!lighting.dynamic)
             lighting.voxel_gi = false;
-        static_cast<void>(renderer.set_lighting_settings(lighting));
+        if (renderer.set_lighting_settings(lighting)) {
+            checkpoint_scene(scene);
+            scene.lighting = lighting;
+            scene.mark_content_changed();
+        }
     }
     ImGui::Text("GI geometry %.3f ms, lighting %.3f ms", performance.average.gpu_voxel_geometry_ms,
                 performance.average.gpu_voxel_light_ms);
@@ -3769,6 +3779,7 @@ void EditorUi::open_scene(SceneDocument& scene) {
     scene_file_status_ =
         "Opened " + scene_path_.string();
     scene_replaced_ = true;
+    startup_camera_requested_ = true;
     selected_node_ = {};
     pending_delete_ = {};
     delete_confirmation_ = {};

@@ -16,6 +16,18 @@ compile_commands.json
 # Locally downloaded build tools
 /.tools/
 
+# Local game content. Only renderer resources and validation fixtures are versioned.
+/assets/*
+!/assets/sky_clouds.png
+!/assets/smaa/
+!/assets/validation/
+/art/
+/scripts/blender/*freight*.py
+/scripts/import_freight_yard.ps1
+/scripts/package_freight_yard.py
+/scripts/run_freight_yard.cmd
+/docs/FREIGHT_YARD.md
+
 # Runtime-generated renderer data
 /benchmark.json
 /pipeline_cache.bin

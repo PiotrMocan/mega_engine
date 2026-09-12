@@ -204,10 +204,16 @@ void EditorApplication::initialize(const CliOptions& options) {
         fatal(SDL_GetError());
     }
 
+    const auto asset_root = find_runtime_asset_root();
+    if (!asset_root) fatal("Unable to locate the runtime assets directory.");
+    std::string scene_error;
+    if (!load_startup_scene(asset_root->path / canonical_scene_relative_path, scene_, scene_error))
+        fatal(scene_error);
+    const auto lighting = resolve_scene_lighting(options, scene_.lighting);
     context_.initialize(window_.get(), options.validation);
     renderer_.initialize(context_, window_.get(), preferred_present_mode(options.present),
                          RunMode::scene, 1U, options.gpu_workload_iterations, options.anti_aliasing,
-                         options.mcp_stdio, true, true, options.lighting);
+                         options.mcp_stdio, true, true, lighting);
 
     VisibilitySettings visibility{options.frustum_culling, options.occlusion_culling, options.lod,
                                   options.dynamic_shadows};
@@ -220,19 +226,11 @@ void EditorApplication::initialize(const CliOptions& options) {
         fatal("GPU visibility is unavailable on this device");
     }
     renderer_.set_visibility_settings(visibility);
-    scene_ = SceneDocument::make_default();
     scene_instances_.reserve(max_scene_nodes);
     scene_models_.reserve(max_scene_nodes);
     ui_.initialize(context_, window_.get(), renderer_);
-    const std::filesystem::path scene_path =
-        ui_.asset_root() / canonical_scene_relative_path;
-    std::string scene_error;
-    if (!load_scene_file(scene_path, scene_, scene_error)) {
-        std::cerr
-            << "Unable to load canonical editor/game scene: "
-            << scene_path << '\n';
-        fatal(scene_error);
-    }
+    camera_ = scene_startup_camera(scene_, options.camera_z_explicit
+        ? std::optional<double>(options.camera_z) : std::nullopt);
     update_scene_snapshot();
     renderer_.enable_async_assets();
 
@@ -298,7 +296,13 @@ void EditorApplication::main_loop() {
             running_ = false;
             break;
         }
+        if (ui_.consume_startup_camera_requested()) {
+            camera_ = scene_startup_camera(scene_, options_.camera_z_explicit
+                ? std::optional<double>(options_.camera_z) : std::nullopt);
+        }
         if (ui_.consume_scene_replaced()) {
+            if (!renderer_.set_lighting_settings(resolve_scene_lighting(options_, scene_.lighting)))
+                fatal("Scene lighting is unavailable; restart the editor with --gi voxel or a supported shadow resolution.");
             submitted_scene_revision_ = 0U;
             renderer_.invalidate_editor_scene();
         }
@@ -432,7 +436,8 @@ void EditorApplication::execute_mcp_command(
     case McpCommandType::editor_list_nodes: {
         std::vector<SceneHierarchyRow> rows;
         rows.reserve(scene_.size());
-        scene_.build_hierarchy_rows(rows);
+        // MCP enumerates the document, independently of the editor tree expansion.
+        scene_.build_hierarchy_rows(rows, {}, SceneHierarchyScope::all);
         const std::size_t begin = std::min<std::size_t>(
             command.value, rows.size());
         const std::size_t end = std::min<std::size_t>(

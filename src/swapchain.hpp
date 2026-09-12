@@ -29,7 +29,8 @@ public:
         SDL_Window* window,
         VkPresentModeKHR preferred_mode,
         bool enable_screenshot_capture);
-    void recreate(VkPresentModeKHR preferred_mode);
+    // False means the surface is temporarily empty; the active generation stays owned.
+    [[nodiscard]] bool recreate(VkPresentModeKHR preferred_mode);
     void shutdown() noexcept;
 
     [[nodiscard]] VkSwapchainKHR handle() const noexcept { return swapchain_; }
@@ -62,7 +63,7 @@ public:
     [[nodiscard]] static const char* present_mode_name(VkPresentModeKHR mode);
 
 private:
-    void create(VkPresentModeKHR preferred_mode, VkSwapchainKHR old_swapchain);
+    [[nodiscard]] bool create(VkPresentModeKHR preferred_mode);
     void destroy_resources(VkSwapchainKHR swapchain) noexcept;
     [[nodiscard]] VkSurfaceFormatKHR choose_surface_format(
         std::span<const VkSurfaceFormatKHR> formats) const;

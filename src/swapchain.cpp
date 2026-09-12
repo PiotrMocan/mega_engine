@@ -21,20 +21,17 @@ void Swapchain::initialize(
     context_ = &context;
     window_ = window;
     screenshot_enabled_ = enable_screenshot_capture;
-    create(preferred_mode, VK_NULL_HANDLE);
+    if (!create(preferred_mode)) {
+        fatal("Cannot initialize swapchain for an empty surface.");
+    }
 }
 
-void Swapchain::recreate(const VkPresentModeKHR preferred_mode) {
+bool Swapchain::recreate(const VkPresentModeKHR preferred_mode) {
     if (context_ == nullptr) {
-        return;
+        return false;
     }
     VK_CHECK(vkDeviceWaitIdle(context_->device()));
-    // All swapchain-owned vectors store the active generation. Destroy them
-    // before populating the next generation; clearing them afterwards would
-    // accidentally erase the newly created image/view arrays.
-    destroy_resources(swapchain_);
-    swapchain_ = VK_NULL_HANDLE;
-    create(preferred_mode, VK_NULL_HANDLE);
+    return create(preferred_mode);
 }
 
 void Swapchain::shutdown() noexcept {
@@ -49,14 +46,24 @@ void Swapchain::shutdown() noexcept {
     window_ = nullptr;
 }
 
-void Swapchain::create(
-    const VkPresentModeKHR preferred_mode,
-    const VkSwapchainKHR old_swapchain) {
+bool Swapchain::create(const VkPresentModeKHR preferred_mode) {
     VkSurfaceCapabilitiesKHR capabilities{};
     VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
         context_->physical_device(),
         context_->surface(),
         &capabilities));
+
+    // On Windows a minimized SDL window can retain its last nonzero pixel
+    // size while Vulkan reports a 0x0 surface. Keep the active generation
+    // intact until this authoritative extent is drawable again.
+    const VkExtent2D next_extent = choose_extent(capabilities);
+    if (next_extent.width == 0U || next_extent.height == 0U) {
+        return false;
+    }
+    // recreate() established device idle. Retire the old vectors before
+    // populating the new generation, using the same capabilities snapshot.
+    destroy_resources(swapchain_);
+    swapchain_ = VK_NULL_HANDLE;
 
     std::uint32_t format_count = 0;
     VK_CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(
@@ -88,7 +95,7 @@ void Swapchain::create(
     color_format_ = surface_format.format;
     color_space_ = surface_format.colorSpace;
     present_mode_ = choose_present_mode(preferred_mode);
-    extent_ = choose_extent(capabilities);
+    extent_ = next_extent;
     depth_format_ = choose_depth_format();
     VkFormatProperties color_properties{};
     vkGetPhysicalDeviceFormatProperties(
@@ -135,7 +142,7 @@ void Swapchain::create(
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
         .presentMode = present_mode_,
         .clipped = VK_TRUE,
-        .oldSwapchain = old_swapchain,
+        .oldSwapchain = VK_NULL_HANDLE,
     };
     VK_CHECK(vkCreateSwapchainKHR(
         context_->device(), &create_info, nullptr, &swapchain_));
@@ -220,6 +227,7 @@ void Swapchain::create(
               << ", screenshot "
               << (screenshot_supported_ ? "yes" : "no")
               << '\n' << std::flush;
+    return true;
 }
 
 void Swapchain::destroy_resources(const VkSwapchainKHR swapchain) noexcept {

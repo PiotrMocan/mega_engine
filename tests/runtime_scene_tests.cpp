@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 
 namespace {
 void expect(bool result, const char *message) {
@@ -14,8 +15,85 @@ void expect(bool result, const char *message) {
         std::exit(1);
     }
 }
+
+void authored_lod_tests() {
+    vcr::CookedModelAsset base;
+    base.materials = {{.name = "metal"}, {.name = "detail"}};
+    base.vertices.resize(4);
+    base.vertices[0].normal = {0, 1, 0};
+    base.vertices[0].texcoord = {.25F, .75F};
+    base.vertices[0].tangent = {1, 0, 0, -1};
+    base.indices = {0, 1, 2, 1, 2, 3, 0, 2, 3};
+    base.submeshes = {{.first_index = 0, .index_count = 3, .material_index = 0},
+                      {.first_index = 3, .index_count = 3, .material_index = 1},
+                      {.first_index = 6, .index_count = 3, .material_index = 0}};
+    base.lods = {{"lod1.vcrasset.json", .05F}, {"lod2.vcrasset.json", .2F}};
+    std::array<vcr::CookedModelAsset, 2> levels;
+    // Reverse material order in LOD1; omit the detail material in LOD2.
+    levels[0].materials = {{.name = "detail"}, {.name = "metal"}};
+    levels[0].vertices = base.vertices;
+    levels[0].vertices[0].position = {0, .05F, 0};
+    levels[0].indices = {0, 2, 3, 0, 1, 2};
+    levels[0].submeshes = {{.index_count = 3, .material_index = 0},
+                           {.first_index = 3, .index_count = 3, .material_index = 1}};
+    levels[1].materials = {{.name = "metal"}};
+    levels[1].vertices = base.vertices;
+    levels[1].indices = {1, 2, 3};
+    levels[1].submeshes = {{.index_count = 3}};
+    auto prepared = base;
+    vcr::prepare_authored_model_lods(prepared, levels, 4096);
+    expect(prepared.vertices.size() == 12 && prepared.indices.size() == 18 &&
+               prepared.submeshes.size() == 2, "authored geometry aggregates per material");
+    const auto &metal = prepared.submeshes[0];
+    const auto &detail = prepared.submeshes[1];
+    expect(metal.lod_count == std::array<std::uint32_t, 3>{6, 3, 3} &&
+               detail.lod_count == std::array<std::uint32_t, 3>{3, 3, 0},
+           "authored LOD supports merged submeshes and removed material geometry");
+    expect(prepared.indices[metal.lod_first[1]] == 4 &&
+               prepared.indices[metal.lod_first[2]] == 9 &&
+               prepared.indices[detail.lod_first[1] + 1] == 6,
+           "authored LOD rebases indices and maps material names, not slots");
+    expect(prepared.vertices[4].position[1] == .05F &&
+               prepared.vertices[4].normal == base.vertices[0].normal &&
+               prepared.vertices[4].texcoord == base.vertices[0].texcoord &&
+               prepared.vertices[4].tangent == base.vertices[0].tangent,
+           "authored vertex attributes remain exact");
+    expect(vcr::select_lod(detail.lod_error, 1, 1000, 500, 0) == 2 &&
+               detail.lod_count[2] == 0,
+           "finite error selects authored removal using existing pixel criterion");
+    for (const auto &mesh : prepared.submeshes) {
+        for (unsigned level = 0; level < 3; ++level) {
+            expect(mesh.lod_first[level] + mesh.lod_count[level] <= prepared.indices.size(),
+                   "every runtime authored range remains inside combined index buffer");
+        }
+    }
+    const auto rejects = [&](auto invalid_base, const auto &invalid_levels, std::size_t budget) {
+        try {
+            vcr::prepare_authored_model_lods(invalid_base, invalid_levels, budget);
+        } catch (const std::exception &) {
+            return true;
+        }
+        return false;
+    };
+    expect(rejects(base, levels, 64), "authored combined upload budget is enforced");
+    auto bad_levels = levels;
+    bad_levels[1].materials[0].name = "unknown";
+    expect(rejects(base, bad_levels, 4096), "unknown LOD material is rejected");
+    bad_levels = levels;
+    bad_levels[0].materials[1].name = "detail";
+    expect(rejects(base, bad_levels, 4096), "ambiguous LOD material is rejected");
+    bad_levels = levels;
+    bad_levels[1].indices[0] = 99;
+    expect(rejects(base, bad_levels, 4096), "out of bounds LOD index is rejected");
+    bad_levels = levels;
+    bad_levels[1].lods = base.lods;
+    expect(rejects(base, bad_levels, 4096), "nested authored LOD is rejected without recursion");
+    base.lods[1].geometric_error = .01F;
+    expect(rejects(base, levels, 4096), "decreasing authored error is rejected");
+}
 } // namespace
 int main() {
+    authored_lod_tests();
     auto vp = glm::perspective(glm::radians(65.0F), 16.0F / 9.0F, 0.1F, 100.0F);
     vp[1][1] *= -1;
     const vcr::ViewFrustum frustum(vp);
