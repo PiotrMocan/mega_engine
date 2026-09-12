@@ -63,14 +63,17 @@ constexpr std::array<std::string_view, 21> runtime_tool_names{
     "engine.quit",
 };
 
-constexpr std::array<std::string_view, 16> editor_tool_names{
+constexpr std::array<std::string_view, 19> editor_tool_names{
     "editor.get_state",
+    "editor.selection.set",
     "editor.scene.list_nodes",
     "editor.scene.get_node",
     "editor.scene.create_node",
     "editor.scene.update_node",
     "editor.scene.delete_node",
     "editor.scene.reparent_node",
+    "editor.scene.duplicate_node",
+    "editor.camera.focus_selection",
     "editor.scene.save",
     "editor.history.undo",
     "editor.history.redo",
@@ -605,6 +608,11 @@ private:
         "Return the live authoring state, revisions, history, asset root, and import status.",
         object_schema(), true, false, true));
     tools.push_back(tool_definition(
+        "editor.selection.set", "Set editor selection",
+        "Select one valid scene node in the live editor, reveal it in the hierarchy, or clear selection with null.",
+        object_schema(Json{{"id", optional_parent_schema}}, Json::array({"id"})),
+        false, false, true));
+    tools.push_back(tool_definition(
         "editor.scene.list_nodes", "List scene nodes",
         "Return a stable preorder page of authored nodes and generational handles.",
         object_schema(Json{
@@ -678,6 +686,15 @@ private:
             Json{{"id", handle_schema}, {"parent", optional_parent_schema}},
             Json::array({"id", "parent"})),
         false, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.duplicate_node", "Duplicate scene subtree",
+        "Duplicate one node and every descendant under the same parent as one undoable editor operation.",
+        object_schema(Json{{"id", handle_schema}}, Json::array({"id"})),
+        false, false, false));
+    tools.push_back(tool_definition(
+        "editor.camera.focus_selection", "Focus selected node",
+        "Move the editor camera to frame the current selection without modifying the authored scene.",
+        object_schema(), false, false, true));
     tools.push_back(tool_definition(
         "editor.scene.save", "Save authored scene",
         "Atomically save the canonical editor/game scene JSON.",
@@ -1068,6 +1085,10 @@ private:
         command.type = McpCommandType::editor_get_state;
         return require_empty();
     }
+    if (name == "editor.camera.focus_selection") {
+        command.type = McpCommandType::editor_focus_selection;
+        return require_empty();
+    }
     if (name == "capture.screenshot") {
         command.type = McpCommandType::capture_screenshot;
         return require_empty();
@@ -1115,7 +1136,8 @@ private:
         return true;
     }
     if (name == "editor.scene.get_node" ||
-        name == "editor.scene.delete_node") {
+        name == "editor.scene.delete_node" ||
+        name == "editor.scene.duplicate_node") {
         if (arguments.size() != 1U || !arguments.contains("id") ||
             !parse_node_handle(arguments["id"], command.node_id)) {
             error = "id must be the only argument and contain index/generation";
@@ -1123,7 +1145,22 @@ private:
         }
         command.type = name == "editor.scene.get_node"
             ? McpCommandType::editor_get_node
-            : McpCommandType::editor_delete_node;
+            : name == "editor.scene.delete_node"
+            ? McpCommandType::editor_delete_node
+            : McpCommandType::editor_duplicate_node;
+        return true;
+    }
+    if (name == "editor.selection.set") {
+        if (arguments.size() != 1U || !arguments.contains("id")) {
+            error = "id must be the only argument and contain index/generation or null";
+            return false;
+        }
+        if (!arguments["id"].is_null() &&
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "id must contain index/generation or be null";
+            return false;
+        }
+        command.type = McpCommandType::editor_set_selection;
         return true;
     }
     if (name == "editor.scene.reparent_node") {

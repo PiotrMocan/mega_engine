@@ -9,7 +9,11 @@
 
 #include <imgui_impl_sdl3.h>
 #include <imgui_internal.h>
+#include <ImGuizmo.h>
 #include <nlohmann/json.hpp>
+
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
 
 #include <algorithm>
 #include <array>
@@ -305,6 +309,78 @@ void check_imgui_vk_result(const VkResult result) {
     const VkExtent2D lhs,
     const VkExtent2D rhs) noexcept {
     return lhs.width == rhs.width && lhs.height == rhs.height;
+}
+
+struct EditorViewportRay {
+    glm::vec3 origin{};
+    glm::vec3 direction{};
+};
+
+[[nodiscard]] glm::mat4 editor_projection(
+    const float width,
+    const float height) noexcept {
+    return glm::perspective(
+        glm::radians(65.0F),
+        width / std::max(height, 1.0F),
+        0.1F,
+        500.0F);
+}
+
+[[nodiscard]] std::optional<EditorViewportRay> viewport_ray(
+    const ImVec2 mouse,
+    const ImVec2 minimum,
+    const ImVec2 maximum,
+    const FlyCamera& camera) noexcept {
+    const float width = maximum.x - minimum.x;
+    const float height = maximum.y - minimum.y;
+    if (width <= 1.0F || height <= 1.0F ||
+        mouse.x < minimum.x || mouse.x > maximum.x ||
+        mouse.y < minimum.y || mouse.y > maximum.y) {
+        return std::nullopt;
+    }
+    const float normalized_x =
+        ((mouse.x - minimum.x) / width) * 2.0F - 1.0F;
+    const float normalized_y =
+        1.0F - ((mouse.y - minimum.y) / height) * 2.0F;
+    const glm::mat4 inverse_view_projection = glm::inverse(
+        editor_projection(width, height) * camera.view_matrix());
+    glm::vec4 far_point = inverse_view_projection * glm::vec4(
+        normalized_x, normalized_y, 1.0F, 1.0F);
+    if (!std::isfinite(far_point.w) ||
+        std::abs(far_point.w) <= std::numeric_limits<float>::epsilon()) {
+        return std::nullopt;
+    }
+    far_point /= far_point.w;
+    const glm::vec3 direction =
+        glm::vec3(far_point) - camera.position();
+    const float length_squared = glm::dot(direction, direction);
+    if (!std::isfinite(length_squared) || length_squared <= 0.0F) {
+        return std::nullopt;
+    }
+    return EditorViewportRay{
+        .origin = camera.position(),
+        .direction = direction / std::sqrt(length_squared),
+    };
+}
+
+[[nodiscard]] ImGuizmo::OPERATION imguizmo_operation(
+    const EditorGizmoOperation operation) noexcept {
+    switch (operation) {
+    case EditorGizmoOperation::translate:
+        return ImGuizmo::TRANSLATE;
+    case EditorGizmoOperation::rotate:
+        return ImGuizmo::ROTATE;
+    case EditorGizmoOperation::scale:
+        return ImGuizmo::SCALE;
+    }
+    return ImGuizmo::TRANSLATE;
+}
+
+[[nodiscard]] ImGuizmo::MODE imguizmo_space(
+    const EditorGizmoSpace space) noexcept {
+    return space == EditorGizmoSpace::local
+        ? ImGuizmo::LOCAL
+        : ImGuizmo::WORLD;
 }
 
 [[nodiscard]] const char* play_state_name(
@@ -1153,7 +1229,16 @@ void EditorUi::shutdown() noexcept {
     asset_import_enabled_ = false;
     undo_history_.clear();
     redo_history_.clear();
+    selected_node_ = {};
+    pending_delete_ = {};
+    pending_duplicate_ = {};
+    delete_confirmation_ = {};
+    pending_reparent_child_ = {};
+    pending_reparent_parent_ = {};
+    edit_scene_snapshot_.reset();
     inspector_edit_snapshot_.reset();
+    gizmo_edit_snapshot_.reset();
+    focus_selection_requested_ = false;
     scatter_created_.clear();
 }
 
@@ -1279,14 +1364,82 @@ void EditorUi::synchronize_renderer(Renderer& renderer) {
     }
 }
 
+bool EditorUi::select_node(
+    SceneDocument& scene,
+    const SceneNodeId id) noexcept {
+    if (id && !scene.valid(id)) {
+        return false;
+    }
+    selected_node_ = id;
+    name_buffer_node_ = {};
+    inspector_edit_snapshot_.reset();
+    gizmo_edit_snapshot_.reset();
+    std::uint32_t traversed = 0U;
+    for (SceneNodeId ancestor = id ? scene.parent(id) : SceneNodeId{};
+         ancestor && traversed < max_scene_nodes;
+         ancestor = scene.parent(ancestor), ++traversed) {
+        scene.set_expanded(ancestor, true);
+    }
+    hierarchy_revision_ = 0U;
+    return true;
+}
+
+bool EditorUi::duplicate_selection(
+    SceneDocument& scene,
+    std::uint32_t& duplicated_nodes,
+    std::string& error) {
+    if (play_state_ != EditorPlayState::edit ||
+        !scene.valid(selected_node_)) {
+        duplicated_nodes = 0U;
+        error = "Select a valid scene node in Edit mode before duplicating.";
+        return false;
+    }
+    SceneDocument snapshot = scene;
+    const SceneNodeId duplicate = duplicate_scene_subtree(
+        scene, selected_node_, duplicated_nodes, error);
+    if (!duplicate) {
+        return false;
+    }
+    push_undo_snapshot(std::move(snapshot));
+    static_cast<void>(select_node(scene, duplicate));
+    return true;
+}
+
+bool EditorUi::focus_selection(
+    const SceneDocument& scene,
+    const Renderer& renderer,
+    FlyCamera& camera) const noexcept {
+    if (!scene.valid(selected_node_)) {
+        return false;
+    }
+    glm::vec3 target{};
+    float distance = 4.0F;
+    if (const auto bounds = renderer.editor_node_bounds(selected_node_)) {
+        target = bounds->center;
+        distance = std::clamp(
+            glm::length(bounds->extent) * 2.6F,
+            2.5F,
+            250.0F);
+    } else if (const auto world =
+                   scene_world_matrix(scene, selected_node_)) {
+        target = glm::vec3((*world)[3]);
+    } else {
+        return false;
+    }
+    camera.focus(target, distance);
+    return true;
+}
+
 void EditorUi::begin_frame(
     SceneDocument& scene,
     Renderer& renderer,
+    FlyCamera& camera,
     const PerformanceSnapshot& performance,
     const std::chrono::steady_clock::time_point now) {
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
+    ImGuizmo::BeginFrame();
     camera_input_ = {};
     external_viewport_hovered_ = false;
     external_viewport_focused_ = false;
@@ -1389,7 +1542,7 @@ void EditorUi::begin_frame(
             ImGui::DockBuilderSplitNode(
                 center,
                 ImGuiDir_Up,
-                0.11F,
+                0.16F,
                 &top,
                 &center);
             if (ImGuiDockNode* const toolbar_node =
@@ -1418,7 +1571,7 @@ void EditorUi::begin_frame(
     build_toolbar(scene);
     build_hierarchy(scene);
     build_inspector(scene);
-    build_viewport(scene, renderer, now);
+    build_viewport(scene, renderer, camera, now);
     build_assets(scene, renderer);
     build_landscape(scene, renderer);
     if (import_dialog_requested_) {
@@ -1581,6 +1734,29 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
                 false,
                 editable && can_redo())) {
             static_cast<void>(redo_scene(scene));
+        }
+        ImGui::Separator();
+        const bool has_selection = scene.valid(selected_node_);
+        if (ImGui::MenuItem(
+                "Duplicate selected",
+                "Ctrl+D",
+                false,
+                editable && has_selection)) {
+            pending_duplicate_ = selected_node_;
+        }
+        if (ImGui::MenuItem(
+                "Delete selected",
+                "Delete",
+                false,
+                editable && has_selection)) {
+            pending_delete_ = selected_node_;
+        }
+        if (ImGui::MenuItem(
+                "Focus selected",
+                "F",
+                false,
+                has_selection)) {
+            focus_selection_requested_ = true;
         }
         ImGui::EndMenu();
     }
@@ -1808,6 +1984,29 @@ void EditorUi::build_hierarchy(SceneDocument& scene) {
         "Search objects...",
         hierarchy_filter_.data(),
         hierarchy_filter_.size()));
+    if (ImGui::SmallButton("Expand all")) {
+        std::vector<SceneHierarchyRow> all_rows;
+        all_rows.reserve(scene.size());
+        scene.build_hierarchy_rows(
+            all_rows, {}, SceneHierarchyScope::all);
+        for (const SceneHierarchyRow& row : all_rows) {
+            if (row.has_children) {
+                scene.set_expanded(row.id, true);
+            }
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Collapse all")) {
+        std::vector<SceneHierarchyRow> all_rows;
+        all_rows.reserve(scene.size());
+        scene.build_hierarchy_rows(
+            all_rows, {}, SceneHierarchyScope::all);
+        for (const SceneHierarchyRow& row : all_rows) {
+            if (row.has_children) {
+                scene.set_expanded(row.id, false);
+            }
+        }
+    }
     const bool filter_changed =
         hierarchy_filter_ != previous_hierarchy_filter_;
     if (hierarchy_revision_ != scene.structure_revision() ||
@@ -1846,7 +2045,7 @@ void EditorUi::build_hierarchy(SceneDocument& scene) {
                     selected,
                     node.visible);
             if (row_result.selected) {
-                selected_node_ = row.id;
+                static_cast<void>(select_node(scene, row.id));
             }
             if (row_result.expansion_toggled) {
                 scene.set_expanded(row.id, !node.expanded);
@@ -1874,6 +2073,18 @@ void EditorUi::build_hierarchy(SceneDocument& scene) {
                 ImGui::EndDragDropTarget();
             }
             if (ImGui::BeginPopupContextItem()) {
+                if (ImGui::MenuItem(
+                        "Duplicate",
+                        "Ctrl+D",
+                        false,
+                        play_state_ == EditorPlayState::edit)) {
+                    pending_duplicate_ = row.id;
+                }
+                if (ImGui::MenuItem("Focus", "F")) {
+                    static_cast<void>(select_node(scene, row.id));
+                    focus_selection_requested_ = true;
+                }
+                ImGui::Separator();
                 if (ImGui::MenuItem(
                         "Delete",
                         nullptr,
@@ -2010,11 +2221,7 @@ void EditorUi::build_inspector(SceneDocument& scene) {
         ui_kit_.end_property_grid();
     }
 
-    const bool has_transform =
-        node.kind == SceneNodeKind::folder ||
-        node.kind == SceneNodeKind::cube ||
-        node.kind == SceneNodeKind::model ||
-        node.kind == SceneNodeKind::ground;
+    const bool has_transform = true;
     if (has_transform) {
         ui_kit_.section_header(
             EditorIcon::cube,
@@ -2119,6 +2326,7 @@ void EditorUi::build_inspector(SceneDocument& scene) {
 void EditorUi::build_viewport(
     SceneDocument& scene,
     Renderer& renderer,
+    FlyCamera& camera,
     const std::chrono::steady_clock::time_point now) {
     ImGui::SetNextWindowSize(
         ImVec2(900.0F, 620.0F), ImGuiCond_FirstUseEver);
@@ -2130,6 +2338,102 @@ void EditorUi::build_viewport(
         ImGui::End();
         return;
     }
+
+    const bool editable = play_state_ == EditorPlayState::edit;
+    viewport_focused_ = ImGui::IsWindowFocused(
+        ImGuiFocusedFlags_RootAndChildWindows);
+    const ImGuiIO& io = ImGui::GetIO();
+    const bool viewport_shortcuts =
+        editable && viewport_focused_ && !io.WantTextInput &&
+        !ImGui::IsMouseDown(ImGuiMouseButton_Right);
+    if (focus_selection_requested_) {
+        static_cast<void>(focus_selection(scene, renderer, camera));
+        focus_selection_requested_ = false;
+    }
+    if (viewport_shortcuts) {
+        if (!io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_W, false)) {
+            gizmo_operation_ = EditorGizmoOperation::translate;
+        }
+        if (!io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_E, false)) {
+            gizmo_operation_ = EditorGizmoOperation::rotate;
+        }
+        if (!io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_R, false)) {
+            gizmo_operation_ = EditorGizmoOperation::scale;
+        }
+        if (!io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F, false)) {
+            static_cast<void>(focus_selection(scene, renderer, camera));
+        }
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D, false)) {
+            std::uint32_t duplicated_nodes = 0U;
+            std::string duplicate_error;
+            if (!duplicate_selection(
+                    scene, duplicated_nodes, duplicate_error)) {
+                asset_error_ = std::move(duplicate_error);
+            }
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) &&
+            scene.valid(selected_node_)) {
+            pending_delete_ = selected_node_;
+        }
+    }
+
+    ImGui::BeginDisabled(!editable);
+    if (ImGui::RadioButton(
+            "W  Move",
+            gizmo_operation_ == EditorGizmoOperation::translate)) {
+        gizmo_operation_ = EditorGizmoOperation::translate;
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton(
+            "E  Rotate",
+            gizmo_operation_ == EditorGizmoOperation::rotate)) {
+        gizmo_operation_ = EditorGizmoOperation::rotate;
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton(
+            "R  Scale",
+            gizmo_operation_ == EditorGizmoOperation::scale)) {
+        gizmo_operation_ = EditorGizmoOperation::scale;
+    }
+    ImGui::SameLine(0.0F, 18.0F);
+    ImGui::SetNextItemWidth(82.0F);
+    const char* const spaces[] = {"World", "Local"};
+    int space_index = gizmo_space_ == EditorGizmoSpace::world ? 0 : 1;
+    if (ImGui::Combo(
+            "##GizmoSpace", &space_index, spaces,
+            static_cast<int>(std::size(spaces)))) {
+        gizmo_space_ = space_index == 0
+            ? EditorGizmoSpace::world
+            : EditorGizmoSpace::local;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Transform orientation");
+    }
+    ImGui::SameLine();
+    static_cast<void>(ImGui::Checkbox("Snap", &gizmo_snap_enabled_));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(76.0F);
+    float* snap_value = &gizmo_translation_snap_;
+    const char* snap_format = "%.2f";
+    float snap_speed = 0.05F;
+    if (gizmo_operation_ == EditorGizmoOperation::rotate) {
+        snap_value = &gizmo_rotation_snap_;
+        snap_format = "%.0f deg";
+        snap_speed = 1.0F;
+    } else if (gizmo_operation_ == EditorGizmoOperation::scale) {
+        snap_value = &gizmo_scale_snap_;
+        snap_format = "%.2f";
+        snap_speed = 0.01F;
+    }
+    static_cast<void>(ImGui::DragFloat(
+        "##GizmoSnap", snap_value, snap_speed, 0.01F, 100.0F,
+        snap_format, ImGuiSliderFlags_AlwaysClamp));
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "Snap step. Hold Ctrl for temporary snapping.");
+    }
+    ImGui::EndDisabled();
+
     const ImVec2 available = ImGui::GetContentRegionAvail();
     const float dpi = std::max(
         ImGui::GetWindowViewport()->DpiScale, 0.25F);
@@ -2147,6 +2451,9 @@ void EditorUi::build_viewport(
         available,
         ImVec2(0.0F, 0.0F),
         ImVec2(1.0F, 1.0F));
+    const bool viewport_clicked =
+        ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    viewport_hovered_ = ImGui::IsItemHovered();
     const ImVec2 image_minimum = ImGui::GetItemRectMin();
     const ImVec2 image_maximum = ImGui::GetItemRectMax();
     ImGui::GetWindowDrawList()->AddRect(
@@ -2190,9 +2497,124 @@ void EditorUi::build_viewport(
         ImVec2(
             image_minimum.x + 10.0F,
             image_maximum.y - 34.0F),
-        "RMB + WASD  /  SHIFT BOOST",
+        "LMB SELECT  /  RMB + WASD  /  F FOCUS",
         EditorTone::purple);
-    viewport_hovered_ = ImGui::IsItemHovered();
+
+    const float image_width = image_maximum.x - image_minimum.x;
+    const float image_height = image_maximum.y - image_minimum.y;
+    const glm::mat4 view = camera.view_matrix();
+    const glm::mat4 projection = editor_projection(
+        image_width, image_height);
+    if (const auto bounds = renderer.editor_node_bounds(selected_node_)) {
+        ImVec2 selection_minimum(
+            std::numeric_limits<float>::infinity(),
+            std::numeric_limits<float>::infinity());
+        ImVec2 selection_maximum(
+            -std::numeric_limits<float>::infinity(),
+            -std::numeric_limits<float>::infinity());
+        std::uint32_t projected_corners = 0U;
+        for (const glm::vec3 corner : bounds_corners(*bounds)) {
+            const glm::vec4 clip =
+                projection * view * glm::vec4(corner, 1.0F);
+            if (!std::isfinite(clip.w) || clip.w <= 0.0F) {
+                continue;
+            }
+            const glm::vec3 ndc = glm::vec3(clip) / clip.w;
+            const ImVec2 screen{
+                image_minimum.x + (ndc.x * 0.5F + 0.5F) * image_width,
+                image_minimum.y + (0.5F - ndc.y * 0.5F) * image_height,
+            };
+            selection_minimum.x = std::min(selection_minimum.x, screen.x);
+            selection_minimum.y = std::min(selection_minimum.y, screen.y);
+            selection_maximum.x = std::max(selection_maximum.x, screen.x);
+            selection_maximum.y = std::max(selection_maximum.y, screen.y);
+            ++projected_corners;
+        }
+        if (projected_corners >= 2U) {
+            ImGui::GetWindowDrawList()->AddRect(
+                selection_minimum,
+                selection_maximum,
+                ImGui::ColorConvertFloat4ToU32(
+                    EditorUiKit::color(EditorTone::info)),
+                2.0F,
+                0,
+                1.5F);
+        }
+    }
+
+    bool gizmo_over = false;
+    bool gizmo_using = false;
+    if (editable && scene.valid(selected_node_)) {
+        if (auto world = scene_world_matrix(scene, selected_node_)) {
+            ImGuizmo::SetDrawlist(ImGui::GetWindowDrawList());
+            ImGuizmo::SetRect(
+                image_minimum.x,
+                image_minimum.y,
+                image_width,
+                image_height);
+            ImGuizmo::SetOrthographic(false);
+            ImGuizmo::Enable(true);
+            ImGuizmo::PushID(static_cast<int>(selected_node_.index));
+            std::array<float, 3U> translation_snap{
+                gizmo_translation_snap_,
+                gizmo_translation_snap_,
+                gizmo_translation_snap_,
+            };
+            const bool snap_active = gizmo_snap_enabled_ || io.KeyCtrl;
+            const float* snap = nullptr;
+            if (snap_active) {
+                snap = gizmo_operation_ == EditorGizmoOperation::translate
+                    ? translation_snap.data()
+                    : gizmo_operation_ == EditorGizmoOperation::rotate
+                    ? &gizmo_rotation_snap_
+                    : &gizmo_scale_snap_;
+            }
+            const bool manipulated = ImGuizmo::Manipulate(
+                glm::value_ptr(view),
+                glm::value_ptr(projection),
+                imguizmo_operation(gizmo_operation_),
+                imguizmo_space(gizmo_space_),
+                glm::value_ptr(*world),
+                nullptr,
+                snap);
+            gizmo_over = ImGuizmo::IsOver();
+            gizmo_using = ImGuizmo::IsUsing();
+            ImGuizmo::PopID();
+            if (manipulated) {
+                const auto local = scene_local_transform_from_world(
+                    scene, selected_node_, *world);
+                if (local) {
+                    const auto selected = scene.node(selected_node_);
+                    if (selected && selected->get().transform != *local) {
+                        if (!gizmo_edit_snapshot_) {
+                            gizmo_edit_snapshot_ = scene;
+                        }
+                        selected->get().transform = *local;
+                        scene.mark_content_changed();
+                    }
+                } else {
+                    asset_error_ =
+                        "The gizmo result cannot be represented as a finite "
+                        "positive-scale local transform.";
+                }
+            }
+        }
+    }
+    if (gizmo_edit_snapshot_ && !gizmo_using) {
+        push_undo_snapshot(std::move(*gizmo_edit_snapshot_));
+        gizmo_edit_snapshot_.reset();
+    }
+
+    if (viewport_clicked && editable && !gizmo_over && !gizmo_using) {
+        const auto ray = viewport_ray(
+            io.MousePos, image_minimum, image_maximum, camera);
+        if (ray) {
+            const auto picked = renderer.pick_editor_scene(
+                ray->origin, ray->direction);
+            static_cast<void>(select_node(
+                scene, picked.value_or(SceneNodeId{})));
+        }
+    }
     if (ImGui::BeginDragDropTarget()) {
         if (const ImGuiPayload* payload =
                 ImGui::AcceptDragDropPayload(
@@ -2225,8 +2647,6 @@ void EditorUi::build_viewport(
         }
         ImGui::EndDragDropTarget();
     }
-    viewport_focused_ = ImGui::IsWindowFocused(
-        ImGuiFocusedFlags_RootAndChildWindows);
     ImGui::End();
 }
 
@@ -3919,6 +4339,17 @@ std::string_view EditorUi::asset_import_status() const noexcept {
 
 void EditorUi::apply_deferred_scene_commands(
     SceneDocument& scene) {
+    if (play_state_ == EditorPlayState::edit &&
+        scene.valid(pending_duplicate_)) {
+        static_cast<void>(select_node(scene, pending_duplicate_));
+        std::uint32_t duplicated_nodes = 0U;
+        std::string duplicate_error;
+        if (!duplicate_selection(
+                scene, duplicated_nodes, duplicate_error)) {
+            asset_error_ = std::move(duplicate_error);
+        }
+    }
+    pending_duplicate_ = {};
     if (play_state_ == EditorPlayState::edit &&
         pending_reparent_child_ &&
         pending_reparent_parent_) {

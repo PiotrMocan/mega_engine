@@ -111,6 +111,17 @@ int main() {
         vcr::transform_bounds({{0, 0, 0}, {1, 2, 3}}, {1, 2, 0, 4}, {0, -2, 0, 5}, {0, 0, 3, 6});
     expect(transformed.extent == glm::vec3(5, 4, 9) && transformed.center == glm::vec3(4, 5, 6),
            "bounds support shear and negative scale");
+    const auto ray_hit = vcr::ray_bounds_intersection(
+        {0, 0, 0}, {0, 0, -1}, {{0, 0, -5}, {1, 2, 1}});
+    expect(ray_hit && std::abs(*ray_hit - 4.0F) < 0.0001F,
+           "editor picking ray returns nearest bounds entry");
+    expect(!vcr::ray_bounds_intersection(
+               {3, 0, 0}, {0, 0, -1}, {{0, 0, -5}, {1, 2, 1}}),
+           "parallel picking ray rejects a missed bounds slab");
+    const auto inside_hit = vcr::ray_bounds_intersection(
+        {0, 0, -5}, {1, 0, 0}, {{0, 0, -5}, {1, 2, 1}});
+    expect(inside_hit && *inside_hit == 0.0F,
+           "picking from inside bounds starts at zero distance");
     vcr::OcclusionGrid grid;
     const glm::vec2 guard = glm::vec2(2) / glm::vec2(1920, 1080);
     grid.clear();

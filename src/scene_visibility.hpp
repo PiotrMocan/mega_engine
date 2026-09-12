@@ -3,6 +3,7 @@
 #include <glm/glm.hpp>
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <span>
 
 namespace vcr {
@@ -19,6 +20,12 @@ struct LodProjection {
 
 [[nodiscard]] Bounds transform_bounds(const Bounds &bounds, const glm::vec4 &row0,
                                       const glm::vec4 &row1, const glm::vec4 &row2) noexcept;
+
+// Returns the nearest non-negative distance along a normalized ray.
+[[nodiscard]] std::optional<float> ray_bounds_intersection(
+    glm::vec3 origin,
+    glm::vec3 direction,
+    const Bounds& bounds) noexcept;
 
 // Vulkan clip volume: -w <= x,y <= w, 0 <= z <= w. Bounds tests are
 // conservative, including nonuniform scale/shear and the near plane.

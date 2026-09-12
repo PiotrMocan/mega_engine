@@ -48,6 +48,18 @@ AI мог только эмулировать ввод в game executable, чт�
   покрыт настоящим cook fixture. Image import сохраняет PNG, JPEG, TGA, HDR, BMP,
   DDS и EXR.
 
+## Реализованный второй ручной срез
+
+- Hierarchy chevrons исправлены, добавлены Expand/Collapse All и reveal
+  выбранного через UI/MCP.
+- Scene View поддерживает picking renderable bounds, single selection,
+  selection outline и translate/rotate/scale gizmo в World/Local space со snap.
+- `W/E/R`, `F`, `Ctrl+D` и `Delete` дают базовый keyboard workflow; duplicate
+  копирует subtree, а gizmo drag coalesced в одну bounded Undo-запись.
+- MCP получил `editor.selection.set`, `editor.scene.duplicate_node` и
+  `editor.camera.focus_selection`; точный TRS по-прежнему меняется через
+  `editor.scene.update_node`.
+
 ## Полный набор, необходимый современному level editor
 
 ### P0 — надёжное AI authoring

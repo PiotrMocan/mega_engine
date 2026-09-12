@@ -2,7 +2,10 @@
 
 #include "scene_document.hpp"
 
+#include <glm/mat4x4.hpp>
+
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -55,6 +58,31 @@ struct ModelScatterOptions {
     SceneDocument& scene,
     const ModelScatterOptions& options,
     std::vector<SceneNodeId>& created,
+    std::string& error);
+
+[[nodiscard]] glm::mat4 scene_transform_matrix(
+    const SceneTransform& transform) noexcept;
+
+// Computes authored world space without relying on renderer-owned caches.
+// The hierarchy is bounded by max_scene_nodes, so a corrupt chain cannot loop.
+[[nodiscard]] std::optional<glm::mat4> scene_world_matrix(
+    const SceneDocument& scene,
+    SceneNodeId id) noexcept;
+
+// Converts a manipulated world matrix back to the selected node's local TRS.
+[[nodiscard]] std::optional<SceneTransform>
+    scene_local_transform_from_world(
+        const SceneDocument& scene,
+        SceneNodeId id,
+        const glm::mat4& world_matrix) noexcept;
+
+// Duplicates one complete subtree under the same parent as its source. The
+// returned handle is the new root and every partial allocation is rolled back
+// on failure.
+[[nodiscard]] SceneNodeId duplicate_scene_subtree(
+    SceneDocument& scene,
+    SceneNodeId source,
+    std::uint32_t& duplicated_nodes,
     std::string& error);
 
 } // namespace vcr

@@ -15,11 +15,14 @@ Nuklear остаётся хорошим вариантом для компакт
 окон, clipping больших списков и значительную часть editor widgets.
 
 Dear ImGui выбран из-за официальных SDL3/Vulkan backends, docking branch,
-multi-viewport и `ImGuiListClipper`. Поверх него редактор использует
+multi-viewport и `ImGuiListClipper`. Transform gizmo использует закреплённое
+ядро ImGuizmo `1.10`; sequencer, graph editor и examples не собираются. Поверх
+них редактор использует
 собственный `EditorUiKit`, чтобы стандартные immediate-mode widgets выглядели
 как единый интерфейс движка. Ссылки:
 
 - <https://github.com/ocornut/imgui/tree/v1.92.8-docking>
+- <https://github.com/CedricGuillemet/ImGuizmo/tree/1.10>
 - <https://github.com/Immediate-Mode-UI/Nuklear/tree/4.13.3>
 - <https://github.com/Binaryify/OneDark-Pro>
 
@@ -88,15 +91,20 @@ performance benchmark используется изолированный `vulka
 ## Возможности
 
 - `Scene Hierarchy`: иерархический forest с generational handles,
-  drag-and-drop reparenting, защитой от циклов, фильтром и clipped-отрисовкой.
-- `Inspector`: имя и visibility для всех nodes; position/rotation/scale для
-  geometry, imported models и иерархических folders; asset path для model
+  работающими chevrons, `Expand all`/`Collapse all`, drag-and-drop reparenting,
+  защитой от циклов, фильтром и clipped-отрисовкой.
+- `Inspector`: имя, visibility и position/rotation/scale для всех nodes;
+  asset path для model
   nodes; PBR base color, metallic, roughness и ambient occlusion для
   cubes/ground. Terrain, sky и sun visibility уже
   управляет renderer, а неподключённые component controls намеренно не
   показываются как работающие.
-- `Scene View`: offscreen Vulkan target, изменяемый размер и fly camera
-  (`RMB + WASD`, `E/Q`, `Shift`).
+- `Scene View`: offscreen Vulkan target, изменяемый размер, ray/AABB picking,
+  selection bounds и transform gizmo. `W/E/R` выбирают move/rotate/scale,
+  доступны World/Local space, постоянный snap и временный snap через `Ctrl`.
+  `F` кадрирует выбранный объект, `Ctrl+D` дублирует весь subtree, `Delete`
+  удаляет выбранное с возможностью Undo. Fly camera: `RMB + WASD`, `E/Q`,
+  `Shift`.
 - `Play/Stop` (`F5`): authoring scene сохраняется перед Play, редактирование
   блокируется, а Stop восстанавливает исходный снимок.
 - `Save/Open` (`Ctrl+S`/`Ctrl+O`): versioned JSON в
@@ -127,7 +135,8 @@ performance benchmark используется изолированный `vulka
 - `Landscape`: создание плоского authored ground и deterministic scatter
   выбранного imported model с count, seed, area и scale range.
 - `Undo/Redo`: bounded history на 32 scene transactions, `Ctrl+Z/Ctrl+Y`;
-  structural actions, Inspector edits и landscape batches входят в историю.
+  structural actions, Inspector edits, целый gizmo drag, duplicate и landscape
+  batches входят в историю.
 - `Renderer`: live CPU/GPU timings и управление AA.
 
 Первая раскладка создаётся автоматически: hierarchy слева, inspector справа,
@@ -144,6 +153,10 @@ sibling хранятся индексами; обход, удаление subtre
 World transforms вычисляются как точные affine matrices. Поэтому
 `non-uniform parent scale + rotated child` сохраняет shear вместо ошибочного
 разложения обратно в TRS; GPU scene instance с PBR material занимает 80 bytes.
+Gizmo редактирует world matrix и затем проверенно переводит её в локальный
+положительный TRS. World-rotation под non-uniform parent может породить shear,
+который authored TRS не хранит; в этом частном случае используется ближайший
+ортонормальный rotation basis, а Local mode остаётся точным вариантом.
 
 GPU scene data имеет фиксированный верхний предел и отдельный
 device-local buffer на каждый `FrameContext`. Изменённый render view копируется
@@ -187,9 +200,10 @@ Resize viewport coalesced с задержкой 140 ms и ограничен `38
 - Save/Open уже сохраняет иерархию и authored properties. Undo/Redo использует
   bounded full-scene snapshots; для очень больших сцен следующий этап — delta
   history с byte budget. Save As, prefabs, component inspector и произвольный
-  node graph ещё не реализованы.
+  node graph и multi-selection ещё не реализованы.
   Текущая иерархия намеренно остаётся tree/forest, чтобы ownership и transform
-  propagation были однозначными; Delete требует подтверждения.
+  propagation были однозначными. Context-menu Delete требует подтверждения,
+  а клавиша `Delete` выполняет сразу отменяемую через Undo операцию.
 
 Эти ограничения нельзя скрывать при performance-отчёте: FPS `vulkan_editor`
 включает UI и не сравнивается с baseline `vulkan_cube`.

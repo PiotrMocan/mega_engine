@@ -1,7 +1,12 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$ExePath,
-    [switch]$Validation
+    [switch]$Validation,
+    [ValidateRange(320, 16384)]
+    [int]$Width = 800,
+    [ValidateRange(240, 16384)]
+    [int]$Height = 600,
+    [string]$ScreenshotPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -9,7 +14,7 @@ $ErrorActionPreference = "Stop"
 $startInfo = New-Object System.Diagnostics.ProcessStartInfo
 $startInfo.FileName = $ExePath
 $validationArgument = if ($Validation) { "--validation" } else { "--no-validation" }
-$startInfo.Arguments = "--mcp-stdio $validationArgument --width 800 --height 600"
+$startInfo.Arguments = "--mcp-stdio $validationArgument --width $Width --height $Height"
 $startInfo.UseShellExecute = $false
 $startInfo.CreateNoWindow = $true
 $startInfo.RedirectStandardInput = $true
@@ -64,6 +69,9 @@ try {
         "editor.get_state",
         "editor.scene.list_nodes",
         "editor.scene.create_node",
+        "editor.scene.duplicate_node",
+        "editor.selection.set",
+        "editor.camera.focus_selection",
         "editor.landscape.create_flat_ground",
         "editor.landscape.scatter_model",
         "editor.assets.list",
@@ -130,41 +138,79 @@ try {
         throw "Unable to update authored ground material"
     }
 
-    $nodes = Send-McpMessage @{
+    $selection = Send-McpMessage @{
         jsonrpc = "2.0"; id = 8; method = "tools/call"
+        params = @{
+            name = "editor.selection.set"
+            arguments = @{ id = $groundId }
+        }
+    } 8
+    if ($selection.isError -or
+        $selection.structuredContent.selection.index -ne $groundId.index) {
+        throw "Unable to select the authored ground"
+    }
+
+    $duplicate = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 9; method = "tools/call"
+        params = @{
+            name = "editor.scene.duplicate_node"
+            arguments = @{ id = $groundId }
+        }
+    } 9
+    if ($duplicate.isError -or
+        $duplicate.structuredContent.duplicated_nodes -ne 1) {
+        throw "Unable to duplicate the selected authored ground"
+    }
+
+    $focus = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 10; method = "tools/call"
+        params = @{
+            name = "editor.camera.focus_selection"
+            arguments = @{}
+        }
+    } 10
+    if ($focus.isError) { throw "Unable to focus the editor selection" }
+
+    $nodes = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 11; method = "tools/call"
         params = @{
             name = "editor.scene.list_nodes"
             arguments = @{ offset = 0; limit = 100 }
         }
-    } 8
+    } 11
     if ($nodes.isError -or
-        $nodes.structuredContent.total -ne $before.structuredContent.node_count + 2) {
+        $nodes.structuredContent.total -ne $before.structuredContent.node_count + 3) {
         throw "Editor scene mutations are not visible through list_nodes"
     }
 
-    $undo = Send-McpMessage @{
-        jsonrpc = "2.0"; id = 9; method = "tools/call"
-        params = @{ name = "editor.history.undo"; arguments = @{} }
-    } 9
-    if ($undo.isError -or -not $undo.structuredContent.undone) {
-        throw "Editor undo failed"
-    }
-
     $screenshot = Send-McpMessage @{
-        jsonrpc = "2.0"; id = 10; method = "tools/call"
+        jsonrpc = "2.0"; id = 12; method = "tools/call"
         params = @{ name = "capture.screenshot"; arguments = @{} }
-    } 10
+    } 12
     $image = $screenshot.content |
         Where-Object { $_.type -eq "image" } |
         Select-Object -First 1
     if ($screenshot.isError -or $null -eq $image -or $image.mimeType -ne "image/png") {
         throw "Editor screenshot did not return PNG ImageContent"
     }
+    if (-not [string]::IsNullOrWhiteSpace($ScreenshotPath)) {
+        [System.IO.File]::WriteAllBytes(
+            $ScreenshotPath,
+            [Convert]::FromBase64String($image.data))
+    }
+
+    $undo = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 13; method = "tools/call"
+        params = @{ name = "editor.history.undo"; arguments = @{} }
+    } 13
+    if ($undo.isError -or -not $undo.structuredContent.undone) {
+        throw "Editor undo failed"
+    }
 
     $quit = Send-McpMessage @{
-        jsonrpc = "2.0"; id = 11; method = "tools/call"
+        jsonrpc = "2.0"; id = 14; method = "tools/call"
         params = @{ name = "engine.quit"; arguments = @{} }
-    } 11
+    } 14
     if (-not $quit.structuredContent.shutting_down) {
         throw "engine.quit was not acknowledged"
     }

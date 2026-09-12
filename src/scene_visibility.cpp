@@ -47,6 +47,51 @@ Bounds transform_bounds(const Bounds &b, const glm::vec4 &x, const glm::vec4 &y,
             {glm::dot(glm::abs(glm::vec3(x)), b.extent), glm::dot(glm::abs(glm::vec3(y)), b.extent),
              glm::dot(glm::abs(glm::vec3(z)), b.extent)}};
 }
+
+std::optional<float> ray_bounds_intersection(
+    const glm::vec3 origin,
+    const glm::vec3 direction,
+    const Bounds& bounds) noexcept {
+    if (!std::isfinite(origin.x) || !std::isfinite(origin.y) ||
+        !std::isfinite(origin.z) || !std::isfinite(direction.x) ||
+        !std::isfinite(direction.y) || !std::isfinite(direction.z) ||
+        !std::isfinite(bounds.center.x) ||
+        !std::isfinite(bounds.center.y) ||
+        !std::isfinite(bounds.center.z) ||
+        !std::isfinite(bounds.extent.x) ||
+        !std::isfinite(bounds.extent.y) ||
+        !std::isfinite(bounds.extent.z) ||
+        bounds.extent.x < 0.0F || bounds.extent.y < 0.0F ||
+        bounds.extent.z < 0.0F) {
+        return std::nullopt;
+    }
+    float nearest = 0.0F;
+    float farthest = std::numeric_limits<float>::infinity();
+    constexpr float parallel_epsilon = 1.0e-7F;
+    for (glm::length_t axis = 0; axis < 3; ++axis) {
+        const float minimum = bounds.center[axis] - bounds.extent[axis];
+        const float maximum = bounds.center[axis] + bounds.extent[axis];
+        if (std::abs(direction[axis]) <= parallel_epsilon) {
+            if (origin[axis] < minimum || origin[axis] > maximum) {
+                return std::nullopt;
+            }
+            continue;
+        }
+        float entry = (minimum - origin[axis]) / direction[axis];
+        float exit = (maximum - origin[axis]) / direction[axis];
+        if (entry > exit) {
+            std::swap(entry, exit);
+        }
+        nearest = std::max(nearest, entry);
+        farthest = std::min(farthest, exit);
+        if (nearest > farthest) {
+            return std::nullopt;
+        }
+    }
+    return farthest >= 0.0F
+        ? std::optional<float>(nearest)
+        : std::nullopt;
+}
 ViewFrustum::ViewFrustum(const glm::mat4 &m) noexcept {
     const auto w = row(m, 3);
     planes_ = {w + row(m, 0), w - row(m, 0), w + row(m, 1),

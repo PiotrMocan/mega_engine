@@ -12,7 +12,9 @@ build\windows-debug\bin\vulkan_editor.exe --mcp-stdio --no-validation
 | Toolset | Инструменты |
 | --- | --- |
 | `editor` | `get_state` |
-| `editor.scene` | `list_nodes`, `get_node`, `create_node`, `update_node`, `delete_node`, `reparent_node`, `save` |
+| `editor.selection` | `set` |
+| `editor.scene` | `list_nodes`, `get_node`, `create_node`, `update_node`, `delete_node`, `reparent_node`, `duplicate_node`, `save` |
+| `editor.camera` | `focus_selection` |
 | `editor.history` | `undo`, `redo` |
 | `editor.assets` | `list`, `import` |
 | `editor.landscape` | `create_flat_ground`, `scatter_model` |
@@ -28,6 +30,12 @@ handle нужно считать недействительным и снова 
 `scatter_model` принимает cooked `*.vcrasset.json`, count до 10 000, seed,
 центр/размер XZ-области и scale range. Повторный вызов с теми же параметрами
 создаёт те же transforms, но новые nodes.
+`selection.set` принимает generational handle либо `null`, раскрывает родителей
+выбранного node в UI и отражается в `editor.get_state`. `duplicate_node`
+копирует весь subtree одной Undo-транзакцией и выбирает новую root-копию;
+`camera.focus_selection` кадрирует текущий выбор без изменения scene document.
+Точный эквивалент ручного gizmo для AI — `editor.scene.update_node` с
+`translation`, `rotation_degrees` и/или `scale`.
 
 Нативный smoke editor-profile:
 

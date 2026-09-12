@@ -51,6 +51,21 @@ using Json = nlohmann::json;
     return "unknown";
 }
 
+[[nodiscard]] std::string_view gizmo_operation_token(
+    const EditorGizmoOperation operation) noexcept {
+    switch (operation) {
+    case EditorGizmoOperation::translate: return "translate";
+    case EditorGizmoOperation::rotate: return "rotate";
+    case EditorGizmoOperation::scale: return "scale";
+    }
+    return "translate";
+}
+
+[[nodiscard]] std::string_view gizmo_space_token(
+    const EditorGizmoSpace space) noexcept {
+    return space == EditorGizmoSpace::local ? "local" : "world";
+}
+
 [[nodiscard]] Json node_id_json(const SceneNodeId id) {
     if (!id) {
         return nullptr;
@@ -239,8 +254,8 @@ void EditorApplication::initialize(const CliOptions& options) {
     last_title_update_ = now;
     running_ = true;
     std::cout
-        << "Editor controls: RMB + WASD in Scene View, "
-           "drag hierarchy rows to reparent, Play for runtime view.\n";
+        << "Editor controls: LMB select, W/E/R gizmo, F focus, Ctrl+D "
+           "duplicate, Delete remove, RMB + WASD fly camera.\n";
 }
 
 void EditorApplication::main_loop() {
@@ -289,6 +304,7 @@ void EditorApplication::main_loop() {
         ui_.begin_frame(
             scene_,
             renderer_,
+            camera_,
             ui_metrics_,
             frame_begin);
         if (ui_.wants_quit()) {
@@ -418,6 +434,14 @@ void EditorApplication::execute_mcp_command(
                 {"node_count", scene_.size()},
                 {"content_revision", scene_.content_revision()},
                 {"structure_revision", scene_.structure_revision()},
+                {"selection", node_id_json(ui_.selected_node())},
+                {"gizmo", Json{
+                    {"operation", std::string(gizmo_operation_token(
+                        ui_.gizmo_operation()))},
+                    {"space", std::string(gizmo_space_token(
+                        ui_.gizmo_space()))},
+                    {"snap", ui_.gizmo_snap_enabled()},
+                }},
                 {"dirty", ui_.scene_is_dirty(scene_)},
                 {"can_undo", ui_.can_undo()},
                 {"can_redo", ui_.can_redo()},
@@ -433,6 +457,15 @@ void EditorApplication::execute_mcp_command(
             });
         return;
     }
+    case McpCommandType::editor_set_selection:
+        if (!ui_.select_node(scene_, command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        succeed(
+            command.node_id ? "scene node selected" : "scene selection cleared",
+            Json{{"selection", node_id_json(ui_.selected_node())}});
+        return;
     case McpCommandType::editor_list_nodes: {
         std::vector<SceneHierarchyRow> rows;
         rows.reserve(scene_.size());
@@ -664,6 +697,9 @@ void EditorApplication::execute_mcp_command(
             fail("unable to delete scene subtree");
             return;
         }
+        if (!scene_.valid(ui_.selected_node())) {
+            static_cast<void>(ui_.select_node(scene_, {}));
+        }
         succeed(
             "scene subtree deleted",
             Json{{"deleted", node_id_json(command.node_id)}});
@@ -689,6 +725,36 @@ void EditorApplication::execute_mcp_command(
             });
         return;
     }
+    case McpCommandType::editor_duplicate_node: {
+        if (!scene_.valid(command.node_id) ||
+            !ui_.select_node(scene_, command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        std::uint32_t duplicated_nodes = 0U;
+        std::string error;
+        if (!ui_.duplicate_selection(
+                scene_, duplicated_nodes, error)) {
+            fail(std::move(error));
+            return;
+        }
+        succeed(
+            "scene subtree duplicated",
+            Json{
+                {"node", scene_node_json(scene_, ui_.selected_node())},
+                {"duplicated_nodes", duplicated_nodes},
+            });
+        return;
+    }
+    case McpCommandType::editor_focus_selection:
+        if (!ui_.focus_selection(scene_, renderer_, camera_)) {
+            fail("select a valid scene node before focusing the editor camera");
+            return;
+        }
+        succeed(
+            "editor camera focused on selection",
+            Json{{"selection", node_id_json(ui_.selected_node())}});
+        return;
     case McpCommandType::editor_save_scene: {
         std::string error;
         if (!ui_.save_scene_external(scene_, error)) {

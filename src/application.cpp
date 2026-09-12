@@ -1127,12 +1127,15 @@ void Application::execute_mcp_command(const McpCommand& command) {
             Json{{"released", true}});
         return;
     case McpCommandType::editor_get_state:
+    case McpCommandType::editor_set_selection:
     case McpCommandType::editor_list_nodes:
     case McpCommandType::editor_get_node:
     case McpCommandType::editor_create_node:
     case McpCommandType::editor_update_node:
     case McpCommandType::editor_delete_node:
     case McpCommandType::editor_reparent_node:
+    case McpCommandType::editor_duplicate_node:
+    case McpCommandType::editor_focus_selection:
     case McpCommandType::editor_save_scene:
     case McpCommandType::editor_undo:
     case McpCommandType::editor_redo:

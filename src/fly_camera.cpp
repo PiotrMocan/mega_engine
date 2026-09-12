@@ -77,6 +77,17 @@ void FlyCamera::update(
     position_ += movement * speed * clamped_delta;
 }
 
+void FlyCamera::focus(
+    const glm::vec3 target,
+    const float distance) noexcept {
+    if (!std::isfinite(target.x) || !std::isfinite(target.y) ||
+        !std::isfinite(target.z) || !std::isfinite(distance) ||
+        distance <= 0.0F) {
+        return;
+    }
+    position_ = target - forward_ * distance;
+}
+
 glm::mat4 FlyCamera::view_matrix() const noexcept {
     return glm::lookAt(position_, position_ + forward_, world_up);
 }

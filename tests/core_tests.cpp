@@ -785,7 +785,71 @@ int main() {
             expect(
                 matches,
                 "hierarchical affine transform preserves shear");
+            const auto authored_world =
+                vcr::scene_world_matrix(scene, cube);
+            expect(
+                authored_world.has_value(),
+                "editor gizmo resolves selected world transform");
+            if (authored_world) {
+                const auto recovered =
+                    vcr::scene_local_transform_from_world(
+                        scene, cube, *authored_world);
+                bool round_trip = recovered.has_value();
+                if (recovered) {
+                    const glm::mat4 recovered_world =
+                        vcr::scene_transform_matrix(
+                            parent_node->get().transform) *
+                        vcr::scene_transform_matrix(*recovered);
+                    for (glm::length_t column = 0;
+                         column < 4 && round_trip;
+                         ++column) {
+                        for (glm::length_t row = 0;
+                             row < 4;
+                             ++row) {
+                            round_trip = close_to(
+                                recovered_world[column][row],
+                                (*authored_world)[column][row],
+                                0.001);
+                        }
+                    }
+                }
+                expect(
+                    round_trip,
+                    "gizmo world-to-local conversion preserves hierarchical TRS");
+            }
         }
+    }
+
+    {
+        vcr::SceneDocument scene;
+        const auto root = scene.create_node(
+            "Group", vcr::SceneNodeKind::folder);
+        const auto child = scene.create_node(
+            "Cube", vcr::SceneNodeKind::cube, root);
+        const auto grandchild = scene.create_node(
+            "Model", vcr::SceneNodeKind::model, child);
+        scene.node(root)->get().transform.translation =
+            {4.0F, 1.0F, -2.0F};
+        scene.node(child)->get().material.metallic = 0.65F;
+        scene.node(grandchild)->get().asset_path =
+            "models/tree/tree.vcrasset.json";
+        scene.mark_content_changed();
+        std::uint32_t duplicated_nodes = 0U;
+        std::string error;
+        const auto duplicate = vcr::duplicate_scene_subtree(
+            scene, root, duplicated_nodes, error);
+        std::vector<vcr::SceneNodeRecord> records;
+        scene.build_node_records(records);
+        expect(
+            duplicate && error.empty() && duplicated_nodes == 3U &&
+                scene.size() == 6U &&
+                scene.parent(duplicate) == vcr::SceneNodeId{} &&
+                scene.node(duplicate)->get().name == "Group Copy" &&
+                scene.node(duplicate)->get().transform ==
+                    scene.node(root)->get().transform &&
+                records.back().value.asset_path ==
+                    "models/tree/tree.vcrasset.json",
+            "editor duplicate copies a complete authored subtree");
     }
 
     {

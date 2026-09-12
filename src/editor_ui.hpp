@@ -36,6 +36,17 @@ enum class EditorPlayState : std::uint8_t {
     paused,
 };
 
+enum class EditorGizmoOperation : std::uint8_t {
+    translate,
+    rotate,
+    scale,
+};
+
+enum class EditorGizmoSpace : std::uint8_t {
+    world,
+    local,
+};
+
 struct SavedMaterialUpdate {
     std::string relative_path{};
     PbrMaterial material{};
@@ -63,6 +74,7 @@ public:
     void begin_frame(
         SceneDocument& scene,
         Renderer& renderer,
+        FlyCamera& camera,
         const PerformanceSnapshot& performance,
         std::chrono::steady_clock::time_point now);
     [[nodiscard]] ImDrawData* end_frame() noexcept;
@@ -83,6 +95,29 @@ public:
     [[nodiscard]] EditorPlayState play_state() const noexcept {
         return play_state_;
     }
+    [[nodiscard]] SceneNodeId selected_node() const noexcept {
+        return selected_node_;
+    }
+    [[nodiscard]] EditorGizmoOperation gizmo_operation() const noexcept {
+        return gizmo_operation_;
+    }
+    [[nodiscard]] EditorGizmoSpace gizmo_space() const noexcept {
+        return gizmo_space_;
+    }
+    [[nodiscard]] bool gizmo_snap_enabled() const noexcept {
+        return gizmo_snap_enabled_;
+    }
+    [[nodiscard]] bool select_node(
+        SceneDocument& scene,
+        SceneNodeId id) noexcept;
+    [[nodiscard]] bool duplicate_selection(
+        SceneDocument& scene,
+        std::uint32_t& duplicated_nodes,
+        std::string& error);
+    [[nodiscard]] bool focus_selection(
+        const SceneDocument& scene,
+        const Renderer& renderer,
+        FlyCamera& camera) const noexcept;
     [[nodiscard]] bool external_game_window_open() const noexcept {
         return external_game_window_open_;
     }
@@ -140,6 +175,7 @@ private:
     void build_viewport(
         SceneDocument& scene,
         Renderer& renderer,
+        FlyCamera& camera,
         std::chrono::steady_clock::time_point now);
     void build_external_game_window(
         std::chrono::steady_clock::time_point now);
@@ -216,11 +252,13 @@ private:
 
     SceneNodeId selected_node_{};
     SceneNodeId pending_delete_{};
+    SceneNodeId pending_duplicate_{};
     SceneNodeId delete_confirmation_{};
     SceneNodeId pending_reparent_child_{};
     SceneNodeId pending_reparent_parent_{};
     std::optional<SceneDocument> edit_scene_snapshot_{};
     std::optional<SceneDocument> inspector_edit_snapshot_{};
+    std::optional<SceneDocument> gizmo_edit_snapshot_{};
     static constexpr std::size_t maximum_history_entries = 32U;
     std::vector<SceneDocument> undo_history_{};
     std::vector<SceneDocument> redo_history_{};
@@ -233,7 +271,15 @@ private:
     bool toggle_play_requested_ = false;
     bool toggle_external_window_requested_ = false;
     bool delete_popup_requested_ = false;
+    bool focus_selection_requested_ = false;
     FlyCameraInput camera_input_{};
+    EditorGizmoOperation gizmo_operation_ =
+        EditorGizmoOperation::translate;
+    EditorGizmoSpace gizmo_space_ = EditorGizmoSpace::world;
+    bool gizmo_snap_enabled_ = false;
+    float gizmo_translation_snap_ = 0.5F;
+    float gizmo_rotation_snap_ = 15.0F;
+    float gizmo_scale_snap_ = 0.1F;
 
     std::vector<SceneHierarchyRow> hierarchy_rows_{};
     std::uint64_t hierarchy_revision_ = 0U;

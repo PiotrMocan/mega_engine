@@ -686,7 +686,6 @@ EditorTreeRowResult EditorUiKit::hierarchy_row(
     const bool activated = ImGui::InvisibleButton(
         "##hierarchy-row", ImVec2(width, row_height));
     const bool hovered = ImGui::IsItemHovered();
-    const bool mouse_clicked = ImGui::IsItemClicked();
     const bool focused = ImGui::IsItemFocused();
     const ImVec2 minimum = ImGui::GetItemRectMin();
     const ImVec2 maximum = ImGui::GetItemRectMax();
@@ -797,8 +796,7 @@ EditorTreeRowResult EditorUiKit::hierarchy_row(
     EditorTreeRowResult result{};
     if (activated) {
         const ImVec2 mouse = ImGui::GetIO().MousePos;
-        if (mouse_clicked &&
-            has_children &&
+        if (has_children &&
             point_inside(mouse, chevron_minimum, chevron_maximum)) {
             result.expansion_toggled = true;
         } else {

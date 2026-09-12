@@ -214,6 +214,11 @@ public:
     [[nodiscard]] std::uint64_t editor_viewport_generation() const noexcept {
         return editor_viewport_generation_;
     }
+    [[nodiscard]] std::optional<SceneNodeId> pick_editor_scene(
+        glm::vec3 ray_origin,
+        glm::vec3 ray_direction) const noexcept;
+    [[nodiscard]] std::optional<Bounds> editor_node_bounds(
+        SceneNodeId id) const noexcept;
     [[nodiscard]] std::uint64_t swapchain_generation() const noexcept {
         return swapchain_generation_;
     }

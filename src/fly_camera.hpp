@@ -39,6 +39,7 @@ public:
         FlyCameraConfig config = {}) noexcept;
 
     void update(const FlyCameraInput& input, float delta_seconds) noexcept;
+    void focus(glm::vec3 target, float distance) noexcept;
 
     [[nodiscard]] glm::mat4 view_matrix() const noexcept;
     [[nodiscard]] glm::vec3 position() const noexcept { return position_; }

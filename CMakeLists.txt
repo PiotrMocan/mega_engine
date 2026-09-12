@@ -114,6 +114,12 @@ FetchContent_Declare(
     GIT_SHALLOW TRUE
 )
 FetchContent_Declare(
+    ImGuizmo
+    GIT_REPOSITORY https://github.com/CedricGuillemet/ImGuizmo.git
+    GIT_TAG 1.10
+    GIT_SHALLOW TRUE
+)
+FetchContent_Declare(
     assimp
     GIT_REPOSITORY https://github.com/assimp/assimp.git
     GIT_TAG v6.0.5
@@ -155,6 +161,10 @@ FetchContent_MakeAvailable(
 FetchContent_GetProperties(DearImGui)
 if(NOT dearimgui_POPULATED)
     FetchContent_Populate(DearImGui)
+endif()
+FetchContent_GetProperties(ImGuizmo)
+if(NOT imguizmo_POPULATED)
+    FetchContent_Populate(ImGuizmo)
 endif()
 
 # v1.92.8 stores the first secondary viewport's VkFormat address in the
@@ -315,11 +325,13 @@ add_library(vcr_imgui STATIC
     "${dearimgui_SOURCE_DIR}/imgui_tables.cpp"
     "${dearimgui_SOURCE_DIR}/imgui_widgets.cpp"
     "${dearimgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp"
+    "${imguizmo_SOURCE_DIR}/src/ImGuizmo.cpp"
     src/imgui_vulkan_backend.cpp
 )
 target_include_directories(vcr_imgui PUBLIC
     "${dearimgui_SOURCE_DIR}"
     "${dearimgui_SOURCE_DIR}/backends"
+    "${imguizmo_SOURCE_DIR}/src"
     "${volk_SOURCE_DIR}"
     "${vulkanheaders_SOURCE_DIR}/include"
 )

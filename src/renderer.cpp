@@ -1574,6 +1574,66 @@ bool Renderer::prepare_editor_model(
     return true;
 }
 
+std::optional<SceneNodeId> Renderer::pick_editor_scene(
+    const glm::vec3 ray_origin,
+    const glm::vec3 ray_direction) const noexcept {
+    const float length_squared = glm::dot(ray_direction, ray_direction);
+    if (!std::isfinite(length_squared) || length_squared <= 0.0F ||
+        scene_metadata_.size() != world_bounds_.size()) {
+        return std::nullopt;
+    }
+    const glm::vec3 direction = ray_direction / std::sqrt(length_squared);
+    float nearest = std::numeric_limits<float>::infinity();
+    SceneNodeId selected{};
+    for (std::size_t index = 0U;
+         index < scene_metadata_.size();
+         ++index) {
+        if (!scene_metadata_[index].id) {
+            continue;
+        }
+        const auto distance = ray_bounds_intersection(
+            ray_origin, direction, world_bounds_[index]);
+        if (distance && *distance < nearest) {
+            nearest = *distance;
+            selected = scene_metadata_[index].id;
+        }
+    }
+    return selected
+        ? std::optional<SceneNodeId>(selected)
+        : std::nullopt;
+}
+
+std::optional<Bounds> Renderer::editor_node_bounds(
+    const SceneNodeId id) const noexcept {
+    if (!id || scene_metadata_.size() != world_bounds_.size()) {
+        return std::nullopt;
+    }
+    glm::vec3 minimum(std::numeric_limits<float>::infinity());
+    glm::vec3 maximum(-std::numeric_limits<float>::infinity());
+    bool found = false;
+    for (std::size_t index = 0U;
+         index < scene_metadata_.size();
+         ++index) {
+        if (scene_metadata_[index].id != id) {
+            continue;
+        }
+        minimum = glm::min(
+            minimum,
+            world_bounds_[index].center - world_bounds_[index].extent);
+        maximum = glm::max(
+            maximum,
+            world_bounds_[index].center + world_bounds_[index].extent);
+        found = true;
+    }
+    if (!found) {
+        return std::nullopt;
+    }
+    return Bounds{
+        .center = (minimum + maximum) * 0.5F,
+        .extent = (maximum - minimum) * 0.5F,
+    };
+}
+
 bool Renderer::update_editor_scene(
     const SceneRenderView& view,
     const std::filesystem::path& asset_root,
@@ -1734,6 +1794,16 @@ bool Renderer::update_editor_scene(
     instance_lods_.assign(scene_metadata_.size(), 0);
     instance_visibility_.resize(scene_metadata_.size());
     world_bounds_.resize(scene_metadata_.size());
+    for (std::size_t index = 0U;
+         index < scene_metadata_.size();
+         ++index) {
+        const SceneGpuInstance& instance = editor_scene_instances_[index];
+        world_bounds_[index] = transform_bounds(
+            scene_metadata_[index].local_bounds,
+            instance.model_row_0,
+            instance.model_row_1,
+            instance.model_row_2);
+    }
     packet_document_revision_ = 0;
     shadow_dirty_ = true;
     // Authored snapshots may add/remove geometry or change materials. Only
@@ -5643,7 +5713,12 @@ void Renderer::record_commands(
                 frame.timestamp_queries,
                 timestamp_geometry_end);
         }
-        draw_hud();
+#if VCR_EDITOR_ENABLED
+        if (!editor_frame)
+#endif
+        {
+            draw_hud();
+        }
         vkCmdEndRendering(command_buffer);
 #if VCR_EDITOR_ENABLED
         if (editor_frame) {
@@ -6002,7 +6077,12 @@ void Renderer::record_commands(
             anti_aliasing_.method == AntiAliasingMethod::smaa   ? smaa_neighborhood_pipeline_
             : anti_aliasing_.method == AntiAliasingMethod::fsr3 ? fsr_composite_pipeline_
                                                                 : tonemap_pipeline_.get());
-        draw_hud();
+#if VCR_EDITOR_ENABLED
+        if (!editor_frame)
+#endif
+        {
+            draw_hud();
+        }
         vkCmdEndRendering(command_buffer);
 #if VCR_EDITOR_ENABLED
         if (editor_frame) {
