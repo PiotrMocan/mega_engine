@@ -398,10 +398,12 @@ void SceneDocument::build_node_records(
 
 SceneRenderView SceneDocument::build_render_view(
     std::vector<SceneGpuInstance>& cube_output,
-    std::vector<SceneModelInstance>& model_output) {
+    std::vector<SceneModelInstance>& model_output,
+    std::vector<ScenePunctualLight>& light_output) {
     cube_output.clear();
     last_transform_updates_ = 0;
     model_output.clear();
+    light_output.clear();
     render_cube_ids_.clear();
     render_cube_ids_.reserve(max_scene_nodes);
     SceneNodeId ground_id{};
@@ -410,6 +412,7 @@ SceneRenderView SceneDocument::build_render_view(
     bool terrain_visible = false;
     bool sky_visible = false;
     bool sun_visible = false;
+    bool local_lights_overflow = false;
     std::uint32_t index = first_root_;
     std::uint32_t depth = 0U;
     while (index != invalid_scene_node_index) {
@@ -482,6 +485,25 @@ SceneRenderView SceneDocument::build_render_view(
                 render_cube_ids_.push_back(id_for_index(index));
             }
         } else if (world_visible &&
+                   (slot.value.kind == SceneNodeKind::point_light ||
+                    slot.value.kind == SceneNodeKind::spot_light)) {
+            const PunctualLightType type =
+                slot.value.kind == SceneNodeKind::spot_light
+                    ? PunctualLightType::spot
+                    : PunctualLightType::point;
+            GpuPunctualLight gpu{};
+            if (make_gpu_punctual_light(
+                    slot.value.light, type, world_matrix, gpu)) {
+                if (light_output.size() < maximum_local_lights) {
+                    light_output.push_back(ScenePunctualLight{
+                        .gpu = gpu,
+                        .id = id_for_index(index),
+                    });
+                } else {
+                    local_lights_overflow = true;
+                }
+            }
+        } else if (world_visible &&
                    slot.value.kind == SceneNodeKind::model &&
                    valid_scene_asset_path(slot.value.asset_path) &&
                    model_output.size() < max_scene_nodes) {
@@ -499,14 +521,25 @@ SceneRenderView SceneDocument::build_render_view(
         .ground = ground,
         .cubes = cube_output,
         .models = model_output,
+        .local_lights = light_output,
         .revision = content_revision_,
         .has_ground = has_ground,
         .terrain_visible = terrain_visible,
         .sky_visible = sky_visible,
         .sun_visible = sun_visible,
+        .local_lights_overflow = local_lights_overflow,
         .ground_id = ground_id,
         .cube_ids = render_cube_ids_,
     };
+}
+
+std::uint32_t SceneDocument::local_light_count() const noexcept {
+    return static_cast<std::uint32_t>(std::count_if(
+        slots_.begin(), slots_.end(), [](const Slot& slot) {
+            return slot.alive &&
+                (slot.value.kind == SceneNodeKind::point_light ||
+                 slot.value.kind == SceneNodeKind::spot_light);
+        }));
 }
 
 SceneDocument SceneDocument::make_default() {
@@ -719,6 +752,8 @@ std::string_view to_string(const SceneNodeKind kind) noexcept {
     case SceneNodeKind::terrain: return "Terrain";
     case SceneNodeKind::camera: return "Camera";
     case SceneNodeKind::directional_light: return "Directional light";
+    case SceneNodeKind::point_light: return "Point light";
+    case SceneNodeKind::spot_light: return "Spot light";
     case SceneNodeKind::environment: return "Environment";
     }
     return "Unknown";

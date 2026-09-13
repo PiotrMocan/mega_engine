@@ -1,0 +1,10 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "gt7_tone_mapping.glsl"
+layout(local_size_x=1) in;
+layout(set=0,binding=0,std430) readonly buffer Inputs { vec4 samples[]; } inputs;
+layout(set=0,binding=1,std430) writeonly buffer Outputs { vec4 samples[]; } outputs;
+void main() {
+    uint i=gl_GlobalInvocationID.x;
+    outputs.samples[i]=vec4(gt7ToneMapping(inputs.samples[i].rgb),1);
+}

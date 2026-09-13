@@ -64,38 +64,56 @@ function Compile-Shader {
     }
 }
 
-$regularShaders = @(
-    @("voxel_geometry.comp", "voxel_geometry.comp.spv"),
-    @("voxel_light.comp", "voxel_light.comp.spv"),
-    @("scene.vert", "scene.vert.spv"),
-    @("scene.frag", "scene.frag.spv"),
-    @("terrain.vert", "terrain.vert.spv"),
-    @("terrain_aa.vert", "terrain_aa.vert.spv"),
-    @("shadow.vert", "shadow.vert.spv"),
-    @("editor_shadow.vert", "editor_shadow.vert.spv"),
-    @("scene_visibility.comp", "scene_visibility.comp.spv"),
-    @("terrain_shadow.vert", "terrain_shadow.vert.spv"),
-    @("cube_aa.vert", "cube_aa.vert.spv"),
-    @("cube_aa.frag", "cube_aa.frag.spv"),
-    @("scene_aa.vert", "scene_aa.vert.spv"),
-    @("editor_scene.vert", "editor_scene.vert.spv"),
-    @("editor_scene_aa.vert", "editor_scene_aa.vert.spv"),
-    @("editor_model.vert", "editor_model.vert.spv"),
-    @("editor_model.frag", "editor_model.frag.spv"),
-    @("editor_model_aa.vert", "editor_model_aa.vert.spv"),
-    @("editor_model_aa.frag", "editor_model_aa.frag.spv"),
-    @("scene_aa.frag", "scene_aa.frag.spv"),
-    @("sky.frag", "sky.frag.spv"),
-    @("sky_aa.frag", "sky_aa.frag.spv"),
-    @("fullscreen.vert", "fullscreen.vert.spv"),
-    @("composite.frag", "composite.frag.spv"),
-    @("tonemap.frag", "tonemap.frag.spv"),
-    @("hud.frag", "hud.frag.spv")
+# Every ordinary source must get fresh SPIR-V. SMAA's preset shaders are
+# compiled separately below; a hand-maintained subset previously missed sky.vert.
+$presetShaders = @(
+    'smaa_edge.frag',
+    'smaa_blend.frag',
+    'smaa_neighborhood.frag',
+    'smaa_neighborhood_history.frag',
+    'motion_blur.frag'
 )
+$regularShaders = Get-ChildItem -LiteralPath $shaderRoot -File |
+    Where-Object { $_.Extension -in @('.vert', '.frag', '.comp') -and $_.Name -notin $presetShaders } |
+    Sort-Object Name
 foreach ($shader in $regularShaders) {
-    Compile-Shader -Source $shader[0] -Output $shader[1]
+    $extraArguments = @()
+    if ($shader.Name -eq 'workload.comp') {
+        # Preserve the benchmark's existing inlined/SSA SPIR-V; rebuilding it
+        # without size optimization introduced unrelated function/local traffic.
+        $extraArguments = @('-Os')
+    }
+    Compile-Shader -Source $shader.Name -Output ($shader.Name + '.spv') -ExtraArguments $extraArguments
 }
-
+$subsurfaceGeometryShaders = @(
+    'cube.frag',
+    'cube_aa.frag',
+    'scene.frag',
+    'scene_aa.frag',
+    'editor_model.frag',
+    'editor_model_aa.frag',
+    'sky.frag',
+    'sky_aa.frag'
+)
+foreach ($shader in $subsurfaceGeometryShaders) {
+    $stem = [System.IO.Path]::GetFileNameWithoutExtension($shader)
+    Compile-Shader `
+        -Source $shader `
+        -Output ($stem + '_sss.frag.spv') `
+        -ExtraArguments @('-DVCR_SSS_OUTPUT=1')
+}
+Compile-Shader `
+    -Source 'subsurface_blur.frag' `
+    -Output 'subsurface_blur_vertical.frag.spv' `
+    -ExtraArguments @('-DVCR_SSS_VERTICAL=1')
+Compile-Shader `
+    -Source 'motion_blur.frag' `
+    -Output 'motion_blur_scene.frag.spv' `
+    -ExtraArguments @('-DVCR_MOTION_BLUR_RECONSTRUCTED=0')
+Compile-Shader `
+    -Source 'motion_blur.frag' `
+    -Output 'motion_blur_reconstructed.frag.spv' `
+    -ExtraArguments @('-DVCR_MOTION_BLUR_RECONSTRUCTED=1')
 $smaaPresets = @(
     @("low", "SMAA_PRESET_LOW"),
     @("medium", "SMAA_PRESET_MEDIUM"),
@@ -111,6 +129,10 @@ foreach ($preset in $smaaPresets) {
         -Output "smaa_edge_$quality.frag.spv" `
         -ExtraArguments $sharedArguments
     Compile-Shader `
+        -Source "smaa_edge.frag" `
+        -Output "smaa_edge_blurred_$quality.frag.spv" `
+        -ExtraArguments ($sharedArguments + '-DVCR_SMAA_BLURRED_SOURCE=1')
+    Compile-Shader `
         -Source "smaa_blend.frag" `
         -Output "smaa_blend_$quality.frag.spv" `
         -ExtraArguments $sharedArguments
@@ -118,6 +140,14 @@ foreach ($preset in $smaaPresets) {
 Compile-Shader `
     -Source "smaa_neighborhood.frag" `
     -Output "smaa_neighborhood.frag.spv" `
+    -ExtraArguments @("-I$smaaInclude")
+Compile-Shader `
+    -Source "smaa_neighborhood.frag" `
+    -Output "smaa_neighborhood_blurred.frag.spv" `
+    -ExtraArguments @("-I$smaaInclude", '-DVCR_SMAA_BLURRED_SOURCE=1')
+Compile-Shader `
+    -Source "smaa_neighborhood_history.frag" `
+    -Output "smaa_neighborhood_history.frag.spv" `
     -ExtraArguments @("-I$smaaInclude")
 
 if (-not $spirvVal) {

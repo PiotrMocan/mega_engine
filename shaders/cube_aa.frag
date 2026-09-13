@@ -1,14 +1,14 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+
+#define VCR_SSS_TEMPORAL 1
+#include "subsurface_output.glsl"
 
 layout(location = 0) in vec3 inWorldNormal;
 layout(location = 1) in vec4 inColor;
 layout(location = 2) flat in uint inInstanceIndex;
 layout(location = 3) in vec4 inCurrentClip;
 layout(location = 4) in vec4 inPreviousClip;
-
-layout(location = 0) out vec4 outColor;
-layout(location = 1) out vec2 outMotionVector;
-layout(location = 2) out float outDepth;
 
 layout(set = 0, binding = 0, std140) uniform FrameUniforms
 {
@@ -76,7 +76,7 @@ void main()
             clamp(pushConstants.workloadMix, 0.0, 1.0));
     }
 
-    outColor = vec4(shadedColor, inColor.a);
+    writeOpaqueSurface(shadedColor, inColor.a);
     outMotionVector =
         inPreviousClip.xy / inPreviousClip.w
         - inCurrentClip.xy / inCurrentClip.w;

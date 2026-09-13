@@ -1,0 +1,104 @@
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 6) buffer ExposureState
+{
+    uint bins[256];
+    uint invalidSampleCount;
+    uint sampleWeight;
+    uint historyValid;
+    uint stateReserved;
+    float exposure;
+    float targetExposure;
+    float averageLuminance;
+    float statePadding;
+} exposureState;
+layout(r32f, set = 0, binding = 9) uniform writeonly image2D exposureImage;
+
+layout(push_constant) uniform ExposurePushConstants
+{
+    vec2 inverseResolution;
+    uint exposureMode;
+    uint sampleStride;
+    uvec2 sourceExtent;
+    uint metering;
+    uint reset;
+    float deltaSeconds;
+    float compensationEv;
+    float minimumEv;
+    float maximumEv;
+    float lowPercentile;
+    float highPercentile;
+    float brightenSeconds;
+    float darkenSeconds;
+} settings;
+
+void main()
+{
+    uint total = 0u;
+    if (settings.exposureMode == 1u) {
+        for (uint bin = 0u; bin < 256u; ++bin) total += exposureState.bins[bin];
+    }
+
+    float averageLogLuminance = log2(0.18);
+    if (total != 0u) {
+        const float low = floor(float(total) * settings.lowPercentile);
+        const float high = ceil(float(total) * settings.highPercentile);
+        float previous = float(exposureState.bins[0]);
+        float weightedLogSum = 0.0;
+        float includedWeight = 0.0;
+        for (uint bin = 1u; bin < 256u; ++bin) {
+            const float current = previous + float(exposureState.bins[bin]);
+            const float selected = max(0.0, min(current, high) - max(previous, low));
+            if (selected > 0.0) {
+                const float logCenter = bin == 255u
+                    ? 16.0
+                    : -16.0 + (float(bin) - 0.5) * (32.0 / 254.0);
+                weightedLogSum += logCenter * selected;
+                includedWeight += selected;
+            }
+            previous = current;
+        }
+        if (includedWeight >= max(1.0, ceil(float(total) * 0.01))) {
+            averageLogLuminance = weightedLogSum / includedWeight;
+        } else {
+            total = 0u;
+        }
+    }
+
+    if (settings.reset != 0u) exposureState.historyValid = 0u;
+    if (settings.exposureMode == 1u && total == 0u) {
+        if (exposureState.historyValid == 0u || isnan(exposureState.exposure) ||
+            isinf(exposureState.exposure) || exposureState.exposure <= 0.0) {
+            exposureState.exposure = 1.0;
+            exposureState.targetExposure = 1.0;
+            exposureState.averageLuminance = 0.18;
+        }
+        exposureState.sampleWeight = 0u;
+        imageStore(exposureImage, ivec2(0), vec4(exposureState.exposure, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    const float targetEv = settings.exposureMode == 1u
+        ? clamp(log2(0.18) - averageLogLuminance + settings.compensationEv,
+                settings.minimumEv, settings.maximumEv)
+        : clamp(settings.compensationEv, -24.0, 24.0);
+    const float target = exp2(targetEv);
+    const bool invalidPrevious = isnan(exposureState.exposure) ||
+        isinf(exposureState.exposure) || exposureState.exposure <= 0.0;
+    float adapted = target;
+    if (settings.exposureMode == 1u && exposureState.historyValid != 0u && !invalidPrevious) {
+        const float currentEv = log2(exposureState.exposure);
+        const float seconds = targetEv > currentEv
+            ? settings.brightenSeconds : settings.darkenSeconds;
+        const float alpha = 1.0 - exp(-clamp(settings.deltaSeconds, 0.0, 1.0) / seconds);
+        adapted = exp2(mix(currentEv, targetEv, alpha));
+    }
+    exposureState.exposure = clamp(adapted, exp2(-24.0), exp2(24.0));
+    exposureState.targetExposure = target;
+    exposureState.averageLuminance = exp2(averageLogLuminance);
+    exposureState.sampleWeight = total;
+    exposureState.historyValid = 1u;
+    imageStore(exposureImage, ivec2(0), vec4(exposureState.exposure, 0.0, 0.0, 0.0));
+}

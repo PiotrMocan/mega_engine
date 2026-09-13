@@ -116,7 +116,7 @@ public:
         std::string& error);
     [[nodiscard]] bool focus_selection(
         const SceneDocument& scene,
-        const Renderer& renderer,
+        Renderer& renderer,
         FlyCamera& camera) const noexcept;
     [[nodiscard]] bool external_game_window_open() const noexcept {
         return external_game_window_open_;

@@ -35,6 +35,14 @@ void Renderer::create_gpu_visibility() {
     if (!authored_scene_enabled_) {
         return;
     }
+    // CPU visibility uses the same vertex indirection without requiring the
+    // optional compute/indirect-draw features below.
+    for (auto &frame : frames_) {
+        frame.visibility.visible.create(*context_, 32 + source_capacity * 3 * 4,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, 0, "frame visible instance indices");
+    }
     const auto &limits = context_->properties().limits;
     if (!context_->indirect_first_instance() || limits.maxPerStageDescriptorStorageBuffers < 6 ||
         limits.maxDescriptorSetStorageBuffers < 6 || limits.maxComputeWorkGroupInvocations < 128 ||
@@ -62,7 +70,7 @@ void Renderer::create_gpu_visibility() {
                       name);
     };
     constexpr auto storage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    device_buffer(visibility_lod_history_, source_capacity * 4, storage, "visibility LOD history");
+    device_buffer(visibility_lod_history_, source_capacity * 16, storage, "visibility LOD history");
     std::array<VkDescriptorSetLayoutBinding, 7> bindings{};
     for (unsigned i = 0; i < bindings.size(); ++i) {
         bindings[i] = {.binding = i,
@@ -109,8 +117,6 @@ void Renderer::create_gpu_visibility() {
                                visibility_pool_.put(context_->device(), vkDestroyDescriptorPool)));
     for (auto &frame : frames_) {
         auto &f = frame.visibility;
-        device_buffer(f.visible, 32 + source_capacity * 3 * 4,
-                      storage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, "GPU visible instances");
         device_buffer(f.indirect, command_capacity,
                       storage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -253,7 +259,11 @@ void Renderer::build_gpu_visibility_scene(std::uint32_t plane_count, std::uint32
     reset_lod_history_ = true;
 }
 void Renderer::prepare_gpu_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExtent2D extent) {
-    const bool changed = gpu_packet_revision_ != gpu_scene_revision_ ||
+    const bool fade_enabled = lod_fade_pattern_ != LodFadePattern::off && visibility_settings_.lod &&
+                              !editor_model_draws_.empty();
+    // Optional fading advances without a camera change. It never requires
+    // synchronous readback of the active-transition count.
+    const bool changed = fade_enabled || reset_lod_history_ || gpu_packet_revision_ != gpu_scene_revision_ ||
                          packet_document_revision_ != editor_scene_revision_ ||
                          packet_runtime_revision_ != runtime_transforms_.revision() ||
                          packet_extent_.width != extent.width ||
@@ -385,10 +395,12 @@ void Renderer::prepare_gpu_scene_packet(const glm::mat4 &vp, glm::vec3 camera, V
     const VisibilityUniforms uniform{padded,
                                      frustum.planes(),
                                      {camera, pixels},
-                                     {guard, visibility_settings_.lod_pixel_error, 0},
+                                     {guard, visibility_settings_.lod_pixel_error,
+                                      fade_enabled ? std::clamp(fsr_frame_time_ms_ * 0.001F / lod_fade_seconds_, 0.0F, 1.0F) : 0.0F},
                                      {static_cast<unsigned>(scene_metadata_.size()),
                                       visibility_settings_.frustum, occlusion_enabled,
-                                      visibility_settings_.lod},
+                                      unsigned(visibility_settings_.lod) |
+                                        (fade_enabled ? (unsigned(lod_fade_pattern_) << 1U) : 0U)},
                                      grid.depths()};
     if (!gpu_visibility_bypassed_) {
         frames_[frame_index_].visibility.uniform.write(std::as_bytes(std::span{&uniform, 1}));
@@ -435,6 +447,7 @@ void Renderer::upload_gpu_scene_records(VkCommandBuffer command, FrameContext &f
     }
     f.dirty_records.clear();
     frame.scene_revision = packet_revision_;
+    frame.scene_source_revision = 0; // GPU dirty-record uploads own this version.
 }
 void Renderer::record_gpu_visibility(VkCommandBuffer command, FrameContext &frame) {
     if (!gpu_visibility_active_ || mode_ == RunMode::instancing) {

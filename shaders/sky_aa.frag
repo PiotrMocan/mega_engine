@@ -1,12 +1,10 @@
 #version 450
 #extension GL_GOOGLE_include_directive:require
+#define VCR_SSS_TEMPORAL 1
 #include "lighting_common.glsl"
+#include "subsurface_output.glsl"
 
 layout(location = 0) in vec2 inNdc;
-layout(location = 0) out vec4 outColor;
-layout(location = 1) out vec2 outMotionVector;
-layout(location = 2) out float outDepth;
-
 layout(set = 0, binding = 0, std140) uniform FrameUniforms
 {
     mat4 viewProjection;
@@ -30,7 +28,7 @@ const float inverseTwoPi = 0.15915494309189533577;
 void main()
 {
     const vec4 worldAtFarPlane =
-        frame.inverseViewProjection * vec4(inNdc, 1.0, 1.0);
+        frame.inverseViewProjection * vec4(inNdc, 0.0, 1.0);
     const vec3 worldPosition =
         worldAtFarPlane.xyz / worldAtFarPlane.w;
     const vec3 viewDirection =
@@ -50,7 +48,7 @@ void main()
         frame.unjitteredViewProjection * vec4(viewDirection, 0.0);
     const vec4 previousClip =
         frame.previousUnjitteredViewProjection * vec4(viewDirection, 0.0);
-    outColor = vec4(lighting.options.x>0.5?dynamicSky(viewDirection):sky, 1.0);
+    writeOpaqueSurface(lighting.options.x>0.5?dynamicSky(viewDirection):sky, 1.0);
     outMotionVector =
         previousClip.xy / previousClip.w
         - currentClip.xy / currentClip.w;

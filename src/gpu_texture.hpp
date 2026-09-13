@@ -55,6 +55,21 @@ public:
         std::string_view debug_name);
     void create_volume(VulkanContext &context, std::uint32_t size, std::uint32_t mips,
                        VkFormat format, std::string_view debug_name);
+    void create_sampled_volume(
+        VulkanContext& context,
+        std::uint32_t size,
+        VkFormat format,
+        VkFilter filter,
+        std::string_view debug_name);
+    void create_multisampled_render_target(
+        VulkanContext& context,
+        std::uint32_t width,
+        std::uint32_t height,
+        VkFormat format,
+        VkImageUsageFlags usage,
+        VkImageAspectFlags aspect_mask,
+        VkSampleCountFlagBits samples,
+        std::string_view debug_name);
     void destroy() noexcept;
 
     [[nodiscard]] VkImage image() const noexcept { return image_; }
@@ -71,6 +86,9 @@ public:
     [[nodiscard]] VkImageAspectFlags aspect_mask() const noexcept {
         return aspect_mask_;
     }
+    [[nodiscard]] VkSampleCountFlagBits samples() const noexcept {
+        return samples_;
+    }
     [[nodiscard]] VkImageCreateInfo image_create_info() const noexcept {
         return VkImageCreateInfo{
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -81,7 +99,7 @@ public:
             .extent = VkExtent3D{width_, height_, depth_},
             .mipLevels = mip_levels_,
             .arrayLayers = 1,
-            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .samples = samples_,
             .tiling = VK_IMAGE_TILING_OPTIMAL,
             .usage = usage_,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
@@ -100,7 +118,8 @@ private:
                    VkImageAspectFlags aspect_mask, VkFilter filter,
                    VkSamplerAddressMode address_mode, VkBool32 compare_enable,
                    VkCompareOp compare_op, VkBorderColor border_color, std::string_view debug_name,
-                   std::uint32_t depth = 1);
+                   std::uint32_t depth = 1,
+                   VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT);
 
   VulkanContext *context_ = nullptr;
   VkImage image_ = VK_NULL_HANDLE;
@@ -114,6 +133,7 @@ private:
   VkFormat format_ = VK_FORMAT_UNDEFINED;
   VkImageUsageFlags usage_ = 0;
   VkImageAspectFlags aspect_mask_ = 0;
+  VkSampleCountFlagBits samples_ = VK_SAMPLE_COUNT_1_BIT;
 };
 
 } // namespace vcr

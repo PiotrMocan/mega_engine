@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "pbr_material.glsl"
 
 // Host ABI (std140):
 //   mat4 viewProjection        @ byte 0
@@ -30,6 +32,7 @@ struct PbrInstanceData
     vec4 scale;
     vec4 baseColor;
     vec4 materialParameters;
+    float indexOfRefraction; uint shadingModel; uint subsurfaceProfile; float subsurfaceStrength;
 };
 
 layout(set = 0, binding = 1, std430) readonly buffer InstanceBuffer
@@ -61,6 +64,14 @@ vec3 rotateByQuaternion(vec3 value, vec4 rotation)
                        cross(rotation.xyz, value) + rotation.w * value);
 }
 
+layout(location = 11) flat out float outDielectricF0;
+layout(location = 12) flat out uint outMaterialModel;
+layout(location = 14) flat out uint outSubsurfaceProfile;
+layout(location = 15) flat out float outSubsurfaceStrength;
+
+// Identical clip depth across the depth-only and EQUAL color pipelines.
+invariant gl_Position;
+
 void main()
 {
     const PbrInstanceData instance = instances[gl_InstanceIndex];
@@ -78,5 +89,9 @@ void main()
         frame.lightViewProjection * vec4(worldPosition, 1.0);
     outWorldPosition = worldPosition;
     outMaterialParameters = instance.materialParameters;
+    outDielectricF0 = materialDielectricF0(instance.indexOfRefraction);
+    outMaterialModel = instance.shadingModel;
+    outSubsurfaceProfile = instance.subsurfaceProfile;
+    outSubsurfaceStrength = instance.subsurfaceStrength;
     gl_Position = frame.viewProjection * vec4(worldPosition, 1.0);
 }

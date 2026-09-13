@@ -38,6 +38,8 @@ using Json = nlohmann::json;
     case SceneNodeKind::camera: return "camera";
     case SceneNodeKind::directional_light:
         return "directional_light";
+    case SceneNodeKind::point_light: return "point_light";
+    case SceneNodeKind::spot_light: return "spot_light";
     case SceneNodeKind::environment: return "environment";
     }
     return "folder";
@@ -54,6 +56,8 @@ using Json = nlohmann::json;
     if (value == "directional_light") {
         return SceneNodeKind::directional_light;
     }
+    if (value == "point_light") return SceneNodeKind::point_light;
+    if (value == "spot_light") return SceneNodeKind::spot_light;
     if (value == "environment") {
         return SceneNodeKind::environment;
     }
@@ -119,9 +123,15 @@ template <typename T>
 
 [[nodiscard]] bool read_lighting(const Json &source, LightingSettings &s) {
     if (!source.is_object()) return false;
+    if (source.contains("shadow_depth")) {
+        if (!source["shadow_depth"].is_string()) return false;
+        const auto depth = parse_shadow_depth_format(source["shadow_depth"].get<std::string_view>());
+        if (!depth) return false;
+        s.shadow_depth = *depth;
+    }
     for (const auto &[key, target] : std::array{
              std::pair{"dynamic", &s.dynamic}, std::pair{"voxel_gi", &s.voxel_gi},
-             std::pair{"cycle", &s.cycle}}) {
+             std::pair{"cycle", &s.cycle}, std::pair{"cascade_cache", &s.cascade_cache}}) {
         if (source.contains(key)) {
             if (!source[key].is_boolean()) return false;
             *target = source[key].get<bool>();
@@ -145,7 +155,9 @@ template <typename T>
     return Json{{"dynamic", s.dynamic}, {"voxel_gi", s.voxel_gi}, {"cycle", s.cycle},
                 {"hour", s.hour}, {"day_seconds", s.day_seconds}, {"gi_extent", s.gi_extent},
                 {"gi_strength", s.gi_strength}, {"triangle_budget", s.triangle_budget},
-                {"gi_update_hz", s.gi_update_hz}, {"shadow_resolution", s.shadow_resolution}};
+                {"gi_update_hz", s.gi_update_hz}, {"shadow_resolution", s.shadow_resolution},
+                {"shadow_depth", to_token(s.shadow_depth)},
+                {"cascade_cache", s.cascade_cache}};
 }
 
 [[nodiscard]] bool replace_scene_file(
@@ -210,8 +222,17 @@ bool save_scene_file(
         error = "Scene exceeds the bounded node capacity.";
         return false;
     }
+    std::uint32_t local_light_count = 0U;
     for (const SceneNodeRecord& record : records) {
         const SceneNode& node = record.value;
+        if (static_cast<std::uint32_t>(node.material.subsurface_profile) >
+                maximum_subsurface_profile ||
+            !std::isfinite(node.material.subsurface_strength) ||
+            node.material.subsurface_strength < 0.0F ||
+            node.material.subsurface_strength > 1.0F) {
+            error = "Scene subsurface material values are invalid.";
+            return false;
+        }
         if ((node.kind == SceneNodeKind::model &&
              !valid_scene_asset_path(node.asset_path)) ||
             (node.kind != SceneNodeKind::model &&
@@ -220,6 +241,18 @@ bool save_scene_file(
                 "Scene model asset path is invalid or assigned to "
                 "a non-model node.";
             return false;
+        }
+        if (node.kind == SceneNodeKind::point_light ||
+            node.kind == SceneNodeKind::spot_light) {
+            ++local_light_count;
+            const PunctualLightType type = node.kind == SceneNodeKind::spot_light
+                ? PunctualLightType::spot
+                : PunctualLightType::point;
+            if (local_light_count > maximum_local_lights ||
+                !valid_punctual_light(node.light, type)) {
+                error = "Scene local lights exceed the bounded photometric contract.";
+                return false;
+            }
         }
     }
 
@@ -293,6 +326,12 @@ bool save_scene_file(
              {
                  {"metallic", material.metallic},
                  {"roughness", material.roughness},
+                 {"ior", material.ior},
+                 {"model", to_token(material.model)},
+                 {"subsurface_profile",
+                  to_token(material.subsurface_profile)},
+                 {"subsurface_strength",
+                  material.subsurface_strength},
                  {"ambient_occlusion",
                   material.ambient_occlusion},
              }},
@@ -304,6 +343,20 @@ bool save_scene_file(
             : Json(record.parent_record_index);
         if (node.kind == SceneNodeKind::model) {
             encoded["asset_path"] = node.asset_path;
+        }
+        if (node.kind == SceneNodeKind::point_light ||
+            node.kind == SceneNodeKind::spot_light) {
+            encoded["light"] = Json{
+                {"color", {node.light.color.r, node.light.color.g, node.light.color.b}},
+                {"intensity_candela", node.light.intensity_candela},
+                {"range", node.light.range},
+            };
+            if (node.kind == SceneNodeKind::spot_light) {
+                encoded["light"]["inner_cone_degrees"] =
+                    node.light.inner_cone_degrees;
+                encoded["light"]["outer_cone_degrees"] =
+                    node.light.outer_cone_degrees;
+            }
         }
         if (index != 0U) {
             output.put(',');
@@ -413,6 +466,7 @@ bool load_scene_file(
         SceneDocument loaded;
         std::vector<SceneNodeId> ids;
         ids.reserve(nodes.size());
+        std::uint32_t local_light_count = 0U;
         for (std::size_t index = 0U;
              index < nodes.size();
              ++index) {
@@ -528,6 +582,66 @@ bool load_scene_file(
                     color[2],
                     color[3]},
             };
+            PunctualLight light{};
+            const bool is_point = *kind == SceneNodeKind::point_light;
+            const bool is_spot = *kind == SceneNodeKind::spot_light;
+            if (is_point || is_spot) {
+                if (!encoded.contains("light") || !encoded["light"].is_object()) {
+                    error = "Point and spot nodes require a light payload.";
+                    return false;
+                }
+                const Json& light_json = encoded["light"];
+                const std::size_t expected_size = is_spot ? 5U : 3U;
+                if (light_json.size() != expected_size ||
+                    !light_json.contains("color") ||
+                    !light_json.contains("intensity_candela") ||
+                    !light_json.contains("range") ||
+                    (is_spot &&
+                     (!light_json.contains("inner_cone_degrees") ||
+                      !light_json.contains("outer_cone_degrees")))) {
+                    error = "Local light payload schema is invalid.";
+                    return false;
+                }
+                std::array<float, 3> light_color{};
+                if (!read_float_array(light_json["color"], light_color) ||
+                    std::ranges::any_of(light_color, [](const float value) {
+                        return value < 0.0F || value > 1.0F;
+                    }) ||
+                    !read_bounded_float(light_json["intensity_candela"], 0.0F,
+                                        1'000'000.0F, light.intensity_candela) ||
+                    !read_bounded_float(light_json["range"], 0.05F, 1'000.0F,
+                                        light.range)) {
+                    error = "Local light values are outside the engine contract.";
+                    return false;
+                }
+                light.color = {light_color[0], light_color[1], light_color[2]};
+                if (is_spot &&
+                    (!read_bounded_float(light_json["inner_cone_degrees"], 0.0F,
+                                         90.0F, light.inner_cone_degrees) ||
+                     !read_bounded_float(light_json["outer_cone_degrees"], 0.0F,
+                                         90.0F, light.outer_cone_degrees))) {
+                    error = "Spot cone angles are invalid.";
+                    return false;
+                }
+                const PunctualLightType type = is_spot
+                    ? PunctualLightType::spot
+                    : PunctualLightType::point;
+                if (!valid_punctual_light(light, type)) {
+                    error = "Local light values are inconsistent.";
+                    return false;
+                }
+            } else if (encoded.contains("light")) {
+                error = "Light payload belongs only to point and spot nodes.";
+                return false;
+            }
+            if (*kind == SceneNodeKind::point_light ||
+                *kind == SceneNodeKind::spot_light) {
+                ++local_light_count;
+                if (local_light_count > maximum_local_lights) {
+                    error = "Scene exceeds the bounded 4096 local-light capacity.";
+                    return false;
+                }
+            }
             if (encoded.contains("pbr")) {
                 const Json& pbr = encoded["pbr"];
                 if (!pbr.is_object() ||
@@ -551,6 +665,45 @@ bool load_scene_file(
                         material.ambient_occlusion)) {
                     error =
                         "Scene PBR material contains invalid values.";
+                    return false;
+                }
+                if (pbr.contains("ior") && !read_bounded_float(
+                        pbr["ior"], 1.0F, std::numeric_limits<float>::max(), material.ior)) {
+                    error = "Scene PBR IOR must be a finite float greater than or equal to 1.";
+                    return false;
+                }
+                if (pbr.contains("model")) {
+                    if (!pbr["model"].is_string()) {
+                        error = "Scene PBR model must be standard, unlit, or subsurface.";
+                        return false;
+                    }
+                    const auto model = parse_material_model(pbr["model"].get_ref<const std::string&>());
+                    if (!model) {
+                        error = "Scene PBR model must be standard, unlit, or subsurface.";
+                        return false;
+                    }
+                    material.model = *model;
+                }
+                if (pbr.contains("subsurface_profile")) {
+                    if (!pbr["subsurface_profile"].is_string()) {
+                        error = "Scene PBR subsurface profile is invalid.";
+                        return false;
+                    }
+                    const auto profile = parse_subsurface_profile(
+                        pbr["subsurface_profile"].get_ref<const std::string&>());
+                    if (!profile) {
+                        error = "Scene PBR subsurface profile is invalid.";
+                        return false;
+                    }
+                    material.subsurface_profile = *profile;
+                }
+                if (pbr.contains("subsurface_strength") &&
+                    !read_bounded_float(
+                        pbr["subsurface_strength"],
+                        0.0F,
+                        1.0F,
+                        material.subsurface_strength)) {
+                    error = "Scene PBR subsurface strength must be a finite float in [0, 1].";
                     return false;
                 }
             }
@@ -585,6 +738,7 @@ bool load_scene_file(
                     scale[2]},
             };
             node->get().material = material;
+            node->get().light = light;
             node->get().asset_path = std::move(asset_path);
             ids.push_back(id);
         }

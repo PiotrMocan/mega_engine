@@ -68,6 +68,17 @@ void RuntimeTransforms::commit() noexcept {
         ++revision_;
     }
 }
+void RuntimeTransforms::snap_history() noexcept {
+    for (auto &slot : slots_) {
+        if (!slot.active) {
+            continue;
+        }
+        slot.previous = slot.current;
+        slot.dirty = false;
+    }
+    dirty_count_ = 0;
+    ++revision_;
+}
 void RuntimeTransforms::reset() noexcept {
     for (auto &slot : slots_) {
         slot = {};

@@ -2,6 +2,7 @@
 
 #include "pbr_material.hpp"
 #include "lighting_settings.hpp"
+#include "punctual_light.hpp"
 
 #include <glm/mat4x4.hpp>
 #include <glm/vec3.hpp>
@@ -44,6 +45,8 @@ enum class SceneNodeKind : std::uint8_t {
     terrain,
     camera,
     directional_light,
+    point_light,
+    spot_light,
     environment,
     model,
 };
@@ -62,6 +65,7 @@ struct SceneNode {
     std::string asset_path;
     SceneTransform transform{};
     PbrMaterial material{};
+    PunctualLight light{};
     SceneNodeKind kind = SceneNodeKind::folder;
     bool visible = true;
     bool expanded = true;
@@ -92,7 +96,7 @@ struct alignas(16) SceneGpuInstance {
     PbrMaterial material{};
 };
 
-static_assert(sizeof(SceneGpuInstance) == 80U);
+static_assert(sizeof(SceneGpuInstance) == 96U);
 static_assert(offsetof(SceneGpuInstance, material) == 48U);
 
 struct SceneModelInstance {
@@ -105,17 +109,24 @@ struct SceneModelInstance {
     SceneNodeId id{};
 };
 
+struct ScenePunctualLight {
+    GpuPunctualLight gpu{};
+    SceneNodeId id{};
+};
+
 // Non-owning view into caller-provided instance storage. Consume it before
 // mutating either the SceneDocument or the output vectors used to build it.
 struct SceneRenderView {
     SceneGpuInstance ground{};
     std::span<const SceneGpuInstance> cubes{};
     std::span<const SceneModelInstance> models{};
+    std::span<const ScenePunctualLight> local_lights{};
     std::uint64_t revision = 0U;
     bool has_ground = false;
     bool terrain_visible = false;
     bool sky_visible = false;
     bool sun_visible = false;
+    bool local_lights_overflow = false;
     SceneNodeId ground_id{};
     std::span<const SceneNodeId> cube_ids{};
 };
@@ -169,11 +180,13 @@ public:
         std::vector<SceneNodeRecord>& output) const;
     [[nodiscard]] SceneRenderView build_render_view(
         std::vector<SceneGpuInstance>& cube_output,
-        std::vector<SceneModelInstance>& model_output);
+        std::vector<SceneModelInstance>& model_output,
+        std::vector<ScenePunctualLight>& light_output);
 
     [[nodiscard]] std::uint32_t size() const noexcept {
         return live_count_;
     }
+    [[nodiscard]] std::uint32_t local_light_count() const noexcept;
     [[nodiscard]] std::uint64_t structure_revision() const noexcept {
         return structure_revision_;
     }

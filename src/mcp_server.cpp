@@ -3,6 +3,7 @@
 #include "png_encoder.hpp"
 
 #include <nlohmann/json.hpp>
+#include <glm/common.hpp>
 
 #include <algorithm>
 #include <array>
@@ -39,7 +40,7 @@ using namespace std::chrono_literals;
 
 constexpr std::string_view protocol_version{"2025-11-25"};
 constexpr std::size_t maximum_input_message_bytes = 1024U * 1024U;
-constexpr std::array<std::string_view, 21> runtime_tool_names{
+constexpr std::array<std::string_view, 30> runtime_tool_names{
     "debug.get_capabilities",
     "debug.get_state",
     "debug.get_metrics",
@@ -51,6 +52,15 @@ constexpr std::array<std::string_view, 21> runtime_tool_names{
     "render.set_gpu_workload",
     "lighting.set",
     "render.set_shadow_resolution",
+    "render.set_shadow_cache",
+    "render.set_tone_mapper",
+    "render.set_exposure",
+    "render.set_color_grading",
+    "render.set_subsurface",
+    "render.set_motion_blur",
+    "render.set_anti_aliasing",
+    "render.set_depth_prepass",
+    "render.set_lod_fade",
     "test.set_roof",
     "render.set_present_mode",
     "window.set_fullscreen",
@@ -63,7 +73,12 @@ constexpr std::array<std::string_view, 21> runtime_tool_names{
     "engine.quit",
 };
 
-constexpr std::array<std::string_view, 19> editor_tool_names{
+constexpr std::array<std::string_view, 24> editor_tool_names{
+    "render.set_exposure",
+    "render.set_color_grading",
+    "render.set_subsurface",
+    "render.set_motion_blur",
+    "render.set_anti_aliasing",
     "editor.get_state",
     "editor.selection.set",
     "editor.scene.list_nodes",
@@ -424,6 +439,91 @@ private:
             Json::array({"hour", "cycle", "gi"})),
         false, false, true));
     tools.push_back(tool_definition(
+        "render.set_tone_mapper", "Set tone mapper",
+        "Select SDR display mapping after reconstruction; applies on the next frame.",
+        object_schema(Json{{"mapper", Json{{"type", "string"},
+            {"enum", Json::array({"reinhard", "gt7"})}}}}, Json::array({"mapper"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "render.set_exposure", "Set scene exposure",
+        "Atomically set fixed or histogram exposure, metering, percentile rejection, EV limits and adaptation constants.",
+        object_schema(Json{
+            {"mode", Json{{"type", "string"}, {"enum", Json::array({"fixed", "auto"})}}},
+            {"metering", Json{{"type", "string"}, {"enum", Json::array({"uniform", "center"})}}},
+            {"compensation_ev", Json{{"type", "number"}, {"minimum", -24}, {"maximum", 24}}},
+            {"minimum_ev", Json{{"type", "number"}, {"minimum", -24}, {"maximum", 24}}},
+            {"maximum_ev", Json{{"type", "number"}, {"minimum", -24}, {"maximum", 24}}},
+            {"low_percentile", Json{{"type", "number"}, {"minimum", 0}, {"maximum", 1}}},
+            {"high_percentile", Json{{"type", "number"}, {"minimum", 0}, {"maximum", 1}}},
+            {"brighten_seconds", Json{{"type", "number"}, {"minimum", 0.01}, {"maximum", 60}}},
+            {"darken_seconds", Json{{"type", "number"}, {"minimum", 0.01}, {"maximum", 60}}}},
+            Json::array({"mode", "metering", "compensation_ev", "minimum_ev", "maximum_ev",
+                         "low_percentile", "high_percentile", "brighten_seconds", "darken_seconds"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "render.set_color_grading", "Set color grading",
+        "Select the built-in identity/reference 3D LUT interpolation and 32 or 64 edge size.",
+        object_schema(Json{
+            {"mode", Json{{"type", "string"}, {"enum", Json::array({"off", "trilinear", "tetrahedral"})}}},
+            {"size", Json{{"type", "integer"}, {"enum", Json::array({32, 64})}}}},
+            Json::array({"mode", "size"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "render.set_subsurface", "Set subsurface scattering",
+        "Enable or disable the lazily provisioned full-resolution masked separable SSS passes.",
+        object_schema(Json{{"mode", Json{{"type", "string"},
+            {"enum", Json::array({"off", "full"})}}}}, Json::array({"mode"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "render.set_motion_blur", "Set motion blur",
+        "Atomically set optional depth-aware TileMax/NeighborMax motion blur. "
+        "Active blur supports AA off, SMAA 1x, and FSR native-aa.",
+        object_schema(Json{
+            {"mode", Json{{"type", "string"},
+                {"enum", Json::array({"off", "camera", "objects", "all"})}}},
+            {"quality", Json{{"type", "string"},
+                {"enum", Json::array({"low", "high"})}}},
+            {"shutter", Json{{"type", "string"},
+                {"enum", Json::array({"centered", "trailing"})}}},
+            {"angle_degrees", Json{{"type", "number"}, {"minimum", 0}, {"maximum", 360}}},
+            {"maximum_radius_pixels", Json{{"type", "number"}, {"minimum", 1}, {"maximum", 64}}},
+            {"camera_fade_start", Json{{"type", "number"}, {"minimum", 0}, {"maximum", 10000}}},
+            {"camera_fade_end", Json{{"type", "number"}, {"minimum", 0}, {"maximum", 10000}}}},
+            Json::array({"mode", "quality", "shutter", "angle_degrees",
+                         "maximum_radius_pixels", "camera_fade_start", "camera_fade_end"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "render.set_anti_aliasing", "Set anti-aliasing",
+        "Select one exclusive AA method. For SMAA, smaa_mode optionally selects spatial 1x or strict two-frame T2x.",
+        object_schema(Json{{"method", Json{{"type", "string"},
+            {"enum", Json::array({"off", "smaa", "fsr3", "msaa2x", "msaa4x"})}}},
+            {"smaa_mode", Json{{"type", "string"},
+            {"enum", Json::array({"1x", "t2x"})}}}},
+            Json::array({"method"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "render.set_depth_prepass", "Set depth prepass",
+        "Select off, terrain/primitive batches only (partial), or all opaque batches (full); "
+        "applies on the next frame using prewarmed pipelines.",
+        object_schema(Json{{"mode", Json{{"type", "string"},
+            {"enum", Json::array({"off", "partial", "full"})}}}}, Json::array({"mode"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "render.set_lod_fade", "Set model LOD fade",
+        "Select ordered Bayer transitions for authored model LODs. Omitted seconds preserves "
+        "the current duration. Terrain LOD remains discrete; shadow casters retain full detail.",
+        object_schema(Json{
+            {"pattern", Json{{"type", "string"}, {"enum", Json::array({"off", "bayer4", "bayer8"})}}},
+            {"seconds", Json{{"type", "number"}, {"minimum", 0.05}, {"maximum", 2.0}}}},
+            Json::array({"pattern"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "render.set_shadow_cache", "Set shadow cache",
+        "Select full-atlas or independent cascade refresh. Switching requests a complete refresh.",
+        object_schema(Json{{"mode", Json{{"type", "string"},
+            {"enum", Json::array({"full", "cascade"})}}}}, Json::array({"mode"})),
+        false, false, true));
+    tools.push_back(tool_definition(
         "render.set_shadow_resolution", "Set shadow resolution",
         "Set full shadow atlas edge; dynamic lighting uses four half-size cascades. "
         "Applied at the next rendered frame; unsupported GPU sizes are rejected.",
@@ -595,14 +695,78 @@ private:
         {"minItems", 4},
         {"maxItems", 4},
     };
+    const Json light_color_schema{
+        {"type", "array"},
+        {"items", Json{
+            {"type", "number"}, {"minimum", 0.0}, {"maximum", 1.0}}},
+        {"minItems", 3},
+        {"maxItems", 3},
+    };
     const Json kind_schema{
         {"type", "string"},
         {"enum", Json::array({
             "folder", "cube", "ground", "terrain", "camera",
-            "directional_light", "environment", "model",
+            "directional_light", "point_light", "spot_light", "environment", "model",
         })},
     };
     Json tools = Json::array();
+    tools.push_back(tool_definition(
+        "render.set_exposure", "Set scene exposure",
+        "Atomically set fixed or histogram exposure, metering, percentile rejection, EV limits and adaptation constants.",
+        object_schema(Json{
+            {"mode", Json{{"type", "string"}, {"enum", Json::array({"fixed", "auto"})}}},
+            {"metering", Json{{"type", "string"}, {"enum", Json::array({"uniform", "center"})}}},
+            {"compensation_ev", Json{{"type", "number"}, {"minimum", -24}, {"maximum", 24}}},
+            {"minimum_ev", Json{{"type", "number"}, {"minimum", -24}, {"maximum", 24}}},
+            {"maximum_ev", Json{{"type", "number"}, {"minimum", -24}, {"maximum", 24}}},
+            {"low_percentile", Json{{"type", "number"}, {"minimum", 0}, {"maximum", 1}}},
+            {"high_percentile", Json{{"type", "number"}, {"minimum", 0}, {"maximum", 1}}},
+            {"brighten_seconds", Json{{"type", "number"}, {"minimum", 0.01}, {"maximum", 60}}},
+            {"darken_seconds", Json{{"type", "number"}, {"minimum", 0.01}, {"maximum", 60}}}},
+            Json::array({"mode", "metering", "compensation_ev", "minimum_ev", "maximum_ev",
+                         "low_percentile", "high_percentile", "brighten_seconds", "darken_seconds"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "render.set_color_grading", "Set color grading",
+        "Select the built-in identity/reference 3D LUT interpolation and 32 or 64 edge size.",
+        object_schema(Json{
+            {"mode", Json{{"type", "string"}, {"enum", Json::array({"off", "trilinear", "tetrahedral"})}}},
+            {"size", Json{{"type", "integer"}, {"enum", Json::array({32, 64})}}}},
+            Json::array({"mode", "size"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "render.set_subsurface", "Set subsurface scattering",
+        "Enable or disable the lazily provisioned full-resolution masked separable SSS passes.",
+        object_schema(Json{{"mode", Json{{"type", "string"},
+            {"enum", Json::array({"off", "full"})}}}}, Json::array({"mode"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "render.set_motion_blur", "Set motion blur",
+        "Atomically set optional depth-aware TileMax/NeighborMax motion blur. "
+        "Active blur supports AA off, SMAA 1x, and FSR native-aa.",
+        object_schema(Json{
+            {"mode", Json{{"type", "string"},
+                {"enum", Json::array({"off", "camera", "objects", "all"})}}},
+            {"quality", Json{{"type", "string"},
+                {"enum", Json::array({"low", "high"})}}},
+            {"shutter", Json{{"type", "string"},
+                {"enum", Json::array({"centered", "trailing"})}}},
+            {"angle_degrees", Json{{"type", "number"}, {"minimum", 0}, {"maximum", 360}}},
+            {"maximum_radius_pixels", Json{{"type", "number"}, {"minimum", 1}, {"maximum", 64}}},
+            {"camera_fade_start", Json{{"type", "number"}, {"minimum", 0}, {"maximum", 10000}}},
+            {"camera_fade_end", Json{{"type", "number"}, {"minimum", 0}, {"maximum", 10000}}}},
+            Json::array({"mode", "quality", "shutter", "angle_degrees",
+                         "maximum_radius_pixels", "camera_fade_start", "camera_fade_end"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "render.set_anti_aliasing", "Set anti-aliasing",
+        "Select one exclusive AA method. For SMAA, smaa_mode optionally selects spatial 1x or strict two-frame T2x.",
+        object_schema(Json{{"method", Json{{"type", "string"},
+            {"enum", Json::array({"off", "smaa", "fsr3", "msaa2x", "msaa4x"})}}},
+            {"smaa_mode", Json{{"type", "string"},
+            {"enum", Json::array({"1x", "t2x"})}}}},
+            Json::array({"method"})),
+        false, false, true));
     tools.push_back(tool_definition(
         "editor.get_state", "Get editor state",
         "Return the live authoring state, revisions, history, asset root, and import status.",
@@ -626,7 +790,7 @@ private:
         true, false, true));
     tools.push_back(tool_definition(
         "editor.scene.create_node", "Create scene node",
-        "Create a node with an optional parent, transform, visibility, and model asset path.",
+        "Create a node with optional parent, transform, visibility, model asset path, and cube/ground material factors.",
         object_schema(
             Json{
                 {"name", Json{{"type", "string"}, {"minLength", 1},
@@ -648,12 +812,29 @@ private:
                 {"ambient_occlusion", Json{{"type", "number"},
                                               {"minimum", 0.0},
                                               {"maximum", 1.0}}},
+                {"ior", Json{{"type", "number"}, {"minimum", 1.0},
+                                {"maximum", std::numeric_limits<float>::max()}}},
+                {"model", Json{{"type", "string"},
+                                  {"enum", Json::array({"standard", "unlit", "subsurface"})}}},
+                {"subsurface_profile", Json{{"type", "string"},
+                    {"enum", Json::array({"none", "narrow", "medium", "wide"})}}},
+                {"subsurface_strength", Json{{"type", "number"},
+                    {"minimum", 0.0}, {"maximum", 1.0}}},
+                {"light_color", light_color_schema},
+                {"intensity_candela", Json{{"type", "number"}, {"minimum", 0.0},
+                                              {"maximum", 1'000'000.0}}},
+                {"light_range", Json{{"type", "number"}, {"minimum", 0.05},
+                                        {"maximum", 1'000.0}}},
+                {"inner_cone_degrees", Json{{"type", "number"}, {"minimum", 0.0},
+                                               {"maximum", 90.0}}},
+                {"outer_cone_degrees", Json{{"type", "number"}, {"minimum", 0.0},
+                                               {"maximum", 90.0}}},
             },
             Json::array({"name", "kind"})),
         false, false, false));
     tools.push_back(tool_definition(
         "editor.scene.update_node", "Update scene node",
-        "Patch authored node identity, visibility, transform, or model asset reference.",
+        "Patch authored node identity, visibility, transform, model asset reference, or cube/ground material factors.",
         object_schema(Json{
             {"id", handle_schema},
             {"name", Json{{"type", "string"}, {"minLength", 1},
@@ -673,6 +854,23 @@ private:
             {"ambient_occlusion", Json{{"type", "number"},
                                           {"minimum", 0.0},
                                           {"maximum", 1.0}}},
+            {"ior", Json{{"type", "number"}, {"minimum", 1.0},
+                            {"maximum", std::numeric_limits<float>::max()}}},
+            {"model", Json{{"type", "string"},
+                              {"enum", Json::array({"standard", "unlit", "subsurface"})}}},
+            {"subsurface_profile", Json{{"type", "string"},
+                {"enum", Json::array({"none", "narrow", "medium", "wide"})}}},
+            {"subsurface_strength", Json{{"type", "number"},
+                {"minimum", 0.0}, {"maximum", 1.0}}},
+            {"light_color", light_color_schema},
+            {"intensity_candela", Json{{"type", "number"}, {"minimum", 0.0},
+                                          {"maximum", 1'000'000.0}}},
+            {"light_range", Json{{"type", "number"}, {"minimum", 0.05},
+                                    {"maximum", 1'000.0}}},
+            {"inner_cone_degrees", Json{{"type", "number"}, {"minimum", 0.0},
+                                           {"maximum", 90.0}}},
+            {"outer_cone_degrees", Json{{"type", "number"}, {"minimum", 0.0},
+                                           {"maximum", 90.0}}},
         }, Json::array({"id"})), false, false, true));
     tools.push_back(tool_definition(
         "editor.scene.delete_node", "Delete scene subtree",
@@ -882,6 +1080,23 @@ private:
     return std::nullopt;
 }
 
+[[nodiscard]] std::optional<AntiAliasingMethod> parse_anti_aliasing_method(
+    const std::string_view value) noexcept {
+    if (value == "off") return AntiAliasingMethod::off;
+    if (value == "smaa") return AntiAliasingMethod::smaa;
+    if (value == "fsr3") return AntiAliasingMethod::fsr3;
+    if (value == "msaa2x") return AntiAliasingMethod::msaa2x;
+    if (value == "msaa4x") return AntiAliasingMethod::msaa4x;
+    return std::nullopt;
+}
+
+[[nodiscard]] std::optional<SmaaMode> parse_smaa_mode(
+    const std::string_view value) noexcept {
+    if (value == "1x") return SmaaMode::x1;
+    if (value == "t2x") return SmaaMode::t2x;
+    return std::nullopt;
+}
+
 [[nodiscard]] bool copy_command_text(
     const std::string_view source,
     const std::span<char> destination,
@@ -1016,6 +1231,54 @@ private:
     return static_cast<float>(value);
 }
 
+[[nodiscard]] bool parse_motion_blur_arguments(
+    const Json& arguments,
+    McpCommand& command,
+    std::string& error) {
+    if (arguments.size() != 7U ||
+        !arguments.contains("mode") || !arguments["mode"].is_string() ||
+        !arguments.contains("quality") || !arguments["quality"].is_string() ||
+        !arguments.contains("shutter") || !arguments["shutter"].is_string()) {
+        error = "all motion blur fields are required";
+        return false;
+    }
+    const auto mode = parse_motion_blur_mode(
+        arguments["mode"].get<std::string_view>());
+    const auto quality = parse_motion_blur_quality(
+        arguments["quality"].get<std::string_view>());
+    const auto shutter = parse_motion_blur_shutter(
+        arguments["shutter"].get<std::string_view>());
+    const auto angle = get_finite_float(
+        arguments, "angle_degrees", 0.0F, 360.0F);
+    const auto radius = get_finite_float(
+        arguments, "maximum_radius_pixels", 1.0F, 64.0F);
+    const auto fade_start = get_finite_float(
+        arguments, "camera_fade_start", 0.0F, 10'000.0F);
+    const auto fade_end = get_finite_float(
+        arguments, "camera_fade_end", 0.0F, 10'000.0F);
+    if (!mode || !quality || !shutter || !angle || !radius ||
+        !fade_start || !fade_end) {
+        error = "motion blur fields contain an unknown token or invalid range";
+        return false;
+    }
+    const MotionBlurSettings settings{
+        .mode = *mode,
+        .quality = *quality,
+        .shutter = *shutter,
+        .shutter_angle_degrees = *angle,
+        .maximum_radius_pixels = *radius,
+        .camera_fade_start = *fade_start,
+        .camera_fade_end = *fade_end,
+    };
+    if (!valid_motion_blur_settings(settings)) {
+        error = "camera fade must be disabled with two zeros or use start below end";
+        return false;
+    }
+    command.type = McpCommandType::render_set_motion_blur;
+    command.motion_blur = settings;
+    return true;
+}
+
 [[nodiscard]] std::optional<SceneNodeKind> parse_node_kind(
     const std::string_view value) noexcept {
     if (value == "folder") return SceneNodeKind::folder;
@@ -1024,6 +1287,8 @@ private:
     if (value == "terrain") return SceneNodeKind::terrain;
     if (value == "camera") return SceneNodeKind::camera;
     if (value == "directional_light") return SceneNodeKind::directional_light;
+    if (value == "point_light") return SceneNodeKind::point_light;
+    if (value == "spot_light") return SceneNodeKind::spot_light;
     if (value == "environment") return SceneNodeKind::environment;
     if (value == "model") return SceneNodeKind::model;
     return std::nullopt;
@@ -1044,12 +1309,13 @@ private:
     const auto parse_factor = [&](const std::string_view key,
                                   float& output,
                                   const float minimum,
+                                  const float maximum,
                                   const std::uint32_t mask) {
         if (!arguments.contains(key)) {
             return true;
         }
         const auto value = get_finite_float(
-            arguments, key, minimum, 1.0F);
+            arguments, key, minimum, maximum);
         if (!value) {
             error = std::string(key) + " must be finite and within its PBR range";
             return false;
@@ -1058,15 +1324,84 @@ private:
         command.edit_mask |= mask;
         return true;
     };
-    return parse_factor(
-               "metallic", command.material.metallic, 0.0F,
-               McpCommand::edit_metallic) &&
-        parse_factor(
+    if (!parse_factor(
+               "metallic", command.material.metallic, 0.0F, 1.0F,
+               McpCommand::edit_metallic) ||
+        !parse_factor(
                "roughness", command.material.roughness,
-               minimum_pbr_roughness, McpCommand::edit_roughness) &&
-        parse_factor(
-               "ambient_occlusion", command.material.ambient_occlusion, 0.0F,
-               McpCommand::edit_ambient_occlusion);
+               minimum_pbr_roughness, 1.0F, McpCommand::edit_roughness) ||
+        !parse_factor(
+               "ambient_occlusion", command.material.ambient_occlusion, 0.0F, 1.0F,
+               McpCommand::edit_ambient_occlusion) ||
+        !parse_factor(
+               "ior", command.material.ior, 1.0F,
+               std::numeric_limits<float>::max(), McpCommand::edit_ior) ||
+        !parse_factor(
+               "subsurface_strength", command.material.subsurface_strength, 0.0F, 1.0F,
+               McpCommand::edit_subsurface_strength)) {
+        return false;
+    }
+    if (arguments.contains("model")) {
+        const auto token = get_string(arguments, "model");
+        const auto model = token ? parse_material_model(*token) : std::nullopt;
+        if (!model) {
+            error = "model must be standard, unlit or subsurface";
+            return false;
+        }
+        command.material.model = *model;
+        command.edit_mask |= McpCommand::edit_material_model;
+    }
+    if (arguments.contains("subsurface_profile")) {
+        const auto token = get_string(arguments, "subsurface_profile");
+        const auto profile = token ? parse_subsurface_profile(*token) : std::nullopt;
+        if (!profile) {
+            error = "subsurface_profile must be none, narrow, medium or wide";
+            return false;
+        }
+        command.material.subsurface_profile = *profile;
+        command.edit_mask |= McpCommand::edit_subsurface_profile;
+    }
+    return true;
+}
+
+[[nodiscard]] bool parse_optional_light_fields(
+    const Json& arguments,
+    McpCommand& command,
+    std::string& error) {
+    if (arguments.contains("light_color")) {
+        glm::vec3 color{};
+        if (!parse_vec3(arguments, "light_color", color) ||
+            glm::any(glm::lessThan(color, glm::vec3(0.0F))) ||
+            glm::any(glm::greaterThan(color, glm::vec3(1.0F)))) {
+            error = "light_color must contain three finite values from 0 through 1";
+            return false;
+        }
+        command.light.color = color;
+        command.edit_mask |= McpCommand::edit_light_color;
+    }
+    const auto parse_factor = [&](const std::string_view key,
+                                  float& output,
+                                  const float minimum,
+                                  const float maximum,
+                                  const std::uint32_t mask) {
+        if (!arguments.contains(key)) return true;
+        const auto value = get_finite_float(arguments, key, minimum, maximum);
+        if (!value) {
+            error = std::string(key) + " must be finite and within its light range";
+            return false;
+        }
+        output = *value;
+        command.edit_mask |= mask;
+        return true;
+    };
+    return parse_factor("intensity_candela", command.light.intensity_candela,
+                        0.0F, 1'000'000.0F, McpCommand::edit_light_intensity) &&
+        parse_factor("light_range", command.light.range, 0.05F, 1'000.0F,
+                     McpCommand::edit_light_range) &&
+        parse_factor("inner_cone_degrees", command.light.inner_cone_degrees,
+                     0.0F, 90.0F, McpCommand::edit_spot_inner) &&
+        parse_factor("outer_cone_degrees", command.light.outer_cone_degrees,
+                     0.0F, 90.0F, McpCommand::edit_spot_outer);
 }
 
 [[nodiscard]] bool command_from_editor_tool(
@@ -1081,6 +1416,116 @@ private:
         }
         return true;
     };
+    if (name == "render.set_exposure") {
+        constexpr std::array<std::string_view, 7> numeric_fields{
+            "compensation_ev", "minimum_ev", "maximum_ev", "low_percentile",
+            "high_percentile", "brighten_seconds", "darken_seconds"};
+        if (arguments.size() != 9U || !arguments.contains("mode") ||
+            !arguments["mode"].is_string() || !arguments.contains("metering") ||
+            !arguments["metering"].is_string()) {
+            error = "all exposure fields are required";
+            return false;
+        }
+        for (const auto field : numeric_fields) {
+            if (!arguments.contains(field) || !arguments[field].is_number()) {
+                error = "all exposure numeric fields must be finite numbers";
+                return false;
+            }
+        }
+        const auto mode = parse_exposure_mode(arguments["mode"].get<std::string_view>());
+        const auto metering = parse_exposure_metering(arguments["metering"].get<std::string_view>());
+        if (!mode || !metering) {
+            error = "mode or metering is invalid";
+            return false;
+        }
+        command.exposure = ExposureSettings{
+            .mode = *mode,
+            .metering = *metering,
+            .compensation_ev = arguments["compensation_ev"].get<float>(),
+            .minimum_ev = arguments["minimum_ev"].get<float>(),
+            .maximum_ev = arguments["maximum_ev"].get<float>(),
+            .low_percentile = arguments["low_percentile"].get<float>(),
+            .high_percentile = arguments["high_percentile"].get<float>(),
+            .brighten_seconds = arguments["brighten_seconds"].get<float>(),
+            .darken_seconds = arguments["darken_seconds"].get<float>(),
+        };
+        if (!valid_exposure_settings(command.exposure)) {
+            error = "exposure values violate finite ranges or ordering";
+            return false;
+        }
+        command.type = McpCommandType::render_set_exposure;
+        return true;
+    }
+    if (name == "render.set_color_grading") {
+        if (arguments.size() != 2U || !arguments.contains("mode") ||
+            !arguments["mode"].is_string()) {
+            error = "mode and size are required";
+            return false;
+        }
+        const auto size_value = get_u32(arguments, "size", 32U, 64U);
+        const auto grading = parse_color_grading(arguments["mode"].get<std::string_view>());
+        const auto size = size_value
+            ? parse_color_grading_lut_size(std::to_string(*size_value))
+            : std::nullopt;
+        if (!grading || !size) {
+            error = "mode must be off, trilinear or tetrahedral and size must be 32 or 64";
+            return false;
+        }
+        command.type = McpCommandType::render_set_color_grading;
+        command.color_grading = *grading;
+        command.color_grading_lut_size = *size;
+        return true;
+    }
+    if (name == "render.set_subsurface") {
+        if (arguments.size() != 1U || !arguments.contains("mode") ||
+            !arguments["mode"].is_string()) {
+            error = "mode must be off or full";
+            return false;
+        }
+        const auto mode = parse_subsurface_mode(arguments["mode"].get<std::string_view>());
+        if (!mode) {
+            error = "mode must be off or full";
+            return false;
+        }
+        command.type = McpCommandType::render_set_subsurface;
+        command.subsurface = *mode;
+        return true;
+    }
+    if (name == "render.set_motion_blur") {
+        return parse_motion_blur_arguments(arguments, command, error);
+    }
+    if (name == "render.set_anti_aliasing") {
+        if (arguments.size() < 1U || arguments.size() > 2U ||
+            !arguments.contains("method") || !arguments["method"].is_string() ||
+            (arguments.size() == 2U && !arguments.contains("smaa_mode"))) {
+            error = "method is required; smaa_mode is optional for SMAA";
+            return false;
+        }
+        const auto method = parse_anti_aliasing_method(
+            arguments["method"].get<std::string_view>());
+        if (!method) {
+            error = "unsupported anti-aliasing method";
+            return false;
+        }
+        command.type = McpCommandType::render_set_anti_aliasing;
+        command.value = static_cast<std::uint32_t>(*method);
+        if (arguments.contains("smaa_mode")) {
+            if (*method != AntiAliasingMethod::smaa ||
+                !arguments["smaa_mode"].is_string()) {
+                error = "smaa_mode is only valid with method smaa";
+                return false;
+            }
+            const auto mode = parse_smaa_mode(
+                arguments["smaa_mode"].get<std::string_view>());
+            if (!mode) {
+                error = "smaa_mode must be 1x or t2x";
+                return false;
+            }
+            command.smaa_mode = *mode;
+            command.smaa_mode_supplied = true;
+        }
+        return true;
+    }
     if (name == "editor.get_state") {
         command.type = McpCommandType::editor_get_state;
         return require_empty();
@@ -1180,7 +1625,10 @@ private:
         if (!only_keys(arguments, {
                 "name", "kind", "parent", "asset_path", "visible",
                 "translation", "rotation_degrees", "scale", "base_color",
-                "metallic", "roughness", "ambient_occlusion"})) {
+                "metallic", "roughness", "ambient_occlusion", "ior", "model",
+                "subsurface_profile", "subsurface_strength",
+                "light_color", "intensity_candela", "light_range",
+                "inner_cone_degrees", "outer_cone_degrees"})) {
             error = "create_node contains an unknown argument";
             return false;
         }
@@ -1230,13 +1678,17 @@ private:
                                McpCommand::edit_rotation) &&
             parse_optional_vec("scale", command.transform.scale,
                                McpCommand::edit_scale) &&
-            parse_optional_material_fields(arguments, command, error);
+            parse_optional_material_fields(arguments, command, error) &&
+            parse_optional_light_fields(arguments, command, error);
     }
     if (name == "editor.scene.update_node") {
         if (!only_keys(arguments, {
                 "id", "name", "asset_path", "visible", "translation",
                 "rotation_degrees", "scale", "base_color", "metallic",
-                "roughness", "ambient_occlusion"}) ||
+                "roughness", "ambient_occlusion", "ior", "model",
+                "subsurface_profile", "subsurface_strength",
+                "light_color", "intensity_candela", "light_range",
+                "inner_cone_degrees", "outer_cone_degrees"}) ||
             !arguments.contains("id") ||
             !parse_node_handle(arguments["id"], command.node_id)) {
             error = "update_node requires a valid id and known patch fields";
@@ -1284,7 +1736,8 @@ private:
                                 McpCommand::edit_rotation) ||
             !parse_optional_vec("scale", command.transform.scale,
                                 McpCommand::edit_scale) ||
-            !parse_optional_material_fields(arguments, command, error)) {
+            !parse_optional_material_fields(arguments, command, error) ||
+            !parse_optional_light_fields(arguments, command, error)) {
             return false;
         }
         if (command.edit_mask == 0U) {
@@ -1560,6 +2013,186 @@ private:
         }
         command.type = McpCommandType::render_set_shadow_resolution;
         command.value = *resolution;
+        return true;
+    }
+    if (name == "render.set_shadow_cache") {
+        if (arguments.size() != 1 || !arguments.contains("mode") ||
+            !arguments["mode"].is_string() ||
+            (arguments["mode"] != "full" && arguments["mode"] != "cascade")) {
+            error = "mode must be full or cascade";
+            return false;
+        }
+        command.type = McpCommandType::render_set_shadow_cache;
+        command.enabled = arguments["mode"] == "cascade";
+        return true;
+    }
+    if (name == "render.set_depth_prepass") {
+        if (arguments.size() != 1 || !arguments.contains("mode") ||
+            !arguments["mode"].is_string()) {
+            error = "mode must be off, partial or full";
+            return false;
+        }
+        const auto prepass = parse_depth_prepass(arguments["mode"].get<std::string_view>());
+        if (!prepass) {
+            error = "mode must be off, partial or full";
+            return false;
+        }
+        command.type = McpCommandType::render_set_depth_prepass;
+        command.value = static_cast<std::uint32_t>(*prepass);
+        return true;
+    }
+    if (name == "render.set_lod_fade") {
+        const bool seconds_supplied = arguments.contains("seconds");
+        if (!arguments.contains("pattern") || !arguments["pattern"].is_string() ||
+            arguments.size() != (seconds_supplied ? 2U : 1U)) {
+            error = "pattern must be off, bayer4 or bayer8; only optional seconds is accepted";
+            return false;
+        }
+        const auto pattern = parse_lod_fade_pattern(arguments["pattern"].get<std::string_view>());
+        if (!pattern) {
+            error = "pattern must be off, bayer4 or bayer8";
+            return false;
+        }
+        double seconds = 0.25;
+        if (seconds_supplied) {
+            if (!arguments["seconds"].is_number()) {
+                error = "seconds must be a finite number from 0.05 through 2";
+                return false;
+            }
+            seconds = arguments["seconds"].get<double>();
+            if (!std::isfinite(seconds) || seconds < 0.05 || seconds > 2.0) {
+                error = "seconds must be a finite number from 0.05 through 2";
+                return false;
+            }
+        }
+        command.type = McpCommandType::render_set_lod_fade;
+        command.value = static_cast<std::uint32_t>(*pattern);
+        command.lod_fade_seconds = static_cast<float>(seconds);
+        command.lod_fade_seconds_supplied = seconds_supplied;
+        return true;
+    }
+    if (name == "render.set_tone_mapper") {
+        if (arguments.size() != 1 || !arguments.contains("mapper") ||
+            !arguments["mapper"].is_string()) {
+            error = "mapper must be reinhard or gt7";
+            return false;
+        }
+        const auto mapper = parse_tone_mapper(arguments["mapper"].get<std::string_view>());
+        if (!mapper) {
+            error = "mapper must be reinhard or gt7";
+            return false;
+        }
+        command.type = McpCommandType::render_set_tone_mapper;
+        command.value = static_cast<std::uint32_t>(*mapper);
+        return true;
+    }
+    if (name == "render.set_exposure") {
+        constexpr std::array<std::string_view, 7> numeric_fields{
+            "compensation_ev", "minimum_ev", "maximum_ev", "low_percentile",
+            "high_percentile", "brighten_seconds", "darken_seconds"};
+        if (arguments.size() != 9U || !arguments.contains("mode") ||
+            !arguments["mode"].is_string() || !arguments.contains("metering") ||
+            !arguments["metering"].is_string()) {
+            error = "all exposure fields are required";
+            return false;
+        }
+        for (const auto field : numeric_fields) {
+            if (!arguments.contains(field) || !arguments[field].is_number()) {
+                error = "all exposure numeric fields must be finite numbers";
+                return false;
+            }
+        }
+        const auto mode = parse_exposure_mode(arguments["mode"].get<std::string_view>());
+        const auto metering = parse_exposure_metering(arguments["metering"].get<std::string_view>());
+        if (!mode || !metering) {
+            error = "mode or metering is invalid";
+            return false;
+        }
+        ExposureSettings settings{};
+        settings.mode = *mode;
+        settings.metering = *metering;
+        settings.compensation_ev = arguments["compensation_ev"].get<float>();
+        settings.minimum_ev = arguments["minimum_ev"].get<float>();
+        settings.maximum_ev = arguments["maximum_ev"].get<float>();
+        settings.low_percentile = arguments["low_percentile"].get<float>();
+        settings.high_percentile = arguments["high_percentile"].get<float>();
+        settings.brighten_seconds = arguments["brighten_seconds"].get<float>();
+        settings.darken_seconds = arguments["darken_seconds"].get<float>();
+        if (!valid_exposure_settings(settings)) {
+            error = "exposure values violate finite ranges or ordering";
+            return false;
+        }
+        command.type = McpCommandType::render_set_exposure;
+        command.exposure = settings;
+        return true;
+    }
+    if (name == "render.set_color_grading") {
+        if (arguments.size() != 2U || !arguments.contains("mode") ||
+            !arguments["mode"].is_string() || !arguments.contains("size") ||
+            !arguments["size"].is_number_unsigned()) {
+            error = "mode and size are required";
+            return false;
+        }
+        const auto grading = parse_color_grading(arguments["mode"].get<std::string_view>());
+        const auto size = parse_color_grading_lut_size(
+            std::to_string(arguments["size"].get<std::uint32_t>()));
+        if (!grading || !size) {
+            error = "mode must be off, trilinear or tetrahedral and size must be 32 or 64";
+            return false;
+        }
+        command.type = McpCommandType::render_set_color_grading;
+        command.color_grading = *grading;
+        command.color_grading_lut_size = *size;
+        return true;
+    }
+    if (name == "render.set_subsurface") {
+        if (arguments.size() != 1U || !arguments.contains("mode") ||
+            !arguments["mode"].is_string()) {
+            error = "mode must be off or full";
+            return false;
+        }
+        const auto mode = parse_subsurface_mode(arguments["mode"].get<std::string_view>());
+        if (!mode) {
+            error = "mode must be off or full";
+            return false;
+        }
+        command.type = McpCommandType::render_set_subsurface;
+        command.subsurface = *mode;
+        return true;
+    }
+    if (name == "render.set_motion_blur") {
+        return parse_motion_blur_arguments(arguments, command, error);
+    }
+    if (name == "render.set_anti_aliasing") {
+        if (arguments.size() < 1U || arguments.size() > 2U ||
+            !arguments.contains("method") || !arguments["method"].is_string() ||
+            (arguments.size() == 2U && !arguments.contains("smaa_mode"))) {
+            error = "method is required; smaa_mode is optional for SMAA";
+            return false;
+        }
+        const auto method = parse_anti_aliasing_method(
+            arguments["method"].get<std::string_view>());
+        if (!method) {
+            error = "unsupported anti-aliasing method";
+            return false;
+        }
+        command.type = McpCommandType::render_set_anti_aliasing;
+        command.value = static_cast<std::uint32_t>(*method);
+        if (arguments.contains("smaa_mode")) {
+            if (*method != AntiAliasingMethod::smaa ||
+                !arguments["smaa_mode"].is_string()) {
+                error = "smaa_mode is only valid with method smaa";
+                return false;
+            }
+            const auto mode = parse_smaa_mode(
+                arguments["smaa_mode"].get<std::string_view>());
+            if (!mode) {
+                error = "smaa_mode must be 1x or t2x";
+                return false;
+            }
+            command.smaa_mode = *mode;
+            command.smaa_mode_supplied = true;
+        }
         return true;
     }
     if (name == "lighting.set") {

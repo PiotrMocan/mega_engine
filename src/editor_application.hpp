@@ -59,6 +59,7 @@ private:
     FlyCamera camera_{};
     std::vector<SceneGpuInstance> scene_instances_{};
     std::vector<SceneModelInstance> scene_models_{};
+    std::vector<ScenePunctualLight> scene_lights_{};
     CliOptions options_{};
     McpControlPlane mcp_control_{};
     McpServer mcp_server_{mcp_control_, McpServerProfile::editor};

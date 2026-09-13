@@ -1000,6 +1000,92 @@ copy_obj_material_libraries(
 }
 
 [[nodiscard]] AssetImportOutcome<void>
+validate_gltf_material_extensions(const Json& document, const std::filesystem::path& source) {
+    const auto reject = [&source](std::string message) {
+        return make_unexpected_asset_import_error(make_error(
+            AssetImportErrorCode::invalid_asset_data, std::move(message), source));
+    };
+    const auto materials = document.find("materials");
+    if (materials == document.end()) return {};
+    if (!materials->is_array()) return reject("glTF materials must be an array.");
+    for (const auto& material : *materials) {
+        if (!material.is_object()) return reject("glTF material must be an object.");
+        const auto extensions = material.find("extensions");
+        if (extensions == material.end()) continue;
+        if (!extensions->is_object()) return reject("glTF material extensions must be an object.");
+        // KHR_materials_ior exclusions apply per glTF material, not to the
+        // document's extensionsUsed list or to the engine's internal material.
+        if (extensions->contains("KHR_materials_ior")) {
+            for (const char* excluded : {"KHR_materials_unlit", "KHR_materials_pbrSpecularGlossiness"}) {
+                if (extensions->contains(excluded)) {
+                    return reject(std::string("glTF KHR_materials_ior cannot be combined with ") +
+                                  excluded + " in the same material.");
+                }
+            }
+        }
+        for (const char* name : {"KHR_materials_ior", "KHR_materials_unlit"}) {
+            const auto extension = extensions->find(name);
+            if (extension == extensions->end()) continue;
+            if (!extension->is_object()) {
+                return reject(std::string("glTF ") + name + " must be an object.");
+            }
+            const auto used = document.find("extensionsUsed");
+            if (used == document.end() || !used->is_array() ||
+                std::find(used->begin(), used->end(), Json(name)) == used->end()) {
+                return reject(std::string("glTF ") + name + " must be listed in extensionsUsed.");
+            }
+            if (std::string_view(name) != "KHR_materials_ior") continue;
+            const auto ior = extension->find("ior");
+            if (ior == extension->end()) continue; // Extension default is 1.5.
+            if (!ior->is_number()) return reject("glTF material IOR must be numeric.");
+            const double value = ior->get<double>();
+            if (value == 0.0) {
+                return reject("glTF IOR 0 compatibility mode is unsupported; use a finite IOR >= 1.");
+            }
+            if (!std::isfinite(value) || value < 1.0 ||
+                value > static_cast<double>(std::numeric_limits<float>::max())) {
+                return reject("glTF material IOR must be a finite float greater than or equal to 1.");
+            }
+        }
+    }
+    return {};
+}
+
+[[nodiscard]] AssetImportOutcome<void>
+validate_glb_material_extensions(const std::filesystem::path& snapshot_source) {
+    // Read only the GLB JSON chunk, not the binary geometry/images. Source size
+    // was bounded during snapshot copying; Assimp still owns full GLB decoding.
+    std::ifstream input(snapshot_source, std::ios::binary);
+    std::array<unsigned char, 20> header{};
+    input.read(reinterpret_cast<char*>(header.data()), static_cast<std::streamsize>(header.size()));
+    const auto u32 = [&header](std::size_t offset) {
+        std::uint32_t value = 0;
+        for (unsigned byte = 0; byte < 4; ++byte) {
+            value |= static_cast<std::uint32_t>(header[offset + byte]) << (byte * 8);
+        }
+        return value;
+    };
+    std::error_code error;
+    const auto file_size = std::filesystem::file_size(snapshot_source, error);
+    const auto json_size = u32(12);
+    if (!input || error || file_size < header.size() || u32(0) != 0x46546C67U ||
+        u32(4) != 2 || u32(8) != file_size || u32(16) != 0x4E4F534AU ||
+        json_size == 0 || json_size % 4 != 0 || json_size > file_size - header.size()) {
+        return make_unexpected_asset_import_error(make_error(
+            AssetImportErrorCode::invalid_asset_data, "GLB header or first JSON chunk is invalid.",
+            snapshot_source));
+    }
+    std::string text(json_size, '\0');
+    input.read(text.data(), static_cast<std::streamsize>(text.size()));
+    const Json document = input ? Json::parse(text, nullptr, false) : Json();
+    if (!document.is_object()) {
+        return make_unexpected_asset_import_error(make_error(
+            AssetImportErrorCode::invalid_asset_data, "GLB JSON chunk is invalid.", snapshot_source));
+    }
+    return validate_gltf_material_extensions(document, snapshot_source);
+}
+
+[[nodiscard]] AssetImportOutcome<void>
 copy_gltf_buffer_dependencies(
     ImportContext& context,
     const std::filesystem::path& original_source,
@@ -1017,6 +1103,9 @@ copy_gltf_buffer_dependencies(
             AssetImportErrorCode::invalid_asset_data,
             "glTF source is not valid JSON.",
             original_source));
+    }
+    if (const auto validation = validate_gltf_material_extensions(document, original_source); !validation) {
+        return validation;
     }
     const auto buffers = document.find("buffers");
     if (buffers == document.end() || !buffers->is_array()) {
@@ -1393,12 +1482,37 @@ import_materials(
         const auto color = finite_color(
             imported_base_color,
             {1.0F, 1.0F, 1.0F, 1.0F});
+        float ior = 1.5F;
+        // Assimp OBJ publishes a synthetic REFRACTI=1.0 even without an authored
+        // Ni directive. Until legacy formats have a provenance contract, only
+        // glTF/GLB KHR_materials_ior may override the historical 1.5 default.
+        if (context.result.source_kind == AssetSourceKind::model_gltf ||
+            context.result.source_kind == AssetSourceKind::model_glb) {
+            float imported_ior = 1.5F;
+            if (material_observer->Get(AI_MATKEY_REFRACTI, imported_ior) == AI_SUCCESS) {
+                if (!std::isfinite(imported_ior) || imported_ior < 1.0F) {
+                    return make_unexpected_asset_import_error(make_error(
+                        AssetImportErrorCode::invalid_asset_data,
+                        imported_ior == 0.0F
+                            ? "glTF IOR 0 compatibility mode is unsupported; use a finite IOR >= 1."
+                            : "Imported material IOR must be finite and greater than or equal to 1.",
+                        model_source));
+                }
+                ior = imported_ior;
+            }
+        }
+        int shading_model = 0;
+        static_cast<void>(material_observer->Get(AI_MATKEY_SHADING_MODEL, shading_model));
         const PbrMaterial pbr = sanitize_pbr_material(PbrMaterial{
             .base_color =
                 {color[0U], color[1U], color[2U], color[3U]},
             .metallic = metallic,
             .roughness = roughness,
             .ambient_occlusion = 1.0F,
+            .ior = ior,
+            .model = shading_model == aiShadingMode_Unlit ? MaterialModel::unlit : MaterialModel::standard,
+            .subsurface_profile = SubsurfaceProfile::none,
+            .subsurface_strength = 0.0F,
         });
 
         Json texture_references = Json::object();
@@ -1499,6 +1613,10 @@ import_materials(
                  {"metallic", pbr.metallic},
                  {"roughness", pbr.roughness},
                  {"ambient_occlusion", pbr.ambient_occlusion},
+                 {"ior", pbr.ior},
+                 {"model", to_token(pbr.model)},
+                 {"subsurface_profile", to_token(pbr.subsurface_profile)},
+                 {"subsurface_strength", pbr.subsurface_strength},
              }},
             {"textures", std::move(texture_references)},
         };
@@ -1626,6 +1744,10 @@ import_model(
         if (!dependencies_copied) {
             return make_unexpected_asset_import_error(
                 dependencies_copied.error());
+        }
+    } else if (context.result.source_kind == AssetSourceKind::model_glb) {
+        if (const auto validation = validate_glb_material_extensions(source_snapshot); !validation) {
+            return make_unexpected_asset_import_error(validation.error());
         }
     }
 

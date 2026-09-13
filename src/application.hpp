@@ -67,6 +67,7 @@ private:
     SceneDocument scene_{};
     std::vector<SceneGpuInstance> scene_instances_{};
     std::vector<SceneModelInstance> scene_models_{};
+    std::vector<ScenePunctualLight> scene_lights_{};
     std::vector<SceneNodeId> stress_cube_ids_{};
     bool stream_asset_placed_ = false;
     double camera_animation_time_ = 0;
@@ -78,6 +79,8 @@ private:
     double benchmark_measurement_seconds_ = 0.0;
     SceneNodeId animated_node_{};
     TransformRows animation_origin_{};
+    SceneNodeId secondary_animated_node_{};
+    TransformRows secondary_animation_origin_{};
     double animation_time_ = 0;
     McpControlPlane mcp_control_{};
     McpServer mcp_server_{mcp_control_};

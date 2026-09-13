@@ -20,6 +20,7 @@ struct PbrInstanceData
     vec4 scale;
     vec4 baseColor;
     vec4 materialParameters;
+    float indexOfRefraction; uint shadingModel; uint subsurfaceProfile; float subsurfaceStrength;
 };
 
 layout(set = 0, binding = 1, std430) readonly buffer InstanceBuffer

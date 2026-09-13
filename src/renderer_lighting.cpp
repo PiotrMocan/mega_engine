@@ -1,8 +1,10 @@
 #include "image_barrier.hpp"
 #include "renderer.hpp"
+#include "camera_projection.hpp"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstring>
 #include <glm/gtc/matrix_transform.hpp>
 
 namespace vcr {
@@ -11,6 +13,18 @@ constexpr VkFormat radiance_format = VK_FORMAT_R16G16B16A16_SFLOAT;
 constexpr VkPipelineStageFlags2 compute = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
 constexpr VkAccessFlags2 storage_rw =
     VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+constexpr VkDeviceSize local_light_buffer_size =
+    sizeof(GpuPunctualLight) * static_cast<VkDeviceSize>(maximum_local_lights);
+constexpr VkDeviceSize local_light_cluster_header_bytes =
+    sizeof(std::uint32_t) * 2ULL * local_light_cluster_count;
+constexpr VkDeviceSize local_light_cluster_index_bytes =
+    sizeof(std::uint32_t) * static_cast<VkDeviceSize>(local_light_cluster_count) *
+    local_light_cluster_capacity;
+constexpr VkDeviceSize local_light_cluster_statistics_offset =
+    local_light_cluster_header_bytes + local_light_cluster_index_bytes;
+constexpr VkDeviceSize local_light_cluster_buffer_size =
+    local_light_cluster_statistics_offset + sizeof(LocalLightStatistics);
+static_assert(sizeof(LocalLightStatistics) == 16U);
 void memory_barrier(VkCommandBuffer cmd, VkPipelineStageFlags2 source, VkAccessFlags2 reads,
                     VkPipelineStageFlags2 destination, VkAccessFlags2 writes) {
     const VkMemoryBarrier2 barrier{
@@ -27,13 +41,22 @@ bool Renderer::set_lighting_settings(LightingSettings settings) noexcept {
     if (!valid_lighting_settings(settings) || (settings.voxel_gi && !gi_provisioned_) ||
         !supports_shadow_resolution(settings.shadow_resolution))
         return false;
+    // Depth format is a startup pipeline profile. Runtime resolution/cache
+    // controls keep the already-created depth attachment format and pipelines.
+    if (settings.shadow_depth != lighting_settings_.shadow_depth &&
+        shadow_map_format_ != VK_FORMAT_UNDEFINED)
+        return false;
     settings.hour = wrap_day_hour(settings.hour);
+    if (settings.cascade_cache != lighting_settings_.cascade_cache)
+        shadow_dirty_ = true;
     if (settings.dynamic != lighting_settings_.dynamic ||
         settings.hour != lighting_settings_.hour) {
         shadow_dirty_ = true;
         lighting_shadow_initialized_ = false;
-        temporal_history_valid_ = false;
-        fsr3_upscaler_.request_reset();
+        invalidate_temporal_history();
+    }
+    if (settings.dynamic != lighting_settings_.dynamic) {
+        exposure_reset_pending_ = true;
     }
     if (settings.gi_extent != lighting_settings_.gi_extent)
         gi_scene_revision_ = 0;
@@ -43,6 +66,15 @@ bool Renderer::set_lighting_settings(LightingSettings settings) noexcept {
 }
 void Renderer::create_lighting_resources() {
     const auto &limits = context_->properties().limits;
+    if (limits.maxStorageBufferRange < std::max(
+            local_light_buffer_size, local_light_cluster_buffer_size) ||
+        limits.maxPerStageDescriptorStorageBuffers < 6U ||
+        limits.maxDescriptorSetStorageBuffers < 9U ||
+        limits.maxComputeWorkGroupInvocations < 64U ||
+        limits.maxComputeWorkGroupSize[0] < 64U ||
+        limits.maxComputeWorkGroupCount[0] < maximum_local_lights) {
+        fatal("Local lighting exceeds compute/storage descriptor limits");
+    }
     VkFormatProperties properties{};
     vkGetPhysicalDeviceFormatProperties(context_->physical_device(), radiance_format, &properties);
     constexpr auto features = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
@@ -104,6 +136,12 @@ void Renderer::create_lighting_resources() {
                                      VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
         VkDescriptorSetLayoutBinding{6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,
                                      VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        VkDescriptorSetLayoutBinding{7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+                                     nullptr},
+        VkDescriptorSetLayoutBinding{8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+                                     nullptr},
     };
     const VkDescriptorSetLayoutCreateInfo layout{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0,
@@ -120,6 +158,21 @@ void Renderer::create_lighting_resources() {
         const LightingUniforms initial{};
         frame.lighting_uniform_buffer.write(std::as_bytes(std::span{&initial, std::size_t{1}}));
         frame.lighting_was_dynamic = false;
+        frame.local_light_buffer.create(
+            *context_, local_light_buffer_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VMA_MEMORY_USAGE_AUTO, host, "local punctual lights");
+        frame.local_light_revision = 0U;
+        frame.local_light_cluster_buffer.create(
+            *context_, local_light_cluster_buffer_size,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, 0, "clustered local-light lists");
+        frame.local_light_statistics_readback.create(
+            *context_, sizeof(LocalLightStatistics), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+            "clustered local-light statistics readback");
+        frame.local_light_culling_was_updated = false;
         frame.voxel_job_buffer.create(
             *context_, sizeof(GiJob) * (gi_provisioned_ ? max_scene_nodes + 2ULL : 1ULL),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO, host,
@@ -138,7 +191,7 @@ void Renderer::create_lighting_pipelines() {
     const std::array sizes{
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2},
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 12},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2},
     };
     const VkDescriptorPoolCreateInfo pool{
@@ -167,6 +220,10 @@ void Renderer::create_lighting_pipelines() {
                                    frame.voxel_job_buffer.size()},
             VkDescriptorBufferInfo{frame.voxel_dirty_buffer.handle(), 0,
                                    frame.voxel_dirty_buffer.size()},
+            VkDescriptorBufferInfo{frame.local_light_buffer.handle(), 0,
+                                   frame.local_light_buffer.size()},
+            VkDescriptorBufferInfo{frame.local_light_cluster_buffer.handle(), 0,
+                                   frame.local_light_cluster_buffer.size()},
         };
         const std::array images{
             VkDescriptorImageInfo{voxel_radiance_.sampler(), voxel_radiance_.view(),
@@ -174,8 +231,8 @@ void Renderer::create_lighting_pipelines() {
             VkDescriptorImageInfo{VK_NULL_HANDLE, voxel_storage_view_.get(),
                                   VK_IMAGE_LAYOUT_GENERAL},
         };
-        std::array<VkWriteDescriptorSet, 7> writes{};
-        for (unsigned i = 0; i < 7; ++i) {
+        std::array<VkWriteDescriptorSet, 9> writes{};
+        for (unsigned i = 0; i < writes.size(); ++i) {
             auto &w = writes[i];
             w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             w.dstSet = frame.lighting_descriptor_set;
@@ -188,13 +245,15 @@ void Renderer::create_lighting_pipelines() {
             } else {
                 w.descriptorType =
                     i == 0 ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                w.pBufferInfo = &buffers[i == 0 ? 0 : i - 1];
+                const unsigned buffer_index =
+                    i == 0 ? 0U : i >= 7 ? i - 2U : i - 1U;
+                w.pBufferInfo = &buffers[buffer_index];
             }
         }
-        vkUpdateDescriptorSets(context_->device(), 7, writes.data(), 0, nullptr);
+        vkUpdateDescriptorSets(
+            context_->device(), static_cast<std::uint32_t>(writes.size()),
+            writes.data(), 0, nullptr);
     }
-    if (!gi_provisioned_)
-        return;
     const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
     const VkPipelineLayoutCreateInfo info{
         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, nullptr, 0, 1, &layout, 1, &push};
@@ -202,8 +261,8 @@ void Renderer::create_lighting_pipelines() {
         context_->device(), &info, nullptr,
         lighting_compute_layout_.put(context_->device(), vkDestroyPipelineLayout)));
     context_->set_debug_name(VK_OBJECT_TYPE_PIPELINE_LAYOUT,
-                             handle_value(lighting_compute_layout_.get()), "voxel compute layout");
-    for (unsigned i = 0; i < 2; ++i) {
+                             handle_value(lighting_compute_layout_.get()), "lighting compute layout");
+    if (gi_provisioned_) for (unsigned i = 0; i < 2; ++i) {
         const auto shader =
             load_shader(i == 0 ? "voxel_geometry.comp.spv" : "voxel_light.comp.spv");
         VkComputePipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
@@ -221,6 +280,19 @@ void Renderer::create_lighting_pipelines() {
                                           destination.put(context_->device(), vkDestroyPipeline)));
         context_->set_debug_name(VK_OBJECT_TYPE_PIPELINE, handle_value(destination.get()),
                                  i == 0 ? "GI voxelize triangles" : "GI relight voxels");
+    }
+    {
+        const auto shader = load_shader("cluster_lights.comp.spv");
+        VkComputePipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipeline.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                          nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, shader.get(), "main", nullptr};
+        pipeline.layout = lighting_compute_layout_.get();
+        VK_CHECK(vkCreateComputePipelines(
+            context_->device(), pipeline_cache_, 1, &pipeline, nullptr,
+            local_light_cluster_pipeline_.put(context_->device(), vkDestroyPipeline)));
+        context_->set_debug_name(
+            VK_OBJECT_TYPE_PIPELINE, handle_value(local_light_cluster_pipeline_.get()),
+            "cluster local lights");
     }
 }
 std::uint32_t Renderer::append_gi_triangles(std::span<const GiTriangle> triangles) {
@@ -314,10 +386,47 @@ void Renderer::start_voxel_job() {
     voxel_job_active_ = true;
 }
 void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkExtent2D extent) {
+    auto &u = lighting_uniforms_;
+    const bool local_lights_changed =
+        frame.local_light_revision != local_light_revision_;
+    if (local_lights_changed) {
+        if (!local_lights_.empty()) {
+            frame.local_light_buffer.write(
+                std::as_bytes(std::span{local_lights_}));
+        }
+        frame.local_light_revision = local_light_revision_;
+    }
+    const LocalLightBackend local_backend = local_light_backend_actual();
+    const std::uint32_t active_local_lights = local_backend == LocalLightBackend::off
+        ? 0U
+        : static_cast<std::uint32_t>(local_lights_.size());
+    u.local_light_counts = glm::uvec4(
+        active_local_lights,
+        local_backend == LocalLightBackend::clustered ? 2U
+            : local_backend == LocalLightBackend::forward ? 1U : 0U,
+        0U,
+        0U);
+    const std::uint32_t viewport_width = std::max(extent.width, 1U);
+    const std::uint32_t viewport_height = std::max(extent.height, 1U);
+    const float aspect =
+        static_cast<float>(viewport_width) / static_cast<float>(viewport_height);
+    glm::mat4 projection = camera_projection(aspect);
+    projection[1][1] *= -1.0F;
+    u.camera_view = view;
+    u.cluster_projection = glm::vec4(
+        projection[0][0], projection[1][1], camera_near, camera_far);
+    u.cluster_viewport = glm::vec4(
+        static_cast<float>(viewport_width), static_cast<float>(viewport_height),
+        1.0F / static_cast<float>(viewport_width),
+        1.0F / static_cast<float>(viewport_height));
+    u.cluster_dimensions = glm::uvec4(
+        local_light_cluster_x, local_light_cluster_y, local_light_cluster_z,
+        local_light_cluster_capacity);
     if (!lighting_settings_.dynamic) {
         voxel_light_due_ = false;
         voxel_job_finishes_ = false;
-        if (frame.lighting_was_dynamic) {
+        if (frame.lighting_was_dynamic || local_lights_changed ||
+            local_backend == LocalLightBackend::clustered) {
             lighting_uniforms_.options = {};
             frame.lighting_uniform_buffer.write(
                 std::as_bytes(std::span{&lighting_uniforms_, std::size_t{1}}));
@@ -329,16 +438,13 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
     const double dt = std::max(0.0, static_cast<double>(fsr_frame_time_ms_) * 0.001);
     advance_lighting_clock(lighting_settings_, dt, lighting_paused_);
     const auto sun = evaluate_sun(lighting_settings_.hour);
-    auto &u = lighting_uniforms_;
     u.sun_direction_intensity = sun.direction_intensity;
     u.sun_color = sun.color;
     u.sky_zenith = sun.sky_zenith;
     u.sky_horizon = sun.sky_horizon;
-    u.camera_view = view;
     if (authored_scene_enabled_ && !editor_sun_visible_)
         u.sun_direction_intensity.w = 0;
     const double shadow_hour = std::floor(lighting_settings_.hour * 3600.0) / 3600.0;
-    const float aspect = static_cast<float>(extent.width) / static_cast<float>(extent.height);
     if (mode_ != RunMode::instancing &&
         (!lighting_shadow_initialized_ || lighting_shadow_view_ != view ||
          lighting_shadow_hour_ != shadow_hour || lighting_shadow_aspect_ != aspect)) {
@@ -349,8 +455,10 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
         const auto matrices = shadow_cascades(view, aspect, glm::vec3(shadow_sun.direction_intensity),
                                                tile_resolution);
         if (!lighting_shadow_initialized_ || matrices != u.shadow_matrices) {
-            u.shadow_matrices = matrices;
             for (unsigned i = 0; i < matrices.size(); ++i) {
+                if (!lighting_settings_.cascade_cache || !lighting_shadow_initialized_ ||
+                    matrices[i] != u.shadow_matrices[i])
+                    shadow_matrix_dirty_mask_ |= 1U << i;
                 const auto &matrix = matrices[i];
                 // Convert a world-space shadow texel to depth once per matrix
                 // update, instead of multiplying two uniform arrays per fragment.
@@ -359,7 +467,7 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
                     (static_cast<float>(tile_resolution) *
                      glm::length(glm::vec3(matrix[0][0], matrix[1][0], matrix[2][0])));
             }
-            shadow_dirty_ = true;
+            u.shadow_matrices = matrices;
         }
         lighting_shadow_initialized_ = true;
         lighting_shadow_view_ = view;
@@ -454,6 +562,58 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
                               : 0,
                           lighting_settings_.gi_strength, 1);
     frame.lighting_uniform_buffer.write(std::as_bytes(std::span{&u, std::size_t{1}}));
+}
+
+void Renderer::record_clustered_lights(
+    const VkCommandBuffer command_buffer,
+    FrameContext& frame) {
+    frame.local_light_culling_was_updated =
+        local_light_backend_actual() == LocalLightBackend::clustered;
+    if (!frame.local_light_culling_was_updated) {
+        local_light_statistics_ = {};
+        return;
+    }
+    vkCmdFillBuffer(
+        command_buffer, frame.local_light_cluster_buffer.handle(), 0,
+        local_light_cluster_header_bytes, 0U);
+    vkCmdFillBuffer(
+        command_buffer, frame.local_light_cluster_buffer.handle(),
+        local_light_cluster_statistics_offset, sizeof(LocalLightStatistics), 0U);
+    memory_barrier(
+        command_buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, storage_rw);
+    vkCmdBindPipeline(
+        command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+        local_light_cluster_pipeline_.get());
+    vkCmdBindDescriptorSets(
+        command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+        lighting_compute_layout_.get(), 0, 1, &frame.lighting_descriptor_set, 0, nullptr);
+    vkCmdDispatch(
+        command_buffer,
+        static_cast<std::uint32_t>(local_lights_.size()),
+        1U,
+        1U);
+    memory_barrier(
+        command_buffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT);
+    const VkBufferCopy statistics_copy{
+        .srcOffset = local_light_cluster_statistics_offset,
+        .dstOffset = 0U,
+        .size = sizeof(LocalLightStatistics),
+    };
+    vkCmdCopyBuffer(
+        command_buffer, frame.local_light_cluster_buffer.handle(),
+        frame.local_light_statistics_readback.handle(), 1U, &statistics_copy);
+}
+
+void Renderer::read_local_light_statistics(FrameContext& frame) {
+    if (!frame.local_light_culling_was_updated) return;
+    frame.local_light_statistics_readback.invalidate(0, sizeof(LocalLightStatistics));
+    std::memcpy(
+        &local_light_statistics_, frame.local_light_statistics_readback.mapped_data(),
+        sizeof(LocalLightStatistics));
 }
 void Renderer::record_voxel_geometry(VkCommandBuffer command, FrameContext &frame) {
     frame.voxel_geometry_was_updated = gi_provisioned_ && voxel_job_active_ &&
@@ -556,6 +716,7 @@ void Renderer::record_voxel_light(VkCommandBuffer command, FrameContext &frame) 
     ++lighting_statistics_.radiance_updates;
 }
 void Renderer::destroy_lighting() noexcept {
+    local_light_cluster_pipeline_.reset();
     voxel_geometry_pipeline_.reset();
     voxel_light_pipeline_.reset();
     lighting_compute_layout_.reset();
@@ -569,6 +730,11 @@ void Renderer::destroy_lighting() noexcept {
         frame.lighting_uniform_buffer.destroy();
         frame.voxel_job_buffer.destroy();
         frame.voxel_dirty_buffer.destroy();
+        frame.local_light_buffer.destroy();
+        frame.local_light_cluster_buffer.destroy();
+        frame.local_light_statistics_readback.destroy();
+        frame.local_light_revision = 0U;
+        frame.local_light_culling_was_updated = false;
     }
     voxel_jobs_.clear();
     voxel_batch_.clear();
@@ -581,5 +747,8 @@ void Renderer::destroy_lighting() noexcept {
     gi_scene_revision_ = 0;
     gi_geometry_urgent_ = false;
     lighting_shadow_initialized_ = false;
+    local_lights_.clear();
+    local_light_revision_ = 1U;
+    local_light_statistics_ = {};
 }
 } // namespace vcr

@@ -21,7 +21,14 @@ struct FrameContext {
     VkSemaphore image_available = VK_NULL_HANDLE;
     GpuBuffer uniform_buffer{};
     GpuBuffer lighting_uniform_buffer{}, voxel_job_buffer{}, voxel_dirty_buffer{};
+    GpuBuffer local_light_buffer{};
+    GpuBuffer local_light_cluster_buffer{};
+    GpuBuffer local_light_statistics_readback{};
+    GpuBuffer exposure_readback{};
     VkDescriptorSet lighting_descriptor_set = VK_NULL_HANDLE;
+    std::uint64_t local_light_revision = 0U;
+    bool local_light_culling_was_updated = false;
+    bool exposure_was_updated = false;
     bool lighting_was_dynamic = false;
     bool voxel_geometry_was_updated = false, voxel_light_was_updated = false;
     GpuBuffer workload_buffer{};
@@ -32,6 +39,10 @@ struct FrameContext {
     bool workload_was_enabled = false;
     bool shadow_was_updated = false;
     bool visibility_was_updated = false;
+    bool postprocess_was_enabled = false;
+    bool subsurface_was_enabled = false;
+    bool motion_blur_was_enabled = false;
+    bool depth_prepass_was_enabled = false;
     bool screenshot_capture = false;
     std::uint32_t screenshot_width = 0;
     std::uint32_t screenshot_height = 0;
@@ -40,6 +51,7 @@ struct FrameContext {
     GpuBuffer scene_instance_buffer{};
     GpuBuffer scene_upload_buffer{};
     std::uint64_t scene_revision = 0U;
+    std::uint64_t scene_source_revision = 0U;
     std::uint32_t scene_ground_count = 0U;
     std::uint32_t scene_cube_count = 0U;
     std::uint32_t scene_color_first_instance = 0U;

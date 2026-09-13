@@ -1,6 +1,7 @@
 #pragma once
 #include "runtime_scene.hpp"
 #include "lighting_settings.hpp"
+#include "punctual_light.hpp"
 #include <array>
 #include <bitset>
 #include <cstdint>
@@ -36,10 +37,21 @@ struct alignas(16) LightingUniforms {
     // dynamic, GI enabled/ready, strength, exposure
     glm::vec4 options{};
     glm::vec4 volume_parameters{};
+    // x: active point/spot light count. Remaining lanes are reserved for the
+    // clustered-lighting backend without changing the scene light ABI.
+    glm::uvec4 local_light_counts{};
+    // x/y: signed projection scales, z/w: near/far view distances.
+    glm::vec4 cluster_projection{};
+    // xy: output extent, zw: inverse output extent.
+    glm::vec4 cluster_viewport{};
+    // xyz: cluster dimensions, w: fixed per-cluster list capacity.
+    glm::uvec4 cluster_dimensions{};
 };
-static_assert(sizeof(LightingUniforms) == 464);
+static_assert(sizeof(LightingUniforms) == 528);
 static_assert(sizeof(GiTriangle) == 48);
 struct LightingStatistics {
+    std::uint64_t shadow_passes = 0, shadow_tiles = 0;
+    std::uint32_t last_shadow_mask = 0;
     std::uint64_t geometry_updates = 0, radiance_updates = 0;
     std::uint32_t pending_bricks = 0, processed_triangles = 0;
     double oldest_geometry_ms = 0.0;

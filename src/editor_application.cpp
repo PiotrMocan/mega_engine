@@ -45,6 +45,8 @@ using Json = nlohmann::json;
     case SceneNodeKind::terrain: return "terrain";
     case SceneNodeKind::camera: return "camera";
     case SceneNodeKind::directional_light: return "directional_light";
+    case SceneNodeKind::point_light: return "point_light";
+    case SceneNodeKind::spot_light: return "spot_light";
     case SceneNodeKind::environment: return "environment";
     case SceneNodeKind::model: return "model";
     }
@@ -108,6 +110,17 @@ using Json = nlohmann::json;
             {"metallic", value.material.metallic},
             {"roughness", value.material.roughness},
             {"ambient_occlusion", value.material.ambient_occlusion},
+            {"ior", value.material.ior},
+            {"model", to_token(value.material.model)},
+            {"subsurface_profile", to_token(value.material.subsurface_profile)},
+            {"subsurface_strength", value.material.subsurface_strength},
+        }},
+        {"light", Json{
+            {"color", vec3_json(value.light.color)},
+            {"intensity_candela", value.light.intensity_candela},
+            {"range", value.light.range},
+            {"inner_cone_degrees", value.light.inner_cone_degrees},
+            {"outer_cone_degrees", value.light.outer_cone_degrees},
         }},
     };
     if (depth) {
@@ -149,6 +162,27 @@ using Json = nlohmann::json;
 [[nodiscard]] bool supports_authored_material(
     const SceneNodeKind kind) noexcept {
     return kind == SceneNodeKind::cube || kind == SceneNodeKind::ground;
+}
+
+[[nodiscard]] bool supports_punctual_light(
+    const SceneNodeKind kind) noexcept {
+    return kind == SceneNodeKind::point_light ||
+        kind == SceneNodeKind::spot_light;
+}
+
+void apply_light_patch(
+    PunctualLight& light,
+    const McpCommand& command) noexcept {
+    if ((command.edit_mask & McpCommand::edit_light_color) != 0U)
+        light.color = command.light.color;
+    if ((command.edit_mask & McpCommand::edit_light_intensity) != 0U)
+        light.intensity_candela = command.light.intensity_candela;
+    if ((command.edit_mask & McpCommand::edit_light_range) != 0U)
+        light.range = command.light.range;
+    if ((command.edit_mask & McpCommand::edit_spot_inner) != 0U)
+        light.inner_cone_degrees = command.light.inner_cone_degrees;
+    if ((command.edit_mask & McpCommand::edit_spot_outer) != 0U)
+        light.outer_cone_degrees = command.light.outer_cone_degrees;
 }
 
 } // namespace
@@ -229,9 +263,34 @@ void EditorApplication::initialize(const CliOptions& options) {
     renderer_.initialize(context_, window_.get(), preferred_present_mode(options.present),
                          RunMode::scene, 1U, options.gpu_workload_iterations, options.anti_aliasing,
                          options.mcp_stdio, true, true, lighting);
+    if (!renderer_.set_local_light_backend(options.local_light_backend)) {
+        fatal("Invalid local-lighting backend");
+    }
+    static_cast<void>(renderer_.set_tone_mapper(options.tone_mapper));
+    if (!renderer_.set_exposure_settings(options.exposure)) {
+        fatal("Invalid exposure settings");
+    }
+    if (!renderer_.set_color_grading(
+            options.color_grading, options.color_grading_lut_size)) {
+        fatal("Invalid color grading settings");
+    }
+    if (!renderer_.set_subsurface_mode(options.subsurface)) {
+        fatal("Invalid subsurface mode");
+    }
+    if (!renderer_.set_motion_blur_settings(options.motion_blur)) {
+        fatal("Invalid motion blur settings for the selected AA mode");
+    }
+    if (!renderer_.set_depth_prepass(options.depth_prepass)) {
+        fatal("Invalid depth prepass mode");
+    }
+    if (!renderer_.set_lod_fade(options.lod_fade, options.lod_fade_seconds)) {
+        fatal("Invalid model LOD fade settings");
+    }
 
     VisibilitySettings visibility{options.frustum_culling, options.occlusion_culling, options.lod,
                                   options.dynamic_shadows};
+    visibility.coarse_front_to_back = options.coarse_front_to_back;
+    visibility.cpu_hierarchy = options.cpu_hierarchy;
     visibility.backend = options.visibility_backend == "cpu" ? VisibilitySettings::Backend::cpu
                          : options.visibility_backend == "gpu"
                              ? VisibilitySettings::Backend::gpu
@@ -416,7 +475,20 @@ void EditorApplication::execute_mcp_command(
         McpCommand::edit_base_color |
         McpCommand::edit_metallic |
         McpCommand::edit_roughness |
-        McpCommand::edit_ambient_occlusion;
+        McpCommand::edit_ambient_occlusion |
+        McpCommand::edit_ior |
+        McpCommand::edit_material_model |
+        McpCommand::edit_subsurface_profile |
+        McpCommand::edit_subsurface_strength;
+    constexpr std::uint32_t light_edit_mask =
+        McpCommand::edit_light_color |
+        McpCommand::edit_light_intensity |
+        McpCommand::edit_light_range |
+        McpCommand::edit_spot_inner |
+        McpCommand::edit_spot_outer;
+    constexpr std::uint32_t spot_edit_mask =
+        McpCommand::edit_spot_inner |
+        McpCommand::edit_spot_outer;
 
     switch (command.type) {
     case McpCommandType::editor_get_state: {
@@ -432,6 +504,95 @@ void EditorApplication::execute_mcp_command(
                 {"protocol_version", "2025-11-25"},
                 {"mode", play_state},
                 {"node_count", scene_.size()},
+                {"local_light_count", scene_.local_light_count()},
+                {"local_light_backend_requested",
+                 to_token(renderer_.local_light_backend())},
+                {"local_light_backend_actual",
+                 to_token(renderer_.local_light_backend_actual())},
+                {"local_light_assignments",
+                 renderer_.local_light_statistics().assignments},
+                {"local_light_overflow_clusters",
+                 renderer_.local_light_statistics().overflow_clusters},
+                {"local_light_dropped",
+                 renderer_.local_light_statistics().dropped_lights},
+                {"exposure", Json{
+                    {"mode_requested", to_token(renderer_.exposure_settings().mode)},
+                    {"mode_actual", to_token(renderer_.exposure_mode_actual())},
+                    {"metering", to_token(renderer_.exposure_settings().metering)},
+                    {"multiplier", renderer_.exposure_mode_actual() == ExposureMode::fixed
+                        ? fixed_exposure_multiplier(renderer_.exposure_settings())
+                        : renderer_.exposure_state().exposure},
+                    {"target_multiplier", renderer_.exposure_mode_actual() == ExposureMode::fixed
+                        ? fixed_exposure_multiplier(renderer_.exposure_settings())
+                        : renderer_.exposure_state().target_exposure},
+                    {"average_luminance", renderer_.exposure_state().average_luminance},
+                    {"sample_weight", renderer_.exposure_state().sample_weight},
+                    {"invalid_samples", renderer_.exposure_state().invalid_sample_count},
+                }},
+                {"color_grading", Json{
+                    {"mode_requested", to_token(renderer_.color_grading())},
+                    {"mode_actual", to_token(renderer_.color_grading_actual())},
+                    {"lut", "identity"},
+                    {"size", grading_lut_size(renderer_.color_grading_lut_size())},
+                    {"format", "rgba16f"},
+                    {"domain", "linear-rec709-[0,1]"},
+                    {"resident_bytes", 2'359'296U},
+                }},
+                {"subsurface", Json{
+                    {"mode_requested", to_token(renderer_.subsurface_mode())},
+                    {"mode_actual", to_token(renderer_.subsurface_mode_actual())},
+                    {"supported", true},
+                    {"provisioned", renderer_.subsurface_resources_provisioned()},
+                    {"active_material_count", renderer_.subsurface_active_material_count()},
+                    {"render_width", renderer_.render_extent().width},
+                    {"render_height", renderer_.render_extent().height},
+                    {"resident_bytes", renderer_.subsurface_resident_bytes()},
+                }},
+                {"motion_blur", Json{
+                    {"mode_requested", to_token(renderer_.motion_blur_settings().mode)},
+                    {"mode_actual", to_token(renderer_.motion_blur_mode_actual())},
+                    {"quality", to_token(renderer_.motion_blur_settings().quality)},
+                    {"shutter", to_token(renderer_.motion_blur_settings().shutter)},
+                    {"angle_degrees", renderer_.motion_blur_settings().shutter_angle_degrees},
+                    {"maximum_radius_pixels", renderer_.motion_blur_settings().maximum_radius_pixels},
+                    {"camera_fade_start", renderer_.motion_blur_settings().camera_fade_start},
+                    {"camera_fade_end", renderer_.motion_blur_settings().camera_fade_end},
+                }},
+                {"anti_aliasing", Json{
+                    {"requested_method", to_token(
+                        renderer_.anti_aliasing_requested_method())},
+                    {"method", to_token(renderer_.anti_aliasing().method)},
+                    {"display_name", to_string(renderer_.anti_aliasing())},
+                    {"quality", renderer_.anti_aliasing_quality_name()},
+                    {"smaa_mode", to_string(renderer_.anti_aliasing().smaa_mode)},
+                    {"smaa_temporal", is_temporal_smaa(renderer_.anti_aliasing())},
+                    {"smaa_history_valid", renderer_.smaa_history_valid()},
+                    {"smaa_temporal_phase", renderer_.smaa_temporal_phase()},
+                    {"smaa_history_resident_bytes", is_temporal_smaa(renderer_.anti_aliasing())
+                        ? renderer_.smaa_history_resident_bytes() : 0U},
+                    {"smaa_history_width", is_temporal_smaa(renderer_.anti_aliasing())
+                        ? renderer_.render_extent().width : 0U},
+                    {"smaa_history_height", is_temporal_smaa(renderer_.anti_aliasing())
+                        ? renderer_.render_extent().height : 0U},
+                    {"smaa_history_incremental_bytes", 0U},
+                    {"smaa_history_reuses_fsr_output", is_temporal_smaa(renderer_.anti_aliasing())},
+                    {"requested_sample_count", anti_aliasing_sample_count(
+                        renderer_.anti_aliasing_requested_method())},
+                    {"sample_count", renderer_.anti_aliasing_sample_count_actual()},
+                    {"msaa_2x_supported", renderer_.supports_msaa(
+                        AntiAliasingMethod::msaa2x)},
+                    {"msaa_4x_supported", renderer_.supports_msaa(
+                        AntiAliasingMethod::msaa4x)},
+                    {"sample_shading", false},
+                    {"color_format", "rgba16f"},
+                    {"depth_format", renderer_.msaa_depth_format_name()},
+                    {"color_resolve", is_msaa(renderer_.anti_aliasing().method)
+                        ? "average" : "none"},
+                    {"depth_resolve", "none"},
+                    {"target_width", renderer_.msaa_target_extent().width},
+                    {"target_height", renderer_.msaa_target_extent().height},
+                    {"resident_bytes", renderer_.msaa_resident_bytes()},
+                }},
                 {"content_revision", scene_.content_revision()},
                 {"structure_revision", scene_.structure_revision()},
                 {"selection", node_id_json(ui_.selected_node())},
@@ -451,6 +612,7 @@ void EditorApplication::execute_mcp_command(
                 {"screenshot_pending", renderer_.screenshot_pending()},
                 {"limits", Json{
                     {"max_scene_nodes", max_scene_nodes},
+                    {"max_local_lights", maximum_local_lights},
                     {"max_scatter_instances", maximum_scatter_instances},
                     {"history_entries", 32},
                 }},
@@ -528,6 +690,30 @@ void EditorApplication::execute_mcp_command(
             fail("authored PBR factors are available only for cube and ground nodes");
             return;
         }
+        const bool local_light = supports_punctual_light(command.node_kind);
+        if ((command.edit_mask & light_edit_mask) != 0U && !local_light) {
+            fail("photometric fields are available only for point and spot lights");
+            return;
+        }
+        if (command.node_kind == SceneNodeKind::point_light &&
+            (command.edit_mask & spot_edit_mask) != 0U) {
+            fail("point lights reject spot cone fields");
+            return;
+        }
+        if (local_light && scene_.local_light_count() >= maximum_local_lights) {
+            fail("scene already contains the bounded maximum of 4096 local lights");
+            return;
+        }
+        PunctualLight candidate_light{};
+        apply_light_patch(candidate_light, command);
+        if (local_light && !valid_punctual_light(
+                candidate_light,
+                command.node_kind == SceneNodeKind::spot_light
+                    ? PunctualLightType::spot
+                    : PunctualLightType::point)) {
+            fail("local light fields violate the finite photometric/cone contract");
+            return;
+        }
         ui_.checkpoint_scene(scene_);
         const SceneNodeId id = scene_.create_node(
             command.name.data(), command.node_kind,
@@ -568,6 +754,21 @@ void EditorApplication::execute_mcp_command(
             value.material.ambient_occlusion =
                 command.material.ambient_occlusion;
         }
+        if ((command.edit_mask & McpCommand::edit_ior) != 0U) {
+            value.material.ior = command.material.ior;
+        }
+        if ((command.edit_mask & McpCommand::edit_material_model) != 0U) {
+            value.material.model = command.material.model;
+        }
+        if ((command.edit_mask & McpCommand::edit_subsurface_profile) != 0U) {
+            value.material.subsurface_profile = command.material.subsurface_profile;
+        }
+        if ((command.edit_mask & McpCommand::edit_subsurface_strength) != 0U) {
+            value.material.subsurface_strength = command.material.subsurface_strength;
+        }
+        if (local_light) {
+            value.light = candidate_light;
+        }
         value.material = sanitize_pbr_material(value.material);
         scene_.mark_content_changed();
         succeed(
@@ -603,10 +804,32 @@ void EditorApplication::execute_mcp_command(
             return;
         }
 
+        const bool local_light = supports_punctual_light(node->get().kind);
+        if ((command.edit_mask & light_edit_mask) != 0U && !local_light) {
+            fail("photometric fields can patch only point and spot lights");
+            return;
+        }
+        if (node->get().kind == SceneNodeKind::point_light &&
+            (command.edit_mask & spot_edit_mask) != 0U) {
+            fail("point lights reject spot cone fields");
+            return;
+        }
+        PunctualLight candidate_light = node->get().light;
+        apply_light_patch(candidate_light, command);
+        if (local_light && !valid_punctual_light(
+                candidate_light,
+                node->get().kind == SceneNodeKind::spot_light
+                    ? PunctualLightType::spot
+                    : PunctualLightType::point)) {
+            fail("merged local light patch violates the photometric/cone contract");
+            return;
+        }
+
         const SceneNode& current = node->get();
         const bool name_changed =
             (command.edit_mask & McpCommand::edit_name) != 0U &&
             current.name != command.name.data();
+        const bool light_changed = local_light && candidate_light != current.light;
         const bool content_changed =
             ((command.edit_mask & McpCommand::edit_visible) != 0U &&
              current.visible != command.enabled) ||
@@ -632,7 +855,16 @@ void EditorApplication::execute_mcp_command(
              current.material.roughness != command.material.roughness) ||
             ((command.edit_mask & McpCommand::edit_ambient_occlusion) != 0U &&
              current.material.ambient_occlusion !=
-                 command.material.ambient_occlusion);
+                 command.material.ambient_occlusion) ||
+            ((command.edit_mask & McpCommand::edit_ior) != 0U &&
+             current.material.ior != command.material.ior) ||
+            ((command.edit_mask & McpCommand::edit_material_model) != 0U &&
+             current.material.model != command.material.model) ||
+            ((command.edit_mask & McpCommand::edit_subsurface_profile) != 0U &&
+             current.material.subsurface_profile != command.material.subsurface_profile) ||
+            ((command.edit_mask & McpCommand::edit_subsurface_strength) != 0U &&
+             current.material.subsurface_strength != command.material.subsurface_strength) ||
+            light_changed;
         if (!name_changed && !content_changed) {
             succeed(
                 "scene node already matches the requested patch",
@@ -675,6 +907,21 @@ void EditorApplication::execute_mcp_command(
         if ((command.edit_mask & McpCommand::edit_ambient_occlusion) != 0U) {
             value.material.ambient_occlusion =
                 command.material.ambient_occlusion;
+        }
+        if ((command.edit_mask & McpCommand::edit_ior) != 0U) {
+            value.material.ior = command.material.ior;
+        }
+        if ((command.edit_mask & McpCommand::edit_material_model) != 0U) {
+            value.material.model = command.material.model;
+        }
+        if ((command.edit_mask & McpCommand::edit_subsurface_profile) != 0U) {
+            value.material.subsurface_profile = command.material.subsurface_profile;
+        }
+        if ((command.edit_mask & McpCommand::edit_subsurface_strength) != 0U) {
+            value.material.subsurface_strength = command.material.subsurface_strength;
+        }
+        if (local_light) {
+            value.light = candidate_light;
         }
         if (content_changed) {
             value.material = sanitize_pbr_material(value.material);
@@ -927,6 +1174,110 @@ void EditorApplication::execute_mcp_command(
         pending_screenshot_token_ = command.token;
         return;
     }
+    case McpCommandType::render_set_exposure: {
+        if (!renderer_.set_exposure_settings(command.exposure)) {
+            fail("Invalid exposure settings");
+            return;
+        }
+        renderer_.reset_metrics();
+        succeed("Exposure settings applied", Json{
+            {"mode_requested", to_token(renderer_.exposure_settings().mode)},
+            {"mode_actual", to_token(renderer_.exposure_mode_actual())},
+            {"metering", to_token(renderer_.exposure_settings().metering)},
+            {"compensation_ev", renderer_.exposure_settings().compensation_ev},
+            {"minimum_ev", renderer_.exposure_settings().minimum_ev},
+            {"maximum_ev", renderer_.exposure_settings().maximum_ev},
+            {"low_percentile", renderer_.exposure_settings().low_percentile},
+            {"high_percentile", renderer_.exposure_settings().high_percentile},
+            {"brighten_seconds", renderer_.exposure_settings().brighten_seconds},
+            {"darken_seconds", renderer_.exposure_settings().darken_seconds},
+        });
+        return;
+    }
+    case McpCommandType::render_set_color_grading: {
+        if (!renderer_.set_color_grading(
+                command.color_grading, command.color_grading_lut_size)) {
+            fail("Invalid color grading settings");
+            return;
+        }
+        renderer_.reset_metrics();
+        succeed("Color grading settings applied", Json{
+            {"mode_requested", to_token(renderer_.color_grading())},
+            {"mode_actual", to_token(renderer_.color_grading_actual())},
+            {"lut", "identity"},
+            {"size", grading_lut_size(renderer_.color_grading_lut_size())},
+            {"format", "rgba16f"},
+            {"domain", "linear-rec709-[0,1]"},
+        });
+        return;
+    }
+    case McpCommandType::render_set_subsurface: {
+        if (!renderer_.set_subsurface_mode(command.subsurface)) {
+            fail("Invalid subsurface mode");
+            return;
+        }
+        renderer_.reset_metrics();
+        succeed("Subsurface mode requested; lazy resources apply at the next rendered frame", Json{
+            {"mode_requested", to_token(renderer_.subsurface_mode())},
+            {"mode_actual", to_token(renderer_.subsurface_mode_actual())},
+            {"provisioned", renderer_.subsurface_resources_provisioned()},
+            {"resident_bytes", renderer_.subsurface_resident_bytes()},
+        });
+        return;
+    }
+    case McpCommandType::render_set_motion_blur: {
+        if (!renderer_.set_motion_blur_settings(command.motion_blur)) {
+            fail("Motion blur settings are invalid or incompatible with the active AA mode");
+            return;
+        }
+        renderer_.reset_metrics();
+        const auto settings = renderer_.motion_blur_settings();
+        succeed("Motion blur settings applied", Json{
+            {"mode_requested", to_token(settings.mode)},
+            {"mode_actual", to_token(renderer_.motion_blur_mode_actual())},
+            {"quality", to_token(settings.quality)},
+            {"shutter", to_token(settings.shutter)},
+            {"angle_degrees", settings.shutter_angle_degrees},
+            {"maximum_radius_pixels", settings.maximum_radius_pixels},
+            {"camera_fade_start", settings.camera_fade_start},
+            {"camera_fade_end", settings.camera_fade_end},
+        });
+        return;
+    }
+    case McpCommandType::render_set_anti_aliasing: {
+        const auto method = static_cast<AntiAliasingMethod>(command.value);
+        if (!renderer_.set_anti_aliasing(method)) {
+            fail("Anti-aliasing method is unsupported or incompatible with full SSS");
+            return;
+        }
+        if (command.smaa_mode_supplied &&
+            !renderer_.set_smaa_mode(command.smaa_mode)) {
+            fail("Invalid SMAA mode");
+            return;
+        }
+        renderer_.reset_metrics();
+        succeed("Anti-aliasing applied", Json{
+            {"requested_method", to_token(renderer_.anti_aliasing_requested_method())},
+            {"method", to_token(renderer_.anti_aliasing().method)},
+            {"smaa_mode", to_string(renderer_.anti_aliasing().smaa_mode)},
+            {"smaa_temporal", is_temporal_smaa(renderer_.anti_aliasing())},
+            {"smaa_history_valid", renderer_.smaa_history_valid()},
+            {"smaa_history_resident_bytes", is_temporal_smaa(renderer_.anti_aliasing())
+                ? renderer_.smaa_history_resident_bytes() : 0U},
+            {"smaa_history_width", is_temporal_smaa(renderer_.anti_aliasing())
+                ? renderer_.render_extent().width : 0U},
+            {"smaa_history_height", is_temporal_smaa(renderer_.anti_aliasing())
+                ? renderer_.render_extent().height : 0U},
+            {"smaa_history_incremental_bytes", 0U},
+            {"smaa_history_reuses_fsr_output", is_temporal_smaa(renderer_.anti_aliasing())},
+            {"sample_count", renderer_.anti_aliasing_sample_count_actual()},
+            {"sample_shading", false},
+            {"color_resolve", is_msaa(renderer_.anti_aliasing().method) ? "average" : "none"},
+            {"depth_resolve", "none"},
+            {"resident_bytes", renderer_.msaa_resident_bytes()},
+        });
+        return;
+    }
     case McpCommandType::engine_request_quit:
         succeed("editor shutdown accepted", Json{{"shutting_down", true}});
         return;
@@ -943,6 +1294,10 @@ void EditorApplication::execute_mcp_command(
     case McpCommandType::render_set_gpu_workload:
     case McpCommandType::lighting_set:
     case McpCommandType::render_set_shadow_resolution:
+    case McpCommandType::render_set_shadow_cache:
+    case McpCommandType::render_set_tone_mapper:
+    case McpCommandType::render_set_depth_prepass:
+    case McpCommandType::render_set_lod_fade:
     case McpCommandType::test_set_roof:
     case McpCommandType::render_set_present_mode:
     case McpCommandType::window_set_fullscreen:
@@ -1012,7 +1367,7 @@ void EditorApplication::update_scene_snapshot() {
     }
     const SceneRenderView view =
         scene_.build_render_view(
-            scene_instances_, scene_models_);
+            scene_instances_, scene_models_, scene_lights_);
     std::string asset_error;
     if (!renderer_.update_editor_scene(
             view, ui_.asset_root(), asset_error)) {

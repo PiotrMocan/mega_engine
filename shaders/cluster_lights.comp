@@ -1,0 +1,155 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#define LIGHTING_SET 0
+#include "lighting_common.glsl"
+
+struct GpuPunctualLight
+{
+    vec4 positionRange;
+    vec4 directionType;
+    vec4 colorIntensity;
+    vec4 spotScaleOffset;
+};
+
+layout(set = 0, binding = 7, std430) readonly buffer LocalLightBuffer
+{
+    GpuPunctualLight localLights[];
+};
+
+layout(set = 0, binding = 8, std430) buffer LocalLightClusterBuffer
+{
+    uint clusterData[];
+};
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+shared uint lightActive;
+shared uvec2 minimumTileShared;
+shared uvec2 maximumTileShared;
+shared uint minimumSliceShared;
+shared uint maximumSliceShared;
+shared uint maximumListLengthShared;
+
+uint depthSlice(float depth)
+{
+    const float nearPlane = lighting.clusterProjection.z;
+    const float farPlane = lighting.clusterProjection.w;
+    const float slices = float(lighting.clusterDimensions.z);
+    const float normalized = log2(max(depth, nearPlane) / nearPlane)
+        / log2(farPlane / nearPlane);
+    return min(uint(max(floor(normalized * slices), 0.0)),
+               lighting.clusterDimensions.z - 1u);
+}
+
+uint appendLight(uint cluster, uint lightIndex)
+{
+    const uint capacity = lighting.clusterDimensions.w;
+    const uint clusterCount = lighting.clusterDimensions.x
+        * lighting.clusterDimensions.y * lighting.clusterDimensions.z;
+    const uint header = cluster * 2u;
+    const uint previous = atomicAdd(clusterData[header], 1u);
+    const uint indexBase = clusterCount * 2u;
+    if (previous < capacity)
+    {
+        clusterData[indexBase + cluster * capacity + previous] = lightIndex;
+    }
+    else if (previous == capacity)
+    {
+        atomicExchange(clusterData[header + 1u], 1u);
+        const uint statisticsBase = indexBase + clusterCount * capacity;
+        atomicAdd(clusterData[statisticsBase + 1u], 1u);
+    }
+    return previous + 1u;
+}
+
+void main()
+{
+    const uint lightIndex = gl_WorkGroupID.x;
+    const uint localIndex = gl_LocalInvocationID.x;
+    if (localIndex == 0u)
+    {
+        lightActive = 0u;
+        maximumListLengthShared = 0u;
+        if (lightIndex < lighting.localLightCounts.x)
+        {
+            const GpuPunctualLight light = localLights[lightIndex];
+            const vec3 viewPosition =
+                (lighting.cameraView * vec4(light.positionRange.xyz, 1.0)).xyz;
+            const float centreDepth = -viewPosition.z;
+            const float radius = light.positionRange.w;
+            const float nearPlane = lighting.clusterProjection.z;
+            const float farPlane = lighting.clusterProjection.w;
+            const float nearDepth = max(centreDepth - radius, nearPlane);
+            const float farDepth = min(centreDepth + radius, farPlane);
+            if (farDepth >= nearPlane && nearDepth <= farPlane && nearDepth <= farDepth)
+            {
+                const float denominator = max(centreDepth - radius, nearPlane);
+                const float centreDenominator = max(centreDepth, nearPlane);
+                const vec2 ndcCentre = viewPosition.xy * lighting.clusterProjection.xy
+                    / centreDenominator;
+                // Include the projected centre displacement as depth varies
+                // across the sphere, plus one pixel of numeric guard.
+                const vec2 ndcRadius = abs(lighting.clusterProjection.xy) * radius
+                    / denominator
+                    * (vec2(1.0) + abs(viewPosition.xy) / centreDenominator);
+                const vec2 uvGuard = lighting.clusterViewport.zw;
+                const vec2 uvMinimum =
+                    (ndcCentre - ndcRadius) * 0.5 + 0.5 - uvGuard;
+                const vec2 uvMaximum =
+                    (ndcCentre + ndcRadius) * 0.5 + 0.5 + uvGuard;
+                if (!any(lessThan(uvMaximum, vec2(0.0))) &&
+                    !any(greaterThan(uvMinimum, vec2(1.0))))
+                {
+                    const uvec2 dimensions = lighting.clusterDimensions.xy;
+                    minimumTileShared = min(
+                        uvec2(floor(clamp(uvMinimum, vec2(0.0), vec2(1.0))
+                            * vec2(dimensions))),
+                        dimensions - 1u);
+                    maximumTileShared = min(
+                        uvec2(floor(clamp(uvMaximum, vec2(0.0), vec2(1.0))
+                            * vec2(dimensions))),
+                        dimensions - 1u);
+                    minimumSliceShared = depthSlice(
+                        max(nearDepth * (1.0 - 1.0e-5), nearPlane));
+                    maximumSliceShared = depthSlice(
+                        min(farDepth * (1.0 + 1.0e-5), farPlane));
+                    lightActive = 1u;
+                }
+            }
+        }
+    }
+    barrier();
+    if (lightActive == 0u) return;
+
+    const uvec2 dimensions = lighting.clusterDimensions.xy;
+    const uint tileWidth = maximumTileShared.x - minimumTileShared.x + 1u;
+    const uint tileHeight = maximumTileShared.y - minimumTileShared.y + 1u;
+    const uint sliceCount = maximumSliceShared - minimumSliceShared + 1u;
+    const uint tilesPerSlice = tileWidth * tileHeight;
+    const uint assignmentCount = tilesPerSlice * sliceCount;
+    uint localMaximum = 0u;
+    for (uint assignment = localIndex; assignment < assignmentCount;
+         assignment += gl_WorkGroupSize.x)
+    {
+        const uint sliceOffset = assignment / tilesPerSlice;
+        const uint tileOffset = assignment - sliceOffset * tilesPerSlice;
+        const uint yOffset = tileOffset / tileWidth;
+        const uint xOffset = tileOffset - yOffset * tileWidth;
+        const uint cluster = minimumTileShared.x + xOffset + dimensions.x *
+            (minimumTileShared.y + yOffset + dimensions.y *
+                (minimumSliceShared + sliceOffset));
+        localMaximum = max(localMaximum, appendLight(cluster, lightIndex));
+    }
+    atomicMax(maximumListLengthShared, localMaximum);
+    barrier();
+    if (localIndex == 0u)
+    {
+        const uint clusterCount = dimensions.x * dimensions.y
+            * lighting.clusterDimensions.z;
+        const uint statisticsBase = clusterCount * 2u
+            + clusterCount * lighting.clusterDimensions.w;
+        atomicAdd(clusterData[statisticsBase], assignmentCount);
+        atomicMax(clusterData[statisticsBase + 2u], maximumListLengthShared);
+    }
+}

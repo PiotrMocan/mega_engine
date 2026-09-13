@@ -1,0 +1,130 @@
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+const uint sampleCapacity = 16u;
+
+struct ExposureCase {
+    vec4 samples[sampleCapacity];
+    uvec4 control; // Sample count, reset, history valid, padding.
+    vec4 previous; // Exposure, target exposure, average luminance, padding.
+    vec4 settings0; // Delta seconds, compensation EV, minimum EV, maximum EV.
+    vec4 settings1; // Low/high percentiles, brighten/darken time constants.
+};
+
+struct ExposureResult {
+    uint bins[256];
+    uvec4 counters; // Invalid samples, selected weight, history valid, padding.
+    vec4 values; // Exposure, target exposure, average luminance, padding.
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer ExposureCases {
+    ExposureCase cases[];
+} inputs;
+layout(std430, set = 0, binding = 1) writeonly buffer ExposureResults {
+    ExposureResult cases[];
+} outputs;
+
+shared uint histogram[256];
+
+void main()
+{
+    const uint caseIndex = gl_WorkGroupID.x;
+    const ExposureCase inputCase = inputs.cases[caseIndex];
+    for (uint bin = 0u; bin < 256u; ++bin) histogram[bin] = 0u;
+
+    uint invalidSamples = 0u;
+    const uint sampleCount = min(inputCase.control.x, sampleCapacity);
+    for (uint sampleIndex = 0u; sampleIndex < sampleCount; ++sampleIndex) {
+        const vec3 source = inputCase.samples[sampleIndex].rgb;
+        if (any(isnan(source)) || any(isinf(source))) {
+            ++invalidSamples;
+            continue;
+        }
+
+        const float luminance = dot(max(source, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
+        uint bin = 0u;
+        if (luminance > 0.0) {
+            const float logLuminance = log2(luminance);
+            if (logLuminance >= 16.0) {
+                bin = 255u;
+            } else if (logLuminance >= -16.0) {
+                bin = 1u + uint(clamp(
+                    floor((logLuminance + 16.0) * (254.0 / 32.0)),
+                    0.0, 253.0));
+            }
+        }
+        ++histogram[bin];
+    }
+
+    uint total = 0u;
+    for (uint bin = 0u; bin < 256u; ++bin) {
+        outputs.cases[caseIndex].bins[bin] = histogram[bin];
+        total += histogram[bin];
+    }
+
+    float averageLogLuminance = log2(0.18);
+    if (total != 0u) {
+        const float low = floor(float(total) * inputCase.settings1.x);
+        const float high = ceil(float(total) * inputCase.settings1.y);
+        float previousCount = float(histogram[0]);
+        float weightedLogSum = 0.0;
+        float includedWeight = 0.0;
+        for (uint bin = 1u; bin < 256u; ++bin) {
+            const float currentCount = previousCount + float(histogram[bin]);
+            const float selected = max(
+                0.0,
+                min(currentCount, high) - max(previousCount, low));
+            if (selected > 0.0) {
+                const float logCenter = bin == 255u
+                    ? 16.0
+                    : -16.0 + (float(bin) - 0.5) * (32.0 / 254.0);
+                weightedLogSum += logCenter * selected;
+                includedWeight += selected;
+            }
+            previousCount = currentCount;
+        }
+        if (includedWeight >= max(1.0, ceil(float(total) * 0.01))) {
+            averageLogLuminance = weightedLogSum / includedWeight;
+        } else {
+            total = 0u;
+        }
+    }
+
+    bool historyValid = inputCase.control.z != 0u;
+    if (inputCase.control.y != 0u) historyValid = false;
+    float exposure = inputCase.previous.x;
+    float targetExposure = inputCase.previous.y;
+    float averageLuminance = inputCase.previous.z;
+    if (total == 0u) {
+        if (!historyValid || isnan(exposure) || isinf(exposure) || exposure <= 0.0) {
+            exposure = 1.0;
+            targetExposure = 1.0;
+            averageLuminance = 0.18;
+        }
+        outputs.cases[caseIndex].counters = uvec4(invalidSamples, 0u, historyValid ? 1u : 0u, 0u);
+        outputs.cases[caseIndex].values = vec4(exposure, targetExposure, averageLuminance, 0.0);
+        return;
+    }
+
+    const float targetEv = clamp(
+        log2(0.18) - averageLogLuminance + inputCase.settings0.y,
+        inputCase.settings0.z,
+        inputCase.settings0.w);
+    const float target = exp2(targetEv);
+    const bool invalidPrevious = isnan(exposure) || isinf(exposure) || exposure <= 0.0;
+    float adapted = target;
+    if (historyValid && !invalidPrevious) {
+        const float currentEv = log2(exposure);
+        const float seconds = targetEv > currentEv ? inputCase.settings1.z : inputCase.settings1.w;
+        const float alpha = 1.0 - exp(-clamp(inputCase.settings0.x, 0.0, 1.0) / seconds);
+        adapted = exp2(mix(currentEv, targetEv, alpha));
+    }
+
+    outputs.cases[caseIndex].counters = uvec4(invalidSamples, total, 1u, 0u);
+    outputs.cases[caseIndex].values = vec4(
+        clamp(adapted, exp2(-24.0), exp2(24.0)),
+        target,
+        exp2(averageLogLuminance),
+        0.0);
+}

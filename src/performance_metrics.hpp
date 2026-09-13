@@ -1,5 +1,10 @@
 #pragma once
 #include "lighting.hpp"
+#include "tone_mapping.hpp"
+#include "exposure.hpp"
+#include "color_grading.hpp"
+#include "subsurface.hpp"
+#include "motion_blur.hpp"
 
 #include <array>
 #include <chrono>
@@ -27,8 +32,21 @@ struct FrameTimings {
     // Leave them negative while timestamp-query data is not yet available.
     double gpu_frame_ms = unavailable_timing_ms;
     double gpu_geometry_ms = unavailable_timing_ms;
+    // Zero marks a disabled local-light culling pass.
+    double gpu_light_culling_ms = unavailable_timing_ms;
     double gpu_workload_ms = unavailable_timing_ms;
     double gpu_shadow_ms = unavailable_timing_ms;
+    double gpu_postprocess_ms = unavailable_timing_ms;
+    // Final display-mapping draw only; excludes SMAA/FSR and exposure.
+    double gpu_display_ms = unavailable_timing_ms;
+    // Zero marks a disabled histogram/adaptation pass.
+    double gpu_exposure_ms = unavailable_timing_ms;
+    // Zero marks a disabled subsurface-scattering pass.
+    double gpu_subsurface_ms = unavailable_timing_ms;
+    // Zero marks a disabled motion-blur pass.
+    double gpu_motion_blur_ms = unavailable_timing_ms;
+    // Zero marks a disabled prepass; unavailable queries remain negative.
+    double gpu_depth_prepass_ms = unavailable_timing_ms;
     double gpu_voxel_geometry_ms = unavailable_timing_ms;
     double gpu_voxel_light_ms = unavailable_timing_ms;
     double gpu_visibility_ms = unavailable_timing_ms;
@@ -77,8 +95,15 @@ private:
       present,
       gpu_frame,
       gpu_geometry,
+      gpu_light_culling,
       gpu_workload,
       gpu_shadow,
+      gpu_postprocess,
+      gpu_display,
+      gpu_exposure,
+      gpu_subsurface,
+      gpu_motion_blur,
+      gpu_depth_prepass,
       gpu_voxel_geometry,
       gpu_voxel_light,
       gpu_visibility,
@@ -178,6 +203,21 @@ private:
 struct BenchmarkResult {
     LightingSettings lighting{};
     LightingStatistics lighting_statistics{};
+    std::string shadow_depth_actual = "unavailable";
+    std::string depth_prepass_requested = "off";
+    std::string depth_prepass_actual = "off";
+    std::string lod_fade_requested = "off";
+    std::string lod_fade_actual = "off";
+    float lod_fade_seconds_requested = 0.25F;
+    float lod_fade_seconds_actual = 0.25F;
+    std::string front_to_back_requested = "off";
+    std::string front_to_back_actual = "off";
+    std::string cpu_culling_requested = "linear";
+    std::string cpu_culling_actual = "off";
+    std::string render_fixture = "none";
+    std::uint32_t motion_fixture_fps = 0U;
+    std::string light_swarm_layout = "separated";
+    bool shadow_linear_filter = false;
     bool lighting_room = false;
     std::string gpu;
     std::string driver;
@@ -186,6 +226,32 @@ struct BenchmarkResult {
     std::string present_mode;
     std::string anti_aliasing;
     std::string anti_aliasing_quality;
+    std::string anti_aliasing_requested = "off";
+    std::string anti_aliasing_actual = "off";
+    std::string smaa_mode = "1x";
+    std::uint32_t smaa_temporal_samples = 1U;
+    std::uint64_t smaa_history_resident_bytes = 0U;
+    std::uint64_t smaa_history_incremental_bytes = 0U;
+    bool smaa_history_reuses_fsr_output = false;
+    std::uint32_t msaa_samples_requested = 1U;
+    std::uint32_t msaa_samples_actual = 1U;
+    bool msaa_2x_supported = false;
+    bool msaa_4x_supported = false;
+    std::uint64_t msaa_resident_bytes = 0U;
+    ToneMapper tone_mapper = ToneMapper::reinhard;
+    ExposureSettings exposure{};
+    std::string exposure_mode_actual = "fixed";
+    ExposureGpuReadback exposure_state{};
+    ColorGrading color_grading = ColorGrading::off;
+    ColorGrading color_grading_actual = ColorGrading::off;
+    ColorGradingLutSize color_grading_lut_size = ColorGradingLutSize::size_32;
+    SubsurfaceMode subsurface = SubsurfaceMode::off;
+    SubsurfaceMode subsurface_actual = SubsurfaceMode::off;
+    bool subsurface_provisioned = false;
+    std::uint32_t subsurface_active_material_count = 0U;
+    std::uint64_t subsurface_resident_bytes = 0U;
+    MotionBlurSettings motion_blur{};
+    std::string motion_blur_actual = "off";
     std::string mode;
     std::string build_type;
     std::uint64_t triangles = 0;
@@ -201,13 +267,27 @@ struct BenchmarkResult {
     double average_queue_submit_ms = unavailable_timing_ms;
     double average_present_ms = unavailable_timing_ms;
     double average_gpu_geometry_ms = unavailable_timing_ms;
+    double average_gpu_light_culling_ms = unavailable_timing_ms;
     double average_gpu_workload_ms = unavailable_timing_ms;
     double average_gpu_shadow_ms = unavailable_timing_ms;
+    double average_gpu_postprocess_ms = unavailable_timing_ms;
+    double average_gpu_display_ms = unavailable_timing_ms;
+    double average_gpu_exposure_ms = unavailable_timing_ms;
+    double average_gpu_subsurface_ms = unavailable_timing_ms;
+    double average_gpu_motion_blur_ms = unavailable_timing_ms;
+    double average_gpu_depth_prepass_ms = unavailable_timing_ms;
     double average_gpu_voxel_geometry_ms = unavailable_timing_ms;
     double average_gpu_voxel_light_ms = unavailable_timing_ms;
     double average_gpu_visibility_ms = unavailable_timing_ms;
     std::string visibility_backend = "cpu";
     double average_scene_prepare_ms = unavailable_timing_ms;
+    std::string local_light_backend_requested = "auto";
+    std::string local_light_backend_actual = "off";
+    std::uint32_t local_light_count = 0;
+    std::uint32_t local_light_assignments = 0;
+    std::uint32_t local_light_maximum_list = 0;
+    std::uint32_t local_light_overflow_clusters = 0;
+    std::uint32_t local_light_dropped = 0;
     std::uint32_t visible_instances = 0, frustum_rejected = 0, occlusion_rejected = 0;
     std::array<std::uint32_t, 3> lod_instances{};
     bool frustum_culling = true, occlusion_culling = true, lod = true, dynamic_shadows = true,

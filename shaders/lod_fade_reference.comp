@@ -1,0 +1,122 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "lod_fade.glsl"
+
+layout(local_size_x = 64) in;
+
+// The CPU supplies independent explicit-matrix thresholds, not shader ranks.
+struct CoverageCase {
+    uvec4 metadata; // Source, pattern (1/2), pixel origin X/Y.
+    uint firstPhase[64];
+};
+struct EncoderCase {
+    uvec4 inputValue; // Source, float phase bits, pattern, previous role.
+    uvec4 expected; // Encoded token, arbitrary raw token, decoded source, padding.
+};
+layout(set = 0, binding = 0, std430) readonly buffer CoverageInputs {
+    CoverageCase cases[];
+} coverage;
+layout(set = 0, binding = 1, std430) readonly buffer EncoderInputs {
+    EncoderCase cases[];
+} encoders;
+layout(set = 0, binding = 2, std430) buffer Results {
+    uint coveragePairs;
+    uint coverageFailures;
+    uint sourceFailures;
+    uint complementFailures;
+    uint endpointFailures;
+    uint offChecks;
+    uint offFailures;
+    uint roundtripChecks;
+    uint roundtripFailures;
+    uint encoderChecks;
+    uint encoderFailures;
+    uint maskChecks;
+    uint maskFailures;
+    uint firstCoverage;
+    uint firstSource;
+    uint firstComplement;
+    uint firstEndpoint;
+    uint firstOff;
+    uint firstRoundtrip;
+    uint firstEncoder;
+    uint firstMask;
+    uint padding0;
+    uint padding1;
+    uint padding2;
+} result;
+
+void main() {
+    uint phase = gl_GlobalInvocationID.x;
+    uint caseIndex = gl_GlobalInvocationID.y;
+    if (phase >= 4096u || caseIndex >= uint(coverage.cases.length())) return;
+    uvec4 info = coverage.cases[caseIndex].metadata;
+    uint invocation = caseIndex * 4096u + phase;
+    // Coverage tests deliberately bypass lodToken: encoder errors must not
+    // disguise coverage errors or prevent visiting an exact quantized phase.
+    uint current = info.x | (phase << 17u) | (1u << 31u) |
+                   (info.y == 2u ? (1u << 30u) : 0u);
+    uint previous = current | (1u << 29u);
+    uint failures = 0u, complementFailures = 0u, endpointFailures = 0u;
+    uint offFailures = 0u;
+    for (uint pixel = 0u; pixel < 64u; ++pixel) {
+        uvec2 position = info.zw + uvec2(pixel % 8u, pixel / 8u);
+        bool keepCurrent = lodKeep(current, position);
+        bool keepPrevious = lodKeep(previous, position);
+        bool expected = phase >= coverage.cases[caseIndex].firstPhase[pixel];
+        uint checkIndex = invocation * 64u + pixel;
+        if (keepCurrent != expected || keepPrevious == expected) {
+            ++failures;
+            atomicMin(result.firstCoverage, checkIndex);
+        }
+        if (keepCurrent == keepPrevious) {
+            ++complementFailures;
+            atomicMin(result.firstComplement, checkIndex);
+        }
+        if ((phase == 0u && (keepCurrent || !keepPrevious)) ||
+            (phase == 4095u && (!keepCurrent || keepPrevious))) {
+            ++endpointFailures;
+            atomicMin(result.firstEndpoint, checkIndex);
+        }
+        if (phase == 0u && (!lodKeep(info.x, position) || lodSource(info.x) != info.x)) {
+            ++offFailures;
+            atomicMin(result.firstOff, caseIndex * 64u + pixel);
+        }
+    }
+    atomicAdd(result.coveragePairs, 64u);
+    if (failures != 0u) atomicAdd(result.coverageFailures, failures);
+    if (complementFailures != 0u) atomicAdd(result.complementFailures, complementFailures);
+    if (endpointFailures != 0u) atomicAdd(result.endpointFailures, endpointFailures);
+    if (lodSource(current) != info.x || lodSource(previous) != info.x) {
+        atomicAdd(result.sourceFailures, 1u);
+        atomicMin(result.firstSource, invocation);
+    }
+    if (phase == 0u) {
+        atomicAdd(result.offChecks, 64u);
+        if (offFailures != 0u) atomicAdd(result.offFailures, offFailures);
+    }
+    // Every representable quantized phase must round-trip through the real
+    // shader encoder for both roles and every selected source/pattern.
+    float value = float(phase) / 4095.0;
+    atomicAdd(result.roundtripChecks, 2u);
+    if (lodToken(info.x, value, false, info.y) != current ||
+        lodToken(info.x, value, true, info.y) != previous) {
+        atomicAdd(result.roundtripFailures, 1u);
+        atomicMin(result.firstRoundtrip, invocation);
+    }
+    if (invocation < uint(encoders.cases.length())) {
+        EncoderCase encoder = encoders.cases[invocation];
+        uint actual = lodToken(encoder.inputValue.x, uintBitsToFloat(encoder.inputValue.y),
+                               encoder.inputValue.w != 0u, encoder.inputValue.z);
+        atomicAdd(result.encoderChecks, 1u);
+        if (actual != encoder.expected.x) {
+            atomicAdd(result.encoderFailures, 1u);
+            atomicMin(result.firstEncoder, invocation);
+        }
+        atomicAdd(result.maskChecks, 1u);
+        if (lodSource(encoder.expected.y) != encoder.expected.z) {
+            atomicAdd(result.maskFailures, 1u);
+            atomicMin(result.firstMask, invocation);
+        }
+    }
+}

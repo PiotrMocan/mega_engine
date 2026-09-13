@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "pbr_material.glsl"
 
 layout(set = 0, binding = 0, std140) uniform FrameUniforms
 {
@@ -22,6 +24,7 @@ struct EditorInstanceData
     vec4 modelRow2;
     vec4 baseColor;
     vec4 materialParameters;
+    float indexOfRefraction; uint shadingModel; uint subsurfaceProfile; float subsurfaceStrength;
     vec4 previousRow0;
     vec4 previousRow1;
     vec4 previousRow2;
@@ -48,6 +51,14 @@ layout(location = 4) out vec4 outCurrentClip;
 layout(location = 5) out vec4 outPreviousClip;
 layout(location = 6) out vec3 outWorldPosition;
 layout(location = 7) out vec4 outMaterialParameters;
+
+layout(location = 11) flat out float outDielectricF0;
+layout(location = 12) flat out uint outMaterialModel;
+layout(location = 14) flat out uint outSubsurfaceProfile;
+layout(location = 15) flat out float outSubsurfaceStrength;
+
+// Identical clip depth across the depth-only and EQUAL color pipelines.
+invariant gl_Position;
 
 void main()
 {
@@ -88,5 +99,9 @@ void main()
             dot(instance.previousRow2, localPosition), 1.0);
     outWorldPosition = worldPosition;
     outMaterialParameters = instance.materialParameters;
+    outDielectricF0 = materialDielectricF0(instance.indexOfRefraction);
+    outMaterialModel = instance.shadingModel;
+    outSubsurfaceProfile = instance.subsurfaceProfile;
+    outSubsurfaceStrength = instance.subsurfaceStrength;
     gl_Position = frame.viewProjection * world;
 }

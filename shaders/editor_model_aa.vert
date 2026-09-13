@@ -1,4 +1,7 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "pbr_material.glsl"
+#include "lod_fade.glsl"
 
 layout(set = 0, binding = 0, std140) uniform FrameUniforms
 {
@@ -15,7 +18,7 @@ layout(set = 0, binding = 0, std140) uniform FrameUniforms
     mat4 previousUnjitteredViewProjection;
 } frame;
 
-// This must stay ABI-compatible with the host's 128-byte RuntimeGpuInstance.
+// This must stay ABI-compatible with the host's 144-byte RuntimeGpuInstance.
 struct EditorInstanceData
 {
     vec4 modelRow0;
@@ -23,6 +26,7 @@ struct EditorInstanceData
     vec4 modelRow2;
     vec4 baseColor;
     vec4 materialParameters;
+    float indexOfRefraction; uint shadingModel; uint subsurfaceProfile; float subsurfaceStrength;
     vec4 previousRow0;
     vec4 previousRow1;
     vec4 previousRow2;
@@ -66,10 +70,21 @@ vec3 safeNormalize(vec3 value, vec3 fallback)
     return value * inversesqrt(lengthSquared);
 }
 
+layout(location = 11) flat out float outDielectricF0;
+layout(location = 12) flat out uint outMaterialModel;
+layout(location = 13) flat out uint outLodToken;
+layout(location = 14) flat out uint outSubsurfaceProfile;
+layout(location = 15) flat out float outSubsurfaceStrength;
+
+// Identical clip depth across the depth-only and EQUAL color pipelines.
+invariant gl_Position;
+
 void main()
 {
-    const uint sourceIndex = frame.globalRotation.x > 0.5
+    const uint token = frame.globalRotation.x > 0.5
         ? visibleIndices[gl_InstanceIndex] : gl_InstanceIndex;
+    const uint sourceIndex = lodSource(token);
+    outLodToken = token;
     const EditorInstanceData instance = instances[sourceIndex];
     const vec4 localPosition = vec4(inPosition, 1.0);
     const vec3 worldPosition = vec3(
@@ -145,6 +160,10 @@ void main()
             dot(instance.previousRow2, localPosition), 1.0);
     outWorldPosition = worldPosition;
     outMaterialParameters = instance.materialParameters;
+    outDielectricF0 = materialDielectricF0(instance.indexOfRefraction);
+    outMaterialModel = instance.shadingModel;
+    outSubsurfaceProfile = instance.subsurfaceProfile;
+    outSubsurfaceStrength = instance.subsurfaceStrength;
     // Match the direct editor path: cooked FBX/OBJ UVs are authoring-space
     // bottom-left coordinates, while decoded texture rows are top-to-bottom.
     // Do not alter the tangent basis; OpenGL-style normal maps remain authored

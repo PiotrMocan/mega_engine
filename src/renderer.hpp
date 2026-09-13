@@ -3,13 +3,19 @@
 #include "asset_preparation.hpp"
 #include "cli_options.hpp"
 #include "device_object.hpp"
+#include "depth_prepass.hpp"
+#include "lod_transition.hpp"
 #include "frame_context.hpp"
 #include "fsr3_upscaler.hpp"
+#include "exposure.hpp"
+#include "color_grading.hpp"
+#include "subsurface.hpp"
 #include "gpu_buffer.hpp"
 #include "gpu_texture.hpp"
 #include "lighting.hpp"
 #include "performance_metrics.hpp"
 #include "runtime_scene.hpp"
+#include "bounds_hierarchy.hpp"
 #include "swapchain.hpp"
 #include "upload_batch.hpp"
 #include "vulkan_context.hpp"
@@ -60,7 +66,7 @@ public:
                     std::uint32_t initial_instances, std::uint32_t initial_gpu_workload,
                     AntiAliasingSettings initial_anti_aliasing, bool enable_screenshot_capture,
                     bool enable_editor_output = false, bool enable_authored_scene = false,
-                    LightingSettings lighting = {});
+                    LightingSettings lighting = {}, RenderFixture fixture = RenderFixture::none);
     [[nodiscard]] bool draw_frame(
         FrameTimings& timings,
         const glm::mat4& view_matrix
@@ -78,9 +84,125 @@ public:
     [[nodiscard]] const LightingStatistics &lighting_statistics() const noexcept {
         return lighting_statistics_;
     }
+    [[nodiscard]] std::uint32_t local_light_count() const noexcept {
+        return static_cast<std::uint32_t>(local_lights_.size());
+    }
+    [[nodiscard]] bool set_local_light_backend(LocalLightBackend backend) noexcept {
+        if (backend != LocalLightBackend::off && backend != LocalLightBackend::forward &&
+            backend != LocalLightBackend::clustered && backend != LocalLightBackend::automatic)
+            return false;
+        if (local_light_backend_ != backend) {
+            local_light_backend_ = backend;
+            ++local_light_revision_;
+            if (local_light_revision_ == 0U) ++local_light_revision_;
+        }
+        return true;
+    }
+    [[nodiscard]] LocalLightBackend local_light_backend() const noexcept {
+        return local_light_backend_;
+    }
+    [[nodiscard]] LocalLightBackend local_light_backend_actual() const noexcept {
+        if (local_light_backend_ == LocalLightBackend::off || local_lights_.empty())
+            return LocalLightBackend::off;
+        if (local_light_backend_ == LocalLightBackend::automatic)
+            return local_lights_.size() >= 64U
+                ? LocalLightBackend::clustered
+                : LocalLightBackend::forward;
+        return local_light_backend_;
+    }
+    [[nodiscard]] const LocalLightStatistics& local_light_statistics() const noexcept {
+        return local_light_statistics_;
+    }
     [[nodiscard]] bool gi_provisioned() const noexcept { return gi_provisioned_; }
     [[nodiscard]] bool set_lighting_settings(LightingSettings settings) noexcept;
+    [[nodiscard]] ToneMapper tone_mapper() const noexcept { return tone_mapper_; }
+    [[nodiscard]] DepthPrepass depth_prepass() const noexcept { return depth_prepass_; }
+    [[nodiscard]] LodFadePattern lod_fade_pattern() const noexcept { return lod_fade_pattern_; }
+    [[nodiscard]] float lod_fade_seconds() const noexcept { return lod_fade_seconds_; }
+    [[nodiscard]] LodFadePattern lod_fade_actual() const noexcept {
+#if VCR_EDITOR_ENABLED
+        return authored_scene_enabled_ && mode_ != RunMode::instancing && visibility_settings_.lod
+            ? lod_fade_pattern_ : LodFadePattern::off;
+#else
+        return LodFadePattern::off;
+#endif
+    }
+    [[nodiscard]] bool set_lod_fade(LodFadePattern pattern, float seconds) noexcept;
+    [[nodiscard]] bool set_depth_prepass(DepthPrepass mode) noexcept {
+        if (mode != DepthPrepass::off && mode != DepthPrepass::partial &&
+            mode != DepthPrepass::full) return false;
+        depth_prepass_ = mode;
+        return true;
+    }
+    // Display mapping runs after temporal reconstruction, so switching it does
+    // not invalidate scene-linear history or touch any in-flight resources.
+    [[nodiscard]] bool set_tone_mapper(ToneMapper mapper) noexcept {
+        if (mapper != ToneMapper::reinhard && mapper != ToneMapper::gt7) return false;
+        tone_mapper_ = mapper;
+        return true;
+    }
+    [[nodiscard]] const ExposureSettings& exposure_settings() const noexcept {
+        return exposure_settings_;
+    }
+    [[nodiscard]] bool set_exposure_settings(ExposureSettings settings) noexcept {
+        if (!valid_exposure_settings(settings)) return false;
+        if (exposure_settings_ == settings) return true;
+        exposure_settings_ = settings;
+        exposure_reset_pending_ = true;
+        return true;
+    }
+    [[nodiscard]] ExposureMode exposure_mode_actual() const noexcept {
+        return lighting_settings_.dynamic && mode_ != RunMode::instancing
+            ? exposure_settings_.mode : ExposureMode::fixed;
+    }
+    [[nodiscard]] const ExposureGpuReadback& exposure_state() const noexcept {
+        return exposure_readback_;
+    }
+    void request_exposure_reset() noexcept { exposure_reset_pending_ = true; }
+    [[nodiscard]] ColorGrading color_grading() const noexcept {
+        return color_grading_;
+    }
+    [[nodiscard]] ColorGrading color_grading_actual() const noexcept {
+        return lighting_settings_.dynamic && mode_ != RunMode::instancing
+            ? color_grading_ : ColorGrading::off;
+    }
+    [[nodiscard]] ColorGradingLutSize color_grading_lut_size() const noexcept {
+        return color_grading_lut_size_;
+    }
+    [[nodiscard]] bool set_color_grading(
+        ColorGrading grading,
+        ColorGradingLutSize size) noexcept {
+        if ((grading != ColorGrading::off && grading != ColorGrading::trilinear &&
+             grading != ColorGrading::tetrahedral) ||
+            (size != ColorGradingLutSize::size_32 &&
+             size != ColorGradingLutSize::size_64)) return false;
+        if (color_grading_ == grading && color_grading_lut_size_ == size) return true;
+        color_grading_ = grading;
+        color_grading_lut_size_ = size;
+        return true;
+    }
+    [[nodiscard]] bool set_subsurface_mode(SubsurfaceMode mode) noexcept;
+    [[nodiscard]] SubsurfaceMode subsurface_mode() const noexcept {
+        return subsurface_mode_;
+    }
+    [[nodiscard]] SubsurfaceMode subsurface_mode_actual() const noexcept {
+        return subsurface_mode_ == SubsurfaceMode::full_resolution &&
+                   subsurface_resources_provisioned_ &&
+                   mode_ != RunMode::instancing
+            ? SubsurfaceMode::full_resolution
+            : SubsurfaceMode::off;
+    }
+    [[nodiscard]] bool subsurface_resources_provisioned() const noexcept {
+        return subsurface_resources_provisioned_;
+    }
+    [[nodiscard]] std::uint64_t subsurface_resident_bytes() const noexcept;
+    [[nodiscard]] std::uint32_t subsurface_active_material_count() const noexcept;
     [[nodiscard]] std::uint32_t shadow_resolution() const noexcept { return shadow_map_.width(); }
+    [[nodiscard]] std::string_view shadow_depth_format() const noexcept {
+        return shadow_map_format_ == VK_FORMAT_D32_SFLOAT ? "d32"
+             : shadow_map_format_ == VK_FORMAT_D16_UNORM ? "d16" : "unavailable";
+    }
+    [[nodiscard]] bool shadow_linear_filter() const noexcept { return shadow_map_linear_; }
     [[nodiscard]] bool supports_shadow_resolution(std::uint32_t resolution) const noexcept {
         return valid_shadow_resolution(resolution) && resolution <= max_shadow_resolution_;
     }
@@ -96,6 +218,17 @@ public:
     void set_gpu_workload_iterations(std::uint32_t iterations) noexcept;
     void adjust_load(int direction) noexcept;
     void cycle_anti_aliasing();
+    [[nodiscard]] bool set_anti_aliasing(AntiAliasingMethod method) noexcept;
+    [[nodiscard]] bool set_smaa_mode(SmaaMode mode) noexcept;
+    [[nodiscard]] bool set_motion_blur_settings(
+        MotionBlurSettings settings) noexcept;
+    [[nodiscard]] MotionBlurSettings motion_blur_settings() const noexcept {
+        return motion_blur_settings_;
+    }
+    [[nodiscard]] MotionBlurMode motion_blur_mode_actual() const noexcept {
+        return mode_ == RunMode::instancing
+            ? MotionBlurMode::off : motion_blur_settings_.mode;
+    }
     void adjust_anti_aliasing_quality(int direction) noexcept;
     [[nodiscard]] bool request_screenshot() noexcept;
     [[nodiscard]] std::optional<ScreenshotCapture>
@@ -118,6 +251,27 @@ public:
     [[nodiscard]] AntiAliasingSettings anti_aliasing() const noexcept {
         return anti_aliasing_;
     }
+    [[nodiscard]] AntiAliasingMethod anti_aliasing_requested_method() const noexcept {
+        return anti_aliasing_requested_method_;
+    }
+    [[nodiscard]] bool supports_msaa(AntiAliasingMethod method) const noexcept;
+    [[nodiscard]] std::uint32_t anti_aliasing_sample_count_actual() const noexcept {
+        return anti_aliasing_sample_count(anti_aliasing_.method);
+    }
+    [[nodiscard]] std::uint64_t msaa_resident_bytes() const noexcept;
+    [[nodiscard]] std::uint64_t smaa_history_resident_bytes() const noexcept {
+        const VkExtent2D extent = scene_output_extent();
+        return static_cast<std::uint64_t>(extent.width) * extent.height * 8U *
+            max_frames_in_flight;
+    }
+    [[nodiscard]] bool smaa_history_valid() const noexcept {
+        return is_temporal_smaa(anti_aliasing_) && smaa_t2x_history_valid_;
+    }
+    [[nodiscard]] std::uint32_t smaa_temporal_phase() const noexcept {
+        return smaa_t2x_phase_;
+    }
+    [[nodiscard]] VkExtent2D msaa_target_extent() const noexcept;
+    [[nodiscard]] std::string_view msaa_depth_format_name() const noexcept;
     [[nodiscard]] VkExtent2D render_extent() const noexcept {
         return current_render_extent_.width > 0U &&
                 current_render_extent_.height > 0U
@@ -137,6 +291,8 @@ public:
         if (anti_aliasing_.method == AntiAliasingMethod::fsr3) {
             return to_string(anti_aliasing_.fsr3_quality);
         }
+        if (anti_aliasing_.method == AntiAliasingMethod::msaa2x) return "2x";
+        if (anti_aliasing_.method == AntiAliasingMethod::msaa4x) return "4x";
         return "n/a";
     }
     [[nodiscard]] std::uint32_t max_instance_capacity() const noexcept {
@@ -191,6 +347,15 @@ public:
         }
         return gpu_visibility_active_ ? (gpu_visibility_bypassed_ ? "direct" : "gpu") : "cpu";
     }
+    [[nodiscard]] const char *cpu_culling_path() const noexcept {
+        if (mode_ == RunMode::instancing || gpu_visibility_active_ ||
+            scene_metadata_.empty() || !visibility_settings_.frustum) return "off";
+        return bounds_hierarchy_active_ ? "hierarchy" : "linear";
+    }
+    [[nodiscard]] bool coarse_depth_order_active() const noexcept {
+        return visibility_settings_.coarse_front_to_back && mode_ != RunMode::instancing &&
+            !gpu_visibility_active_ && !scene_metadata_.empty();
+    }
     [[nodiscard]] unsigned terrain_lod() const noexcept {
         return terrain_lod_;
     }
@@ -226,21 +391,38 @@ public:
 
 private:
     struct AntiAliasingFrameResources {
+        struct MsaaTargets {
+            GpuTexture color{};
+            GpuTexture depth{};
+            VkImageLayout color_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+            VkImageLayout depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        };
         GpuTexture color{};
+        GpuTexture subsurface_base{};
+        GpuTexture subsurface_ping{};
         GpuTexture motion_vectors{};
         GpuTexture depth{};
         GpuTexture depth_attachment{};
         GpuTexture smaa_edges{};
         GpuTexture smaa_weights{};
         GpuTexture fsr_output{};
+        GpuTexture motion_tile_max{};
+        GpuTexture motion_neighbor_max{};
+        MsaaTargets msaa{};
         VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+        VkDescriptorSet subsurface_horizontal_set = VK_NULL_HANDLE;
+        VkDescriptorSet subsurface_vertical_set = VK_NULL_HANDLE;
         VkImageLayout color_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImageLayout subsurface_base_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImageLayout subsurface_ping_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         VkImageLayout motion_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         VkImageLayout depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         VkImageLayout depth_attachment_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         VkImageLayout edges_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         VkImageLayout weights_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         VkImageLayout fsr_output_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImageLayout motion_tile_max_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImageLayout motion_neighbor_max_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     };
 #if VCR_EDITOR_ENABLED
     struct EditorViewportResources {
@@ -332,14 +514,36 @@ private:
     void apply_shadow_resolution();
     void create_anti_aliasing_resources();
     void create_anti_aliasing_targets();
+    void invalidate_temporal_history() noexcept;
+    void detect_msaa_support();
+    void prepare_msaa_targets_for_frame(std::size_t frame_index);
     void destroy_anti_aliasing_resources() noexcept;
     void destroy_anti_aliasing_targets() noexcept;
+    void create_display_mapping_resources();
+    void destroy_display_mapping_resources() noexcept;
+    void record_auto_exposure(
+        VkCommandBuffer command_buffer,
+        FrameContext& frame,
+        VkExtent2D source_extent,
+        VkDescriptorSet descriptor_set);
+    void read_exposure_state(FrameContext& frame);
     void render_static_shadow_map();
     void record_shadow_map(VkCommandBuffer command_buffer, FrameContext &frame);
     void create_descriptors();
     void create_anti_aliasing_descriptors();
     void destroy_anti_aliasing_descriptors() noexcept;
+    void create_subsurface_targets();
+    void destroy_subsurface_targets() noexcept;
+    void create_subsurface_descriptors();
+    void destroy_subsurface_descriptors() noexcept;
+    void provision_subsurface_resources();
+    void record_subsurface(
+        VkCommandBuffer command_buffer,
+        FrameContext& frame,
+        AntiAliasingFrameResources& resources,
+        VkExtent2D extent);
     void read_gpu_timestamps(FrameContext& frame, FrameTimings& timings) const;
+    void read_local_light_statistics(FrameContext& frame);
     void complete_screenshot(FrameContext& frame);
     [[nodiscard]] bool prepare_screenshot_buffer();
     void upload_to_device_buffer(GpuBuffer &destination, std::span<const std::byte> bytes,
@@ -360,6 +564,7 @@ private:
         ImDrawData* editor_draw_data
 #endif
     );
+    void record_clustered_lights(VkCommandBuffer command_buffer, FrameContext& frame);
     void rebuild_swapchain();
     void recreate_swapchain(VkPresentModeKHR preferred_mode);
     [[nodiscard]] ShaderModule load_shader(const std::filesystem::path& path) const;
@@ -395,6 +600,16 @@ private:
     };
     static_assert(sizeof(GiJob) == 80);
     LightingSettings lighting_settings_{};
+    ToneMapper tone_mapper_ = ToneMapper::reinhard;
+    ExposureSettings exposure_settings_{};
+    ExposureGpuReadback exposure_readback_{};
+    ColorGrading color_grading_ = ColorGrading::off;
+    ColorGradingLutSize color_grading_lut_size_ = ColorGradingLutSize::size_32;
+    SubsurfaceMode subsurface_mode_ = SubsurfaceMode::off;
+    MotionBlurSettings motion_blur_settings_{};
+    DepthPrepass depth_prepass_ = DepthPrepass::off;
+    LodFadePattern lod_fade_pattern_ = LodFadePattern::off;
+    float lod_fade_seconds_ = 0.25F;
     bool lighting_paused_ = false;
     LightingStatistics lighting_statistics_{};
     LightingUniforms lighting_uniforms_{};
@@ -402,14 +617,31 @@ private:
     DeviceObject<VkDescriptorPool> lighting_pool_{};
     DeviceObject<VkPipelineLayout> lighting_compute_layout_{};
     DeviceObject<VkPipeline> voxel_geometry_pipeline_{}, voxel_light_pipeline_{};
+    DeviceObject<VkPipeline> local_light_cluster_pipeline_{};
     DeviceObject<VkImageView> voxel_storage_view_{};
     DeviceObject<VkPipeline> tonemap_pipeline_{};
+    DeviceObject<VkPipeline> exposure_histogram_pipeline_{};
+    DeviceObject<VkPipeline> exposure_adapt_pipeline_{};
+    DeviceObject<VkPipeline> subsurface_horizontal_pipeline_{};
+    DeviceObject<VkPipeline> subsurface_vertical_pipeline_{};
+    GpuBuffer exposure_state_buffer_{};
+    GpuTexture exposure_value_{};
+    VkImageLayout exposure_value_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    GpuTexture grading_lut_32_{};
+    GpuTexture grading_lut_64_{};
+    bool exposure_reset_pending_ = true;
+    bool subsurface_resources_provisioned_ = false;
+    bool subsurface_provision_pending_ = false;
     GpuBuffer voxel_geometry_{}, voxel_triangles_{};
     GpuTexture voxel_radiance_{};
     VkImageLayout voxel_radiance_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     DirtyVoxelBricks voxel_dirty_{};
     std::array<std::uint32_t, gi_brick_count> voxel_job_mask_{};
     std::vector<GiJob> voxel_jobs_{}, voxel_batch_{};
+    std::vector<GpuPunctualLight> local_lights_{};
+    std::uint64_t local_light_revision_ = 1U;
+    LocalLightBackend local_light_backend_ = LocalLightBackend::automatic;
+    LocalLightStatistics local_light_statistics_{};
     VoxelSceneTracker voxel_scene_{};
     glm::vec4 gi_last_sun_{}, gi_last_sun_color_{};
     std::uint32_t voxel_job_index_ = 0, voxel_job_triangle_ = 0, voxel_triangle_count_ = 0;
@@ -461,13 +693,36 @@ private:
         DeviceObject<VkPipeline> terrain{};
         DeviceObject<VkPipeline> sky{};
     } smaa_geometry_{};
+    // All variants are prewarmed and retire with the other swapchain pipelines.
+    // Depth-only variants use the exact corresponding color-pass vertex module.
+    SpatialPipelines depth_geometry_{}, depth_temporal_geometry_{};
+    DeviceObject<VkPipeline> lod_depth_model_{}, lod_depth_temporal_model_{};
+    SpatialPipelines equal_direct_{}, equal_spatial_{}, equal_temporal_{};
+    std::array<SpatialPipelines, 2> msaa_geometry_{};
+    std::array<SpatialPipelines, 2> depth_msaa_geometry_{};
+    std::array<SpatialPipelines, 2> equal_msaa_{};
+    std::array<DeviceObject<VkPipeline>, 2> lod_depth_msaa_model_{};
+    SpatialPipelines subsurface_spatial_{}, subsurface_temporal_{};
+    SpatialPipelines equal_subsurface_spatial_{}, equal_subsurface_temporal_{};
     VkDescriptorSetLayout anti_aliasing_descriptor_set_layout_ =
         VK_NULL_HANDLE;
     VkPipelineLayout post_process_pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout exposure_pipeline_layout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout subsurface_descriptor_set_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout subsurface_pipeline_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout hud_pipeline_layout_ = VK_NULL_HANDLE;
     std::array<VkPipeline, 4> smaa_edge_pipelines_{};
+    std::array<VkPipeline, 4> smaa_blurred_edge_pipelines_{};
     std::array<VkPipeline, 4> smaa_blend_pipelines_{};
     VkPipeline smaa_neighborhood_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline smaa_blurred_neighborhood_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline smaa_neighborhood_history_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline smaa_temporal_resolve_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline motion_blur_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline motion_blur_reconstructed_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline motion_blur_hdr_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline motion_tile_max_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline motion_neighbor_max_pipeline_ = VK_NULL_HANDLE;
     VkPipeline fsr_composite_pipeline_ = VK_NULL_HANDLE;
     VkPipeline hud_pipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout compute_pipeline_layout_ = VK_NULL_HANDLE;
@@ -475,12 +730,15 @@ private:
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
     VkDescriptorPool anti_aliasing_descriptor_pool_ = VK_NULL_HANDLE;
+    VkDescriptorPool subsurface_descriptor_pool_ = VK_NULL_HANDLE;
     GpuBuffer vertex_buffer_{};
     GpuBuffer index_buffer_{};
     GpuBuffer instance_buffer_{};
     GpuBuffer demo_instance_buffer_{};
     GpuBuffer pbr_sample_vertex_buffer_{};
     GpuBuffer pbr_sample_index_buffer_{};
+    RenderFixture fixture_ = RenderFixture::none;
+    std::uint32_t pbr_sample_instance_count_ = 10;
     GpuBuffer terrain_vertex_buffer_{};
     GpuBuffer terrain_index_buffer_{};
     std::array<std::uint32_t, 3> terrain_lod_first_{}, terrain_lod_count_{};
@@ -495,6 +753,7 @@ private:
         anti_aliasing_frames_{};
     Fsr3Upscaler fsr3_upscaler_{};
     VkFormat shadow_map_format_ = VK_FORMAT_UNDEFINED;
+    bool shadow_map_linear_ = false;
     std::uint32_t max_shadow_resolution_ = 0;
     glm::mat4 light_view_projection_{1.0F};
     glm::mat4 previous_unjittered_view_projection_{1.0F};
@@ -507,6 +766,10 @@ private:
     std::uint32_t frame_serial_ = 0;
     RunMode mode_ = RunMode::scene;
     AntiAliasingSettings anti_aliasing_{};
+    AntiAliasingMethod anti_aliasing_requested_method_ = AntiAliasingMethod::off;
+    bool smaa_t2x_history_valid_ = false;
+    std::uint32_t smaa_t2x_phase_ = 0U;
+    VkSampleCountFlags msaa_supported_sample_counts_ = VK_SAMPLE_COUNT_1_BIT;
     PerformanceMetrics metrics_{};
     bool screenshot_requested_ = false;
     bool screenshot_in_flight_ = false;
@@ -531,17 +794,28 @@ private:
     std::vector<RuntimeGpuInstance> scene_packet_{};
     std::vector<EditorModelDraw> visible_model_draws_{};
     std::vector<std::uint32_t> visible_indices_{}, visibility_scratch_{};
+    std::vector<std::uint32_t> coarse_depth_keys_{};
     std::vector<std::uint8_t> instance_lods_{};
+    std::vector<LodFadeState> instance_lod_fades_{};
+    bool lod_fades_active_ = false, reset_lod_fades_ = true;
+    glm::vec3 lod_camera_position_{};
+    glm::vec3 lod_camera_forward_{};
+    bool lod_camera_valid_ = false;
     std::vector<std::uint8_t> instance_visibility_{};
     std::vector<Bounds> world_bounds_{};
+    BoundsHierarchy world_hierarchy_{};
+    bool hierarchy_rebuild_required_ = true;
+    bool bounds_hierarchy_active_ = false;
     VisibilitySettings visibility_settings_{};
     VisibilityStatistics visibility_statistics_{};
     glm::mat4 packet_view_projection_{0.0F};
     VkExtent2D packet_extent_{};
     std::uint64_t packet_runtime_revision_ = 0, packet_document_revision_ = 0;
     std::uint64_t packet_revision_ = 1;
+    std::uint64_t source_packet_revision_ = 1;
     std::uint32_t visible_ground_count_ = 0, visible_cube_count_ = 0;
     bool shadow_dirty_ = true;
+    std::uint32_t shadow_matrix_dirty_mask_ = 0;
     DeviceObject<VkDescriptorSetLayout> visibility_layout_;
     DeviceObject<VkPipelineLayout> visibility_pipeline_layout_;
     DeviceObject<VkDescriptorPool> visibility_pool_;

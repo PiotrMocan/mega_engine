@@ -1,6 +1,7 @@
 #include "fsr3_upscaler.hpp"
 
 #include "vulkan_common.hpp"
+#include "camera_projection.hpp"
 
 #include <SDL3/SDL.h>
 
@@ -102,7 +103,7 @@ void Fsr3Upscaler::initialize(
     context_description_.header.pNext = &backend_description_.header;
     context_description_.flags =
         FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE |
-        FFX_UPSCALE_ENABLE_AUTO_EXPOSURE |
+        FFX_UPSCALE_ENABLE_DEPTH_INVERTED |
         FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION;
     if (context.validation_enabled()) {
         context_description_.flags |=
@@ -278,6 +279,7 @@ void Fsr3Upscaler::dispatch(const Fsr3Dispatch& description) {
         description.color == nullptr ||
         description.depth == nullptr ||
         description.motion_vectors == nullptr ||
+        description.exposure == nullptr ||
         description.output == nullptr ||
         description.render_extent.width == 0U ||
         description.render_extent.height == 0U ||
@@ -299,6 +301,9 @@ void Fsr3Upscaler::dispatch(const Fsr3Dispatch& description) {
         FFX_API_RESOURCE_STATE_COMPUTE_READ);
     dispatch_description.motionVectors = wrap_resource(
         *description.motion_vectors,
+        FFX_API_RESOURCE_STATE_COMPUTE_READ);
+    dispatch_description.exposure = wrap_resource(
+        *description.exposure,
         FFX_API_RESOURCE_STATE_COMPUTE_READ);
     dispatch_description.output = wrap_resource(
         *description.output,
@@ -324,10 +329,11 @@ void Fsr3Upscaler::dispatch(const Fsr3Dispatch& description) {
         std::clamp(description.frame_time_ms, 0.001F, 1000.0F);
     dispatch_description.preExposure = 1.0F;
     dispatch_description.reset = reset_history_;
-    dispatch_description.cameraNear = 0.1F;
-    dispatch_description.cameraFar = 500.0F;
+    // FidelityFX's inverted-depth API names follow depth 0 and depth 1.
+    dispatch_description.cameraNear = camera_far;
+    dispatch_description.cameraFar = camera_near;
     dispatch_description.cameraFovAngleVertical =
-        65.0F * 3.14159265358979323846F / 180.0F;
+        glm::radians(camera_vertical_fov);
     dispatch_description.viewSpaceToMetersFactor = 1.0F;
 
     const ffxReturnCode_t result = dispatch_(

@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -171,6 +172,18 @@ void expect(const bool condition, const std::string_view message) {
     return found == result.files.end()
         ? std::filesystem::path{}
         : found->relative_path;
+}
+
+[[nodiscard]] bool has_explicit_disabled_subsurface(
+    const nlohmann::json& material) {
+    const auto pbr = material.find("pbr");
+    return pbr != material.end() && pbr->is_object() &&
+        pbr->contains("subsurface_profile") &&
+        pbr->at("subsurface_profile").is_string() &&
+        pbr->at("subsurface_profile").get_ref<const std::string&>() == "none" &&
+        pbr->contains("subsurface_strength") &&
+        pbr->at("subsurface_strength").is_number() &&
+        pbr->at("subsurface_strength").get<float>() == 0.0F;
 }
 
 } // namespace
@@ -442,10 +455,35 @@ int main() {
                 std::abs(
                     roughness -
                     std::sqrt(2.0F / 66.0F)) < 0.0001F;
+            expect(material["pbr"].value("ior", 0.0F) == 1.5F &&
+                       material["pbr"].value("model", std::string{}) == "standard" &&
+                       has_explicit_disabled_subsurface(material),
+                   "legacy OBJ retains explicit standard and disabled-subsurface defaults");
         }
         expect(
             painted_material_found,
             "OBJ MTL is emitted as a separate authored material asset");
+    }
+
+    // Preserve the legacy contract even when OBJ Ni is authored: Assimp's
+    // default and an authored Ni=1.0 cannot be distinguished in its material API.
+    const auto legacy_ior_source = source_root / "legacy_ior.obj";
+    expect(write_text(material_source, std::string(material_text) + "Ni 2.4\n") &&
+               write_text(legacy_ior_source, model_text),
+           "legacy OBJ authored IOR fixture written");
+    const auto legacy_ior_import = vcr::import_asset(legacy_ior_source, options);
+    expect(static_cast<bool>(legacy_ior_import), "legacy OBJ with authored Ni still imports");
+    if (legacy_ior_import) {
+        bool found = false;
+        for (const auto& file : legacy_ior_import->files) {
+            if (file.kind != ImportedAssetKind::material) continue;
+            const auto material = read_json(asset_root / file.relative_path);
+            if (material.value("name", std::string{}) != "Painted") continue;
+            found = true;
+            expect(material["pbr"].value("ior", 0.0F) == 1.5F,
+                   "legacy formats retain IOR 1.5 until explicit provenance support exists");
+        }
+        expect(found, "legacy authored Ni fixture has its expected material");
     }
 
     const std::filesystem::path gltf_buffer_source =
@@ -505,6 +543,189 @@ int main() {
                     return file.kind == ImportedAssetKind::source;
                 }) == 2,
         "glTF with a sandboxed external buffer imports transactionally");
+
+    {
+        using Json = nlohmann::json;
+        auto optical = Json::parse(gltf_text);
+        optical["extensionsUsed"] = {"KHR_materials_ior"};
+        optical["materials"] = {{{"name", "Optical"}, {"extensions", {
+            {"KHR_materials_ior", {{"ior", 1.7654321F}}}}}}};
+        optical["meshes"][0]["primitives"][0]["material"] = 0;
+        const auto write_optical_source = [&](const std::filesystem::path& source, Json document) {
+            if (source.extension() == ".gltf") return write_text(source, document.dump());
+            document["buffers"][0].erase("uri");
+            auto json_text = document.dump();
+            while (json_text.size() % 4 != 0) json_text.push_back(' ');
+            std::vector<std::byte> binary(gltf_buffer.begin(), gltf_buffer.end());
+            while (binary.size() % 4 != 0) binary.push_back(std::byte{});
+            std::vector<std::byte> container;
+            const auto append_u32 = [&](std::uint32_t value) {
+                for (unsigned shift = 0; shift < 32; shift += 8) {
+                    container.push_back(static_cast<std::byte>((value >> shift) & 255U));
+                }
+            };
+            append_u32(0x46546C67U);
+            append_u32(2);
+            append_u32(static_cast<std::uint32_t>(28 + json_text.size() + binary.size()));
+            append_u32(static_cast<std::uint32_t>(json_text.size()));
+            append_u32(0x4E4F534AU);
+            for (const char value : json_text) container.push_back(static_cast<std::byte>(value));
+            append_u32(static_cast<std::uint32_t>(binary.size()));
+            append_u32(0x004E4942U);
+            container.insert(container.end(), binary.begin(), binary.end());
+            return write_binary(source, container);
+        };
+        const auto check_optical_import = [&](const auto& result, float expected_ior,
+                                               std::string_view expected_model) {
+            expect(static_cast<bool>(result), "authored glTF optical material imports");
+            if (!result) {
+                std::cerr << result.error().message << '\n';
+                return;
+            }
+            bool found = false;
+            for (const auto& file : result->files) {
+                if (file.kind != ImportedAssetKind::material) continue;
+                const auto material = read_json(asset_root / file.relative_path);
+                if (material.value("name", std::string{}) != "Optical") continue;
+                found = true;
+                expect(material["pbr"].value("ior", 0.0F) == expected_ior &&
+                           material["pbr"].value("model", std::string{}) == expected_model &&
+                           has_explicit_disabled_subsurface(material),
+                       "glTF/GLB optical fields survive cooking without inferred subsurface data");
+            }
+            expect(found, "authored optical material is present in cooked output");
+        };
+        std::size_t fixture_index = 0;
+        for (const char* extension : {".gltf", ".glb"}) {
+            const auto next_source = [&] {
+                return source_root / ("optical_" + std::to_string(fixture_index++) + extension);
+            };
+            for (const float ior : {1.0F, 1.7654321F, std::numeric_limits<float>::max()}) {
+                optical["materials"][0]["extensions"]["KHR_materials_ior"]["ior"] = ior;
+                const auto source = next_source();
+                expect(write_optical_source(source, optical), "optical import fixture written");
+                check_optical_import(vcr::import_asset(source, options), ior, "standard");
+            }
+            auto default_ior = optical;
+            default_ior["materials"][0]["extensions"]["KHR_materials_ior"].erase("ior");
+            const auto default_source = next_source();
+            expect(write_optical_source(default_source, default_ior), "default IOR extension fixture written");
+            check_optical_import(vcr::import_asset(default_source, options), 1.5F, "standard");
+            auto unlit_only = optical;
+            unlit_only["materials"][0]["extensions"].erase("KHR_materials_ior");
+            unlit_only["materials"][0]["extensions"]["KHR_materials_unlit"] = Json::object();
+            unlit_only["extensionsUsed"] = {"KHR_materials_unlit"};
+            const auto unlit_source = next_source();
+            expect(write_optical_source(unlit_source, unlit_only), "independent unlit extension fixture written");
+            check_optical_import(vcr::import_asset(unlit_source, options), 1.5F, "unlit");
+
+            auto standard = optical;
+            standard["materials"][0]["extensions"]["KHR_materials_ior"]["ior"] = 2.417123F;
+            standard["extensionsUsed"] = {"KHR_materials_ior"};
+            const auto standard_source = next_source();
+            expect(write_optical_source(standard_source, standard), "standard IOR fixture written");
+            check_optical_import(vcr::import_asset(standard_source, options), 2.417123F, "standard");
+
+            auto legacy = optical;
+            legacy["materials"][0].erase("extensions");
+            legacy.erase("extensionsUsed");
+            const auto legacy_source = next_source();
+            expect(write_optical_source(legacy_source, legacy), "legacy glTF material fixture written");
+            check_optical_import(vcr::import_asset(legacy_source, options), 1.5F, "standard");
+
+            auto separate_materials = standard;
+            separate_materials["extensionsUsed"].push_back("KHR_materials_unlit");
+            auto second_material = unlit_only["materials"][0];
+            second_material["name"] = "Unlit";
+            separate_materials["materials"].push_back(std::move(second_material));
+            auto second_primitive = separate_materials["meshes"][0]["primitives"][0];
+            second_primitive["material"] = 1;
+            separate_materials["meshes"][0]["primitives"].push_back(std::move(second_primitive));
+            const auto separate_source = next_source();
+            expect(write_optical_source(separate_source, separate_materials),
+                   "separate IOR and unlit materials fixture written");
+            check_optical_import(vcr::import_asset(separate_source, options), 2.417123F, "standard");
+
+            for (const char* excluded : {"KHR_materials_unlit", "KHR_materials_pbrSpecularGlossiness"}) {
+                auto incompatible = standard;
+                incompatible["extensionsUsed"].push_back(excluded);
+                incompatible["materials"][0]["extensions"][excluded] = Json::object();
+                const auto source = next_source();
+                expect(write_optical_source(source, incompatible), "incompatible glTF extensions fixture written");
+                const auto result = vcr::import_asset(source, options);
+                expect(!result && result.error().code == vcr::AssetImportErrorCode::invalid_asset_data &&
+                           result.error().message.find("KHR_materials_ior") != std::string::npos &&
+                           result.error().message.find(excluded) != std::string::npos &&
+                           !std::filesystem::exists(import_root / source.stem()) &&
+                           !has_staging_directory(import_root),
+                       "glTF/GLB rejects IOR exclusions transactionally with both extension names");
+            }
+
+            const std::array invalid_iors{Json(0), Json(-1), Json(.999999999), Json(1.0e39),
+                Json(nullptr), Json(true), Json("1.5"), Json::array({1.5}), Json::object()};
+            for (const auto& ior : invalid_iors) {
+                auto invalid = optical;
+                invalid["materials"][0]["extensions"]["KHR_materials_ior"]["ior"] = ior;
+                const auto source = next_source();
+                expect(write_optical_source(source, invalid), "invalid glTF IOR fixture written");
+                const auto result = vcr::import_asset(source, options);
+                expect(!result && result.error().code == vcr::AssetImportErrorCode::invalid_asset_data &&
+                           !std::filesystem::exists(import_root / source.stem()) &&
+                           !has_staging_directory(import_root),
+                       "glTF/GLB rejects invalid IOR before Assimp can replace it with defaults");
+                if (ior == Json(0)) {
+                    expect(!result && result.error().message.find("IOR 0") != std::string::npos,
+                           "unsupported glTF zero-IOR compatibility mode has a specific diagnostic");
+                }
+            }
+            for (const char* name : {"KHR_materials_ior", "KHR_materials_unlit"}) {
+                auto malformed = std::string_view(name) == "KHR_materials_ior" ? optical : unlit_only;
+                malformed["materials"][0]["extensions"][name] = true;
+                const auto source = next_source();
+                expect(write_optical_source(source, malformed), "malformed optical extension fixture written");
+                const auto result = vcr::import_asset(source, options);
+                expect(!result && result.error().code == vcr::AssetImportErrorCode::invalid_asset_data &&
+                           !has_staging_directory(import_root),
+                       "glTF/GLB optical extensions must be objects");
+            }
+            auto undeclared = optical;
+            undeclared.erase("extensionsUsed");
+            const auto undeclared_source = next_source();
+            expect(write_optical_source(undeclared_source, undeclared), "undeclared extension fixture written");
+            const auto undeclared_result = vcr::import_asset(undeclared_source, options);
+            expect(!undeclared_result &&
+                       undeclared_result.error().code == vcr::AssetImportErrorCode::invalid_asset_data &&
+                       !has_staging_directory(import_root),
+                   "undeclared optical extensions cannot silently fall back to Assimp defaults");
+        }
+        const auto valid_container_source = source_root / "optical_container.glb";
+        expect(write_optical_source(valid_container_source, optical), "GLB bounds fixture written");
+        const auto container_bytes = read_bytes(valid_container_source);
+        expect(container_bytes.size() >= 20, "GLB bounds fixture contains the complete header");
+        if (container_bytes.size() >= 20) {
+            for (const bool truncate : {false, true}) {
+                auto malformed = container_bytes;
+                if (truncate) {
+                    malformed.resize(19);
+                } else {
+                    // Advertise a JSON payload well outside the copied source,
+                    // while retaining the valid outer header and actual length.
+                    for (std::size_t byte = 12; byte < 16; ++byte) {
+                        malformed[byte] = std::byte{0xFF};
+                    }
+                    malformed[12] = std::byte{0xFC};
+                }
+                const auto source = source_root /
+                    (truncate ? "truncated_optical.glb" : "oversized_optical_json.glb");
+                expect(write_binary(source, malformed), "invalid GLB container fixture written");
+                const auto result = vcr::import_asset(source, options);
+                expect(!result && result.error().code == vcr::AssetImportErrorCode::invalid_asset_data &&
+                           result.error().message.find("GLB header") != std::string::npos &&
+                           !has_staging_directory(import_root),
+                       "GLB JSON preflight rejects truncated and oversized chunks before allocation");
+            }
+        }
+    }
 
     // glTF exports one image for both channels; Assimp exposes three aliases.
     // Check both external .gltf and the embedded GLB path used by Blender.

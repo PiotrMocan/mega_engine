@@ -3,6 +3,8 @@
 
 #include "pbr_lighting.glsl"
 #include "voxel_sampling.glsl"
+#include "punctual_lighting.glsl"
+#include "subsurface_output.glsl"
 
 layout(location = 0) in vec3 inWorldNormal;
 layout(location = 1) in vec4 inBaseColor;
@@ -11,7 +13,10 @@ layout(location = 3) in vec4 inShadowPosition;
 layout(location = 4) in vec3 inWorldPosition;
 layout(location = 5) in vec4 inMaterialParameters;
 
-layout(location = 0) out vec4 outColor;
+layout(location = 11) flat in float inDielectricF0;
+layout(location = 12) flat in uint inMaterialModel;
+layout(location = 14) flat in uint inSubsurfaceProfile;
+layout(location = 15) flat in float inSubsurfaceStrength;
 
 layout(set = 0, binding = 0, std140) uniform FrameUniforms
 {
@@ -102,36 +107,53 @@ vec3 sampleEnvironment(
 
 void main()
 {
-    const vec3 normal = normalize(inWorldNormal);
-    const vec3 viewDirection =
-        normalize(frame.cameraPosition.xyz - inWorldPosition);
-    const vec3 lightDirection =
-        normalize(frame.sunDirectionIntensity.xyz);
-    const float visibility = sunVisibility(normal, lightDirection);
-    vec3 diffuseAmbient=frame.skyAmbient.rgb*frame.skyAmbient.a;
-    if(lighting.options.x>0.5) diffuseAmbient=(lighting.skyZenith.rgb+lighting.skyHorizon.rgb)*0.175;
-    if(voxelGiCompiled && lighting.options.y>0.5) diffuseAmbient=voxelDiffuse(inWorldPosition,normal);
-    const vec3 directRadiance =
-        frame.sunColorSkyYaw.rgb
-        * frame.sunDirectionIntensity.w;
-    const float roughness =
-        clamp(
-            inMaterialParameters.y,
-            pbrMinimumRoughness,
-            1.0);
-    const vec3 environmentRadiance =
-        sampleEnvironment(normal, viewDirection, roughness)
-        * frame.skyAmbient.a;
-    vec3 shadedColor = evaluatePbrLighting(
-        clamp(inBaseColor.rgb, vec3(0.0), vec3(1.0)),
-        inMaterialParameters.xyz,
-        normal,
-        viewDirection,
-        lightDirection,
-        directRadiance,
-        diffuseAmbient,
-        environmentRadiance,
-        visibility);
+    vec3 shadedColor = clamp(inBaseColor.rgb, vec3(0.0), vec3(1.0));
+    PbrLightingComponents lightingComponents;
+    lightingComponents.diffuse = vec3(0.0);
+    lightingComponents.specular = vec3(0.0);
+    if (inMaterialModel != 1u) {
+        const vec3 normal = normalize(inWorldNormal);
+        const vec3 viewDirection =
+            normalize(frame.cameraPosition.xyz - inWorldPosition);
+        const vec3 lightDirection =
+            normalize(frame.sunDirectionIntensity.xyz);
+        const float visibility = sunVisibility(normal, lightDirection);
+        vec3 diffuseAmbient=frame.skyAmbient.rgb*frame.skyAmbient.a;
+        if(lighting.options.x>0.5) diffuseAmbient=(lighting.skyZenith.rgb+lighting.skyHorizon.rgb)*0.175;
+        if(voxelGiCompiled && lighting.options.y>0.5) diffuseAmbient=voxelDiffuse(inWorldPosition,normal);
+        const vec3 directRadiance =
+            frame.sunColorSkyYaw.rgb
+            * frame.sunDirectionIntensity.w;
+        const float roughness =
+            clamp(
+                inMaterialParameters.y,
+                pbrMinimumRoughness,
+                1.0);
+        const vec3 environmentRadiance =
+            sampleEnvironment(normal, viewDirection, roughness)
+            * frame.skyAmbient.a;
+        lightingComponents = evaluatePbrLightingComponents(
+            clamp(inBaseColor.rgb, vec3(0.0), vec3(1.0)),
+            inMaterialParameters.xyz,
+            normal,
+            viewDirection,
+            lightDirection,
+            directRadiance,
+            diffuseAmbient,
+            environmentRadiance,
+            visibility,
+            inDielectricF0);
+        const PbrLightingComponents punctual = evaluatePunctualLightingComponents(
+            clamp(inBaseColor.rgb, vec3(0.0), vec3(1.0)),
+            inMaterialParameters.xyz,
+            normal,
+            viewDirection,
+            inWorldPosition,
+            inDielectricF0);
+        lightingComponents.diffuse += punctual.diffuse;
+        lightingComponents.specular += punctual.specular;
+        shadedColor = lightingComponents.diffuse + lightingComponents.specular;
+    }
 
     if (pushConstants.workloadElementCount != 0u
         && pushConstants.workloadMix > 0.0)
@@ -150,7 +172,19 @@ void main()
             vec3(1.0),
             workloadModulation,
             clamp(pushConstants.workloadMix, 0.0, 1.0));
+        lightingComponents.diffuse *= mix(
+            vec3(1.0), workloadModulation,
+            clamp(pushConstants.workloadMix, 0.0, 1.0));
+        lightingComponents.specular *= mix(
+            vec3(1.0), workloadModulation,
+            clamp(pushConstants.workloadMix, 0.0, 1.0));
     }
 
-    outColor = vec4(shadedColor, inBaseColor.a);
+    writeLitSurface(
+        lightingComponents.diffuse, lightingComponents.specular, shadedColor,
+        inBaseColor.a, inMaterialModel, inSubsurfaceProfile,
+        inSubsurfaceStrength);
+#ifdef VCR_SSS_OUTPUT
+    outDepth = gl_FragCoord.z;
+#endif
 }

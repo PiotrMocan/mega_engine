@@ -1,11 +1,30 @@
 #include "renderer.hpp"
+#include "coarse_depth_order.hpp"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
+#include <utility>
 #include <glm/gtc/matrix_access.hpp>
 
 namespace vcr {
+bool Renderer::set_lod_fade(LodFadePattern pattern, float seconds) noexcept {
+    if ((pattern != LodFadePattern::off && pattern != LodFadePattern::bayer4 &&
+         pattern != LodFadePattern::bayer8) || !std::isfinite(seconds) ||
+        seconds < 0.05F || seconds > 2.0F) return false;
+    if (pattern == lod_fade_pattern_ && seconds == lod_fade_seconds_) return true;
+    lod_fade_pattern_ = pattern;
+    lod_fade_seconds_ = seconds;
+#if VCR_EDITOR_ENABLED
+    reset_lod_fades_ = true;
+    reset_lod_history_ = true;
+    packet_document_revision_ = 0;
+#endif
+    invalidate_temporal_history();
+    exposure_reset_pending_ = true;
+    return true;
+}
 #if VCR_EDITOR_ENABLED
 bool Renderer::set_runtime_transform(SceneNodeId id, TransformRows transform) noexcept {
     if (!runtime_transforms_.contains(id)) {
@@ -29,6 +48,18 @@ void Renderer::set_visibility_settings(VisibilitySettings settings) noexcept {
     shadow_dirty_ = true;
 }
 void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExtent2D extent) {
+    const auto forward = glm::normalize(glm::vec3(glm::row(vp, 3)));
+    // Large discontinuities and long pauses snap instead of fading stale LODs.
+    // Normal continuous motion advances in seconds, independent of frame rate.
+    if (lod_fade_pattern_ != LodFadePattern::off &&
+        (!lod_camera_valid_ || glm::length(camera - lod_camera_position_) > 25.0F ||
+         glm::dot(forward, lod_camera_forward_) < 0.70710678F || fsr_frame_time_ms_ > 250.0F)) {
+        reset_lod_fades_ = true;
+        reset_lod_history_ = true;
+    }
+    lod_camera_position_ = camera;
+    lod_camera_forward_ = forward;
+    lod_camera_valid_ = lod_fade_pattern_ != LodFadePattern::off;
     const bool gpu = visibility_pipeline_.get() != VK_NULL_HANDLE && !scene_metadata_.empty() &&
                      visibility_settings_.backend != VisibilitySettings::Backend::cpu &&
                      (visibility_settings_.backend == VisibilitySettings::Backend::gpu ||
@@ -44,6 +75,7 @@ void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExt
     }
     if (gpu_visibility_active_) {
         gpu_visibility_active_ = false;
+        reset_lod_fades_ = true;
         packet_document_revision_ = 0;
         for (auto &frame : frames_) {
             frame.scene_revision = 0;
@@ -51,13 +83,20 @@ void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExt
     }
     const bool data_changed = packet_runtime_revision_ != runtime_transforms_.revision() ||
                               packet_document_revision_ != editor_scene_revision_;
-    if (!data_changed && !visibility_settings_.frustum &&
+    const bool fade_enabled = lod_fade_pattern_ != LodFadePattern::off && visibility_settings_.lod;
+    const bool reset_fade = reset_lod_fades_ || packet_document_revision_ != editor_scene_revision_;
+    // Without camera-dependent membership/LOD, only clip.w can change the
+    // coarse keys. Exact equality also permits lateral motion and AA jitter
+    // to reuse the packet when that row remains bit-for-bit unchanged.
+    const bool depth_order_unchanged = !visibility_settings_.coarse_front_to_back ||
+        glm::row(vp, 3) == glm::row(packet_view_projection_, 3);
+    if (!data_changed && !lod_fades_active_ && !reset_fade && depth_order_unchanged && !visibility_settings_.frustum &&
         (!visibility_settings_.occlusion ||
          scene_metadata_.size() < visibility_settings_.occlusion_threshold) &&
         (!visibility_settings_.lod || (editor_model_draws_.empty() && !editor_terrain_visible_))) {
         return;
     }
-    if (!data_changed && extent.width == packet_extent_.width &&
+    if (!data_changed && !lod_fades_active_ && !reset_fade && extent.width == packet_extent_.width &&
         extent.height == packet_extent_.height && vp == packet_view_projection_) {
         return;
     }
@@ -82,21 +121,37 @@ void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExt
         (count <= 2048 || visibility_settings_.backend == VisibilitySettings::Backend::cpu);
     OcclusionGrid occlusion;
     std::array<std::pair<float, std::uint32_t>, 16> occluders{};
-    for (std::uint32_t i = 0; i < count; ++i) {
-        auto &instance = editor_scene_instances_[i];
-        const auto &metadata = scene_metadata_[i];
-        if (data_changed && runtime_transforms_.contains(metadata.id)) {
-            const auto t = runtime_transforms_.current(metadata.id);
-            instance.model_row_0 = t.x;
-            instance.model_row_1 = t.y;
-            instance.model_row_2 = t.z;
-        }
-        if (data_changed) {
+    if (data_changed) {
+        for (std::uint32_t i = 0; i < count; ++i) {
+            auto &instance = editor_scene_instances_[i];
+            const auto &metadata = scene_metadata_[i];
+            if (runtime_transforms_.contains(metadata.id)) {
+                const auto t = runtime_transforms_.current(metadata.id);
+                instance.model_row_0 = t.x;
+                instance.model_row_1 = t.y;
+                instance.model_row_2 = t.z;
+            }
             world_bounds_[i] = transform_bounds(metadata.local_bounds, instance.model_row_0,
                                                 instance.model_row_1, instance.model_row_2);
         }
+    }
+    bounds_hierarchy_active_ = false;
+    if (visibility_settings_.frustum && visibility_settings_.cpu_hierarchy) {
+        if (hierarchy_rebuild_required_ || (data_changed && !world_hierarchy_.valid())) {
+            // Topology changes are cold scene preparation. Transform changes
+            // retain the balanced topology and only refit its enclosure.
+            static_cast<void>(world_hierarchy_.build(world_bounds_));
+            hierarchy_rebuild_required_ = false;
+        } else if (data_changed) {
+            static_cast<void>(world_hierarchy_.refit(world_bounds_));
+        }
+        bounds_hierarchy_active_ = world_hierarchy_.query(frustum, instance_visibility_);
+    }
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const auto &metadata = scene_metadata_[i];
         const auto &b = world_bounds_[i];
-        const bool visible = !visibility_settings_.frustum || frustum.intersects(b);
+        const bool visible = bounds_hierarchy_active_ ? instance_visibility_[i] != 0 :
+            (!visibility_settings_.frustum || frustum.intersects(b));
         instance_visibility_[i] = visible ? 1U : 0U;
         if (use_occlusion && visible && metadata.occluder) {
             const float distance = glm::length(b.center - camera);
@@ -137,13 +192,37 @@ void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExt
         }
     }
     visibility_scratch_.clear();
-    const auto add_range = [this](std::uint32_t begin, std::uint32_t end) {
+    if (visibility_settings_.coarse_front_to_back) {
+        coarse_depth_keys_.resize(count);
+    }
+    const auto sort_range = [this, &vp](std::size_t first) {
+        if (!visibility_settings_.coarse_front_to_back || visibility_scratch_.size() - first < 2) {
+            return;
+        }
+        // Preserve batching boundaries and source indices. Only the appended
+        // visible packet changes order; the shadow/source packet stays intact.
+        // Calculate the finite/overflow-safe key once per visible instance,
+        // instead of repeating its double arithmetic for every comparison.
+        for (auto position = first; position < visibility_scratch_.size(); ++position) {
+            const auto index = lod_visibility_source(visibility_scratch_[position]);
+            coarse_depth_keys_[index] = coarse_depth_key(world_bounds_[index], vp);
+        }
+        std::sort(visibility_scratch_.begin() + static_cast<std::ptrdiff_t>(first),
+                  visibility_scratch_.end(), [this](std::uint32_t left, std::uint32_t right) {
+                      left = lod_visibility_source(left);
+                      right = lod_visibility_source(right);
+                      return std::pair{coarse_depth_keys_[left], left} <
+                             std::pair{coarse_depth_keys_[right], right};
+                  });
+    };
+    const auto add_range = [this, &sort_range](std::uint32_t begin, std::uint32_t end) {
         const auto first = visibility_scratch_.size();
         for (auto i = begin; i < end; ++i) {
             if (instance_visibility_[i]) {
                 visibility_scratch_.push_back(i);
             }
         }
+        sort_range(first);
         return static_cast<std::uint32_t>(visibility_scratch_.size() - first);
     };
     visible_ground_count_ = add_range(0, editor_ground_count_);
@@ -153,6 +232,7 @@ void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExt
     visibility_statistics_.lod_instances[0] = visible_ground_count_ + visible_cube_count_;
     visible_model_draws_.clear();
     bool lod_changed = false;
+    lod_fades_active_ = false;
     for (const auto &draw : editor_model_draws_) {
         const auto &asset = editor_model_assets_[draw.asset_index];
         const auto &submesh = asset.submeshes[draw.submesh_index];
@@ -175,19 +255,36 @@ void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExt
             const auto usable = std::isfinite(submesh.lod_error[lod]) ? lod : 0;
             lod_changed |= instance_lods_[i] != usable;
             instance_lods_[i] = static_cast<std::uint8_t>(usable);
+            if (fade_enabled) {
+                auto &fade = instance_lod_fades_[i];
+                advance_lod_fade(fade, usable, fsr_frame_time_ms_ * 0.001F,
+                                 lod_fade_seconds_, true,
+                                 reset_fade || instance_visibility_[i] == 0);
+                lod_fades_active_ |= fade.previous != fade.current && fade.progress < 1.0F;
+            }
         }
         for (unsigned lod = 0; lod < 3; ++lod) {
+            const auto first = visibility_scratch_.size();
             auto visible = draw;
-            visible.first_instance = count + static_cast<std::uint32_t>(visibility_scratch_.size());
+            visible.first_instance = static_cast<std::uint32_t>(visibility_scratch_.size());
             visible.instance_count = 0;
             visible.first_index = lod == 0 ? draw.first_index : submesh.lod_first[lod];
             visible.index_count = lod == 0 ? draw.index_count : submesh.lod_count[lod];
             for (auto i = draw.first_instance; i < draw.first_instance + draw.instance_count; ++i) {
-                if (instance_visibility_[i] && instance_lods_[i] == lod) {
-                    visibility_scratch_.push_back(i);
+                const auto &fade = instance_lod_fades_[i];
+                const bool transitioning = fade_enabled && fade.previous != fade.current && fade.progress < 1.0F;
+                const auto current_lod = fade_enabled ? fade.current : instance_lods_[i];
+                if (instance_visibility_[i] && (current_lod == lod ||
+                    (transitioning && fade.previous == lod))) {
+                    const auto token = transitioning
+                        ? encode_lod_visibility(i, fade.progress, fade.previous == lod, lod_fade_pattern_)
+                        : std::optional<std::uint32_t>{i};
+                    assert(token.has_value());
+                    visibility_scratch_.push_back(*token);
                     ++visible.instance_count;
                 }
             }
+            sort_range(first);
             if (visible.instance_count) {
                 visible_model_draws_.push_back(visible);
                 visibility_statistics_.lod_instances[lod] += visible.instance_count;
@@ -196,9 +293,11 @@ void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExt
             }
         }
     }
-    visibility_statistics_.visible = static_cast<std::uint32_t>(visibility_scratch_.size());
-    if (data_changed || lod_changed || visible_indices_ != visibility_scratch_) {
-        visible_indices_.assign(visibility_scratch_.begin(), visibility_scratch_.end());
+    // Draw emission counts include both LODs; visibility counts unique sources.
+    visibility_statistics_.visible = count - visibility_statistics_.frustum_rejected -
+                                      visibility_statistics_.occlusion_rejected;
+    reset_lod_fades_ = false;
+    if (data_changed) {
         scene_packet_.clear();
         for (std::uint32_t i = 0; i < count; ++i) {
             const auto &current = editor_scene_instances_[i];
@@ -212,12 +311,12 @@ void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExt
             // material's reserved GPU lane is not part of authored factors.
             scene_packet_.back().current.material.reserved = static_cast<float>(id ? id.index : i);
         }
-        // Source and destination are disjoint; the entire vector capacity was
-        // reserved before frames begin, so appending cannot invalidate source.
-        for (auto i : visible_indices_) {
-            const auto instance = scene_packet_[i];
-            scene_packet_.push_back(instance);
-        }
+        ++source_packet_revision_;
+    }
+    if (data_changed || lod_changed || visible_indices_ != visibility_scratch_) {
+        // Camera/LOD changes only rebuild indices. Original records retain
+        // their transforms and material data for both camera and shadow draws.
+        visible_indices_.assign(visibility_scratch_.begin(), visibility_scratch_.end());
         ++packet_revision_;
     }
     visibility_statistics_.packet_revision = packet_revision_;

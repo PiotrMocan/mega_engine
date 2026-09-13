@@ -14,6 +14,49 @@ void expect(bool ok, const char *message) {
 } // namespace
 int main() {
     using namespace vcr;
+    {
+        const PunctualLight point{.color = {1.0F, 0.5F, 0.25F},
+                                  .intensity_candela = 120.0F,
+                                  .range = 4.0F};
+        expect(valid_punctual_light(point, PunctualLightType::point),
+               "finite point-light photometric contract");
+        expect(std::abs(punctual_distance_attenuation(1.0F, 2.0F) - 15.0F / 16.0F) < 1e-6F &&
+                   std::abs(punctual_distance_attenuation(1.0F, 4.0F) - 255.0F / 256.0F) < 1e-6F &&
+                   std::abs(punctual_distance_attenuation(2.0F, 4.0F) - 15.0F / 64.0F) < 1e-6F &&
+                   punctual_distance_attenuation(4.0F, 4.0F) == 0.0F,
+               "punctual cutoff follows the KHR inverse-square reference");
+        expect(std::abs(punctual_distance_attenuation(0.0F, 4.0F) - 100.0F) < 0.001F,
+               "punctual singularity is bounded at the documented source radius");
+
+        PunctualLight spot = point;
+        spot.inner_cone_degrees = 20.0F;
+        spot.outer_cone_degrees = 30.0F;
+        const float inner_cosine = std::cos(glm::radians(spot.inner_cone_degrees));
+        const float outer_cosine = std::cos(glm::radians(spot.outer_cone_degrees));
+        expect(valid_punctual_light(spot, PunctualLightType::spot) &&
+                   punctual_spot_attenuation(inner_cosine, 20.0F, 30.0F) == 1.0F &&
+                   punctual_spot_attenuation(outer_cosine, 20.0F, 30.0F) == 0.0F &&
+                   punctual_spot_attenuation(-1.0F, 20.0F, 30.0F) == 0.0F,
+               "spot cone has finite complementary endpoints");
+
+        glm::mat4 world(1.0F);
+        world[0][0] = 2.0F;
+        world[1][1] = 3.0F;
+        world[2][2] = 4.0F;
+        world[3] = glm::vec4(3.0F, 2.0F, -7.0F, 1.0F);
+        GpuPunctualLight gpu{};
+        expect(make_gpu_punctual_light(spot, PunctualLightType::spot, world, gpu) &&
+                   glm::vec3(gpu.position_range) == glm::vec3(3.0F, 2.0F, -7.0F) &&
+                   gpu.position_range.w == 4.0F &&
+                   glm::vec3(gpu.direction_type) == glm::vec3(0.0F, 0.0F, -1.0F) &&
+                   gpu.direction_type.w == 1.0F && gpu.color_intensity.w == 120.0F,
+               "GPU local light ignores node scale for direction and range");
+
+        spot.outer_cone_degrees = spot.inner_cone_degrees;
+        expect(!valid_punctual_light(spot, PunctualLightType::spot) &&
+                   !make_gpu_punctual_light(spot, PunctualLightType::spot, world, gpu),
+               "invalid spot cone is rejected before GPU packing");
+    }
     expect(wrap_day_hour(-1) == 23 && wrap_day_hour(48) == 0, "day wraps both directions");
     expect(std::isfinite(wrap_day_hour(std::numeric_limits<double>::infinity())),
            "nonfinite hours stay safe");

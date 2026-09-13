@@ -6,6 +6,12 @@ const float pbrInversePi = 0.31830988618379067154;
 const float pbrInverseTwoPi = 0.15915494309189533577;
 const float pbrMinimumRoughness = 0.045;
 
+struct PbrLightingComponents
+{
+    vec3 diffuse;
+    vec3 specular;
+};
+
 vec3 fresnelSchlick(float cosine, vec3 reflectanceAtNormal)
 {
     const float oneMinusCosine =
@@ -102,16 +108,15 @@ vec2 directionToEquirectangularUv(
     return vec2(fract(longitude), latitude);
 }
 
-vec3 evaluatePbrLighting(
+PbrLightingComponents evaluatePbrDirectComponents(
     vec3 baseColor,
     vec3 materialParameters,
     vec3 normal,
     vec3 viewDirection,
     vec3 lightDirection,
     vec3 directRadiance,
-    vec3 diffuseAmbient,
-    vec3 environmentRadiance,
-    float directVisibility)
+    float directVisibility,
+    float dielectricF0)
 {
     const float metallic =
         clamp(materialParameters.x, 0.0, 1.0);
@@ -120,16 +125,16 @@ vec3 evaluatePbrLighting(
             materialParameters.y,
             pbrMinimumRoughness,
             1.0);
-    const float ambientOcclusion =
-        clamp(materialParameters.z, 0.0, 1.0);
     const float normalDotView =
         max(dot(normal, viewDirection), 1.0e-4);
     const float normalDotLight =
         max(dot(normal, lightDirection), 0.0);
     const vec3 reflectanceAtNormal =
-        mix(vec3(0.04), baseColor, metallic);
+        mix(vec3(dielectricF0), baseColor, metallic);
 
-    vec3 direct = vec3(0.0);
+    PbrLightingComponents direct;
+    direct.diffuse = vec3(0.0);
+    direct.specular = vec3(0.0);
     const vec3 halfVectorUnnormalized =
         viewDirection + lightDirection;
     const float halfVectorLengthSquared =
@@ -157,13 +162,67 @@ vec3 evaluatePbrLighting(
             distribution * visibility * fresnel;
         const vec3 diffuseBrdf =
             baseColor * (1.0 - metallic) * pbrInversePi;
-        direct =
-            ((vec3(1.0) - fresnel) * diffuseBrdf + specularBrdf)
-            * directRadiance
-            * normalDotLight
+        const vec3 incident = directRadiance * normalDotLight
             * clamp(directVisibility, 0.0, 1.0);
+        direct.diffuse = (vec3(1.0) - fresnel) * diffuseBrdf * incident;
+        direct.specular = specularBrdf * incident;
     }
 
+    direct.diffuse = max(direct.diffuse, vec3(0.0));
+    direct.specular = max(direct.specular, vec3(0.0));
+    return direct;
+}
+
+vec3 evaluatePbrDirect(
+    vec3 baseColor,
+    vec3 materialParameters,
+    vec3 normal,
+    vec3 viewDirection,
+    vec3 lightDirection,
+    vec3 directRadiance,
+    float directVisibility,
+    float dielectricF0)
+{
+    const PbrLightingComponents result = evaluatePbrDirectComponents(
+        baseColor, materialParameters, normal, viewDirection, lightDirection,
+        directRadiance, directVisibility, dielectricF0);
+    return result.diffuse + result.specular;
+}
+
+PbrLightingComponents evaluatePbrLightingComponents(
+    vec3 baseColor,
+    vec3 materialParameters,
+    vec3 normal,
+    vec3 viewDirection,
+    vec3 lightDirection,
+    vec3 directRadiance,
+    vec3 diffuseAmbient,
+    vec3 environmentRadiance,
+    float directVisibility,
+    float dielectricF0)
+{
+    const float metallic =
+        clamp(materialParameters.x, 0.0, 1.0);
+    const float roughness =
+        clamp(
+            materialParameters.y,
+            pbrMinimumRoughness,
+            1.0);
+    const float ambientOcclusion =
+        clamp(materialParameters.z, 0.0, 1.0);
+    const float normalDotView =
+        max(dot(normal, viewDirection), 1.0e-4);
+    const vec3 reflectanceAtNormal =
+        mix(vec3(dielectricF0), baseColor, metallic);
+    PbrLightingComponents result = evaluatePbrDirectComponents(
+        baseColor,
+        materialParameters,
+        normal,
+        viewDirection,
+        lightDirection,
+        directRadiance,
+        directVisibility,
+        dielectricF0);
     const vec3 ambientFresnel =
         fresnelSchlickRoughness(
             normalDotView,
@@ -179,10 +238,30 @@ vec3 evaluatePbrLighting(
            + integratedBrdf.y);
     const vec3 ambientDiffuse =
         diffuseWeight * baseColor * diffuseAmbient;
-    return max(
-        direct
-        + (ambientDiffuse + ambientSpecular) * ambientOcclusion,
-        vec3(0.0));
+    result.diffuse = max(
+        result.diffuse + ambientDiffuse * ambientOcclusion, vec3(0.0));
+    result.specular = max(
+        result.specular + ambientSpecular * ambientOcclusion, vec3(0.0));
+    return result;
+}
+
+vec3 evaluatePbrLighting(
+    vec3 baseColor,
+    vec3 materialParameters,
+    vec3 normal,
+    vec3 viewDirection,
+    vec3 lightDirection,
+    vec3 directRadiance,
+    vec3 diffuseAmbient,
+    vec3 environmentRadiance,
+    float directVisibility,
+    float dielectricF0)
+{
+    const PbrLightingComponents result = evaluatePbrLightingComponents(
+        baseColor, materialParameters, normal, viewDirection, lightDirection,
+        directRadiance, diffuseAmbient, environmentRadiance, directVisibility,
+        dielectricF0);
+    return result.diffuse + result.specular;
 }
 
 #endif

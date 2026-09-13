@@ -447,6 +447,7 @@ set(VCR_RENDERER_SOURCES
     src/runtime_scene.cpp
     src/renderer_scene.cpp
     src/lighting.cpp
+    src/punctual_light.cpp
     src/renderer_lighting.cpp
     src/renderer_gpu_visibility.cpp
     src/model_lod.cpp
@@ -454,6 +455,7 @@ set(VCR_RENDERER_SOURCES
     src/upload_batch.cpp
     src/renderer_assets.cpp
     src/scene_visibility.cpp
+    src/bounds_hierarchy.cpp
     src/runtime_assets.cpp
     src/swapchain.cpp
     src/vma.cpp
@@ -463,6 +465,7 @@ set(VCR_RENDERER_SOURCES
 add_executable(vulkan_cube
     src/main.cpp
     src/application.cpp
+    src/render_fixture_scene.cpp
     src/mcp_server.cpp
     src/scene_document.cpp
     src/scene_io.cpp
@@ -545,6 +548,37 @@ endfunction()
 
 vcr_configure_executable(vulkan_cube 1)
 vcr_configure_executable(vulkan_editor 1)
+
+# Explicit GPU numerical gate; ordinary CPU CTest does not silently require a GPU.
+add_executable(vcr_tone_mapping_gpu_tests EXCLUDE_FROM_ALL
+    tests/tone_mapping_gpu_tests.cpp src/vulkan_context.cpp src/vma.cpp src/gpu_buffer.cpp)
+vcr_configure_executable(vcr_tone_mapping_gpu_tests 0)
+target_compile_definitions(vcr_tone_mapping_gpu_tests PRIVATE
+    "VCR_TONE_MAPPING_TEST_SPV=\"${CMAKE_CURRENT_SOURCE_DIR}/shaders/spv/tone_mapping_reference.comp.spv\"")
+# Explicit exposure histogram/adaptation numeric gate; ordinary CTest stays CPU-only.
+add_executable(vcr_exposure_gpu_tests EXCLUDE_FROM_ALL
+    tests/exposure_gpu_tests.cpp src/vulkan_context.cpp src/vma.cpp src/gpu_buffer.cpp)
+vcr_configure_executable(vcr_exposure_gpu_tests 0)
+target_compile_definitions(vcr_exposure_gpu_tests PRIVATE
+    "VCR_EXPOSURE_TEST_SPV=\"${CMAKE_CURRENT_SOURCE_DIR}/shaders/spv/exposure_reference.comp.spv\"")
+# Explicit material numeric/ABI gate; never part of the ordinary CPU CTest run.
+add_executable(vcr_material_gpu_tests EXCLUDE_FROM_ALL
+    tests/material_gpu_tests.cpp src/vulkan_context.cpp src/vma.cpp src/gpu_buffer.cpp)
+vcr_configure_executable(vcr_material_gpu_tests 0)
+target_compile_definitions(vcr_material_gpu_tests PRIVATE
+    "VCR_MATERIAL_TEST_SPV=\"${CMAKE_CURRENT_SOURCE_DIR}/shaders/spv/material_reference.comp.spv\"")
+add_executable(vcr_lod_fade_gpu_tests EXCLUDE_FROM_ALL
+    tests/lod_fade_gpu_tests.cpp src/vulkan_context.cpp src/vma.cpp src/gpu_buffer.cpp)
+vcr_configure_executable(vcr_lod_fade_gpu_tests 0)
+target_compile_definitions(vcr_lod_fade_gpu_tests PRIVATE
+    "VCR_LOD_FADE_TEST_SPV=\"${CMAKE_CURRENT_SOURCE_DIR}/shaders/spv/lod_fade_reference.comp.spv\"")
+# Explicit 3D LUT interpolation gate; ordinary CPU CTest never requires a GPU.
+add_executable(vcr_color_grading_gpu_tests EXCLUDE_FROM_ALL
+    tests/color_grading_gpu_tests.cpp src/vulkan_context.cpp src/vma.cpp
+    src/gpu_buffer.cpp src/gpu_texture.cpp)
+vcr_configure_executable(vcr_color_grading_gpu_tests 0)
+target_compile_definitions(vcr_color_grading_gpu_tests PRIVATE
+    "VCR_COLOR_GRADING_TEST_SPV=\"${CMAKE_CURRENT_SOURCE_DIR}/shaders/spv/color_grading_reference.comp.spv\"")
 if(WIN32)
     add_custom_target(vcr_clang_tidy
         COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass -File
@@ -609,7 +643,21 @@ add_dependencies(vulkan_editor vcr_runtime_assets)
 
 include(CTest)
 if(BUILD_TESTING)
-    add_executable(vcr_lighting_tests tests/lighting_tests.cpp src/lighting.cpp src/scene_visibility.cpp)
+    add_executable(vcr_exposure_tests tests/exposure_tests.cpp)
+    target_include_directories(vcr_exposure_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    if(MSVC)
+        target_compile_options(vcr_exposure_tests PRIVATE /W4 /permissive- /EHsc)
+    endif()
+    add_test(NAME vcr_exposure_tests COMMAND vcr_exposure_tests)
+
+    add_executable(vcr_lod_transition_tests tests/lod_transition_tests.cpp)
+    target_include_directories(vcr_lod_transition_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    if(MSVC)
+        target_compile_options(vcr_lod_transition_tests PRIVATE /W4 /permissive- /EHsc)
+    endif()
+    add_test(NAME vcr_lod_transition_tests COMMAND vcr_lod_transition_tests)
+    add_executable(vcr_lighting_tests tests/lighting_tests.cpp src/lighting.cpp
+        src/punctual_light.cpp src/scene_visibility.cpp)
     target_include_directories(vcr_lighting_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_link_libraries(vcr_lighting_tests PRIVATE glm::glm)
     target_compile_definitions(vcr_lighting_tests PRIVATE GLM_FORCE_DEPTH_ZERO_TO_ONE GLM_FORCE_RADIANS)
@@ -618,8 +666,8 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME vcr_lighting_tests COMMAND vcr_lighting_tests)
     add_executable(vcr_runtime_tests tests/runtime_scene_tests.cpp
-        src/runtime_scene.cpp src/scene_visibility.cpp src/scene_document.cpp
-        src/model_lod.cpp src/asset_preparation.cpp)
+        src/runtime_scene.cpp src/scene_visibility.cpp src/bounds_hierarchy.cpp src/scene_document.cpp
+        src/model_lod.cpp src/asset_preparation.cpp src/punctual_light.cpp)
     target_include_directories(vcr_runtime_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_link_libraries(vcr_runtime_tests PRIVATE glm::glm meshoptimizer
         vcr_cooked_model_asset vcr_cooked_texture_asset Threads::Threads)
@@ -635,7 +683,9 @@ if(BUILD_TESTING)
         src/editor_scene_tools.cpp
         src/fly_camera.cpp
         src/performance_metrics.cpp
+        src/punctual_light.cpp
         src/png_encoder.cpp
+        src/render_fixture_scene.cpp
         src/scene_document.cpp
         src/scene_io.cpp
     )

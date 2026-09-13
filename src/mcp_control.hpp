@@ -26,6 +26,15 @@ enum class McpCommandType : std::uint8_t {
     render_set_gpu_workload,
     lighting_set,
     render_set_shadow_resolution,
+    render_set_shadow_cache,
+    render_set_tone_mapper,
+    render_set_exposure,
+    render_set_color_grading,
+    render_set_subsurface,
+    render_set_motion_blur,
+    render_set_anti_aliasing,
+    render_set_depth_prepass,
+    render_set_lod_fade,
     test_set_roof,
     render_set_present_mode,
     window_set_fullscreen,
@@ -105,6 +114,15 @@ struct McpCommand {
     static constexpr std::uint32_t edit_metallic = 1U << 7U;
     static constexpr std::uint32_t edit_roughness = 1U << 8U;
     static constexpr std::uint32_t edit_ambient_occlusion = 1U << 9U;
+    static constexpr std::uint32_t edit_ior = 1U << 10U;
+    static constexpr std::uint32_t edit_material_model = 1U << 11U;
+    static constexpr std::uint32_t edit_light_color = 1U << 12U;
+    static constexpr std::uint32_t edit_light_intensity = 1U << 13U;
+    static constexpr std::uint32_t edit_light_range = 1U << 14U;
+    static constexpr std::uint32_t edit_spot_inner = 1U << 15U;
+    static constexpr std::uint32_t edit_spot_outer = 1U << 16U;
+    static constexpr std::uint32_t edit_subsurface_profile = 1U << 17U;
+    static constexpr std::uint32_t edit_subsurface_strength = 1U << 18U;
 
     std::uint64_t token = 0;
     McpCommandType type = McpCommandType::debug_get_state;
@@ -118,13 +136,23 @@ struct McpCommand {
     std::uint32_t height = 0;
     float mouse_delta_x = 0.0F;
     float mouse_delta_y = 0.0F;
+    float lod_fade_seconds = 0.25F;
+    bool lod_fade_seconds_supplied = false;
     bool enabled = false;
     LightingSettings lighting{};
+    ExposureSettings exposure{};
+    ColorGrading color_grading = ColorGrading::off;
+    ColorGradingLutSize color_grading_lut_size = ColorGradingLutSize::size_32;
+    SubsurfaceMode subsurface = SubsurfaceMode::off;
+    MotionBlurSettings motion_blur{};
+    SmaaMode smaa_mode = SmaaMode::x1;
+    bool smaa_mode_supplied = false;
     SceneNodeId node_id{};
     SceneNodeId parent_id{};
     SceneNodeKind node_kind = SceneNodeKind::folder;
     SceneTransform transform{};
     PbrMaterial material{};
+    PunctualLight light{};
     std::array<char, max_scene_node_name_bytes + 1U> name{};
     std::array<char, text_capacity> text{};
     std::array<char, secondary_text_capacity> secondary_text{};

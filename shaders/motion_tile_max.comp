@@ -1,0 +1,47 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "motion_blur_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 16, rgba16f) uniform writeonly image2D tileMaximum;
+
+shared vec4 candidates[64];
+
+void main()
+{
+    const ivec2 sourceExtent = textureSize(motionVectors, 0);
+    const ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy) * 16;
+    vec4 best = vec4(0.0, 0.0, postProcess.cameraFarPlane, 0.0);
+    float bestMagnitude = -1.0;
+    for (int y = int(gl_LocalInvocationID.y); y < 16; y += 8) {
+        for (int x = int(gl_LocalInvocationID.x); x < 16; x += 8) {
+            const ivec2 pixel = tileOrigin + ivec2(x, y);
+            if (any(greaterThanEqual(pixel, sourceExtent))) continue;
+            float depth;
+            const vec2 motion = effectiveMotionAt(pixel, depth);
+            const float magnitude = length(limitedMotionPixels(motion));
+            if (magnitude > bestMagnitude) {
+                bestMagnitude = magnitude;
+                best = vec4(motion, depth, 1.0);
+            }
+        }
+    }
+    const uint localIndex = gl_LocalInvocationIndex;
+    candidates[localIndex] = best;
+    barrier();
+
+    for (uint stride = 32u; stride != 0u; stride >>= 1u) {
+        if (localIndex < stride) {
+            const vec4 other = candidates[localIndex + stride];
+            if (length(limitedMotionPixels(other.xy)) >
+                length(limitedMotionPixels(candidates[localIndex].xy))) {
+                candidates[localIndex] = other;
+            }
+        }
+        barrier();
+    }
+    if (localIndex == 0u) {
+        imageStore(tileMaximum, ivec2(gl_WorkGroupID.xy), candidates[0]);
+    }
+}

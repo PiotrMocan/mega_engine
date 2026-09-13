@@ -1,6 +1,7 @@
 #include "application.hpp"
 
 #include "runtime_assets.hpp"
+#include "render_fixture_scene.hpp"
 #include "scene_io.hpp"
 #include "vulkan_common.hpp"
 
@@ -68,8 +69,14 @@ using Json = nlohmann::json;
         {"present_ms", timings.present_ms},
         {"gpu_frame_ms", timings.gpu_frame_ms},
         {"gpu_geometry_ms", timings.gpu_geometry_ms},
+        {"gpu_light_culling_ms", timings.gpu_light_culling_ms},
         {"gpu_workload_ms", timings.gpu_workload_ms},
         {"gpu_shadow_ms", timings.gpu_shadow_ms},
+        {"gpu_postprocess_ms", timings.gpu_postprocess_ms},
+        {"gpu_display_ms", timings.gpu_display_ms},
+        {"gpu_exposure_ms", timings.gpu_exposure_ms},
+        {"gpu_subsurface_ms", timings.gpu_subsurface_ms},
+        {"gpu_depth_prepass_ms", timings.gpu_depth_prepass_ms},
         {"gpu_voxel_geometry_ms", timings.gpu_voxel_geometry_ms},
         {"gpu_voxel_light_ms", timings.gpu_voxel_light_ms},
         {"gpu_visibility_ms", timings.gpu_visibility_ms},
@@ -152,7 +159,7 @@ void Application::initialize(const CliOptions& options) {
         preferred_present = VK_PRESENT_MODE_FIFO_KHR;
         break;
     }
-    if (!options.lighting_room && options.scene_count == 0) {
+    if (!options.lighting_room && options.scene_count == 0 && options.render_fixture == RenderFixture::none) {
         const auto asset_root = find_runtime_asset_root();
         if (!asset_root) fatal("Unable to locate the runtime assets directory.");
         std::string error;
@@ -162,13 +169,41 @@ void Application::initialize(const CliOptions& options) {
     const auto lighting = resolve_scene_lighting(options, scene_.lighting);
     renderer_.initialize(context_, window_.get(), preferred_present, options.initial_mode,
                          options.instances, options.gpu_workload_iterations, options.anti_aliasing,
-                         options.mcp_stdio, false, true, lighting);
+                         options.mcp_stdio, false,
+                         options.render_fixture != RenderFixture::material_spheres &&
+                             options.render_fixture != RenderFixture::subsurface_profiles,
+                         lighting, options.render_fixture);
+    if (!renderer_.set_local_light_backend(options.local_light_backend)) {
+        fatal("Invalid local-lighting backend");
+    }
+    static_cast<void>(renderer_.set_tone_mapper(options.tone_mapper));
+    if (!renderer_.set_exposure_settings(options.exposure)) {
+        fatal("Invalid exposure settings");
+    }
+    if (!renderer_.set_color_grading(
+            options.color_grading, options.color_grading_lut_size)) {
+        fatal("Invalid color grading settings");
+    }
+    if (!renderer_.set_subsurface_mode(options.subsurface)) {
+        fatal("Invalid subsurface mode");
+    }
+    if (!renderer_.set_motion_blur_settings(options.motion_blur)) {
+        fatal("Invalid motion blur settings for the selected AA mode");
+    }
+    if (!renderer_.set_depth_prepass(options.depth_prepass)) {
+        fatal("Invalid depth prepass mode");
+    }
+    if (!renderer_.set_lod_fade(options.lod_fade, options.lod_fade_seconds)) {
+        fatal("Invalid model LOD fade settings");
+    }
     load_canonical_scene();
     camera_ = scene_startup_camera(scene_,
         options.camera_z_explicit || options.animate_camera
             ? std::optional<double>(options.camera_z) : std::nullopt);
     VisibilitySettings visibility{options.frustum_culling, options.occlusion_culling, options.lod,
                                   options.dynamic_shadows};
+    visibility.coarse_front_to_back = options.coarse_front_to_back;
+    visibility.cpu_hierarchy = options.cpu_hierarchy;
     visibility.backend = options.visibility_backend == "cpu" ? VisibilitySettings::Backend::cpu
                          : options.visibility_backend == "gpu"
                              ? VisibilitySettings::Backend::gpu
@@ -213,6 +248,8 @@ void Application::initialize(const CliOptions& options) {
 }
 
 void Application::load_canonical_scene() {
+    if (options_.render_fixture == RenderFixture::material_spheres ||
+        options_.render_fixture == RenderFixture::subsurface_profiles) return;
     const auto asset_root = find_runtime_asset_root();
     if (!asset_root) {
         fatal("Unable to locate the runtime assets directory.");
@@ -220,6 +257,43 @@ void Application::load_canonical_scene() {
     const std::filesystem::path scene_path =
         asset_root->path / canonical_scene_relative_path;
     std::string error;
+    if (options_.render_fixture != RenderFixture::none) {
+        const auto layers = options_.render_fixture == RenderFixture::overdraw_16 ? 16U
+                          : options_.render_fixture == RenderFixture::overdraw_4 ? 4U : 1U;
+        if (options_.render_fixture == RenderFixture::cascade_cache) {
+            scene_ = make_cascade_cache_fixture(static_cast<float>(options_.camera_z));
+        } else if (options_.render_fixture == RenderFixture::light_swarm) {
+            scene_ = make_light_swarm_fixture(
+                static_cast<float>(options_.camera_z), options_.local_light_count,
+                options_.light_swarm_layout);
+        } else if (options_.render_fixture == RenderFixture::aa_wires) {
+            scene_ = make_aa_wires_fixture(static_cast<float>(options_.camera_z));
+        } else if (options_.render_fixture == RenderFixture::motion_bars) {
+            scene_ = make_motion_bars_fixture(static_cast<float>(options_.camera_z));
+        } else {
+            scene_ = make_overdraw_fixture(static_cast<float>(options_.camera_z), layers);
+        }
+        scene_instances_.reserve(max_scene_nodes);
+        scene_models_.reserve(max_scene_nodes);
+        const auto view = scene_.build_render_view(
+            scene_instances_, scene_models_, scene_lights_);
+        if (view.cubes.size() > 1) {
+            animated_node_ = view.cube_ids[1];
+            const auto &caster = view.cubes[1];
+            animation_origin_ = {caster.model_row_0, caster.model_row_1, caster.model_row_2};
+        }
+        if (options_.render_fixture == RenderFixture::motion_bars &&
+            view.cubes.size() > 2U) {
+            secondary_animated_node_ = view.cube_ids[2];
+            const auto& bar = view.cubes[2];
+            secondary_animation_origin_ = {
+                bar.model_row_0, bar.model_row_1, bar.model_row_2};
+        }
+        if (!renderer_.update_editor_scene(view, asset_root->path, error)) {
+            fatal(error);
+        }
+        return;
+    }
     if (options_.lighting_room) {
         scene_instances_.reserve(max_scene_nodes);
         scene_models_.reserve(max_scene_nodes);
@@ -297,7 +371,7 @@ void Application::load_canonical_scene() {
     scene_instances_.reserve(max_scene_nodes);
     scene_models_.reserve(max_scene_nodes);
     const SceneRenderView view =
-        scene_.build_render_view(scene_instances_, scene_models_);
+        scene_.build_render_view(scene_instances_, scene_models_, scene_lights_);
     if (!view.cubes.empty()) {
         animated_node_ = view.cube_ids.front();
         const auto &instance = view.cubes.front();
@@ -337,7 +411,8 @@ void Application::set_lighting_room_roof(bool enabled) {
     if (!root)
         fatal("Unable to locate runtime assets while updating the lighting test room");
     std::string error;
-    const auto view = scene_.build_render_view(scene_instances_, scene_models_);
+    const auto view = scene_.build_render_view(
+        scene_instances_, scene_models_, scene_lights_);
     if (!renderer_.update_editor_scene(view, root->path, error))
         fatal(error);
 }
@@ -384,7 +459,8 @@ void Application::service_assets() {
         auto &node = scene_.node(id)->get();
         node.asset_path = options_.stream_asset;
         node.transform = transform;
-        const auto view = scene_.build_render_view(scene_instances_, scene_models_);
+        const auto view = scene_.build_render_view(
+            scene_instances_, scene_models_, scene_lights_);
         if (!renderer_.update_editor_scene(view, root->path, error)) {
             fatal(error);
         }
@@ -452,11 +528,25 @@ void Application::main_loop() {
                                  4, static_cast<float>(options_.camera_z)});
         }
         if (options_.animate_scene && animated_node_) {
-            animation_time_ += camera_delta_seconds;
+            const double animation_delta_seconds =
+                options_.render_fixture == RenderFixture::motion_bars &&
+                        options_.motion_fixture_fps != 0U
+                    ? 1.0 / static_cast<double>(options_.motion_fixture_fps)
+                    : camera_delta_seconds;
+            animation_time_ += animation_delta_seconds;
             auto transform = animation_origin_;
             transform.x.w += 2.0F * static_cast<float>(std::sin(animation_time_ * 1.3));
             transform.y.w += 0.5F * static_cast<float>(std::sin(animation_time_ * 0.7));
             static_cast<void>(renderer_.set_runtime_transform(animated_node_, transform));
+            if (secondary_animated_node_) {
+                auto secondary = secondary_animation_origin_;
+                secondary.x.w -= 1.6F * static_cast<float>(
+                    std::sin(animation_time_ * 1.3));
+                secondary.y.w -= 0.7F * static_cast<float>(
+                    std::sin(animation_time_ * 0.9));
+                static_cast<void>(renderer_.set_runtime_transform(
+                    secondary_animated_node_, secondary));
+            }
         }
 
         int pixel_width = 0;
@@ -753,7 +843,10 @@ void Application::execute_mcp_command(const McpCommand& command) {
                 {"screenshot_supported",
                  renderer_.screenshot_supported()},
                 {"anti_aliasing", Json{
-                    {"methods", Json::array({"off", "smaa", "fsr3"})},
+                    {"methods", Json::array({
+                        "off", "smaa", "fsr3", "msaa2x", "msaa4x"})},
+                    {"smaa_modes", Json::array({"1x", "t2x"})},
+                    {"smaa_edge_detection", "color"},
                     {"smaa_qualities", Json::array({
                         "low", "medium", "high", "ultra"})},
                     {"fsr3_qualities", Json::array({
@@ -762,6 +855,13 @@ void Application::execute_mcp_command(const McpCommand& command) {
                     {"fsr3_available", renderer_.fsr3_available()},
                     {"fsr3_version",
                      std::string(renderer_.fsr3_version())},
+                    {"msaa_2x_available", renderer_.supports_msaa(AntiAliasingMethod::msaa2x)},
+                    {"msaa_4x_available", renderer_.supports_msaa(AntiAliasingMethod::msaa4x)},
+                    {"msaa_sample_shading", false},
+                    {"msaa_color_format", "rgba16f"},
+                    {"msaa_depth_format", std::string(renderer_.msaa_depth_format_name())},
+                    {"msaa_color_resolve", "average"},
+                    {"msaa_depth_resolve", "none"},
                 }},
                 {"present_modes", std::move(present_modes)},
                 {"limits", Json{
@@ -798,12 +898,98 @@ void Application::execute_mcp_command(const McpCommand& command) {
                      {"mode", std::string(to_string(renderer_.mode()))},
                      {"instances", renderer_.instance_count()},
                      {"triangles", renderer_.triangle_count()},
+                     {"depth_convention", "reverse-z"},
+                     {"render_fixture", to_token(options_.render_fixture)},
+                     {"tone_mapper", to_token(renderer_.tone_mapper())},
+                     {"exposure",
+                      Json{
+                          {"mode_requested", to_token(renderer_.exposure_settings().mode)},
+                          {"mode_actual", to_token(renderer_.exposure_mode_actual())},
+                          {"metering", to_token(renderer_.exposure_settings().metering)},
+                          {"compensation_ev", renderer_.exposure_settings().compensation_ev},
+                          {"minimum_ev", renderer_.exposure_settings().minimum_ev},
+                          {"maximum_ev", renderer_.exposure_settings().maximum_ev},
+                          {"low_percentile", renderer_.exposure_settings().low_percentile},
+                          {"high_percentile", renderer_.exposure_settings().high_percentile},
+                          {"brighten_seconds", renderer_.exposure_settings().brighten_seconds},
+                          {"darken_seconds", renderer_.exposure_settings().darken_seconds},
+                          {"multiplier", renderer_.exposure_mode_actual() == ExposureMode::fixed
+                              ? fixed_exposure_multiplier(renderer_.exposure_settings())
+                              : renderer_.exposure_state().exposure},
+                          {"target_multiplier", renderer_.exposure_mode_actual() == ExposureMode::fixed
+                              ? fixed_exposure_multiplier(renderer_.exposure_settings())
+                              : renderer_.exposure_state().target_exposure},
+                          {"average_luminance", renderer_.exposure_state().average_luminance},
+                          {"sample_weight", renderer_.exposure_state().sample_weight},
+                          {"invalid_samples", renderer_.exposure_state().invalid_sample_count},
+                      }},
+                      {"color_grading",
+                      Json{
+                          {"mode_requested", to_token(renderer_.color_grading())},
+                          {"mode_actual", to_token(renderer_.color_grading_actual())},
+                          {"lut", "identity"},
+                          {"size", grading_lut_size(renderer_.color_grading_lut_size())},
+                          {"format", "rgba16f"},
+                          {"domain", "linear-rec709-[0,1]"},
+                           {"resident_bytes", 2'359'296U},
+                       }},
+                      {"subsurface", Json{
+                          {"mode_requested", to_token(renderer_.subsurface_mode())},
+                          {"mode_actual", to_token(renderer_.subsurface_mode_actual())},
+                          {"supported", true},
+                          {"provisioned", renderer_.subsurface_resources_provisioned()},
+                          {"active_material_count", renderer_.subsurface_active_material_count()},
+                          {"render_width", renderer_.render_extent().width},
+                          {"render_height", renderer_.render_extent().height},
+                          {"resident_bytes", renderer_.subsurface_resident_bytes()},
+                      }},
+                      {"motion_blur", Json{
+                          {"mode_requested", to_token(renderer_.motion_blur_settings().mode)},
+                          {"mode_actual", to_token(renderer_.motion_blur_mode_actual())},
+                          {"quality", to_token(renderer_.motion_blur_settings().quality)},
+                          {"shutter", to_token(renderer_.motion_blur_settings().shutter)},
+                          {"angle_degrees", renderer_.motion_blur_settings().shutter_angle_degrees},
+                          {"maximum_radius_pixels", renderer_.motion_blur_settings().maximum_radius_pixels},
+                          {"camera_fade_start", renderer_.motion_blur_settings().camera_fade_start},
+                          {"camera_fade_end", renderer_.motion_blur_settings().camera_fade_end},
+                      }},
+                      {"depth_prepass", to_token(renderer_.depth_prepass())},
+                     {"lod_fade_requested", to_token(renderer_.lod_fade_pattern())},
+                     {"lod_fade_actual", to_token(renderer_.lod_fade_actual())},
+                     {"lod_fade_seconds_requested", renderer_.lod_fade_seconds()},
+                     {"lod_fade_seconds_actual", renderer_.lod_fade_seconds()},
+                     {"front_to_back_requested",
+                      renderer_.visibility_settings().coarse_front_to_back ? "coarse" : "off"},
+                     {"cpu_culling_requested",
+                      renderer_.visibility_settings().cpu_hierarchy ? "hierarchy" : "linear"},
+                     {"cpu_culling_actual", renderer_.cpu_culling_path()},
+                     {"front_to_back_actual", renderer_.coarse_depth_order_active() ? "coarse" : "off"},
                      {"lighting",
                       Json{{"dynamic", renderer_.lighting_settings().dynamic},
                            {"hour", renderer_.lighting_settings().hour},
                            {"cycle", renderer_.lighting_settings().cycle},
                            {"voxel_gi", renderer_.lighting_settings().voxel_gi},
                            {"shadow_resolution", renderer_.shadow_resolution()},
+                           {"shadow_depth_requested", to_token(renderer_.lighting_settings().shadow_depth)},
+                           {"shadow_depth_actual", renderer_.shadow_depth_format()},
+                           {"shadow_linear_filter", renderer_.shadow_linear_filter()},
+                           {"cascade_cache", renderer_.lighting_settings().cascade_cache},
+                           {"local_light_backend_requested",
+                            to_token(renderer_.local_light_backend())},
+                           {"local_light_backend_actual",
+                            to_token(renderer_.local_light_backend_actual())},
+                           {"local_light_count", renderer_.local_light_count()},
+                           {"local_light_assignments",
+                            renderer_.local_light_statistics().assignments},
+                           {"local_light_maximum_list",
+                            renderer_.local_light_statistics().maximum_list_length},
+                           {"local_light_overflow_clusters",
+                            renderer_.local_light_statistics().overflow_clusters},
+                           {"local_light_dropped",
+                            renderer_.local_light_statistics().dropped_lights},
+                           {"shadow_passes", renderer_.lighting_statistics().shadow_passes},
+                           {"shadow_tiles", renderer_.lighting_statistics().shadow_tiles},
+                           {"last_shadow_mask", renderer_.lighting_statistics().last_shadow_mask},
                            {"shadow_resolution_requested", renderer_.lighting_settings().shadow_resolution},
                            {"geometry_updates", renderer_.lighting_statistics().geometry_updates},
                            {"radiance_updates", renderer_.lighting_statistics().radiance_updates},
@@ -824,13 +1010,40 @@ void Application::execute_mcp_command(const McpCommand& command) {
                           {"packet_revision", renderer_.visibility_statistics().packet_revision},
                       }},
                      {"gpu_workload_iterations", renderer_.gpu_workload_iterations()},
-                     {"anti_aliasing",
-                      Json{
-                          {"method", std::string(to_token(anti_aliasing.method))},
-                          {"display_name", std::string(to_string(anti_aliasing.method))},
-                          {"quality", std::string(renderer_.anti_aliasing_quality_name())},
-                          {"fsr3_available", renderer_.fsr3_available()},
-                      }},
+                      {"anti_aliasing",
+                       Json{
+                           {"requested_method", std::string(to_token(
+                               renderer_.anti_aliasing_requested_method()))},
+                           {"method", std::string(to_token(anti_aliasing.method))},
+                           {"display_name", std::string(to_string(anti_aliasing))},
+                           {"quality", std::string(renderer_.anti_aliasing_quality_name())},
+                           {"smaa_mode", std::string(to_string(anti_aliasing.smaa_mode))},
+                           {"smaa_temporal", is_temporal_smaa(anti_aliasing)},
+                           {"smaa_history_valid", renderer_.smaa_history_valid()},
+                           {"smaa_temporal_phase", renderer_.smaa_temporal_phase()},
+                           {"smaa_history_resident_bytes", is_temporal_smaa(anti_aliasing)
+                                ? renderer_.smaa_history_resident_bytes() : 0U},
+                           {"smaa_history_width", is_temporal_smaa(anti_aliasing)
+                                ? renderer_.render_extent().width : 0U},
+                           {"smaa_history_height", is_temporal_smaa(anti_aliasing)
+                                ? renderer_.render_extent().height : 0U},
+                           {"smaa_history_incremental_bytes", 0U},
+                           {"smaa_history_reuses_fsr_output", is_temporal_smaa(anti_aliasing)},
+                           {"fsr3_available", renderer_.fsr3_available()},
+                           {"requested_sample_count", anti_aliasing_sample_count(
+                               renderer_.anti_aliasing_requested_method())},
+                           {"sample_count", renderer_.anti_aliasing_sample_count_actual()},
+                           {"msaa_2x_available", renderer_.supports_msaa(AntiAliasingMethod::msaa2x)},
+                           {"msaa_4x_available", renderer_.supports_msaa(AntiAliasingMethod::msaa4x)},
+                           {"sample_shading", false},
+                           {"color_format", "rgba16f"},
+                           {"depth_format", std::string(renderer_.msaa_depth_format_name())},
+                           {"color_resolve", is_msaa(anti_aliasing.method) ? "average" : "none"},
+                           {"depth_resolve", "none"},
+                           {"resident_bytes", renderer_.msaa_resident_bytes()},
+                           {"target_width", renderer_.msaa_target_extent().width},
+                           {"target_height", renderer_.msaa_target_extent().height},
+                       }},
                      {"present_mode",
                       Swapchain::present_mode_name(renderer_.swapchain().present_mode())},
                      {"screenshot_pending", renderer_.screenshot_pending()},
@@ -989,6 +1202,150 @@ void Application::execute_mcp_command(const McpCommand& command) {
         }
         succeed("Shadow resolution requested; applies at the next rendered frame",
                 Json{{"resolution", settings.shadow_resolution}});
+        return;
+    }
+    case McpCommandType::render_set_tone_mapper: {
+        if (!renderer_.set_tone_mapper(static_cast<ToneMapper>(command.value))) {
+            fail("Invalid tone mapper");
+            return;
+        }
+        succeed("Tone mapper applied", Json{{"tone_mapper", to_token(renderer_.tone_mapper())}});
+        return;
+    }
+    case McpCommandType::render_set_exposure: {
+        if (!renderer_.set_exposure_settings(command.exposure)) {
+            fail("Invalid exposure settings");
+            return;
+        }
+        renderer_.reset_metrics();
+        succeed("Exposure settings applied", Json{
+            {"mode_requested", to_token(renderer_.exposure_settings().mode)},
+            {"mode_actual", to_token(renderer_.exposure_mode_actual())},
+            {"metering", to_token(renderer_.exposure_settings().metering)},
+            {"compensation_ev", renderer_.exposure_settings().compensation_ev},
+            {"minimum_ev", renderer_.exposure_settings().minimum_ev},
+            {"maximum_ev", renderer_.exposure_settings().maximum_ev},
+            {"low_percentile", renderer_.exposure_settings().low_percentile},
+            {"high_percentile", renderer_.exposure_settings().high_percentile},
+            {"brighten_seconds", renderer_.exposure_settings().brighten_seconds},
+            {"darken_seconds", renderer_.exposure_settings().darken_seconds},
+        });
+        return;
+    }
+    case McpCommandType::render_set_color_grading: {
+        if (!renderer_.set_color_grading(
+                command.color_grading, command.color_grading_lut_size)) {
+            fail("Invalid color grading settings");
+            return;
+        }
+        renderer_.reset_metrics();
+        succeed("Color grading settings applied", Json{
+            {"mode_requested", to_token(renderer_.color_grading())},
+            {"mode_actual", to_token(renderer_.color_grading_actual())},
+            {"lut", "identity"},
+            {"size", grading_lut_size(renderer_.color_grading_lut_size())},
+            {"format", "rgba16f"},
+            {"domain", "linear-rec709-[0,1]"},
+        });
+        return;
+    }
+    case McpCommandType::render_set_subsurface: {
+        if (!renderer_.set_subsurface_mode(command.subsurface)) {
+            fail("Invalid subsurface mode");
+            return;
+        }
+        renderer_.reset_metrics();
+        succeed("Subsurface mode requested; lazy resources apply at the next rendered frame", Json{
+            {"mode_requested", to_token(renderer_.subsurface_mode())},
+            {"mode_actual", to_token(renderer_.subsurface_mode_actual())},
+            {"provisioned", renderer_.subsurface_resources_provisioned()},
+            {"resident_bytes", renderer_.subsurface_resident_bytes()},
+        });
+        return;
+    }
+    case McpCommandType::render_set_motion_blur: {
+        if (!renderer_.set_motion_blur_settings(command.motion_blur)) {
+            fail("Motion blur settings are invalid or incompatible with the active AA mode");
+            return;
+        }
+        renderer_.reset_metrics();
+        const auto settings = renderer_.motion_blur_settings();
+        succeed("Motion blur settings applied", Json{
+            {"mode_requested", to_token(settings.mode)},
+            {"mode_actual", to_token(renderer_.motion_blur_mode_actual())},
+            {"quality", to_token(settings.quality)},
+            {"shutter", to_token(settings.shutter)},
+            {"angle_degrees", settings.shutter_angle_degrees},
+            {"maximum_radius_pixels", settings.maximum_radius_pixels},
+            {"camera_fade_start", settings.camera_fade_start},
+            {"camera_fade_end", settings.camera_fade_end},
+        });
+        return;
+    }
+    case McpCommandType::render_set_anti_aliasing: {
+        const auto method = static_cast<AntiAliasingMethod>(command.value);
+        if (!renderer_.set_anti_aliasing(method)) {
+            fail("Anti-aliasing method is unsupported or incompatible with full SSS");
+            return;
+        }
+        if (command.smaa_mode_supplied &&
+            !renderer_.set_smaa_mode(command.smaa_mode)) {
+            fail("Invalid SMAA mode");
+            return;
+        }
+        renderer_.reset_metrics();
+        succeed("Anti-aliasing applied", Json{
+            {"requested_method", to_token(renderer_.anti_aliasing_requested_method())},
+            {"method", to_token(renderer_.anti_aliasing().method)},
+            {"smaa_mode", to_string(renderer_.anti_aliasing().smaa_mode)},
+            {"smaa_temporal", is_temporal_smaa(renderer_.anti_aliasing())},
+            {"smaa_history_valid", renderer_.smaa_history_valid()},
+            {"smaa_history_resident_bytes", is_temporal_smaa(renderer_.anti_aliasing())
+                ? renderer_.smaa_history_resident_bytes() : 0U},
+            {"smaa_history_width", is_temporal_smaa(renderer_.anti_aliasing())
+                ? renderer_.render_extent().width : 0U},
+            {"smaa_history_height", is_temporal_smaa(renderer_.anti_aliasing())
+                ? renderer_.render_extent().height : 0U},
+            {"smaa_history_incremental_bytes", 0U},
+            {"smaa_history_reuses_fsr_output", is_temporal_smaa(renderer_.anti_aliasing())},
+            {"sample_count", renderer_.anti_aliasing_sample_count_actual()},
+            {"sample_shading", false},
+            {"color_resolve", is_msaa(renderer_.anti_aliasing().method) ? "average" : "none"},
+            {"depth_resolve", "none"},
+            {"resident_bytes", renderer_.msaa_resident_bytes()},
+        });
+        return;
+    }
+    case McpCommandType::render_set_depth_prepass: {
+        if (!renderer_.set_depth_prepass(static_cast<DepthPrepass>(command.value))) {
+            fail("Invalid depth prepass mode");
+            return;
+        }
+        succeed("Depth prepass applied", Json{{"depth_prepass", to_token(renderer_.depth_prepass())}});
+        return;
+    }
+    case McpCommandType::render_set_lod_fade: {
+        const float seconds = command.lod_fade_seconds_supplied
+            ? command.lod_fade_seconds : renderer_.lod_fade_seconds();
+        if (!renderer_.set_lod_fade(static_cast<LodFadePattern>(command.value), seconds)) {
+            fail("Invalid model LOD fade pattern or duration");
+            return;
+        }
+        succeed("Model LOD fade applied", Json{
+            {"lod_fade_requested", to_token(renderer_.lod_fade_pattern())},
+            {"lod_fade_actual", to_token(renderer_.lod_fade_actual())},
+            {"lod_fade_seconds_requested", renderer_.lod_fade_seconds()},
+            {"lod_fade_seconds_actual", renderer_.lod_fade_seconds()}});
+        return;
+    }
+    case McpCommandType::render_set_shadow_cache: {
+        auto settings = renderer_.lighting_settings();
+        settings.cascade_cache = command.enabled;
+        if (!renderer_.set_lighting_settings(settings)) {
+            fail("Shadow cache settings rejected");
+            return;
+        }
+        succeed("Shadow cache selected", Json{{"cascade_cache", settings.cascade_cache}});
         return;
     }
     case McpCommandType::lighting_set: {
@@ -1218,7 +1575,7 @@ void Application::update_window_title() {
         static_cast<unsigned long long>(renderer_.triangle_count()),
         to_string(renderer_.mode()).data(),
         renderer_.gpu_workload_iterations(),
-        to_string(renderer_.anti_aliasing().method).data(),
+        to_string(renderer_.anti_aliasing()).data(),
         renderer_.anti_aliasing_quality_name().data(),
         Swapchain::present_mode_name(renderer_.swapchain().present_mode()));
     SDL_SetWindowTitle(window_.get(), title);
@@ -1250,7 +1607,7 @@ void Application::finish_benchmark() {
         resolution,
         render_resolution,
         Swapchain::present_mode_name(renderer_.swapchain().present_mode()),
-        std::string(to_string(renderer_.anti_aliasing().method)),
+        std::string(to_string(renderer_.anti_aliasing())),
         std::string(renderer_.anti_aliasing_quality_name()),
         renderer_.instance_count(),
         renderer_.gpu_workload_iterations(),
@@ -1281,8 +1638,67 @@ void Application::finish_benchmark() {
     result.animated_camera = options_.animate_camera;
     result.visibility_backend = renderer_.visibility_backend();
     result.lighting = renderer_.lighting_settings();
+    result.shadow_depth_actual = renderer_.shadow_depth_format();
+    result.shadow_linear_filter = renderer_.shadow_linear_filter();
+    result.tone_mapper = renderer_.tone_mapper();
+    result.exposure = renderer_.exposure_settings();
+    result.exposure_mode_actual = to_token(renderer_.exposure_mode_actual());
+    result.exposure_state = renderer_.exposure_state();
+    if (renderer_.exposure_mode_actual() == ExposureMode::fixed) {
+        result.exposure_state.exposure = fixed_exposure_multiplier(result.exposure);
+        result.exposure_state.target_exposure = result.exposure_state.exposure;
+        result.exposure_state.average_luminance = exposure_middle_grey;
+        result.exposure_state.sample_weight = 0U;
+        result.exposure_state.invalid_sample_count = 0U;
+    }
+    result.color_grading = renderer_.color_grading();
+    result.color_grading_actual = renderer_.color_grading_actual();
+    result.color_grading_lut_size = renderer_.color_grading_lut_size();
+    result.subsurface = renderer_.subsurface_mode();
+    result.subsurface_actual = renderer_.subsurface_mode_actual();
+    result.subsurface_provisioned = renderer_.subsurface_resources_provisioned();
+    result.subsurface_active_material_count = renderer_.subsurface_active_material_count();
+    result.subsurface_resident_bytes = renderer_.subsurface_resident_bytes();
+    result.motion_blur = renderer_.motion_blur_settings();
+    result.motion_blur_actual = to_token(renderer_.motion_blur_mode_actual());
+    result.anti_aliasing_requested = to_token(
+        renderer_.anti_aliasing_requested_method());
+    result.anti_aliasing_actual = to_token(renderer_.anti_aliasing().method);
+    result.smaa_mode = to_string(renderer_.anti_aliasing().smaa_mode);
+    result.smaa_temporal_samples = is_temporal_smaa(renderer_.anti_aliasing()) ? 2U : 1U;
+    result.smaa_history_resident_bytes = is_temporal_smaa(renderer_.anti_aliasing())
+        ? renderer_.smaa_history_resident_bytes() : 0U;
+    result.smaa_history_incremental_bytes = 0U;
+    result.smaa_history_reuses_fsr_output = is_temporal_smaa(renderer_.anti_aliasing());
+    result.msaa_samples_requested = anti_aliasing_sample_count(
+        renderer_.anti_aliasing_requested_method());
+    result.msaa_samples_actual = renderer_.anti_aliasing_sample_count_actual();
+    result.msaa_2x_supported = renderer_.supports_msaa(AntiAliasingMethod::msaa2x);
+    result.msaa_4x_supported = renderer_.supports_msaa(AntiAliasingMethod::msaa4x);
+    result.msaa_resident_bytes = renderer_.msaa_resident_bytes();
+    result.depth_prepass_requested = to_token(options_.depth_prepass);
+    result.depth_prepass_actual = to_token(renderer_.depth_prepass());
+    result.lod_fade_requested = to_token(options_.lod_fade);
+    result.lod_fade_actual = to_token(renderer_.lod_fade_actual());
+    result.lod_fade_seconds_requested = options_.lod_fade_seconds;
+    result.lod_fade_seconds_actual = renderer_.lod_fade_seconds();
+    result.front_to_back_requested = options_.coarse_front_to_back ? "coarse" : "off";
+    result.cpu_culling_requested = options_.cpu_hierarchy ? "hierarchy" : "linear";
+    result.cpu_culling_actual = renderer_.cpu_culling_path();
+    result.front_to_back_actual = renderer_.coarse_depth_order_active() ? "coarse" : "off";
     result.lighting_statistics = renderer_.lighting_statistics();
     result.lighting_room = options_.lighting_room;
+    result.render_fixture = to_token(options_.render_fixture);
+    result.motion_fixture_fps = options_.motion_fixture_fps;
+    result.light_swarm_layout = to_token(options_.light_swarm_layout);
+    result.local_light_backend_requested = to_token(renderer_.local_light_backend());
+    result.local_light_backend_actual = to_token(renderer_.local_light_backend_actual());
+    result.local_light_count = renderer_.local_light_count();
+    const auto& local_light_statistics = renderer_.local_light_statistics();
+    result.local_light_assignments = local_light_statistics.assignments;
+    result.local_light_maximum_list = local_light_statistics.maximum_list_length;
+    result.local_light_overflow_clusters = local_light_statistics.overflow_clusters;
+    result.local_light_dropped = local_light_statistics.dropped_lights;
     result.camera_z = options_.camera_z;
     result.scene_scale = options_.scene_scale;
     result.scene_walls = options_.scene_walls;

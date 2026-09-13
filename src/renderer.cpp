@@ -1,4 +1,5 @@
 #include "renderer.hpp"
+#include "camera_projection.hpp"
 #include "image_barrier.hpp"
 
 #include "pbr_material.hpp"
@@ -27,6 +28,7 @@
 
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/matrix_inverse.hpp>
+#include <glm/gtc/packing.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <glm/mat3x3.hpp>
 
@@ -107,7 +109,7 @@ struct TerrainVertex {
 
 static_assert(sizeof(FrameUniforms) == 416);
 static_assert(sizeof(InstanceData) == 64);
-static_assert(sizeof(PbrInstanceData) == 80);
+static_assert(sizeof(PbrInstanceData) == 96);
 static_assert(offsetof(PbrInstanceData, material) == 48U);
 static_assert(sizeof(TerrainVertex) == 16);
 
@@ -117,10 +119,72 @@ inline constexpr VkFormat aa_motion_format =
     VK_FORMAT_R16G16_SFLOAT;
 inline constexpr VkFormat aa_depth_format =
     VK_FORMAT_R32_SFLOAT;
+inline constexpr VkFormat motion_tile_format =
+    VK_FORMAT_R16G16B16A16_SFLOAT;
+inline constexpr std::uint32_t motion_tile_size = 16U;
+
+[[nodiscard]] constexpr std::size_t msaa_index(
+    const AntiAliasingMethod method) noexcept {
+    return method == AntiAliasingMethod::msaa4x ? 1U : 0U;
+}
+
+[[nodiscard]] constexpr VkSampleCountFlagBits vk_msaa_samples(
+    const AntiAliasingMethod method) noexcept {
+    return method == AntiAliasingMethod::msaa4x
+        ? VK_SAMPLE_COUNT_4_BIT : VK_SAMPLE_COUNT_2_BIT;
+}
 inline constexpr VkFormat smaa_edges_format =
     VK_FORMAT_R8G8_UNORM;
 inline constexpr VkFormat smaa_weights_format =
     VK_FORMAT_R8G8B8A8_UNORM;
+inline constexpr VkDeviceSize exposure_histogram_bytes =
+    exposure_histogram_bins * sizeof(std::uint32_t);
+inline constexpr VkDeviceSize exposure_state_bytes =
+    exposure_histogram_bytes + sizeof(ExposureGpuReadback);
+inline constexpr std::uint32_t display_push_constant_bytes = 64U;
+
+struct alignas(16) ExposurePushConstants {
+    float inverse_resolution[2];
+    std::uint32_t exposure_mode;
+    std::uint32_t sample_stride;
+    std::uint32_t source_width;
+    std::uint32_t source_height;
+    std::uint32_t metering;
+    std::uint32_t reset;
+    float delta_seconds;
+    float compensation_ev;
+    float minimum_ev;
+    float maximum_ev;
+    float low_percentile;
+    float high_percentile;
+    float brighten_seconds;
+    float darken_seconds;
+};
+static_assert(sizeof(ExposurePushConstants) == 64U);
+static_assert(offsetof(ExposurePushConstants, inverse_resolution) == 0U);
+static_assert(offsetof(ExposurePushConstants, exposure_mode) == 8U);
+static_assert(offsetof(ExposurePushConstants, sample_stride) == 12U);
+static_assert(offsetof(ExposurePushConstants, source_width) == 16U);
+static_assert(offsetof(ExposurePushConstants, source_height) == 20U);
+static_assert(offsetof(ExposurePushConstants, metering) == 24U);
+static_assert(offsetof(ExposurePushConstants, reset) == 28U);
+static_assert(offsetof(ExposurePushConstants, delta_seconds) == 32U);
+static_assert(offsetof(ExposurePushConstants, compensation_ev) == 36U);
+static_assert(offsetof(ExposurePushConstants, minimum_ev) == 40U);
+static_assert(offsetof(ExposurePushConstants, maximum_ev) == 44U);
+static_assert(offsetof(ExposurePushConstants, low_percentile) == 48U);
+static_assert(offsetof(ExposurePushConstants, high_percentile) == 52U);
+static_assert(offsetof(ExposurePushConstants, brighten_seconds) == 56U);
+static_assert(offsetof(ExposurePushConstants, darken_seconds) == 60U);
+
+struct alignas(16) SubsurfacePushConstants {
+    glm::vec4 depth_parameters{};
+    glm::uvec2 render_extent{};
+    glm::uvec2 padding{};
+};
+static_assert(sizeof(SubsurfacePushConstants) == 32U);
+static_assert(offsetof(SubsurfacePushConstants, depth_parameters) == 0U);
+static_assert(offsetof(SubsurfacePushConstants, render_extent) == 16U);
 
 glm::mat4 create_sun_light_view_projection() {
     const glm::vec3 scene_center(0.0F, 1.5F, -7.0F);
@@ -250,6 +314,18 @@ enum TimestampQuery : std::uint32_t {
     timestamp_voxel_geometry_end,
     timestamp_voxel_light_begin,
     timestamp_voxel_light_end,
+    timestamp_postprocess_end,
+    timestamp_depth_prepass_end,
+    timestamp_local_light_begin,
+    timestamp_local_light_end,
+    timestamp_subsurface_begin,
+    timestamp_subsurface_end,
+    timestamp_exposure_begin,
+    timestamp_exposure_end,
+    timestamp_display_begin,
+    timestamp_display_end,
+    timestamp_motion_blur_begin,
+    timestamp_motion_blur_end,
     timestamp_query_count,
 };
 
@@ -396,7 +472,7 @@ inline constexpr std::uint32_t pbr_sample_index_count =
     pbr_sample_triangle_count * 3U;
 inline constexpr std::uint32_t pbr_sample_count = 10U;
 inline constexpr std::uint32_t demo_instance_count =
-    1U + pbr_sample_count;
+    1U + 28U; // Includes capacity for the optional material chart.
 inline constexpr std::uint32_t demo_ground_instance = 0U;
 inline constexpr std::uint32_t demo_sample_first_instance = 1U;
 static_assert(
@@ -627,10 +703,16 @@ void Renderer::initialize(VulkanContext &context, SDL_Window *window,
                           const std::uint32_t initial_gpu_workload,
                           const AntiAliasingSettings initial_anti_aliasing,
                           const bool enable_screenshot_capture, const bool enable_editor_output,
-                          const bool enable_authored_scene, const LightingSettings lighting) {
+                          const bool enable_authored_scene, const LightingSettings lighting,
+                          const RenderFixture fixture) {
     context_ = &context;
     window_ = window;
     lighting_settings_ = lighting;
+    fixture_ = fixture;
+    pbr_sample_instance_count_ =
+        fixture == RenderFixture::material_spheres ||
+                fixture == RenderFixture::subsurface_profiles
+            ? 28U : pbr_sample_count;
     if (!valid_lighting_settings(lighting))
         fatal("Invalid lighting settings");
 #if VCR_EDITOR_ENABLED
@@ -639,18 +721,24 @@ void Renderer::initialize(VulkanContext &context, SDL_Window *window,
         enable_authored_scene || enable_editor_output;
     editor_scene_instances_.reserve(
         maximum_editor_scene_instances);
+    local_lights_.reserve(maximum_local_lights);
     editor_model_assets_.reserve(64U);
     editor_texture_assets_.reserve(128U);
     editor_model_draws_.reserve(max_scene_nodes);
     editor_model_sort_scratch_.reserve(max_scene_nodes);
     scene_metadata_.reserve(maximum_editor_scene_instances);
-    scene_packet_.reserve(maximum_editor_scene_instances * 2U);
+    scene_packet_.reserve(maximum_editor_scene_instances);
     visible_model_draws_.reserve(max_scene_nodes * 3U);
-    visible_indices_.reserve(maximum_editor_scene_instances);
-    visibility_scratch_.reserve(maximum_editor_scene_instances);
+    visible_indices_.reserve(maximum_editor_scene_instances * 2U);
+    visibility_scratch_.reserve(maximum_editor_scene_instances * 2U);
+    coarse_depth_keys_.reserve(maximum_editor_scene_instances);
     instance_lods_.reserve(maximum_editor_scene_instances);
+    instance_lod_fades_.reserve(maximum_editor_scene_instances);
     instance_visibility_.reserve(maximum_editor_scene_instances);
     world_bounds_.reserve(maximum_editor_scene_instances);
+    if (!world_hierarchy_.prepare_capacity(maximum_editor_scene_instances)) {
+        std::cerr << "CPU bounds hierarchy allocation failed; using linear culling.\n";
+    }
 #else
     static_cast<void>(enable_editor_output);
     static_cast<void>(enable_authored_scene);
@@ -667,6 +755,7 @@ void Renderer::initialize(VulkanContext &context, SDL_Window *window,
         std::clamp(initial_instances, 1U, max_instance_capacity_);
     gpu_workload_iterations_ = std::min(initial_gpu_workload, 4096U);
     anti_aliasing_ = initial_anti_aliasing;
+    anti_aliasing_requested_method_ = initial_anti_aliasing.method;
     light_view_projection_ = create_sun_light_view_projection();
     set_mode(initial_mode);
     swapchain_.initialize(
@@ -684,6 +773,7 @@ void Renderer::initialize(VulkanContext &context, SDL_Window *window,
     create_pipeline_cache();
     create_lighting_resources();
     create_scene_resources();
+    create_display_mapping_resources();
     create_anti_aliasing_resources();
     create_pipeline();
     create_lighting_pipelines();
@@ -716,6 +806,7 @@ void Renderer::shutdown() noexcept {
     screenshot_requested_ = false;
     screenshot_in_flight_ = false;
     destroy_anti_aliasing_resources();
+    destroy_display_mapping_resources();
 #if VCR_EDITOR_ENABLED
     destroy_editor_viewport();
     editor_scene_instances_.clear();
@@ -813,7 +904,10 @@ void Renderer::create_frame_contexts() {
             constexpr std::uint64_t scene_instance_capacity =
                 static_cast<std::uint64_t>(max_scene_nodes) + 1ULL;
             constexpr std::uint64_t scene_buffer_bytes =
-                scene_instance_capacity * 2ULL * sizeof(RuntimeGpuInstance);
+                scene_instance_capacity * sizeof(RuntimeGpuInstance);
+            constexpr std::uint64_t scene_upload_bytes =
+                scene_buffer_bytes + scene_instance_capacity * 2U * sizeof(std::uint32_t);
+            static_assert(scene_instance_capacity <= lod_visibility_source_mask + 1ULL);
             static_assert(
                 scene_buffer_bytes <=
                 std::numeric_limits<VkDeviceSize>::max());
@@ -827,7 +921,7 @@ void Renderer::create_frame_contexts() {
                 "editor scene instance buffer");
             frame.scene_upload_buffer.create(
                 *context_,
-                static_cast<VkDeviceSize>(scene_buffer_bytes),
+                static_cast<VkDeviceSize>(scene_upload_bytes),
                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                 VMA_MEMORY_USAGE_AUTO,
                 VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
@@ -987,6 +1081,7 @@ bool Renderer::prepare_editor_viewport(VkExtent2D extent) {
     // Waiting here covers the main swapchain plus Dear ImGui platform-window
     // submissions, whose fences are owned by the upstream backend.
     VK_CHECK(vkDeviceWaitIdle(context_->device()));
+    destroy_subsurface_descriptors();
     destroy_anti_aliasing_descriptors();
     fsr3_upscaler_.shutdown();
     destroy_anti_aliasing_targets();
@@ -999,7 +1094,7 @@ bool Renderer::prepare_editor_viewport(VkExtent2D extent) {
         anti_aliasing_.method = AntiAliasingMethod::smaa;
     }
     create_anti_aliasing_descriptors();
-    temporal_history_valid_ = false;
+    invalidate_temporal_history();
     return true;
 }
 
@@ -1643,6 +1738,11 @@ bool Renderer::update_editor_scene(
         view.revision == editor_scene_revision_) {
         return true;
     }
+    if (view.local_lights_overflow ||
+        view.local_lights.size() > maximum_local_lights) {
+        error = "Scene exceeds the bounded 4096 local-light capacity.";
+        return false;
+    }
     const std::size_t ground_count =
         view.has_ground ? 1U : 0U;
     if (view.cubes.size() >
@@ -1654,6 +1754,14 @@ bool Renderer::update_editor_scene(
     editor_scene_instances_.clear();
     editor_model_draws_.clear();
     scene_metadata_.clear();
+    local_lights_.clear();
+    for (const ScenePunctualLight& light : view.local_lights) {
+        local_lights_.push_back(light.gpu);
+    }
+    ++local_light_revision_;
+    if (local_light_revision_ == 0U) {
+        ++local_light_revision_;
+    }
     if (view.has_ground) {
         editor_scene_instances_.push_back(view.ground);
         scene_metadata_.push_back({view.ground_id, Bounds{{0, 0, 0}, {1, 0, 1}}, false});
@@ -1792,8 +1900,11 @@ bool Renderer::update_editor_scene(
             {instance.model_row_0, instance.model_row_1, instance.model_row_2}));
     }
     instance_lods_.assign(scene_metadata_.size(), 0);
+    instance_lod_fades_.assign(scene_metadata_.size(), {});
+    reset_lod_fades_ = true;
     instance_visibility_.resize(scene_metadata_.size());
     world_bounds_.resize(scene_metadata_.size());
+    hierarchy_rebuild_required_ = true;
     for (std::size_t index = 0U;
          index < scene_metadata_.size();
          ++index) {
@@ -1808,8 +1919,8 @@ bool Renderer::update_editor_scene(
     shadow_dirty_ = true;
     // Authored snapshots may add/remove geometry or change materials. Only
     // the runtime transform API can preserve temporal history across updates.
-    temporal_history_valid_ = false;
-    fsr3_upscaler_.request_reset();
+    invalidate_temporal_history();
+    exposure_reset_pending_ = true;
     build_gpu_visibility_scene(plane_index_count, plane_first_index, plane_vertex_offset,
                                cube_index_count);
     return complete;
@@ -1839,8 +1950,8 @@ bool Renderer::apply_editor_material_factors(
 void Renderer::invalidate_editor_scene() noexcept {
     editor_scene_revision_ = 0U;
     runtime_transforms_.reset();
-    temporal_history_valid_ = false;
-    fsr3_upscaler_.request_reset();
+    invalidate_temporal_history();
+    exposure_reset_pending_ = true;
     shadow_dirty_ = true;
     for (FrameContext& frame : frames_) {
         frame.scene_revision = 0U;
@@ -1852,20 +1963,31 @@ void Renderer::invalidate_editor_scene() noexcept {
 void Renderer::record_editor_scene_upload(
     const VkCommandBuffer command_buffer,
     FrameContext& frame) {
-    if (gpu_visibility_active_ && mode_ != RunMode::instancing) {
+    // Instancing has separate storage and must not overwrite cached GPU
+    // visibility indices needed when returning to the authored scene.
+    if (mode_ == RunMode::instancing) return;
+    if (gpu_visibility_active_) {
         upload_gpu_scene_records(command_buffer, frame);
         return;
     }
-    if (!authored_scene_enabled_ || frame.scene_revision == packet_revision_) {
+    if (!authored_scene_enabled_ ||
+        (frame.scene_revision == packet_revision_ &&
+         frame.scene_source_revision == source_packet_revision_)) {
         return;
     }
     const VkDeviceSize byte_count =
         static_cast<VkDeviceSize>(scene_packet_.size()) * sizeof(RuntimeGpuInstance);
-    if (byte_count > frame.scene_upload_buffer.size() ||
-        byte_count > frame.scene_instance_buffer.size()) {
+    const auto indices = std::as_bytes(std::span{visible_indices_});
+    constexpr VkDeviceSize index_offset = 8U * sizeof(std::uint32_t);
+    if (byte_count > frame.scene_instance_buffer.size() ||
+        byte_count > frame.scene_upload_buffer.size() ||
+        indices.size() > frame.scene_upload_buffer.size() - byte_count ||
+        !frame.visibility.visible || frame.visibility.visible.size() < index_offset ||
+        indices.size() > frame.visibility.visible.size() - index_offset) {
         fatal("Editor scene upload exceeds its bounded frame buffer.");
     }
-    if (byte_count > 0U) {
+    if (byte_count > 0U && (frame.scene_revision == 0 ||
+                           frame.scene_source_revision != source_packet_revision_)) {
         frame.scene_upload_buffer.write(
             std::as_bytes(std::span{scene_packet_.data(), scene_packet_.size()}));
         const VkBufferCopy copy{
@@ -1898,10 +2020,38 @@ void Renderer::record_editor_scene_upload(
         };
         vkCmdPipelineBarrier2(command_buffer, &dependency);
     }
+    if (!indices.empty() && frame.scene_revision != packet_revision_) {
+        // The acquired frame fence owns both buffers. Index staging follows
+        // the source range, so its mapped writes cannot clobber a source copy.
+        frame.scene_upload_buffer.write(indices, byte_count);
+        const VkBufferCopy copy{byte_count, index_offset, indices.size()};
+        vkCmdCopyBuffer(command_buffer, frame.scene_upload_buffer.handle(),
+                        frame.visibility.visible.handle(), 1, &copy);
+        const VkBufferMemoryBarrier2 barrier{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+            .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = frame.visibility.visible.handle(),
+            .offset = index_offset,
+            .size = indices.size(),
+        };
+        const VkDependencyInfo dependency{
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &barrier,
+        };
+        vkCmdPipelineBarrier2(command_buffer, &dependency);
+        frame.visibility.view_revision = 0;
+    }
     frame.scene_revision = packet_revision_;
+    frame.scene_source_revision = source_packet_revision_;
     frame.scene_ground_count = visible_ground_count_;
     frame.scene_cube_count = visible_cube_count_;
-    frame.scene_color_first_instance = static_cast<std::uint32_t>(editor_scene_instances_.size());
+    frame.scene_color_first_instance = 0;
 }
 #endif
 
@@ -2026,6 +2176,72 @@ void Renderer::create_scene_resources() {
                     .ambient_occlusion = 1.0F,
                 },
             };
+        }
+    }
+    if (fixture_ == RenderFixture::material_spheres) {
+        constexpr std::array iors{1.0F, 1.33F, 1.5F, 2.0F};
+        constexpr std::array roughness{0.05F, 0.25F, 0.7F};
+        constexpr float pitch = 0.20943951024F;
+        const glm::vec3 forward{0, -std::sin(pitch), -std::cos(pitch)};
+        const glm::vec3 up{0, std::cos(pitch), -std::sin(pitch)};
+        for (unsigned row = 0; row < 7; ++row) {
+            for (unsigned column = 0; column < 4; ++column) {
+                auto &sample = demo_instances[demo_sample_first_instance + row * 4 + column];
+                sample.translation = glm::vec4(glm::vec3(0, 4, 12) + forward * 14.0F +
+                    up * ((3.0F - static_cast<float>(row)) * 1.6F) +
+                    glm::vec3((static_cast<float>(column) - 1.5F) * 2.0F, 0, 0), 0);
+                sample.rotation = {0, 0, 0, 1};
+                sample.scale = {.65F, .65F, .65F, 0};
+                sample.material = PbrMaterial{
+                    .base_color = row < 3 ? glm::vec4(.45F, .45F, .45F, 1) :
+                        (row < 6 ? glm::vec4(.8F, .45F, .2F, 1) : glm::vec4(.25F, .5F, .75F, 1)),
+                    .metallic = row >= 3 && row < 6 ? 1.0F : 0.0F,
+                    .roughness = roughness[row % 3],
+                    .ior = iors[column],
+                    .model = row == 6 ? MaterialModel::unlit : MaterialModel::standard,
+                };
+            }
+        }
+    }
+    if (fixture_ == RenderFixture::subsurface_profiles) {
+        constexpr std::array row_profiles{
+            SubsurfaceProfile::none,
+            SubsurfaceProfile::narrow,
+            SubsurfaceProfile::medium,
+            SubsurfaceProfile::wide,
+            SubsurfaceProfile::medium,
+            SubsurfaceProfile::wide,
+            SubsurfaceProfile::none,
+        };
+        constexpr std::array row_strengths{0.0F, 1.0F, 1.0F, 1.0F, 0.5F, 0.5F, 0.0F};
+        constexpr float pitch = 0.20943951024F;
+        const glm::vec3 forward{0, -std::sin(pitch), -std::cos(pitch)};
+        const glm::vec3 up{0, std::cos(pitch), -std::sin(pitch)};
+        for (unsigned row = 0; row < 7; ++row) {
+            for (unsigned column = 0; column < 4; ++column) {
+                auto& sample = demo_instances[demo_sample_first_instance + row * 4 + column];
+                sample.translation = glm::vec4(
+                    glm::vec3(0, 4, 12) + forward * (11.0F + 2.0F * column) +
+                        up * ((3.0F - static_cast<float>(row)) * 1.7F) +
+                        glm::vec3((static_cast<float>(column) - 1.5F) * 1.8F, 0, 0),
+                    0);
+                sample.rotation = {0, 0, 0, 1};
+                sample.scale = {.72F, .72F, .72F, 0};
+                sample.material = PbrMaterial{
+                    .base_color = row == 5
+                        ? glm::vec4(.80F, .22F, .10F, 1)
+                        : glm::vec4(.76F, .38F, .24F, 1),
+                    .metallic = 0.0F,
+                    .roughness = row == 5 ? 0.08F : 0.62F,
+                    .ambient_occlusion = 1.0F,
+                    .ior = 1.5F,
+                    .model = row == 6 ? MaterialModel::unlit
+                                      : (row == 0 ? MaterialModel::standard
+                                                  : MaterialModel::subsurface),
+                    .subsurface_profile = row_profiles[row],
+                    .subsurface_strength = row_strengths[row],
+                };
+            }
         }
     }
     const PbrSampleMesh sample_mesh = create_pbr_sample_mesh();
@@ -2395,6 +2611,9 @@ void Renderer::create_shadow_map() {
         VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
 
     for (const VkFormat candidate : candidates) {
+        if ((lighting_settings_.shadow_depth == ShadowDepthFormat::d16 && candidate != VK_FORMAT_D16_UNORM) ||
+            (lighting_settings_.shadow_depth == ShadowDepthFormat::d32 && candidate != VK_FORMAT_D32_SFLOAT))
+            continue;
         VkFormatProperties3 properties3{
             .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3,
         };
@@ -2422,14 +2641,16 @@ void Renderer::create_shadow_map() {
             (properties3.optimalTilingFeatures & required_features) == required_features &&
             maximum >= lighting_settings_.shadow_resolution) {
             shadow_map_format_ = candidate;
+            shadow_map_linear_ =
+                (properties3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
             max_shadow_resolution_ = maximum;
             break;
         }
     }
     if (shadow_map_format_ == VK_FORMAT_UNDEFINED) {
         fatal(
-            "Requested shadow resolution is unsupported by this GPU; "
-            "try --shadow-resolution 1024.");
+            "Requested shadow depth format/resolution is unsupported by this GPU; "
+            "try --shadow-depth auto --shadow-resolution 1024.");
     }
 
     const std::uint32_t resolution = lighting_settings_.shadow_resolution;
@@ -2473,8 +2694,7 @@ void Renderer::apply_shadow_resolution() {
     shadow_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     shadow_dirty_ = true;
     lighting_shadow_initialized_ = false;
-    temporal_history_valid_ = false;
-    fsr3_upscaler_.request_reset();
+    invalidate_temporal_history();
 }
 
 void Renderer::create_anti_aliasing_resources() {
@@ -2495,12 +2715,14 @@ void Renderer::create_anti_aliasing_resources() {
     require_format(
         aa_color_format,
         VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
-            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT,
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT,
         "HDR scene color");
     require_format(
         aa_color_format,
         VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
-            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT,
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT,
         "FSR 3 output");
     require_format(
         aa_motion_format,
@@ -2512,6 +2734,11 @@ void Renderer::create_anti_aliasing_resources() {
         VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
             VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT,
         "FSR 3 depth");
+    require_format(
+        motion_tile_format,
+        VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT,
+        "motion-blur TileMax and NeighborMax");
     require_format(
         smaa_edges_format,
         VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
@@ -2583,7 +2810,21 @@ void Renderer::create_anti_aliasing_resources() {
             "SMAA search lookup");
     }
 
+    detect_msaa_support();
+    if (is_msaa(anti_aliasing_.method) &&
+        !supports_msaa(anti_aliasing_.method)) {
+        const AntiAliasingMethod fallback =
+            anti_aliasing_.method == AntiAliasingMethod::msaa4x &&
+                    supports_msaa(AntiAliasingMethod::msaa2x)
+                ? AntiAliasingMethod::msaa2x
+                : AntiAliasingMethod::off;
+        std::cerr << "warning: requested " << to_token(anti_aliasing_.method)
+                  << " is unsupported for the selected HDR/depth formats; falling back to "
+                  << to_token(fallback) << '\n';
+        anti_aliasing_.method = fallback;
+    }
     create_anti_aliasing_targets();
+    if (subsurface_provision_pending_) provision_subsurface_resources();
     fsr3_upscaler_.initialize(*context_, scene_output_extent());
     if (anti_aliasing_.method == AntiAliasingMethod::fsr3 &&
         !fsr3_upscaler_.available()) {
@@ -2593,7 +2834,67 @@ void Renderer::create_anti_aliasing_resources() {
             << "); falling back to SMAA\n";
         anti_aliasing_.method = AntiAliasingMethod::smaa;
     }
-    temporal_history_valid_ = false;
+    invalidate_temporal_history();
+}
+
+void Renderer::detect_msaa_support() {
+    const auto exact_format_samples = [this](
+                                          const VkFormat format,
+                                          const VkImageUsageFlags usage) {
+        VkImageFormatProperties properties{};
+        const VkResult result = vkGetPhysicalDeviceImageFormatProperties(
+            context_->physical_device(), format, VK_IMAGE_TYPE_2D,
+            VK_IMAGE_TILING_OPTIMAL, usage, 0U, &properties);
+        if (result == VK_SUCCESS) return properties.sampleCounts;
+        if (result == VK_ERROR_FORMAT_NOT_SUPPORTED) {
+            return VkSampleCountFlags{0U};
+        }
+        check_vk(
+            result, "vkGetPhysicalDeviceImageFormatProperties",
+            __FILE__, __LINE__);
+        return VkSampleCountFlags{0U};
+    };
+    const auto& limits = context_->properties().limits;
+    const VkSampleCountFlags color = exact_format_samples(
+        aa_color_format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    const VkSampleCountFlags depth = exact_format_samples(
+        swapchain_.depth_format(), VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+    msaa_supported_sample_counts_ =
+        limits.framebufferColorSampleCounts &
+        limits.framebufferDepthSampleCounts & color & depth;
+    msaa_supported_sample_counts_ |= VK_SAMPLE_COUNT_1_BIT;
+}
+
+void Renderer::prepare_msaa_targets_for_frame(const std::size_t frame_index) {
+    if (frame_index >= anti_aliasing_frames_.size()) {
+        fatal("Invalid frame slot for MSAA resources.");
+    }
+    auto& targets = anti_aliasing_frames_[frame_index].msaa;
+    const VkSampleCountFlagBits samples = is_msaa(anti_aliasing_.method)
+        ? vk_msaa_samples(anti_aliasing_.method) : VK_SAMPLE_COUNT_1_BIT;
+    if (targets.color && targets.color.samples() == samples) return;
+    targets.depth.destroy();
+    targets.color.destroy();
+    targets.depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    targets.color_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (samples == VK_SAMPLE_COUNT_1_BIT) return;
+    if ((msaa_supported_sample_counts_ & samples) == 0U) {
+        fatal("Active MSAA mode is unsupported by its render targets.");
+    }
+    const VkExtent2D extent = scene_output_extent();
+    if (extent.width == 0U || extent.height == 0U) {
+        fatal("Cannot create MSAA targets for an empty extent.");
+    }
+    const bool four_samples = samples == VK_SAMPLE_COUNT_4_BIT;
+    targets.color.create_multisampled_render_target(
+        *context_, extent.width, extent.height, aa_color_format,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT,
+        samples, four_samples ? "MSAA 4x HDR color" : "MSAA 2x HDR color");
+    targets.depth.create_multisampled_render_target(
+        *context_, extent.width, extent.height, swapchain_.depth_format(),
+        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+        VK_IMAGE_ASPECT_DEPTH_BIT, samples,
+        four_samples ? "MSAA 4x depth" : "MSAA 2x depth");
 }
 
 void Renderer::create_anti_aliasing_targets() {
@@ -2601,6 +2902,10 @@ void Renderer::create_anti_aliasing_targets() {
     if (extent.width == 0U || extent.height == 0U) {
         fatal("Cannot create anti-aliasing targets for an empty extent.");
     }
+    const std::uint32_t motion_tiles_x =
+        (extent.width + motion_tile_size - 1U) / motion_tile_size;
+    const std::uint32_t motion_tiles_y =
+        (extent.height + motion_tile_size - 1U) / motion_tile_size;
     for (auto& resources : anti_aliasing_frames_) {
         resources.color.create_render_target(
             *context_,
@@ -2666,16 +2971,69 @@ void Renderer::create_anti_aliasing_targets() {
             extent.width,
             extent.height,
             aa_color_format,
-            VK_IMAGE_USAGE_STORAGE_BIT |
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                VK_IMAGE_USAGE_STORAGE_BIT |
                 VK_IMAGE_USAGE_SAMPLED_BIT,
             VK_IMAGE_ASPECT_COLOR_BIT,
             VK_FILTER_LINEAR,
             "FSR 3 upscaled output");
+        resources.motion_tile_max.create_render_target(
+            *context_, motion_tiles_x, motion_tiles_y, motion_tile_format,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT, VK_FILTER_NEAREST,
+            "motion-blur TileMax");
+        resources.motion_neighbor_max.create_render_target(
+            *context_, motion_tiles_x, motion_tiles_y, motion_tile_format,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT, VK_FILTER_NEAREST,
+            "motion-blur NeighborMax");
     }
 }
 
-void Renderer::destroy_anti_aliasing_targets() noexcept {
+void Renderer::create_subsurface_targets() {
+    const VkExtent2D extent = scene_output_extent();
+    if (extent.width == 0U || extent.height == 0U) {
+        fatal("Cannot create subsurface targets for an empty extent.");
+    }
     for (auto& resources : anti_aliasing_frames_) {
+        resources.subsurface_base.create_render_target(
+            *context_, extent.width, extent.height, aa_color_format,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT, VK_FILTER_NEAREST,
+            "SSS unscattered HDR base");
+        resources.subsurface_ping.create_render_target(
+            *context_, extent.width, extent.height, aa_color_format,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT, VK_FILTER_NEAREST,
+            "SSS horizontal diffusion");
+        resources.subsurface_base_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        resources.subsurface_ping_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+}
+
+void Renderer::destroy_subsurface_targets() noexcept {
+    for (auto& resources : anti_aliasing_frames_) {
+        resources.subsurface_ping.destroy();
+        resources.subsurface_base.destroy();
+        resources.subsurface_horizontal_set = VK_NULL_HANDLE;
+        resources.subsurface_vertical_set = VK_NULL_HANDLE;
+        resources.subsurface_base_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        resources.subsurface_ping_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+    subsurface_resources_provisioned_ = false;
+    subsurface_provision_pending_ =
+        subsurface_mode_ == SubsurfaceMode::full_resolution;
+}
+
+void Renderer::destroy_anti_aliasing_targets() noexcept {
+    destroy_subsurface_targets();
+    for (auto& resources : anti_aliasing_frames_) {
+        resources.msaa.depth.destroy();
+        resources.msaa.color.destroy();
+        resources.msaa.depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        resources.msaa.color_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        resources.motion_neighbor_max.destroy();
+        resources.motion_tile_max.destroy();
         resources.fsr_output.destroy();
         resources.smaa_weights.destroy();
         resources.smaa_edges.destroy();
@@ -2691,15 +3049,128 @@ void Renderer::destroy_anti_aliasing_targets() noexcept {
         resources.edges_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         resources.weights_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         resources.fsr_output_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        resources.motion_tile_max_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        resources.motion_neighbor_max_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     }
 }
 
 void Renderer::destroy_anti_aliasing_resources() noexcept {
+    destroy_subsurface_descriptors();
     destroy_anti_aliasing_descriptors();
     fsr3_upscaler_.shutdown();
     destroy_anti_aliasing_targets();
     smaa_search_texture_.destroy();
     smaa_area_texture_.destroy();
+    subsurface_resources_provisioned_ = false;
+    subsurface_provision_pending_ = false;
+}
+
+void Renderer::create_display_mapping_resources() {
+    const auto require_format = [this](
+                                    const VkFormat format,
+                                    const VkFormatFeatureFlags features,
+                                    const std::string_view purpose) {
+        VkFormatProperties properties{};
+        vkGetPhysicalDeviceFormatProperties(context_->physical_device(), format, &properties);
+        if ((properties.optimalTilingFeatures & features) != features) {
+            std::cerr << "Required display-mapping format is unsupported for "
+                      << purpose << ": " << static_cast<int>(format) << '\n';
+            fatal("GPU does not support exposure/color-grading resources.");
+        }
+    };
+    require_format(
+        VK_FORMAT_R32_SFLOAT,
+        VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT,
+        "application exposure");
+    require_format(
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+            VK_FORMAT_FEATURE_TRANSFER_DST_BIT,
+        "3D grading LUT");
+    VkImageFormatProperties lut_properties{};
+    const VkResult lut_support = vkGetPhysicalDeviceImageFormatProperties(
+        context_->physical_device(), VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_TYPE_3D, VK_IMAGE_TILING_OPTIMAL,
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        0U, &lut_properties);
+    if (lut_support == VK_ERROR_FORMAT_NOT_SUPPORTED ||
+        lut_properties.maxExtent.width < 64U ||
+        lut_properties.maxExtent.height < 64U ||
+        lut_properties.maxExtent.depth < 64U) {
+        fatal("GPU does not support a 64^3 RGBA16F grading LUT.");
+    }
+    VK_CHECK(lut_support);
+    if (context_->properties().limits.maxImageDimension3D < 64U ||
+        context_->properties().limits.maxStorageBufferRange < exposure_state_bytes) {
+        fatal("GPU limits are too small for exposure/color grading.");
+    }
+
+    exposure_state_buffer_.create(
+        *context_, exposure_state_bytes,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, 0U, "exposure histogram and state");
+    exposure_value_.create_render_target(
+        *context_, 1U, 1U, VK_FORMAT_R32_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT, VK_FILTER_NEAREST, "application exposure value");
+    exposure_value_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    for (auto& frame : frames_) {
+        frame.exposure_readback.create(
+            *context_, sizeof(ExposureGpuReadback), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                VMA_ALLOCATION_CREATE_MAPPED_BIT,
+            "exposure diagnostics readback");
+        frame.exposure_was_updated = false;
+    }
+
+    const auto create_identity = [this](
+                                     GpuTexture& texture,
+                                     const std::uint32_t size,
+                                     const std::string_view name) {
+        const std::uint64_t texel_count = static_cast<std::uint64_t>(size) * size * size;
+        if (texel_count > std::numeric_limits<std::size_t>::max() / sizeof(std::uint64_t)) {
+            fatal("Identity grading LUT size overflow.");
+        }
+        std::vector<std::uint64_t> texels(static_cast<std::size_t>(texel_count));
+        std::size_t destination = 0U;
+        const float denominator = static_cast<float>(size - 1U);
+        for (std::uint32_t blue = 0U; blue < size; ++blue) {
+            for (std::uint32_t green = 0U; green < size; ++green) {
+                for (std::uint32_t red = 0U; red < size; ++red) {
+                    texels[destination++] = glm::packHalf4x16(glm::vec4{
+                        static_cast<float>(red) / denominator,
+                        static_cast<float>(green) / denominator,
+                        static_cast<float>(blue) / denominator,
+                        1.0F});
+                }
+            }
+        }
+        texture.create_sampled_volume(
+            *context_, size, VK_FORMAT_R16G16B16A16_SFLOAT, VK_FILTER_LINEAR, name);
+        upload_to_device_texture(
+            texture, std::as_bytes(std::span{texels}), sizeof(std::uint64_t), name);
+    };
+    create_identity(grading_lut_32_, 32U, "identity grading LUT 32");
+    create_identity(grading_lut_64_, 64U, "identity grading LUT 64");
+    exposure_readback_ = {};
+    exposure_reset_pending_ = true;
+}
+
+void Renderer::destroy_display_mapping_resources() noexcept {
+    grading_lut_64_.destroy();
+    grading_lut_32_.destroy();
+    exposure_value_.destroy();
+    exposure_value_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    exposure_state_buffer_.destroy();
+    for (auto& frame : frames_) {
+        frame.exposure_readback.destroy();
+        frame.exposure_was_updated = false;
+    }
+    exposure_readback_ = {};
+    exposure_reset_pending_ = true;
 }
 
 void Renderer::destroy_scene_resources() noexcept {
@@ -2726,6 +3197,7 @@ void Renderer::destroy_scene_resources() noexcept {
     }
     shadow_map_.destroy();
     shadow_map_format_ = VK_FORMAT_UNDEFINED;
+    shadow_map_linear_ = false;
     max_shadow_resolution_ = 0;
     sky_texture_.destroy();
     terrain_index_buffer_.destroy();
@@ -2748,6 +3220,18 @@ void Renderer::destroy_anti_aliasing_descriptors() noexcept {
     }
     for (auto& resources : anti_aliasing_frames_) {
         resources.descriptor_set = VK_NULL_HANDLE;
+    }
+}
+
+void Renderer::destroy_subsurface_descriptors() noexcept {
+    if (subsurface_descriptor_pool_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(
+            context_->device(), subsurface_descriptor_pool_, nullptr);
+        subsurface_descriptor_pool_ = VK_NULL_HANDLE;
+    }
+    for (auto& resources : anti_aliasing_frames_) {
+        resources.subsurface_horizontal_set = VK_NULL_HANDLE;
+        resources.subsurface_vertical_set = VK_NULL_HANDLE;
     }
 }
 
@@ -2993,15 +3477,29 @@ void Renderer::create_descriptors() {
 
 void Renderer::create_anti_aliasing_descriptors() {
     destroy_anti_aliasing_descriptors();
-    const VkDescriptorPoolSize pool_size{
-        .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        .descriptorCount = max_frames_in_flight * 6U,
+    const std::array pool_sizes{
+        VkDescriptorPoolSize{
+            .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = max_frames_in_flight * 13U,
+        },
+        VkDescriptorPoolSize{
+            .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = max_frames_in_flight,
+        },
+        VkDescriptorPoolSize{
+            .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .descriptorCount = max_frames_in_flight * 3U,
+        },
+        VkDescriptorPoolSize{
+            .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = max_frames_in_flight,
+        },
     };
     const VkDescriptorPoolCreateInfo pool_info{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .maxSets = max_frames_in_flight,
-        .poolSizeCount = 1,
-        .pPoolSizes = &pool_size,
+        .poolSizeCount = static_cast<std::uint32_t>(pool_sizes.size()),
+        .pPoolSizes = pool_sizes.data(),
     };
     VK_CHECK(vkCreateDescriptorPool(
         context_->device(),
@@ -3059,19 +3557,149 @@ void Renderer::create_anti_aliasing_descriptors() {
                 .imageView = resources.fsr_output.view(),
                 .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             },
+            VkDescriptorImageInfo{
+                .sampler = grading_lut_32_.sampler(),
+                .imageView = grading_lut_32_.view(),
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            },
+            VkDescriptorImageInfo{
+                .sampler = grading_lut_64_.sampler(),
+                .imageView = grading_lut_64_.view(),
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            },
         };
-        std::array<VkWriteDescriptorSet, 6> writes{};
-        for (std::size_t binding = 0;
-             binding < image_infos.size();
-             ++binding) {
-            writes[binding] = VkWriteDescriptorSet{
+        std::array<VkWriteDescriptorSet, 18> writes{};
+        for (std::size_t source = 0; source < image_infos.size(); ++source) {
+            const std::uint32_t binding = source < 6U
+                ? static_cast<std::uint32_t>(source)
+                : static_cast<std::uint32_t>(source + 1U);
+            writes[source] = VkWriteDescriptorSet{
                 .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                 .dstSet = resources.descriptor_set,
-                .dstBinding = static_cast<std::uint32_t>(binding),
+                .dstBinding = binding,
                 .descriptorCount = 1,
                 .descriptorType =
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                .pImageInfo = &image_infos[binding],
+                .pImageInfo = &image_infos[source],
+            };
+        }
+        const VkDescriptorBufferInfo exposure_buffer_info{
+            .buffer = exposure_state_buffer_.handle(),
+            .offset = 0U,
+            .range = exposure_state_buffer_.size(),
+        };
+        writes[8] = VkWriteDescriptorSet{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = resources.descriptor_set,
+            .dstBinding = 6U,
+            .descriptorCount = 1U,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &exposure_buffer_info,
+        };
+        const VkDescriptorImageInfo exposure_image_info{
+            .sampler = VK_NULL_HANDLE,
+            .imageView = exposure_value_.view(),
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        };
+        writes[9] = VkWriteDescriptorSet{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = resources.descriptor_set,
+            .dstBinding = 9U,
+            .descriptorCount = 1U,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .pImageInfo = &exposure_image_info,
+        };
+        const auto& previous = anti_aliasing_frames_[
+            (index + max_frames_in_flight - 1U) % max_frames_in_flight];
+        const std::array temporal_image_infos{
+            VkDescriptorImageInfo{
+                .sampler = previous.fsr_output.sampler(),
+                .imageView = previous.fsr_output.view(),
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            },
+            VkDescriptorImageInfo{
+                .sampler = resources.motion_vectors.sampler(),
+                .imageView = resources.motion_vectors.view(),
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            },
+        };
+        for (std::uint32_t temporal = 0U;
+             temporal < temporal_image_infos.size(); ++temporal) {
+            writes[10U + temporal] = VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = resources.descriptor_set,
+                .dstBinding = 10U + temporal,
+                .descriptorCount = 1U,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &temporal_image_infos[temporal],
+            };
+        }
+        const VkDescriptorImageInfo depth_info{
+            .sampler = resources.depth.sampler(),
+            .imageView = resources.depth.view(),
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        writes[12] = VkWriteDescriptorSet{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = resources.descriptor_set,
+            .dstBinding = 12U,
+            .descriptorCount = 1U,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &depth_info,
+        };
+        const VkDescriptorBufferInfo frame_uniform_info{
+            .buffer = frames_[index].uniform_buffer.handle(),
+            .offset = 0U,
+            .range = sizeof(FrameUniforms),
+        };
+        writes[13] = VkWriteDescriptorSet{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = resources.descriptor_set,
+            .dstBinding = 13U,
+            .descriptorCount = 1U,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .pBufferInfo = &frame_uniform_info,
+        };
+        const std::array motion_tile_sampled_infos{
+            VkDescriptorImageInfo{
+                .sampler = resources.motion_tile_max.sampler(),
+                .imageView = resources.motion_tile_max.view(),
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            },
+            VkDescriptorImageInfo{
+                .sampler = resources.motion_neighbor_max.sampler(),
+                .imageView = resources.motion_neighbor_max.view(),
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            },
+        };
+        const std::array motion_tile_storage_infos{
+            VkDescriptorImageInfo{
+                .sampler = VK_NULL_HANDLE,
+                .imageView = resources.motion_tile_max.view(),
+                .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            },
+            VkDescriptorImageInfo{
+                .sampler = VK_NULL_HANDLE,
+                .imageView = resources.motion_neighbor_max.view(),
+                .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            },
+        };
+        for (std::uint32_t tile = 0U; tile < 2U; ++tile) {
+            writes[14U + tile] = VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = resources.descriptor_set,
+                .dstBinding = 14U + tile,
+                .descriptorCount = 1U,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &motion_tile_sampled_infos[tile],
+            };
+            writes[16U + tile] = VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = resources.descriptor_set,
+                .dstBinding = 16U + tile,
+                .descriptorCount = 1U,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                .pImageInfo = &motion_tile_storage_infos[tile],
             };
         }
         vkUpdateDescriptorSets(
@@ -3081,6 +3709,92 @@ void Renderer::create_anti_aliasing_descriptors() {
             0,
             nullptr);
     }
+}
+
+void Renderer::create_subsurface_descriptors() {
+    destroy_subsurface_descriptors();
+    if (!subsurface_resources_provisioned_) return;
+    const VkDescriptorPoolSize pool_size{
+        .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .descriptorCount = max_frames_in_flight * 2U * 3U,
+    };
+    const VkDescriptorPoolCreateInfo pool_info{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = max_frames_in_flight * 2U,
+        .poolSizeCount = 1U,
+        .pPoolSizes = &pool_size,
+    };
+    VK_CHECK(vkCreateDescriptorPool(
+        context_->device(), &pool_info, nullptr,
+        &subsurface_descriptor_pool_));
+
+    std::array<VkDescriptorSetLayout, max_frames_in_flight * 2U> layouts{};
+    layouts.fill(subsurface_descriptor_set_layout_);
+    std::array<VkDescriptorSet, max_frames_in_flight * 2U> sets{};
+    const VkDescriptorSetAllocateInfo allocate_info{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = subsurface_descriptor_pool_,
+        .descriptorSetCount = static_cast<std::uint32_t>(sets.size()),
+        .pSetLayouts = layouts.data(),
+    };
+    VK_CHECK(vkAllocateDescriptorSets(
+        context_->device(), &allocate_info, sets.data()));
+
+    for (std::uint32_t index = 0U; index < max_frames_in_flight; ++index) {
+        auto& resources = anti_aliasing_frames_[index];
+        resources.subsurface_horizontal_set = sets[index * 2U];
+        resources.subsurface_vertical_set = sets[index * 2U + 1U];
+        const std::array horizontal_infos{
+            VkDescriptorImageInfo{
+                resources.color.sampler(), resources.color.view(),
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            VkDescriptorImageInfo{
+                resources.subsurface_base.sampler(), resources.subsurface_base.view(),
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            VkDescriptorImageInfo{
+                resources.depth.sampler(), resources.depth.view(),
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        };
+        const std::array vertical_infos{
+            VkDescriptorImageInfo{
+                resources.subsurface_ping.sampler(), resources.subsurface_ping.view(),
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            horizontal_infos[1],
+            horizontal_infos[2],
+        };
+        const auto update_set = [this](
+                                    const VkDescriptorSet set,
+                                    const std::array<VkDescriptorImageInfo, 3>& infos) {
+            std::array<VkWriteDescriptorSet, 3> writes{};
+            for (std::uint32_t binding = 0U;
+                 binding < static_cast<std::uint32_t>(writes.size()); ++binding) {
+                writes[binding] = VkWriteDescriptorSet{
+                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                    .dstSet = set,
+                    .dstBinding = binding,
+                    .descriptorCount = 1U,
+                    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    .pImageInfo = &infos[binding],
+                };
+            }
+            vkUpdateDescriptorSets(
+                context_->device(), static_cast<std::uint32_t>(writes.size()),
+                writes.data(), 0U, nullptr);
+        };
+        update_set(resources.subsurface_horizontal_set, horizontal_infos);
+        update_set(resources.subsurface_vertical_set, vertical_infos);
+    }
+}
+
+void Renderer::provision_subsurface_resources() {
+    if (subsurface_resources_provisioned_) {
+        subsurface_provision_pending_ = false;
+        return;
+    }
+    create_subsurface_targets();
+    subsurface_resources_provisioned_ = true;
+    create_subsurface_descriptors();
+    subsurface_provision_pending_ = false;
 }
 
 void Renderer::render_static_shadow_map() {
@@ -3096,6 +3810,16 @@ void Renderer::render_static_shadow_map() {
 }
 
 void Renderer::record_shadow_map(VkCommandBuffer command_buffer, FrameContext &frame) {
+    const unsigned cascades = lighting_settings_.dynamic ? 4U : 1U;
+    const std::uint32_t all_cascades = (1U << cascades) - 1U;
+    // Generic scene/transform/resource invalidation always refreshes every tile.
+    // Only unchanged camera cascades may retain both their matrix and image data.
+    const std::uint32_t update_mask =
+        shadow_dirty_ || !lighting_settings_.cascade_cache ||
+                shadow_layout_ == VK_IMAGE_LAYOUT_UNDEFINED
+            ? all_cascades : shadow_matrix_dirty_mask_ & all_cascades;
+    if (update_mask == 0) return;
+    const bool partial = update_mask != all_cascades;
     transition_image(
         command_buffer, shadow_map_.image(), VK_IMAGE_ASPECT_DEPTH_BIT, shadow_layout_,
         VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
@@ -3104,13 +3828,14 @@ void Renderer::record_shadow_map(VkCommandBuffer command_buffer, FrameContext &f
         shadow_layout_ == VK_IMAGE_LAYOUT_UNDEFINED ? VK_ACCESS_2_NONE
                                                     : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
         VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
-        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+            (partial ? VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT : 0));
 
     const VkRenderingAttachmentInfo depth_attachment{
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
         .imageView = shadow_map_.view(),
         .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .loadOp = partial ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR,
         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
         .clearValue = VkClearValue{.depthStencil = {1.0F, 0}},
     };
@@ -3128,11 +3853,21 @@ void Renderer::record_shadow_map(VkCommandBuffer command_buffer, FrameContext &f
         .pDepthAttachment = &depth_attachment,
     };
     vkCmdBeginRendering(command_buffer, &rendering_info);
-    const unsigned cascades = lighting_settings_.dynamic ? 4U : 1U;
     for (unsigned cascade = 0; cascade < cascades; ++cascade) {
+        if ((update_mask & (1U << cascade)) == 0) continue;
         const unsigned tile = cascades == 4 ? extent.width / 2 : extent.width;
         const unsigned x = cascades == 4 ? (cascade % 2) * tile : 0,
                        y = cascades == 4 ? (cascade / 2) * tile : 0;
+        if (partial) {
+            const VkClearAttachment clear{
+                .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+                .clearValue = VkClearValue{.depthStencil = {1.0F, 0}}};
+            const VkClearRect rectangle{
+                .rect = {{static_cast<std::int32_t>(x), static_cast<std::int32_t>(y)}, {tile, tile}},
+                .baseArrayLayer = 0, .layerCount = 1};
+            vkCmdClearAttachments(command_buffer, 1, &clear, 1, &rectangle);
+        }
+        ++lighting_statistics_.shadow_tiles;
         const auto &matrix =
             cascades == 4 ? lighting_uniforms_.shadow_matrices[cascade] : light_view_projection_;
         vkCmdPushConstants(command_buffer, pipeline_layout_, VK_SHADER_STAGE_VERTEX_BIT, 16, 64,
@@ -3158,7 +3893,9 @@ void Renderer::record_shadow_map(VkCommandBuffer command_buffer, FrameContext &f
         vkCmdBindIndexBuffer(command_buffer, terrain_index_buffer_.handle(), 0,
                              VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(command_buffer,
-                         authored_scene_enabled_ && !editor_terrain_visible_ ? 0U
+                         fixture_ == RenderFixture::material_spheres ||
+                             fixture_ == RenderFixture::subsurface_profiles ||
+                             (authored_scene_enabled_ && !editor_terrain_visible_) ? 0U
                                                                              : terrain_index_count,
                          1, 0, 0, 0);
 #if VCR_EDITOR_ENABLED
@@ -3197,7 +3934,7 @@ void Renderer::record_shadow_map(VkCommandBuffer command_buffer, FrameContext &f
             vkCmdBindVertexBuffers(command_buffer, 0, 1, &sample_vertex_buffer, &vertex_offset);
             vkCmdBindIndexBuffer(command_buffer, pbr_sample_index_buffer_.handle(), 0,
                                  VK_INDEX_TYPE_UINT16);
-            vkCmdDrawIndexed(command_buffer, pbr_sample_index_count, pbr_sample_count, 0, 0,
+            vkCmdDrawIndexed(command_buffer, pbr_sample_index_count, pbr_sample_instance_count_, 0, 0,
                              demo_sample_first_instance);
         }
     }
@@ -3211,6 +3948,9 @@ void Renderer::record_shadow_map(VkCommandBuffer command_buffer, FrameContext &f
         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     shadow_layout_ = VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL;
     shadow_dirty_ = false;
+    shadow_matrix_dirty_mask_ = 0;
+    ++lighting_statistics_.shadow_passes;
+    lighting_statistics_.last_shadow_mask = update_mask;
 }
 
 void Renderer::upload_to_device_buffer(GpuBuffer &destination,
@@ -3280,6 +4020,7 @@ void Renderer::upload_to_device_texture(
     const std::uint64_t expected_bytes =
         static_cast<std::uint64_t>(destination.width()) *
         static_cast<std::uint64_t>(destination.height()) *
+        static_cast<std::uint64_t>(destination.depth()) *
         bytes_per_pixel;
     if (expected_bytes != pixels.size_bytes() ||
         expected_bytes > std::numeric_limits<VkDeviceSize>::max()) {
@@ -3333,11 +4074,14 @@ void Renderer::upload_to_device_texture(
             VkExtent3D{
                 destination.width(),
                 destination.height(),
-                1U,
+                destination.depth(),
             },
     };
     vkCmdCopyBufferToImage(command_buffer, source, destination.image(),
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
+    if (destination.depth() > 1U && destination.mip_levels() > 1U) {
+        fatal("Mipmapped 3D texture upload is not implemented.");
+    }
     std::uint32_t mip_width = destination.width();
     std::uint32_t mip_height = destination.height();
     for (std::uint32_t level = 1U;
@@ -3436,6 +4180,358 @@ void Renderer::upload_to_device_texture(
     }
 }
 
+void Renderer::record_subsurface(
+    const VkCommandBuffer command_buffer,
+    FrameContext& frame,
+    AntiAliasingFrameResources& resources,
+    const VkExtent2D extent) {
+    frame.subsurface_was_enabled =
+        subsurface_mode_actual() == SubsurfaceMode::full_resolution;
+    if (!frame.subsurface_was_enabled) return;
+    if (extent.width == 0U || extent.height == 0U ||
+        resources.subsurface_horizontal_set == VK_NULL_HANDLE ||
+        resources.subsurface_vertical_set == VK_NULL_HANDLE) {
+        fatal("SSS resources are incomplete for the current frame.");
+    }
+    if (frame.timestamp_queries != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp2(
+            command_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            frame.timestamp_queries, timestamp_subsurface_begin);
+    }
+
+    constexpr VkPipelineStageFlags2 sampled_stages =
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    transition_tracked_image(
+        command_buffer, resources.color, resources.color_layout,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    transition_tracked_image(
+        command_buffer, resources.subsurface_base,
+        resources.subsurface_base_layout,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    transition_tracked_image(
+        command_buffer, resources.depth, resources.depth_layout,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    transition_tracked_image(
+        command_buffer, resources.subsurface_ping,
+        resources.subsurface_ping_layout,
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+
+    const SubsurfacePushConstants push{
+        .depth_parameters = glm::vec4(
+            camera_near,
+            camera_far,
+            0.5F * static_cast<float>(extent.height) /
+                std::tan(glm::radians(camera_vertical_fov) * 0.5F),
+            0.35F),
+        .render_extent = glm::uvec2(extent.width, extent.height),
+    };
+    const VkViewport viewport{
+        .x = 0.0F,
+        .y = 0.0F,
+        .width = static_cast<float>(extent.width),
+        .height = static_cast<float>(extent.height),
+        .minDepth = 0.0F,
+        .maxDepth = 1.0F,
+    };
+    const VkRect2D scissor{{0, 0}, extent};
+    vkCmdSetViewport(command_buffer, 0U, 1U, &viewport);
+    vkCmdSetScissor(command_buffer, 0U, 1U, &scissor);
+    const auto draw_pass = [this, command_buffer, &push](
+                               const VkPipeline pipeline,
+                               const VkDescriptorSet descriptor_set) {
+        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        vkCmdBindDescriptorSets(
+            command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            subsurface_pipeline_layout_, 0U, 1U, &descriptor_set, 0U, nullptr);
+        vkCmdPushConstants(
+            command_buffer, subsurface_pipeline_layout_,
+            VK_SHADER_STAGE_FRAGMENT_BIT, 0U, sizeof(push), &push);
+        vkCmdDraw(command_buffer, 3U, 1U, 0U, 0U);
+    };
+    const VkRenderingAttachmentInfo horizontal_attachment{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = resources.subsurface_ping.view(),
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+    };
+    const VkRenderingInfo horizontal_info{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .renderArea = VkRect2D{{0, 0}, extent},
+        .layerCount = 1U,
+        .colorAttachmentCount = 1U,
+        .pColorAttachments = &horizontal_attachment,
+    };
+    vkCmdBeginRendering(command_buffer, &horizontal_info);
+    draw_pass(
+        subsurface_horizontal_pipeline_.get(),
+        resources.subsurface_horizontal_set);
+    vkCmdEndRendering(command_buffer);
+
+    transition_tracked_image(
+        command_buffer, resources.subsurface_ping,
+        resources.subsurface_ping_layout,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    transition_tracked_image(
+        command_buffer, resources.color, resources.color_layout,
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    const VkRenderingAttachmentInfo vertical_attachment{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = resources.color.view(),
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+    };
+    const VkRenderingInfo vertical_info{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .renderArea = VkRect2D{{0, 0}, extent},
+        .layerCount = 1U,
+        .colorAttachmentCount = 1U,
+        .pColorAttachments = &vertical_attachment,
+    };
+    vkCmdBeginRendering(command_buffer, &vertical_info);
+    draw_pass(
+        subsurface_vertical_pipeline_.get(),
+        resources.subsurface_vertical_set);
+    vkCmdEndRendering(command_buffer);
+    transition_tracked_image(
+        command_buffer, resources.color, resources.color_layout,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+        sampled_stages,
+        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+
+    if (frame.timestamp_queries != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp2(
+            command_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            frame.timestamp_queries, timestamp_subsurface_end);
+    }
+}
+
+void Renderer::record_auto_exposure(
+    const VkCommandBuffer command_buffer,
+    FrameContext& frame,
+    const VkExtent2D source_extent,
+    const VkDescriptorSet descriptor_set) {
+    const bool automatic = exposure_mode_actual() == ExposureMode::automatic;
+    const bool fsr_needs_exposure =
+        anti_aliasing_.method == AntiAliasingMethod::fsr3 &&
+        fsr3_upscaler_.available();
+    frame.exposure_was_updated = automatic || fsr_needs_exposure;
+    if (!frame.exposure_was_updated) return;
+    if (source_extent.width == 0U || source_extent.height == 0U) {
+        fatal("Cannot meter an empty HDR scene extent.");
+    }
+
+    if (frame.timestamp_queries != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp2(
+            command_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            frame.timestamp_queries, timestamp_exposure_begin);
+    }
+
+    constexpr std::uint64_t maximum_weighted_samples = 1'000'000'000ULL;
+    std::uint32_t sample_stride = 1U;
+    while (((static_cast<std::uint64_t>(source_extent.width) + sample_stride - 1U) /
+                sample_stride) *
+               ((static_cast<std::uint64_t>(source_extent.height) + sample_stride - 1U) /
+                sample_stride) *
+               4ULL > maximum_weighted_samples) {
+        ++sample_stride;
+    }
+    const std::uint32_t sample_width = static_cast<std::uint32_t>(
+        (static_cast<std::uint64_t>(source_extent.width) + sample_stride - 1U) /
+        sample_stride);
+    const std::uint32_t sample_height = static_cast<std::uint32_t>(
+        (static_cast<std::uint64_t>(source_extent.height) + sample_stride - 1U) /
+        sample_stride);
+
+    const VkBufferMemoryBarrier2 prior_state{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT |
+            VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT |
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT |
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = exposure_state_buffer_.handle(),
+        .offset = 0U,
+        .size = exposure_state_buffer_.size(),
+    };
+    const VkDependencyInfo prior_dependency{
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .bufferMemoryBarrierCount = 1U,
+        .pBufferMemoryBarriers = &prior_state,
+    };
+    vkCmdPipelineBarrier2(command_buffer, &prior_dependency);
+    vkCmdFillBuffer(
+        command_buffer, exposure_state_buffer_.handle(), 0U,
+        exposure_histogram_bytes + sizeof(std::uint32_t), 0U);
+    const VkBufferMemoryBarrier2 histogram_clear{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = exposure_state_buffer_.handle(),
+        .offset = 0U,
+        .size = exposure_state_buffer_.size(),
+    };
+    const VkDependencyInfo histogram_dependency{
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .bufferMemoryBarrierCount = 1U,
+        .pBufferMemoryBarriers = &histogram_clear,
+    };
+    vkCmdPipelineBarrier2(command_buffer, &histogram_dependency);
+
+    transition_tracked_image(
+        command_buffer, exposure_value_, exposure_value_layout_, VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+
+    const float raw_delta_seconds = std::isfinite(fsr_frame_time_ms_)
+        ? std::max(0.0F, fsr_frame_time_ms_ * 0.001F) : 0.0F;
+    const ExposurePushConstants push{
+        .inverse_resolution = {
+            1.0F / static_cast<float>(source_extent.width),
+            1.0F / static_cast<float>(source_extent.height)},
+        .exposure_mode = static_cast<std::uint32_t>(
+            automatic ? ExposureMode::automatic : ExposureMode::fixed),
+        .sample_stride = sample_stride,
+        .source_width = source_extent.width,
+        .source_height = source_extent.height,
+        .metering = static_cast<std::uint32_t>(exposure_settings_.metering),
+        .reset = exposure_reset_pending_ || raw_delta_seconds > 0.25F ? 1U : 0U,
+        .delta_seconds = std::min(raw_delta_seconds, 0.25F),
+        .compensation_ev = exposure_settings_.compensation_ev,
+        .minimum_ev = exposure_settings_.minimum_ev,
+        .maximum_ev = exposure_settings_.maximum_ev,
+        .low_percentile = exposure_settings_.low_percentile,
+        .high_percentile = exposure_settings_.high_percentile,
+        .brighten_seconds = exposure_settings_.brighten_seconds,
+        .darken_seconds = exposure_settings_.darken_seconds,
+    };
+    vkCmdBindDescriptorSets(
+        command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+        exposure_pipeline_layout_, 0U, 1U, &descriptor_set, 0U, nullptr);
+    vkCmdPushConstants(
+        command_buffer, exposure_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
+        0U, sizeof(push), &push);
+    if (automatic) {
+        vkCmdBindPipeline(
+            command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+            exposure_histogram_pipeline_.get());
+        vkCmdDispatch(
+            command_buffer, (sample_width + 15U) / 16U,
+            (sample_height + 7U) / 8U, 1U);
+        const VkMemoryBarrier2 histogram_ready{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        };
+        const VkDependencyInfo ready_dependency{
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .memoryBarrierCount = 1U,
+            .pMemoryBarriers = &histogram_ready,
+        };
+        vkCmdPipelineBarrier2(command_buffer, &ready_dependency);
+    }
+    vkCmdBindPipeline(
+        command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+        exposure_adapt_pipeline_.get());
+    vkCmdDispatch(command_buffer, 1U, 1U, 1U);
+
+    const VkBufferMemoryBarrier2 state_ready{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+            VK_ACCESS_2_TRANSFER_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = exposure_state_buffer_.handle(),
+        .offset = exposure_histogram_bytes,
+        .size = sizeof(ExposureGpuReadback),
+    };
+    const VkDependencyInfo state_dependency{
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .bufferMemoryBarrierCount = 1U,
+        .pBufferMemoryBarriers = &state_ready,
+    };
+    vkCmdPipelineBarrier2(command_buffer, &state_dependency);
+    transition_tracked_image(
+        command_buffer, exposure_value_, exposure_value_layout_,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    if (frame.timestamp_queries != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp2(
+            command_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            frame.timestamp_queries, timestamp_exposure_end);
+    }
+    const VkBufferCopy readback_copy{
+        .srcOffset = exposure_histogram_bytes,
+        .dstOffset = 0U,
+        .size = sizeof(ExposureGpuReadback),
+    };
+    vkCmdCopyBuffer(
+        command_buffer, exposure_state_buffer_.handle(),
+        frame.exposure_readback.handle(), 1U, &readback_copy);
+    exposure_reset_pending_ = false;
+}
+
+void Renderer::read_exposure_state(FrameContext& frame) {
+    if (!frame.exposure_was_updated) return;
+    frame.exposure_readback.invalidate(0U, sizeof(ExposureGpuReadback));
+    std::memcpy(
+        &exposure_readback_, frame.exposure_readback.mapped_data(),
+        sizeof(ExposureGpuReadback));
+}
+
 void Renderer::update_frame_uniform(
     FrameContext& frame,
     const glm::mat4& view_matrix) {
@@ -3451,12 +4547,16 @@ void Renderer::update_frame_uniform(
             frame_serial_,
             current_render_extent_.width,
             display_extent.width);
+    } else if (is_temporal_smaa(anti_aliasing_)) {
+        current_jitter_ = (smaa_t2x_phase_ & 1U) == 0U
+            ? TemporalOffset{0.25F, -0.25F}
+            : TemporalOffset{-0.25F, 0.25F};
     }
     const auto extent = current_render_extent_;
     const float aspect =
         static_cast<float>(extent.width) / static_cast<float>(extent.height);
     glm::mat4 unjittered_projection =
-        glm::perspective(glm::radians(65.0F), aspect, 0.1F, 500.0F);
+        camera_projection(aspect);
     unjittered_projection[1][1] *= -1.0F;
     const glm::mat4 unjittered_view_projection =
         unjittered_projection * view_matrix;
@@ -3469,8 +4569,9 @@ void Renderer::update_frame_uniform(
 #endif
     prepare_lighting(frame, view_matrix, extent);
     glm::mat4 projection = unjittered_projection;
-    if (anti_aliasing_.method == AntiAliasingMethod::fsr3 &&
-        fsr3_upscaler_.available()) {
+    if ((anti_aliasing_.method == AntiAliasingMethod::fsr3 &&
+         fsr3_upscaler_.available()) ||
+        is_temporal_smaa(anti_aliasing_)) {
         const auto projection_jitter = vulkan_projection_jitter(
             current_jitter_, extent.width, extent.height);
         projection[2][0] += projection_jitter.x;
@@ -3487,7 +4588,8 @@ void Renderer::update_frame_uniform(
     // Authored vertex shaders interpret X as the visibility-indirection flag.
     // Legacy instancing retains the identity quaternion.
     uniforms.global_rotation.x =
-        (gpu_visibility_active_ && !gpu_visibility_bypassed_ && mode_ != RunMode::instancing)
+        (authored_scene_enabled_ && mode_ != RunMode::instancing &&
+         (!gpu_visibility_active_ || !gpu_visibility_bypassed_))
             ? 1.0F
             : 0.0F;
     uniforms.unjittered_view_projection =
@@ -3779,11 +4881,9 @@ void Renderer::create_pipeline() {
     VK_CHECK(vkCreatePipelineLayout(
         context_->device(), &layout_info, nullptr, &pipeline_layout_));
 
-    std::array<VkDescriptorSetLayoutBinding, 6>
+    std::array<VkDescriptorSetLayoutBinding, 18>
         anti_aliasing_bindings{};
-    for (std::size_t binding = 0;
-         binding < anti_aliasing_bindings.size();
-         ++binding) {
+    for (std::size_t binding = 0; binding < 6U; ++binding) {
         anti_aliasing_bindings[binding] =
             VkDescriptorSetLayoutBinding{
                 .binding = static_cast<std::uint32_t>(binding),
@@ -3793,6 +4893,66 @@ void Renderer::create_pipeline() {
                 .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
                 .pImmutableSamplers = nullptr,
             };
+    }
+    anti_aliasing_bindings[0].stageFlags |= VK_SHADER_STAGE_COMPUTE_BIT;
+    anti_aliasing_bindings[6] = VkDescriptorSetLayoutBinding{
+        .binding = 6U,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1U,
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+    };
+    for (std::uint32_t binding = 7U; binding <= 8U; ++binding) {
+        anti_aliasing_bindings[binding] = VkDescriptorSetLayoutBinding{
+            .binding = binding,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1U,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        };
+    }
+    anti_aliasing_bindings[9] = VkDescriptorSetLayoutBinding{
+        .binding = 9U,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        .descriptorCount = 1U,
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+    };
+    for (std::uint32_t binding = 10U; binding <= 11U; ++binding) {
+        anti_aliasing_bindings[binding] = VkDescriptorSetLayoutBinding{
+            .binding = binding,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1U,
+            .stageFlags = static_cast<VkShaderStageFlags>(
+                binding == 11U
+                    ? VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT
+                    : VK_SHADER_STAGE_FRAGMENT_BIT),
+        };
+    }
+    anti_aliasing_bindings[12] = VkDescriptorSetLayoutBinding{
+        .binding = 12U,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .descriptorCount = 1U,
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+    };
+    anti_aliasing_bindings[13] = VkDescriptorSetLayoutBinding{
+        .binding = 13U,
+        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        .descriptorCount = 1U,
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+    };
+    for (std::uint32_t binding = 14U; binding <= 15U; ++binding) {
+        anti_aliasing_bindings[binding] = VkDescriptorSetLayoutBinding{
+            .binding = binding,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1U,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+        };
+    }
+    for (std::uint32_t binding = 16U; binding <= 17U; ++binding) {
+        anti_aliasing_bindings[binding] = VkDescriptorSetLayoutBinding{
+            .binding = binding,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .descriptorCount = 1U,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        };
     }
     const VkDescriptorSetLayoutCreateInfo
         anti_aliasing_descriptor_info{
@@ -3809,15 +4969,15 @@ void Renderer::create_pipeline() {
         &anti_aliasing_descriptor_set_layout_));
 
     const VkPushConstantRange post_process_push_constants{
-        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-        .offset = 0,
-        .size = 16,
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0U,
+        .size = display_push_constant_bytes,
     };
     const VkPipelineLayoutCreateInfo post_process_layout_info{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1,
         .pSetLayouts = &anti_aliasing_descriptor_set_layout_,
-        .pushConstantRangeCount = 1,
+        .pushConstantRangeCount = 1U,
         .pPushConstantRanges = &post_process_push_constants,
     };
     VK_CHECK(vkCreatePipelineLayout(
@@ -3825,12 +4985,64 @@ void Renderer::create_pipeline() {
         &post_process_layout_info,
         nullptr,
         &post_process_pipeline_layout_));
+    const VkPushConstantRange exposure_push_constants{
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0U,
+        .size = sizeof(ExposurePushConstants),
+    };
+    const VkPipelineLayoutCreateInfo exposure_layout_info{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1U,
+        .pSetLayouts = &anti_aliasing_descriptor_set_layout_,
+        .pushConstantRangeCount = 1U,
+        .pPushConstantRanges = &exposure_push_constants,
+    };
+    VK_CHECK(vkCreatePipelineLayout(
+        context_->device(), &exposure_layout_info, nullptr,
+        &exposure_pipeline_layout_));
+    std::array<VkDescriptorSetLayoutBinding, 3> subsurface_bindings{};
+    for (std::uint32_t binding = 0U; binding < subsurface_bindings.size(); ++binding) {
+        subsurface_bindings[binding] = VkDescriptorSetLayoutBinding{
+            .binding = binding,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1U,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        };
+    }
+    const VkDescriptorSetLayoutCreateInfo subsurface_descriptor_info{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = static_cast<std::uint32_t>(subsurface_bindings.size()),
+        .pBindings = subsurface_bindings.data(),
+    };
+    VK_CHECK(vkCreateDescriptorSetLayout(
+        context_->device(), &subsurface_descriptor_info, nullptr,
+        &subsurface_descriptor_set_layout_));
+    const VkPushConstantRange subsurface_push_constants{
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset = 0U,
+        .size = sizeof(SubsurfacePushConstants),
+    };
+    const VkPipelineLayoutCreateInfo subsurface_layout_info{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1U,
+        .pSetLayouts = &subsurface_descriptor_set_layout_,
+        .pushConstantRangeCount = 1U,
+        .pPushConstantRanges = &subsurface_push_constants,
+    };
+    VK_CHECK(vkCreatePipelineLayout(
+        context_->device(), &subsurface_layout_info, nullptr,
+        &subsurface_pipeline_layout_));
+    const VkPushConstantRange hud_push_constants{
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset = 0U,
+        .size = 16U,
+    };
     const VkPipelineLayoutCreateInfo hud_layout_info{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 0,
         .pSetLayouts = nullptr,
         .pushConstantRangeCount = 1,
-        .pPushConstantRanges = &post_process_push_constants,
+        .pPushConstantRanges = &hud_push_constants,
     };
     VK_CHECK(vkCreatePipelineLayout(
         context_->device(),
@@ -3986,7 +5198,7 @@ void Renderer::create_pipeline() {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
         .depthTestEnable = VK_TRUE,
         .depthWriteEnable = VK_TRUE,
-        .depthCompareOp = VK_COMPARE_OP_LESS,
+        .depthCompareOp = VK_COMPARE_OP_GREATER,
     };
     const VkPipelineColorBlendAttachmentState blend_attachment{
         .colorWriteMask =
@@ -4031,6 +5243,58 @@ void Renderer::create_pipeline() {
         .pDynamicState = &dynamic_state,
         .layout = pipeline_layout_,
     };
+    const auto create_prepass_variants =
+        [this, &depth_stencil](const VkGraphicsPipelineCreateInfo &source,
+                              DeviceObject<VkPipeline> &equal,
+                              DeviceObject<VkPipeline> &depth,
+                              DeviceObject<VkPipeline> *fade_depth = nullptr) {
+            VkPipelineDepthStencilStateCreateInfo equal_state = depth_stencil;
+            equal_state.depthCompareOp = VK_COMPARE_OP_EQUAL;
+            equal_state.depthWriteEnable = VK_FALSE;
+            VkGraphicsPipelineCreateInfo info = source;
+            info.pDepthStencilState = &equal_state;
+            VK_CHECK(vkCreateGraphicsPipelines(context_->device(), pipeline_cache_, 1, &info,
+                                               nullptr, equal.put(context_->device(), vkDestroyPipeline)));
+            context_->set_debug_name(VK_OBJECT_TYPE_PIPELINE, handle_value(equal.get()),
+                                     "prepassed opaque EQUAL color pipeline");
+            // Direct and spatial color paths share the same vertex shader.
+            if (depth.get() != VK_NULL_HANDLE) return;
+            const VkPipelineRenderingCreateInfo rendering{
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+                .depthAttachmentFormat = swapchain_.depth_format(),
+            };
+            const VkPipelineColorBlendStateCreateInfo no_color{
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+            };
+            info.pNext = &rendering;
+            info.stageCount = 1;
+            info.pDepthStencilState = &depth_stencil;
+            info.pColorBlendState = &no_color;
+            VK_CHECK(vkCreateGraphicsPipelines(context_->device(), pipeline_cache_, 1, &info,
+                                               nullptr, depth.put(context_->device(), vkDestroyPipeline)));
+            context_->set_debug_name(VK_OBJECT_TYPE_PIPELINE, handle_value(depth.get()),
+                                     "opaque depth-only prepass pipeline");
+            if (fade_depth != nullptr) {
+                const ShaderModule coverage_vertex = load_shader("editor_model_depth.vert.spv");
+                const ShaderModule coverage = load_shader("lod_depth.frag.spv");
+                const std::array coverage_stages{
+                    VkPipelineShaderStageCreateInfo{
+                        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                        .stage = VK_SHADER_STAGE_VERTEX_BIT,
+                        .module = coverage_vertex.get(), .pName = "main"},
+                    VkPipelineShaderStageCreateInfo{
+                        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                        .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                        .module = coverage.get(), .pName = "main"}};
+                info.stageCount = static_cast<std::uint32_t>(coverage_stages.size());
+                info.pStages = coverage_stages.data();
+                VK_CHECK(vkCreateGraphicsPipelines(context_->device(), pipeline_cache_, 1, &info,
+                    nullptr, fade_depth->put(context_->device(), vkDestroyPipeline)));
+                context_->set_debug_name(VK_OBJECT_TYPE_PIPELINE, handle_value(fade_depth->get()),
+                                         "complementary LOD depth coverage pipeline");
+            }
+        };
+    create_prepass_variants(pipeline_info, equal_direct_.cubes, depth_geometry_.cubes);
     VK_CHECK(vkCreateGraphicsPipelines(
         context_->device(),
         pipeline_cache_,
@@ -4068,6 +5332,7 @@ void Renderer::create_pipeline() {
     scene_pipeline_info.stageCount =
         static_cast<std::uint32_t>(scene_stages.size());
     scene_pipeline_info.pStages = scene_stages.data();
+    create_prepass_variants(scene_pipeline_info, equal_direct_.scene, depth_geometry_.scene);
     VK_CHECK(vkCreateGraphicsPipelines(
         context_->device(),
         pipeline_cache_,
@@ -4109,6 +5374,8 @@ void Renderer::create_pipeline() {
             editor_model_stages.data();
         editor_model_pipeline_info.pVertexInputState =
             &editor_model_vertex_input;
+        create_prepass_variants(editor_model_pipeline_info, equal_direct_.models,
+                                depth_geometry_.models, &lod_depth_model_);
         VK_CHECK(vkCreateGraphicsPipelines(
             context_->device(),
             pipeline_cache_,
@@ -4133,6 +5400,7 @@ void Renderer::create_pipeline() {
     terrain_pipeline_info.pStages = terrain_stages.data();
     terrain_pipeline_info.pVertexInputState = &terrain_vertex_input;
     terrain_pipeline_info.pInputAssemblyState = &terrain_input_assembly;
+    create_prepass_variants(terrain_pipeline_info, equal_direct_.terrain, depth_geometry_.terrain);
     VK_CHECK(vkCreateGraphicsPipelines(
         context_->device(),
         pipeline_cache_,
@@ -4173,11 +5441,14 @@ void Renderer::create_pipeline() {
     spatial_rendering_info.colorAttachmentCount = 1U;
     const auto create_aa_geometry_pipeline =
         [this, &gi_specialization, &pipeline_info, &aa_rendering_info, &aa_color_blend,
-         &spatial_rendering_info, &color_blend](
+         &spatial_rendering_info, &color_blend, &create_prepass_variants](
             const std::filesystem::path &vertex_path, const std::filesystem::path &fragment_path,
             const VkPipelineVertexInputStateCreateInfo &vertex_input_state,
             const VkPipelineInputAssemblyStateCreateInfo &input_assembly_state,
-            const char *const debug_name, const bool temporal = true) {
+            const char *const debug_name, DeviceObject<VkPipeline> &equal,
+            DeviceObject<VkPipeline> &depth, const bool temporal = true,
+            const VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT,
+            DeviceObject<VkPipeline>* const fade_depth = nullptr) {
             const ShaderModule vertex =
                 load_shader(vertex_path);
             const ShaderModule fragment =
@@ -4198,6 +5469,11 @@ void Renderer::create_pipeline() {
                 },
             };
             VkGraphicsPipelineCreateInfo info = pipeline_info;
+            VkPipelineMultisampleStateCreateInfo sample_state =
+                *pipeline_info.pMultisampleState;
+            sample_state.rasterizationSamples = samples;
+            sample_state.sampleShadingEnable = VK_FALSE;
+            info.pMultisampleState = &sample_state;
             info.pNext = temporal ? &aa_rendering_info : &spatial_rendering_info;
             info.stageCount =
                 static_cast<std::uint32_t>(shader_stages.size());
@@ -4205,6 +5481,12 @@ void Renderer::create_pipeline() {
             info.pVertexInputState = &vertex_input_state;
             info.pInputAssemblyState = &input_assembly_state;
             info.pColorBlendState = temporal ? &aa_color_blend : &color_blend;
+            DeviceObject<VkPipeline>* effective_fade_depth = fade_depth;
+            if (effective_fade_depth == nullptr &&
+                &depth == &depth_temporal_geometry_.models) {
+                effective_fade_depth = &lod_depth_temporal_model_;
+            }
+            create_prepass_variants(info, equal, depth, effective_fade_depth);
             DeviceObject<VkPipeline> result;
             VK_CHECK(vkCreateGraphicsPipelines(
                 context_->device(),
@@ -4224,7 +5506,7 @@ void Renderer::create_pipeline() {
         "cube_aa.frag.spv",
         vertex_input,
         input_assembly,
-        "AA instancing graphics pipeline");
+        "AA instancing graphics pipeline", equal_temporal_.cubes, depth_temporal_geometry_.cubes);
     const char* aa_scene_vertex_shader =
         "scene_aa.vert.spv";
 #if VCR_EDITOR_ENABLED
@@ -4238,7 +5520,7 @@ void Renderer::create_pipeline() {
         "scene_aa.frag.spv",
         vertex_input,
         input_assembly,
-        "AA shadowed scene graphics pipeline");
+        "AA shadowed scene graphics pipeline", equal_temporal_.scene, depth_temporal_geometry_.scene);
 #if VCR_EDITOR_ENABLED
     if (authored_scene_enabled_) {
         aa_editor_model_pipeline_ =
@@ -4247,7 +5529,8 @@ void Renderer::create_pipeline() {
                 "editor_model_aa.frag.spv",
                 editor_model_vertex_input,
                 input_assembly,
-                "AA textured editor model graphics pipeline");
+                "AA textured editor model graphics pipeline", equal_temporal_.models,
+                depth_temporal_geometry_.models);
     }
 #endif
     aa_terrain_pipeline_ = create_aa_geometry_pipeline(
@@ -4255,26 +5538,171 @@ void Renderer::create_pipeline() {
         "scene_aa.frag.spv",
         terrain_vertex_input,
         terrain_input_assembly,
-        "AA indexed heightfield graphics pipeline");
+        "AA indexed heightfield graphics pipeline", equal_temporal_.terrain, depth_temporal_geometry_.terrain);
 
     smaa_geometry_.cubes = create_aa_geometry_pipeline(
         "cube.vert.spv", "cube.frag.spv", vertex_input, input_assembly,
-        "SMAA color-only instancing pipeline", false);
+        "SMAA color-only instancing pipeline", equal_spatial_.cubes, depth_geometry_.cubes, false);
     smaa_geometry_.scene = create_aa_geometry_pipeline(
         scene_vertex_shader, "scene.frag.spv", vertex_input, input_assembly,
-        "SMAA color-only scene pipeline", false);
+        "SMAA color-only scene pipeline", equal_spatial_.scene, depth_geometry_.scene, false);
 #if VCR_EDITOR_ENABLED
     if (authored_scene_enabled_) {
         smaa_geometry_.models = create_aa_geometry_pipeline(
             "editor_model.vert.spv", "editor_model.frag.spv",
             editor_model_vertex_input, input_assembly,
-            "SMAA color-only model pipeline", false);
+            "SMAA color-only model pipeline", equal_spatial_.models, depth_geometry_.models, false);
     }
 #endif
     smaa_geometry_.terrain = create_aa_geometry_pipeline(
         "terrain.vert.spv", "scene.frag.spv",
         terrain_vertex_input, terrain_input_assembly,
-        "SMAA color-only terrain pipeline", false);
+        "SMAA color-only terrain pipeline", equal_spatial_.terrain, depth_geometry_.terrain, false);
+
+    constexpr std::array msaa_samples{
+        VK_SAMPLE_COUNT_2_BIT, VK_SAMPLE_COUNT_4_BIT};
+    for (std::size_t index = 0U; index < msaa_samples.size(); ++index) {
+        if ((msaa_supported_sample_counts_ & msaa_samples[index]) == 0U) continue;
+        const char* const debug_name = index == 0U
+            ? "MSAA 2x geometry pipeline" : "MSAA 4x geometry pipeline";
+        msaa_geometry_[index].cubes = create_aa_geometry_pipeline(
+            "cube.vert.spv", "cube.frag.spv", vertex_input, input_assembly,
+            debug_name, equal_msaa_[index].cubes,
+            depth_msaa_geometry_[index].cubes, false, msaa_samples[index]);
+        msaa_geometry_[index].scene = create_aa_geometry_pipeline(
+            scene_vertex_shader, "scene.frag.spv", vertex_input, input_assembly,
+            debug_name, equal_msaa_[index].scene,
+            depth_msaa_geometry_[index].scene, false, msaa_samples[index]);
+#if VCR_EDITOR_ENABLED
+        if (authored_scene_enabled_) {
+            msaa_geometry_[index].models = create_aa_geometry_pipeline(
+                "editor_model.vert.spv", "editor_model.frag.spv",
+                editor_model_vertex_input, input_assembly, debug_name,
+                equal_msaa_[index].models, depth_msaa_geometry_[index].models,
+                false, msaa_samples[index], &lod_depth_msaa_model_[index]);
+        }
+#endif
+        msaa_geometry_[index].terrain = create_aa_geometry_pipeline(
+            "terrain.vert.spv", "scene.frag.spv", terrain_vertex_input,
+            terrain_input_assembly, debug_name, equal_msaa_[index].terrain,
+            depth_msaa_geometry_[index].terrain, false, msaa_samples[index]);
+    }
+
+    const std::array sss_spatial_formats{
+        aa_color_format, aa_color_format, aa_depth_format};
+    const std::array sss_temporal_formats{
+        aa_color_format, aa_color_format, aa_motion_format, aa_depth_format};
+    const std::array sss_spatial_blend_attachments{
+        blend_attachment, blend_attachment, blend_attachment};
+    const std::array sss_temporal_blend_attachments{
+        blend_attachment, blend_attachment, blend_attachment, blend_attachment};
+    const VkPipelineColorBlendStateCreateInfo sss_spatial_blend{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .attachmentCount = static_cast<std::uint32_t>(sss_spatial_blend_attachments.size()),
+        .pAttachments = sss_spatial_blend_attachments.data(),
+    };
+    const VkPipelineColorBlendStateCreateInfo sss_temporal_blend{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .attachmentCount = static_cast<std::uint32_t>(sss_temporal_blend_attachments.size()),
+        .pAttachments = sss_temporal_blend_attachments.data(),
+    };
+    const VkPipelineRenderingCreateInfo sss_spatial_rendering{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+        .colorAttachmentCount = static_cast<std::uint32_t>(sss_spatial_formats.size()),
+        .pColorAttachmentFormats = sss_spatial_formats.data(),
+        .depthAttachmentFormat = swapchain_.depth_format(),
+    };
+    const VkPipelineRenderingCreateInfo sss_temporal_rendering{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+        .colorAttachmentCount = static_cast<std::uint32_t>(sss_temporal_formats.size()),
+        .pColorAttachmentFormats = sss_temporal_formats.data(),
+        .depthAttachmentFormat = swapchain_.depth_format(),
+    };
+    const auto create_subsurface_geometry_pipeline =
+        [this, &gi_specialization, &pipeline_info, &create_prepass_variants,
+         &sss_spatial_rendering, &sss_temporal_rendering,
+         &sss_spatial_blend, &sss_temporal_blend](
+            const std::filesystem::path& vertex_path,
+            const std::filesystem::path& fragment_path,
+            const VkPipelineVertexInputStateCreateInfo& vertex_input_state,
+            const VkPipelineInputAssemblyStateCreateInfo& input_assembly_state,
+            const bool temporal,
+            DeviceObject<VkPipeline>& equal,
+            DeviceObject<VkPipeline>& existing_depth,
+            const char* debug_name) {
+            const ShaderModule vertex = load_shader(vertex_path);
+            const ShaderModule fragment = load_shader(fragment_path);
+            const std::array stages{
+                VkPipelineShaderStageCreateInfo{
+                    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    .stage = VK_SHADER_STAGE_VERTEX_BIT,
+                    .module = vertex.get(),
+                    .pName = "main",
+                },
+                VkPipelineShaderStageCreateInfo{
+                    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                    .module = fragment.get(),
+                    .pName = "main",
+                    .pSpecializationInfo = &gi_specialization,
+                },
+            };
+            VkGraphicsPipelineCreateInfo info = pipeline_info;
+            info.pNext = temporal
+                ? static_cast<const void*>(&sss_temporal_rendering)
+                : static_cast<const void*>(&sss_spatial_rendering);
+            info.stageCount = static_cast<std::uint32_t>(stages.size());
+            info.pStages = stages.data();
+            info.pVertexInputState = &vertex_input_state;
+            info.pInputAssemblyState = &input_assembly_state;
+            info.pColorBlendState = temporal ? &sss_temporal_blend : &sss_spatial_blend;
+            create_prepass_variants(info, equal, existing_depth);
+            DeviceObject<VkPipeline> result;
+            VK_CHECK(vkCreateGraphicsPipelines(
+                context_->device(), pipeline_cache_, 1U, &info, nullptr,
+                result.put(context_->device(), vkDestroyPipeline)));
+            context_->set_debug_name(
+                VK_OBJECT_TYPE_PIPELINE, handle_value(result.get()), debug_name);
+            return result;
+        };
+    subsurface_spatial_.cubes = create_subsurface_geometry_pipeline(
+        "cube.vert.spv", "cube_sss.frag.spv", vertex_input, input_assembly,
+        false, equal_subsurface_spatial_.cubes, depth_geometry_.cubes,
+        "SSS spatial instancing pipeline");
+    subsurface_spatial_.scene = create_subsurface_geometry_pipeline(
+        scene_vertex_shader, "scene_sss.frag.spv", vertex_input, input_assembly,
+        false, equal_subsurface_spatial_.scene, depth_geometry_.scene,
+        "SSS spatial scene pipeline");
+    subsurface_spatial_.terrain = create_subsurface_geometry_pipeline(
+        "terrain.vert.spv", "scene_sss.frag.spv", terrain_vertex_input,
+        terrain_input_assembly, false, equal_subsurface_spatial_.terrain,
+        depth_geometry_.terrain, "SSS spatial terrain pipeline");
+    subsurface_temporal_.cubes = create_subsurface_geometry_pipeline(
+        "cube_aa.vert.spv", "cube_aa_sss.frag.spv", vertex_input, input_assembly,
+        true, equal_subsurface_temporal_.cubes, depth_temporal_geometry_.cubes,
+        "SSS temporal instancing pipeline");
+    subsurface_temporal_.scene = create_subsurface_geometry_pipeline(
+        aa_scene_vertex_shader, "scene_aa_sss.frag.spv", vertex_input,
+        input_assembly, true, equal_subsurface_temporal_.scene,
+        depth_temporal_geometry_.scene, "SSS temporal scene pipeline");
+    subsurface_temporal_.terrain = create_subsurface_geometry_pipeline(
+        "terrain_aa.vert.spv", "scene_aa_sss.frag.spv", terrain_vertex_input,
+        terrain_input_assembly, true, equal_subsurface_temporal_.terrain,
+        depth_temporal_geometry_.terrain, "SSS temporal terrain pipeline");
+#if VCR_EDITOR_ENABLED
+    if (authored_scene_enabled_) {
+        subsurface_spatial_.models = create_subsurface_geometry_pipeline(
+            "editor_model.vert.spv", "editor_model_sss.frag.spv",
+            editor_model_vertex_input, input_assembly, false,
+            equal_subsurface_spatial_.models, depth_geometry_.models,
+            "SSS spatial editor model pipeline");
+        subsurface_temporal_.models = create_subsurface_geometry_pipeline(
+            "editor_model_aa.vert.spv", "editor_model_aa_sss.frag.spv",
+            editor_model_vertex_input, input_assembly, true,
+            equal_subsurface_temporal_.models, depth_temporal_geometry_.models,
+            "SSS temporal editor model pipeline");
+    }
+#endif
 
     const ShaderModule sky_vertex_module =
         load_shader("sky.vert.spv");
@@ -4301,7 +5729,7 @@ void Renderer::create_pipeline() {
     VkPipelineDepthStencilStateCreateInfo sky_depth_stencil =
         depth_stencil;
     sky_depth_stencil.depthWriteEnable = VK_FALSE;
-    sky_depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+    sky_depth_stencil.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
 
     VkGraphicsPipelineCreateInfo sky_pipeline_info = pipeline_info;
     sky_pipeline_info.stageCount =
@@ -4331,6 +5759,21 @@ void Renderer::create_pipeline() {
         VK_OBJECT_TYPE_PIPELINE, handle_value(smaa_geometry_.sky.get()),
         "SMAA color-only sky pipeline");
 
+    for (std::size_t index = 0U; index < msaa_samples.size(); ++index) {
+        if ((msaa_supported_sample_counts_ & msaa_samples[index]) == 0U) continue;
+        VkPipelineMultisampleStateCreateInfo sample_state = multisampling;
+        sample_state.rasterizationSamples = msaa_samples[index];
+        sample_state.sampleShadingEnable = VK_FALSE;
+        VkGraphicsPipelineCreateInfo msaa_sky_info = spatial_sky_info;
+        msaa_sky_info.pMultisampleState = &sample_state;
+        VK_CHECK(vkCreateGraphicsPipelines(
+            context_->device(), pipeline_cache_, 1U, &msaa_sky_info, nullptr,
+            msaa_geometry_[index].sky.put(context_->device(), vkDestroyPipeline)));
+        context_->set_debug_name(
+            VK_OBJECT_TYPE_PIPELINE, handle_value(msaa_geometry_[index].sky.get()),
+            index == 0U ? "MSAA 2x sky pipeline" : "MSAA 4x sky pipeline");
+    }
+
     const ShaderModule aa_sky_fragment_module =
         load_shader("sky_aa.frag.spv");
     std::array<VkPipelineShaderStageCreateInfo, 2> aa_sky_stages =
@@ -4352,6 +5795,36 @@ void Renderer::create_pipeline() {
         VK_OBJECT_TYPE_PIPELINE,
         handle_value(aa_sky_pipeline_.get()),
         "AA sky graphics pipeline");
+
+    const ShaderModule sss_sky_fragment_module =
+        load_shader("sky_sss.frag.spv");
+    auto sss_sky_stages = sky_stages;
+    sss_sky_stages[1].module = sss_sky_fragment_module.get();
+    VkGraphicsPipelineCreateInfo sss_spatial_sky_info = sky_pipeline_info;
+    sss_spatial_sky_info.pNext = &sss_spatial_rendering;
+    sss_spatial_sky_info.pStages = sss_sky_stages.data();
+    sss_spatial_sky_info.pColorBlendState = &sss_spatial_blend;
+    VK_CHECK(vkCreateGraphicsPipelines(
+        context_->device(), pipeline_cache_, 1U, &sss_spatial_sky_info,
+        nullptr, subsurface_spatial_.sky.put(context_->device(), vkDestroyPipeline)));
+    context_->set_debug_name(
+        VK_OBJECT_TYPE_PIPELINE, handle_value(subsurface_spatial_.sky.get()),
+        "SSS spatial sky pipeline");
+
+    const ShaderModule sss_temporal_sky_fragment_module =
+        load_shader("sky_aa_sss.frag.spv");
+    auto sss_temporal_sky_stages = sky_stages;
+    sss_temporal_sky_stages[1].module = sss_temporal_sky_fragment_module.get();
+    VkGraphicsPipelineCreateInfo sss_temporal_sky_info = sky_pipeline_info;
+    sss_temporal_sky_info.pNext = &sss_temporal_rendering;
+    sss_temporal_sky_info.pStages = sss_temporal_sky_stages.data();
+    sss_temporal_sky_info.pColorBlendState = &sss_temporal_blend;
+    VK_CHECK(vkCreateGraphicsPipelines(
+        context_->device(), pipeline_cache_, 1U, &sss_temporal_sky_info,
+        nullptr, subsurface_temporal_.sky.put(context_->device(), vkDestroyPipeline)));
+    context_->set_debug_name(
+        VK_OBJECT_TYPE_PIPELINE, handle_value(subsurface_temporal_.sky.get()),
+        "SSS temporal sky pipeline");
 
     if (shadow_map_format_ == VK_FORMAT_UNDEFINED) {
         fatal("Shadow-map format was not selected before pipeline creation.");
@@ -4376,6 +5849,11 @@ void Renderer::create_pipeline() {
         terrain_vertex_input;
     shadow_vertex_input.vertexAttributeDescriptionCount = 1;
     VkGraphicsPipelineCreateInfo shadow_pipeline_info = pipeline_info;
+    // Shadow projections, comparison samplers and positive bias retain the
+    // conventional depth contract independently of the reverse-Z camera.
+    auto shadow_depth_stencil = depth_stencil;
+    shadow_depth_stencil.depthCompareOp = VK_COMPARE_OP_LESS;
+    shadow_pipeline_info.pDepthStencilState = &shadow_depth_stencil;
     shadow_pipeline_info.pNext = &shadow_rendering_info;
     shadow_pipeline_info.stageCount = 1;
     shadow_pipeline_info.pVertexInputState = &shadow_vertex_input;
@@ -4569,12 +6047,32 @@ void Renderer::create_pipeline() {
         "smaa_edge_high.frag.spv",
         "smaa_edge_ultra.frag.spv",
     };
+    constexpr std::array<const char*, 4> blurred_edge_shader_paths{
+        "smaa_edge_blurred_low.frag.spv",
+        "smaa_edge_blurred_medium.frag.spv",
+        "smaa_edge_blurred_high.frag.spv",
+        "smaa_edge_blurred_ultra.frag.spv",
+    };
     constexpr std::array<const char*, 4> blend_shader_paths{
         "smaa_blend_low.frag.spv",
         "smaa_blend_medium.frag.spv",
         "smaa_blend_high.frag.spv",
         "smaa_blend_ultra.frag.spv",
     };
+    subsurface_horizontal_pipeline_ = DeviceObject<VkPipeline>(
+        context_->device(),
+        create_fullscreen_pipeline(
+            "subsurface_blur.frag.spv", aa_color_format,
+            subsurface_pipeline_layout_, post_blend_attachment,
+            VK_FORMAT_UNDEFINED, "SSS horizontal diffusion"),
+        vkDestroyPipeline);
+    subsurface_vertical_pipeline_ = DeviceObject<VkPipeline>(
+        context_->device(),
+        create_fullscreen_pipeline(
+            "subsurface_blur_vertical.frag.spv", aa_color_format,
+            subsurface_pipeline_layout_, post_blend_attachment,
+            VK_FORMAT_UNDEFINED, "SSS vertical diffusion and composition"),
+        vkDestroyPipeline);
     for (std::size_t index = 0;
          index < smaa_edge_pipelines_.size();
          ++index) {
@@ -4586,6 +6084,14 @@ void Renderer::create_pipeline() {
                 post_blend_attachment,
                 VK_FORMAT_UNDEFINED,
                 "SMAA edge detection pipeline");
+        smaa_blurred_edge_pipelines_[index] =
+            create_fullscreen_pipeline(
+                blurred_edge_shader_paths[index],
+                smaa_edges_format,
+                post_process_pipeline_layout_,
+                post_blend_attachment,
+                VK_FORMAT_UNDEFINED,
+                "SMAA blurred-source edge detection pipeline");
         smaa_blend_pipelines_[index] =
             create_fullscreen_pipeline(
                 blend_shader_paths[index],
@@ -4602,6 +6108,74 @@ void Renderer::create_pipeline() {
         post_blend_attachment,
         VK_FORMAT_UNDEFINED,
         "SMAA neighborhood pipeline");
+    smaa_blurred_neighborhood_pipeline_ = create_fullscreen_pipeline(
+        "smaa_neighborhood_blurred.frag.spv",
+        swapchain_.color_format(),
+        post_process_pipeline_layout_,
+        post_blend_attachment,
+        VK_FORMAT_UNDEFINED,
+        "SMAA blurred-source neighborhood pipeline");
+    smaa_neighborhood_history_pipeline_ = create_fullscreen_pipeline(
+        "smaa_neighborhood_history.frag.spv",
+        aa_color_format,
+        post_process_pipeline_layout_,
+        post_blend_attachment,
+        VK_FORMAT_UNDEFINED,
+        "SMAA T2x current-frame neighborhood pipeline");
+    smaa_temporal_resolve_pipeline_ = create_fullscreen_pipeline(
+        "smaa_temporal_resolve.frag.spv",
+        swapchain_.color_format(),
+        post_process_pipeline_layout_,
+        post_blend_attachment,
+        VK_FORMAT_UNDEFINED,
+        "SMAA T2x two-frame resolve pipeline");
+    motion_blur_pipeline_ = create_fullscreen_pipeline(
+        "motion_blur_scene.frag.spv",
+        swapchain_.color_format(),
+        post_process_pipeline_layout_,
+        post_blend_attachment,
+        VK_FORMAT_UNDEFINED,
+        "Depth-aware velocity motion blur pipeline");
+    motion_blur_hdr_pipeline_ = create_fullscreen_pipeline(
+        "motion_blur_scene.frag.spv",
+        aa_color_format,
+        post_process_pipeline_layout_,
+        post_blend_attachment,
+        VK_FORMAT_UNDEFINED,
+        "HDR depth-aware velocity motion blur pipeline");
+    motion_blur_reconstructed_pipeline_ = create_fullscreen_pipeline(
+        "motion_blur_reconstructed.frag.spv",
+        swapchain_.color_format(),
+        post_process_pipeline_layout_,
+        post_blend_attachment,
+        VK_FORMAT_UNDEFINED,
+        "Reconstructed depth-aware velocity motion blur pipeline");
+    const auto create_motion_blur_compute_pipeline =
+        [this](const char* shader_path, VkPipeline& destination,
+               const char* debug_name) {
+            const auto shader = load_shader(shader_path);
+            const VkComputePipelineCreateInfo info{
+                .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                .stage = VkPipelineShaderStageCreateInfo{
+                    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                    .module = shader.get(),
+                    .pName = "main",
+                },
+                .layout = post_process_pipeline_layout_,
+            };
+            VK_CHECK(vkCreateComputePipelines(
+                context_->device(), pipeline_cache_, 1U, &info, nullptr,
+                &destination));
+            context_->set_debug_name(
+                VK_OBJECT_TYPE_PIPELINE, handle_value(destination), debug_name);
+        };
+    create_motion_blur_compute_pipeline(
+        "motion_tile_max.comp.spv", motion_tile_max_pipeline_,
+        "motion-blur TileMax pipeline");
+    create_motion_blur_compute_pipeline(
+        "motion_neighbor_max.comp.spv", motion_neighbor_max_pipeline_,
+        "motion-blur NeighborMax pipeline");
     fsr_composite_pipeline_ = create_fullscreen_pipeline(
         "composite.frag.spv",
         swapchain_.color_format(),
@@ -4615,6 +6189,33 @@ void Renderer::create_pipeline() {
                                    post_process_pipeline_layout_, post_blend_attachment,
                                    VK_FORMAT_UNDEFINED, "HDR display mapping"),
         vkDestroyPipeline);
+    const auto create_exposure_pipeline = [this](
+                                             const char* shader_path,
+                                             DeviceObject<VkPipeline>& destination,
+                                             const char* debug_name) {
+        const auto shader = load_shader(shader_path);
+        const VkComputePipelineCreateInfo info{
+            .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .stage = VkPipelineShaderStageCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                .module = shader.get(),
+                .pName = "main",
+            },
+            .layout = exposure_pipeline_layout_,
+        };
+        VK_CHECK(vkCreateComputePipelines(
+            context_->device(), pipeline_cache_, 1U, &info, nullptr,
+            destination.put(context_->device(), vkDestroyPipeline)));
+        context_->set_debug_name(
+            VK_OBJECT_TYPE_PIPELINE, handle_value(destination.get()), debug_name);
+    };
+    create_exposure_pipeline(
+        "exposure_histogram.comp.spv", exposure_histogram_pipeline_,
+        "HDR exposure histogram");
+    create_exposure_pipeline(
+        "exposure_adapt.comp.spv", exposure_adapt_pipeline_,
+        "HDR exposure adaptation");
     hud_pipeline_ = create_fullscreen_pipeline(
         "hud.frag.spv",
         swapchain_.color_format(),
@@ -4662,6 +6263,27 @@ void Renderer::create_pipeline() {
 }
 
 void Renderer::destroy_pipeline() noexcept {
+    for (std::size_t index = 0U; index < msaa_geometry_.size(); ++index) {
+        msaa_geometry_[index] = {};
+        depth_msaa_geometry_[index] = {};
+        equal_msaa_[index] = {};
+        lod_depth_msaa_model_[index].reset();
+    }
+    subsurface_horizontal_pipeline_.reset();
+    subsurface_vertical_pipeline_.reset();
+    subsurface_spatial_ = {};
+    subsurface_temporal_ = {};
+    equal_subsurface_spatial_ = {};
+    equal_subsurface_temporal_ = {};
+    depth_geometry_ = {};
+    depth_temporal_geometry_ = {};
+    lod_depth_model_.reset();
+    lod_depth_temporal_model_.reset();
+    equal_direct_ = {};
+    equal_spatial_ = {};
+    equal_temporal_ = {};
+    exposure_adapt_pipeline_.reset();
+    exposure_histogram_pipeline_.reset();
     tonemap_pipeline_.reset();
     authored_shadow_pipeline_.reset();
     model_shadow_pipeline_.reset();
@@ -4696,6 +6318,44 @@ void Renderer::destroy_pipeline() noexcept {
             nullptr);
         smaa_neighborhood_pipeline_ = VK_NULL_HANDLE;
     }
+    if (smaa_blurred_neighborhood_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(
+            context_->device(),
+            smaa_blurred_neighborhood_pipeline_,
+            nullptr);
+        smaa_blurred_neighborhood_pipeline_ = VK_NULL_HANDLE;
+    }
+    if (motion_blur_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(context_->device(), motion_blur_pipeline_, nullptr);
+        motion_blur_pipeline_ = VK_NULL_HANDLE;
+    }
+    if (motion_blur_reconstructed_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(
+            context_->device(), motion_blur_reconstructed_pipeline_, nullptr);
+        motion_blur_reconstructed_pipeline_ = VK_NULL_HANDLE;
+    }
+    if (motion_blur_hdr_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(context_->device(), motion_blur_hdr_pipeline_, nullptr);
+        motion_blur_hdr_pipeline_ = VK_NULL_HANDLE;
+    }
+    if (motion_tile_max_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(context_->device(), motion_tile_max_pipeline_, nullptr);
+        motion_tile_max_pipeline_ = VK_NULL_HANDLE;
+    }
+    if (motion_neighbor_max_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(context_->device(), motion_neighbor_max_pipeline_, nullptr);
+        motion_neighbor_max_pipeline_ = VK_NULL_HANDLE;
+    }
+    if (smaa_temporal_resolve_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(
+            context_->device(), smaa_temporal_resolve_pipeline_, nullptr);
+        smaa_temporal_resolve_pipeline_ = VK_NULL_HANDLE;
+    }
+    if (smaa_neighborhood_history_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(
+            context_->device(), smaa_neighborhood_history_pipeline_, nullptr);
+        smaa_neighborhood_history_pipeline_ = VK_NULL_HANDLE;
+    }
     for (auto& pipeline : smaa_blend_pipelines_) {
         if (pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(context_->device(), pipeline, nullptr);
@@ -4703,6 +6363,12 @@ void Renderer::destroy_pipeline() noexcept {
         }
     }
     for (auto& pipeline : smaa_edge_pipelines_) {
+        if (pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(context_->device(), pipeline, nullptr);
+            pipeline = VK_NULL_HANDLE;
+        }
+    }
+    for (auto& pipeline : smaa_blurred_edge_pipelines_) {
         if (pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(context_->device(), pipeline, nullptr);
             pipeline = VK_NULL_HANDLE;
@@ -4766,6 +6432,21 @@ void Renderer::destroy_pipeline() noexcept {
             nullptr);
         post_process_pipeline_layout_ = VK_NULL_HANDLE;
     }
+    if (exposure_pipeline_layout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(
+            context_->device(), exposure_pipeline_layout_, nullptr);
+        exposure_pipeline_layout_ = VK_NULL_HANDLE;
+    }
+    if (subsurface_pipeline_layout_ != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(
+            context_->device(), subsurface_pipeline_layout_, nullptr);
+        subsurface_pipeline_layout_ = VK_NULL_HANDLE;
+    }
+    if (subsurface_descriptor_set_layout_ != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(
+            context_->device(), subsurface_descriptor_set_layout_, nullptr);
+        subsurface_descriptor_set_layout_ = VK_NULL_HANDLE;
+    }
     if (anti_aliasing_descriptor_set_layout_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(
             context_->device(),
@@ -4805,6 +6486,10 @@ bool Renderer::draw_frame(
                 frame_now - last_frame_time_).count());
     }
     last_frame_time_ = frame_now;
+    if (motion_blur_mode_actual() != MotionBlurMode::off &&
+        (!std::isfinite(fsr_frame_time_ms_) || fsr_frame_time_ms_ > 250.0F)) {
+        invalidate_temporal_history();
+    }
 
     auto& frame = frames_[frame_index_];
     auto begin = Clock::now();
@@ -4814,6 +6499,8 @@ bool Renderer::draw_frame(
     complete_screenshot(frame);
     read_gpu_timestamps(frame, timings);
     read_gpu_visibility(frame);
+    read_local_light_statistics(frame);
+    read_exposure_state(frame);
 
     if (resize_requested_) {
         rebuild_swapchain();
@@ -4824,6 +6511,8 @@ bool Renderer::draw_frame(
     // the ordinary fence/acquire timings (which must not include allocation).
     if (shadow_map_.width() != lighting_settings_.shadow_resolution)
         apply_shadow_resolution();
+    prepare_msaa_targets_for_frame(frame_index_);
+    if (subsurface_provision_pending_) provision_subsurface_resources();
 
     std::uint32_t image_index = 0;
     begin = Clock::now();
@@ -4908,6 +6597,10 @@ bool Renderer::draw_frame(
         mode_ == RunMode::gpu_saturation &&
         gpu_workload_iterations_ > 0U;
     ++frame_serial_;
+    if (is_temporal_smaa(anti_aliasing_)) {
+        smaa_t2x_history_valid_ = true;
+        smaa_t2x_phase_ ^= 1U;
+    }
 
     const VkSwapchainKHR swapchain_handle = swapchain_.handle();
     const VkPresentInfoKHR present_info{
@@ -4968,6 +6661,109 @@ void Renderer::read_gpu_timestamps(
         elapsed(timestamp_frame_begin, timestamp_frame_end);
     timings.gpu_geometry_ms =
         elapsed(timestamp_geometry_begin, timestamp_geometry_end);
+    timings.gpu_light_culling_ms = 0.0;
+    if (frame.local_light_culling_was_updated) {
+        const auto local_light_result = vkGetQueryPoolResults(
+            context_->device(), frame.timestamp_queries, timestamp_local_light_begin, 2,
+            2 * sizeof(std::uint64_t), timestamps.data() + timestamp_local_light_begin,
+            sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
+        if (local_light_result == VK_SUCCESS) {
+            timings.gpu_light_culling_ms =
+                elapsed(timestamp_local_light_begin, timestamp_local_light_end);
+        } else if (local_light_result == VK_NOT_READY) {
+            timings.gpu_light_culling_ms = unavailable_timing_ms;
+        } else {
+            VK_CHECK(local_light_result);
+        }
+    }
+    timings.gpu_depth_prepass_ms = 0.0;
+    if (frame.depth_prepass_was_enabled) {
+        const auto depth_result = vkGetQueryPoolResults(
+            context_->device(), frame.timestamp_queries, timestamp_depth_prepass_end, 1,
+            sizeof(std::uint64_t), timestamps.data() + timestamp_depth_prepass_end,
+            sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
+        if (depth_result == VK_SUCCESS)
+            timings.gpu_depth_prepass_ms = elapsed(timestamp_geometry_begin, timestamp_depth_prepass_end);
+        else if (depth_result == VK_NOT_READY)
+            timings.gpu_depth_prepass_ms = unavailable_timing_ms;
+        else
+            VK_CHECK(depth_result);
+    }
+    timings.gpu_postprocess_ms = 0.0;
+    if (frame.postprocess_was_enabled) {
+        const auto postprocess_result = vkGetQueryPoolResults(
+            context_->device(), frame.timestamp_queries, timestamp_postprocess_end, 1,
+            sizeof(std::uint64_t), timestamps.data() + timestamp_postprocess_end,
+            sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
+        if (postprocess_result == VK_SUCCESS)
+            timings.gpu_postprocess_ms = elapsed(timestamp_geometry_end, timestamp_postprocess_end);
+        else if (postprocess_result == VK_NOT_READY)
+            timings.gpu_postprocess_ms = unavailable_timing_ms;
+        else
+            VK_CHECK(postprocess_result);
+    }
+    timings.gpu_display_ms = 0.0;
+    if (frame.postprocess_was_enabled) {
+        const auto display_result = vkGetQueryPoolResults(
+            context_->device(), frame.timestamp_queries, timestamp_display_begin, 2,
+            2 * sizeof(std::uint64_t), timestamps.data() + timestamp_display_begin,
+            sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
+        if (display_result == VK_SUCCESS) {
+            timings.gpu_display_ms =
+                elapsed(timestamp_display_begin, timestamp_display_end);
+        } else if (display_result == VK_NOT_READY) {
+            timings.gpu_display_ms = unavailable_timing_ms;
+        } else {
+            VK_CHECK(display_result);
+        }
+    }
+    timings.gpu_exposure_ms = 0.0;
+    if (frame.exposure_was_updated) {
+        const auto exposure_result = vkGetQueryPoolResults(
+            context_->device(), frame.timestamp_queries, timestamp_exposure_begin, 2,
+            2 * sizeof(std::uint64_t), timestamps.data() + timestamp_exposure_begin,
+            sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
+        if (exposure_result == VK_SUCCESS) {
+            timings.gpu_exposure_ms =
+                elapsed(timestamp_exposure_begin, timestamp_exposure_end);
+        } else if (exposure_result == VK_NOT_READY) {
+            timings.gpu_exposure_ms = unavailable_timing_ms;
+        } else {
+            VK_CHECK(exposure_result);
+        }
+    }
+    timings.gpu_subsurface_ms = 0.0;
+    if (frame.subsurface_was_enabled) {
+        const auto subsurface_result = vkGetQueryPoolResults(
+            context_->device(), frame.timestamp_queries, timestamp_subsurface_begin, 2,
+            2 * sizeof(std::uint64_t), timestamps.data() + timestamp_subsurface_begin,
+            sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
+        if (subsurface_result == VK_SUCCESS) {
+            timings.gpu_subsurface_ms =
+                elapsed(timestamp_subsurface_begin, timestamp_subsurface_end);
+        } else if (subsurface_result == VK_NOT_READY) {
+            timings.gpu_subsurface_ms = unavailable_timing_ms;
+        } else {
+            VK_CHECK(subsurface_result);
+        }
+    }
+    timings.gpu_motion_blur_ms = 0.0;
+    if (frame.motion_blur_was_enabled) {
+        const auto motion_blur_result = vkGetQueryPoolResults(
+            context_->device(), frame.timestamp_queries,
+            timestamp_motion_blur_begin, 2,
+            2 * sizeof(std::uint64_t),
+            timestamps.data() + timestamp_motion_blur_begin,
+            sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
+        if (motion_blur_result == VK_SUCCESS) {
+            timings.gpu_motion_blur_ms = elapsed(
+                timestamp_motion_blur_begin, timestamp_motion_blur_end);
+        } else if (motion_blur_result == VK_NOT_READY) {
+            timings.gpu_motion_blur_ms = unavailable_timing_ms;
+        } else {
+            VK_CHECK(motion_blur_result);
+        }
+    }
     timings.gpu_shadow_ms = 0.0;
     if (frame.shadow_was_updated) {
         const auto shadow_result = vkGetQueryPoolResults(
@@ -5129,6 +6925,10 @@ void Renderer::record_commands(
     VK_CHECK(vkBeginCommandBuffer(command_buffer, &begin_info));
 
     auto& frame = frames_[frame_index_];
+    frame.postprocess_was_enabled = false;
+    frame.subsurface_was_enabled = false;
+    frame.motion_blur_was_enabled = false;
+    frame.depth_prepass_was_enabled = depth_prepass_ != DepthPrepass::off;
     vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 2, 1,
                             &frame.lighting_descriptor_set, 0, nullptr);
     if (frame.timestamp_queries != VK_NULL_HANDLE) {
@@ -5237,7 +7037,7 @@ void Renderer::record_commands(
 
 #if VCR_EDITOR_ENABLED
     frame.shadow_was_updated =
-        shadow_dirty_ && mode_ != RunMode::instancing;
+        (shadow_dirty_ || shadow_matrix_dirty_mask_ != 0) && mode_ != RunMode::instancing;
     if (frame.shadow_was_updated) {
         if (frame.timestamp_queries != VK_NULL_HANDLE) {
             vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,
@@ -5270,6 +7070,19 @@ void Renderer::record_commands(
     if (frame.timestamp_queries && light_update)
         vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                              frame.timestamp_queries, timestamp_voxel_light_end);
+    const bool cluster_local_lights =
+        local_light_backend_actual() == LocalLightBackend::clustered;
+    if (cluster_local_lights && frame.timestamp_queries != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp2(
+            command_buffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            frame.timestamp_queries, timestamp_local_light_begin);
+    }
+    record_clustered_lights(command_buffer, frame);
+    if (cluster_local_lights && frame.timestamp_queries != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp2(
+            command_buffer, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            frame.timestamp_queries, timestamp_local_light_end);
+    }
     if (frame.timestamp_queries != VK_NULL_HANDLE) {
         vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,
                              frame.timestamp_queries, timestamp_geometry_begin);
@@ -5312,7 +7125,8 @@ void Renderer::record_commands(
             const VkPipeline scene_pipeline,
             const VkPipeline editor_model_pipeline,
             const VkPipeline terrain_pipeline,
-            const VkPipeline sky_pipeline) {
+            const VkPipeline sky_pipeline,
+            const bool depth_only = false) {
 #if !VCR_EDITOR_ENABLED
             static_cast<void>(editor_model_pipeline);
 #endif
@@ -5395,13 +7209,14 @@ void Renderer::record_commands(
                     }
                     const auto &model_draws =
                         gpu_visibility_active_ ? editor_model_draws_ : visible_model_draws_;
-                    if (!model_draws.empty()) {
+                    const bool include_models = !depth_only || depth_prepass_ == DepthPrepass::full;
+                    if (include_models && !model_draws.empty()) {
                         vkCmdBindPipeline(
                             command_buffer,
                             VK_PIPELINE_BIND_POINT_GRAPHICS,
                             editor_model_pipeline);
                     }
-                    for (std::size_t draw_index = 0; draw_index < model_draws.size();
+                    for (std::size_t draw_index = 0; include_models && draw_index < model_draws.size();
                          ++draw_index) {
                         const auto &draw = model_draws[draw_index];
                         vkCmdBindDescriptorSets(
@@ -5447,7 +7262,8 @@ void Renderer::record_commands(
                 } else
 #endif
                 {
-                    vkCmdDrawIndexed(
+                    if (fixture_ != RenderFixture::material_spheres &&
+                        fixture_ != RenderFixture::subsurface_profiles) vkCmdDrawIndexed(
                         command_buffer,
                         plane_index_count,
                         1,
@@ -5470,16 +7286,16 @@ void Renderer::record_commands(
                     vkCmdDrawIndexed(
                         command_buffer,
                         pbr_sample_index_count,
-                        pbr_sample_count,
+                        pbr_sample_instance_count_,
                         0,
                         0,
                         demo_sample_first_instance);
                 }
-                bool draw_terrain = true;
+                bool draw_terrain = fixture_ != RenderFixture::material_spheres &&
+                    fixture_ != RenderFixture::subsurface_profiles;
 #if VCR_EDITOR_ENABLED
                 draw_terrain =
-                    !authored_scene_enabled_ ||
-                    editor_terrain_visible_;
+                    draw_terrain && (!authored_scene_enabled_ || editor_terrain_visible_);
 #endif
                 if (draw_terrain) {
                     vkCmdBindPipeline(
@@ -5510,8 +7326,8 @@ void Renderer::record_commands(
                 (!authored_scene_enabled_ ||
                  editor_sky_visible_);
 #endif
-            if (draw_sky) {
-                // The triangle sits at depth 1.0 and is drawn last.
+            if (draw_sky && !depth_only) {
+                // The triangle sits at reverse-Z far depth 0.0 and is drawn last.
                 vkCmdBindPipeline(
                     command_buffer,
                     VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -5520,28 +7336,132 @@ void Renderer::record_commands(
             }
         };
 
+    const auto prepassed_pipeline = [this](VkPipeline normal, const DeviceObject<VkPipeline> &equal,
+                                          bool imported_model = false) {
+        return depth_prepass_ != DepthPrepass::off &&
+                       (!imported_model || depth_prepass_ == DepthPrepass::full)
+                   ? equal.get() : normal;
+    };
+    const auto record_depth_prepass = [&](VkImage image, VkImageView view, VkExtent2D extent,
+                                         bool temporal) {
+        if (depth_prepass_ == DepthPrepass::off) return;
+        const VkRenderingAttachmentInfo attachment{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = view,
+            .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = VkClearValue{.depthStencil = {0.0F, 0}},
+        };
+        const VkRenderingInfo rendering{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea = VkRect2D{{0, 0}, extent},
+            .layerCount = 1,
+            .pDepthAttachment = &attachment,
+        };
+        const bool multisampled = is_msaa(anti_aliasing_.method);
+        const std::size_t sample_index = multisampled
+            ? msaa_index(anti_aliasing_.method) : 0U;
+        const auto &pipelines = multisampled
+            ? depth_msaa_geometry_[sample_index]
+            : temporal ? depth_temporal_geometry_ : depth_geometry_;
+        vkCmdBeginRendering(command_buffer, &rendering);
+        const auto model_depth = lod_fade_actual() != LodFadePattern::off
+            ? (multisampled ? lod_depth_msaa_model_[sample_index].get()
+                            : temporal ? lod_depth_temporal_model_.get()
+                                       : lod_depth_model_.get())
+            : pipelines.models.get();
+        draw_geometry(extent, pipelines.cubes.get(), pipelines.scene.get(), model_depth,
+                      pipelines.terrain.get(), VK_NULL_HANDLE, true);
+        vkCmdEndRendering(command_buffer);
+        // STORE/LOAD crosses dynamic rendering instances: make depth writes
+        // visible to EQUAL tests, and serialize the non-prepassed model writes.
+        transition_image(command_buffer, image, VK_IMAGE_ASPECT_DEPTH_BIT,
+                         VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+        if (frame.timestamp_queries != VK_NULL_HANDLE)
+            // ALL_COMMANDS orders this completion timestamp after the shared
+            // geometry-begin write (which may execute later than its named stage).
+            // This is query ordering, not an added resource barrier or queue wait.
+            vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                 frame.timestamp_queries, timestamp_depth_prepass_end);
+    };
+
     struct PostProcessPushConstants {
         float inverse_resolution[2];
         std::uint32_t method;
         std::uint32_t display_mapping;
+        std::uint32_t exposure_mode;
+        float fixed_exposure;
+        std::uint32_t grading;
+        std::uint32_t lut_size;
+        std::uint32_t motion_blur_flags;
+        std::uint32_t motion_blur_samples;
+        float shutter_fraction;
+        float maximum_radius_pixels;
+        float camera_fade_start;
+        float camera_fade_end;
+        float camera_near_plane;
+        float camera_far_plane;
     };
+    static_assert(sizeof(PostProcessPushConstants) == display_push_constant_bytes);
     const VkExtent2D display_extent = scene_output_extent();
 #if VCR_EDITOR_ENABLED
     const bool editor_frame =
         editor_output_enabled_ && editor_draw_data != nullptr;
 #endif
+    const bool motion_blur_active =
+        motion_blur_mode_actual() != MotionBlurMode::off;
+    const bool motion_blur_before_smaa =
+        motion_blur_active && anti_aliasing_.method == AntiAliasingMethod::smaa;
+    std::uint32_t motion_blur_flags =
+        static_cast<std::uint32_t>(motion_blur_mode_actual());
+    if (anti_aliasing_.method == AntiAliasingMethod::fsr3) {
+        motion_blur_flags |= 1U << 2U;
+    }
+    if (motion_blur_settings_.shutter == MotionBlurShutter::trailing) {
+        motion_blur_flags |= 1U << 3U;
+    }
+    if (motion_blur_before_smaa) {
+        motion_blur_flags |= 1U << 5U;
+    }
     const PostProcessPushConstants post_process_push{
         {1.0F / static_cast<float>(display_extent.width),
          1.0F / static_cast<float>(display_extent.height)},
-        static_cast<std::uint32_t>(anti_aliasing_.method),
-        lighting_settings_.dynamic && mode_ != RunMode::instancing ? 1U : 0U,
+        is_temporal_smaa(anti_aliasing_)
+            ? 2U | (smaa_t2x_history_valid_ ? 1U : 0U) |
+                  ((smaa_t2x_phase_ & 1U) != 0U ? 4U : 0U)
+            : 0U,
+        lighting_settings_.dynamic && mode_ != RunMode::instancing
+            ? static_cast<std::uint32_t>(tone_mapper_) : 0U,
+        static_cast<std::uint32_t>(exposure_mode_actual()),
+        fixed_exposure_multiplier(exposure_settings_),
+        static_cast<std::uint32_t>(color_grading_actual()),
+        grading_lut_size(color_grading_lut_size_),
+        motion_blur_flags,
+        motion_blur_sample_count(motion_blur_settings_.quality),
+        motion_blur_settings_.shutter_angle_degrees / 360.0F,
+        motion_blur_settings_.maximum_radius_pixels,
+        motion_blur_settings_.camera_fade_start,
+        motion_blur_settings_.camera_fade_end,
+        camera_near,
+        camera_far,
     };
     auto& aa_resources = anti_aliasing_frames_[frame_index_];
+    const bool subsurface_active =
+        subsurface_mode_actual() == SubsurfaceMode::full_resolution;
     const auto draw_post_process =
         [this,
          command_buffer,
          &aa_resources,
-         &post_process_push](const VkPipeline pipeline) {
+         &post_process_push](
+            const VkPipeline pipeline,
+            const PostProcessPushConstants* const override_push = nullptr) {
+            const auto& push = override_push != nullptr
+                ? *override_push : post_process_push;
             vkCmdBindPipeline(
                 command_buffer,
                 VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -5558,11 +7478,82 @@ void Renderer::record_commands(
             vkCmdPushConstants(
                 command_buffer,
                 post_process_pipeline_layout_,
-                VK_SHADER_STAGE_FRAGMENT_BIT,
+                VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
                 0,
-                sizeof(post_process_push),
-                &post_process_push);
+                sizeof(push),
+                &push);
             vkCmdDraw(command_buffer, 3, 1, 0, 0);
+        };
+    const auto record_motion_blur_tiles =
+        [this, command_buffer, &frame, &aa_resources, &post_process_push]() {
+            if (frame.timestamp_queries != VK_NULL_HANDLE) {
+                vkCmdWriteTimestamp2(
+                    command_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                    frame.timestamp_queries, timestamp_motion_blur_begin);
+            }
+            transition_tracked_image(
+                command_buffer,
+                aa_resources.motion_tile_max,
+                aa_resources.motion_tile_max_layout,
+                VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
+                    VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+            transition_tracked_image(
+                command_buffer,
+                aa_resources.motion_neighbor_max,
+                aa_resources.motion_neighbor_max_layout,
+                VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
+                    VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+            vkCmdBindDescriptorSets(
+                command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                post_process_pipeline_layout_, 0U, 1U,
+                &aa_resources.descriptor_set, 0U, nullptr);
+            vkCmdPushConstants(
+                command_buffer, post_process_pipeline_layout_,
+                VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, 0U,
+                sizeof(post_process_push), &post_process_push);
+            vkCmdBindPipeline(
+                command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                motion_tile_max_pipeline_);
+            vkCmdDispatch(
+                command_buffer,
+                aa_resources.motion_tile_max.width(),
+                aa_resources.motion_tile_max.height(), 1U);
+            transition_tracked_image(
+                command_buffer,
+                aa_resources.motion_tile_max,
+                aa_resources.motion_tile_max_layout,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            vkCmdBindPipeline(
+                command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                motion_neighbor_max_pipeline_);
+            vkCmdDispatch(
+                command_buffer,
+                (aa_resources.motion_neighbor_max.width() + 7U) / 8U,
+                (aa_resources.motion_neighbor_max.height() + 7U) / 8U,
+                1U);
+            transition_tracked_image(
+                command_buffer,
+                aa_resources.motion_neighbor_max,
+                aa_resources.motion_neighbor_max_layout,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         };
     const auto draw_hud =
         [this, command_buffer, display_extent]() {
@@ -5574,13 +7565,17 @@ void Renderer::record_commands(
             };
             const HudPushConstants hud_push{
                 static_cast<std::uint32_t>(anti_aliasing_.method),
-                anti_aliasing_.method == AntiAliasingMethod::smaa
+                is_msaa(anti_aliasing_.method)
+                    ? anti_aliasing_sample_count(anti_aliasing_.method)
+                    : anti_aliasing_.method == AntiAliasingMethod::smaa
                     ? static_cast<std::uint32_t>(
                           anti_aliasing_.smaa_quality)
                     : static_cast<std::uint32_t>(
                           anti_aliasing_.fsr3_quality),
                 fsr3_upscaler_.available() ? 1U : 0U,
-                0U,
+                anti_aliasing_.method == AntiAliasingMethod::smaa
+                    ? static_cast<std::uint32_t>(anti_aliasing_.smaa_mode)
+                    : 0U,
             };
             vkCmdBindPipeline(
                 command_buffer,
@@ -5607,7 +7602,8 @@ void Renderer::record_commands(
         };
 
     if (anti_aliasing_.method == AntiAliasingMethod::off &&
-        (!lighting_settings_.dynamic || mode_ == RunMode::instancing)) {
+        (!lighting_settings_.dynamic || mode_ == RunMode::instancing) &&
+        !subsurface_active && !motion_blur_active) {
 #if VCR_EDITOR_ENABLED
         if (editor_frame) {
             transition_tracked_image(
@@ -5656,12 +7652,15 @@ void Renderer::record_commands(
             swapchain_.image_view(image_index);
         VkImageView scene_depth_view =
             swapchain_.depth_target(image_index).view;
+        VkImage scene_depth_image = swapchain_.depth_target(image_index).image;
 #if VCR_EDITOR_ENABLED
         if (editor_frame) {
             scene_color_view = editor_viewport_.color.view();
             scene_depth_view = editor_viewport_.depth.view();
+            scene_depth_image = editor_viewport_.depth.image();
         }
 #endif
+        record_depth_prepass(scene_depth_image, scene_depth_view, display_extent, false);
         const VkRenderingAttachmentInfo color_attachment{
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .imageView = scene_color_view,
@@ -5677,9 +7676,9 @@ void Renderer::record_commands(
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .imageView = scene_depth_view,
             .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .loadOp = depth_prepass_ == DepthPrepass::off ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
             .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-            .clearValue = VkClearValue{.depthStencil = {1.0F, 0}},
+            .clearValue = VkClearValue{.depthStencil = {0.0F, 0}},
         };
         const VkRenderingInfo rendering_info{
             .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
@@ -5695,21 +7694,21 @@ void Renderer::record_commands(
         vkCmdBeginRendering(command_buffer, &rendering_info);
         draw_geometry(
             display_extent,
-            pipeline_,
-            scene_pipeline_,
+            prepassed_pipeline(pipeline_, equal_direct_.cubes),
+            prepassed_pipeline(scene_pipeline_, equal_direct_.scene),
 #if VCR_EDITOR_ENABLED
             authored_scene_enabled_
-                ? editor_model_pipeline_
-                : scene_pipeline_,
+                ? prepassed_pipeline(editor_model_pipeline_, equal_direct_.models, true)
+                : prepassed_pipeline(scene_pipeline_, equal_direct_.scene),
 #else
-            scene_pipeline_,
+            prepassed_pipeline(scene_pipeline_, equal_direct_.scene),
 #endif
-            terrain_pipeline_,
+            prepassed_pipeline(terrain_pipeline_, equal_direct_.terrain),
             sky_pipeline_);
         if (frame.timestamp_queries != VK_NULL_HANDLE) {
             vkCmdWriteTimestamp2(
                 command_buffer,
-                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                 frame.timestamp_queries,
                 timestamp_geometry_end);
         }
@@ -5734,7 +7733,17 @@ void Renderer::record_commands(
         }
 #endif
     } else {
-        const bool temporal = anti_aliasing_.method == AntiAliasingMethod::fsr3;
+        const bool temporal =
+            anti_aliasing_.method == AntiAliasingMethod::fsr3 ||
+            is_temporal_smaa(anti_aliasing_) || motion_blur_active;
+        const bool multisampled = is_msaa(anti_aliasing_.method);
+        const std::size_t sample_index = multisampled
+            ? msaa_index(anti_aliasing_.method) : 0U;
+        auto& msaa_targets = aa_resources.msaa;
+        if (multisampled && (temporal || subsurface_active)) {
+            fatal("MSAA cannot share the current temporal or SSS attachment contract.");
+        }
+        frame.postprocess_was_enabled = true;
         constexpr VkPipelineStageFlags2 previous_read_stages =
             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -5747,6 +7756,17 @@ void Renderer::record_commands(
             VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        if (subsurface_active) {
+            transition_tracked_image(
+                command_buffer,
+                aa_resources.subsurface_base,
+                aa_resources.subsurface_base_layout,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                previous_read_stages,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        }
         if (temporal) {
             transition_tracked_image(
                 command_buffer,
@@ -5757,6 +7777,8 @@ void Renderer::record_commands(
                 VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        }
+        if (temporal || subsurface_active) {
             transition_tracked_image(
                 command_buffer,
                 aa_resources.depth,
@@ -5767,67 +7789,108 @@ void Renderer::record_commands(
                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
         }
-        transition_tracked_image(
-            command_buffer,
-            aa_resources.depth_attachment,
-            aa_resources.depth_attachment_layout,
-            VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
-            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
-            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+        if (multisampled) {
+            transition_tracked_image(
+                command_buffer, msaa_targets.color, msaa_targets.color_layout,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+            transition_tracked_image(
+                command_buffer, msaa_targets.depth, msaa_targets.depth_layout,
+                VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+        } else {
+            transition_tracked_image(
+                command_buffer,
+                aa_resources.depth_attachment,
+                aa_resources.depth_attachment_layout,
+                VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+        }
 
-        const std::array offscreen_color_attachments{
-            VkRenderingAttachmentInfo{
-                .sType =
-                    VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-                .imageView = aa_resources.color.view(),
-                .imageLayout =
-                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        const VkClearValue empty_color{
+            .color = VkClearColorValue{{0.0F, 0.0F, 0.0F, 0.0F}}};
+        const VkClearValue hdr_background{
+            .color = VkClearColorValue{{0.015F, 0.025F, 0.055F, 1.0F}}};
+        const auto make_color_attachment = [](
+                                               const VkImageView view,
+                                               const VkClearValue clear) {
+            return VkRenderingAttachmentInfo{
+                .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                .imageView = view,
+                .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
                 .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-                .clearValue = VkClearValue{
-                    .color = VkClearColorValue{
-                        {0.015F, 0.025F, 0.055F, 1.0F}},
-                },
-            },
-            VkRenderingAttachmentInfo{
-                .sType =
-                    VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-                .imageView = aa_resources.motion_vectors.view(),
-                .imageLayout =
-                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-                .clearValue = VkClearValue{
-                    .color = VkClearColorValue{
-                        {0.0F, 0.0F, 0.0F, 0.0F}},
-                },
-            },
-            VkRenderingAttachmentInfo{
-                .sType =
-                    VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-                .imageView = aa_resources.depth.view(),
-                .imageLayout =
-                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-                .clearValue = VkClearValue{
-                    .color = VkClearColorValue{
-                        {1.0F, 0.0F, 0.0F, 0.0F}},
-                },
-            },
+                .clearValue = clear,
+            };
         };
+        std::array<VkRenderingAttachmentInfo, 4> offscreen_color_attachments{};
+        std::uint32_t offscreen_color_count = 1U;
+        if (subsurface_active) {
+            offscreen_color_attachments[0] =
+                make_color_attachment(aa_resources.color.view(), empty_color);
+            offscreen_color_attachments[1] =
+                make_color_attachment(aa_resources.subsurface_base.view(), hdr_background);
+            if (temporal) {
+                offscreen_color_attachments[2] =
+                    make_color_attachment(aa_resources.motion_vectors.view(), empty_color);
+                offscreen_color_attachments[3] =
+                    make_color_attachment(aa_resources.depth.view(), empty_color);
+                offscreen_color_count = 4U;
+            } else {
+                offscreen_color_attachments[2] =
+                    make_color_attachment(aa_resources.depth.view(), empty_color);
+                offscreen_color_count = 3U;
+            }
+        } else {
+            offscreen_color_attachments[0] =
+                make_color_attachment(
+                    multisampled ? msaa_targets.color.view()
+                                 : aa_resources.color.view(),
+                    hdr_background);
+            if (multisampled) {
+                offscreen_color_attachments[0].resolveMode =
+                    VK_RESOLVE_MODE_AVERAGE_BIT;
+                offscreen_color_attachments[0].resolveImageView =
+                    aa_resources.color.view();
+                offscreen_color_attachments[0].resolveImageLayout =
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                offscreen_color_attachments[0].storeOp =
+                    VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            }
+            if (temporal) {
+                offscreen_color_attachments[1] =
+                    make_color_attachment(aa_resources.motion_vectors.view(), empty_color);
+                offscreen_color_attachments[2] =
+                    make_color_attachment(aa_resources.depth.view(), empty_color);
+                offscreen_color_count = 3U;
+            }
+        }
+        const VkImage offscreen_depth_image = multisampled
+            ? msaa_targets.depth.image() : aa_resources.depth_attachment.image();
+        const VkImageView offscreen_depth_view = multisampled
+            ? msaa_targets.depth.view() : aa_resources.depth_attachment.view();
         const VkRenderingAttachmentInfo offscreen_depth_attachment{
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .imageView = aa_resources.depth_attachment.view(),
+            .imageView = offscreen_depth_view,
             .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .loadOp = depth_prepass_ == DepthPrepass::off ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
             .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-            .clearValue = VkClearValue{.depthStencil = {1.0F, 0}},
+            .clearValue = VkClearValue{.depthStencil = {0.0F, 0}},
         };
         const VkRenderingInfo offscreen_rendering_info{
             .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
@@ -5836,44 +7899,78 @@ void Renderer::record_commands(
                 .extent = current_render_extent_,
             },
             .layerCount = 1,
-            .colorAttachmentCount = temporal ? 3U : 1U,
+            .colorAttachmentCount = offscreen_color_count,
             .pColorAttachments =
                 offscreen_color_attachments.data(),
             .pDepthAttachment = &offscreen_depth_attachment,
         };
+        record_depth_prepass(
+            offscreen_depth_image, offscreen_depth_view,
+            current_render_extent_, temporal);
         vkCmdBeginRendering(
             command_buffer, &offscreen_rendering_info);
-        draw_geometry(
-            current_render_extent_,
-            (temporal ? aa_pipeline_ : smaa_geometry_.cubes).get(),
-            (temporal ? aa_scene_pipeline_ : smaa_geometry_.scene).get(),
+        if (subsurface_active) {
+            const auto& pipelines = temporal
+                ? subsurface_temporal_ : subsurface_spatial_;
+            const auto& equal = temporal
+                ? equal_subsurface_temporal_ : equal_subsurface_spatial_;
+            draw_geometry(
+                current_render_extent_,
+                prepassed_pipeline(pipelines.cubes.get(), equal.cubes),
+                prepassed_pipeline(pipelines.scene.get(), equal.scene),
 #if VCR_EDITOR_ENABLED
-            authored_scene_enabled_
-                ? (temporal ? aa_editor_model_pipeline_ : smaa_geometry_.models).get()
-                : (temporal ? aa_scene_pipeline_ : smaa_geometry_.scene).get(),
+                authored_scene_enabled_
+                    ? prepassed_pipeline(pipelines.models.get(), equal.models, true)
+                    : prepassed_pipeline(pipelines.scene.get(), equal.scene),
 #else
-            (temporal ? aa_scene_pipeline_ : smaa_geometry_.scene).get(),
+                prepassed_pipeline(pipelines.scene.get(), equal.scene),
 #endif
-            (temporal ? aa_terrain_pipeline_ : smaa_geometry_.terrain).get(),
-            (temporal ? aa_sky_pipeline_ : smaa_geometry_.sky).get());
+                prepassed_pipeline(pipelines.terrain.get(), equal.terrain),
+                pipelines.sky.get());
+        } else {
+            const auto& pipelines = multisampled
+                ? msaa_geometry_[sample_index] : smaa_geometry_;
+            const auto& equal = multisampled
+                ? equal_msaa_[sample_index]
+                : temporal ? equal_temporal_ : equal_spatial_;
+            draw_geometry(
+                current_render_extent_,
+                prepassed_pipeline((temporal ? aa_pipeline_ : pipelines.cubes).get(), equal.cubes),
+                prepassed_pipeline((temporal ? aa_scene_pipeline_ : pipelines.scene).get(), equal.scene),
+#if VCR_EDITOR_ENABLED
+                authored_scene_enabled_
+                    ? prepassed_pipeline((temporal ? aa_editor_model_pipeline_ : pipelines.models).get(), equal.models, true)
+                    : prepassed_pipeline((temporal ? aa_scene_pipeline_ : pipelines.scene).get(), equal.scene),
+#else
+                prepassed_pipeline((temporal ? aa_scene_pipeline_ : pipelines.scene).get(), equal.scene),
+#endif
+                prepassed_pipeline((temporal ? aa_terrain_pipeline_ : pipelines.terrain).get(), equal.terrain),
+                (temporal ? aa_sky_pipeline_ : pipelines.sky).get());
+        }
         vkCmdEndRendering(command_buffer);
         if (frame.timestamp_queries != VK_NULL_HANDLE) {
             vkCmdWriteTimestamp2(
                 command_buffer,
-                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                 frame.timestamp_queries,
                 timestamp_geometry_end);
         }
 
-        transition_tracked_image(
-            command_buffer,
-            aa_resources.color,
-            aa_resources.color_layout,
-            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-            previous_read_stages,
-            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        if (subsurface_active) {
+            record_subsurface(
+                command_buffer, frame, aa_resources, current_render_extent_);
+        } else {
+            frame.subsurface_was_enabled = false;
+            transition_tracked_image(
+                command_buffer,
+                aa_resources.color,
+                aa_resources.color_layout,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                previous_read_stages,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        }
         if (temporal) {
             transition_tracked_image(
                 command_buffer,
@@ -5884,15 +7981,71 @@ void Renderer::record_commands(
                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
                 previous_read_stages,
                 VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            if (!subsurface_active) {
+                transition_tracked_image(
+                    command_buffer,
+                    aa_resources.depth,
+                    aa_resources.depth_layout,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                    previous_read_stages,
+                    VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            }
+        }
+
+        record_auto_exposure(
+            command_buffer, frame, current_render_extent_,
+            aa_resources.descriptor_set);
+
+        if (motion_blur_before_smaa) {
+            record_motion_blur_tiles();
             transition_tracked_image(
                 command_buffer,
-                aa_resources.depth,
-                aa_resources.depth_layout,
+                aa_resources.fsr_output,
+                aa_resources.fsr_output_layout,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
+                    VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+            const VkRenderingAttachmentInfo blur_attachment{
+                .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                .imageView = aa_resources.fsr_output.view(),
+                .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            };
+            const VkRenderingInfo blur_rendering_info{
+                .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+                .renderArea = VkRect2D{{0, 0}, display_extent},
+                .layerCount = 1U,
+                .colorAttachmentCount = 1U,
+                .pColorAttachments = &blur_attachment,
+            };
+            auto hdr_blur_push = post_process_push;
+            hdr_blur_push.motion_blur_flags |= 1U << 4U;
+            vkCmdBeginRendering(command_buffer, &blur_rendering_info);
+            set_viewport(display_extent);
+            draw_post_process(motion_blur_hdr_pipeline_, &hdr_blur_push);
+            vkCmdEndRendering(command_buffer);
+            transition_tracked_image(
+                command_buffer,
+                aa_resources.fsr_output,
+                aa_resources.fsr_output_layout,
                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                previous_read_stages,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                 VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            if (frame.timestamp_queries != VK_NULL_HANDLE) {
+                vkCmdWriteTimestamp2(
+                    command_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                    frame.timestamp_queries, timestamp_motion_blur_end);
+            }
+            frame.motion_blur_was_enabled = true;
         }
 
         if (anti_aliasing_.method == AntiAliasingMethod::smaa) {
@@ -5931,9 +8084,12 @@ void Renderer::record_commands(
             vkCmdBeginRendering(
                 command_buffer, &edge_rendering_info);
             set_viewport(display_extent);
-            draw_post_process(smaa_edge_pipelines_[
-                static_cast<std::size_t>(
-                    anti_aliasing_.smaa_quality)]);
+            const auto edge_index = static_cast<std::size_t>(
+                anti_aliasing_.smaa_quality);
+            draw_post_process(
+                motion_blur_before_smaa
+                    ? smaa_blurred_edge_pipelines_[edge_index]
+                    : smaa_edge_pipelines_[edge_index]);
             vkCmdEndRendering(command_buffer);
             transition_tracked_image(
                 command_buffer,
@@ -5993,7 +8149,72 @@ void Renderer::record_commands(
                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                 VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-        } else if (temporal) {
+            if (is_temporal_smaa(anti_aliasing_)) {
+                auto& previous_history = anti_aliasing_frames_[
+                    (frame_index_ + max_frames_in_flight - 1U) %
+                    max_frames_in_flight];
+                // The descriptor is dynamically unused on the first temporal
+                // frame, but keeping every bound history image in its declared
+                // layout also satisfies validation and makes the first-frame
+                // contract independent of shader control-flow analysis.
+                if (is_temporal_smaa(anti_aliasing_)) {
+                    transition_tracked_image(
+                        command_buffer,
+                        previous_history.fsr_output,
+                        previous_history.fsr_output_layout,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+                }
+                transition_tracked_image(
+                    command_buffer,
+                    aa_resources.fsr_output,
+                    aa_resources.fsr_output_layout,
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
+                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+                const VkRenderingAttachmentInfo history_attachment{
+                    .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                    .imageView = aa_resources.fsr_output.view(),
+                    .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                };
+                const VkRenderingInfo history_rendering_info{
+                    .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+                    .renderArea = VkRect2D{
+                        .offset = {0, 0},
+                        .extent = display_extent,
+                    },
+                    .layerCount = 1,
+                    .colorAttachmentCount = 1,
+                    .pColorAttachments = &history_attachment,
+                };
+                vkCmdBeginRendering(command_buffer, &history_rendering_info);
+                set_viewport(display_extent);
+                draw_post_process(smaa_neighborhood_history_pipeline_);
+                vkCmdEndRendering(command_buffer);
+                transition_tracked_image(
+                    command_buffer,
+                    aa_resources.fsr_output,
+                    aa_resources.fsr_output_layout,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            }
+        } else if (anti_aliasing_.method == AntiAliasingMethod::fsr3) {
             transition_tracked_image(
                 command_buffer,
                 aa_resources.fsr_output,
@@ -6008,6 +8229,7 @@ void Renderer::record_commands(
                 .color = &aa_resources.color,
                 .depth = &aa_resources.depth,
                 .motion_vectors = &aa_resources.motion_vectors,
+                .exposure = &exposure_value_,
                 .output = &aa_resources.fsr_output,
                 .render_extent = current_render_extent_,
                 .display_extent = display_extent,
@@ -6023,6 +8245,12 @@ void Renderer::record_commands(
                 VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                 VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        }
+
+        const bool motion_blur_at_display =
+            motion_blur_active && !motion_blur_before_smaa;
+        if (motion_blur_at_display) {
+            record_motion_blur_tiles();
         }
 
 #if VCR_EDITOR_ENABLED
@@ -6053,7 +8281,9 @@ void Renderer::record_commands(
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .imageView = final_image_view,
             .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            // Every pixel/channel is written by the oversized postprocess
+            // triangle (no depth, discard or blending), before HUD blending.
+            .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
             .clearValue = VkClearValue{
                 .color = VkClearColorValue{
@@ -6073,10 +8303,38 @@ void Renderer::record_commands(
         vkCmdBeginRendering(
             command_buffer, &final_rendering_info);
         set_viewport(display_extent);
+        if (frame.timestamp_queries != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                 frame.timestamp_queries, timestamp_display_begin);
+        }
         draw_post_process(
-            anti_aliasing_.method == AntiAliasingMethod::smaa   ? smaa_neighborhood_pipeline_
+            motion_blur_at_display                              ?
+                (anti_aliasing_.method == AntiAliasingMethod::fsr3
+                    ? motion_blur_reconstructed_pipeline_
+                    : motion_blur_pipeline_)
+            : is_temporal_smaa(anti_aliasing_)                  ? smaa_temporal_resolve_pipeline_
+            : anti_aliasing_.method == AntiAliasingMethod::smaa ?
+                (motion_blur_before_smaa
+                    ? smaa_blurred_neighborhood_pipeline_
+                    : smaa_neighborhood_pipeline_)
             : anti_aliasing_.method == AntiAliasingMethod::fsr3 ? fsr_composite_pipeline_
-                                                                : tonemap_pipeline_.get());
+                                                                 : tonemap_pipeline_.get());
+        if (motion_blur_at_display && frame.timestamp_queries != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp2(
+                command_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                frame.timestamp_queries, timestamp_motion_blur_end);
+        }
+        frame.motion_blur_was_enabled = motion_blur_active;
+        if (frame.timestamp_queries != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                 frame.timestamp_queries, timestamp_display_end);
+        }
+        // Reuse geometry_end as the start: include transitions and AA/upscaling,
+        // then finish after display mapping, before HUD/editor/capture work.
+        if (frame.timestamp_queries != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                 frame.timestamp_queries, timestamp_postprocess_end);
+        }
 #if VCR_EDITOR_ENABLED
         if (!editor_frame)
 #endif
@@ -6288,6 +8546,7 @@ void Renderer::recreate_swapchain(
 
     // Swapchain::recreate waits for device idle, so descriptor sets, the FFX
     // context, and all extent-dependent images can now be retired safely.
+    destroy_subsurface_descriptors();
     destroy_anti_aliasing_descriptors();
     fsr3_upscaler_.shutdown();
     destroy_anti_aliasing_targets();
@@ -6316,9 +8575,9 @@ void Renderer::recreate_swapchain(
         create_descriptors();
     }
     create_anti_aliasing_resources();
+    if (subsurface_provision_pending_) provision_subsurface_resources();
     create_anti_aliasing_descriptors();
-    temporal_history_valid_ = false;
-    fsr3_upscaler_.request_reset();
+    invalidate_temporal_history();
 }
 
 void Renderer::toggle_vsync() {
@@ -6363,7 +8622,9 @@ std::uint32_t Renderer::instance_count() const noexcept {
         return authored_scene_object_count_;
     }
 #endif
-    return scene_object_count;
+    return fixture_ == RenderFixture::material_spheres ||
+                   fixture_ == RenderFixture::subsurface_profiles
+        ? pbr_sample_instance_count_ : scene_object_count;
 }
 
 std::uint64_t Renderer::triangle_count() const noexcept {
@@ -6381,30 +8642,196 @@ std::uint64_t Renderer::triangle_count() const noexcept {
                (editor_sky_visible_ ? 1U : 0U);
     }
 #endif
-    return scene_triangle_count;
+    return fixture_ == RenderFixture::material_spheres ||
+                   fixture_ == RenderFixture::subsurface_profiles ?
+        sky_triangle_count + std::uint64_t(pbr_sample_triangle_count) * pbr_sample_instance_count_ :
+        scene_triangle_count;
+}
+
+void Renderer::invalidate_temporal_history() noexcept {
+    temporal_history_valid_ = false;
+    smaa_t2x_history_valid_ = false;
+    smaa_t2x_phase_ = 0U;
+    fsr3_upscaler_.request_reset();
+#if VCR_EDITOR_ENABLED
+    runtime_transforms_.snap_history();
+#endif
 }
 
 void Renderer::set_mode(const RunMode mode) noexcept {
     if (mode_ != mode) {
-        temporal_history_valid_ = false;
-        fsr3_upscaler_.request_reset();
+#if VCR_EDITOR_ENABLED
+        reset_lod_fades_ = true;
+        reset_lod_history_ = true;
+        lod_camera_valid_ = false;
+#endif
+    }
+    if (mode_ != mode) {
+        invalidate_temporal_history();
+        exposure_reset_pending_ = true;
     }
     mode_ = mode;
+}
+
+bool Renderer::set_subsurface_mode(const SubsurfaceMode mode) noexcept {
+    if (mode != SubsurfaceMode::off && mode != SubsurfaceMode::full_resolution) {
+        return false;
+    }
+    if (mode == SubsurfaceMode::full_resolution &&
+        is_msaa(anti_aliasing_.method)) {
+        return false;
+    }
+    if (subsurface_mode_ == mode) return true;
+    subsurface_mode_ = mode;
+    subsurface_provision_pending_ = mode == SubsurfaceMode::full_resolution &&
+        !subsurface_resources_provisioned_;
+    invalidate_temporal_history();
+    exposure_reset_pending_ = true;
+    return true;
+}
+
+bool Renderer::set_motion_blur_settings(
+    const MotionBlurSettings settings) noexcept {
+    if (!valid_motion_blur_settings(settings)) return false;
+    if (settings.mode != MotionBlurMode::off &&
+        (is_msaa(anti_aliasing_.method) ||
+         is_temporal_smaa(anti_aliasing_) ||
+         (anti_aliasing_.method == AntiAliasingMethod::fsr3 &&
+          anti_aliasing_.fsr3_quality != Fsr3Quality::native_aa))) {
+        return false;
+    }
+    if (motion_blur_settings_ == settings) return true;
+    motion_blur_settings_ = settings;
+    invalidate_temporal_history();
+    return true;
+}
+
+std::uint64_t Renderer::subsurface_resident_bytes() const noexcept {
+    if (!subsurface_resources_provisioned_) return 0U;
+    const VkExtent2D extent = scene_output_extent();
+    return static_cast<std::uint64_t>(extent.width) * extent.height * 8U * 2U *
+        max_frames_in_flight;
+}
+
+bool Renderer::supports_msaa(const AntiAliasingMethod method) const noexcept {
+    if (!is_msaa(method)) return false;
+    return (msaa_supported_sample_counts_ & vk_msaa_samples(method)) != 0U;
+}
+
+std::uint64_t Renderer::msaa_resident_bytes() const noexcept {
+    std::uint64_t result = 0U;
+    const std::uint64_t pixels =
+        static_cast<std::uint64_t>(scene_output_extent().width) *
+        scene_output_extent().height;
+    const std::uint64_t depth_bytes =
+        swapchain_.depth_format() == VK_FORMAT_D16_UNORM ? 2U
+      : swapchain_.depth_format() == VK_FORMAT_D32_SFLOAT_S8_UINT ? 8U
+                                                                  : 4U;
+    for (const auto& resources : anti_aliasing_frames_) {
+        if (!resources.msaa.color) continue;
+        const std::uint64_t samples = resources.msaa.color.samples() ==
+                VK_SAMPLE_COUNT_4_BIT
+            ? 4U : 2U;
+        result += pixels * samples * (8U + depth_bytes);
+    }
+    return result;
+}
+
+VkExtent2D Renderer::msaa_target_extent() const noexcept {
+    for (const auto& resources : anti_aliasing_frames_) {
+        if (resources.msaa.color) {
+            return VkExtent2D{
+                resources.msaa.color.width(), resources.msaa.color.height()};
+        }
+    }
+    return {};
+}
+
+std::string_view Renderer::msaa_depth_format_name() const noexcept {
+    switch (swapchain_.depth_format()) {
+    case VK_FORMAT_D32_SFLOAT: return "d32-sfloat";
+    case VK_FORMAT_D24_UNORM_S8_UINT: return "d24-unorm-s8";
+    case VK_FORMAT_D16_UNORM: return "d16-unorm";
+    case VK_FORMAT_D32_SFLOAT_S8_UINT: return "d32-sfloat-s8";
+    default: return "unknown";
+    }
+}
+
+bool Renderer::set_anti_aliasing(const AntiAliasingMethod method) noexcept {
+    if (method != AntiAliasingMethod::off &&
+        method != AntiAliasingMethod::smaa &&
+        method != AntiAliasingMethod::fsr3 &&
+        method != AntiAliasingMethod::msaa2x &&
+        method != AntiAliasingMethod::msaa4x) {
+        return false;
+    }
+    if (is_msaa(method) &&
+        (!supports_msaa(method) ||
+         subsurface_mode_ == SubsurfaceMode::full_resolution ||
+         motion_blur_settings_.mode != MotionBlurMode::off)) {
+        return false;
+    }
+    if (method == AntiAliasingMethod::fsr3 &&
+        (!fsr3_upscaler_.available() ||
+         (motion_blur_settings_.mode != MotionBlurMode::off &&
+          anti_aliasing_.fsr3_quality != Fsr3Quality::native_aa))) {
+        return false;
+    }
+    if (method == AntiAliasingMethod::smaa &&
+        anti_aliasing_.smaa_mode == SmaaMode::t2x &&
+        motion_blur_settings_.mode != MotionBlurMode::off) {
+        return false;
+    }
+    anti_aliasing_requested_method_ = method;
+    if (anti_aliasing_.method == method) return true;
+    anti_aliasing_.method = method;
+    invalidate_temporal_history();
+    exposure_reset_pending_ = true;
+    return true;
+}
+
+bool Renderer::set_smaa_mode(const SmaaMode mode) noexcept {
+    if (mode != SmaaMode::x1 && mode != SmaaMode::t2x) return false;
+    if (mode == SmaaMode::t2x &&
+        motion_blur_settings_.mode != MotionBlurMode::off) return false;
+    if (anti_aliasing_.smaa_mode == mode) return true;
+    anti_aliasing_.smaa_mode = mode;
+    if (anti_aliasing_.method == AntiAliasingMethod::smaa) {
+        invalidate_temporal_history();
+        exposure_reset_pending_ = true;
+    }
+    return true;
+}
+
+std::uint32_t Renderer::subsurface_active_material_count() const noexcept {
+    if (fixture_ == RenderFixture::subsurface_profiles) return 20U;
+    std::uint32_t count = 0U;
+#if VCR_EDITOR_ENABLED
+    for (const auto& instance : editor_scene_instances_) {
+        count += instance.material.model == MaterialModel::subsurface &&
+                 instance.material.subsurface_profile != SubsurfaceProfile::none &&
+                 instance.material.subsurface_strength > 0.0F ? 1U : 0U;
+    }
+#endif
+    return count;
 }
 
 void Renderer::set_instance_count(const std::uint32_t count) noexcept {
     const std::uint32_t clamped = std::clamp(count, 1U, max_instance_capacity_);
     if (instancing_count_ != clamped) {
-        temporal_history_valid_ = false;
-        fsr3_upscaler_.request_reset();
+        invalidate_temporal_history();
     }
     instancing_count_ = clamped;
 }
 
 void Renderer::set_gpu_workload_iterations(
     const std::uint32_t iterations) noexcept {
-    gpu_workload_iterations_ =
+    const std::uint32_t clamped =
         std::min(iterations, max_gpu_workload_iterations());
+    if (gpu_workload_iterations_ != clamped) {
+        invalidate_temporal_history();
+    }
+    gpu_workload_iterations_ = clamped;
 }
 
 bool Renderer::request_screenshot() noexcept {
@@ -6451,8 +8878,7 @@ void Renderer::adjust_load(const int direction) noexcept {
                 }
             }
         }
-        instancing_count_ =
-            std::clamp(next, 1U, max_instance_capacity_);
+        set_instance_count(next);
     } else if (mode_ == RunMode::gpu_saturation) {
         constexpr std::array levels{0U, 8U, 32U, 128U, 512U};
         std::uint32_t next = gpu_workload_iterations_;
@@ -6471,28 +8897,27 @@ void Renderer::adjust_load(const int direction) noexcept {
                 }
             }
         }
-        gpu_workload_iterations_ = next;
+        set_gpu_workload_iterations(next);
     }
 }
 
 void Renderer::cycle_anti_aliasing() {
-    switch (anti_aliasing_.method) {
-    case AntiAliasingMethod::off:
-        anti_aliasing_.method = AntiAliasingMethod::smaa;
-        break;
-    case AntiAliasingMethod::smaa:
-        anti_aliasing_.method = fsr3_upscaler_.available()
-            ? AntiAliasingMethod::fsr3
-            : AntiAliasingMethod::off;
-        break;
-    case AntiAliasingMethod::fsr3:
-        anti_aliasing_.method = AntiAliasingMethod::off;
-        break;
+    constexpr std::array methods{
+        AntiAliasingMethod::off,
+        AntiAliasingMethod::smaa,
+        AntiAliasingMethod::msaa2x,
+        AntiAliasingMethod::msaa4x,
+        AntiAliasingMethod::fsr3,
+    };
+    std::size_t current = 0U;
+    for (std::size_t index = 0U; index < methods.size(); ++index) {
+        if (methods[index] == anti_aliasing_.method) current = index;
     }
-    temporal_history_valid_ = false;
-    fsr3_upscaler_.request_reset();
+    for (std::size_t step = 1U; step <= methods.size(); ++step) {
+        if (set_anti_aliasing(methods[(current + step) % methods.size()])) break;
+    }
     std::cout
-        << "Anti-aliasing: " << to_string(anti_aliasing_.method);
+        << "Anti-aliasing: " << to_string(anti_aliasing_);
     if (anti_aliasing_.method == AntiAliasingMethod::smaa) {
         std::cout << ' ' << to_string(anti_aliasing_.smaa_quality);
     } else if (anti_aliasing_.method == AntiAliasingMethod::fsr3) {
@@ -6521,12 +8946,13 @@ void Renderer::adjust_anti_aliasing_quality(
         if (adjusted == anti_aliasing_.fsr3_quality) {
             return;
         }
+        if (motion_blur_settings_.mode != MotionBlurMode::off &&
+            adjusted != Fsr3Quality::native_aa) return;
         anti_aliasing_.fsr3_quality = adjusted;
     } else {
         return;
     }
-    temporal_history_valid_ = false;
-    fsr3_upscaler_.request_reset();
+    invalidate_temporal_history();
 }
 
 void Renderer::print_metrics() const {
@@ -6537,7 +8963,7 @@ void Renderer::print_metrics() const {
               << "  present: "
               << Swapchain::present_mode_name(swapchain_.present_mode()) << '\n'
               << "  anti-aliasing: "
-              << to_string(anti_aliasing_.method) << ' '
+              << to_string(anti_aliasing_) << ' '
               << anti_aliasing_quality_name() << '\n'
               << "  frames: " << stats.frames_rendered << '\n'
               << "  FPS (1 s): " << stats.one_second_average_fps << '\n'
@@ -6553,6 +8979,13 @@ void Renderer::print_metrics() const {
               << "  present: " << stats.average.present_ms << " ms\n"
               << "  GPU frame: " << stats.average.gpu_frame_ms << " ms\n"
               << "  GPU geometry: " << stats.average.gpu_geometry_ms << " ms\n"
+              << "  GPU local-light culling: " << stats.average.gpu_light_culling_ms << " ms\n"
+              << "  GPU postprocess: " << stats.average.gpu_postprocess_ms << " ms\n"
+              << "  GPU display: " << stats.average.gpu_display_ms << " ms\n"
+              << "  GPU exposure: " << stats.average.gpu_exposure_ms << " ms\n"
+              << "  GPU subsurface: " << stats.average.gpu_subsurface_ms << " ms\n"
+              << "  GPU motion blur: " << stats.average.gpu_motion_blur_ms << " ms\n"
+              << "  GPU depth prepass: " << stats.average.gpu_depth_prepass_ms << " ms\n"
               << "  GPU workload: " << stats.average.gpu_workload_ms << " ms\n"
               << "  instances: " << instance_count() << '\n'
               << "  max instance capacity: " << max_instance_capacity_ << '\n'

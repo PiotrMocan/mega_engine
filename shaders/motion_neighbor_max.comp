@@ -1,0 +1,33 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "motion_blur_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 14) uniform sampler2D tileMaximum;
+layout(set = 0, binding = 17, rgba16f) uniform writeonly image2D neighborMaximum;
+
+void main()
+{
+    const ivec2 tile = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 extent = imageSize(neighborMaximum);
+    if (any(greaterThanEqual(tile, extent))) return;
+
+    vec4 best = vec4(0.0, 0.0, postProcess.cameraFarPlane, 0.0);
+    float bestMagnitude = -1.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            const ivec2 candidateTile = tile + ivec2(x, y);
+            if (any(lessThan(candidateTile, ivec2(0))) ||
+                any(greaterThanEqual(candidateTile, extent))) continue;
+            const vec4 candidate = texelFetch(tileMaximum, candidateTile, 0);
+            const float magnitude =
+                length(limitedMotionPixels(candidate.xy));
+            if (magnitude > bestMagnitude) {
+                bestMagnitude = magnitude;
+                best = candidate;
+            }
+        }
+    }
+    imageStore(neighborMaximum, tile, best);
+}

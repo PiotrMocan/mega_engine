@@ -10,6 +10,8 @@ enum class AntiAliasingMethod : std::uint8_t {
     off,
     smaa,
     fsr3,
+    msaa2x,
+    msaa4x,
 };
 
 enum class SmaaQuality : std::uint8_t {
@@ -17,6 +19,11 @@ enum class SmaaQuality : std::uint8_t {
     medium,
     high,
     ultra,
+};
+
+enum class SmaaMode : std::uint8_t {
+    x1,
+    t2x,
 };
 
 enum class Fsr3Quality : std::uint8_t {
@@ -30,6 +37,7 @@ enum class Fsr3Quality : std::uint8_t {
 struct AntiAliasingSettings {
     AntiAliasingMethod method = AntiAliasingMethod::off;
     SmaaQuality smaa_quality = SmaaQuality::high;
+    SmaaMode smaa_mode = SmaaMode::x1;
     Fsr3Quality fsr3_quality = Fsr3Quality::quality;
 };
 
@@ -42,6 +50,10 @@ struct AntiAliasingSettings {
         return "SMAA 1x";
     case AntiAliasingMethod::fsr3:
         return "FSR 3.1.4";
+    case AntiAliasingMethod::msaa2x:
+        return "MSAA 2x";
+    case AntiAliasingMethod::msaa4x:
+        return "MSAA 4x";
     }
     return "unknown";
 }
@@ -55,8 +67,25 @@ struct AntiAliasingSettings {
         return "smaa";
     case AntiAliasingMethod::fsr3:
         return "fsr3";
+    case AntiAliasingMethod::msaa2x:
+        return "msaa2x";
+    case AntiAliasingMethod::msaa4x:
+        return "msaa4x";
     }
     return "unknown";
+}
+
+[[nodiscard]] constexpr bool is_msaa(
+    const AntiAliasingMethod method) noexcept {
+    return method == AntiAliasingMethod::msaa2x ||
+        method == AntiAliasingMethod::msaa4x;
+}
+
+[[nodiscard]] constexpr std::uint32_t anti_aliasing_sample_count(
+    const AntiAliasingMethod method) noexcept {
+    return method == AntiAliasingMethod::msaa2x ? 2U
+         : method == AntiAliasingMethod::msaa4x ? 4U
+                                                : 1U;
 }
 
 [[nodiscard]] constexpr std::string_view to_string(
@@ -72,6 +101,31 @@ struct AntiAliasingSettings {
         return "ultra";
     }
     return "unknown";
+}
+
+[[nodiscard]] constexpr std::string_view to_string(
+    const SmaaMode mode) noexcept {
+    switch (mode) {
+    case SmaaMode::x1:
+        return "1x";
+    case SmaaMode::t2x:
+        return "t2x";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] constexpr std::string_view to_string(
+    const AntiAliasingSettings settings) noexcept {
+    if (settings.method == AntiAliasingMethod::smaa) {
+        return settings.smaa_mode == SmaaMode::t2x ? "SMAA T2x" : "SMAA 1x";
+    }
+    return to_string(settings.method);
+}
+
+[[nodiscard]] constexpr bool is_temporal_smaa(
+    const AntiAliasingSettings settings) noexcept {
+    return settings.method == AntiAliasingMethod::smaa &&
+        settings.smaa_mode == SmaaMode::t2x;
 }
 
 [[nodiscard]] constexpr std::string_view to_string(

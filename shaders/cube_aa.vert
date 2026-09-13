@@ -51,6 +51,9 @@ vec3 rotateByQuaternion(vec3 value, vec4 rotation)
                        cross(rotation.xyz, value) + rotation.w * value);
 }
 
+// Identical clip depth across the depth-only and EQUAL color pipelines.
+invariant gl_Position;
+
 void main()
 {
     const InstanceData instance = instances[gl_InstanceIndex];

@@ -1,10 +1,9 @@
 #version 450
 #extension GL_GOOGLE_include_directive:require
 #include "lighting_common.glsl"
+#include "subsurface_output.glsl"
 
 layout(location = 0) in vec2 inNdc;
-layout(location = 0) out vec4 outColor;
-
 layout(set = 0, binding = 0, std140) uniform FrameUniforms
 {
     mat4 viewProjection;
@@ -25,7 +24,7 @@ const float inverseTwoPi = 0.15915494309189533577;
 void main()
 {
     const vec4 worldAtFarPlane =
-        frame.inverseViewProjection * vec4(inNdc, 1.0, 1.0);
+        frame.inverseViewProjection * vec4(inNdc, 0.0, 1.0);
     const vec3 worldPosition =
         worldAtFarPlane.xyz / worldAtFarPlane.w;
     const vec3 viewDirection =
@@ -43,5 +42,8 @@ void main()
         skyTexture,
         vec2(fract(longitude), latitude)).rgb;
 
-    outColor = vec4(lighting.options.x>0.5?dynamicSky(viewDirection):sky, 1.0);
+    writeOpaqueSurface(lighting.options.x>0.5?dynamicSky(viewDirection):sky, 1.0);
+#ifdef VCR_SSS_OUTPUT
+    outDepth = gl_FragCoord.z;
+#endif
 }

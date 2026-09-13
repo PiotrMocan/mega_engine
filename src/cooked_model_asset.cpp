@@ -598,6 +598,56 @@ parse_material(
         };
     }
     factors.reserved = 0.0F;
+    if (pbr->contains("ior") && !json_float_in_range(*pbr, "ior", 1.0F,
+            std::numeric_limits<float>::max(), factors.ior)) {
+        return CookedModelLoadError{
+            .code = CookedModelLoadErrorCode::invalid_material,
+            .message = "Material IOR must be a finite float greater than or equal to 1.",
+            .path = file.absolute,
+        };
+    }
+    if (pbr->contains("model")) {
+        const auto& model_value = pbr->at("model");
+        const auto model = model_value.is_string()
+            ? parse_material_model(model_value.get_ref<const std::string&>()) : std::nullopt;
+        if (!model) {
+            return CookedModelLoadError{
+                .code = CookedModelLoadErrorCode::invalid_material,
+                .message = "Material model must be standard, unlit, or subsurface.",
+                .path = file.absolute,
+            };
+        }
+        factors.model = *model;
+    }
+    if (pbr->contains("subsurface_profile")) {
+        const auto& profile_value = pbr->at("subsurface_profile");
+        const auto profile = profile_value.is_string()
+            ? parse_subsurface_profile(
+                  profile_value.get_ref<const std::string&>())
+            : std::nullopt;
+        if (!profile) {
+            return CookedModelLoadError{
+                .code = CookedModelLoadErrorCode::invalid_material,
+                .message = "Material subsurface profile is invalid.",
+                .path = file.absolute,
+            };
+        }
+        factors.subsurface_profile = *profile;
+    }
+    if (pbr->contains("subsurface_strength") &&
+        !json_float_in_range(
+            *pbr,
+            "subsurface_strength",
+            0.0F,
+            1.0F,
+            factors.subsurface_strength)) {
+        return CookedModelLoadError{
+            .code = CookedModelLoadErrorCode::invalid_material,
+            .message =
+                "Material subsurface strength must be a finite float in [0, 1].",
+            .path = file.absolute,
+        };
+    }
 
     const auto textures = metadata.find("textures");
     if (textures == metadata.end() || !textures->is_object()) {

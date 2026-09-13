@@ -10,7 +10,7 @@
 layout(push_constant) uniform PostProcessPushConstants
 {
     vec2 inverseResolution;
-    uint method;
+    uint flags;
     uint displayMappingEnabled;
 } postProcess;
 
@@ -36,6 +36,11 @@ void main()
         texcoord,
         pixelCoordinate,
         offsets);
+    ivec4 subsampleIndices = ivec4(0);
+    if ((postProcess.flags & 2u) != 0u)
+        subsampleIndices = (postProcess.flags & 4u) != 0u
+            ? ivec4(2, 2, 2, 0)
+            : ivec4(1, 1, 1, 0);
     outWeights = SMAABlendingWeightCalculationPS(
         texcoord,
         pixelCoordinate,
@@ -43,5 +48,5 @@ void main()
         edgesTexture,
         areaTexture,
         searchTexture,
-        ivec4(0));
+        subsampleIndices);
 }

@@ -61,6 +61,20 @@ struct Argument {
     return true;
 }
 
+[[nodiscard]] bool parse_finite_double(
+    const std::string_view text,
+    double& value) noexcept {
+    if (text.empty()) return false;
+    double parsed = 0.0;
+    const char* const first = text.data();
+    const char* const last = first + text.size();
+    const auto [end, error] =
+        std::from_chars(first, last, parsed, std::chars_format::general);
+    if (error != std::errc{} || end != last || !std::isfinite(parsed)) return false;
+    value = parsed;
+    return true;
+}
+
 [[nodiscard]] std::string missing_value(std::string_view name) {
     std::string result{"missing value for "};
     result.append(name);
@@ -155,6 +169,14 @@ struct Argument {
         method = AntiAliasingMethod::fsr3;
         return true;
     }
+    if (value == "msaa2x") {
+        method = AntiAliasingMethod::msaa2x;
+        return true;
+    }
+    if (value == "msaa4x") {
+        method = AntiAliasingMethod::msaa4x;
+        return true;
+    }
     return false;
 }
 
@@ -174,6 +196,19 @@ struct Argument {
     }
     if (value == "ultra") {
         quality = SmaaQuality::ultra;
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] bool parse_smaa_mode(
+    std::string_view value, SmaaMode& mode) noexcept {
+    if (value == "1x") {
+        mode = SmaaMode::x1;
+        return true;
+    }
+    if (value == "t2x") {
+        mode = SmaaMode::t2x;
         return true;
     }
     return false;
@@ -219,6 +254,9 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
     bool instances_was_explicit = false;
     bool workload_was_explicit = false;
     bool mode_was_explicit = false;
+    bool local_light_count_was_explicit = false;
+    bool light_swarm_layout_was_explicit = false;
+    bool motion_fixture_fps_was_explicit = false;
 
     for (int index = 1; index < argc; ++index) {
         if (argv[index] == nullptr) {
@@ -291,6 +329,211 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
             continue;
         }
         std::string_view value;
+        if (argument.name == "--cpu-culling") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            if (value != "linear" && value != "hierarchy") {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.cpu_hierarchy = value == "hierarchy";
+            continue;
+        }
+        if (argument.name == "--front-to-back") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            if (value != "off" && value != "coarse") {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.coarse_front_to_back = value == "coarse";
+            continue;
+        }
+        if (argument.name == "--depth-prepass") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            const auto prepass = parse_depth_prepass(value);
+            if (!prepass) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.depth_prepass = *prepass;
+            continue;
+        }
+        if (argument.name == "--lod-fade") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            const auto pattern = parse_lod_fade_pattern(value);
+            if (!pattern) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.lod_fade = *pattern;
+            continue;
+        }
+        if (argument.name == "--lod-fade-seconds") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            double seconds = 0.0;
+            if (!parse_nonnegative_double(value, seconds) || seconds < 0.05 || seconds > 2.0) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.lod_fade_seconds = static_cast<float>(seconds);
+            continue;
+        }
+        if (argument.name == "--local-lighting") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            const auto backend = parse_local_light_backend(value);
+            if (!backend) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.local_light_backend = *backend;
+            continue;
+        }
+        if (argument.name == "--local-light-count") {
+            local_light_count_was_explicit = true;
+            if (!take_value(argument, index, argc, argv, value, result.error) ||
+                !parse_u32(value, result.options.local_light_count) ||
+                result.options.local_light_count > maximum_local_lights) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            continue;
+        }
+        if (argument.name == "--light-swarm-layout") {
+            light_swarm_layout_was_explicit = true;
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            const auto layout = parse_light_swarm_layout(value);
+            if (!layout) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.light_swarm_layout = *layout;
+            continue;
+        }
+        if (argument.name == "--render-fixture") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            const auto fixture = parse_render_fixture(value);
+            if (!fixture) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.render_fixture = *fixture;
+            continue;
+        }
+        if (argument.name == "--motion-fixture-fps") {
+            motion_fixture_fps_was_explicit = true;
+            if (!take_value(argument, index, argc, argv, value, result.error) ||
+                !parse_u32(value, result.options.motion_fixture_fps) ||
+                (result.options.motion_fixture_fps != 30U &&
+                 result.options.motion_fixture_fps != 60U &&
+                 result.options.motion_fixture_fps != 144U)) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            continue;
+        }
+        if (argument.name == "--shadow-depth") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            const auto depth = parse_shadow_depth_format(value);
+            if (!depth) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.lighting.shadow_depth = *depth;
+            result.options.lighting_overrides.shadow_depth = true;
+            continue;
+        }
+        if (argument.name == "--shadow-cache") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            if (value != "full" && value != "cascade") {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.lighting.cascade_cache = value == "cascade";
+            result.options.lighting_overrides.cascade_cache = true;
+            continue;
+        }
+        if (argument.name == "--tone-mapper") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            const auto mapper = parse_tone_mapper(value);
+            if (!mapper) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.tone_mapper = *mapper;
+            continue;
+        }
+        if (argument.name == "--subsurface") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            const auto mode = parse_subsurface_mode(value);
+            if (!mode) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.subsurface = *mode;
+            continue;
+        }
+        if (argument.name == "--exposure") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            const auto mode = parse_exposure_mode(value);
+            if (!mode) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.exposure.mode = *mode;
+            continue;
+        }
+        if (argument.name == "--exposure-metering") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            const auto metering = parse_exposure_metering(value);
+            if (!metering) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.exposure.metering = *metering;
+            continue;
+        }
+        if (argument.name == "--grading") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            const auto grading = parse_color_grading(value);
+            if (!grading) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.color_grading = *grading;
+            continue;
+        }
+        if (argument.name == "--grading-lut-size") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            const auto size = parse_color_grading_lut_size(value);
+            if (!size) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.color_grading_lut_size = *size;
+            continue;
+        }
+        if (argument.name == "--exposure-ev" ||
+            argument.name == "--exposure-min-ev" ||
+            argument.name == "--exposure-max-ev" ||
+            argument.name == "--exposure-low-percent" ||
+            argument.name == "--exposure-high-percent" ||
+            argument.name == "--exposure-brighten-seconds" ||
+            argument.name == "--exposure-darken-seconds") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            double number = 0.0;
+            if (!parse_finite_double(value, number)) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            auto& exposure = result.options.exposure;
+            if (argument.name == "--exposure-ev") exposure.compensation_ev = static_cast<float>(number);
+            else if (argument.name == "--exposure-min-ev") exposure.minimum_ev = static_cast<float>(number);
+            else if (argument.name == "--exposure-max-ev") exposure.maximum_ev = static_cast<float>(number);
+            else if (argument.name == "--exposure-low-percent") exposure.low_percentile = static_cast<float>(number);
+            else if (argument.name == "--exposure-high-percent") exposure.high_percentile = static_cast<float>(number);
+            else if (argument.name == "--exposure-brighten-seconds") exposure.brighten_seconds = static_cast<float>(number);
+            else exposure.darken_seconds = static_cast<float>(number);
+            continue;
+        }
         if (argument.name == "--lighting" || argument.name == "--gi" ||
             argument.name == "--day-cycle" || argument.name == "--time-of-day" ||
             argument.name == "--day-length" || argument.name == "--gi-extent" ||
@@ -543,6 +786,81 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
             }
             continue;
         }
+        if (argument.name == "--motion-blur") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) {
+                return result;
+            }
+            const auto mode = parse_motion_blur_mode(value);
+            if (!mode) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.motion_blur.mode = *mode;
+            continue;
+        }
+        if (argument.name == "--motion-blur-quality") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) {
+                return result;
+            }
+            const auto quality = parse_motion_blur_quality(value);
+            if (!quality) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.motion_blur.quality = *quality;
+            continue;
+        }
+        if (argument.name == "--motion-blur-shutter") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) {
+                return result;
+            }
+            const auto shutter = parse_motion_blur_shutter(value);
+            if (!shutter) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.motion_blur.shutter = *shutter;
+            continue;
+        }
+        if (argument.name == "--motion-blur-angle" ||
+            argument.name == "--motion-blur-radius" ||
+            argument.name == "--motion-blur-camera-fade-start" ||
+            argument.name == "--motion-blur-camera-fade-end") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) {
+                return result;
+            }
+            double number = 0.0;
+            if (!parse_nonnegative_double(value, number)) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            if (argument.name == "--motion-blur-angle") {
+                result.options.motion_blur.shutter_angle_degrees =
+                    static_cast<float>(number);
+            } else if (argument.name == "--motion-blur-radius") {
+                result.options.motion_blur.maximum_radius_pixels =
+                    static_cast<float>(number);
+            } else if (argument.name == "--motion-blur-camera-fade-start") {
+                result.options.motion_blur.camera_fade_start =
+                    static_cast<float>(number);
+            } else {
+                result.options.motion_blur.camera_fade_end =
+                    static_cast<float>(number);
+            }
+            continue;
+        }
+        if (argument.name == "--smaa-mode") {
+            if (!take_value(
+                    argument, index, argc, argv, value, result.error)) {
+                return result;
+            }
+            if (!parse_smaa_mode(
+                    value, result.options.anti_aliasing.smaa_mode)) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            continue;
+        }
         if (argument.name == "--fsr-quality") {
             if (!take_value(
                     argument, index, argc, argv, value, result.error)) {
@@ -563,6 +881,45 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
 
     // Explicit workload knobs are convenient mode selectors, while --mode
     // always wins when the user supplied it.
+    if (!valid_exposure_settings(result.options.exposure)) {
+        result.error = "invalid exposure settings";
+        return result;
+    }
+    if (!valid_motion_blur_settings(result.options.motion_blur)) {
+        result.error = "invalid motion blur settings";
+        return result;
+    }
+    if (result.options.motion_blur.mode != MotionBlurMode::off &&
+        (is_msaa(result.options.anti_aliasing.method) ||
+         is_temporal_smaa(result.options.anti_aliasing) ||
+         (result.options.anti_aliasing.method == AntiAliasingMethod::fsr3 &&
+          result.options.anti_aliasing.fsr3_quality != Fsr3Quality::native_aa))) {
+        result.error =
+            "motion blur supports AA off, SMAA 1x, or FSR native-aa";
+        return result;
+    }
+    if (is_msaa(result.options.anti_aliasing.method) &&
+        result.options.subsurface == SubsurfaceMode::full_resolution) {
+        result.error = "MSAA cannot be combined with --subsurface full";
+        return result;
+    }
+    if (result.options.render_fixture != RenderFixture::none &&
+        (result.options.lighting_room || result.options.scene_count > 0)) {
+        result.error = "--render-fixture cannot be combined with --lighting-room or --scene-count";
+        return result;
+    }
+    if (motion_fixture_fps_was_explicit &&
+        (result.options.render_fixture != RenderFixture::motion_bars ||
+         !result.options.animate_scene)) {
+        result.error =
+            "--motion-fixture-fps requires --render-fixture motion-bars and --animate-scene";
+        return result;
+    }
+    if ((local_light_count_was_explicit || light_swarm_layout_was_explicit) &&
+        result.options.render_fixture != RenderFixture::light_swarm) {
+        result.error = "--local-light-count and --light-swarm-layout require --render-fixture light-swarm";
+        return result;
+    }
     if (!result.options.scene_asset.empty() && result.options.scene_count == 0) {
         result.error = "--scene-asset requires --scene-count";
         return result;
@@ -596,6 +953,8 @@ LightingSettings resolve_scene_lighting(
     if (options.lighting_overrides.triangle_budget) result.triangle_budget = options.lighting.triangle_budget;
     if (options.lighting_overrides.gi_update_hz) result.gi_update_hz = options.lighting.gi_update_hz;
     if (options.lighting_overrides.shadow_resolution) result.shadow_resolution = options.lighting.shadow_resolution;
+    if (options.lighting_overrides.shadow_depth) result.shadow_depth = options.lighting.shadow_depth;
+    if (options.lighting_overrides.cascade_cache) result.cascade_cache = options.lighting.cascade_cache;
     // Selecting legacy lighting disables features that require the dynamic path.
     if (!result.dynamic) {
         result.voxel_gi = false;
@@ -618,6 +977,8 @@ std::string cli_usage(std::string_view executable_name) {
                   "  --gpu-workload N        GPU workload iterations (default: 0)\n"
                   "  --culling MODE          none, frustum, occlusion (default: occlusion)\n"
                   "  --visibility-backend MODE  auto, cpu, gpu (default: auto)\n"
+                  "  --front-to-back MODE    off, coarse (CPU visibility only; default: off)\n"
+                  "  --cpu-culling MODE      linear, hierarchy (CPU frustum; default: linear)\n"
                   "  --lod on|off            Screen-error mesh/terrain LOD (default: on)\n"
                   "  --dynamic-shadows on|off  Authored casters and invalidation (default: on)\n"
                   "  --animate-scene         Animate one runtime object (game executable)\n"
@@ -626,13 +987,44 @@ std::string cli_usage(std::string_view executable_name) {
                   "  --scene-scale N         Stress object scale, .001..100 (default: 1)\n"
                   "  --scene-count N         Generated stress scene, 1..100000 objects\n"
                   "  --scene-walls on|off    Include large occluders in the stress scene\n"
+                  "  --render-fixture MODE   none, cascade-cache, overdraw-1/4/16 (default: none)\n"
+                  "                          material-spheres, subsurface-profiles, light-swarm,\n"
+                  "                          aa-wires, or motion-bars\n"
+                  "  --motion-fixture-fps N fixed motion-bars simulation step: 30, 60, or 144\n"
+                  "  --local-light-count N   light-swarm lights, 0..4096 (default: 256)\n"
+                  "  --light-swarm-layout L  separated or overlap (default: separated)\n"
                   "  --scene-asset PATH      Repeat this cooked model in the stress scene\n"
                   "  --stream-asset PATH     Load/place a model while rendering\n"
                   "  --present MODE          auto (uncapped), immediate, mailbox, or fifo\n"
                   "  --mode MODE             scene, instancing,\n"
                   "                          or gpu-saturation\n"
-                  "  --aa MODE               off, smaa, or fsr3 (default: off)\n"
+                  "  --aa MODE               off, smaa, fsr3, msaa2x, or msaa4x (default: off)\n"
+                  "  --motion-blur MODE      off, camera, objects, all (default: off)\n"
+                  "  --motion-blur-quality Q low or high (default: high)\n"
+                  "  --motion-blur-shutter S centered or trailing (default: centered)\n"
+                  "  --motion-blur-angle DEG shutter angle, 0..360 (default: 180)\n"
+                  "  --motion-blur-radius PX maximum radius, 1..64 (default: 32)\n"
+                  "  --motion-blur-camera-fade-start M  optional camera fade start\n"
+                  "  --motion-blur-camera-fade-end M    optional camera fade end\n"
+                  "  --depth-prepass MODE    off, partial, full (default: off)\n"
+                  "                          partial: terrain/primitives; full: all opaque\n"
+                  "  --local-lighting MODE   off, forward, clustered, auto (default: auto)\n"
+                  "  --subsurface off|full   Full-resolution masked separable SSS (default: off)\n"
+                  "  --exposure fixed|auto   Scene exposure mode (default: fixed)\n"
+                  "  --exposure-ev EV        Fixed EV or auto compensation, -24..24 (default: 0)\n"
+                  "  --exposure-metering M   uniform or center (default: uniform)\n"
+                  "  --exposure-min-ev EV    Auto lower clamp, -24..24 (default: -10)\n"
+                  "  --exposure-max-ev EV    Auto upper clamp, -24..24 (default: 10)\n"
+                  "  --exposure-low-percent N  Histogram lower fraction, 0..1 (default: .02)\n"
+                  "  --exposure-high-percent N Histogram upper fraction, 0..1 (default: .98)\n"
+                  "  --exposure-brighten-seconds N  Dark-scene time constant (default: 1)\n"
+                  "  --exposure-darken-seconds N    Bright-scene time constant (default: .25)\n"
+                  "  --grading MODE          off, trilinear, tetrahedral (default: off)\n"
+                  "  --grading-lut-size N    Identity/reference LUT: 32 or 64 (default: 32)\n"
+                  "  --lod-fade PATTERN      Model LOD: off, bayer4, bayer8 (default: off)\n"
+                  "  --lod-fade-seconds SEC  Model LOD transition: 0.05..2 (default: 0.25)\n"
                   "  --smaa-quality MODE     low, medium, high, or ultra\n"
+                  "  --smaa-mode MODE        1x or t2x (default: 1x)\n"
                   "  --fsr-quality MODE      native-aa, quality, balanced, performance,\n"
                   "                          or ultra-performance\n"
                   "  --duration SECONDS      Measurement duration (default: 15)\n"
@@ -651,8 +1043,11 @@ std::string cli_usage(std::string_view executable_name) {
                   "  1/2/3                   Scene/instancing/GPU workload mode\n"
                   "  Up/Down                 Adjust active benchmark load\n"
                   "  --lighting dynamic|legacy  Lighting path (dynamic by default)\n"
+                  "  --tone-mapper reinhard|gt7  SDR display mapping (reinhard)\n"
                   "  --gi voxel|off             Dynamic diffuse GI (voxel by default)\n"
                   "  --shadow-resolution N      Atlas edge: 1024|2048|4096|8192 (2048)\n"
+                  "  --shadow-depth auto|d32|d16 Startup shadow depth profile (auto)\n"
+                  "  --shadow-cache full|cascade Cascade refresh policy (full)\n"
                   "  --time-of-day 0..24         Initial hour (14)\n"
                   "  --day-cycle on|off          Advance time (on)\n"
                   "  --day-length SECONDS        Full day duration (600)\n"

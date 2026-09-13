@@ -256,7 +256,6 @@ VkSurfaceFormatKHR Swapchain::choose_surface_format(
     constexpr std::array preferred{
         VK_FORMAT_B8G8R8A8_SRGB,
         VK_FORMAT_R8G8B8A8_SRGB,
-        VK_FORMAT_B8G8R8A8_UNORM,
     };
     for (const auto preferred_format : preferred) {
         const auto it = std::ranges::find_if(formats, [preferred_format](const auto& value) {
@@ -267,7 +266,9 @@ VkSurfaceFormatKHR Swapchain::choose_surface_format(
             return *it;
         }
     }
-    return formats.front();
+    fatal(
+        "The surface exposes no sRGB swapchain format; the renderer cannot "
+        "preserve its single display-encoding contract.");
 }
 
 VkPresentModeKHR Swapchain::choose_present_mode(

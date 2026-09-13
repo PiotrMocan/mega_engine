@@ -18,6 +18,7 @@ build\windows-debug\bin\vulkan_editor.exe --mcp-stdio --no-validation
 | `editor.history` | `undo`, `redo` |
 | `editor.assets` | `list`, `import` |
 | `editor.landscape` | `create_flat_ground`, `scatter_model` |
+| `render` | `set_exposure`, `set_color_grading`, `set_subsurface`, `set_motion_blur`, `set_anti_aliasing` |
 | `capture` | `screenshot` |
 | `engine` | `quit` |
 
@@ -86,7 +87,7 @@ MCP-клиент должен запускать этот процесс как 
 | `test` | `run_self_check`, `set_roof` (только `--lighting-room`) |
 | `lighting` | `set` (hour, cycle, gi) |
 | `capture` | `screenshot` |
-| `render` | `set_mode`, `set_instances`, `set_gpu_workload`, `set_present_mode`, `set_shadow_resolution` |
+| `render` | `set_mode`, `set_instances`, `set_gpu_workload`, `set_present_mode`, `set_shadow_resolution`, `set_shadow_cache`, `set_tone_mapper`, `set_exposure`, `set_color_grading`, `set_subsurface`, `set_motion_blur`, `set_anti_aliasing`, `set_depth_prepass`, `set_lod_fade` |
 | `window` | `set_fullscreen`, `set_size`, `set_mouse_capture` |
 | `input` | `key`, `mouse_move`, `mouse_button`, `release_all` |
 | `engine` | `quit` |
@@ -117,9 +118,47 @@ action keys. MCP-вызов `escape` безопасно отпускает mouse
 успел уйти клиенту.
 
 Для сглаживания доступны те же engine-local клавиши, что и в окне: `f6`
-переключает `off`/SMAA/FSR 3, `f7` понижает, а `f8` повышает качество.
-`debug.get_capabilities` возвращает доступность и версию FSR, а
-`debug.get_state` — активный метод и качество.
+переключает `off`/SMAA/MSAA2/MSAA4/FSR 3, `f7` понижает, а `f8` повышает
+качество SMAA/FSR. Typed `render.set_anti_aliasing` принимает `off`, `smaa`,
+`fsr3`, `msaa2x` или `msaa4x`. Для `method: "smaa"` optional поле
+`smaa_mode` принимает `"1x"` или `"t2x"`; с другим методом это поле считается
+ошибкой. Одинаковая typed schema действует в runtime и editor profiles:
+
+```text
+render.set_anti_aliasing {"method":"smaa","smaa_mode":"t2x"}
+render.set_anti_aliasing {"method":"smaa","smaa_mode":"1x"}
+```
+
+`debug.get_capabilities` публикует `anti_aliasing.smaa_modes`, support FSR/MSAA,
+formats и resolve policy. Runtime `debug.get_state` и editor `editor.get_state`
+возвращают `smaa_mode`, `smaa_temporal`, `smaa_history_valid`,
+`smaa_temporal_phase`, `smaa_history_resident_bytes`, history width/height,
+`smaa_history_incremental_bytes` и `smaa_history_reuses_fsr_output`. При 1080p
+T2x сообщает 31.64 MiB общей resident history capacity и 0 incremental bytes,
+поскольку использует два per-frame `RGBA16F` FSR outputs. Benchmark JSON также
+содержит `smaa_mode`, `smaa_temporal_samples`, `smaa_history_resident_bytes`,
+`smaa_history_incremental_bytes` и `smaa_history_reuses_fsr_output`.
+Full SSS и MSAA взаимоисключающие.
+
+Typed `render.set_motion_blur` атомарно принимает все семь полей:
+
+```text
+render.set_motion_blur {"mode":"all","quality":"high","shutter":"centered","angle_degrees":180,"maximum_radius_pixels":32,"camera_fade_start":0,"camera_fade_end":0}
+```
+
+`mode` — `off|camera|objects|all`, `quality` — `low|high` (8/16 taps),
+`shutter` — `centered|trailing`; angle ограничен 0–360°, radius 1–64 px.
+Camera fade выключается двумя нулями либо требует `start < end` в диапазоне
+0–10000. Runtime `debug.get_state` и editor `editor.get_state` возвращают
+`motion_blur.mode_requested`, `mode_actual`, quality, shutter, angle, radius и
+fade. Benchmark JSON дублирует requested/actual settings и публикует отдельный
+`average_gpu_motion_blur_ms`.
+
+Active blur поддерживает AA Off/SMAA1 и FSR Native. Для SMAA он выполняется до
+edge detection, для FSR Native — после upscale. MSAA, SMAA T2x и scaled FSR
+возвращают ошибку совместимости. HUD/editor компонуются после blur. Пауза больше
+250 ms, camera cut или смена настроек сбрасывают temporal state. Runtime/editor
+smoke inventories после E17 содержат 30/24 tools.
 
 ### Screenshot
 

@@ -99,8 +99,8 @@ bool Renderer::poll_assets() {
         editor_scene_revision_ = 0;
         packet_document_revision_ = 0;
         shadow_dirty_ = true;
-        temporal_history_valid_ = false;
-        fsr3_upscaler_.request_reset();
+        invalidate_temporal_history();
+        exposure_reset_pending_ = true;
     }
     return changed;
 }

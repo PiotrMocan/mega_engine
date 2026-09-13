@@ -1,0 +1,93 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "pbr_material.glsl"
+
+layout(local_size_x = 1) in;
+
+// Actual host PbrMaterial ABI: 48-byte std430 array stride, without packing
+// IOR/model into a float or narrowing material fields to half precision.
+struct MaterialData
+{
+    vec4 baseColor;
+    vec4 parameters;
+    float indexOfRefraction;
+    uint shadingModel;
+    uint subsurfaceProfile;
+    float subsurfaceStrength;
+};
+
+struct MaterialResult
+{
+    vec4 baseColor;
+    vec4 parameters;
+    vec4 numeric; // F0, unchanged IOR, two fixed output sentinels.
+    uvec4 exact;  // Model/profile remain exact; strength bits and record ID follow.
+};
+
+// Three current rows + 48-byte material + three previous rows = 144 bytes.
+struct RuntimeData
+{
+    vec4 currentRow0;
+    vec4 currentRow1;
+    vec4 currentRow2;
+    MaterialData material;
+    vec4 previousRow0;
+    vec4 previousRow1;
+    vec4 previousRow2;
+};
+
+struct RuntimeResult
+{
+    vec4 currentRow0;
+    vec4 currentRow1;
+    vec4 currentRow2;
+    MaterialResult material;
+    vec4 previousRow0;
+    vec4 previousRow1;
+    vec4 previousRow2;
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer Materials
+{
+    MaterialData values[];
+} materials;
+layout(set = 0, binding = 1, std430) writeonly buffer MaterialResults
+{
+    MaterialResult values[];
+} materialResults;
+layout(set = 0, binding = 2, std430) readonly buffer RuntimeInstances
+{
+    RuntimeData values[];
+} runtimeInstances;
+layout(set = 0, binding = 3, std430) writeonly buffer RuntimeResults
+{
+    RuntimeResult values[];
+} runtimeResults;
+
+MaterialResult evaluateMaterial(MaterialData material, uint recordIndex)
+{
+    return MaterialResult(
+        material.baseColor,
+        material.parameters,
+        vec4(materialDielectricF0(material.indexOfRefraction),
+             material.indexOfRefraction, -7.25, 19.5),
+        uvec4(material.shadingModel, material.subsurfaceProfile,
+              floatBitsToUint(material.subsurfaceStrength),
+              recordIndex ^ 0x6d61746cu));
+}
+
+void main()
+{
+    const uint index = gl_GlobalInvocationID.x;
+    if (index < uint(materials.values.length()) && index < uint(materialResults.values.length()))
+        materialResults.values[index] = evaluateMaterial(materials.values[index], index);
+
+    if (index < uint(runtimeInstances.values.length()) && index < uint(runtimeResults.values.length()))
+    {
+        RuntimeData instance = runtimeInstances.values[index];
+        runtimeResults.values[index] = RuntimeResult(
+            instance.currentRow0, instance.currentRow1, instance.currentRow2,
+            evaluateMaterial(instance.material, index),
+            instance.previousRow0, instance.previousRow1, instance.previousRow2);
+    }
+}

@@ -12,7 +12,7 @@ glm::vec4 row(const glm::mat4 &m, int i) noexcept {
 struct Projection {
     std::array<glm::vec2, 8> points{};
     glm::vec2 low{1.0F}, high{-1.0F};
-    float near_depth = 1.0F, far_depth = 0.0F;
+    float near_depth = 0.0F, far_depth = 1.0F;
 };
 bool project(const std::array<glm::vec3, 8> &corners, const glm::mat4 &matrix,
              Projection &result) noexcept {
@@ -20,7 +20,8 @@ bool project(const std::array<glm::vec3, 8> &corners, const glm::mat4 &matrix,
         const glm::vec4 clip = matrix * glm::vec4(corners[i], 1.0F);
         // Clipping an occluder at the near plane requires new silhouette
         // vertices. Retain such objects instead of guessing that silhouette.
-        if (!std::isfinite(clip.w) || clip.w <= 1.0e-5F || clip.z <= 0.0F) {
+        if (!std::isfinite(clip.w) || clip.w <= 1.0e-5F ||
+            clip.z >= clip.w || clip.z <= 0.0F) {
             return false;
         }
         const glm::vec3 ndc = glm::vec3(clip) / clip.w;
@@ -30,8 +31,8 @@ bool project(const std::array<glm::vec3, 8> &corners, const glm::mat4 &matrix,
         result.points[i] = glm::vec2(ndc) * 0.5F + 0.5F;
         result.low = glm::min(result.low, result.points[i]);
         result.high = glm::max(result.high, result.points[i]);
-        result.near_depth = std::min(result.near_depth, ndc.z);
-        result.far_depth = std::max(result.far_depth, ndc.z);
+        result.near_depth = std::max(result.near_depth, ndc.z);
+        result.far_depth = std::min(result.far_depth, ndc.z);
     }
     return true;
 }
@@ -116,15 +117,15 @@ std::array<glm::vec3, 8> bounds_corners(const Bounds &b) noexcept {
     return out;
 }
 void OcclusionGrid::clear() noexcept {
-    depths_.fill(std::numeric_limits<float>::infinity());
+    depths_.fill(0.0F);
 }
 bool OcclusionGrid::has_coverage() const noexcept {
-    return std::ranges::any_of(depths_, [](float depth) { return depth < 1.0F; });
+    return std::ranges::any_of(depths_, [](float depth) { return depth > 0.0F; });
 }
 void OcclusionGrid::add_box(const std::array<glm::vec3, 8> &corners, const glm::mat4 &vp,
                             const glm::vec2 guard) noexcept {
     Projection p;
-    if (!project(corners, vp, p) || p.far_depth >= 1.0F) {
+    if (!project(corners, vp, p) || p.far_depth <= 0.0F) {
         return;
     }
     std::sort(p.points.begin(), p.points.end(),
@@ -171,7 +172,7 @@ void OcclusionGrid::add_box(const std::array<glm::vec3, 8> &corners, const glm::
             }
             if (inside) {
                 const auto cell = std::size_t(y) * width + x;
-                depths_[cell] = std::min(depths_[cell], p.far_depth + 1.0e-5F);
+                depths_[cell] = std::max(depths_[cell], p.far_depth - 1.0e-5F);
             }
         }
     }
@@ -193,7 +194,7 @@ bool OcclusionGrid::occluded(const Bounds &bounds, const glm::mat4 &vp,
                y1 = static_cast<unsigned>(p.high.y * height);
     for (auto y = y0; y <= y1; ++y) {
         for (auto x = x0; x <= x1; ++x) {
-            if (depths_[std::size_t(y) * width + x] >= p.near_depth - 1.0e-5F) {
+            if (depths_[std::size_t(y) * width + x] <= p.near_depth + 1.0e-5F) {
                 return false;
             }
         }

@@ -34,6 +34,7 @@ GpuTexture& GpuTexture::operator=(GpuTexture&& other) noexcept {
     usage_ = std::exchange(other.usage_, VkImageUsageFlags{0});
     aspect_mask_ =
         std::exchange(other.aspect_mask_, VkImageAspectFlags{0});
+    samples_ = std::exchange(other.samples_, VK_SAMPLE_COUNT_1_BIT);
     return *this;
 }
 
@@ -165,6 +166,25 @@ void GpuTexture::create_render_target(
         debug_name);
 }
 
+void GpuTexture::create_multisampled_render_target(
+    VulkanContext& context,
+    const std::uint32_t width,
+    const std::uint32_t height,
+    const VkFormat format,
+    const VkImageUsageFlags usage,
+    const VkImageAspectFlags aspect_mask,
+    const VkSampleCountFlagBits samples,
+    const std::string_view debug_name) {
+    if (samples != VK_SAMPLE_COUNT_2_BIT && samples != VK_SAMPLE_COUNT_4_BIT) {
+        fatal("MSAA render target sample count must be 2 or 4.");
+    }
+    create_impl(
+        context, width, height, 1U, format, usage, aspect_mask,
+        VK_FILTER_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        VK_FALSE, VK_COMPARE_OP_ALWAYS, VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK,
+        debug_name, 1U, samples);
+}
+
 void GpuTexture::create_volume(VulkanContext &context, std::uint32_t size, std::uint32_t mips,
                                VkFormat format, std::string_view name) {
     // Use depth >= 2 so the view remains 3D even for the disabled dummy volume.
@@ -178,13 +198,31 @@ void GpuTexture::create_volume(VulkanContext &context, std::uint32_t size, std::
                 VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK, name, size);
 }
 
+void GpuTexture::create_sampled_volume(
+    VulkanContext& context,
+    const std::uint32_t size,
+    const VkFormat format,
+    const VkFilter filter,
+    const std::string_view debug_name) {
+    if (size < 2U || size > context.properties().limits.maxImageDimension3D) {
+        fatal("Invalid sampled volume extent");
+    }
+    create_impl(
+        context, size, size, 1U, format,
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT, filter, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        VK_FALSE, VK_COMPARE_OP_ALWAYS, VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
+        debug_name, size);
+}
+
 void GpuTexture::create_impl(VulkanContext &context, const std::uint32_t width,
                              const std::uint32_t height, const std::uint32_t mip_levels,
                              const VkFormat format, const VkImageUsageFlags usage,
                              const VkImageAspectFlags aspect_mask, const VkFilter filter,
                              const VkSamplerAddressMode address_mode, const VkBool32 compare_enable,
                              const VkCompareOp compare_op, const VkBorderColor border_color,
-                             const std::string_view debug_name, const std::uint32_t depth) {
+                             const std::string_view debug_name, const std::uint32_t depth,
+                             const VkSampleCountFlagBits samples) {
     destroy();
     if (width == 0U || height == 0U || mip_levels == 0U) {
         fatal("Attempted to create a zero-sized GPU texture.");
@@ -207,6 +245,7 @@ void GpuTexture::create_impl(VulkanContext &context, const std::uint32_t width,
     format_ = format;
     usage_ = usage;
     aspect_mask_ = aspect_mask;
+    samples_ = samples;
 
     const VkImageCreateInfo image_info{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -217,7 +256,7 @@ void GpuTexture::create_impl(VulkanContext &context, const std::uint32_t width,
         .extent = VkExtent3D{width, height, depth},
         .mipLevels = mip_levels,
         .arrayLayers = 1,
-        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .samples = samples,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
@@ -251,6 +290,7 @@ void GpuTexture::create_impl(VulkanContext &context, const std::uint32_t width,
         format_ = VK_FORMAT_UNDEFINED;
         usage_ = 0;
         aspect_mask_ = 0;
+        samples_ = VK_SAMPLE_COUNT_1_BIT;
         check_vk(image_result, "vmaCreateImage", __FILE__, __LINE__);
     }
 
@@ -306,11 +346,13 @@ void GpuTexture::create_impl(VulkanContext &context, const std::uint32_t width,
         .borderColor = border_color,
         .unnormalizedCoordinates = VK_FALSE,
     };
-    const VkResult sampler_result = vkCreateSampler(
-        context.device(), &sampler_info, nullptr, &sampler_);
-    if (sampler_result != VK_SUCCESS) {
-        destroy();
-        check_vk(sampler_result, "vkCreateSampler", __FILE__, __LINE__);
+    if (samples == VK_SAMPLE_COUNT_1_BIT) {
+        const VkResult sampler_result = vkCreateSampler(
+            context.device(), &sampler_info, nullptr, &sampler_);
+        if (sampler_result != VK_SUCCESS) {
+            destroy();
+            check_vk(sampler_result, "vkCreateSampler", __FILE__, __LINE__);
+        }
     }
 
     if (!debug_name.empty()) {
@@ -325,10 +367,12 @@ void GpuTexture::create_impl(VulkanContext &context, const std::uint32_t width,
             VK_OBJECT_TYPE_IMAGE_VIEW,
             handle_value(view_),
             view_name.c_str());
-        context.set_debug_name(
-            VK_OBJECT_TYPE_SAMPLER,
-            handle_value(sampler_),
-            sampler_name.c_str());
+        if (sampler_ != VK_NULL_HANDLE) {
+            context.set_debug_name(
+                VK_OBJECT_TYPE_SAMPLER,
+                handle_value(sampler_),
+                sampler_name.c_str());
+        }
         vmaSetAllocationName(
             context.allocator(), allocation_, image_name.c_str());
     }
@@ -358,6 +402,7 @@ void GpuTexture::destroy() noexcept {
     format_ = VK_FORMAT_UNDEFINED;
     usage_ = 0;
     aspect_mask_ = 0;
+    samples_ = VK_SAMPLE_COUNT_1_BIT;
 }
 
 } // namespace vcr

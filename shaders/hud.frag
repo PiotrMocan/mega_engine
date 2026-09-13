@@ -16,13 +16,27 @@ uint stringCharacterOff(uint index)
     return index < 7u ? text[index] : 32u;
 }
 
-uint stringCharacterSmaa(uint index, uint quality)
+uint stringCharacterSmaa(uint index, uint quality, uint mode)
 {
     const uint prefix[9] =
         uint[9](65u, 65u, 58u, 32u, 83u, 77u, 65u, 65u, 32u);
     if (index < 9u)
         return prefix[index];
     index -= 9u;
+    if (mode == 1u)
+    {
+        const uint modeWord[4] = uint[4](84u, 50u, 88u, 32u);
+        if (index < 4u)
+            return modeWord[index];
+        index -= 4u;
+    }
+    else
+    {
+        const uint modeWord[3] = uint[3](49u, 88u, 32u);
+        if (index < 3u)
+            return modeWord[index];
+        index -= 3u;
+    }
 
     if (quality == 0u)
     {
@@ -83,6 +97,19 @@ uint stringCharacterFsr(uint index, uint quality)
         85u, 76u, 84u, 82u, 65u, 45u, 80u, 69u, 82u,
         70u, 79u, 82u, 77u, 65u, 78u, 67u, 69u);
     return index < 17u ? word[index] : 32u;
+}
+
+uint stringCharacterMsaa(uint index, uint samples)
+{
+    const uint prefix[9] =
+        uint[9](65u, 65u, 58u, 32u, 77u, 83u, 65u, 65u, 32u);
+    if (index < 9u)
+        return prefix[index];
+    if (index == 9u)
+        return samples == 4u ? 52u : 50u;
+    if (index == 10u)
+        return 88u;
+    return 32u;
 }
 
 uint controlsCharacter(uint index)
@@ -172,9 +199,12 @@ void main()
             if (hud.method == 0u)
                 character = stringCharacterOff(characterIndex);
             else if (hud.method == 1u)
-                character = stringCharacterSmaa(characterIndex, hud.quality);
-            else
+                character = stringCharacterSmaa(
+                    characterIndex, hud.quality, hud.padding);
+            else if (hud.method == 2u)
                 character = stringCharacterFsr(characterIndex, hud.quality);
+            else
+                character = stringCharacterMsaa(characterIndex, hud.quality);
         }
         else
         {
@@ -191,6 +221,7 @@ void main()
     {
         const vec3 methodColor =
             hud.method == 2u ? vec3(0.45, 0.85, 1.0)
+          : hud.method >= 3u ? vec3(1.0, 0.72, 0.36)
           : hud.method == 1u ? vec3(0.45, 1.0, 0.68)
                              : vec3(0.92, 0.94, 1.0);
         outColor = vec4(line == 0 ? methodColor : vec3(0.82), 1.0);

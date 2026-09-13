@@ -1,7 +1,15 @@
 #pragma once
 
 #include "anti_aliasing.hpp"
+#include "depth_prepass.hpp"
+#include "exposure.hpp"
+#include "color_grading.hpp"
 #include "lighting.hpp"
+#include "lod_transition.hpp"
+#include "motion_blur.hpp"
+#include "render_fixture.hpp"
+#include "subsurface.hpp"
+#include "tone_mapping.hpp"
 
 #include <array>
 #include <cstddef>
@@ -48,6 +56,8 @@ struct LightingOverrides {
     bool triangle_budget = false;
     bool gi_update_hz = false;
     bool shadow_resolution = false;
+    bool shadow_depth = false;
+    bool cascade_cache = false;
 };
 
 struct CliOptions {
@@ -65,6 +75,16 @@ struct CliOptions {
     RunMode initial_mode = RunMode::scene;
     PresentPreference present = PresentPreference::automatic;
     AntiAliasingSettings anti_aliasing{};
+    ToneMapper tone_mapper = ToneMapper::reinhard;
+    ExposureSettings exposure{};
+    ColorGrading color_grading = ColorGrading::off;
+    ColorGradingLutSize color_grading_lut_size = ColorGradingLutSize::size_32;
+    SubsurfaceMode subsurface = SubsurfaceMode::off;
+    DepthPrepass depth_prepass = DepthPrepass::off;
+    LodFadePattern lod_fade = LodFadePattern::off;
+    MotionBlurSettings motion_blur{};
+    LocalLightBackend local_light_backend = LocalLightBackend::automatic;
+    float lod_fade_seconds = 0.25F;
     bool benchmark = false;
     bool mcp_stdio = false;
     bool validation = default_validation_enabled;
@@ -73,6 +93,8 @@ struct CliOptions {
     bool occlusion_culling = true;
     bool lod = true;
     bool dynamic_shadows = true;
+    bool coarse_front_to_back = false;
+    bool cpu_hierarchy = false;
     bool animate_scene = false;
     std::uint32_t scene_count = 0;
     std::string scene_asset{};
@@ -84,6 +106,10 @@ struct CliOptions {
     double scene_scale = 1.0;
     bool scene_walls = true;
     bool lighting_room = false;
+    RenderFixture render_fixture = RenderFixture::none;
+    std::uint32_t motion_fixture_fps = 0;
+    std::uint32_t local_light_count = 256;
+    LightSwarmLayout light_swarm_layout = LightSwarmLayout::separated;
     LightingSettings lighting{};
     LightingOverrides lighting_overrides{};
 };

@@ -1,10 +1,11 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "subsurface_output.glsl"
 
 layout(location = 0) in vec3 inWorldNormal;
 layout(location = 1) in vec4 inColor;
 layout(location = 2) flat in uint inInstanceIndex;
-
-layout(location = 0) out vec4 outColor;
 
 // Shared per-frame sky and directional-sun lighting state.
 layout(set = 0, binding = 0, std140) uniform FrameUniforms
@@ -79,5 +80,8 @@ void main()
             clamp(pushConstants.workloadMix, 0.0, 1.0));
     }
 
-    outColor = vec4(shadedColor, inColor.a);
+    writeOpaqueSurface(shadedColor, inColor.a);
+#ifdef VCR_SSS_OUTPUT
+    outDepth = gl_FragCoord.z;
+#endif
 }

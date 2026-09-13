@@ -1,13 +1,16 @@
 #include "asset_browser.hpp"
 #include "editor_scene_tools.hpp"
 #include "cli_options.hpp"
+#include "coarse_depth_order.hpp"
 #include "fly_camera.hpp"
 #include "mcp_control.hpp"
 #include "performance_metrics.hpp"
 #include "png_encoder.hpp"
+#include "render_fixture_scene.hpp"
 #include "scene_document.hpp"
 #include "scene_io.hpp"
 #include "temporal_coordinates.hpp"
+#include "camera_projection.hpp"
 
 #include <algorithm>
 #include <array>
@@ -23,6 +26,7 @@
 #include <limits>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -49,6 +53,642 @@ bool close_to(const double value, const double expected, const double epsilon) {
 } // namespace
 
 int main() {
+    {
+        for (const float ior : {1.0F, 1.33F, 1.5F, 2.0F, 2.42F, 10.0F, 1.0e20F,
+                                std::numeric_limits<float>::max()}) {
+            const double ratio = (static_cast<double>(ior) - 1.0) / (static_cast<double>(ior) + 1.0);
+            expect(close_to(vcr::dielectric_f0(ior), ratio * ratio, 2.0e-7),
+                   "dielectric F0 matches the independent double Fresnel reference");
+        }
+        expect(vcr::dielectric_f0(1.5F) == 0.04F && vcr::dielectric_f0(1.0F) == 0.0F,
+               "default and index-matched F0 preserve exact endpoint values");
+        vcr::PbrMaterial material;
+        material.ior = std::numeric_limits<float>::infinity();
+        material.model = static_cast<vcr::MaterialModel>(99);
+        material.subsurface_profile = static_cast<vcr::SubsurfaceProfile>(99);
+        material.subsurface_strength = std::numeric_limits<float>::infinity();
+        material = vcr::sanitize_pbr_material(material);
+        expect(material.ior == 1.5F && material.model == vcr::MaterialModel::standard &&
+                   material.subsurface_profile == vcr::SubsurfaceProfile::none &&
+                   material.subsurface_strength == 0.0F,
+               "invalid material optics sanitize to the established defaults and disable SSS");
+        expect(vcr::parse_material_model("standard") == vcr::MaterialModel::standard &&
+                   vcr::parse_material_model("unlit") == vcr::MaterialModel::unlit &&
+                   vcr::parse_material_model("subsurface") == vcr::MaterialModel::subsurface &&
+                   !vcr::parse_material_model("Unlit") && !vcr::parse_material_model("1"),
+               "material model tokens are explicit and unknown models are not silently enabled");
+        const char* fixture[]{"vcr", "--render-fixture=material-spheres"};
+        const auto parsed = vcr::parse_cli_options(2, fixture);
+        expect(parsed && parsed.options.render_fixture == vcr::RenderFixture::material_spheres,
+               "material sphere fixture is exposed through the strict renderer CLI");
+    }
+    {
+        expect(!vcr::CliOptions{}.cpu_hierarchy, "linear CPU culling remains the default");
+        const char* hierarchy[]{"vcr", "--cpu-culling=hierarchy"};
+        const char* linear[]{"vcr", "--cpu-culling", "linear"};
+        const auto selected = vcr::parse_cli_options(2, hierarchy);
+        const auto baseline = vcr::parse_cli_options(3, linear);
+        expect(selected && selected.options.cpu_hierarchy && baseline && !baseline.options.cpu_hierarchy,
+               "CPU culling selects an explicit hierarchy or linear reference");
+        for (const char* token : {"", "auto", "Hierarchy", "hierarchy ", "--aa=off"}) {
+            const char* args[]{"vcr", "--cpu-culling", token};
+            expect(!vcr::parse_cli_options(3, args), "CPU culling rejects invalid mode tokens");
+        }
+        const char* missing[]{"vcr", "--cpu-culling"};
+        expect(!vcr::parse_cli_options(2, missing), "CPU culling requires an argument");
+        vcr::BenchmarkResult result;
+        result.cpu_culling_requested = "hierarchy";
+        const auto json = nlohmann::json::parse(vcr::benchmark_result_to_json(result));
+        expect(json.at("cpu_culling_requested") == "hierarchy" && json.at("cpu_culling_actual") == "off",
+               "benchmark records hierarchy request separately from the active culling path");
+    }
+    {
+        expect(!vcr::CliOptions{}.coarse_front_to_back,
+               "coarse front-to-back sorting is disabled by default");
+        for (const char* mode : {"off", "coarse"}) {
+            const char* args[]{"vcr", "--front-to-back", mode};
+            const auto parsed = vcr::parse_cli_options(3, args);
+            const auto inline_argument = std::string{"--front-to-back="} + mode;
+            const char* inline_args[]{"vcr", inline_argument.c_str()};
+            const auto inline_parsed = vcr::parse_cli_options(2, inline_args);
+            const bool enabled = std::string_view(mode) == "coarse";
+            expect(parsed && inline_parsed && parsed.options.coarse_front_to_back == enabled &&
+                       inline_parsed.options.coarse_front_to_back == enabled,
+                   "front-to-back mode accepts both strict CLI spellings");
+        }
+        for (const char* bad : {"", "on", "auto", "Coarse", "coarse ", " coarse", "1"}) {
+            const char* args[]{"vcr", "--front-to-back", bad};
+            const auto inline_argument = std::string{"--front-to-back="} + bad;
+            const char* inline_args[]{"vcr", inline_argument.c_str()};
+            expect(!vcr::parse_cli_options(3, args) && !vcr::parse_cli_options(2, inline_args),
+                   "front-to-back mode rejects unknown tokens and whitespace");
+        }
+        const char* missing[]{"vcr", "--front-to-back"};
+        const char* next_option[]{"vcr", "--front-to-back", "--aa=off"};
+        const char* reset[]{"vcr", "--front-to-back=coarse", "--front-to-back=off"};
+        const auto disabled = vcr::parse_cli_options(3, reset);
+        expect(!vcr::parse_cli_options(2, missing) && !vcr::parse_cli_options(3, next_option) &&
+                   disabled && !disabled.options.coarse_front_to_back,
+               "front-to-back requires a value and explicit off resets coarse mode");
+        expect(vcr::cli_usage("vcr").find("--front-to-back") != std::string::npos,
+               "CLI help documents optional CPU front-to-back sorting");
+        vcr::BenchmarkResult result;
+        expect(result.front_to_back_requested == "off" && result.front_to_back_actual == "off",
+               "front-to-back benchmark metadata defaults to off");
+        result.front_to_back_requested = "coarse";
+        const auto json = nlohmann::json::parse(vcr::benchmark_result_to_json(result));
+        expect(json.at("front_to_back_requested") == "coarse" &&
+                   json.at("front_to_back_actual") == "off",
+               "benchmark metadata distinguishes requested sorting from an unavailable path");
+    }
+    {
+        const auto vp = vcr::camera_projection(16.0F / 9.0F);
+        const vcr::Bounds exact{{0, 0, -17}, {1, 1, 1}};
+        const vcr::Bounds preceding{{0, 0, -16.99F}, {1, 1, 1}};
+        expect(vcr::coarse_depth_key(exact, vp) == 2 &&
+                   vcr::coarse_depth_key(preceding, vp) == 1,
+               "coarse depth uses nearest AABB distance and eight metre boundaries");
+        expect(vcr::coarse_depth_key({{0, 0, -.5F}, {1, 1, 1}}, vp) == 0 &&
+                   vcr::coarse_depth_key({{0, 0, 20}, {1, 1, 1}}, vp) == 0,
+               "eye-plane-crossing and behind-camera bounds clamp to the first bucket");
+        auto oblique = glm::mat4(1.0F);
+        oblique[0][3] = 2; oblique[1][3] = -3;
+        oblique[2][3] = -4; oblique[3][3] = 8;
+        expect(vcr::coarse_depth_key({{10, 10, -20}, {1, 2, 3}}, oblique) == 7,
+               "coarse depth projects the AABB support radius through the complete clip-w row");
+        auto jittered = vp;
+        jittered[2][0] += .001F; jittered[2][1] -= .002F;
+        const auto ordinary = glm::perspectiveRH_ZO(glm::radians(65.0F), 16.0F / 9.0F, .1F, 500.0F);
+        expect(vcr::coarse_depth_key(exact, jittered) == vcr::coarse_depth_key(exact, vp) &&
+                   vcr::coarse_depth_key(exact, ordinary) == vcr::coarse_depth_key(exact, vp),
+               "coarse ordering is independent of projection jitter and reverse-Z encoding");
+        constexpr auto maximum = std::numeric_limits<std::uint32_t>::max();
+        const float huge = std::numeric_limits<float>::max();
+        expect(vcr::coarse_depth_key({{0, 0, -huge}, {0, 0, 0}}, vp) == maximum,
+               "huge finite distances saturate before unsigned conversion");
+        auto huge_projection = vp;
+        huge_projection[2][3] = -huge;
+        expect(vcr::coarse_depth_key({{0, 0, -huge}, {0, 0, 0}}, huge_projection) == maximum,
+               "finite float products do not overflow intermediate depth arithmetic");
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        const float infinity = std::numeric_limits<float>::infinity();
+        auto invalid_projection = vp;
+        invalid_projection[3][3] = nan;
+        expect(vcr::coarse_depth_key({{nan, 0, -17}, {1, 1, 1}}, vp) == maximum &&
+                   vcr::coarse_depth_key({{0, 0, -17}, {infinity, 1, 1}}, vp) == maximum &&
+                   vcr::coarse_depth_key({{0, 0, -17}, {-1, 1, 1}}, vp) == maximum &&
+                   vcr::coarse_depth_key(exact, invalid_projection) == maximum,
+               "nonfinite inputs and invalid extents sort last without undefined conversion");
+        const vcr::Bounds same_bucket{{0, 0, -20}, {1, 1, 1}};
+        const auto earlier_source = std::pair{vcr::coarse_depth_key(same_bucket, vp), 3U};
+        const auto later_source = std::pair{vcr::coarse_depth_key(exact, vp), 8U};
+        expect(earlier_source < later_source && !(later_source < earlier_source),
+               "equal depth buckets retain deterministic source-index order");
+    }
+    {
+        using Pattern = vcr::LodFadePattern;
+        expect(vcr::CliOptions{}.lod_fade == Pattern::off &&
+                   vcr::CliOptions{}.lod_fade_seconds == 0.25F,
+               "model LOD fade defaults to off and a quarter second");
+        const std::array patterns{Pattern::off, Pattern::bayer4, Pattern::bayer8};
+        const std::array<const char*, 3> tokens{"off", "bayer4", "bayer8"};
+        for (std::size_t i = 0; i < patterns.size(); ++i) {
+            const char* args[]{"vcr", "--lod-fade", tokens[i]};
+            const auto parsed = vcr::parse_cli_options(3, args);
+            const auto inline_argument = std::string{"--lod-fade="} + tokens[i];
+            const char* inline_args[]{"vcr", inline_argument.c_str()};
+            const auto inline_parsed = vcr::parse_cli_options(2, inline_args);
+            expect(parsed && inline_parsed && parsed.options.lod_fade == patterns[i] &&
+                       inline_parsed.options.lod_fade == patterns[i] &&
+                       vcr::to_token(patterns[i]) == tokens[i] &&
+                       vcr::parse_lod_fade_pattern(tokens[i]) == patterns[i],
+                   "model LOD fade tokens and both CLI spellings parse");
+        }
+        for (const char* bad : {"", "on", "auto", "blue-noise", "Bayer4", "BAYER8",
+                                "bayer4 ", " bayer8", "1"}) {
+            const char* args[]{"vcr", "--lod-fade", bad};
+            const auto inline_argument = std::string{"--lod-fade="} + bad;
+            const char* inline_args[]{"vcr", inline_argument.c_str()};
+            expect(!vcr::parse_cli_options(3, args) && !vcr::parse_cli_options(2, inline_args) &&
+                       !vcr::parse_lod_fade_pattern(bad),
+                   "model LOD fade rejects unsupported tokens without normalization");
+        }
+        const std::array<const char*, 4> durations{"0.05", ".25", "0.75", "2"};
+        const std::array values{0.05F, 0.25F, 0.75F, 2.0F};
+        for (std::size_t i = 0; i < durations.size(); ++i) {
+            const char* args[]{"vcr", "--lod-fade-seconds", durations[i]};
+            const auto parsed = vcr::parse_cli_options(3, args);
+            const auto inline_argument = std::string{"--lod-fade-seconds="} + durations[i];
+            const char* inline_args[]{"vcr", inline_argument.c_str()};
+            const auto inline_parsed = vcr::parse_cli_options(2, inline_args);
+            expect(parsed && inline_parsed && parsed.options.lod_fade_seconds == values[i] &&
+                       inline_parsed.options.lod_fade_seconds == values[i] &&
+                       parsed.options.lod_fade == Pattern::off,
+                   "LOD fade duration accepts inclusive bounds and preserves the selected pattern");
+        }
+        for (const char* bad : {"", "nan", "NaN", "inf", "-inf", "1e100", "0", "-1",
+                                "0.0499999999", "2.0000000001", "true", "null", "[1]",
+                                "x", "0.5x", " 0.5", "0.5 ", "+0.5"}) {
+            const char* args[]{"vcr", "--lod-fade-seconds", bad};
+            const auto inline_argument = std::string{"--lod-fade-seconds="} + bad;
+            const char* inline_args[]{"vcr", inline_argument.c_str()};
+            expect(!vcr::parse_cli_options(3, args) && !vcr::parse_cli_options(2, inline_args),
+                   "LOD fade duration rejects invalid or out-of-range doubles before float conversion");
+        }
+        for (const char* option : {"--lod-fade", "--lod-fade-seconds"}) {
+            const char* missing[]{"vcr", option};
+            const char* next_option[]{"vcr", option, "--aa=off"};
+            expect(!vcr::parse_cli_options(2, missing) && !vcr::parse_cli_options(3, next_option),
+                   "model LOD fade rejects missing arguments");
+        }
+        const char* reset[]{"vcr", "--lod-fade=bayer8", "--lod-fade-seconds=0.75", "--lod-fade=off"};
+        const auto disabled = vcr::parse_cli_options(4, reset);
+        expect(disabled && disabled.options.lod_fade == Pattern::off &&
+                   disabled.options.lod_fade_seconds == 0.75F,
+               "explicit fade off preserves the configured duration");
+        expect(vcr::to_token(static_cast<Pattern>(255)) == "unknown",
+               "unknown model LOD fade enum has no valid token");
+        const auto usage = vcr::cli_usage("vcr");
+        expect(usage.find("--lod-fade PATTERN") != std::string::npos &&
+                   usage.find("--lod-fade-seconds SEC") != std::string::npos,
+               "CLI help documents both model LOD fade controls");
+        vcr::BenchmarkResult result;
+        expect(result.lod_fade_requested == "off" && result.lod_fade_actual == "off" &&
+                   result.lod_fade_seconds_requested == 0.25F &&
+                   result.lod_fade_seconds_actual == 0.25F,
+               "benchmark model LOD fade defaults are explicit");
+        result.lod_fade_requested = "bayer8";
+        result.lod_fade_seconds_requested = 0.75F;
+        result.lod_fade_seconds_actual = 1.5F;
+        const auto json = nlohmann::json::parse(vcr::benchmark_result_to_json(result));
+        expect(json.at("lod_fade_requested") == "bayer8" && json.at("lod_fade_actual") == "off" &&
+                   json.at("lod_fade_seconds_requested") == 0.75 &&
+                   json.at("lod_fade_seconds_actual") == 1.5,
+               "benchmark keeps requested and actual LOD fade policy and duration independent");
+    }
+    {
+        using Prepass = vcr::DepthPrepass;
+        expect(vcr::CliOptions{}.depth_prepass == Prepass::off,
+               "depth prepass is disabled by default");
+        const std::array modes{Prepass::off, Prepass::partial, Prepass::full};
+        const std::array<const char*, 3> tokens{"off", "partial", "full"};
+        for (std::size_t i = 0; i < modes.size(); ++i) {
+            const char* args[]{"vcr", "--depth-prepass", tokens[i]};
+            const auto parsed = vcr::parse_cli_options(3, args);
+            const auto inline_argument = std::string{"--depth-prepass="} + tokens[i];
+            const char* inline_args[]{"vcr", inline_argument.c_str()};
+            const auto inline_parsed = vcr::parse_cli_options(2, inline_args);
+            expect(parsed && parsed.options.depth_prepass == modes[i] &&
+                       inline_parsed && inline_parsed.options.depth_prepass == modes[i] &&
+                       vcr::to_token(modes[i]) == tokens[i] &&
+                       vcr::parse_depth_prepass(tokens[i]) == modes[i],
+                   "depth prepass tokens and both CLI spellings parse");
+        }
+        for (const char* bad : {"", "on", "auto", "Partial", "FULL", "partial ", " full", "1"}) {
+            const char* args[]{"vcr", "--depth-prepass", bad};
+            const auto inline_argument = std::string{"--depth-prepass="} + bad;
+            const char* inline_args[]{"vcr", inline_argument.c_str()};
+            expect(!vcr::parse_cli_options(3, args) &&
+                       !vcr::parse_cli_options(2, inline_args) && !vcr::parse_depth_prepass(bad),
+                   "unknown depth prepass tokens are rejected strictly");
+        }
+        const char* missing[]{"vcr", "--depth-prepass"};
+        const char* next_option[]{"vcr", "--depth-prepass", "--aa=off"};
+        expect(!vcr::parse_cli_options(2, missing) && !vcr::parse_cli_options(3, next_option),
+               "missing depth prepass mode is rejected");
+        const char* reset[]{"vcr", "--depth-prepass=full", "--depth-prepass=off"};
+        const auto disabled = vcr::parse_cli_options(3, reset);
+        expect(disabled && disabled.options.depth_prepass == Prepass::off,
+               "explicit off resets a previously selected depth prepass");
+        expect(vcr::to_token(static_cast<Prepass>(255)) == "unknown",
+               "unknown depth prepass enum has no valid token");
+        expect(vcr::cli_usage("vcr").find("--depth-prepass") != std::string::npos,
+               "CLI help documents depth prepass selection");
+    }
+    {
+        using Fixture = vcr::RenderFixture;
+        expect(vcr::CliOptions{}.render_fixture == Fixture::none,
+               "procedural render fixture is disabled by default");
+        expect(vcr::to_token(Fixture::none) == "none" &&
+                   vcr::to_token(Fixture::cascade_cache) == "cascade-cache" &&
+                   vcr::to_token(Fixture::subsurface_profiles) == "subsurface-profiles" &&
+                   vcr::to_token(Fixture::light_swarm) == "light-swarm" &&
+                   vcr::to_token(Fixture::aa_wires) == "aa-wires" &&
+                   vcr::to_token(Fixture::motion_bars) == "motion-bars" &&
+                   vcr::parse_render_fixture("none") == Fixture::none &&
+                   vcr::parse_render_fixture("cascade-cache") == Fixture::cascade_cache &&
+                   vcr::parse_render_fixture("subsurface-profiles") == Fixture::subsurface_profiles &&
+                   vcr::parse_render_fixture("light-swarm") == Fixture::light_swarm &&
+                   vcr::parse_render_fixture("aa-wires") == Fixture::aa_wires &&
+                   vcr::parse_render_fixture("motion-bars") == Fixture::motion_bars,
+                "render fixture tokens are stable");
+        for (const auto fixture : {Fixture::overdraw_1, Fixture::overdraw_4, Fixture::overdraw_16}) {
+            const auto token = vcr::to_token(fixture);
+            const char* args[]{"vcr", "--render-fixture", token.data()};
+            const auto option = vcr::parse_cli_options(3, args);
+            expect(option && option.options.render_fixture == fixture &&
+                       vcr::parse_render_fixture(token) == fixture,
+                   "controlled overdraw fixture selects an exact layer count");
+        }
+        const char* selected[]{"vcr", "--render-fixture", "cascade-cache"};
+        const auto parsed = vcr::parse_cli_options(3, selected);
+        expect(parsed && parsed.options.render_fixture == Fixture::cascade_cache,
+               "cascade fixture CLI selection parses");
+        const char* disabled[]{"vcr", "--render-fixture=cascade-cache", "--render-fixture=none"};
+        const auto reset = vcr::parse_cli_options(3, disabled);
+        expect(reset && reset.options.render_fixture == Fixture::none,
+               "explicit none resets a previously selected fixture");
+        const char* missing[]{"vcr", "--render-fixture"};
+        expect(!vcr::parse_cli_options(2, missing), "missing render fixture is rejected");
+        for (const char* bad : {"", "cascade_cache", "Cascade-cache", "cascade-cache ",
+                                "aa_wires", "AA-wires", "aa-wires ", "auto"}) {
+            const char* args[]{"vcr", "--render-fixture", bad};
+            expect(!vcr::parse_cli_options(3, args) && !vcr::parse_render_fixture(bad),
+                   "unknown render fixture tokens are rejected strictly");
+        }
+        for (const char* selector : {"--lighting-room", "--scene-count=128"}) {
+            const char* first[]{"vcr", "--render-fixture=cascade-cache", selector};
+            const char* last[]{"vcr", selector, "--render-fixture=cascade-cache"};
+            const auto fixture_first = vcr::parse_cli_options(3, first);
+            const auto fixture_last = vcr::parse_cli_options(3, last);
+            expect(!fixture_first && !fixture_last &&
+                       fixture_first.error.find("cannot be combined") != std::string::npos &&
+                       fixture_last.error.find("cannot be combined") != std::string::npos,
+                   "conflicting fixture scene selectors are rejected in both flag orders");
+            const char* none[]{"vcr", selector, "--render-fixture=none"};
+            expect(static_cast<bool>(vcr::parse_cli_options(3, none)),
+                   "explicit none permits another scene selector");
+        }
+        const char* compatible[]{"vcr", "--render-fixture=cascade-cache", "--camera-z=12",
+                                 "--lighting=dynamic", "--animate-scene"};
+        const auto configured = vcr::parse_cli_options(5, compatible);
+        expect(configured && configured.options.render_fixture == Fixture::cascade_cache &&
+                   configured.options.camera_z_explicit && configured.options.lighting.dynamic &&
+                   configured.options.animate_scene,
+                "render fixture permits camera lighting and caster animation options");
+        const char* swarm[]{"vcr", "--render-fixture=light-swarm", "--local-light-count=4096",
+                            "--light-swarm-layout=overlap"};
+        const auto swarm_options = vcr::parse_cli_options(4, swarm);
+        expect(swarm_options && swarm_options.options.render_fixture == Fixture::light_swarm &&
+                   swarm_options.options.local_light_count == vcr::maximum_local_lights &&
+                   swarm_options.options.light_swarm_layout == vcr::LightSwarmLayout::overlap,
+               "light swarm accepts bounded count and layout controls");
+        for (const char* bad_count : {"4097", "-1", "1.5"}) {
+            const char* args[]{"vcr", "--render-fixture=light-swarm", "--local-light-count", bad_count};
+            expect(!vcr::parse_cli_options(4, args), "light swarm rejects invalid counts");
+        }
+        const char* unrelated[]{"vcr", "--local-light-count=16"};
+        expect(!vcr::parse_cli_options(2, unrelated),
+               "light swarm controls cannot be silently ignored by another scene");
+        auto swarm_scene = vcr::make_light_swarm_fixture(
+            12.0F, 256U, vcr::LightSwarmLayout::overlap);
+        std::vector<vcr::SceneGpuInstance> swarm_cubes;
+        std::vector<vcr::SceneModelInstance> swarm_models;
+        std::vector<vcr::ScenePunctualLight> swarm_lights;
+        const auto swarm_view = swarm_scene.build_render_view(
+            swarm_cubes, swarm_models, swarm_lights);
+        expect(swarm_view.local_lights.size() == 256U && !swarm_view.local_lights_overflow &&
+                   swarm_cubes.size() == 4U && swarm_view.sun_visible && swarm_view.sky_visible,
+               "light swarm uses the regular bounded scene/render-view path");
+
+        const char* aa_args[]{"vcr", "--render-fixture=aa-wires"};
+        const auto aa_options = vcr::parse_cli_options(2, aa_args);
+        expect(aa_options && aa_options.options.render_fixture == Fixture::aa_wires,
+               "AA wire fixture is exposed through the strict renderer CLI");
+        expect(vcr::cli_usage("vcr").find("aa-wires") != std::string::npos,
+               "CLI help documents the AA wire quality fixture");
+        auto aa_scene = vcr::make_aa_wires_fixture(12.0F);
+        std::vector<vcr::SceneGpuInstance> aa_cubes;
+        std::vector<vcr::SceneModelInstance> aa_models;
+        std::vector<vcr::ScenePunctualLight> aa_lights;
+        const auto aa_view = aa_scene.build_render_view(aa_cubes, aa_models, aa_lights);
+        const bool all_unlit = std::ranges::all_of(
+            aa_cubes, [](const vcr::SceneGpuInstance& cube) {
+                return cube.material.model == vcr::MaterialModel::unlit;
+            });
+        std::vector<vcr::SceneNodeRecord> aa_records;
+        aa_scene.build_node_records(aa_records);
+        const auto named = [&](const std::string_view name) {
+            return std::ranges::any_of(aa_records, [&](const vcr::SceneNodeRecord& record) {
+                return record.value.name == name;
+            });
+        };
+        expect(aa_view.cubes.size() == 17U && aa_scene.size() == 17U &&
+                   aa_view.models.empty() && aa_view.local_lights.empty() &&
+                   !aa_view.sun_visible && !aa_view.sky_visible && all_unlit &&
+                   named("AA dark background") && named("AA red boundary") &&
+                   named("AA green boundary") && named("AA far blue panel") &&
+                   named("AA near cross horizontal") && named("AA near cross vertical") &&
+                   named("AA black interior control") && named("AA grey interior control") &&
+                   named("AA white interior control"),
+               "AA wire fixture is deterministic, unlit, and contains edge and interior controls");
+
+        const char* motion_args[]{"vcr", "--render-fixture=motion-bars",
+                                   "--animate-scene", "--motion-blur=all",
+                                   "--motion-fixture-fps", "60"};
+        const auto motion_options = vcr::parse_cli_options(
+            static_cast<int>(std::size(motion_args)), motion_args);
+        expect(motion_options &&
+                   motion_options.options.render_fixture == Fixture::motion_bars &&
+                   motion_options.options.animate_scene &&
+                   motion_options.options.motion_fixture_fps == 60U &&
+                   motion_options.options.motion_blur.mode == vcr::MotionBlurMode::all,
+               "motion-bar fixture parses a deterministic simulation rate");
+        const char* motion_30[]{"vcr", "--render-fixture", "motion-bars",
+                                "--animate-scene", "--motion-fixture-fps=30"};
+        const char* motion_144[]{"vcr", "--render-fixture", "motion-bars",
+                                 "--animate-scene", "--motion-fixture-fps=144"};
+        const char* motion_bad_rate[]{"vcr", "--render-fixture", "motion-bars",
+                                      "--animate-scene", "--motion-fixture-fps", "120"};
+        const char* motion_wrong_fixture[]{"vcr", "--render-fixture", "aa-wires",
+                                           "--animate-scene", "--motion-fixture-fps", "60"};
+        const char* motion_not_animated[]{"vcr", "--render-fixture", "motion-bars",
+                                          "--motion-fixture-fps", "60"};
+        expect(vcr::parse_cli_options(static_cast<int>(std::size(motion_30)), motion_30) &&
+                   vcr::parse_cli_options(static_cast<int>(std::size(motion_144)), motion_144) &&
+                   !vcr::parse_cli_options(
+                       static_cast<int>(std::size(motion_bad_rate)), motion_bad_rate) &&
+                   !vcr::parse_cli_options(
+                       static_cast<int>(std::size(motion_wrong_fixture)), motion_wrong_fixture) &&
+                   !vcr::parse_cli_options(
+                       static_cast<int>(std::size(motion_not_animated)), motion_not_animated) &&
+                   vcr::CliOptions{}.motion_fixture_fps == 0U &&
+                   vcr::cli_usage("vcr").find("--motion-fixture-fps") != std::string::npos,
+               "fixed motion fixture rate is bounded and fixture-local");
+        auto motion_scene = vcr::make_motion_bars_fixture(12.0F);
+        std::vector<vcr::SceneGpuInstance> motion_cubes;
+        std::vector<vcr::SceneModelInstance> motion_models;
+        std::vector<vcr::ScenePunctualLight> motion_lights;
+        const auto motion_view = motion_scene.build_render_view(
+            motion_cubes, motion_models, motion_lights);
+        const bool motion_unlit = std::ranges::all_of(
+            motion_cubes, [](const vcr::SceneGpuInstance& cube) {
+                return cube.material.model == vcr::MaterialModel::unlit;
+            });
+        expect(motion_view.cubes.size() == 6U &&
+                   motion_scene.size() == 6U && motion_unlit &&
+                   motion_view.models.empty() && motion_view.local_lights.empty() &&
+                   !motion_view.sun_visible && !motion_view.sky_visible,
+               "motion fixture has counter-moving bars, depth markers, and no lighting noise");
+    }
+    {
+        using Mode = vcr::SubsurfaceMode;
+        using Profile = vcr::SubsurfaceProfile;
+        const char* enabled[]{"vcr", "--subsurface=full",
+                              "--render-fixture", "subsurface-profiles"};
+        const auto parsed = vcr::parse_cli_options(4, enabled);
+        expect(parsed && parsed.options.subsurface == Mode::full_resolution &&
+                   parsed.options.render_fixture == vcr::RenderFixture::subsurface_profiles,
+               "SSS mode and procedural profile fixture parse together");
+        const char* invalid[]{"vcr", "--subsurface", "half"};
+        expect(!vcr::parse_cli_options(3, invalid) &&
+                   vcr::CliOptions{}.subsurface == Mode::off &&
+                   vcr::cli_usage("vcr").find("--subsurface") != std::string::npos,
+               "SSS stays default-off and rejects unsupported modes");
+        for (const auto profile : {
+                 Profile::narrow, Profile::medium, Profile::wide}) {
+            for (const float strength : {0.0F, 0.5F, 1.0F}) {
+                const float packed = vcr::pack_subsurface_control(profile, strength);
+                expect(vcr::unpack_subsurface_profile(packed) == profile &&
+                           close_to(vcr::unpack_subsurface_strength(packed),
+                                    std::round(strength * 255.0F) / 255.0F, 0.000001),
+                       "FP16-safe SSS control round-trips profile and quantized strength");
+            }
+        }
+        const auto narrow = vcr::subsurface_profile_parameters(Profile::narrow);
+        const auto medium = vcr::subsurface_profile_parameters(Profile::medium);
+        const auto wide = vcr::subsurface_profile_parameters(Profile::wide);
+        expect(narrow.scatter_distance[0] < medium.scatter_distance[0] &&
+                   medium.scatter_distance[0] < wide.scatter_distance[0] &&
+                   wide.scatter_distance[0] > wide.scatter_distance[1] &&
+                   wide.scatter_distance[1] > wide.scatter_distance[2],
+               "reference SSS profiles widen monotonically and scatter red furthest");
+    }
+    {
+        using Mode = vcr::MotionBlurMode;
+        const char* enabled[]{
+            "vcr", "--motion-blur", "all",
+            "--motion-blur-quality=low",
+            "--motion-blur-shutter", "trailing",
+            "--motion-blur-angle=270",
+            "--motion-blur-radius", "24",
+            "--motion-blur-camera-fade-start=25",
+            "--motion-blur-camera-fade-end", "100",
+            "--aa", "smaa",
+        };
+        const auto parsed = vcr::parse_cli_options(
+            static_cast<int>(std::size(enabled)), enabled);
+        expect(parsed && parsed.options.motion_blur.mode == Mode::all &&
+                   parsed.options.motion_blur.quality ==
+                       vcr::MotionBlurQuality::low &&
+                   parsed.options.motion_blur.shutter ==
+                       vcr::MotionBlurShutter::trailing &&
+                   parsed.options.motion_blur.shutter_angle_degrees == 270.0F &&
+                   parsed.options.motion_blur.maximum_radius_pixels == 24.0F &&
+                   parsed.options.motion_blur.camera_fade_start == 25.0F &&
+                   parsed.options.motion_blur.camera_fade_end == 100.0F,
+               "motion blur parses bounded quality, shutter and camera controls");
+        expect(vcr::CliOptions{}.motion_blur.mode == Mode::off &&
+                   vcr::cli_usage("vcr").find("--motion-blur") != std::string::npos,
+               "motion blur stays default-off and is documented by CLI usage");
+
+        const char* msaa[]{"vcr", "--aa", "msaa4x", "--motion-blur", "all"};
+        const char* t2x[]{"vcr", "--aa", "smaa", "--smaa-mode", "t2x",
+                           "--motion-blur", "camera"};
+        const char* scaled_fsr[]{"vcr", "--aa", "fsr3", "--fsr-quality", "quality",
+                                  "--motion-blur", "objects"};
+        const char* native_fsr[]{"vcr", "--aa", "fsr3", "--fsr-quality", "native-aa",
+                                  "--motion-blur", "objects"};
+        const char* bad_radius[]{"vcr", "--motion-blur-radius", "65"};
+        const char* bad_fade[]{"vcr", "--motion-blur-camera-fade-start", "100",
+                                "--motion-blur-camera-fade-end", "25"};
+        expect(!vcr::parse_cli_options(static_cast<int>(std::size(msaa)), msaa) &&
+                   !vcr::parse_cli_options(static_cast<int>(std::size(t2x)), t2x) &&
+                   !vcr::parse_cli_options(
+                       static_cast<int>(std::size(scaled_fsr)), scaled_fsr) &&
+                   vcr::parse_cli_options(
+                       static_cast<int>(std::size(native_fsr)), native_fsr) &&
+                   !vcr::parse_cli_options(
+                       static_cast<int>(std::size(bad_radius)), bad_radius) &&
+                   !vcr::parse_cli_options(
+                       static_cast<int>(std::size(bad_fade)), bad_fade),
+               "motion blur rejects unsupported AA contracts and invalid bounds");
+    }
+    {
+        using Depth = vcr::ShadowDepthFormat;
+        const std::array formats{Depth::automatic, Depth::d32, Depth::d16};
+        const std::array<const char*, 3> tokens{"auto", "d32", "d16"};
+        for (std::size_t i = 0; i < formats.size(); ++i) {
+            const char* args[]{"vcr", "--shadow-depth", tokens[i]};
+            const auto parsed = vcr::parse_cli_options(3, args);
+            expect(parsed && parsed.options.lighting.shadow_depth == formats[i] &&
+                       parsed.options.lighting_overrides.shadow_depth &&
+                       vcr::to_token(formats[i]) == tokens[i] &&
+                       vcr::parse_shadow_depth_format(tokens[i]) == formats[i],
+                   "shadow depth tokens and startup CLI profiles parse");
+            auto settings = vcr::LightingSettings{};
+            settings.shadow_depth = formats[i];
+            expect(vcr::valid_lighting_settings(settings), "known shadow depth profile is valid");
+        }
+        for (const char* bad : {"", "D16", "d24", "automatic", "16", "d32 "}) {
+            const char* args[]{"vcr", "--shadow-depth", bad};
+            expect(!vcr::parse_cli_options(3, args) && !vcr::parse_shadow_depth_format(bad),
+                   "unknown shadow depth profile is rejected strictly");
+        }
+        const char* missing[]{"vcr", "--shadow-depth"};
+        expect(!vcr::parse_cli_options(2, missing), "missing shadow depth profile is rejected");
+        auto authored = vcr::LightingSettings{};
+        authored.shadow_depth = Depth::d16;
+        const vcr::CliOptions defaults{};
+        expect(defaults.lighting.shadow_depth == Depth::automatic &&
+                   !defaults.lighting_overrides.shadow_depth &&
+                   vcr::resolve_scene_lighting(defaults, authored).shadow_depth == Depth::d16,
+               "omitted CLI shadow depth preserves the authored startup profile");
+        const char* automatic[]{"vcr", "--shadow-depth=auto"};
+        const auto override_auto = vcr::parse_cli_options(2, automatic);
+        expect(override_auto &&
+                   vcr::resolve_scene_lighting(override_auto.options, authored).shadow_depth == Depth::automatic,
+               "explicit auto shadow depth overrides an authored d16 profile");
+        authored.shadow_depth = static_cast<Depth>(255);
+        expect(!vcr::valid_lighting_settings(authored), "unknown shadow depth enum is invalid");
+    }
+    {
+        const char* args[]{"vcr", "--shadow-cache", "cascade"};
+        const auto parsed = vcr::parse_cli_options(3, args);
+        expect(parsed && parsed.options.lighting.cascade_cache,
+               "independent shadow cascade cache CLI");
+        auto authored = vcr::LightingSettings{};
+        authored.cascade_cache = false;
+        expect(vcr::resolve_scene_lighting(parsed.options, authored).cascade_cache,
+               "explicit cascade cache overrides authored settings");
+        const char* invalid[]{"vcr", "--shadow-cache", "on"};
+        expect(!vcr::parse_cli_options(3, invalid), "unknown shadow cache policy rejected");
+    }
+    {
+        const char* mapper_args[]{"vcr", "--tone-mapper", "gt7"};
+        const auto parsed = vcr::parse_cli_options(3, mapper_args);
+        expect(parsed && parsed.options.tone_mapper == vcr::ToneMapper::gt7,
+               "GT7 tone mapper CLI parses");
+        const char* invalid_args[]{"vcr", "--tone-mapper", "GT7"};
+        expect(!vcr::parse_cli_options(3, invalid_args), "unknown tone mapper rejected");
+        const char* missing_args[]{"vcr", "--tone-mapper"};
+        expect(!vcr::parse_cli_options(2, missing_args), "missing tone mapper rejected");
+        expect(vcr::CliOptions{}.tone_mapper == vcr::ToneMapper::reinhard,
+               "Reinhard baseline remains default");
+    }
+    {
+        const char* arguments[]{
+            "vcr", "--exposure=auto", "--exposure-metering", "center",
+            "--exposure-ev", "1.5", "--exposure-min-ev=-8", "--exposure-max-ev", "6",
+            "--exposure-low-percent", "0.03", "--exposure-high-percent=.97",
+            "--exposure-brighten-seconds", "1.25", "--exposure-darken-seconds=.2",
+            "--grading", "tetrahedral", "--grading-lut-size=64",
+        };
+        const auto parsed = vcr::parse_cli_options(
+            static_cast<int>(std::size(arguments)), arguments);
+        expect(parsed && parsed.options.exposure.mode == vcr::ExposureMode::automatic &&
+                   parsed.options.exposure.metering == vcr::ExposureMetering::center &&
+                   parsed.options.exposure.compensation_ev == 1.5F &&
+                   parsed.options.exposure.minimum_ev == -8.0F &&
+                   parsed.options.exposure.maximum_ev == 6.0F &&
+                   parsed.options.exposure.low_percentile == 0.03F &&
+                   parsed.options.exposure.high_percentile == 0.97F &&
+                   parsed.options.exposure.brighten_seconds == 1.25F &&
+                   parsed.options.exposure.darken_seconds == 0.2F &&
+                   parsed.options.color_grading == vcr::ColorGrading::tetrahedral &&
+                   parsed.options.color_grading_lut_size == vcr::ColorGradingLutSize::size_64,
+               "display-mapping CLI parses a complete auto-exposure and LUT configuration");
+        const char* invalid_range[]{"vcr", "--exposure-low-percent=.98", "--exposure-high-percent=.02"};
+        const char* invalid_number[]{"vcr", "--exposure-ev", "nan"};
+        const char* invalid_grading[]{"vcr", "--grading", "tetra"};
+        const char* invalid_size[]{"vcr", "--grading-lut-size", "16"};
+        expect(!vcr::parse_cli_options(3, invalid_range) &&
+                   !vcr::parse_cli_options(3, invalid_number) &&
+                   !vcr::parse_cli_options(3, invalid_grading) &&
+                   !vcr::parse_cli_options(3, invalid_size),
+               "display-mapping CLI rejects invalid ranges, non-finite values and unknown LUT modes");
+        expect(vcr::CliOptions{}.exposure.mode == vcr::ExposureMode::fixed &&
+                   vcr::CliOptions{}.color_grading == vcr::ColorGrading::off,
+               "fixed exposure and disabled grading preserve the baseline defaults");
+    }
+    {
+        const auto reversed = vcr::camera_projection(16.0F / 9.0F);
+        const auto conventional = glm::perspectiveRH_ZO(
+            glm::radians(vcr::camera_vertical_fov), 16.0F / 9.0F,
+            vcr::camera_near, vcr::camera_far);
+        const auto depth = [](const glm::mat4& matrix, float distance) {
+            const auto clip = matrix * glm::vec4(0, 0, -distance, 1);
+            return clip.z / clip.w;
+        };
+        expect(close_to(depth(reversed, vcr::camera_near), 1, 1e-6) &&
+                   close_to(depth(reversed, vcr::camera_far), 0, 1e-7),
+               "reverse-Z maps near to one and far to zero");
+        float previous = 1.0F;
+        for (float distance : {0.2F, 1.0F, 10.0F, 100.0F, 400.0F}) {
+            const float value = depth(reversed, distance);
+            expect(value > 0 && value < previous, "reverse-Z is monotonic");
+            previous = value;
+        }
+        const auto quantization_step = [&](const glm::mat4& matrix, float toward) {
+            const auto value = depth(matrix, 400.0F);
+            const auto adjacent = std::nextafter(value, toward);
+            const auto decode = [&](float encoded) {
+                return double(matrix[3][2]) / (double(encoded) + double(matrix[2][2]));
+            };
+            return std::abs(decode(value) - decode(adjacent));
+        };
+        const double ordinary_step = quantization_step(conventional, 0.0F);
+        const double reversed_step = quantization_step(reversed, 1.0F);
+        expect(reversed_step < ordinary_step * 0.001,
+               "float reverse-Z improves representable distance spacing at 400m");
+        std::cout << "D32 depth spacing at 400m: conventional=" << ordinary_step
+                  << "m reverse=" << reversed_step << "m\n";
+        const auto clip = reversed * glm::vec4(0.7F, 0.2F, -400.0F, 1.0F);
+        auto world = glm::inverse(reversed) * (clip / clip.w);
+        world /= world.w;
+        expect(close_to(world.z, -400.0F, 0.001) && close_to(world.x, 0.7F, 1e-5),
+               "reverse-Z inverse projection preserves distant reconstruction");
+    }
     {
         vcr::BenchmarkFrameSamples samples;
         samples.prepare(10'000U);
@@ -82,8 +722,7 @@ int main() {
                    close_to(1.0F * scale.y, 540.0, 0.001),
                "FSR motion vectors convert from NDC to pixels");
         const vcr::TemporalOffset jitter{0.25F, -0.375F};
-        auto projection = glm::perspective(
-            glm::radians(65.0F), float(width) / float(height), 0.1F, 500.0F);
+        auto projection = vcr::camera_projection(float(width) / float(height));
         projection[1][1] *= -1.0F;
         const glm::vec4 point{0.7F, 0.2F, -5.0F, 1.0F};
         const glm::vec4 before = projection * point;
@@ -235,6 +874,66 @@ int main() {
     }
 
     {
+        const char* two_arguments[]{"vulkan_cube", "--aa", "msaa2x"};
+        const char* four_arguments[]{"vulkan_cube", "--aa=msaa4x"};
+        const auto two = vcr::parse_cli_options(
+            static_cast<int>(std::size(two_arguments)), two_arguments);
+        const auto four = vcr::parse_cli_options(
+            static_cast<int>(std::size(four_arguments)), four_arguments);
+        expect(two && four &&
+                   two.options.anti_aliasing.method == vcr::AntiAliasingMethod::msaa2x &&
+                   four.options.anti_aliasing.method == vcr::AntiAliasingMethod::msaa4x &&
+                   vcr::to_token(vcr::AntiAliasingMethod::msaa2x) == "msaa2x" &&
+                   vcr::to_token(vcr::AntiAliasingMethod::msaa4x) == "msaa4x" &&
+                   vcr::anti_aliasing_sample_count(vcr::AntiAliasingMethod::off) == 1U &&
+                   vcr::anti_aliasing_sample_count(vcr::AntiAliasingMethod::msaa2x) == 2U &&
+                   vcr::anti_aliasing_sample_count(vcr::AntiAliasingMethod::msaa4x) == 4U,
+               "forward MSAA CLI tokens and sample counts are stable");
+        for (const char* bad : {"msaa", "2", "8x", "MSAA2X", "msaa2x ", " msaa4x"}) {
+            const char* args[]{"vulkan_cube", "--aa", bad};
+            expect(!vcr::parse_cli_options(3, args),
+                   "unknown MSAA tokens are rejected strictly");
+        }
+        const char* incompatible[]{
+            "vulkan_cube", "--aa=msaa4x", "--subsurface=full"};
+        const auto rejected = vcr::parse_cli_options(3, incompatible);
+        expect(!rejected && rejected.error.find("MSAA") != std::string::npos,
+               "startup rejects MSAA with packed full-resolution SSS");
+    }
+    {
+        const char* t2x_arguments[]{
+            "vulkan_cube", "--aa", "smaa", "--smaa-mode", "t2x"};
+        const char* x1_arguments[]{
+            "vulkan_cube", "--aa=smaa", "--smaa-mode=1x"};
+        const auto t2x = vcr::parse_cli_options(
+            static_cast<int>(std::size(t2x_arguments)), t2x_arguments);
+        const auto x1 = vcr::parse_cli_options(
+            static_cast<int>(std::size(x1_arguments)), x1_arguments);
+        expect(t2x && x1 &&
+                   t2x.options.anti_aliasing.method == vcr::AntiAliasingMethod::smaa &&
+                   t2x.options.anti_aliasing.smaa_mode == vcr::SmaaMode::t2x &&
+                   x1.options.anti_aliasing.smaa_mode == vcr::SmaaMode::x1 &&
+                   vcr::to_string(vcr::SmaaMode::x1) == "1x" &&
+                   vcr::to_string(vcr::SmaaMode::t2x) == "t2x" &&
+                   vcr::to_string(t2x.options.anti_aliasing) == "SMAA T2x" &&
+                   vcr::to_string(x1.options.anti_aliasing) == "SMAA 1x" &&
+                   vcr::is_temporal_smaa(t2x.options.anti_aliasing) &&
+                   !vcr::is_temporal_smaa(x1.options.anti_aliasing),
+               "SMAA 1x/T2x CLI tokens and temporal classification are stable");
+        for (const char* bad : {"2x", "T2X", "t2x ", " t2x", ""}) {
+            const char* args[]{"vulkan_cube", "--smaa-mode", bad};
+            expect(!vcr::parse_cli_options(3, args),
+                   "unknown SMAA mode tokens are rejected strictly");
+        }
+        const char* missing[]{"vulkan_cube", "--smaa-mode"};
+        expect(!vcr::parse_cli_options(2, missing),
+               "SMAA mode requires an argument");
+        expect(vcr::cli_usage("vulkan_cube").find("--smaa-mode") !=
+                   std::string::npos,
+               "CLI help documents SMAA temporal mode");
+    }
+
+    {
         expect(
             vcr::adjust_quality(vcr::SmaaQuality::low, -1) ==
                     vcr::SmaaQuality::low &&
@@ -303,6 +1002,122 @@ int main() {
     }
 
     {
+        vcr::PerformanceMetrics metrics;
+        expect(metrics.snapshot().average.gpu_postprocess_ms == vcr::unavailable_timing_ms &&
+                   metrics.snapshot().average.gpu_display_ms == vcr::unavailable_timing_ms &&
+                   metrics.snapshot().average.gpu_exposure_ms == vcr::unavailable_timing_ms &&
+                   metrics.snapshot().average.gpu_subsurface_ms == vcr::unavailable_timing_ms &&
+                   metrics.snapshot().average.gpu_light_culling_ms == vcr::unavailable_timing_ms,
+               "optional GPU timings start unavailable");
+        for (const double sample : {vcr::unavailable_timing_ms, 0.25,
+                                   std::numeric_limits<double>::quiet_NaN(), 0.5,
+                                   std::numeric_limits<double>::infinity(), 0.0}) {
+            vcr::FrameTimings timings{};
+            timings.gpu_postprocess_ms = sample;
+            timings.gpu_display_ms = sample;
+            timings.gpu_exposure_ms = sample;
+            timings.gpu_subsurface_ms = sample;
+            timings.gpu_light_culling_ms = sample;
+            metrics.record_frame(timings);
+        }
+        const auto snapshot = metrics.snapshot();
+        expect(close_to(snapshot.average.gpu_postprocess_ms, 0.25, 0.000001) &&
+                   snapshot.latest.gpu_postprocess_ms == 0.0 &&
+                   close_to(snapshot.average.gpu_display_ms, 0.25, 0.000001) &&
+                   snapshot.latest.gpu_display_ms == 0.0 &&
+                   close_to(snapshot.average.gpu_exposure_ms, 0.25, 0.000001) &&
+                   snapshot.latest.gpu_exposure_ms == 0.0 &&
+                   close_to(snapshot.average.gpu_subsurface_ms, 0.25, 0.000001) &&
+                   snapshot.latest.gpu_subsurface_ms == 0.0 &&
+                   close_to(snapshot.average.gpu_light_culling_ms, 0.25, 0.000001) &&
+                   snapshot.latest.gpu_light_culling_ms == 0.0,
+               "optional GPU averages exclude unavailable queries and include a measured zero");
+        const auto result = vcr::make_benchmark_result(
+            "GPU", "driver", "640x360", "640x360", "IMMEDIATE", "off", "off",
+            1, 0, snapshot);
+        const auto timing_json = vcr::benchmark_result_to_json(result);
+        expect(close_to(result.average_gpu_postprocess_ms, 0.25, 0.000001) &&
+                   close_to(result.average_gpu_display_ms, 0.25, 0.000001) &&
+                   close_to(result.average_gpu_exposure_ms, 0.25, 0.000001) &&
+                   close_to(result.average_gpu_subsurface_ms, 0.25, 0.000001) &&
+                   close_to(result.average_gpu_light_culling_ms, 0.25, 0.000001) &&
+                   timing_json.find("\"average_gpu_postprocess_ms\": 0.25") != std::string::npos &&
+                   timing_json.find("\"average_gpu_display_ms\": 0.25") != std::string::npos &&
+                   timing_json.find("\"average_gpu_exposure_ms\": 0.25") != std::string::npos &&
+                   timing_json.find("\"average_gpu_subsurface_ms\": 0.25") != std::string::npos &&
+                   timing_json.find("\"average_gpu_light_culling_ms\": 0.25") != std::string::npos,
+               "benchmark preserves measured optional GPU averages");
+        metrics.reset();
+        const auto reset = metrics.snapshot();
+        expect(reset.latest.gpu_postprocess_ms == vcr::unavailable_timing_ms &&
+                   reset.average.gpu_postprocess_ms == vcr::unavailable_timing_ms &&
+                   reset.latest.gpu_display_ms == vcr::unavailable_timing_ms &&
+                   reset.average.gpu_display_ms == vcr::unavailable_timing_ms &&
+                   reset.latest.gpu_exposure_ms == vcr::unavailable_timing_ms &&
+                   reset.average.gpu_exposure_ms == vcr::unavailable_timing_ms &&
+                   reset.latest.gpu_subsurface_ms == vcr::unavailable_timing_ms &&
+                   reset.average.gpu_subsurface_ms == vcr::unavailable_timing_ms &&
+                   reset.latest.gpu_light_culling_ms == vcr::unavailable_timing_ms &&
+                   reset.average.gpu_light_culling_ms == vcr::unavailable_timing_ms,
+               "metrics reset clears latest and average optional GPU timings");
+    }
+
+    {
+        vcr::PerformanceMetrics metrics;
+        expect(metrics.snapshot().average.gpu_depth_prepass_ms == vcr::unavailable_timing_ms,
+               "depth prepass timing starts unavailable");
+        for (const double sample : {vcr::unavailable_timing_ms, 0.125,
+                                   std::numeric_limits<double>::quiet_NaN(), 0.625,
+                                   std::numeric_limits<double>::infinity(), 0.0}) {
+            vcr::FrameTimings timings{};
+            timings.gpu_postprocess_ms = 1.0;
+            timings.gpu_depth_prepass_ms = sample;
+            metrics.record_frame(timings);
+        }
+        const auto snapshot = metrics.snapshot();
+        expect(close_to(snapshot.average.gpu_depth_prepass_ms, 0.25, 0.000001) &&
+                   snapshot.latest.gpu_depth_prepass_ms == 0.0 &&
+                   snapshot.average.gpu_postprocess_ms == 1.0,
+               "prepass average excludes unavailable queries, includes disabled zero and remains independent");
+        auto result = vcr::make_benchmark_result(
+            "GPU", "driver", "640x360", "640x360", "IMMEDIATE", "off", "off",
+            1, 0, snapshot);
+        expect(close_to(result.average_gpu_depth_prepass_ms, 0.25, 0.000001) &&
+                   vcr::benchmark_result_to_json(result).find(
+                       "\"average_gpu_depth_prepass_ms\": 0.25") != std::string::npos,
+               "benchmark preserves the measured prepass average");
+        expect(result.depth_prepass_requested == "off" && result.depth_prepass_actual == "off",
+               "benchmark depth prepass policy defaults to off");
+        result.depth_prepass_requested = "partial";
+        result.depth_prepass_actual = "off";
+        const auto policy_json = vcr::benchmark_result_to_json(result);
+        expect(policy_json.find("\"depth_prepass_requested\": \"partial\"") != std::string::npos &&
+                   policy_json.find("\"depth_prepass_actual\": \"off\"") != std::string::npos,
+               "benchmark serializes requested and actual prepass policies independently");
+        metrics.reset();
+        const auto reset = metrics.snapshot();
+        expect(reset.latest.gpu_depth_prepass_ms == vcr::unavailable_timing_ms &&
+                   reset.average.gpu_depth_prepass_ms == vcr::unavailable_timing_ms,
+               "metrics reset clears latest and average prepass timings");
+        const auto reset_result = vcr::make_benchmark_result(
+            "GPU", "driver", "640x360", "640x360", "IMMEDIATE", "off", "off",
+            1, 0, reset);
+        expect(vcr::benchmark_result_to_json(reset_result).find(
+                   "\"average_gpu_depth_prepass_ms\": null") != std::string::npos,
+               "unavailable prepass timing serializes as null");
+        vcr::FrameTimings disabled{};
+        disabled.gpu_depth_prepass_ms = 0.0;
+        metrics.record_frame(disabled);
+        const auto disabled_result = vcr::make_benchmark_result(
+            "GPU", "driver", "640x360", "640x360", "IMMEDIATE", "off", "off",
+            1, 0, metrics.snapshot());
+        expect(disabled_result.average_gpu_depth_prepass_ms == 0.0 &&
+                   vcr::benchmark_result_to_json(disabled_result).find(
+                       "\"average_gpu_depth_prepass_ms\": 0,") != std::string::npos,
+               "disabled prepass timing remains an available zero in benchmark JSON");
+    }
+
+    {
         using namespace std::chrono_literals;
         vcr::BenchmarkController controller(1.0, 2.0);
         const auto start = vcr::BenchmarkController::TimePoint{};
@@ -323,11 +1138,35 @@ int main() {
         result.render_resolution = "1280x720";
         result.anti_aliasing = "FSR 3.1.4";
         result.anti_aliasing_quality = "quality";
+        result.anti_aliasing_requested = "msaa4x";
+        result.anti_aliasing_actual = "msaa2x";
+        result.smaa_mode = "t2x";
+        result.smaa_temporal_samples = 2;
+        result.smaa_history_resident_bytes = 33'177'600;
+        result.smaa_history_incremental_bytes = 0;
+        result.smaa_history_reuses_fsr_output = true;
+        result.msaa_samples_requested = 4;
+        result.msaa_samples_actual = 2;
+        result.msaa_2x_supported = true;
+        result.msaa_4x_supported = false;
+        result.msaa_resident_bytes = 99'614'720;
+        result.render_fixture = "motion-bars";
+        result.motion_fixture_fps = 60U;
         result.frames_rendered = 42;
         result.mode = "scene";
         result.measurement_seconds = 15.0;
         result.percentile_samples = 42;
         result.average_gpu_workload_ms = vcr::unavailable_timing_ms;
+        result.local_light_backend_requested = "clustered";
+        result.local_light_backend_actual = "clustered";
+        result.local_light_count = 256;
+        result.local_light_assignments = 1024;
+        result.local_light_maximum_list = 12;
+        result.local_light_overflow_clusters = 0;
+        result.local_light_dropped = 0;
+        result.exposure.compensation_ev = -1.5F;
+        result.exposure.minimum_ev = -12.0F;
+        result.exposure.maximum_ev = -2.0F;
         const std::string json = vcr::benchmark_result_to_json(result);
         expect(
             json.find("GPU \\\"quoted\\\"") != std::string::npos,
@@ -341,10 +1180,39 @@ int main() {
                 json.find("\"render_resolution\": \"1280x720\"") !=
                     std::string::npos,
             "benchmark records anti-aliasing and render resolution");
+        expect(json.find("\"anti_aliasing_requested\": \"msaa4x\"") != std::string::npos &&
+                   json.find("\"anti_aliasing_actual\": \"msaa2x\"") != std::string::npos &&
+                   json.find("\"smaa_mode\": \"t2x\"") != std::string::npos &&
+                   json.find("\"smaa_temporal_samples\": 2") != std::string::npos &&
+                   json.find("\"smaa_history_resident_bytes\": 33177600") != std::string::npos &&
+                   json.find("\"smaa_history_incremental_bytes\": 0") != std::string::npos &&
+                   json.find("\"smaa_history_reuses_fsr_output\": true") != std::string::npos &&
+                   json.find("\"msaa_samples_requested\": 4") != std::string::npos &&
+                   json.find("\"msaa_samples_actual\": 2") != std::string::npos &&
+                   json.find("\"msaa_2x_supported\": true") != std::string::npos &&
+                   json.find("\"msaa_4x_supported\": false") != std::string::npos &&
+                   json.find("\"msaa_resident_bytes\": 99614720") != std::string::npos &&
+                   json.find("\"render_fixture\": \"motion-bars\"") != std::string::npos &&
+                   json.find("\"motion_fixture_fps\": 60") != std::string::npos,
+               "benchmark serializes AA state and deterministic fixture rate");
         expect(json.find("\"percentile_scope\": \"full_measurement\"") != std::string::npos &&
                    json.find("\"average_gpu_workload_ms\": null") != std::string::npos &&
+                   json.find("\"average_gpu_postprocess_ms\": null") != std::string::npos &&
+                   json.find("\"average_gpu_display_ms\": null") != std::string::npos &&
+                   json.find("\"average_gpu_exposure_ms\": null") != std::string::npos &&
+                   json.find("\"average_gpu_subsurface_ms\": null") != std::string::npos &&
+                   json.find("\"average_gpu_light_culling_ms\": null") != std::string::npos &&
+                   json.find("\"exposure_compensation_ev\": -1.5") != std::string::npos &&
+                   json.find("\"exposure_minimum_ev\": -12") != std::string::npos &&
+                   json.find("\"exposure_maximum_ev\": -2") != std::string::npos &&
+                   json.find("\"local_light_backend_actual\": \"clustered\"") != std::string::npos &&
+                   json.find("\"local_light_count\": 256") != std::string::npos &&
+                   json.find("\"local_light_assignments\": 1024") != std::string::npos &&
+                   json.find("\"local_light_maximum_list\": 12") != std::string::npos &&
+                   json.find("\"local_light_overflow_clusters\": 0") != std::string::npos &&
+                   json.find("\"local_light_dropped\": 0") != std::string::npos &&
                    json.find("\"mode\": \"scene\"") != std::string::npos,
-               "benchmark exposes sample scope, workload and unavailable timings");
+               "benchmark exposes sample scope, optional timings and local-light diagnostics");
     }
 
     {
@@ -671,6 +1539,10 @@ int main() {
             "Cube", vcr::SceneNodeKind::cube, root));
         const vcr::SceneNodeId model = scene.create_node(
             "Model", vcr::SceneNodeKind::model, root);
+        const vcr::SceneNodeId point = scene.create_node(
+            "Point", vcr::SceneNodeKind::point_light, root);
+        const vcr::SceneNodeId spot = scene.create_node(
+            "Spot", vcr::SceneNodeKind::spot_light, root);
         if (auto model_node = scene.node(model)) {
             model_node->get().asset_path =
                 "models/tree/tree.vcrasset.json";
@@ -678,10 +1550,16 @@ int main() {
                 glm::vec3(2.0F, 3.0F, -4.0F);
             scene.mark_content_changed();
         }
+        if (auto point_node = scene.node(point)) {
+            point_node->get().transform.translation = glm::vec3(1.0F, 2.0F, -3.0F);
+            point_node->get().light.intensity_candela = 250.0F;
+            scene.mark_content_changed();
+        }
         std::vector<vcr::SceneGpuInstance> instances;
         std::vector<vcr::SceneModelInstance> models;
+        std::vector<vcr::ScenePunctualLight> lights;
         const vcr::SceneRenderView visible =
-            scene.build_render_view(instances, models);
+            scene.build_render_view(instances, models, lights);
         expect(
             visible.cubes.size() == 1U &&
                 visible.models.size() == 1U &&
@@ -690,6 +1568,12 @@ int main() {
                 visible.models[0].model_row_0.w == 2.0F &&
                 visible.models[0].model_row_1.w == 3.0F &&
                 visible.models[0].model_row_2.w == -4.0F &&
+                visible.local_lights.size() == 2U &&
+                visible.local_lights[0].id == point &&
+                visible.local_lights[1].id == spot &&
+                visible.local_lights[0].gpu.position_range ==
+                    glm::vec4(1.0F, 2.0F, -3.0F, 10.0F) &&
+                visible.local_lights[0].gpu.color_intensity.w == 250.0F &&
                 visible.terrain_visible &&
                 visible.sky_visible &&
                 visible.sun_visible,
@@ -699,10 +1583,11 @@ int main() {
             scene.mark_content_changed();
         }
         const vcr::SceneRenderView hidden =
-            scene.build_render_view(instances, models);
+            scene.build_render_view(instances, models, lights);
         expect(
             hidden.cubes.empty() &&
                 hidden.models.empty() &&
+                hidden.local_lights.empty() &&
                 !hidden.terrain_visible &&
                 !hidden.sky_visible &&
                 !hidden.sun_visible,
@@ -738,9 +1623,10 @@ int main() {
 
         std::vector<vcr::SceneGpuInstance> instances;
         std::vector<vcr::SceneModelInstance> models;
+        std::vector<vcr::ScenePunctualLight> lights;
         instances.reserve(1U);
         const vcr::SceneRenderView snapshot =
-            scene.build_render_view(instances, models);
+            scene.build_render_view(instances, models, lights);
         expect(
             snapshot.cubes.size() == 1U,
             "scene transform emits one cube");
@@ -1120,6 +2006,12 @@ int main() {
                 "Imported tree",
                 vcr::SceneNodeKind::model,
                 scene_root);
+        const vcr::SceneNodeId scene_point =
+            source_scene.create_node(
+                "Warm point", vcr::SceneNodeKind::point_light, scene_root);
+        const vcr::SceneNodeId scene_spot =
+            source_scene.create_node(
+                "Cool spot", vcr::SceneNodeKind::spot_light, scene_root);
         if (auto cube = source_scene.node(scene_cube)) {
             cube->get().transform.translation =
                 glm::vec3(3.0F, 2.0F, -7.0F);
@@ -1133,6 +2025,8 @@ int main() {
                 .metallic = 0.75F,
                 .roughness = 0.24F,
                 .ambient_occlusion = 0.9F,
+                .ior = 2.42F,
+                .model = vcr::MaterialModel::unlit,
             };
             source_scene.mark_content_changed();
         }
@@ -1142,6 +2036,25 @@ int main() {
                 "tree_stump_01_4k.vcrasset.json";
             model->get().transform.translation =
                 glm::vec3(-2.0F, 0.0F, -5.0F);
+            source_scene.mark_content_changed();
+        }
+        if (auto point = source_scene.node(scene_point)) {
+            point->get().light = vcr::PunctualLight{
+                .color = {1.0F, 0.4F, 0.1F},
+                .intensity_candela = 320.0F,
+                .range = 14.0F,
+            };
+            point->get().transform.translation = {2.0F, 4.0F, -6.0F};
+            source_scene.mark_content_changed();
+        }
+        if (auto spot = source_scene.node(scene_spot)) {
+            spot->get().light = vcr::PunctualLight{
+                .color = {0.1F, 0.4F, 1.0F},
+                .intensity_candela = 640.0F,
+                .range = 22.0F,
+                .inner_cone_degrees = 12.0F,
+                .outer_cone_degrees = 27.0F,
+            };
             source_scene.mark_content_changed();
         }
         const std::filesystem::path scene_file =
@@ -1161,7 +2074,7 @@ int main() {
         source_scene.build_node_records(source_records);
         loaded_scene.build_node_records(loaded_records);
         expect(
-            loaded_records.size() == 3U &&
+            loaded_records.size() == 5U &&
                 source_records.size() == loaded_records.size() &&
                 loaded_records[1].parent_record_index == 0U &&
                 loaded_records[1].value.name == "Cube" &&
@@ -1186,8 +2099,54 @@ int main() {
                     loaded_records[1]
                         .value.material.ambient_occlusion,
                     0.9,
-                    0.0001),
-            "scene JSON preserves hierarchy, model asset and PBR values");
+                    0.0001) &&
+                loaded_records[1].value.material.ior == 2.42F &&
+                loaded_records[1].value.material.model == vcr::MaterialModel::unlit &&
+                loaded_records[3].value.kind == vcr::SceneNodeKind::point_light &&
+                loaded_records[3].value.light.intensity_candela == 320.0F &&
+                loaded_records[3].value.light.range == 14.0F &&
+                loaded_records[4].value.kind == vcr::SceneNodeKind::spot_light &&
+                loaded_records[4].value.light.inner_cone_degrees == 12.0F &&
+                loaded_records[4].value.light.outer_cone_degrees == 27.0F,
+            "scene JSON preserves hierarchy, model, PBR and punctual-light values");
+
+        nlohmann::json valid_material_scene;
+        { std::ifstream input(scene_file); input >> valid_material_scene; }
+        const auto invalid_material_file = temporary_root / "invalid-material.scene.json";
+        for (const auto& invalid : {nlohmann::json{{"ior", 0}}, nlohmann::json{{"ior", .99}},
+                nlohmann::json{{"ior", 1e100}}, nlohmann::json{{"ior", true}},
+                nlohmann::json{{"ior", "1.5"}}, nlohmann::json{{"model", "sss"}},
+                nlohmann::json{{"model", 1}}, nlohmann::json{{"model", nullptr}}}) {
+            auto invalid_scene = valid_material_scene;
+            invalid_scene["nodes"][1]["pbr"].update(invalid);
+            { std::ofstream output(invalid_material_file); output << invalid_scene; }
+            const auto revision = loaded_scene.content_revision();
+            expect(!vcr::load_scene_file(invalid_material_file, loaded_scene, error) &&
+                       loaded_scene.content_revision() == revision,
+                   "invalid material JSON is rejected transactionally");
+        }
+        for (const auto& invalid : {
+                 nlohmann::json{{"range", 0.0}},
+                 nlohmann::json{{"intensity_candela", -1.0}},
+                 nlohmann::json{{"color", nlohmann::json::array({1.0, 0.5})}}}) {
+            auto invalid_scene = valid_material_scene;
+            invalid_scene["nodes"][3]["light"].update(invalid);
+            { std::ofstream output(invalid_material_file); output << invalid_scene; }
+            const auto revision = loaded_scene.content_revision();
+            expect(!vcr::load_scene_file(invalid_material_file, loaded_scene, error) &&
+                       loaded_scene.content_revision() == revision,
+                   "invalid point-light JSON is rejected transactionally");
+        }
+        {
+            auto invalid_scene = valid_material_scene;
+            invalid_scene["nodes"][4]["light"]["inner_cone_degrees"] = 30.0;
+            invalid_scene["nodes"][4]["light"]["outer_cone_degrees"] = 20.0;
+            { std::ofstream output(invalid_material_file); output << invalid_scene; }
+            const auto revision = loaded_scene.content_revision();
+            expect(!vcr::load_scene_file(invalid_material_file, loaded_scene, error) &&
+                       loaded_scene.content_revision() == revision,
+                   "inverted spot cone is rejected transactionally");
+        }
 
         // A placeholder camera in a version-1 document must not change its old view.
         const auto camera_parent = source_scene.create_node("Camera rig", vcr::SceneNodeKind::folder);
@@ -1207,16 +2166,32 @@ int main() {
                "startup camera inherits rig translation scale and Euler orientation");
         expect(vcr::scene_startup_camera(source_scene, 12.0).position() == glm::vec3(0, 4, 12),
                "explicit default CLI Z still overrides authored pose");
-        source_scene.lighting = vcr::LightingSettings{.cycle = false, .hour = 17.2};
+        source_scene.lighting = vcr::LightingSettings{
+            .cycle = false, .cascade_cache = true, .hour = 17.2,
+            .shadow_depth = vcr::ShadowDepthFormat::d16};
         const auto startup_file = temporary_root / "startup.scene.json";
         expect(vcr::save_scene_file(source_scene, startup_file, error) &&
                    vcr::load_scene_file(startup_file, loaded_scene, error),
                "authored startup settings round trip");
         expect(loaded_scene.lighting && !loaded_scene.lighting->cycle &&
+                   loaded_scene.lighting->cascade_cache &&
+                   loaded_scene.lighting->shadow_depth == vcr::ShadowDepthFormat::d16 &&
                    close_to(loaded_scene.lighting->hour, 17.2, .0001) &&
                    glm::length(vcr::scene_startup_camera(loaded_scene).position() -
                                authored_camera.position()) < .0001F,
                "round trip preserves camera node reference and fixed evening");
+        for (const auto depth : {vcr::ShadowDepthFormat::automatic, vcr::ShadowDepthFormat::d32,
+                                 vcr::ShadowDepthFormat::d16}) {
+            source_scene.lighting->shadow_depth = depth;
+            expect(vcr::save_scene_file(source_scene, startup_file, error) &&
+                       vcr::load_scene_file(startup_file, loaded_scene, error) &&
+                       loaded_scene.lighting && loaded_scene.lighting->shadow_depth == depth,
+                   "each shadow depth profile survives scene JSON round trip");
+        }
+        source_scene.lighting->shadow_depth = static_cast<vcr::ShadowDepthFormat>(255);
+        expect(!vcr::save_scene_file(source_scene, startup_file, error),
+               "scene writer rejects an invalid shadow depth enum");
+        source_scene.lighting->shadow_depth = vcr::ShadowDepthFormat::d16;
         expect(source_scene.reparent(scene_cube, camera_parent) &&
                    vcr::save_scene_file(source_scene, startup_file, error) &&
                    vcr::load_scene_file(startup_file, loaded_scene, error) &&
@@ -1236,6 +2211,8 @@ int main() {
                "CLI legacy lighting disables dependent GI and clock");
         nlohmann::json startup_json;
         { std::ifstream input(startup_file); input >> startup_json; }
+        expect(startup_json["lighting"]["shadow_depth"] == "d16",
+               "scene JSON writes a stable string shadow depth profile");
         const auto original_json = startup_json;
         const auto write_startup = [&] {
             std::ofstream output(startup_file);
@@ -1250,16 +2227,27 @@ int main() {
                        loaded_scene.size() == previous_size && loaded_scene.lighting->hour == 17.2,
                    "invalid startup camera rejects transaction without changing document");
         }
-        for (const auto &bad : std::array<nlohmann::json, 6>{
+        for (const auto &bad : std::array<nlohmann::json, 15>{
                  nlohmann::json{{"hour", 24}}, nlohmann::json{{"cycle", "off"}},
                  nlohmann::json{{"triangle_budget", 2048.5}},
                  nlohmann::json{{"shadow_resolution", 3072}},
+                 nlohmann::json{{"cascade_cache", "on"}},
+                 nlohmann::json{{"shadow_depth", "d24"}},
+                 nlohmann::json{{"shadow_depth", "D16"}},
+                 nlohmann::json{{"shadow_depth", ""}},
+                 nlohmann::json{{"shadow_depth", 16}},
+                 nlohmann::json{{"shadow_depth", true}},
+                 nlohmann::json{{"shadow_depth", nullptr}},
+                 nlohmann::json{{"shadow_depth", nlohmann::json::array({"d16"})}},
+                 nlohmann::json{{"shadow_depth", nlohmann::json{{"format", "d16"}}}},
                  nlohmann::json{{"dynamic", false}, {"voxel_gi", true}},
                  nlohmann::json{{"gi_extent", 1e100}}}) {
             startup_json = original_json;
             startup_json["lighting"] = bad;
             write_startup();
-            expect(!vcr::load_scene_file(startup_file, loaded_scene, error),
+            expect(!vcr::load_scene_file(startup_file, loaded_scene, error) &&
+                       loaded_scene.lighting &&
+                       loaded_scene.lighting->shadow_depth == vcr::ShadowDepthFormat::d16,
                    "invalid lighting types ranges and combinations are rejected");
         }
         startup_json = original_json;
@@ -1267,7 +2255,9 @@ int main() {
         write_startup();
         expect(vcr::load_scene_file(startup_file, loaded_scene, error) &&
                    loaded_scene.lighting->dynamic && loaded_scene.lighting->voxel_gi &&
-                   loaded_scene.lighting->shadow_resolution == 2048,
+                   loaded_scene.lighting->shadow_resolution == 2048 &&
+                   loaded_scene.lighting->shadow_depth == vcr::ShadowDepthFormat::automatic &&
+                   !loaded_scene.lighting->cascade_cache,
                "partial lighting gets current safe defaults");
         expect(source_scene.destroy_subtree(camera_parent), "delete authored camera rig");
         expect(vcr::save_scene_file(source_scene, startup_file, error) &&

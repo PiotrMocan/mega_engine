@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "pbr_material.glsl"
 
 layout(set = 0, binding = 0, std140) uniform FrameUniforms
 {
@@ -13,8 +15,8 @@ layout(set = 0, binding = 0, std140) uniform FrameUniforms
     vec4 shadowMapParameters;
 } frame;
 
-// Three affine rows plus a 32-byte PBR material preserve hierarchical shear
-// while matching the 80-byte host SceneGpuInstance stride.
+// Three affine rows plus a 48-byte PBR material preserve hierarchical shear
+// plus previous rows match the 144-byte host RuntimeGpuInstance stride.
 struct EditorInstanceData
 {
     vec4 modelRow0;
@@ -22,6 +24,7 @@ struct EditorInstanceData
     vec4 modelRow2;
     vec4 baseColor;
     vec4 materialParameters;
+    float indexOfRefraction; uint shadingModel; uint subsurfaceProfile; float subsurfaceStrength;
     vec4 previousRow0;
     vec4 previousRow1;
     vec4 previousRow2;
@@ -46,6 +49,14 @@ layout(location = 2) flat out uint outInstanceIndex;
 layout(location = 3) out vec4 outShadowPosition;
 layout(location = 4) out vec3 outWorldPosition;
 layout(location = 5) out vec4 outMaterialParameters;
+
+layout(location = 11) flat out float outDielectricF0;
+layout(location = 12) flat out uint outMaterialModel;
+layout(location = 14) flat out uint outSubsurfaceProfile;
+layout(location = 15) flat out float outSubsurfaceStrength;
+
+// Identical clip depth across the depth-only and EQUAL color pipelines.
+invariant gl_Position;
 
 void main()
 {
@@ -80,6 +91,10 @@ void main()
         frame.lightViewProjection * vec4(worldPosition, 1.0);
     outWorldPosition = worldPosition;
     outMaterialParameters = instance.materialParameters;
+    outDielectricF0 = materialDielectricF0(instance.indexOfRefraction);
+    outMaterialModel = instance.shadingModel;
+    outSubsurfaceProfile = instance.subsurfaceProfile;
+    outSubsurfaceStrength = instance.subsurfaceStrength;
     gl_Position =
         frame.viewProjection * vec4(worldPosition, 1.0);
 }

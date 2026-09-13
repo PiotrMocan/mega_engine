@@ -323,6 +323,132 @@ int main() {
     expect(static_cast<bool>(loaded), "valid cooked model loads");
     expect(loaded && !loaded->materials[0].metallic_roughness_texture,
            "legacy material without packed texture preserves scalar factors");
+    expect(loaded && loaded->materials[0].factors.ior == 1.5F &&
+               loaded->materials[0].factors.model == vcr::MaterialModel::standard &&
+               loaded->materials[0].factors.subsurface_profile ==
+                   vcr::SubsurfaceProfile::none &&
+               loaded->materials[0].factors.subsurface_strength == 0.0F,
+           "legacy cooked materials preserve default optical and subsurface values");
+    Fixture optical = create_fixture(asset_root, "optical");
+    for (const float ior : {1.0F, 1.0001234F, 2.417123F, std::numeric_limits<float>::max()}) {
+        for (const char* model : {"standard", "unlit"}) {
+            optical.material["pbr"]["ior"] = ior;
+            optical.material["pbr"]["model"] = model;
+            expect(write_json(optical.material_absolute, optical.material),
+                   "full-precision optical material fixture written");
+            const auto first = vcr::load_cooked_model_asset(asset_root, optical.metadata_relative);
+            expect(first && first->materials[0].factors.ior == ior &&
+                       vcr::to_token(first->materials[0].factors.model) == model,
+                   "cooked material preserves full float IOR and exact model identity");
+            if (first) {
+                optical.material["pbr"]["ior"] = first->materials[0].factors.ior;
+                optical.material["pbr"]["model"] = vcr::to_token(first->materials[0].factors.model);
+                expect(write_json(optical.material_absolute, optical.material), "optical factors reserialized");
+                const auto second = vcr::load_cooked_model_asset(asset_root, optical.metadata_relative);
+                expect(second && second->materials[0].factors.ior == ior &&
+                           second->materials[0].factors.model == first->materials[0].factors.model,
+                       "cooked optical factors round-trip without quantization");
+            }
+        }
+    }
+    optical.material["pbr"].erase("ior");
+    expect(write_json(optical.material_absolute, optical.material), "model-only optical fixture written");
+    const auto model_only = vcr::load_cooked_model_asset(asset_root, optical.metadata_relative);
+    expect(model_only && model_only->materials[0].factors.ior == 1.5F &&
+               model_only->materials[0].factors.model == vcr::MaterialModel::unlit,
+           "optional IOR defaults independently of an explicit model");
+    optical.material["pbr"].erase("model");
+    optical.material["pbr"]["ior"] = 1.7F;
+    expect(write_json(optical.material_absolute, optical.material), "IOR-only optical fixture written");
+    const auto ior_only = vcr::load_cooked_model_asset(asset_root, optical.metadata_relative);
+    expect(ior_only && ior_only->materials[0].factors.ior == 1.7F &&
+               ior_only->materials[0].factors.model == vcr::MaterialModel::standard,
+           "optional model defaults independently of explicit IOR");
+
+    Fixture subsurface = create_fixture(asset_root, "subsurface");
+    subsurface.material["pbr"]["model"] = "subsurface";
+    subsurface.material["pbr"]["subsurface_profile"] = "medium";
+    subsurface.material["pbr"]["subsurface_strength"] = 0.37123457F;
+    expect(write_json(subsurface.material_absolute, subsurface.material),
+           "subsurface material fixture written");
+    const auto first_subsurface = vcr::load_cooked_model_asset(
+        asset_root, subsurface.metadata_relative);
+    expect(first_subsurface &&
+               first_subsurface->materials[0].factors.model ==
+                   vcr::MaterialModel::subsurface &&
+               first_subsurface->materials[0].factors.subsurface_profile ==
+                   vcr::SubsurfaceProfile::medium &&
+               first_subsurface->materials[0].factors.subsurface_strength ==
+                   0.37123457F,
+           "cooked material preserves exact subsurface schema values");
+    if (first_subsurface) {
+        const auto& factors = first_subsurface->materials[0].factors;
+        subsurface.material["pbr"]["model"] = vcr::to_token(factors.model);
+        subsurface.material["pbr"]["subsurface_profile"] =
+            vcr::to_token(factors.subsurface_profile);
+        subsurface.material["pbr"]["subsurface_strength"] =
+            factors.subsurface_strength;
+        expect(write_json(subsurface.material_absolute, subsurface.material),
+               "subsurface factors reserialized");
+        const auto second_subsurface = vcr::load_cooked_model_asset(
+            asset_root, subsurface.metadata_relative);
+        expect(second_subsurface &&
+                   second_subsurface->materials[0].factors.model == factors.model &&
+                   second_subsurface->materials[0].factors.subsurface_profile ==
+                       factors.subsurface_profile &&
+                   second_subsurface->materials[0].factors.subsurface_strength ==
+                       factors.subsurface_strength,
+               "cooked subsurface factors round-trip without quantization");
+    }
+    const std::array invalid_profiles{
+        Json(""), Json("Medium"), Json("medium "), Json("skin"),
+        Json(nullptr), Json(true), Json(1), Json::array({"medium"}),
+        Json::object()};
+    for (const auto& profile : invalid_profiles) {
+        subsurface.material["pbr"]["subsurface_profile"] = profile;
+        expect(write_json(subsurface.material_absolute, subsurface.material),
+               "invalid subsurface profile fixture written");
+        expect(has_error(
+                   vcr::load_cooked_model_asset(
+                       asset_root, subsurface.metadata_relative),
+                   CookedModelLoadErrorCode::invalid_material),
+               "cooked subsurface profile accepts only exact string tokens");
+    }
+    subsurface.material["pbr"]["subsurface_profile"] = "medium";
+    const std::array invalid_strengths{
+        Json(-0.0001), Json(1.0001), Json(1.0e39), Json(nullptr), Json(true),
+        Json("0.5"), Json::array({0.5}), Json::object()};
+    for (const auto& strength : invalid_strengths) {
+        subsurface.material["pbr"]["subsurface_strength"] = strength;
+        expect(write_json(subsurface.material_absolute, subsurface.material),
+               "invalid subsurface strength fixture written");
+        expect(has_error(
+                   vcr::load_cooked_model_asset(
+                       asset_root, subsurface.metadata_relative),
+                   CookedModelLoadErrorCode::invalid_material),
+               "cooked subsurface strength rejects values outside [0, 1] and invalid types");
+    }
+
+    const std::array invalid_iors{Json(0), Json(-1), Json(.999999999), Json(1.0e39),
+        Json(nullptr), Json(true), Json("1.5"), Json::array({1.5}), Json::object()};
+    for (const auto& ior : invalid_iors) {
+        optical.material["pbr"]["ior"] = ior;
+        expect(write_json(optical.material_absolute, optical.material), "invalid optical IOR fixture written");
+        expect(has_error(vcr::load_cooked_model_asset(asset_root, optical.metadata_relative),
+                         CookedModelLoadErrorCode::invalid_material),
+               "cooked IOR rejects unsupported values, types and float overflow");
+    }
+    optical.material["pbr"]["ior"] = 1.5F;
+    const std::array invalid_models{Json(""), Json("Standard"), Json("unlit "), Json("sss"),
+        Json("Subsurface"), Json("eyes"),
+        Json(nullptr), Json(true), Json(1), Json::array({"unlit"}), Json::object()};
+    for (const auto& model : invalid_models) {
+        optical.material["pbr"]["model"] = model;
+        expect(write_json(optical.material_absolute, optical.material), "invalid shading model fixture written");
+        expect(has_error(vcr::load_cooked_model_asset(asset_root, optical.metadata_relative),
+                         CookedModelLoadErrorCode::invalid_material),
+               "cooked shading model accepts only exact standard/unlit/subsurface string tokens");
+    }
     Fixture packed = create_fixture(asset_root, "packed");
     packed.material["textures"]["metallic_roughness"] = "packed.vcrtexture.json";
     expect(write_json(asset_root / "packed/packed.vcrtexture.json", Json::object()) &&

@@ -14,8 +14,8 @@ struct alignas(16) RuntimeGpuInstance {
     SceneGpuInstance current{};
     TransformRows previous{};
 };
-static_assert(sizeof(RuntimeGpuInstance) == 128);
-static_assert(offsetof(RuntimeGpuInstance, previous) == 80);
+static_assert(sizeof(RuntimeGpuInstance) == 144);
+static_assert(offsetof(RuntimeGpuInstance, previous) == 96);
 
 // Single render-submission owner. Game systems update handles at the frame
 // boundary; previous means LAST SUBMITTED frame, not another in-flight slot.
@@ -26,6 +26,7 @@ class RuntimeTransforms final {
     [[nodiscard]] TransformRows current(SceneNodeId id) const noexcept;
     [[nodiscard]] TransformRows previous(SceneNodeId id) const noexcept;
     void commit() noexcept;
+    void snap_history() noexcept;
     void reset() noexcept;
     void begin_snapshot() noexcept;
     [[nodiscard]] std::span<const std::uint32_t> dirty_indices() const noexcept {
@@ -64,6 +65,8 @@ struct VisibilitySettings {
     std::uint32_t occlusion_threshold = 64;
     float lod_pixel_error = 1.0F;
     Backend backend = Backend::automatic;
+    bool coarse_front_to_back = false;
+    bool cpu_hierarchy = false;
 };
 struct VisibilityStatistics {
     std::uint32_t submitted = 0, visible = 0, frustum_rejected = 0, occlusion_rejected = 0;

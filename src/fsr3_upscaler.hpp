@@ -30,6 +30,7 @@ struct Fsr3Dispatch {
     const GpuTexture* color = nullptr;
     const GpuTexture* depth = nullptr;
     const GpuTexture* motion_vectors = nullptr;
+    const GpuTexture* exposure = nullptr;
     const GpuTexture* output = nullptr;
     VkExtent2D render_extent{};
     VkExtent2D display_extent{};

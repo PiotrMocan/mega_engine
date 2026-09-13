@@ -72,6 +72,14 @@ float terrainRoughness(float height, float normalY)
         snowAmount);
 }
 
+layout(location = 11) flat out float outDielectricF0;
+layout(location = 12) flat out uint outMaterialModel;
+layout(location = 14) flat out uint outSubsurfaceProfile;
+layout(location = 15) flat out float outSubsurfaceStrength;
+
+// Identical clip depth across the depth-only and EQUAL color pipelines.
+invariant gl_Position;
+
 void main()
 {
     const float normalY = sqrt(max(
@@ -90,6 +98,10 @@ void main()
         terrainBaseColor(inPosition.y, normalY) * colorVariation,
         1.0);
     outInstanceIndex = 0u;
+    outDielectricF0 = 0.04;
+    outMaterialModel = 0u;
+    outSubsurfaceProfile = 0u;
+    outSubsurfaceStrength = 0.0;
     outShadowPosition = frame.lightViewProjection * world;
     outCurrentClip = frame.unjitteredViewProjection * world;
     outPreviousClip = frame.previousUnjitteredViewProjection * world;

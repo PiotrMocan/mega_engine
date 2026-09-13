@@ -403,6 +403,8 @@ struct EditorViewportRay {
     case SceneNodeKind::terrain: return EditorIcon::terrain;
     case SceneNodeKind::camera: return EditorIcon::camera;
     case SceneNodeKind::directional_light:
+    case SceneNodeKind::point_light:
+    case SceneNodeKind::spot_light:
         return EditorIcon::light;
     case SceneNodeKind::environment:
         return EditorIcon::environment;
@@ -639,6 +641,44 @@ inline constexpr std::uintmax_t maximum_material_file_bytes =
                 1.0F,
                 material.ambient_occlusion)) {
             error = "Material PBR factors are invalid.";
+            return false;
+        }
+        if (pbr.contains("ior") &&
+            !read_material_factor(
+                pbr["ior"], 1.0F, std::numeric_limits<float>::max(), material.ior)) {
+            error = "Material IOR must be finite and from 1 through FLT_MAX.";
+            return false;
+        }
+        if (pbr.contains("model")) {
+            if (!pbr["model"].is_string()) {
+                error = "Material model must be standard, unlit or subsurface.";
+                return false;
+            }
+            const auto model = parse_material_model(
+                pbr["model"].get_ref<const std::string&>());
+            if (!model) {
+                error = "Material model must be standard, unlit or subsurface.";
+                return false;
+            }
+            material.model = *model;
+        }
+        if (pbr.contains("subsurface_profile")) {
+            if (!pbr["subsurface_profile"].is_string()) {
+                error = "Material subsurface profile must be none, narrow, medium or wide.";
+                return false;
+            }
+            const auto profile = parse_subsurface_profile(
+                pbr["subsurface_profile"].get_ref<const std::string&>());
+            if (!profile) {
+                error = "Material subsurface profile must be none, narrow, medium or wide.";
+                return false;
+            }
+            material.subsurface_profile = *profile;
+        }
+        if (pbr.contains("subsurface_strength") && !read_material_factor(
+                pbr["subsurface_strength"], 0.0F, 1.0F,
+                material.subsurface_strength)) {
+            error = "Material subsurface strength must be finite and from 0 through 1.";
             return false;
         }
         if (!document.contains("textures") ||
@@ -969,6 +1009,10 @@ write_exclusive_material_file(
             {"metallic", material.metallic},
             {"roughness", material.roughness},
             {"ambient_occlusion", material.ambient_occlusion},
+            {"ior", material.ior},
+            {"model", to_token(material.model)},
+            {"subsurface_profile", to_token(material.subsurface_profile)},
+            {"subsurface_strength", material.subsurface_strength},
         };
         const std::string serialized =
             state.document.dump(2) + '\n';
@@ -1407,7 +1451,7 @@ bool EditorUi::duplicate_selection(
 
 bool EditorUi::focus_selection(
     const SceneDocument& scene,
-    const Renderer& renderer,
+    Renderer& renderer,
     FlyCamera& camera) const noexcept {
     if (!scene.valid(selected_node_)) {
         return false;
@@ -1427,6 +1471,7 @@ bool EditorUi::focus_selection(
         return false;
     }
     camera.focus(target, distance);
+    renderer.request_exposure_reset();
     return true;
 }
 
@@ -1788,6 +1833,29 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
                 scene.mark_content_changed();
             }
             selected_node_ = cube;
+        }
+        const bool can_add_light =
+            play_state_ == EditorPlayState::edit &&
+            scene.local_light_count() < maximum_local_lights;
+        if (ImGui::MenuItem("Add point light", nullptr, false, can_add_light)) {
+            checkpoint_scene(scene);
+            const SceneNodeId light = scene.create_node(
+                "Point Light", SceneNodeKind::point_light, parent);
+            if (auto node = scene.node(light)) {
+                node->get().transform.translation = glm::vec3(0.0F, 2.0F, -5.0F);
+                scene.mark_content_changed();
+            }
+            selected_node_ = light;
+        }
+        if (ImGui::MenuItem("Add spot light", nullptr, false, can_add_light)) {
+            checkpoint_scene(scene);
+            const SceneNodeId light = scene.create_node(
+                "Spot Light", SceneNodeKind::spot_light, parent);
+            if (auto node = scene.node(light)) {
+                node->get().transform.translation = glm::vec3(0.0F, 2.0F, -5.0F);
+                scene.mark_content_changed();
+            }
+            selected_node_ = light;
         }
         ImGui::EndMenu();
     }
@@ -2281,6 +2349,71 @@ void EditorUi::build_inspector(SceneDocument& scene) {
                 0.0F,
                 1.0F,
                 "%.2f");
+            ui_kit_.property_row("IOR");
+            changed |= ImGui::DragFloat(
+                "##Ior", &node.material.ior, 0.01F,
+                1.0F, std::numeric_limits<float>::max(), "%.6g",
+                ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_NoRoundToFormat);
+            ui_kit_.property_row("Shading model");
+            if (ImGui::BeginCombo("##MaterialModel", to_token(node.material.model).data())) {
+                for (const auto model : {
+                         MaterialModel::standard, MaterialModel::unlit,
+                         MaterialModel::subsurface}) {
+                    if (ImGui::Selectable(to_token(model).data(), node.material.model == model)) {
+                        changed |= node.material.model != model;
+                        node.material.model = model;
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            if (node.material.model == MaterialModel::subsurface) {
+                ui_kit_.property_row("SSS profile");
+                if (ImGui::BeginCombo(
+                        "##SubsurfaceProfile", to_token(node.material.subsurface_profile).data())) {
+                    for (const auto profile : {
+                             SubsurfaceProfile::none, SubsurfaceProfile::narrow,
+                             SubsurfaceProfile::medium, SubsurfaceProfile::wide}) {
+                        if (ImGui::Selectable(
+                                to_token(profile).data(),
+                                node.material.subsurface_profile == profile)) {
+                            changed |= node.material.subsurface_profile != profile;
+                            node.material.subsurface_profile = profile;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                ui_kit_.property_row("SSS strength");
+                changed |= ImGui::SliderFloat(
+                    "##SubsurfaceStrength", &node.material.subsurface_strength,
+                    0.0F, 1.0F, "%.2f");
+            }
+            ui_kit_.end_property_grid();
+        }
+    }
+    if (node.kind == SceneNodeKind::point_light ||
+        node.kind == SceneNodeKind::spot_light) {
+        ui_kit_.section_header(EditorIcon::light, "Punctual Light");
+        if (ui_kit_.begin_property_grid("PunctualLightProperties")) {
+            ui_kit_.property_row("Linear color");
+            changed |= ImGui::ColorEdit3("##LightColor", &node.light.color.x);
+            ui_kit_.property_row("Intensity (cd)");
+            changed |= ImGui::DragFloat(
+                "##LightIntensity", &node.light.intensity_candela, 1.0F,
+                0.0F, 1'000'000.0F, "%.3g", ImGuiSliderFlags_AlwaysClamp);
+            ui_kit_.property_row("Range (m)");
+            changed |= ImGui::DragFloat(
+                "##LightRange", &node.light.range, 0.05F,
+                0.05F, 1'000.0F, "%.3g", ImGuiSliderFlags_AlwaysClamp);
+            if (node.kind == SceneNodeKind::spot_light) {
+                ui_kit_.property_row("Inner cone");
+                changed |= ImGui::DragFloat(
+                    "##SpotInner", &node.light.inner_cone_degrees, 0.1F,
+                    0.0F, 89.9F, "%.2f deg", ImGuiSliderFlags_AlwaysClamp);
+                ui_kit_.property_row("Outer cone");
+                changed |= ImGui::DragFloat(
+                    "##SpotOuter", &node.light.outer_cone_degrees, 0.1F,
+                    0.1F, 90.0F, "%.2f deg", ImGuiSliderFlags_AlwaysClamp);
+            }
             ui_kit_.end_property_grid();
         }
     }
@@ -2301,6 +2434,19 @@ void EditorUi::build_inspector(SceneDocument& scene) {
             std::max(node.transform.scale.z, minimum_scale);
         node.material =
             sanitize_pbr_material(node.material);
+        node.light.color = glm::clamp(
+            node.light.color, glm::vec3(0.0F), glm::vec3(1.0F));
+        node.light.intensity_candela = std::clamp(
+            node.light.intensity_candela, 0.0F, 1'000'000.0F);
+        node.light.range = std::clamp(node.light.range, 0.05F, 1'000.0F);
+        if (node.kind == SceneNodeKind::spot_light) {
+            node.light.inner_cone_degrees = std::clamp(
+                node.light.inner_cone_degrees, 0.0F, 89.9F);
+            node.light.outer_cone_degrees = std::clamp(
+                node.light.outer_cone_degrees,
+                node.light.inner_cone_degrees + 0.1F,
+                90.0F);
+        }
         scene.mark_content_changed();
     }
     if (inspector_edit_snapshot_ && !ImGui::IsAnyItemActive()) {
@@ -2453,7 +2599,15 @@ void EditorUi::build_viewport(
         ImVec2(1.0F, 1.0F));
     const bool viewport_clicked =
         ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    const bool viewport_activated =
+        viewport_clicked ||
+        ImGui::IsItemClicked(ImGuiMouseButton_Right);
     viewport_hovered_ = ImGui::IsItemHovered();
+    if (viewport_activated) {
+        // Dear ImGui focuses windows implicitly only for LMB clicks.
+        ImGui::SetWindowFocus();
+        viewport_focused_ = true;
+    }
     const ImVec2 image_minimum = ImGui::GetItemRectMin();
     const ImVec2 image_maximum = ImGui::GetItemRectMax();
     ImGui::GetWindowDrawList()->AddRect(
@@ -2692,7 +2846,13 @@ void EditorUi::build_external_game_window(
             available,
             ImVec2(0.0F, 0.0F),
             ImVec2(1.0F, 1.0F));
+        const bool external_viewport_activated =
+            ImGui::IsItemClicked(ImGuiMouseButton_Left) ||
+            ImGui::IsItemClicked(ImGuiMouseButton_Right);
         external_viewport_hovered_ = ImGui::IsItemHovered();
+        if (external_viewport_activated) {
+            ImGui::SetWindowFocus();
+        }
         external_viewport_focused_ = ImGui::IsWindowFocused(
             ImGuiFocusedFlags_RootAndChildWindows);
     }
@@ -3703,6 +3863,23 @@ void EditorUi::build_material_editor() {
                     0.0F,
                     1.0F,
                     "%.2f");
+                ui_kit_.property_row("IOR");
+                changed |= ImGui::DragFloat(
+                    "##MaterialIor", &material_editor_->material.ior, 0.01F,
+                    1.0F, std::numeric_limits<float>::max(), "%.6g",
+                    ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_NoRoundToFormat);
+                ui_kit_.property_row("Shading model");
+                if (ImGui::BeginCombo(
+                        "##MaterialModel", to_token(material_editor_->material.model).data())) {
+                    for (const auto model : {MaterialModel::standard, MaterialModel::unlit}) {
+                        if (ImGui::Selectable(
+                                to_token(model).data(), material_editor_->material.model == model)) {
+                            changed |= material_editor_->material.model != model;
+                            material_editor_->material.model = model;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
                 ui_kit_.end_property_grid();
             }
             if (changed) {
@@ -3951,7 +4128,211 @@ void EditorUi::build_performance(
     }
 
     auto lighting = renderer.lighting_settings();
+    if (ImGui::BeginCombo("Tone mapper", to_token(renderer.tone_mapper()).data())) {
+        for (const auto mapper : {ToneMapper::reinhard, ToneMapper::gt7}) {
+            if (ImGui::Selectable(to_token(mapper).data(), renderer.tone_mapper() == mapper))
+                static_cast<void>(renderer.set_tone_mapper(mapper));
+        }
+        ImGui::EndCombo();
+    }
+    if (ImGui::BeginCombo("Subsurface", to_token(renderer.subsurface_mode()).data())) {
+        for (const auto mode : {SubsurfaceMode::off, SubsurfaceMode::full_resolution}) {
+            if (ImGui::Selectable(to_token(mode).data(), renderer.subsurface_mode() == mode)) {
+                static_cast<void>(renderer.set_subsurface_mode(mode));
+            }
+        }
+        ImGui::EndCombo();
+    }
+    auto motion_blur = renderer.motion_blur_settings();
+    bool motion_blur_changed = false;
+    if (ImGui::BeginCombo(
+            "Motion blur", to_token(motion_blur.mode).data())) {
+        for (const auto mode : {
+                 MotionBlurMode::off, MotionBlurMode::camera,
+                 MotionBlurMode::objects, MotionBlurMode::all}) {
+            if (ImGui::Selectable(
+                    to_token(mode).data(), motion_blur.mode == mode)) {
+                motion_blur.mode = mode;
+                motion_blur_changed = true;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::SetTooltip(
+            "Depth-aware TileMax/NeighborMax blur. Active mode supports Off, SMAA 1x, or FSR Native AA.");
+    }
+    if (motion_blur.mode != MotionBlurMode::off) {
+        if (ImGui::BeginCombo(
+                "Motion blur quality", to_token(motion_blur.quality).data())) {
+            for (const auto quality : {
+                     MotionBlurQuality::low, MotionBlurQuality::high}) {
+                if (ImGui::Selectable(
+                        to_token(quality).data(), motion_blur.quality == quality)) {
+                    motion_blur.quality = quality;
+                    motion_blur_changed = true;
+                }
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::BeginCombo(
+                "Motion blur shutter", to_token(motion_blur.shutter).data())) {
+            for (const auto shutter : {
+                     MotionBlurShutter::centered,
+                     MotionBlurShutter::trailing}) {
+                if (ImGui::Selectable(
+                        to_token(shutter).data(), motion_blur.shutter == shutter)) {
+                    motion_blur.shutter = shutter;
+                    motion_blur_changed = true;
+                }
+            }
+            ImGui::EndCombo();
+        }
+        motion_blur_changed |= ImGui::SliderFloat(
+            "Shutter angle", &motion_blur.shutter_angle_degrees,
+            0.0F, 360.0F, "%.0f deg", ImGuiSliderFlags_AlwaysClamp);
+        motion_blur_changed |= ImGui::SliderFloat(
+            "Maximum blur radius", &motion_blur.maximum_radius_pixels,
+            1.0F, 64.0F, "%.0f px", ImGuiSliderFlags_AlwaysClamp);
+        bool camera_fade = motion_blur.camera_fade_end >
+            motion_blur.camera_fade_start;
+        if (ImGui::Checkbox("Camera depth fade", &camera_fade)) {
+            motion_blur.camera_fade_start = camera_fade ? 100.0F : 0.0F;
+            motion_blur.camera_fade_end = camera_fade ? 500.0F : 0.0F;
+            motion_blur_changed = true;
+        }
+        if (camera_fade) {
+            motion_blur_changed |= ImGui::DragFloat(
+                "Camera fade start", &motion_blur.camera_fade_start,
+                1.0F, 0.0F, motion_blur.camera_fade_end - 0.01F,
+                "%.1f m", ImGuiSliderFlags_AlwaysClamp);
+            motion_blur_changed |= ImGui::DragFloat(
+                "Camera fade end", &motion_blur.camera_fade_end,
+                1.0F, motion_blur.camera_fade_start + 0.01F, 10'000.0F,
+                "%.1f m", ImGuiSliderFlags_AlwaysClamp);
+        }
+    }
+    if (motion_blur_changed) {
+        static_cast<void>(renderer.set_motion_blur_settings(motion_blur));
+    }
+    auto exposure = renderer.exposure_settings();
+    bool exposure_changed = false;
+    if (ImGui::BeginCombo("Exposure", to_token(exposure.mode).data())) {
+        for (const auto mode : {ExposureMode::fixed, ExposureMode::automatic}) {
+            if (ImGui::Selectable(to_token(mode).data(), exposure.mode == mode)) {
+                exposure.mode = mode;
+                exposure_changed = true;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    if (ImGui::BeginCombo("Exposure metering", to_token(exposure.metering).data())) {
+        for (const auto metering : {ExposureMetering::uniform, ExposureMetering::center}) {
+            if (ImGui::Selectable(to_token(metering).data(), exposure.metering == metering)) {
+                exposure.metering = metering;
+                exposure_changed = true;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    exposure_changed |= ImGui::DragFloat(
+        "Exposure EV", &exposure.compensation_ev, 0.05F, -24.0F, 24.0F, "%.2f",
+        ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_NoRoundToFormat);
+    if (exposure.mode == ExposureMode::automatic) {
+        exposure_changed |= ImGui::DragFloat(
+            "Exposure min EV", &exposure.minimum_ev, 0.05F, -24.0F,
+            exposure.maximum_ev, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+        exposure_changed |= ImGui::DragFloat(
+            "Exposure max EV", &exposure.maximum_ev, 0.05F,
+            exposure.minimum_ev, 24.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+        exposure_changed |= ImGui::DragFloat(
+            "Low percentile", &exposure.low_percentile, 0.001F, 0.0F,
+            std::nextafter(exposure.high_percentile, 0.0F), "%.3f",
+            ImGuiSliderFlags_AlwaysClamp);
+        exposure_changed |= ImGui::DragFloat(
+            "High percentile", &exposure.high_percentile, 0.001F,
+            std::nextafter(exposure.low_percentile, 1.0F), 1.0F, "%.3f",
+            ImGuiSliderFlags_AlwaysClamp);
+        exposure_changed |= ImGui::DragFloat(
+            "Brighten seconds", &exposure.brighten_seconds, 0.01F, 0.01F, 60.0F,
+            "%.2f", ImGuiSliderFlags_AlwaysClamp);
+        exposure_changed |= ImGui::DragFloat(
+            "Darken seconds", &exposure.darken_seconds, 0.01F, 0.01F, 60.0F,
+            "%.2f", ImGuiSliderFlags_AlwaysClamp);
+    }
+    if (exposure_changed) static_cast<void>(renderer.set_exposure_settings(exposure));
+    ImGui::TextDisabled(
+        "Actual %s, %.3fx, target %.3fx, luminance %.4f",
+        to_token(renderer.exposure_mode_actual()).data(),
+        renderer.exposure_mode_actual() == ExposureMode::fixed
+            ? fixed_exposure_multiplier(renderer.exposure_settings())
+            : renderer.exposure_state().exposure,
+        renderer.exposure_mode_actual() == ExposureMode::fixed
+            ? fixed_exposure_multiplier(renderer.exposure_settings())
+            : renderer.exposure_state().target_exposure,
+        renderer.exposure_state().average_luminance);
+
+    ColorGrading grading = renderer.color_grading();
+    ColorGradingLutSize grading_size = renderer.color_grading_lut_size();
+    bool grading_changed = false;
+    if (ImGui::BeginCombo("Color grading", to_token(grading).data())) {
+        for (const auto mode : {
+                 ColorGrading::off, ColorGrading::trilinear,
+                 ColorGrading::tetrahedral}) {
+            if (ImGui::Selectable(to_token(mode).data(), grading == mode)) {
+                grading = mode;
+                grading_changed = true;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    if (ImGui::BeginCombo(
+            "Grading LUT size",
+            grading_size == ColorGradingLutSize::size_64 ? "64" : "32")) {
+        for (const auto size : {
+                 ColorGradingLutSize::size_32, ColorGradingLutSize::size_64}) {
+            const char* label = size == ColorGradingLutSize::size_64 ? "64" : "32";
+            if (ImGui::Selectable(label, grading_size == size)) {
+                grading_size = size;
+                grading_changed = true;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    if (grading_changed) {
+        static_cast<void>(renderer.set_color_grading(grading, grading_size));
+    }
+    ImGui::TextDisabled(
+        "Actual %s, identity %u^3 RGBA16F",
+        to_token(renderer.color_grading_actual()).data(),
+        grading_lut_size(renderer.color_grading_lut_size()));
+    if (ImGui::BeginCombo("Depth prepass", to_token(renderer.depth_prepass()).data())) {
+        for (const auto prepass : {DepthPrepass::off, DepthPrepass::partial, DepthPrepass::full}) {
+            if (ImGui::Selectable(to_token(prepass).data(), renderer.depth_prepass() == prepass))
+                static_cast<void>(renderer.set_depth_prepass(prepass));
+        }
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
+        ImGui::SetTooltip("Partial covers terrain and primitives; full also includes imported opaque models.");
+    if (ImGui::BeginCombo("Model LOD fade", to_token(renderer.lod_fade_pattern()).data())) {
+        for (const auto pattern : {LodFadePattern::off, LodFadePattern::bayer4, LodFadePattern::bayer8}) {
+            if (ImGui::Selectable(to_token(pattern).data(), renderer.lod_fade_pattern() == pattern))
+                static_cast<void>(renderer.set_lod_fade(pattern, renderer.lod_fade_seconds()));
+        }
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
+        ImGui::SetTooltip("Ordered Bayer transitions for imported models; terrain LOD remains discrete.");
+    float lod_fade_seconds = renderer.lod_fade_seconds();
+    if (ImGui::DragFloat("LOD fade seconds", &lod_fade_seconds, 0.01F, 0.05F, 2.0F, "%.2f",
+                        ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_NoRoundToFormat)) {
+        static_cast<void>(renderer.set_lod_fade(renderer.lod_fade_pattern(), lod_fade_seconds));
+    }
     bool lighting_changed = ImGui::Checkbox("Dynamic day and night", &lighting.dynamic);
+    lighting_changed |= ImGui::Checkbox("Cache individual shadow cascades", &lighting.cascade_cache);
+    ImGui::Text("Shadow depth: %s (%s filter; startup setting)",
+                renderer.shadow_depth_format().data(), renderer.shadow_linear_filter() ? "linear" : "nearest");
     std::array<char, 32> shadow_label{};
     std::snprintf(shadow_label.data(), shadow_label.size(), "%u x %u",
                   lighting.shadow_resolution, lighting.shadow_resolution);
@@ -4018,8 +4399,13 @@ void EditorUi::build_performance(
                 visible.occlusion_rejected);
     ImGui::Text("LOD instances: %u / %u / %u", visible.lod_instances[0], visible.lod_instances[1],
                 visible.lod_instances[2]);
-    ImGui::Text("GPU culling %.3f ms, shadows %.3f ms", performance.average.gpu_visibility_ms,
-                performance.average.gpu_shadow_ms);
+    ImGui::Text("GPU culling %.3f ms, shadows %.3f ms\nGPU postprocess %.3f ms, display %.3f ms, exposure %.3f ms, SSS %.3f ms, motion blur %.3f ms, depth prepass %.3f ms",
+                performance.average.gpu_visibility_ms, performance.average.gpu_shadow_ms,
+                performance.average.gpu_postprocess_ms, performance.average.gpu_display_ms,
+                performance.average.gpu_exposure_ms,
+                performance.average.gpu_subsurface_ms,
+                performance.average.gpu_motion_blur_ms,
+                performance.average.gpu_depth_prepass_ms);
     ui_kit_.section_header(EditorIcon::renderer, "Output Pipeline");
     if (ui_kit_.begin_property_grid("RendererProperties")) {
         ui_kit_.property_row("Present");

@@ -12,6 +12,7 @@ layout(set=0,binding=0,std140) uniform FrameUniforms {
 struct Instance {
     vec4 row0; vec4 row1; vec4 row2;
     vec4 baseColor; vec4 materialParameters;
+    float indexOfRefraction; uint shadingModel; uint subsurfaceProfile; float subsurfaceStrength;
     vec4 previousRow0; vec4 previousRow1; vec4 previousRow2;
 };
 layout(set=0,binding=1,std430) readonly buffer Instances { Instance instances[]; };

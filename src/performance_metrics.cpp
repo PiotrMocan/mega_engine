@@ -70,8 +70,8 @@ void append_json_string(std::string& output, std::string_view value) {
     output.push_back('"');
 }
 
-void append_json_number(std::string& output, double value) {
-    if (!std::isfinite(value) || value < 0.0) {
+void append_json_finite_number(std::string& output, double value) {
+    if (!std::isfinite(value)) {
         value = 0.0;
     }
 
@@ -87,6 +87,10 @@ void append_json_number(std::string& output, double value) {
     } else {
         output.push_back('0');
     }
+}
+
+void append_json_number(std::string& output, double value) {
+    append_json_finite_number(output, std::max(value, 0.0));
 }
 
 void append_json_u64(std::string& output, std::uint64_t value) {
@@ -147,8 +151,15 @@ void PerformanceMetrics::record_frame(const FrameTimings& timings) noexcept {
     accumulate(TimingIndex::present, timings.present_ms);
     accumulate(TimingIndex::gpu_frame, timings.gpu_frame_ms);
     accumulate(TimingIndex::gpu_geometry, timings.gpu_geometry_ms);
+    accumulate(TimingIndex::gpu_light_culling, timings.gpu_light_culling_ms);
     accumulate(TimingIndex::gpu_workload, timings.gpu_workload_ms);
     accumulate(TimingIndex::gpu_shadow, timings.gpu_shadow_ms);
+    accumulate(TimingIndex::gpu_postprocess, timings.gpu_postprocess_ms);
+    accumulate(TimingIndex::gpu_display, timings.gpu_display_ms);
+    accumulate(TimingIndex::gpu_exposure, timings.gpu_exposure_ms);
+    accumulate(TimingIndex::gpu_subsurface, timings.gpu_subsurface_ms);
+    accumulate(TimingIndex::gpu_motion_blur, timings.gpu_motion_blur_ms);
+    accumulate(TimingIndex::gpu_depth_prepass, timings.gpu_depth_prepass_ms);
     accumulate(TimingIndex::gpu_voxel_geometry, timings.gpu_voxel_geometry_ms);
     accumulate(TimingIndex::gpu_voxel_light, timings.gpu_voxel_light_ms);
     accumulate(TimingIndex::gpu_visibility, timings.gpu_visibility_ms);
@@ -179,8 +190,15 @@ PerformanceSnapshot PerformanceMetrics::snapshot(const bool include_percentile) 
     result.average.present_ms = average(TimingIndex::present);
     result.average.gpu_frame_ms = average(TimingIndex::gpu_frame);
     result.average.gpu_geometry_ms = average(TimingIndex::gpu_geometry);
+    result.average.gpu_light_culling_ms = average(TimingIndex::gpu_light_culling);
     result.average.gpu_workload_ms = average(TimingIndex::gpu_workload);
     result.average.gpu_shadow_ms = average(TimingIndex::gpu_shadow);
+    result.average.gpu_postprocess_ms = average(TimingIndex::gpu_postprocess);
+    result.average.gpu_display_ms = average(TimingIndex::gpu_display);
+    result.average.gpu_exposure_ms = average(TimingIndex::gpu_exposure);
+    result.average.gpu_subsurface_ms = average(TimingIndex::gpu_subsurface);
+    result.average.gpu_motion_blur_ms = average(TimingIndex::gpu_motion_blur);
+    result.average.gpu_depth_prepass_ms = average(TimingIndex::gpu_depth_prepass);
     result.average.gpu_voxel_geometry_ms = average(TimingIndex::gpu_voxel_geometry);
     result.average.gpu_voxel_light_ms = average(TimingIndex::gpu_voxel_light);
     result.average.gpu_visibility_ms = average(TimingIndex::gpu_visibility);
@@ -423,8 +441,15 @@ BenchmarkResult make_benchmark_result(
     result.average_queue_submit_ms = snapshot.average.queue_submit_ms;
     result.average_present_ms = snapshot.average.present_ms;
     result.average_gpu_geometry_ms = snapshot.average.gpu_geometry_ms;
+    result.average_gpu_light_culling_ms = snapshot.average.gpu_light_culling_ms;
     result.average_gpu_workload_ms = snapshot.average.gpu_workload_ms;
     result.average_gpu_shadow_ms = snapshot.average.gpu_shadow_ms;
+    result.average_gpu_postprocess_ms = snapshot.average.gpu_postprocess_ms;
+    result.average_gpu_display_ms = snapshot.average.gpu_display_ms;
+    result.average_gpu_exposure_ms = snapshot.average.gpu_exposure_ms;
+    result.average_gpu_subsurface_ms = snapshot.average.gpu_subsurface_ms;
+    result.average_gpu_motion_blur_ms = snapshot.average.gpu_motion_blur_ms;
+    result.average_gpu_depth_prepass_ms = snapshot.average.gpu_depth_prepass_ms;
     result.average_gpu_voxel_geometry_ms = snapshot.average.gpu_voxel_geometry_ms;
     result.average_gpu_voxel_light_ms = snapshot.average.gpu_voxel_light_ms;
     result.average_gpu_visibility_ms = snapshot.average.gpu_visibility_ms;
@@ -477,8 +502,41 @@ std::string benchmark_result_to_json(const BenchmarkResult& result) {
     timing("average_queue_submit_ms", result.average_queue_submit_ms);
     timing("average_present_ms", result.average_present_ms);
     timing("average_gpu_geometry_ms", result.average_gpu_geometry_ms);
+    timing("average_gpu_light_culling_ms", result.average_gpu_light_culling_ms);
     timing("average_gpu_workload_ms", result.average_gpu_workload_ms);
     timing("average_gpu_shadow_ms", result.average_gpu_shadow_ms);
+    timing("average_gpu_postprocess_ms", result.average_gpu_postprocess_ms);
+    timing("average_gpu_display_ms", result.average_gpu_display_ms);
+    timing("average_gpu_exposure_ms", result.average_gpu_exposure_ms);
+    timing("average_gpu_subsurface_ms", result.average_gpu_subsurface_ms);
+    timing("average_gpu_motion_blur_ms", result.average_gpu_motion_blur_ms);
+    timing("average_gpu_depth_prepass_ms", result.average_gpu_depth_prepass_ms);
+    append_key(output, "depth_prepass_requested");
+    append_json_string(output, result.depth_prepass_requested);
+    output.append(",\n");
+    append_key(output, "depth_prepass_actual");
+    append_json_string(output, result.depth_prepass_actual);
+    output.append(",\n");
+    append_key(output, "lod_fade_requested");
+    append_json_string(output, result.lod_fade_requested);
+    output.append(",\n");
+    append_key(output, "lod_fade_actual");
+    append_json_string(output, result.lod_fade_actual);
+    output.append(",\n");
+    timing("lod_fade_seconds_requested", result.lod_fade_seconds_requested);
+    timing("lod_fade_seconds_actual", result.lod_fade_seconds_actual);
+    append_key(output, "front_to_back_requested");
+    append_json_string(output, result.front_to_back_requested);
+    output.append(",\n");
+    append_key(output, "front_to_back_actual");
+    append_json_string(output, result.front_to_back_actual);
+    output.append(",\n");
+    append_key(output, "cpu_culling_requested");
+    append_json_string(output, result.cpu_culling_requested);
+    output.append(",\n");
+    append_key(output, "cpu_culling_actual");
+    append_json_string(output, result.cpu_culling_actual);
+    output.append(",\n");
     timing("average_gpu_voxel_geometry_ms", result.average_gpu_voxel_geometry_ms);
     timing("average_gpu_voxel_light_ms", result.average_gpu_voxel_light_ms);
     timing("average_gpu_visibility_ms", result.average_gpu_visibility_ms);
@@ -520,7 +578,89 @@ std::string benchmark_result_to_json(const BenchmarkResult& result) {
     boolean("voxel_gi", result.lighting.voxel_gi);
     boolean("day_cycle", result.lighting.cycle);
     integer("shadow_resolution", result.lighting.shadow_resolution);
+    append_key(output, "shadow_depth_requested");
+    append_json_string(output, to_token(result.lighting.shadow_depth));
+    output.append(",\n");
+    append_key(output, "shadow_depth_actual");
+    append_json_string(output, result.shadow_depth_actual);
+    output.append(",\n");
+    boolean("shadow_linear_filter", result.shadow_linear_filter);
+    boolean("cascade_cache", result.lighting.cascade_cache);
+    integer("shadow_passes_total", result.lighting_statistics.shadow_passes);
+    integer("shadow_tiles_total", result.lighting_statistics.shadow_tiles);
+    append_key(output, "tone_mapper");
+    append_json_string(output, to_token(result.tone_mapper));
+    output.append(",\n");
+    append_key(output, "exposure_mode_requested");
+    append_json_string(output, to_token(result.exposure.mode));
+    output.append(",\n");
+    append_key(output, "exposure_mode_actual");
+    append_json_string(output, result.exposure_mode_actual);
+    output.append(",\n");
+    append_key(output, "exposure_metering");
+    append_json_string(output, to_token(result.exposure.metering));
+    output.append(",\n");
+    const auto signed_setting = [&output](const char* key, const double value) {
+        append_key(output, key);
+        append_json_finite_number(output, value);
+        output.append(",\n");
+    };
+    signed_setting("exposure_compensation_ev", result.exposure.compensation_ev);
+    signed_setting("exposure_minimum_ev", result.exposure.minimum_ev);
+    signed_setting("exposure_maximum_ev", result.exposure.maximum_ev);
+    timing("exposure_low_percentile", result.exposure.low_percentile);
+    timing("exposure_high_percentile", result.exposure.high_percentile);
+    timing("exposure_brighten_seconds", result.exposure.brighten_seconds);
+    timing("exposure_darken_seconds", result.exposure.darken_seconds);
+    timing("exposure_multiplier", result.exposure_state.exposure);
+    timing("exposure_target_multiplier", result.exposure_state.target_exposure);
+    timing("exposure_average_luminance", result.exposure_state.average_luminance);
+    integer("exposure_sample_weight", result.exposure_state.sample_weight);
+    integer("exposure_invalid_samples", result.exposure_state.invalid_sample_count);
+    append_key(output, "color_grading_requested");
+    append_json_string(output, to_token(result.color_grading));
+    output.append(",\n");
+    append_key(output, "color_grading_actual");
+    append_json_string(output, to_token(result.color_grading_actual));
+    output.append(",\n");
+    integer("color_grading_lut_size", grading_lut_size(result.color_grading_lut_size));
+    append_key(output, "color_grading_lut");
+    append_json_string(output, "identity");
+    output.append(",\n");
+    append_key(output, "color_grading_format");
+    append_json_string(output, "rgba16f");
+    output.append(",\n");
+    append_key(output, "color_grading_domain");
+    append_json_string(output, "linear-rec709-[0,1]");
+    output.append(",\n");
+    append_key(output, "subsurface_requested");
+    append_json_string(output, to_token(result.subsurface));
+    output.append(",\n");
+    append_key(output, "subsurface_actual");
+    append_json_string(output, to_token(result.subsurface_actual));
+    output.append(",\n");
+    boolean("subsurface_provisioned", result.subsurface_provisioned);
+    integer("subsurface_active_material_count", result.subsurface_active_material_count);
+    integer("subsurface_resident_bytes", result.subsurface_resident_bytes);
     boolean("lighting_room", result.lighting_room);
+    append_key(output, "render_fixture");
+    append_json_string(output, result.render_fixture);
+    output.append(",\n");
+    integer("motion_fixture_fps", result.motion_fixture_fps);
+    append_key(output, "light_swarm_layout");
+    append_json_string(output, result.light_swarm_layout);
+    output.append(",\n");
+    append_key(output, "local_light_backend_requested");
+    append_json_string(output, result.local_light_backend_requested);
+    output.append(",\n");
+    append_key(output, "local_light_backend_actual");
+    append_json_string(output, result.local_light_backend_actual);
+    output.append(",\n");
+    integer("local_light_count", result.local_light_count);
+    integer("local_light_assignments", result.local_light_assignments);
+    integer("local_light_maximum_list", result.local_light_maximum_list);
+    integer("local_light_overflow_clusters", result.local_light_overflow_clusters);
+    integer("local_light_dropped", result.local_light_dropped);
     timing("time_of_day_end", result.lighting.hour);
     timing("day_length_seconds", result.lighting.day_seconds);
     timing("gi_extent", result.lighting.gi_extent);
@@ -554,6 +694,40 @@ std::string benchmark_result_to_json(const BenchmarkResult& result) {
     append_key(output, "anti_aliasing_quality");
     append_json_string(output, result.anti_aliasing_quality);
     output.append(",\n");
+    append_key(output, "anti_aliasing_requested");
+    append_json_string(output, result.anti_aliasing_requested);
+    output.append(",\n");
+    append_key(output, "anti_aliasing_actual");
+    append_json_string(output, result.anti_aliasing_actual);
+    output.append(",\n");
+    append_key(output, "smaa_mode");
+    append_json_string(output, result.smaa_mode);
+    output.append(",\n");
+    integer("smaa_temporal_samples", result.smaa_temporal_samples);
+    integer("smaa_history_resident_bytes", result.smaa_history_resident_bytes);
+    integer("smaa_history_incremental_bytes", result.smaa_history_incremental_bytes);
+    boolean("smaa_history_reuses_fsr_output", result.smaa_history_reuses_fsr_output);
+    integer("msaa_samples_requested", result.msaa_samples_requested);
+    integer("msaa_samples_actual", result.msaa_samples_actual);
+    boolean("msaa_2x_supported", result.msaa_2x_supported);
+    boolean("msaa_4x_supported", result.msaa_4x_supported);
+    integer("msaa_resident_bytes", result.msaa_resident_bytes);
+    append_key(output, "motion_blur_requested");
+    append_json_string(output, to_token(result.motion_blur.mode));
+    output.append(",\n");
+    append_key(output, "motion_blur_actual");
+    append_json_string(output, result.motion_blur_actual);
+    output.append(",\n");
+    append_key(output, "motion_blur_quality");
+    append_json_string(output, to_token(result.motion_blur.quality));
+    output.append(",\n");
+    append_key(output, "motion_blur_shutter");
+    append_json_string(output, to_token(result.motion_blur.shutter));
+    output.append(",\n");
+    timing("motion_blur_shutter_angle_degrees", result.motion_blur.shutter_angle_degrees);
+    timing("motion_blur_maximum_radius_pixels", result.motion_blur.maximum_radius_pixels);
+    timing("motion_blur_camera_fade_start", result.motion_blur.camera_fade_start);
+    timing("motion_blur_camera_fade_end", result.motion_blur.camera_fade_end);
     append_key(output, "instances");
     append_json_u64(output, result.instances);
     output.append(",\n");

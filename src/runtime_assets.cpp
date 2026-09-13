@@ -3,6 +3,9 @@
 #include <SDL3/SDL.h>
 
 #include <cstdint>
+#include <exception>
+#include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 
@@ -45,6 +48,24 @@ find_project_assets(std::filesystem::path candidate) {
 
 std::optional<RuntimeAssetRoot> find_runtime_asset_root() {
     std::error_code filesystem_error;
+    // SDL_getenv observes SDL's thread-safe environment snapshot. Read once per
+    // cold lookup and immediately copy the borrowed UTF-8 bytes into owned data.
+    if (const char* override_root = SDL_getenv("VCR_ASSET_ROOT")) {
+        if (*override_root == '\0') return std::nullopt;
+        try {
+            const std::string_view text(override_root);
+            const std::filesystem::path candidate(std::u8string(text.begin(), text.end()));
+            if (!std::filesystem::is_directory(candidate, filesystem_error) || filesystem_error) {
+                return std::nullopt;
+            }
+            auto root = std::filesystem::canonical(candidate, filesystem_error);
+            if (filesystem_error) return std::nullopt;
+            return RuntimeAssetRoot{.path = std::move(root), .project_owned = false};
+        } catch (const std::exception&) {
+            // Invalid UTF-8/path conversion must not silently load project data.
+            return std::nullopt;
+        }
+    }
     const std::filesystem::path working_directory =
         std::filesystem::current_path(filesystem_error);
     if (!filesystem_error) {

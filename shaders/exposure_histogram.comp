@@ -1,0 +1,89 @@
+#version 450
+
+// Vulkan 1.3 only guarantees 128 workgroup invocations. Each lane owns two
+// histogram bins so this remains portable without a device-specific pipeline.
+layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D sceneColor;
+layout(std430, set = 0, binding = 6) buffer ExposureState
+{
+    uint bins[256];
+    uint invalidSampleCount;
+    uint sampleWeight;
+    uint historyValid;
+    uint stateReserved;
+    float exposure;
+    float targetExposure;
+    float averageLuminance;
+    float statePadding;
+} exposureState;
+
+layout(push_constant) uniform ExposurePushConstants
+{
+    vec2 inverseResolution;
+    uint exposureMode;
+    uint sampleStride;
+    uvec2 sourceExtent;
+    uint metering;
+    uint reset;
+    float deltaSeconds;
+    float compensationEv;
+    float minimumEv;
+    float maximumEv;
+    float lowPercentile;
+    float highPercentile;
+    float brightenSeconds;
+    float darkenSeconds;
+} settings;
+
+shared uint localHistogram[256];
+
+void main()
+{
+    const uint lane = gl_LocalInvocationIndex;
+    localHistogram[lane] = 0u;
+    localHistogram[lane + 128u] = 0u;
+    barrier();
+
+    const uvec2 sampleOrigin = gl_GlobalInvocationID.xy * settings.sampleStride;
+    if (all(lessThan(sampleOrigin, settings.sourceExtent))) {
+        const uvec2 pixel = min(
+            sampleOrigin + uvec2(settings.sampleStride / 2u),
+            settings.sourceExtent - uvec2(1u));
+        const vec3 source = texelFetch(sceneColor, ivec2(pixel), 0).rgb;
+        const bool validSource = !any(isnan(source)) && !any(isinf(source));
+        if (!validSource) {
+            atomicAdd(exposureState.invalidSampleCount, 1u);
+        } else {
+            const vec3 radiance = max(source, vec3(0.0));
+            const float luminance = dot(radiance, vec3(0.2126, 0.7152, 0.0722));
+            uint bin = 0u;
+            if (luminance > 0.0) {
+                const float logLuminance = log2(luminance);
+                if (logLuminance >= 16.0) bin = 255u;
+                else if (logLuminance >= -16.0) {
+                    bin = 1u + uint(clamp(
+                        floor((logLuminance + 16.0) * (254.0 / 32.0)),
+                        0.0, 253.0));
+                }
+            }
+            uint weight = 1u;
+            if (settings.metering == 1u) {
+                const vec2 uv = (vec2(pixel) + 0.5) * settings.inverseResolution;
+                const vec2 centered = uv * 2.0 - 1.0;
+                const float centerWeight = clamp(
+                    1.0 - dot(centered, centered) * 0.5, 0.0, 1.0);
+                weight = 1u + uint(round(centerWeight * 3.0));
+            }
+            atomicAdd(localHistogram[bin], weight);
+        }
+    }
+    barrier();
+
+    const uint firstCount = localHistogram[lane];
+    if (firstCount != 0u) atomicAdd(exposureState.bins[lane], firstCount);
+    const uint secondCount = localHistogram[lane + 128u];
+    if (secondCount != 0u) {
+        atomicAdd(exposureState.bins[lane + 128u], secondCount);
+    }
+}

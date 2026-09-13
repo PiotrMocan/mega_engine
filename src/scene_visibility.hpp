@@ -44,6 +44,7 @@ class ViewFrustum final {
 // A cell is filled only when ALL four corners lie inside the silhouette of
 // a real opaque convex occluder. Its stored depth is the FARTHEST box depth.
 // Partially covered cells remain visible. No temporal data or GPU readback.
+// Matrices and the uploaded grid use reverse-Z (near=1, far/unknown=0).
 class OcclusionGrid final {
   public:
     static constexpr unsigned width = 32, height = 18;

@@ -15,6 +15,10 @@ layout(set=LIGHTING_SET,binding=0,std140) uniform Lighting {
     vec4 volumeOriginCell;
     vec4 options;
     vec4 volumeParameters;
+    uvec4 localLightCounts;
+    vec4 clusterProjection;
+    vec4 clusterViewport;
+    uvec4 clusterDimensions;
 } lighting;
 vec3 dynamicSkyBackground(vec3 direction) {
     float elevation=sqrt(clamp(direction.y,0.0,1.0));
