@@ -719,6 +719,8 @@ void Renderer::initialize(VulkanContext &context, SDL_Window *window,
     editor_output_enabled_ = enable_editor_output;
     authored_scene_enabled_ =
         enable_authored_scene || enable_editor_output;
+    model_tessellation_enabled_ =
+        authored_scene_enabled_ && context.tessellation_shader_enabled();
     editor_scene_instances_.reserve(
         maximum_editor_scene_instances);
     local_lights_.reserve(maximum_local_lights);
@@ -1136,6 +1138,19 @@ void Renderer::create_editor_material_resources() {
         std::as_bytes(std::span{white_pixel}),
         4U,
         "editor default white metallic-roughness texture");
+    constexpr std::array<std::uint8_t, 4U> neutral_displacement_pixel{
+        128U, 128U, 128U, 255U};
+    editor_default_displacement_texture_.create(
+        *context_,
+        1U,
+        1U,
+        VK_FORMAT_R8G8B8A8_UNORM,
+        "editor default neutral displacement texture");
+    upload_to_device_texture(
+        editor_default_displacement_texture_,
+        std::as_bytes(std::span{neutral_displacement_pixel}),
+        4U,
+        "editor default neutral displacement texture");
 }
 
 std::optional<std::uint32_t> Renderer::find_or_load_editor_texture(const PreparedTexture &prepared,
@@ -1264,6 +1279,7 @@ Renderer::create_editor_material_descriptor(
     const GpuTexture& base_color,
     const GpuTexture& normal,
     const GpuTexture& metallic_roughness,
+    const GpuTexture& displacement,
     std::string& error) {
     if (editor_material_descriptor_pool_ == VK_NULL_HANDLE ||
         editor_material_descriptor_set_layout_ == VK_NULL_HANDLE) {
@@ -1309,6 +1325,11 @@ Renderer::create_editor_material_descriptor(
             .imageView = metallic_roughness.view(),
             .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         },
+        VkDescriptorImageInfo{
+            .sampler = displacement.sampler(),
+            .imageView = displacement.view(),
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        },
     };
     const std::array writes{
         VkWriteDescriptorSet{
@@ -1336,6 +1357,14 @@ Renderer::create_editor_material_descriptor(
             .descriptorCount = 1U,
             .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
             .pImageInfo = &image_infos[2U],
+        },
+        VkWriteDescriptorSet{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = descriptor_set,
+            .dstBinding = 3U,
+            .descriptorCount = 1U,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &image_infos[3U],
         },
     };
     vkUpdateDescriptorSets(
@@ -1471,6 +1500,7 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
         std::optional<std::uint32_t> base_color_index;
         std::optional<std::uint32_t> normal_index;
         std::optional<std::uint32_t> metallic_roughness_index;
+        std::optional<std::uint32_t> displacement_index;
         const auto load_slot =
             [this, &prepared, &relative_path](const std::optional<std::filesystem::path> &reference,
                                               const CookedTextureSemantic expected_semantic,
@@ -1524,6 +1554,11 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
                 CookedTextureSemantic::metallic_roughness,
                 CookedTextureColorSpace::linear,
                 metallic_roughness_index);
+            load_slot(
+                material->displacement_texture,
+                CookedTextureSemantic::displacement,
+                CookedTextureColorSpace::linear,
+                displacement_index);
         }
         const GpuTexture& base_color =
             base_color_index
@@ -1537,9 +1572,13 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
             metallic_roughness_index
             ? editor_texture_assets_[*metallic_roughness_index].texture
             : editor_default_metallic_roughness_texture_;
+        const GpuTexture& displacement =
+            displacement_index
+            ? editor_texture_assets_[*displacement_index].texture
+            : editor_default_displacement_texture_;
         const auto descriptor =
             create_editor_material_descriptor(
-                base_color, normal, metallic_roughness, error);
+                base_color, normal, metallic_roughness, displacement, error);
         if (!descriptor) {
             if (material_index > 0U) {
                 const std::uint32_t allocated_count =
@@ -1569,6 +1608,7 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
         std::string material_relative_path;
         VkDescriptorSet material_descriptor =
             material_descriptors.front();
+        MaterialTessellation tessellation{};
         if (source.material_index < model.materials.size()) {
             material =
                 model.materials[source.material_index].factors;
@@ -1577,6 +1617,8 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
                     .relative_path.generic_string();
             material_descriptor =
                 material_descriptors[source.material_index];
+            tessellation =
+                model.materials[source.material_index].tessellation;
         }
         glm::vec3 gi_albedo(1);
         if (source.material_index < model.materials.size()) {
@@ -1605,10 +1647,23 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
             gi_first = append_gi_triangles(triangles);
             gi_count = static_cast<std::uint32_t>(triangles.size());
         }
+        // Compute once during upload, in the same V-flipped coordinates as the
+        // vertex shader. Use LOD0 bounds for every LOD so fading stays stationary.
+        glm::vec2 minimum_uv(std::numeric_limits<float>::max());
+        glm::vec2 maximum_uv(std::numeric_limits<float>::lowest());
+        for (std::uint64_t i = source.first_index;
+             i < source.first_index + source.index_count; ++i) {
+            const auto& uv = model.vertices[model.indices[static_cast<std::size_t>(i)]].texcoord;
+            const glm::vec2 coordinate(uv[0], 1.0F - uv[1]);
+            minimum_uv = glm::min(minimum_uv, coordinate);
+            maximum_uv = glm::max(maximum_uv, coordinate);
+        }
         gpu_asset.submeshes.push_back(EditorModelSubmesh{
             .material_relative_path = std::move(material_relative_path),
             .material = sanitize_pbr_material(material),
             .material_descriptor_set = material_descriptor,
+            .tessellation = tessellation,
+            .tessellation_uv_bounds = glm::vec4(minimum_uv, maximum_uv),
             .first_index = static_cast<std::uint32_t>(source.first_index),
             .index_count = static_cast<std::uint32_t>(source.index_count),
             .gi_first = gi_first,
@@ -1619,6 +1674,24 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
             .lod_error = source.lod_error,
         });
     }
+
+    float maximum_displacement = 0.0F;
+    std::uint32_t tessellated_submeshes = 0U;
+    for (const EditorModelSubmesh& submesh : gpu_asset.submeshes) {
+        if (!submesh.tessellation.enabled()) {
+            continue;
+        }
+        maximum_displacement = std::max(
+            maximum_displacement,
+            submesh.tessellation.displacement_scale *
+                std::max(
+                    submesh.tessellation.displacement_center,
+                    1.0F - submesh.tessellation.displacement_center));
+        if (model_tessellation_enabled_) {
+            ++tessellated_submeshes;
+        }
+    }
+    gpu_asset.bounds.extent += glm::vec3(maximum_displacement);
 
     gpu_asset.vertex_buffer.create(
         *context_,
@@ -1645,6 +1718,7 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
 
     editor_model_assets_.push_back(std::move(gpu_asset));
     editor_model_gpu_bytes_ += gpu_bytes;
+    tessellated_material_count_ += tessellated_submeshes;
     return static_cast<std::uint32_t>(
         editor_model_assets_.size() - 1U);
 }
@@ -1856,6 +1930,8 @@ bool Renderer::update_editor_scene(
             }
             editor_model_draws_.push_back(EditorModelDraw{
                 .material_descriptor_set = submesh.material_descriptor_set,
+                .tessellation = submesh.tessellation,
+                .tessellation_uv_bounds = submesh.tessellation_uv_bounds,
                 .asset_index = *asset_index,
                 .first_index = submesh.first_index,
                 .index_count = submesh.index_count,
@@ -1926,9 +2002,10 @@ bool Renderer::update_editor_scene(
     return complete;
 }
 
-bool Renderer::apply_editor_material_factors(
+bool Renderer::apply_editor_material(
     const std::string_view material_relative_path,
-    PbrMaterial material) noexcept {
+    PbrMaterial material,
+    const MaterialTessellation tessellation) noexcept {
     if (!authored_scene_enabled_ ||
         material_relative_path.empty()) {
         return false;
@@ -1936,12 +2013,41 @@ bool Renderer::apply_editor_material_factors(
     material = sanitize_pbr_material(material);
     bool updated = false;
     for (EditorModelAsset& asset : editor_model_assets_) {
+        float maximum_growth = 0.0F;
         for (EditorModelSubmesh& submesh : asset.submeshes) {
             if (submesh.material_relative_path ==
                 material_relative_path) {
+                const auto displacement_bound = [](const MaterialTessellation& value) {
+                    return value.enabled()
+                        ? value.displacement_scale *
+                            std::max(
+                                value.displacement_center,
+                                1.0F - value.displacement_center)
+                        : 0.0F;
+                };
+                const bool was_active =
+                    model_tessellation_enabled_ &&
+                    submesh.tessellation.enabled();
+                const bool is_active =
+                    model_tessellation_enabled_ && tessellation.enabled();
+                if (was_active != is_active) {
+                    if (is_active) {
+                        ++tessellated_material_count_;
+                    } else if (tessellated_material_count_ > 0U) {
+                        --tessellated_material_count_;
+                    }
+                }
+                maximum_growth = std::max(
+                    maximum_growth,
+                    displacement_bound(tessellation) -
+                        displacement_bound(submesh.tessellation));
                 submesh.material = material;
+                submesh.tessellation = tessellation;
                 updated = true;
             }
+        }
+        if (maximum_growth > 0.0F) {
+            asset.bounds.extent += glm::vec3(maximum_growth);
         }
     }
     return updated;
@@ -3183,11 +3289,14 @@ void Renderer::destroy_scene_resources() noexcept {
         editor_material_descriptor_pool_ = VK_NULL_HANDLE;
     }
     editor_material_descriptor_count_ = 0U;
+    tessellated_material_count_ = 0U;
     editor_model_assets_.clear();
     editor_texture_assets_.clear();
+    editor_default_displacement_texture_.destroy();
     editor_default_metallic_roughness_texture_.destroy();
     editor_default_normal_texture_.destroy();
     editor_default_base_color_texture_.destroy();
+    model_tessellation_enabled_ = false;
     editor_model_gpu_bytes_ = 0U;
     editor_texture_gpu_bytes_ = 0U;
 #endif
@@ -3266,7 +3375,7 @@ void Renderer::create_descriptors() {
         const VkDescriptorPoolSize material_pool_size{
             .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
             .descriptorCount =
-                maximum_editor_material_descriptors * 3U,
+                maximum_editor_material_descriptors * 4U,
         };
         const VkDescriptorPoolCreateInfo material_pool_info{
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -3870,7 +3979,11 @@ void Renderer::record_shadow_map(VkCommandBuffer command_buffer, FrameContext &f
         ++lighting_statistics_.shadow_tiles;
         const auto &matrix =
             cascades == 4 ? lighting_uniforms_.shadow_matrices[cascade] : light_view_projection_;
-        vkCmdPushConstants(command_buffer, pipeline_layout_, VK_SHADER_STAGE_VERTEX_BIT, 16, 64,
+        const VkShaderStageFlags shadow_push_stages =
+            VK_SHADER_STAGE_VERTEX_BIT |
+            VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+            VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+        vkCmdPushConstants(command_buffer, pipeline_layout_, shadow_push_stages, 16, 64,
                            &matrix);
         const VkViewport viewport{
             .x = static_cast<float>(x),
@@ -3913,9 +4026,48 @@ void Renderer::record_shadow_map(VkCommandBuffer command_buffer, FrameContext &f
                 vkCmdDrawIndexed(command_buffer, cube_index_count, editor_cube_count_, 0, 0,
                                  editor_ground_count_);
             }
-            vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                              model_shadow_pipeline_.get());
+            VkPipeline bound_model_shadow_pipeline = VK_NULL_HANDLE;
             for (const auto &draw : editor_model_draws_) {
+                const bool tessellated_draw =
+                    model_tessellation_enabled_ &&
+                    draw.tessellation.enabled();
+                const VkPipeline desired_pipeline = tessellated_draw
+                    ? tessellated_model_shadow_pipeline_.get()
+                    : model_shadow_pipeline_.get();
+                if (desired_pipeline != bound_model_shadow_pipeline) {
+                    vkCmdBindPipeline(
+                        command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                        desired_pipeline);
+                    bound_model_shadow_pipeline = desired_pipeline;
+                }
+                vkCmdBindDescriptorSets(
+                    command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    pipeline_layout_, 1U, 1U,
+                    &draw.material_descriptor_set, 0U, nullptr);
+                if (tessellated_draw) {
+                    const MaterialTessellation& settings = draw.tessellation;
+                    const std::array tessellation_push{
+                        settings.displacement_scale,
+                        settings.displacement_center,
+                        static_cast<float>(tile) /
+                            (2.0F * std::max(settings.target_edge_pixels, 1.0F)),
+                        settings.maximum_factor,
+                        settings.up_facing_only != 0U ? 1.0F : 0.0F,
+                        settings.normal_threshold,
+                        settings.uv_edge_fade,
+                        1.0F, // Shadow cascade viewports are square.
+                        draw.tessellation_uv_bounds.x,
+                        draw.tessellation_uv_bounds.y,
+                        draw.tessellation_uv_bounds.z,
+                        draw.tessellation_uv_bounds.w,
+                    };
+                    vkCmdPushConstants(
+                        command_buffer, pipeline_layout_,
+                        VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+                            VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
+                        80U, sizeof(tessellation_push),
+                        tessellation_push.data());
+                }
                 const auto &asset = editor_model_assets_[draw.asset_index];
                 const VkBuffer vertices = asset.vertex_buffer.handle();
                 vkCmdBindVertexBuffers(command_buffer, 0, 1, &vertices, &vertex_offset);
@@ -4154,7 +4306,8 @@ void Renderer::upload_to_device_texture(
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT,
             VK_ACCESS_2_TRANSFER_READ_BIT,
-            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT,
             VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
             source_level,
             1U);
@@ -4171,7 +4324,8 @@ void Renderer::upload_to_device_texture(
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         VK_PIPELINE_STAGE_2_TRANSFER_BIT,
         VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+            VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT,
         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
         final_level,
         1U);
@@ -4776,7 +4930,10 @@ void Renderer::create_pipeline() {
             .binding = 0,
             .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
             .descriptorCount = 1,
-            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT |
+                VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+                VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT |
+                VK_SHADER_STAGE_FRAGMENT_BIT,
             .pImmutableSamplers = nullptr,
         },
         VkDescriptorSetLayoutBinding{
@@ -4848,6 +5005,13 @@ void Renderer::create_pipeline() {
                 .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
                 .pImmutableSamplers = nullptr,
             },
+            VkDescriptorSetLayoutBinding{
+                .binding = 3U,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = 1U,
+                .stageFlags = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
+                .pImmutableSamplers = nullptr,
+            },
         };
         const VkDescriptorSetLayoutCreateInfo material_layout_info{
             .sType =
@@ -4867,6 +5031,14 @@ void Renderer::create_pipeline() {
     const std::array push_constants{
         VkPushConstantRange{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16},
         VkPushConstantRange{VK_SHADER_STAGE_VERTEX_BIT, 16, 64},
+        VkPushConstantRange{
+            VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+            16,
+            112},
+        VkPushConstantRange{
+            VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
+            16,
+            112},
     };
     const std::array geometry_set_layouts{
         descriptor_set_layout_, editor_material_descriptor_set_layout_, lighting_layout_.get()};
@@ -4875,7 +5047,7 @@ void Renderer::create_pipeline() {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = geometry_set_layout_count,
         .pSetLayouts = geometry_set_layouts.data(),
-        .pushConstantRangeCount = 2,
+        .pushConstantRangeCount = static_cast<std::uint32_t>(push_constants.size()),
         .pPushConstantRanges = push_constants.data(),
     };
     VK_CHECK(vkCreatePipelineLayout(
@@ -5146,6 +5318,14 @@ void Renderer::create_pipeline() {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
         .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
     };
+    const VkPipelineInputAssemblyStateCreateInfo patch_input_assembly{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST,
+    };
+    const VkPipelineTessellationStateCreateInfo tessellation_state{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO,
+        .patchControlPoints = 3U,
+    };
     const VkVertexInputBindingDescription terrain_vertex_binding{
         .binding = 0,
         .stride = sizeof(TerrainVertex),
@@ -5267,7 +5447,24 @@ void Renderer::create_pipeline() {
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
             };
             info.pNext = &rendering;
-            info.stageCount = 1;
+            const bool tessellated = source.pTessellationState != nullptr;
+            ShaderModule tessellated_depth_evaluation;
+            std::array<VkPipelineShaderStageCreateInfo, 3U>
+                tessellated_depth_stages{};
+            if (tessellated) {
+                std::copy_n(
+                    source.pStages, 3U,
+                    tessellated_depth_stages.begin());
+                tessellated_depth_evaluation =
+                    load_shader("editor_model_tess_depth.tese.spv");
+                tessellated_depth_stages[2U].module =
+                    tessellated_depth_evaluation.get();
+                info.stageCount = static_cast<std::uint32_t>(
+                    tessellated_depth_stages.size());
+                info.pStages = tessellated_depth_stages.data();
+            } else {
+                info.stageCount = 1U;
+            }
             info.pDepthStencilState = &depth_stencil;
             info.pColorBlendState = &no_color;
             VK_CHECK(vkCreateGraphicsPipelines(context_->device(), pipeline_cache_, 1, &info,
@@ -5275,18 +5472,33 @@ void Renderer::create_pipeline() {
             context_->set_debug_name(VK_OBJECT_TYPE_PIPELINE, handle_value(depth.get()),
                                      "opaque depth-only prepass pipeline");
             if (fade_depth != nullptr) {
-                const ShaderModule coverage_vertex = load_shader("editor_model_depth.vert.spv");
+                ShaderModule coverage_vertex;
+                if (!tessellated) {
+                    coverage_vertex = load_shader("editor_model_depth.vert.spv");
+                }
                 const ShaderModule coverage = load_shader("lod_depth.frag.spv");
-                const std::array coverage_stages{
-                    VkPipelineShaderStageCreateInfo{
+                ShaderModule tessellated_fade_evaluation;
+                std::array<VkPipelineShaderStageCreateInfo, 4U> coverage_stages{};
+                std::uint32_t coverage_stage_count = 0U;
+                if (tessellated) {
+                    std::copy_n(source.pStages, 3U, coverage_stages.begin());
+                    tessellated_fade_evaluation =
+                        load_shader("editor_model_tess_depth_fade.tese.spv");
+                    coverage_stages[2U].module =
+                        tessellated_fade_evaluation.get();
+                    coverage_stage_count = 3U;
+                } else {
+                    coverage_stages[0] = VkPipelineShaderStageCreateInfo{
                         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                         .stage = VK_SHADER_STAGE_VERTEX_BIT,
-                        .module = coverage_vertex.get(), .pName = "main"},
-                    VkPipelineShaderStageCreateInfo{
-                        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                        .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-                        .module = coverage.get(), .pName = "main"}};
-                info.stageCount = static_cast<std::uint32_t>(coverage_stages.size());
+                        .module = coverage_vertex.get(), .pName = "main"};
+                    coverage_stage_count = 1U;
+                }
+                coverage_stages[coverage_stage_count++] = VkPipelineShaderStageCreateInfo{
+                    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                    .module = coverage.get(), .pName = "main"};
+                info.stageCount = coverage_stage_count;
                 info.pStages = coverage_stages.data();
                 VK_CHECK(vkCreateGraphicsPipelines(context_->device(), pipeline_cache_, 1, &info,
                     nullptr, fade_depth->put(context_->device(), vkDestroyPipeline)));
@@ -5368,8 +5580,7 @@ void Renderer::create_pipeline() {
         VkGraphicsPipelineCreateInfo editor_model_pipeline_info =
             pipeline_info;
         editor_model_pipeline_info.stageCount =
-            static_cast<std::uint32_t>(
-                editor_model_stages.size());
+            static_cast<std::uint32_t>(editor_model_stages.size());
         editor_model_pipeline_info.pStages =
             editor_model_stages.data();
         editor_model_pipeline_info.pVertexInputState =
@@ -5387,6 +5598,60 @@ void Renderer::create_pipeline() {
             VK_OBJECT_TYPE_PIPELINE,
             handle_value(editor_model_pipeline_),
             "textured editor model graphics pipeline");
+
+        if (model_tessellation_enabled_) {
+            const ShaderModule tessellated_vertex =
+                load_shader("editor_model_tess.vert.spv");
+            const ShaderModule tessellated_control =
+                load_shader("editor_model_tess.tesc.spv");
+            const ShaderModule tessellated_evaluation =
+                load_shader("editor_model_tess.tese.spv");
+            const std::array tessellated_stages{
+                VkPipelineShaderStageCreateInfo{
+                    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    .stage = VK_SHADER_STAGE_VERTEX_BIT,
+                    .module = tessellated_vertex.get(),
+                    .pName = "main",
+                },
+                VkPipelineShaderStageCreateInfo{
+                    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    .stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+                    .module = tessellated_control.get(),
+                    .pName = "main",
+                },
+                VkPipelineShaderStageCreateInfo{
+                    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    .stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
+                    .module = tessellated_evaluation.get(),
+                    .pName = "main",
+                },
+                VkPipelineShaderStageCreateInfo{
+                    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                    .module = editor_model_fragment_module.get(),
+                    .pName = "main",
+                    .pSpecializationInfo = &gi_specialization,
+                },
+            };
+            VkGraphicsPipelineCreateInfo tessellated_info =
+                editor_model_pipeline_info;
+            tessellated_info.stageCount =
+                static_cast<std::uint32_t>(tessellated_stages.size());
+            tessellated_info.pStages = tessellated_stages.data();
+            tessellated_info.pInputAssemblyState = &patch_input_assembly;
+            tessellated_info.pTessellationState = &tessellation_state;
+            create_prepass_variants(
+                tessellated_info, equal_direct_.tessellated_models,
+                depth_geometry_.tessellated_models,
+                &lod_depth_tessellated_model_);
+            VK_CHECK(vkCreateGraphicsPipelines(
+                context_->device(), pipeline_cache_, 1U, &tessellated_info,
+                nullptr, &tessellated_editor_model_pipeline_));
+            context_->set_debug_name(
+                VK_OBJECT_TYPE_PIPELINE,
+                handle_value(tessellated_editor_model_pipeline_),
+                "tessellated editor model graphics pipeline");
+        }
     }
 #endif
     const ShaderModule terrain_vertex_module =
@@ -5441,33 +5706,64 @@ void Renderer::create_pipeline() {
     spatial_rendering_info.colorAttachmentCount = 1U;
     const auto create_aa_geometry_pipeline =
         [this, &gi_specialization, &pipeline_info, &aa_rendering_info, &aa_color_blend,
-         &spatial_rendering_info, &color_blend, &create_prepass_variants](
+         &spatial_rendering_info, &color_blend, &create_prepass_variants,
+         &patch_input_assembly, &tessellation_state](
             const std::filesystem::path &vertex_path, const std::filesystem::path &fragment_path,
             const VkPipelineVertexInputStateCreateInfo &vertex_input_state,
             const VkPipelineInputAssemblyStateCreateInfo &input_assembly_state,
             const char *const debug_name, DeviceObject<VkPipeline> &equal,
             DeviceObject<VkPipeline> &depth, const bool temporal = true,
             const VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT,
-            DeviceObject<VkPipeline>* const fade_depth = nullptr) {
+            DeviceObject<VkPipeline>* const fade_depth = nullptr,
+            const bool tessellated_model = false) {
             const ShaderModule vertex =
-                load_shader(vertex_path);
+                load_shader(tessellated_model
+                    ? std::filesystem::path("editor_model_tess.vert.spv")
+                    : vertex_path);
+            ShaderModule tessellation_control;
+            ShaderModule tessellation_evaluation;
+            if (tessellated_model) {
+                tessellation_control =
+                    load_shader("editor_model_tess.tesc.spv");
+                tessellation_evaluation = load_shader(
+                    temporal
+                    ? "editor_model_tess_aa.tese.spv"
+                    : "editor_model_tess.tese.spv");
+            }
             const ShaderModule fragment =
                 load_shader(fragment_path);
-            const std::array shader_stages{
-                VkPipelineShaderStageCreateInfo{
-                    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                    .stage = VK_SHADER_STAGE_VERTEX_BIT,
-                    .module = vertex.get(),
-                    .pName = "main",
-                },
+            std::array<VkPipelineShaderStageCreateInfo, 4U> shader_stages{};
+            shader_stages[0] = VkPipelineShaderStageCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = VK_SHADER_STAGE_VERTEX_BIT,
+                .module = vertex.get(),
+                .pName = "main",
+            };
+            std::uint32_t shader_stage_count = 1U;
+            if (tessellated_model) {
+                shader_stages[shader_stage_count++] =
+                    VkPipelineShaderStageCreateInfo{
+                        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                        .stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+                        .module = tessellation_control.get(),
+                        .pName = "main",
+                    };
+                shader_stages[shader_stage_count++] =
+                    VkPipelineShaderStageCreateInfo{
+                        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                        .stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
+                        .module = tessellation_evaluation.get(),
+                        .pName = "main",
+                    };
+            }
+            shader_stages[shader_stage_count++] =
                 VkPipelineShaderStageCreateInfo{
                     .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                     .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
                     .module = fragment.get(),
                     .pName = "main",
                     .pSpecializationInfo = &gi_specialization,
-                },
-            };
+                };
             VkGraphicsPipelineCreateInfo info = pipeline_info;
             VkPipelineMultisampleStateCreateInfo sample_state =
                 *pipeline_info.pMultisampleState;
@@ -5475,18 +5771,16 @@ void Renderer::create_pipeline() {
             sample_state.sampleShadingEnable = VK_FALSE;
             info.pMultisampleState = &sample_state;
             info.pNext = temporal ? &aa_rendering_info : &spatial_rendering_info;
-            info.stageCount =
-                static_cast<std::uint32_t>(shader_stages.size());
+            info.stageCount = shader_stage_count;
             info.pStages = shader_stages.data();
             info.pVertexInputState = &vertex_input_state;
             info.pInputAssemblyState = &input_assembly_state;
-            info.pColorBlendState = temporal ? &aa_color_blend : &color_blend;
-            DeviceObject<VkPipeline>* effective_fade_depth = fade_depth;
-            if (effective_fade_depth == nullptr &&
-                &depth == &depth_temporal_geometry_.models) {
-                effective_fade_depth = &lod_depth_temporal_model_;
+            if (tessellated_model) {
+                info.pInputAssemblyState = &patch_input_assembly;
+                info.pTessellationState = &tessellation_state;
             }
-            create_prepass_variants(info, equal, depth, effective_fade_depth);
+            info.pColorBlendState = temporal ? &aa_color_blend : &color_blend;
+            create_prepass_variants(info, equal, depth, fade_depth);
             DeviceObject<VkPipeline> result;
             VK_CHECK(vkCreateGraphicsPipelines(
                 context_->device(),
@@ -5530,7 +5824,21 @@ void Renderer::create_pipeline() {
                 editor_model_vertex_input,
                 input_assembly,
                 "AA textured editor model graphics pipeline", equal_temporal_.models,
-                depth_temporal_geometry_.models);
+                depth_temporal_geometry_.models, true, VK_SAMPLE_COUNT_1_BIT,
+                &lod_depth_temporal_model_);
+        if (model_tessellation_enabled_) {
+            aa_tessellated_editor_model_pipeline_ =
+                create_aa_geometry_pipeline(
+                    "editor_model_aa.vert.spv",
+                    "editor_model_aa.frag.spv",
+                    editor_model_vertex_input,
+                    input_assembly,
+                    "AA tessellated editor model graphics pipeline",
+                    equal_temporal_.tessellated_models,
+                    depth_temporal_geometry_.tessellated_models,
+                    true, VK_SAMPLE_COUNT_1_BIT,
+                    &lod_depth_temporal_tessellated_model_, true);
+        }
     }
 #endif
     aa_terrain_pipeline_ = create_aa_geometry_pipeline(
@@ -5551,7 +5859,18 @@ void Renderer::create_pipeline() {
         smaa_geometry_.models = create_aa_geometry_pipeline(
             "editor_model.vert.spv", "editor_model.frag.spv",
             editor_model_vertex_input, input_assembly,
-            "SMAA color-only model pipeline", equal_spatial_.models, depth_geometry_.models, false);
+            "SMAA color-only model pipeline", equal_spatial_.models,
+            depth_geometry_.models, false);
+        if (model_tessellation_enabled_) {
+            smaa_geometry_.tessellated_models =
+                create_aa_geometry_pipeline(
+                    "editor_model.vert.spv", "editor_model.frag.spv",
+                    editor_model_vertex_input, input_assembly,
+                    "SMAA color-only tessellated model pipeline",
+                    equal_spatial_.tessellated_models,
+                    depth_geometry_.tessellated_models, false,
+                    VK_SAMPLE_COUNT_1_BIT, nullptr, true);
+        }
     }
 #endif
     smaa_geometry_.terrain = create_aa_geometry_pipeline(
@@ -5580,6 +5899,16 @@ void Renderer::create_pipeline() {
                 editor_model_vertex_input, input_assembly, debug_name,
                 equal_msaa_[index].models, depth_msaa_geometry_[index].models,
                 false, msaa_samples[index], &lod_depth_msaa_model_[index]);
+            if (model_tessellation_enabled_) {
+                msaa_geometry_[index].tessellated_models =
+                    create_aa_geometry_pipeline(
+                        "editor_model.vert.spv", "editor_model.frag.spv",
+                        editor_model_vertex_input, input_assembly, debug_name,
+                        equal_msaa_[index].tessellated_models,
+                        depth_msaa_geometry_[index].tessellated_models,
+                        false, msaa_samples[index],
+                        &lod_depth_msaa_tessellated_model_[index], true);
+            }
         }
 #endif
         msaa_geometry_[index].terrain = create_aa_geometry_pipeline(
@@ -5621,7 +5950,8 @@ void Renderer::create_pipeline() {
     const auto create_subsurface_geometry_pipeline =
         [this, &gi_specialization, &pipeline_info, &create_prepass_variants,
          &sss_spatial_rendering, &sss_temporal_rendering,
-         &sss_spatial_blend, &sss_temporal_blend](
+         &sss_spatial_blend, &sss_temporal_blend,
+         &patch_input_assembly, &tessellation_state](
             const std::filesystem::path& vertex_path,
             const std::filesystem::path& fragment_path,
             const VkPipelineVertexInputStateCreateInfo& vertex_input_state,
@@ -5629,32 +5959,64 @@ void Renderer::create_pipeline() {
             const bool temporal,
             DeviceObject<VkPipeline>& equal,
             DeviceObject<VkPipeline>& existing_depth,
-            const char* debug_name) {
-            const ShaderModule vertex = load_shader(vertex_path);
+            const char* debug_name,
+            const bool tessellated_model = false) {
+            const ShaderModule vertex = load_shader(
+                tessellated_model
+                ? std::filesystem::path("editor_model_tess.vert.spv")
+                : vertex_path);
+            ShaderModule tessellation_control;
+            ShaderModule tessellation_evaluation;
+            if (tessellated_model) {
+                tessellation_control =
+                    load_shader("editor_model_tess.tesc.spv");
+                tessellation_evaluation = load_shader(
+                    temporal
+                    ? "editor_model_tess_aa.tese.spv"
+                    : "editor_model_tess.tese.spv");
+            }
             const ShaderModule fragment = load_shader(fragment_path);
-            const std::array stages{
-                VkPipelineShaderStageCreateInfo{
+            std::array<VkPipelineShaderStageCreateInfo, 4U> stages{};
+            stages[0] = VkPipelineShaderStageCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = VK_SHADER_STAGE_VERTEX_BIT,
+                .module = vertex.get(),
+                .pName = "main",
+            };
+            std::uint32_t stage_count = 1U;
+            if (tessellated_model) {
+                stages[stage_count++] = VkPipelineShaderStageCreateInfo{
                     .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                    .stage = VK_SHADER_STAGE_VERTEX_BIT,
-                    .module = vertex.get(),
+                    .stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+                    .module = tessellation_control.get(),
                     .pName = "main",
-                },
-                VkPipelineShaderStageCreateInfo{
+                };
+                stages[stage_count++] = VkPipelineShaderStageCreateInfo{
                     .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                    .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-                    .module = fragment.get(),
+                    .stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
+                    .module = tessellation_evaluation.get(),
                     .pName = "main",
-                    .pSpecializationInfo = &gi_specialization,
-                },
+                };
+            }
+            stages[stage_count++] = VkPipelineShaderStageCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                .module = fragment.get(),
+                .pName = "main",
+                .pSpecializationInfo = &gi_specialization,
             };
             VkGraphicsPipelineCreateInfo info = pipeline_info;
             info.pNext = temporal
                 ? static_cast<const void*>(&sss_temporal_rendering)
                 : static_cast<const void*>(&sss_spatial_rendering);
-            info.stageCount = static_cast<std::uint32_t>(stages.size());
+            info.stageCount = stage_count;
             info.pStages = stages.data();
             info.pVertexInputState = &vertex_input_state;
             info.pInputAssemblyState = &input_assembly_state;
+            if (tessellated_model) {
+                info.pInputAssemblyState = &patch_input_assembly;
+                info.pTessellationState = &tessellation_state;
+            }
             info.pColorBlendState = temporal ? &sss_temporal_blend : &sss_spatial_blend;
             create_prepass_variants(info, equal, existing_depth);
             DeviceObject<VkPipeline> result;
@@ -5701,6 +6063,23 @@ void Renderer::create_pipeline() {
             editor_model_vertex_input, input_assembly, true,
             equal_subsurface_temporal_.models, depth_temporal_geometry_.models,
             "SSS temporal editor model pipeline");
+        if (model_tessellation_enabled_) {
+            subsurface_spatial_.tessellated_models =
+                create_subsurface_geometry_pipeline(
+                    "editor_model.vert.spv", "editor_model_sss.frag.spv",
+                    editor_model_vertex_input, input_assembly, false,
+                    equal_subsurface_spatial_.tessellated_models,
+                    depth_geometry_.tessellated_models,
+                    "SSS spatial tessellated editor model pipeline", true);
+            subsurface_temporal_.tessellated_models =
+                create_subsurface_geometry_pipeline(
+                    "editor_model_aa.vert.spv",
+                    "editor_model_aa_sss.frag.spv",
+                    editor_model_vertex_input, input_assembly, true,
+                    equal_subsurface_temporal_.tessellated_models,
+                    depth_temporal_geometry_.tessellated_models,
+                    "SSS temporal tessellated editor model pipeline", true);
+        }
     }
 #endif
 
@@ -5922,15 +6301,60 @@ void Renderer::create_pipeline() {
         context_->device(), pipeline_cache_, 1, &authored_shadow_info, nullptr,
         authored_shadow_pipeline_.put(context_->device(), vkDestroyPipeline)));
     auto model_shadow_input = editor_model_vertex_input;
-    model_shadow_input.vertexAttributeDescriptionCount = 1;
-    authored_shadow_info.pVertexInputState = &model_shadow_input;
+    model_shadow_input.vertexAttributeDescriptionCount = 1U;
+    VkGraphicsPipelineCreateInfo model_shadow_info = authored_shadow_info;
+    model_shadow_info.pVertexInputState = &model_shadow_input;
     VK_CHECK(vkCreateGraphicsPipelines(
-        context_->device(), pipeline_cache_, 1, &authored_shadow_info, nullptr,
+        context_->device(), pipeline_cache_, 1, &model_shadow_info, nullptr,
         model_shadow_pipeline_.put(context_->device(), vkDestroyPipeline)));
+    if (model_tessellation_enabled_) {
+        const ShaderModule model_shadow_vertex =
+            load_shader("editor_model_tess_shadow.vert.spv");
+        const ShaderModule model_shadow_control =
+            load_shader("editor_model_tess_shadow.tesc.spv");
+        const ShaderModule model_shadow_evaluation =
+            load_shader("editor_model_tess_shadow.tese.spv");
+        const std::array model_shadow_stages{
+            VkPipelineShaderStageCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = VK_SHADER_STAGE_VERTEX_BIT,
+                .module = model_shadow_vertex.get(),
+                .pName = "main",
+            },
+            VkPipelineShaderStageCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+                .module = model_shadow_control.get(),
+                .pName = "main",
+            },
+            VkPipelineShaderStageCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
+                .module = model_shadow_evaluation.get(),
+                .pName = "main",
+            },
+        };
+        model_shadow_info.stageCount =
+            static_cast<std::uint32_t>(model_shadow_stages.size());
+        model_shadow_info.pStages = model_shadow_stages.data();
+        model_shadow_info.pVertexInputState = &editor_model_vertex_input;
+        model_shadow_info.pInputAssemblyState = &patch_input_assembly;
+        model_shadow_info.pTessellationState = &tessellation_state;
+        VK_CHECK(vkCreateGraphicsPipelines(
+            context_->device(), pipeline_cache_, 1, &model_shadow_info, nullptr,
+            tessellated_model_shadow_pipeline_.put(
+                context_->device(), vkDestroyPipeline)));
+    }
     context_->set_debug_name(VK_OBJECT_TYPE_PIPELINE, handle_value(authored_shadow_pipeline_.get()),
                              "authored cube shadow pipeline");
     context_->set_debug_name(VK_OBJECT_TYPE_PIPELINE, handle_value(model_shadow_pipeline_.get()),
                              "imported model shadow pipeline");
+    if (tessellated_model_shadow_pipeline_.get() != VK_NULL_HANDLE) {
+        context_->set_debug_name(
+            VK_OBJECT_TYPE_PIPELINE,
+            handle_value(tessellated_model_shadow_pipeline_.get()),
+            "tessellated imported model shadow pipeline");
+    }
 #endif
 
     const ShaderModule fullscreen_vertex_module =
@@ -6268,6 +6692,7 @@ void Renderer::destroy_pipeline() noexcept {
         depth_msaa_geometry_[index] = {};
         equal_msaa_[index] = {};
         lod_depth_msaa_model_[index].reset();
+        lod_depth_msaa_tessellated_model_[index].reset();
     }
     subsurface_horizontal_pipeline_.reset();
     subsurface_vertical_pipeline_.reset();
@@ -6279,6 +6704,8 @@ void Renderer::destroy_pipeline() noexcept {
     depth_temporal_geometry_ = {};
     lod_depth_model_.reset();
     lod_depth_temporal_model_.reset();
+    lod_depth_tessellated_model_.reset();
+    lod_depth_temporal_tessellated_model_.reset();
     equal_direct_ = {};
     equal_spatial_ = {};
     equal_temporal_ = {};
@@ -6287,9 +6714,12 @@ void Renderer::destroy_pipeline() noexcept {
     tonemap_pipeline_.reset();
     authored_shadow_pipeline_.reset();
     model_shadow_pipeline_.reset();
+    tessellated_model_shadow_pipeline_.reset();
     for (auto* const pipeline : {
              &smaa_geometry_.cubes, &smaa_geometry_.scene,
-             &smaa_geometry_.models, &smaa_geometry_.terrain,
+             &smaa_geometry_.models,
+             &smaa_geometry_.tessellated_models,
+             &smaa_geometry_.terrain,
              &smaa_geometry_.sky}) {
         pipeline->reset();
     }
@@ -6377,6 +6807,7 @@ void Renderer::destroy_pipeline() noexcept {
     aa_sky_pipeline_.reset();
 #if VCR_EDITOR_ENABLED
     aa_editor_model_pipeline_.reset();
+    aa_tessellated_editor_model_pipeline_.reset();
 #endif
     aa_scene_pipeline_.reset();
     aa_terrain_pipeline_.reset();
@@ -6400,6 +6831,11 @@ void Renderer::destroy_pipeline() noexcept {
         scene_pipeline_ = VK_NULL_HANDLE;
     }
 #if VCR_EDITOR_ENABLED
+    if (tessellated_editor_model_pipeline_ != VK_NULL_HANDLE) {
+        vkDestroyPipeline(
+            context_->device(), tessellated_editor_model_pipeline_, nullptr);
+        tessellated_editor_model_pipeline_ = VK_NULL_HANDLE;
+    }
     if (editor_model_pipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(
             context_->device(),
@@ -7124,11 +7560,13 @@ void Renderer::record_commands(
             const VkPipeline cube_pipeline,
             const VkPipeline scene_pipeline,
             const VkPipeline editor_model_pipeline,
+            const VkPipeline tessellated_editor_model_pipeline,
             const VkPipeline terrain_pipeline,
             const VkPipeline sky_pipeline,
             const bool depth_only = false) {
 #if !VCR_EDITOR_ENABLED
             static_cast<void>(editor_model_pipeline);
+            static_cast<void>(tessellated_editor_model_pipeline);
 #endif
             set_viewport(extent);
             const VkDescriptorSet descriptor_set =
@@ -7210,15 +7648,23 @@ void Renderer::record_commands(
                     const auto &model_draws =
                         gpu_visibility_active_ ? editor_model_draws_ : visible_model_draws_;
                     const bool include_models = !depth_only || depth_prepass_ == DepthPrepass::full;
-                    if (include_models && !model_draws.empty()) {
-                        vkCmdBindPipeline(
-                            command_buffer,
-                            VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            editor_model_pipeline);
-                    }
+                    VkPipeline bound_model_pipeline = VK_NULL_HANDLE;
                     for (std::size_t draw_index = 0; include_models && draw_index < model_draws.size();
                          ++draw_index) {
                         const auto &draw = model_draws[draw_index];
+                        const bool tessellated_draw =
+                            model_tessellation_enabled_ &&
+                            draw.tessellation.enabled();
+                        const VkPipeline desired_pipeline = tessellated_draw
+                            ? tessellated_editor_model_pipeline
+                            : editor_model_pipeline;
+                        if (desired_pipeline != bound_model_pipeline) {
+                            vkCmdBindPipeline(
+                                command_buffer,
+                                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                desired_pipeline);
+                            bound_model_pipeline = desired_pipeline;
+                        }
                         vkCmdBindDescriptorSets(
                             command_buffer,
                             VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -7228,6 +7674,33 @@ void Renderer::record_commands(
                             &draw.material_descriptor_set,
                             0U,
                             nullptr);
+                        if (tessellated_draw) {
+                            const MaterialTessellation& settings =
+                                draw.tessellation;
+                            const std::array tessellation_push{
+                                settings.displacement_scale,
+                                settings.displacement_center,
+                                static_cast<float>(extent.height) /
+                                    (2.0F * std::max(
+                                        settings.target_edge_pixels, 1.0F)),
+                                settings.maximum_factor,
+                                settings.up_facing_only != 0U ? 1.0F : 0.0F,
+                                settings.normal_threshold,
+                                settings.uv_edge_fade,
+                                static_cast<float>(extent.width) /
+                                    static_cast<float>(std::max(extent.height, 1U)),
+                                draw.tessellation_uv_bounds.x,
+                                draw.tessellation_uv_bounds.y,
+                                draw.tessellation_uv_bounds.z,
+                                draw.tessellation_uv_bounds.w,
+                            };
+                            vkCmdPushConstants(
+                                command_buffer, pipeline_layout_,
+                                VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+                                    VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
+                                80U, sizeof(tessellation_push),
+                                tessellation_push.data());
+                        }
                         const EditorModelAsset& asset =
                             editor_model_assets_[draw.asset_index];
                         const VkBuffer model_vertex_buffer =
@@ -7371,8 +7844,17 @@ void Renderer::record_commands(
                             : temporal ? lod_depth_temporal_model_.get()
                                        : lod_depth_model_.get())
             : pipelines.models.get();
+        const auto tessellated_model_depth =
+            lod_fade_actual() != LodFadePattern::off
+            ? (multisampled
+                   ? lod_depth_msaa_tessellated_model_[sample_index].get()
+                   : temporal
+                   ? lod_depth_temporal_tessellated_model_.get()
+                   : lod_depth_tessellated_model_.get())
+            : pipelines.tessellated_models.get();
         draw_geometry(extent, pipelines.cubes.get(), pipelines.scene.get(), model_depth,
-                      pipelines.terrain.get(), VK_NULL_HANDLE, true);
+                      tessellated_model_depth, pipelines.terrain.get(),
+                      VK_NULL_HANDLE, true);
         vkCmdEndRendering(command_buffer);
         // STORE/LOAD crosses dynamic rendering instances: make depth writes
         // visible to EQUAL tests, and serialize the non-prepassed model writes.
@@ -7700,7 +8182,13 @@ void Renderer::record_commands(
             authored_scene_enabled_
                 ? prepassed_pipeline(editor_model_pipeline_, equal_direct_.models, true)
                 : prepassed_pipeline(scene_pipeline_, equal_direct_.scene),
+            authored_scene_enabled_
+                ? prepassed_pipeline(
+                      tessellated_editor_model_pipeline_,
+                      equal_direct_.tessellated_models, true)
+                : prepassed_pipeline(scene_pipeline_, equal_direct_.scene),
 #else
+            prepassed_pipeline(scene_pipeline_, equal_direct_.scene),
             prepassed_pipeline(scene_pipeline_, equal_direct_.scene),
 #endif
             prepassed_pipeline(terrain_pipeline_, equal_direct_.terrain),
@@ -7922,7 +8410,13 @@ void Renderer::record_commands(
                 authored_scene_enabled_
                     ? prepassed_pipeline(pipelines.models.get(), equal.models, true)
                     : prepassed_pipeline(pipelines.scene.get(), equal.scene),
+                authored_scene_enabled_
+                    ? prepassed_pipeline(
+                          pipelines.tessellated_models.get(),
+                          equal.tessellated_models, true)
+                    : prepassed_pipeline(pipelines.scene.get(), equal.scene),
 #else
+                prepassed_pipeline(pipelines.scene.get(), equal.scene),
                 prepassed_pipeline(pipelines.scene.get(), equal.scene),
 #endif
                 prepassed_pipeline(pipelines.terrain.get(), equal.terrain),
@@ -7941,7 +8435,17 @@ void Renderer::record_commands(
                 authored_scene_enabled_
                     ? prepassed_pipeline((temporal ? aa_editor_model_pipeline_ : pipelines.models).get(), equal.models, true)
                     : prepassed_pipeline((temporal ? aa_scene_pipeline_ : pipelines.scene).get(), equal.scene),
+                authored_scene_enabled_
+                    ? prepassed_pipeline(
+                          (temporal
+                               ? aa_tessellated_editor_model_pipeline_
+                               : pipelines.tessellated_models).get(),
+                          equal.tessellated_models, true)
+                    : prepassed_pipeline(
+                          (temporal ? aa_scene_pipeline_ : pipelines.scene).get(),
+                          equal.scene),
 #else
+                prepassed_pipeline((temporal ? aa_scene_pipeline_ : pipelines.scene).get(), equal.scene),
                 prepassed_pipeline((temporal ? aa_scene_pipeline_ : pipelines.scene).get(), equal.scene),
 #endif
                 prepassed_pipeline((temporal ? aa_terrain_pipeline_ : pipelines.terrain).get(), equal.terrain),

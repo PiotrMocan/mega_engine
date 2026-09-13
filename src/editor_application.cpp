@@ -129,6 +129,39 @@ using Json = nlohmann::json;
     return result;
 }
 
+[[nodiscard]] Json material_snapshot_json(
+    const MaterialEditorSnapshot& snapshot) {
+    const MaterialTessellation& tessellation = snapshot.tessellation;
+    return Json{
+        {"path", snapshot.relative_path},
+        {"name", snapshot.name},
+        {"displacement_texture",
+         snapshot.displacement_texture.empty()
+            ? Json(nullptr) : Json(snapshot.displacement_texture)},
+        {"pbr", Json{
+            {"base_color", Json::array({
+                snapshot.material.base_color.r,
+                snapshot.material.base_color.g,
+                snapshot.material.base_color.b,
+                snapshot.material.base_color.a})},
+            {"metallic", snapshot.material.metallic},
+            {"roughness", snapshot.material.roughness},
+            {"ambient_occlusion", snapshot.material.ambient_occlusion},
+        }},
+        {"tessellation", Json{
+            {"enabled", tessellation.enabled_flag != 0U},
+            {"active", tessellation.enabled()},
+            {"displacement_scale", tessellation.displacement_scale},
+            {"displacement_center", tessellation.displacement_center},
+            {"target_edge_pixels", tessellation.target_edge_pixels},
+            {"maximum_factor", tessellation.maximum_factor},
+            {"up_facing_only", tessellation.up_facing_only != 0U},
+            {"normal_threshold", tessellation.normal_threshold},
+            {"uv_edge_fade", tessellation.uv_edge_fade},
+        }},
+    };
+}
+
 [[nodiscard]] std::filesystem::path path_from_utf8(
     const std::string_view text) {
     std::u8string encoded(text.size(), u8'\0');
@@ -383,9 +416,10 @@ void EditorApplication::main_loop() {
         }
         if (auto material_update =
                 ui_.consume_saved_material_update()) {
-            if (renderer_.apply_editor_material_factors(
+            if (renderer_.apply_editor_material(
                     material_update->relative_path,
-                    material_update->material)) {
+                    material_update->material,
+                    material_update->tessellation)) {
                 submitted_scene_revision_ = 0U;
                 renderer_.invalidate_editor_scene();
             }
@@ -617,6 +651,35 @@ void EditorApplication::execute_mcp_command(
                     {"history_entries", 32},
                 }},
             });
+        return;
+    }
+    case McpCommandType::editor_get_material: {
+        MaterialEditorSnapshot snapshot;
+        std::string error;
+        if (!ui_.inspect_material(
+                path_from_utf8(command.text.data()), snapshot, error)) {
+            fail(error);
+            return;
+        }
+        succeed(
+            "material asset",
+            Json{{"material", material_snapshot_json(snapshot)}});
+        return;
+    }
+    case McpCommandType::editor_set_material_tessellation: {
+        MaterialEditorSnapshot snapshot;
+        std::string error;
+        if (!ui_.set_material_tessellation(
+                path_from_utf8(command.text.data()),
+                command.tessellation,
+                snapshot,
+                error)) {
+            fail(error);
+            return;
+        }
+        succeed(
+            "material tessellation saved",
+            Json{{"material", material_snapshot_json(snapshot)}});
         return;
     }
     case McpCommandType::editor_set_selection:

@@ -470,6 +470,102 @@ int main() {
     expect(has_error(vcr::load_cooked_model_asset(asset_root, packed.metadata_relative),
                      CookedModelLoadErrorCode::invalid_material),
            "packed texture rejects non-string reference");
+    Fixture displaced = create_fixture(asset_root, "displaced");
+    displaced.material["textures"]["displacement"] =
+        "displacement.vcrtexture.json";
+    displaced.material["tessellation"] = {
+        {"enabled", true},
+        {"displacement_scale", 0.08F},
+        {"displacement_center", 0.5F},
+        {"target_edge_pixels", 18.0F},
+        {"maximum_factor", 16.0F},
+        {"up_facing_only", true},
+        {"normal_threshold", 0.55F},
+        {"uv_edge_fade", 0.04F},
+    };
+    expect(
+        write_json(
+            asset_root / "displaced/displacement.vcrtexture.json",
+            Json::object()) &&
+            write_json(displaced.material_absolute, displaced.material),
+        "displaced material fixture is written");
+    const auto displaced_loaded = vcr::load_cooked_model_asset(
+        asset_root, displaced.metadata_relative);
+    expect(
+        displaced_loaded &&
+            displaced_loaded->materials[0].displacement_texture ==
+                std::filesystem::path(
+                    "displaced/displacement.vcrtexture.json") &&
+            displaced_loaded->materials[0].tessellation.displacement_scale ==
+                0.08F &&
+            displaced_loaded->materials[0].tessellation.displacement_center ==
+                0.5F &&
+            displaced_loaded->materials[0].tessellation.target_edge_pixels ==
+                18.0F &&
+            displaced_loaded->materials[0].tessellation.maximum_factor ==
+                16.0F &&
+            displaced_loaded->materials[0].tessellation.enabled() &&
+            displaced_loaded->materials[0].tessellation.up_facing_only == 1U &&
+            displaced_loaded->materials[0].tessellation.normal_threshold ==
+                0.55F &&
+            displaced_loaded->materials[0].tessellation.uv_edge_fade ==
+                0.04F,
+        "material preserves validated tessellation and displacement settings");
+    displaced.material.erase("tessellation");
+    expect(write_json(displaced.material_absolute, displaced.material),
+           "unpaired displacement fixture is written");
+    expect(
+        static_cast<bool>(vcr::load_cooked_model_asset(
+            asset_root, displaced.metadata_relative)),
+        "displacement texture can be authored before tessellation is enabled");
+    displaced.material["tessellation"] = {
+        {"enabled", true},
+        {"displacement_scale", 0.08F},
+        {"displacement_center", 1.5F},
+        {"target_edge_pixels", 18.0F},
+        {"maximum_factor", 16.0F},
+        {"up_facing_only", true},
+        {"normal_threshold", 0.55F},
+        {"uv_edge_fade", 0.04F},
+    };
+    expect(write_json(displaced.material_absolute, displaced.material),
+           "invalid tessellation fixture is written");
+    expect(
+        has_error(
+            vcr::load_cooked_model_asset(
+                asset_root, displaced.metadata_relative),
+            CookedModelLoadErrorCode::invalid_material),
+        "out-of-range tessellation settings are rejected");
+    displaced.material["tessellation"] = {
+        {"enabled", true},
+        {"displacement_scale", 0.12F},
+        {"displacement_center", 0.5F},
+        {"target_edge_pixels", 10.0F},
+        {"maximum_factor", 16.0F},
+        {"up_facing_only", true},
+        {"normal_threshold", 0.55F},
+        {"uv_edge_fade", 0.04F},
+    };
+    displaced.material["textures"].erase("displacement");
+    expect(write_json(displaced.material_absolute, displaced.material),
+           "tessellation-without-height fixture is written");
+    expect(
+        has_error(
+            vcr::load_cooked_model_asset(
+                asset_root, displaced.metadata_relative),
+            CookedModelLoadErrorCode::invalid_material),
+        "tessellation without a displacement texture is rejected");
+    displaced.material["textures"]["displacement"] =
+        "displacement.vcrtexture.json";
+    displaced.material["tessellation"]["up_facing_only"] = "yes";
+    expect(write_json(displaced.material_absolute, displaced.material),
+           "invalid tessellation filter fixture is written");
+    expect(
+        has_error(
+            vcr::load_cooked_model_asset(
+                asset_root, displaced.metadata_relative),
+            CookedModelLoadErrorCode::invalid_material),
+        "tessellation boolean filters reject non-boolean values");
     if (loaded) {
         expect(
             loaded->metadata_relative_path ==

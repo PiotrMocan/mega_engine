@@ -451,6 +451,7 @@ try {
         color_grading = $state.structuredContent.render.color_grading
         subsurface = $state.structuredContent.render.subsurface
         anti_aliasing = $state.structuredContent.render.anti_aliasing
+        tessellation = $state.structuredContent.render.tessellation
         visibility_backend = $state.structuredContent.render.visibility_backend
         visibility = $state.structuredContent.render.visibility
         local_light_backend_requested = $localLighting.local_light_backend_requested

@@ -357,6 +357,9 @@ parse_semantic(const std::string_view value) {
     if (value == "metallic_roughness") {
         return CookedTextureSemantic::metallic_roughness;
     }
+    if (value == "displacement") {
+        return CookedTextureSemantic::displacement;
+    }
     if (value == "roughness") {
         return CookedTextureSemantic::roughness;
     }
@@ -653,12 +656,20 @@ parse_color_space(const std::string_view value) {
         }
 
         const Imf::RgbaChannels channels = input.channels();
-        if ((channels & Imf::WRITE_R) == 0 ||
-            (channels & Imf::WRITE_G) == 0 ||
-            (channels & Imf::WRITE_B) == 0) {
+        const bool rgb = (channels & Imf::WRITE_RGB) == Imf::WRITE_RGB;
+        const bool luminance = (channels & Imf::WRITE_Y) != 0 &&
+            (channels & Imf::WRITE_C) == 0;
+        const bool scalar_semantic =
+            asset.semantic == CookedTextureSemantic::roughness ||
+            asset.semantic == CookedTextureSemantic::metallic ||
+            asset.semantic == CookedTextureSemantic::ambient_occlusion ||
+            asset.semantic == CookedTextureSemantic::displacement ||
+            asset.semantic == CookedTextureSemantic::metallic_roughness ||
+            asset.semantic == CookedTextureSemantic::data;
+        if (!rgb && !(luminance && scalar_semantic)) {
             return fail(
                 CookedTextureLoadErrorCode::unsupported_format,
-                "OpenEXR texture must contain R, G, and B channels.",
+                "OpenEXR requires RGB channels, or luminance Y for scalar data.",
                 source.absolute);
         }
 
@@ -691,6 +702,15 @@ parse_color_space(const std::string_view value) {
                     static_cast<std::uint64_t>(prefix_x + x);
                 const Imf::Rgba& pixel =
                     decoded[static_cast<std::size_t>(source_index)];
+                if (!rgb && asset.semantic == CookedTextureSemantic::metallic_roughness) {
+                    // RgbaInputFile expands Y to RGB. A scalar roughness map
+                    // has no metalness; preserve the renderer's G/B packing.
+                    asset.pixels[destination++] = 255U;
+                    asset.pixels[destination++] = float_to_unorm8(static_cast<float>(pixel.r));
+                    asset.pixels[destination++] = 0U;
+                    asset.pixels[destination++] = 255U;
+                    continue;
+                }
                 asset.pixels[destination++] =
                     float_to_unorm8(static_cast<float>(pixel.r));
                 asset.pixels[destination++] =

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "asset_browser.hpp"
+#include "cooked_model_asset.hpp"
 #include "editor_ui_kit.hpp"
 #include "fly_camera.hpp"
 #include "performance_metrics.hpp"
@@ -50,6 +51,15 @@ enum class EditorGizmoSpace : std::uint8_t {
 struct SavedMaterialUpdate {
     std::string relative_path{};
     PbrMaterial material{};
+    MaterialTessellation tessellation{};
+};
+
+struct MaterialEditorSnapshot {
+    std::string relative_path{};
+    std::string name{};
+    std::string displacement_texture{};
+    PbrMaterial material{};
+    MaterialTessellation tessellation{};
 };
 
 class EditorUi final {
@@ -162,6 +172,15 @@ public:
         return import_activity_pending();
     }
     [[nodiscard]] std::string_view asset_import_status() const noexcept;
+    [[nodiscard]] bool inspect_material(
+        const std::filesystem::path& relative_path,
+        MaterialEditorSnapshot& snapshot,
+        std::string& error) const;
+    [[nodiscard]] bool set_material_tessellation(
+        const std::filesystem::path& relative_path,
+        MaterialTessellation tessellation,
+        MaterialEditorSnapshot& snapshot,
+        std::string& error);
 
 private:
     void initialize_vulkan_backend(Renderer& renderer);
@@ -187,7 +206,7 @@ private:
         Renderer& renderer);
     void build_import_window();
     void build_import_results();
-    void build_material_editor();
+    void build_material_editor(Renderer& renderer);
     void build_performance(
         SceneDocument& scene,
         Renderer& renderer,

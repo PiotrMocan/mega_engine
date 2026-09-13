@@ -74,7 +74,7 @@ $presetShaders = @(
     'motion_blur.frag'
 )
 $regularShaders = Get-ChildItem -LiteralPath $shaderRoot -File |
-    Where-Object { $_.Extension -in @('.vert', '.frag', '.comp') -and $_.Name -notin $presetShaders } |
+    Where-Object { $_.Extension -in @('.vert', '.tesc', '.tese', '.frag', '.comp') -and $_.Name -notin $presetShaders } |
     Sort-Object Name
 foreach ($shader in $regularShaders) {
     $extraArguments = @()

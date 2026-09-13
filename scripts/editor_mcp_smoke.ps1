@@ -8,7 +8,8 @@ param(
     [int]$Height = 600,
     [ValidateSet('forward','clustered')]
     [string]$LocalLighting = 'clustered',
-    [string]$ScreenshotPath
+    [string]$ScreenshotPath,
+    [string]$MaterialPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -83,6 +84,8 @@ try {
         "editor.landscape.scatter_model",
         "editor.assets.list",
         "editor.assets.import",
+        "editor.material.get",
+        "editor.material.set_tessellation",
         "editor.history.undo",
         "capture.screenshot",
         "engine.quit"
@@ -97,6 +100,68 @@ try {
         params = @{ name = "editor.get_state"; arguments = @{} }
     } 3
     if ($before.isError) { throw "Unable to read editor state" }
+
+    if (-not [string]::IsNullOrWhiteSpace($MaterialPath)) {
+        $materialBefore = Send-McpMessage @{
+            jsonrpc = "2.0"; id = 2010; method = "tools/call"
+            params = @{
+                name = "editor.material.get"
+                arguments = @{ path = $MaterialPath }
+            }
+        } 2010
+        if ($materialBefore.isError -or
+            $null -eq $materialBefore.structuredContent.material.displacement_texture) {
+            throw "Unable to inspect tessellated material"
+        }
+        $original = $materialBefore.structuredContent.material.tessellation
+        $temporaryTarget = if ([double]$original.target_edge_pixels -lt 1024.0) {
+            [double]$original.target_edge_pixels + 1.0
+        } else { 1023.0 }
+        $materialChanged = Send-McpMessage @{
+            jsonrpc = "2.0"; id = 2011; method = "tools/call"
+            params = @{
+                name = "editor.material.set_tessellation"
+                arguments = @{
+                    path = $MaterialPath
+                    enabled = [bool]$original.enabled
+                    displacement_scale = [double]$original.displacement_scale
+                    displacement_center = [double]$original.displacement_center
+                    target_edge_pixels = $temporaryTarget
+                    maximum_factor = [double]$original.maximum_factor
+                    up_facing_only = [bool]$original.up_facing_only
+                    normal_threshold = [double]$original.normal_threshold
+                    uv_edge_fade = [double]$original.uv_edge_fade
+                }
+            }
+        } 2011
+        if ($materialChanged.isError -or
+            [double]$materialChanged.structuredContent.material.tessellation.target_edge_pixels -ne
+                $temporaryTarget) {
+            throw "Material tessellation mutation failed"
+        }
+        $materialRestored = Send-McpMessage @{
+            jsonrpc = "2.0"; id = 2012; method = "tools/call"
+            params = @{
+                name = "editor.material.set_tessellation"
+                arguments = @{
+                    path = $MaterialPath
+                    enabled = [bool]$original.enabled
+                    displacement_scale = [double]$original.displacement_scale
+                    displacement_center = [double]$original.displacement_center
+                    target_edge_pixels = [double]$original.target_edge_pixels
+                    maximum_factor = [double]$original.maximum_factor
+                    up_facing_only = [bool]$original.up_facing_only
+                    normal_threshold = [double]$original.normal_threshold
+                    uv_edge_fade = [double]$original.uv_edge_fade
+                }
+            }
+        } 2012
+        if ($materialRestored.isError -or
+            [double]$materialRestored.structuredContent.material.tessellation.target_edge_pixels -ne
+                [double]$original.target_edge_pixels) {
+            throw "Material tessellation restore failed"
+        }
+    }
 
     $exposure = Send-McpMessage @{
         jsonrpc = '2.0'; id = 101; method = 'tools/call'

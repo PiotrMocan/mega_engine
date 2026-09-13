@@ -275,6 +275,17 @@ int main() {
                packed->pixels == std::vector<std::uint8_t>(raw_pixels.begin(), raw_pixels.end()),
            "packed G/B channels remain linear and are not swizzled or gamma converted");
 
+    Json displacement_metadata = raw_metadata;
+    displacement_metadata["usage"] = "displacement";
+    expect(write_json(textures / "displacement.vcrtexture.json", displacement_metadata),
+           "displacement metadata written");
+    const auto displacement = vcr::load_cooked_texture_asset(
+        asset_root, "painted/textures/displacement.vcrtexture.json");
+    expect(displacement &&
+               displacement->semantic == vcr::CookedTextureSemantic::displacement &&
+               displacement->color_space == vcr::CookedTextureColorSpace::linear,
+           "displacement texture remains linear scalar data");
+
     const std::filesystem::path exr_path = textures / "normal.exr";
     try {
         Imf::Header header(2, 1);
@@ -324,6 +335,36 @@ int main() {
                 close_byte(exr->pixels[6U], 128U),
             "OpenEXR channels convert to RGBA8 UNORM");
     }
+
+    try {
+        const std::string name = (textures / "roughness-y.exr").string();
+        Imf::Header header(2, 1);
+        Imf::RgbaOutputFile output(name.c_str(), header, Imf::WRITE_Y, 1);
+        std::array<Imf::Rgba, 2U> pixels{
+            Imf::Rgba(0.25F, 0.25F, 0.25F, 1.0F),
+            Imf::Rgba(0.75F, 0.75F, 0.75F, 1.0F)};
+        output.setFrameBuffer(pixels.data(), 1U, 2U);
+        output.writePixels(1);
+    } catch (const std::exception& exception) {
+        std::cerr << "Scalar EXR fixture error: " << exception.what() << '\n';
+        ++failures;
+    }
+    expect(write_json(textures / "roughness-y.vcrtexture.json", texture_metadata(
+               "roughness", "textures/roughness-y.exr", "metallic_roughness", "linear")),
+           "scalar roughness EXR metadata written");
+    const auto scalar_exr = vcr::load_cooked_texture_asset(
+        asset_root, "painted/textures/roughness-y.vcrtexture.json");
+    expect(scalar_exr && scalar_exr->pixels.size() == 8U &&
+               scalar_exr->pixels[0] == 255U && close_byte(scalar_exr->pixels[1], 64U) &&
+               scalar_exr->pixels[2] == 0U && close_byte(scalar_exr->pixels[5], 191U) &&
+               scalar_exr->pixels[6] == 0U,
+           "luminance roughness EXR becomes G roughness and B zero metalness");
+    expect(write_json(textures / "invalid-normal-y.vcrtexture.json", texture_metadata(
+               "normal", "textures/roughness-y.exr", "normal", "linear")),
+           "scalar normal rejection fixture written");
+    expect(!vcr::load_cooked_texture_asset(
+               asset_root, "painted/textures/invalid-normal-y.vcrtexture.json"),
+           "normal maps still require three independent channels");
 
     vcr::CookedTextureLoadOptions one_pixel{};
     one_pixel.maximum_pixels = 1U;

@@ -22,6 +22,7 @@ enum class CookedTextureSemantic : std::uint8_t {
     emissive,
     data,
     metallic_roughness,
+    displacement,
 };
 
 enum class CookedTextureColorSpace : std::uint8_t {

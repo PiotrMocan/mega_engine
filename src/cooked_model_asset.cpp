@@ -732,6 +732,7 @@ parse_material(
     std::optional<std::filesystem::path> base_color_texture;
     std::optional<std::filesystem::path> normal_texture;
     std::optional<std::filesystem::path> metallic_roughness_texture;
+    std::optional<std::filesystem::path> displacement_texture;
     if (auto error = read_texture_reference(
             "base_color", base_color_texture)) {
         return error;
@@ -744,6 +745,110 @@ parse_material(
             "metallic_roughness", metallic_roughness_texture)) {
         return error;
     }
+    if (auto error = read_texture_reference(
+            "displacement", displacement_texture)) {
+        return error;
+    }
+
+    MaterialTessellation tessellation{};
+    const auto tessellation_value = metadata.find("tessellation");
+    const bool has_tessellation = tessellation_value != metadata.end();
+    if (has_tessellation) {
+        tessellation.enabled_flag = 1U;
+        if (!tessellation_value->is_object() ||
+            !json_float_in_range(
+                *tessellation_value,
+                "displacement_scale",
+                0.0F,
+                10'000.0F,
+                tessellation.displacement_scale) ||
+            !json_float_in_range(
+                *tessellation_value,
+                "displacement_center",
+                0.0F,
+                1.0F,
+                tessellation.displacement_center) ||
+            !json_float_in_range(
+                *tessellation_value,
+                "target_edge_pixels",
+                1.0F,
+                1024.0F,
+                tessellation.target_edge_pixels) ||
+            !json_float_in_range(
+                *tessellation_value,
+                "maximum_factor",
+                1.0F,
+                64.0F,
+                tessellation.maximum_factor)) {
+            return CookedModelLoadError{
+                .code = CookedModelLoadErrorCode::invalid_material,
+                .message = "Material tessellation settings are invalid.",
+                .path = file.absolute,
+            };
+        }
+        const auto enabled = tessellation_value->find("enabled");
+        if (enabled != tessellation_value->end()) {
+            if (!enabled->is_boolean()) {
+                return CookedModelLoadError{
+                    .code = CookedModelLoadErrorCode::invalid_material,
+                    .message = "Material tessellation enabled flag is invalid.",
+                    .path = file.absolute,
+                };
+            }
+            tessellation.enabled_flag = enabled->get<bool>() ? 1U : 0U;
+        }
+        const auto up_facing_only =
+            tessellation_value->find("up_facing_only");
+        if (up_facing_only != tessellation_value->end()) {
+            if (!up_facing_only->is_boolean()) {
+                return CookedModelLoadError{
+                    .code = CookedModelLoadErrorCode::invalid_material,
+                    .message = "Material tessellation face filter is invalid.",
+                    .path = file.absolute,
+                };
+            }
+            tessellation.up_facing_only =
+                up_facing_only->get<bool>() ? 1U : 0U;
+        }
+        const auto normal_threshold =
+            tessellation_value->find("normal_threshold");
+        if (normal_threshold != tessellation_value->end() &&
+            !json_float_in_range(
+                *tessellation_value,
+                "normal_threshold",
+                -1.0F,
+                1.0F,
+                tessellation.normal_threshold)) {
+            return CookedModelLoadError{
+                .code = CookedModelLoadErrorCode::invalid_material,
+                .message = "Material tessellation normal threshold is invalid.",
+                .path = file.absolute,
+            };
+        }
+        const auto uv_edge_fade =
+            tessellation_value->find("uv_edge_fade");
+        if (uv_edge_fade != tessellation_value->end() &&
+            !json_float_in_range(
+                *tessellation_value,
+                "uv_edge_fade",
+                0.0F,
+                0.5F,
+                tessellation.uv_edge_fade)) {
+            return CookedModelLoadError{
+                .code = CookedModelLoadErrorCode::invalid_material,
+                .message = "Material tessellation UV edge fade is invalid.",
+                .path = file.absolute,
+            };
+        }
+    }
+    if (has_tessellation && !displacement_texture.has_value()) {
+        return CookedModelLoadError{
+            .code = CookedModelLoadErrorCode::invalid_material,
+            .message =
+                "Enabled material tessellation requires a displacement texture.",
+            .path = file.absolute,
+        };
+    }
     output = CookedModelMaterial{
         .relative_path = file.relative,
         .name = std::move(name),
@@ -751,6 +856,8 @@ parse_material(
         .base_color_texture = std::move(base_color_texture),
         .normal_texture = std::move(normal_texture),
         .metallic_roughness_texture = std::move(metallic_roughness_texture),
+        .displacement_texture = std::move(displacement_texture),
+        .tessellation = tessellation,
     };
     return std::nullopt;
 }

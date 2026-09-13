@@ -84,6 +84,8 @@ struct MaterialEditorUiState {
     std::filesystem::path absolute_path{};
     std::array<char, 256U> name{};
     PbrMaterial material{};
+    MaterialTessellation tessellation{};
+    bool has_displacement_texture = false;
     std::string error{};
     std::string status{};
     bool open = false;
@@ -688,7 +690,7 @@ inline constexpr std::uintmax_t maximum_material_file_bytes =
         }
         for (const auto& [semantic, reference] :
              document["textures"].items()) {
-            constexpr std::array<std::string_view, 6U>
+            constexpr std::array<std::string_view, 8U>
                 supported_semantics{{
                     "base_color",
                     "normal",
@@ -696,6 +698,8 @@ inline constexpr std::uintmax_t maximum_material_file_bytes =
                     "roughness",
                     "ambient_occlusion",
                     "emissive",
+                    "metallic_roughness",
+                    "displacement",
                 }};
             if (std::ranges::find(
                     supported_semantics,
@@ -728,12 +732,73 @@ inline constexpr std::uintmax_t maximum_material_file_bytes =
             }
         }
 
+        const bool has_displacement_texture =
+            document["textures"].contains("displacement");
+        MaterialTessellation tessellation{};
+        if (document.contains("tessellation")) {
+            const nlohmann::json& authored =
+                document["tessellation"];
+            if (!has_displacement_texture || !authored.is_object() ||
+                !authored.contains("displacement_scale") ||
+                !read_material_factor(
+                    authored["displacement_scale"], 0.0F, 10'000.0F,
+                    tessellation.displacement_scale) ||
+                !authored.contains("displacement_center") ||
+                !read_material_factor(
+                    authored["displacement_center"], 0.0F, 1.0F,
+                    tessellation.displacement_center) ||
+                !authored.contains("target_edge_pixels") ||
+                !read_material_factor(
+                    authored["target_edge_pixels"], 1.0F, 1024.0F,
+                    tessellation.target_edge_pixels) ||
+                !authored.contains("maximum_factor") ||
+                !read_material_factor(
+                    authored["maximum_factor"], 1.0F, 64.0F,
+                    tessellation.maximum_factor)) {
+                error = "Material tessellation settings are invalid.";
+                return false;
+            }
+            tessellation.enabled_flag = 1U;
+            if (authored.contains("enabled")) {
+                if (!authored["enabled"].is_boolean()) {
+                    error = "Material tessellation enabled flag is invalid.";
+                    return false;
+                }
+                tessellation.enabled_flag =
+                    authored["enabled"].get<bool>() ? 1U : 0U;
+            }
+            if (authored.contains("up_facing_only")) {
+                if (!authored["up_facing_only"].is_boolean()) {
+                    error = "Material tessellation face filter is invalid.";
+                    return false;
+                }
+                tessellation.up_facing_only =
+                    authored["up_facing_only"].get<bool>() ? 1U : 0U;
+            }
+            if (authored.contains("normal_threshold") &&
+                !read_material_factor(
+                    authored["normal_threshold"], -1.0F, 1.0F,
+                    tessellation.normal_threshold)) {
+                error = "Material tessellation normal threshold is invalid.";
+                return false;
+            }
+            if (authored.contains("uv_edge_fade") &&
+                !read_material_factor(
+                    authored["uv_edge_fade"], 0.0F, 0.5F,
+                    tessellation.uv_edge_fade)) {
+                error = "Material tessellation UV edge fade is invalid.";
+                return false;
+            }
+        }
+
         state.name.fill('\0');
         std::memcpy(state.name.data(), name.data(), name.size());
         state.document = std::move(document);
         state.relative_path = relative_path.lexically_normal();
         state.absolute_path = std::move(absolute_path);
         state.material = sanitize_pbr_material(material);
+        state.tessellation = tessellation;
+        state.has_displacement_texture = has_displacement_texture;
         state.loaded = true;
         state.dirty = false;
         state.error.clear();
@@ -999,6 +1064,11 @@ write_exclusive_material_file(
     try {
         const PbrMaterial material =
             sanitize_pbr_material(state.material);
+        const auto readable_float = [](const float value) {
+            constexpr double precision = 1'000'000.0;
+            return std::round(static_cast<double>(value) * precision) /
+                precision;
+        };
         state.document["name"] = std::string(name);
         state.document["pbr"] = {
             {"base_color",
@@ -1014,6 +1084,26 @@ write_exclusive_material_file(
             {"subsurface_profile", to_token(material.subsurface_profile)},
             {"subsurface_strength", material.subsurface_strength},
         };
+        if (state.has_displacement_texture) {
+            state.document["tessellation"] = {
+                {"enabled", state.tessellation.enabled_flag != 0U},
+                {"displacement_scale", readable_float(
+                    state.tessellation.displacement_scale)},
+                {"displacement_center", readable_float(
+                    state.tessellation.displacement_center)},
+                {"target_edge_pixels", readable_float(
+                    state.tessellation.target_edge_pixels)},
+                {"maximum_factor", readable_float(
+                    state.tessellation.maximum_factor)},
+                {"up_facing_only", state.tessellation.up_facing_only != 0U},
+                {"normal_threshold", readable_float(
+                    state.tessellation.normal_threshold)},
+                {"uv_edge_fade", readable_float(
+                    state.tessellation.uv_edge_fade)},
+            };
+        } else {
+            state.document.erase("tessellation");
+        }
         const std::string serialized =
             state.document.dump(2) + '\n';
         if (serialized.size() > maximum_material_file_bytes) {
@@ -1625,7 +1715,7 @@ void EditorUi::begin_frame(
     }
     build_import_window();
     build_import_results();
-    build_material_editor();
+    build_material_editor(renderer);
     build_performance(scene, renderer, performance);
     build_external_game_window(now);
     process_file_commands(scene);
@@ -3793,7 +3883,102 @@ void EditorUi::open_material_editor(
     material_editor_->open = true;
 }
 
-void EditorUi::build_material_editor() {
+bool EditorUi::inspect_material(
+    const std::filesystem::path& relative_path,
+    MaterialEditorSnapshot& snapshot,
+    std::string& error) const {
+    MaterialEditorUiState state;
+    if (!load_material_document(
+            asset_browser_.root(), relative_path, state, error)) {
+        return false;
+    }
+    snapshot = MaterialEditorSnapshot{
+        .relative_path = state.relative_path.generic_string(),
+        .name = std::string(state.name.data()),
+        .displacement_texture = state.has_displacement_texture
+            ? state.document["textures"]["displacement"].get<std::string>()
+            : std::string{},
+        .material = state.material,
+        .tessellation = state.tessellation,
+    };
+    return true;
+}
+
+bool EditorUi::set_material_tessellation(
+    const std::filesystem::path& relative_path,
+    MaterialTessellation tessellation,
+    MaterialEditorSnapshot& snapshot,
+    std::string& error) {
+    if (play_state_ != EditorPlayState::edit) {
+        error = "Material authoring is locked during Play.";
+        return false;
+    }
+    if (material_editor_ != nullptr && material_editor_->dirty &&
+        material_editor_->relative_path == relative_path.lexically_normal()) {
+        error = "The material has unsaved edits in Material Editor.";
+        return false;
+    }
+    if (tessellation.enabled_flag > 1U ||
+        tessellation.up_facing_only > 1U ||
+        !std::isfinite(tessellation.displacement_scale) ||
+        tessellation.displacement_scale < 0.0F ||
+        tessellation.displacement_scale > 10'000.0F ||
+        !std::isfinite(tessellation.displacement_center) ||
+        tessellation.displacement_center < 0.0F ||
+        tessellation.displacement_center > 1.0F ||
+        !std::isfinite(tessellation.target_edge_pixels) ||
+        tessellation.target_edge_pixels < 1.0F ||
+        tessellation.target_edge_pixels > 1024.0F ||
+        !std::isfinite(tessellation.maximum_factor) ||
+        tessellation.maximum_factor < 1.0F ||
+        tessellation.maximum_factor > 64.0F ||
+        !std::isfinite(tessellation.normal_threshold) ||
+        tessellation.normal_threshold < -1.0F ||
+        tessellation.normal_threshold > 1.0F ||
+        !std::isfinite(tessellation.uv_edge_fade) ||
+        tessellation.uv_edge_fade < 0.0F ||
+        tessellation.uv_edge_fade > 0.5F) {
+        error = "Material tessellation settings are outside supported ranges.";
+        return false;
+    }
+
+    MaterialEditorUiState state;
+    if (!load_material_document(
+            asset_browser_.root(), relative_path, state, error)) {
+        return false;
+    }
+    if (!state.has_displacement_texture) {
+        error = "A displacement texture is required before tessellation can be configured.";
+        return false;
+    }
+    state.tessellation = tessellation;
+    state.dirty = true;
+    if (!save_material_document(state, asset_browser_.root(), error)) {
+        return false;
+    }
+    snapshot = MaterialEditorSnapshot{
+        .relative_path = state.relative_path.generic_string(),
+        .name = std::string(state.name.data()),
+        .displacement_texture =
+            state.document["textures"]["displacement"].get<std::string>(),
+        .material = state.material,
+        .tessellation = state.tessellation,
+    };
+    if (material_editor_ != nullptr && material_editor_->loaded &&
+        material_editor_->relative_path == state.relative_path) {
+        const bool was_open = material_editor_->open;
+        *material_editor_ = std::move(state);
+        material_editor_->open = was_open;
+    }
+    saved_material_update_ = SavedMaterialUpdate{
+        .relative_path = snapshot.relative_path,
+        .material = snapshot.material,
+        .tessellation = snapshot.tessellation,
+    };
+    return true;
+}
+
+void EditorUi::build_material_editor(Renderer& renderer) {
     if (material_editor_ == nullptr ||
         !material_editor_->open) {
         return;
@@ -3805,7 +3990,7 @@ void EditorUi::build_material_editor() {
         ui_kit_.panel_header(
             EditorIcon::material,
             "MATERIAL EDITOR",
-            "PBR factors and texture references");
+            "PBR textures and adaptive tessellation");
         if (!material_editor_->loaded) {
             ui_kit_.empty_state(
                 EditorIcon::material,
@@ -3882,6 +4067,79 @@ void EditorUi::build_material_editor() {
                 }
                 ui_kit_.end_property_grid();
             }
+            ui_kit_.section_header(
+                EditorIcon::environment,
+                "Tessellation");
+            ui_kit_.badge(
+                renderer.tessellation_supported()
+                    ? "GPU SUPPORTED" : "GPU FALLBACK",
+                renderer.tessellation_supported()
+                    ? EditorTone::success : EditorTone::warning);
+            if (!material_editor_->has_displacement_texture) {
+                ImGui::SameLine();
+                ui_kit_.badge("NO HEIGHT MAP", EditorTone::warning);
+            }
+            ImGui::BeginDisabled(
+                !material_editor_->has_displacement_texture);
+            if (ui_kit_.begin_property_grid(
+                    "MaterialTessellationProperties")) {
+                bool enabled =
+                    material_editor_->tessellation.enabled_flag != 0U;
+                ui_kit_.property_row("Enabled");
+                if (ImGui::Checkbox("##TessellationEnabled", &enabled)) {
+                    material_editor_->tessellation.enabled_flag =
+                        enabled ? 1U : 0U;
+                    changed = true;
+                }
+                ui_kit_.property_row("Displacement (m)");
+                changed |= ImGui::SliderFloat(
+                    "##TessellationScale",
+                    &material_editor_->tessellation.displacement_scale,
+                    0.0F, 0.5F, "%.3f m");
+                ui_kit_.property_row("Height midpoint");
+                changed |= ImGui::SliderFloat(
+                    "##TessellationCenter",
+                    &material_editor_->tessellation.displacement_center,
+                    0.0F, 1.0F, "%.3f");
+                ui_kit_.property_row("Target edge");
+                changed |= ImGui::SliderFloat(
+                    "##TessellationEdgePixels",
+                    &material_editor_->tessellation.target_edge_pixels,
+                    2.0F, 128.0F, "%.1f px");
+                ui_kit_.property_row("Maximum factor");
+                changed |= ImGui::SliderFloat(
+                    "##TessellationMaximumFactor",
+                    &material_editor_->tessellation.maximum_factor,
+                    1.0F, 64.0F, "%.0f");
+                bool up_facing_only =
+                    material_editor_->tessellation.up_facing_only != 0U;
+                ui_kit_.property_row("Up-facing only");
+                if (ImGui::Checkbox(
+                        "##TessellationUpFacingOnly",
+                        &up_facing_only)) {
+                    material_editor_->tessellation.up_facing_only =
+                        up_facing_only ? 1U : 0U;
+                    changed = true;
+                }
+                ui_kit_.property_row("Normal threshold");
+                changed |= ImGui::SliderFloat(
+                    "##TessellationNormalThreshold",
+                    &material_editor_->tessellation.normal_threshold,
+                    -1.0F, 1.0F, "%.2f");
+                ui_kit_.property_row("UV edge fade");
+                changed |= ImGui::SliderFloat(
+                    "##TessellationUvEdgeFade",
+                    &material_editor_->tessellation.uv_edge_fade,
+                    0.0F, 0.25F, "%.3f");
+                ui_kit_.end_property_grid();
+            }
+            ImGui::EndDisabled();
+            ImGui::TextWrapped(
+                "Displacement follows the height map and is faded from "
+                "vertical faces when Up-facing only is enabled. UV edge fade "
+                "fades the outer UV bounds of the whole material surface, "
+                "including tiled textures. Lower Target edge gives finer geometry; "
+                "Height midpoint shifts the surface without adding relief.");
             if (changed) {
                 material_editor_->material =
                     sanitize_pbr_material(
@@ -3889,6 +4147,12 @@ void EditorUi::build_material_editor() {
                 material_editor_->dirty = true;
                 material_editor_->status =
                     "Unsaved material changes.";
+                saved_material_update_ = SavedMaterialUpdate{
+                    .relative_path =
+                        material_editor_->relative_path.generic_string(),
+                    .material = material_editor_->material,
+                    .tessellation = material_editor_->tessellation,
+                };
             }
 
             if (ui_kit_.action_button(
@@ -3911,6 +4175,8 @@ void EditorUi::build_material_editor() {
                                     .generic_string(),
                             .material =
                                 material_editor_->material,
+                            .tessellation =
+                                material_editor_->tessellation,
                         };
                 }
             }
@@ -3930,6 +4196,13 @@ void EditorUi::build_material_editor() {
                         error)) {
                     material_editor_->error =
                         "Revert failed: " + error;
+                } else {
+                    saved_material_update_ = SavedMaterialUpdate{
+                        .relative_path =
+                            material_editor_->relative_path.generic_string(),
+                        .material = material_editor_->material,
+                        .tessellation = material_editor_->tessellation,
+                    };
                 }
             }
             ImGui::EndDisabled();
@@ -4010,6 +4283,8 @@ void EditorUi::build_material_editor() {
                                 .generic_string(),
                         .material =
                             material_editor_->material,
+                        .tessellation =
+                            material_editor_->tessellation,
                     };
                 material_editor_->open = false;
                 ImGui::CloseCurrentPopup();
@@ -4534,6 +4809,8 @@ void EditorUi::process_file_commands(SceneDocument& scene) {
                                     .generic_string(),
                             .material =
                                 material_editor_->material,
+                            .tessellation =
+                                material_editor_->tessellation,
                         };
                 }
             }

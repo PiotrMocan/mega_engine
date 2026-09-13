@@ -73,7 +73,7 @@ constexpr std::array<std::string_view, 30> runtime_tool_names{
     "engine.quit",
 };
 
-constexpr std::array<std::string_view, 24> editor_tool_names{
+constexpr std::array<std::string_view, 26> editor_tool_names{
     "render.set_exposure",
     "render.set_color_grading",
     "render.set_subsurface",
@@ -94,6 +94,8 @@ constexpr std::array<std::string_view, 24> editor_tool_names{
     "editor.history.redo",
     "editor.assets.list",
     "editor.assets.import",
+    "editor.material.get",
+    "editor.material.set_tessellation",
     "editor.landscape.create_flat_ground",
     "editor.landscape.scatter_model",
     "capture.screenshot",
@@ -927,6 +929,41 @@ private:
             },
             Json::array({"source_path"})),
         false, false, false));
+    tools.push_back(tool_definition(
+        "editor.material.get", "Get material",
+        "Read one sandboxed material asset, including its PBR references and tessellation settings.",
+        object_schema(
+            Json{{"path", Json{{"type", "string"}, {"minLength", 1},
+                                 {"maxLength", max_scene_asset_path_bytes}}}},
+            Json::array({"path"})),
+        true, false, true));
+    tools.push_back(tool_definition(
+        "editor.material.set_tessellation", "Set material tessellation",
+        "Atomically configure adaptive height-map displacement for one material asset.",
+        object_schema(
+            Json{
+                {"path", Json{{"type", "string"}, {"minLength", 1},
+                                {"maxLength", max_scene_asset_path_bytes}}},
+                {"enabled", Json{{"type", "boolean"}}},
+                {"displacement_scale", Json{{"type", "number"}, {"minimum", 0.0},
+                                               {"maximum", 10'000.0}}},
+                {"displacement_center", Json{{"type", "number"}, {"minimum", 0.0},
+                                                {"maximum", 1.0}}},
+                {"target_edge_pixels", Json{{"type", "number"}, {"minimum", 1.0},
+                                               {"maximum", 1024.0}}},
+                {"maximum_factor", Json{{"type", "number"}, {"minimum", 1.0},
+                                           {"maximum", 64.0}}},
+                {"up_facing_only", Json{{"type", "boolean"}}},
+                {"normal_threshold", Json{{"type", "number"}, {"minimum", -1.0},
+                                             {"maximum", 1.0}}},
+                {"uv_edge_fade", Json{{"type", "number"}, {"minimum", 0.0},
+                                         {"maximum", 0.5}}},
+            },
+            Json::array({"path", "enabled", "displacement_scale",
+                         "displacement_center", "target_edge_pixels",
+                         "maximum_factor", "up_facing_only", "normal_threshold",
+                         "uv_edge_fade"})),
+        false, false, true));
     tools.push_back(tool_definition(
         "editor.landscape.create_flat_ground", "Create flat terrain",
         "Create an explicitly sized flat authored ground plane.",
@@ -1800,6 +1837,66 @@ private:
             }
         }
         command.type = McpCommandType::editor_import_asset;
+        return true;
+    }
+    if (name == "editor.material.get") {
+        if (arguments.size() != 1U || !arguments.contains("path")) {
+            error = "path must be the only argument";
+            return false;
+        }
+        const auto path = get_string(arguments, "path");
+        if (!path || path->empty() ||
+            !copy_command_text(*path, command.text, error, "path")) {
+            return false;
+        }
+        command.type = McpCommandType::editor_get_material;
+        return true;
+    }
+    if (name == "editor.material.set_tessellation") {
+        if (arguments.size() != 9U ||
+            !only_keys(arguments, {
+                "path", "enabled", "displacement_scale",
+                "displacement_center", "target_edge_pixels",
+                "maximum_factor", "up_facing_only", "normal_threshold",
+                "uv_edge_fade"})) {
+            error = "all tessellation fields are required and unknown fields are rejected";
+            return false;
+        }
+        const auto path = get_string(arguments, "path");
+        const auto enabled = get_bool(arguments, "enabled");
+        const auto displacement_scale = get_finite_float(
+            arguments, "displacement_scale", 0.0F, 10'000.0F);
+        const auto displacement_center = get_finite_float(
+            arguments, "displacement_center", 0.0F, 1.0F);
+        const auto target_edge_pixels = get_finite_float(
+            arguments, "target_edge_pixels", 1.0F, 1024.0F);
+        const auto maximum_factor = get_finite_float(
+            arguments, "maximum_factor", 1.0F, 64.0F);
+        const auto up_facing_only = get_bool(arguments, "up_facing_only");
+        const auto normal_threshold = get_finite_float(
+            arguments, "normal_threshold", -1.0F, 1.0F);
+        const auto uv_edge_fade = get_finite_float(
+            arguments, "uv_edge_fade", 0.0F, 0.5F);
+        if (!path || path->empty() || !enabled || !displacement_scale ||
+            !displacement_center || !target_edge_pixels || !maximum_factor ||
+            !up_facing_only || !normal_threshold || !uv_edge_fade ||
+            !copy_command_text(*path, command.text, error, "path")) {
+            if (error.empty()) {
+                error = "material path and finite tessellation values are required";
+            }
+            return false;
+        }
+        command.type = McpCommandType::editor_set_material_tessellation;
+        command.tessellation = MaterialTessellation{
+            .displacement_scale = *displacement_scale,
+            .displacement_center = *displacement_center,
+            .target_edge_pixels = *target_edge_pixels,
+            .maximum_factor = *maximum_factor,
+            .normal_threshold = *normal_threshold,
+            .uv_edge_fade = *uv_edge_fade,
+            .enabled_flag = *enabled ? 1U : 0U,
+            .up_facing_only = *up_facing_only ? 1U : 0U,
+        };
         return true;
     }
     if (name == "editor.landscape.create_flat_ground") {

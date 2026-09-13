@@ -326,6 +326,12 @@ public:
     [[nodiscard]] std::size_t upload_high_water() const noexcept {
         return asset_upload_.high_water();
     }
+    [[nodiscard]] bool tessellation_supported() const noexcept {
+        return model_tessellation_enabled_;
+    }
+    [[nodiscard]] std::uint32_t tessellated_material_count() const noexcept {
+        return tessellated_material_count_;
+    }
     [[nodiscard]] bool update_editor_scene(
         const SceneRenderView& view,
         const std::filesystem::path& asset_root,
@@ -362,9 +368,10 @@ public:
     [[nodiscard]] const VisibilityStatistics &visibility_statistics() const noexcept {
         return visibility_statistics_;
     }
-    [[nodiscard]] bool apply_editor_material_factors(
+    [[nodiscard]] bool apply_editor_material(
         std::string_view material_relative_path,
-        PbrMaterial material) noexcept;
+        PbrMaterial material,
+        MaterialTessellation tessellation) noexcept;
     void invalidate_editor_scene() noexcept;
     [[nodiscard]] bool prepare_editor_viewport(VkExtent2D extent);
     [[nodiscard]] VkImageView editor_viewport_image_view() const noexcept {
@@ -436,6 +443,8 @@ private:
         std::string material_relative_path{};
         PbrMaterial material{};
         VkDescriptorSet material_descriptor_set = VK_NULL_HANDLE;
+        MaterialTessellation tessellation{};
+        glm::vec4 tessellation_uv_bounds{0, 0, 1, 1};
         std::uint32_t first_index = 0U;
         std::uint32_t index_count = 0U;
         std::uint32_t gi_first = 0, gi_count = 0;
@@ -458,6 +467,8 @@ private:
 
     struct EditorModelDraw {
         VkDescriptorSet material_descriptor_set = VK_NULL_HANDLE;
+        MaterialTessellation tessellation{};
+        glm::vec4 tessellation_uv_bounds{0, 0, 1, 1};
         std::uint32_t asset_index = 0U;
         std::uint32_t first_index = 0U;
         std::uint32_t index_count = 0U;
@@ -579,6 +590,7 @@ private:
         const GpuTexture& base_color,
         const GpuTexture& normal,
         const GpuTexture& metallic_roughness,
+        const GpuTexture& displacement,
         std::string& error);
     [[nodiscard]] std::optional<std::uint32_t>
         find_or_load_editor_model(
@@ -675,12 +687,15 @@ private:
     VkPipeline terrain_shadow_pipeline_ = VK_NULL_HANDLE;
     DeviceObject<VkPipeline> authored_shadow_pipeline_{};
     DeviceObject<VkPipeline> model_shadow_pipeline_{};
+    DeviceObject<VkPipeline> tessellated_model_shadow_pipeline_{};
     VkImageLayout shadow_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     DeviceObject<VkPipeline> aa_pipeline_{};
     DeviceObject<VkPipeline> aa_scene_pipeline_{};
 #if VCR_EDITOR_ENABLED
     VkPipeline editor_model_pipeline_ = VK_NULL_HANDLE;
+    VkPipeline tessellated_editor_model_pipeline_ = VK_NULL_HANDLE;
     DeviceObject<VkPipeline> aa_editor_model_pipeline_{};
+    DeviceObject<VkPipeline> aa_tessellated_editor_model_pipeline_{};
 #endif
     DeviceObject<VkPipeline> aa_terrain_pipeline_{};
     DeviceObject<VkPipeline> aa_sky_pipeline_{};
@@ -690,6 +705,7 @@ private:
         DeviceObject<VkPipeline> cubes{};
         DeviceObject<VkPipeline> scene{};
         DeviceObject<VkPipeline> models{};
+        DeviceObject<VkPipeline> tessellated_models{};
         DeviceObject<VkPipeline> terrain{};
         DeviceObject<VkPipeline> sky{};
     } smaa_geometry_{};
@@ -697,11 +713,15 @@ private:
     // Depth-only variants use the exact corresponding color-pass vertex module.
     SpatialPipelines depth_geometry_{}, depth_temporal_geometry_{};
     DeviceObject<VkPipeline> lod_depth_model_{}, lod_depth_temporal_model_{};
+    DeviceObject<VkPipeline> lod_depth_tessellated_model_{},
+        lod_depth_temporal_tessellated_model_{};
     SpatialPipelines equal_direct_{}, equal_spatial_{}, equal_temporal_{};
     std::array<SpatialPipelines, 2> msaa_geometry_{};
     std::array<SpatialPipelines, 2> depth_msaa_geometry_{};
     std::array<SpatialPipelines, 2> equal_msaa_{};
     std::array<DeviceObject<VkPipeline>, 2> lod_depth_msaa_model_{};
+    std::array<DeviceObject<VkPipeline>, 2>
+        lod_depth_msaa_tessellated_model_{};
     SpatialPipelines subsurface_spatial_{}, subsurface_temporal_{};
     SpatialPipelines equal_subsurface_spatial_{}, equal_subsurface_temporal_{};
     VkDescriptorSetLayout anti_aliasing_descriptor_set_layout_ =
@@ -851,9 +871,12 @@ private:
     GpuTexture editor_default_base_color_texture_{};
     GpuTexture editor_default_normal_texture_{};
     GpuTexture editor_default_metallic_roughness_texture_{};
+    GpuTexture editor_default_displacement_texture_{};
     VkDeviceSize editor_model_gpu_bytes_ = 0U;
     VkDeviceSize editor_texture_gpu_bytes_ = 0U;
     std::uint32_t editor_material_descriptor_count_ = 0U;
+    std::uint32_t tessellated_material_count_ = 0U;
+    bool model_tessellation_enabled_ = false;
     std::uint32_t editor_ground_count_ = 0U;
     std::uint32_t editor_cube_count_ = 0U;
     std::uint32_t authored_scene_object_count_ = 0U;

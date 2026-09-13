@@ -842,6 +842,12 @@ void Application::execute_mcp_command(const McpCommand& command) {
                  context_.timestamp_valid_bits() > 0U},
                 {"screenshot_supported",
                  renderer_.screenshot_supported()},
+                {"tessellation", Json{
+                    {"supported", context_.tessellation_shader_enabled()},
+                    {"material_driven", true},
+                    {"maximum_factor",
+                     context_.properties().limits.maxTessellationGenerationLevel},
+                }},
                 {"anti_aliasing", Json{
                     {"methods", Json::array({
                         "off", "smaa", "fsr3", "msaa2x", "msaa4x"})},
@@ -898,6 +904,11 @@ void Application::execute_mcp_command(const McpCommand& command) {
                      {"mode", std::string(to_string(renderer_.mode()))},
                      {"instances", renderer_.instance_count()},
                      {"triangles", renderer_.triangle_count()},
+                     {"tessellation", Json{
+                         {"supported", renderer_.tessellation_supported()},
+                         {"active_materials",
+                          renderer_.tessellated_material_count()},
+                     }},
                      {"depth_convention", "reverse-z"},
                      {"render_fixture", to_token(options_.render_fixture)},
                      {"tone_mapper", to_token(renderer_.tone_mapper())},
@@ -1498,6 +1509,8 @@ void Application::execute_mcp_command(const McpCommand& command) {
     case McpCommandType::editor_redo:
     case McpCommandType::editor_list_assets:
     case McpCommandType::editor_import_asset:
+    case McpCommandType::editor_get_material:
+    case McpCommandType::editor_set_material_tessellation:
     case McpCommandType::editor_create_flat_ground:
     case McpCommandType::editor_scatter_model:
         fail("editor-only MCP command is unavailable in the runtime profile");

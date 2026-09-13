@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cli_options.hpp"
+#include "cooked_model_asset.hpp"
 #include "scene_document.hpp"
 
 #include <array>
@@ -59,6 +60,8 @@ enum class McpCommandType : std::uint8_t {
     editor_redo,
     editor_list_assets,
     editor_import_asset,
+    editor_get_material,
+    editor_set_material_tessellation,
     editor_create_flat_ground,
     editor_scatter_model,
     engine_request_quit,
@@ -152,6 +155,7 @@ struct McpCommand {
     SceneNodeKind node_kind = SceneNodeKind::folder;
     SceneTransform transform{};
     PbrMaterial material{};
+    MaterialTessellation tessellation{};
     PunctualLight light{};
     std::array<char, max_scene_node_name_bytes + 1U> name{};
     std::array<char, text_capacity> text{};

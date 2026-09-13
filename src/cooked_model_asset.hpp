@@ -37,6 +37,27 @@ struct CookedModelSubmesh {
     std::array<float, 3> lod_error{};
 };
 
+struct MaterialTessellation {
+    // Model-local displacement = scale * (height - center).
+    float displacement_scale = 0.05F;
+    float displacement_center = 0.5F;
+    float target_edge_pixels = 24.0F;
+    float maximum_factor = 8.0F;
+    // World-space Y threshold used to keep displacement off vertical faces.
+    float normal_threshold = 0.55F;
+    // Normalized UV distance over which displacement fades to zero at a mesh edge.
+    float uv_edge_fade = 0.0F;
+    std::uint32_t enabled_flag = 0U;
+    std::uint32_t up_facing_only = 0U;
+
+    [[nodiscard]] bool enabled() const noexcept {
+        return enabled_flag != 0U &&
+            displacement_scale > 0.0F && maximum_factor > 1.0F;
+    }
+};
+
+static_assert(sizeof(MaterialTessellation) == 32U);
+
 struct CookedModelMaterial {
     std::filesystem::path relative_path{};
     std::string name{};
@@ -45,6 +66,8 @@ struct CookedModelMaterial {
     std::optional<std::filesystem::path> normal_texture{};
     // Linear glTF packing: G roughness, B metallic; multiplied by factors.
     std::optional<std::filesystem::path> metallic_roughness_texture{};
+    std::optional<std::filesystem::path> displacement_texture{};
+    MaterialTessellation tessellation{};
 };
 
 struct CookedModelLodReference {

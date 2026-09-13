@@ -105,6 +105,7 @@ PreparedModel prepare_model_asset(std::filesystem::path root, std::string path) 
             texture(material.base_color_texture);
             texture(material.normal_texture);
             texture(material.metallic_roughness_texture);
+            texture(material.displacement_texture);
         }
         result.model = std::move(model);
     } catch (const std::exception &e) {
