@@ -412,6 +412,8 @@ SceneRenderView SceneDocument::build_render_view(
     bool terrain_visible = false;
     bool sky_visible = false;
     bool sun_visible = false;
+    bool ocean_visible = false;
+    float ocean_height = 0.0F;
     bool local_lights_overflow = false;
     std::uint32_t index = first_root_;
     std::uint32_t depth = 0U;
@@ -453,6 +455,11 @@ SceneRenderView SceneDocument::build_render_view(
         const bool world_visible = slot.world_visible;
 
         if (world_visible) {
+            // One horizontal, infinite ocean; the first visible node owns its level.
+            if (slot.value.kind == SceneNodeKind::ocean && !ocean_visible) {
+                ocean_visible = true;
+                ocean_height = world_matrix[3].y;
+            }
             terrain_visible =
                 terrain_visible ||
                 slot.value.kind == SceneNodeKind::terrain;
@@ -527,6 +534,8 @@ SceneRenderView SceneDocument::build_render_view(
         .terrain_visible = terrain_visible,
         .sky_visible = sky_visible,
         .sun_visible = sun_visible,
+        .ocean_visible = ocean_visible,
+        .ocean_height = ocean_height,
         .local_lights_overflow = local_lights_overflow,
         .ground_id = ground_id,
         .cube_ids = render_cube_ids_,
@@ -755,6 +764,7 @@ std::string_view to_string(const SceneNodeKind kind) noexcept {
     case SceneNodeKind::point_light: return "Point light";
     case SceneNodeKind::spot_light: return "Spot light";
     case SceneNodeKind::environment: return "Environment";
+    case SceneNodeKind::ocean: return "Ocean";
     }
     return "Unknown";
 }

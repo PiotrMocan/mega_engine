@@ -86,6 +86,7 @@ foreach ($shader in $regularShaders) {
     Compile-Shader -Source $shader.Name -Output ($shader.Name + '.spv') -ExtraArguments $extraArguments
 }
 $subsurfaceGeometryShaders = @(
+    'ocean.frag',
     'cube.frag',
     'cube_aa.frag',
     'scene.frag',
@@ -102,6 +103,10 @@ foreach ($shader in $subsurfaceGeometryShaders) {
         -Output ($stem + '_sss.frag.spv') `
         -ExtraArguments @('-DVCR_SSS_OUTPUT=1')
 }
+Compile-Shader -Source 'ocean.frag' -Output 'ocean_aa.frag.spv' `
+    -ExtraArguments @('-DVCR_SSS_TEMPORAL=1')
+Compile-Shader -Source 'ocean.frag' -Output 'ocean_aa_sss.frag.spv' `
+    -ExtraArguments @('-DVCR_SSS_TEMPORAL=1', '-DVCR_SSS_OUTPUT=1')
 Compile-Shader `
     -Source 'subsurface_blur.frag' `
     -Output 'subsurface_blur_vertical.frag.spv' `

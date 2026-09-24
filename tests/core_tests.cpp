@@ -1567,6 +1567,13 @@ int main() {
             "Sky", vcr::SceneNodeKind::environment, root));
         static_cast<void>(scene.create_node(
             "Sun", vcr::SceneNodeKind::directional_light, root));
+        const auto ocean_parent = scene.create_node(
+            "Sea level", vcr::SceneNodeKind::folder, root);
+        const auto ocean = scene.create_node(
+            "Ocean", vcr::SceneNodeKind::ocean, ocean_parent);
+        scene.node(ocean_parent)->get().transform.translation.y = -1.0F;
+        scene.node(ocean_parent)->get().transform.scale.y = 2.0F;
+        scene.node(ocean)->get().transform.translation.y = -1.0F;
         static_cast<void>(scene.create_node(
             "Cube", vcr::SceneNodeKind::cube, root));
         const vcr::SceneNodeId model = scene.create_node(
@@ -1608,7 +1615,8 @@ int main() {
                 visible.local_lights[0].gpu.color_intensity.w == 250.0F &&
                 visible.terrain_visible &&
                 visible.sky_visible &&
-                visible.sun_visible,
+                visible.sun_visible && visible.ocean_visible &&
+                visible.ocean_height == -3.0F,
             "scene render view exposes visible component flags");
         if (auto root_node = scene.node(root)) {
             root_node->get().visible = false;
@@ -1622,7 +1630,7 @@ int main() {
                 hidden.local_lights.empty() &&
                 !hidden.terrain_visible &&
                 !hidden.sky_visible &&
-                !hidden.sun_visible,
+                !hidden.sun_visible && !hidden.ocean_visible,
             "hidden parent suppresses renderable descendants");
     }
 
@@ -2044,6 +2052,9 @@ int main() {
         const vcr::SceneNodeId scene_spot =
             source_scene.create_node(
                 "Cool spot", vcr::SceneNodeKind::spot_light, scene_root);
+        const auto scene_ocean = source_scene.create_node(
+            "Ocean", vcr::SceneNodeKind::ocean, scene_root);
+        source_scene.node(scene_ocean)->get().transform.translation.y = -2.0F;
         if (auto cube = source_scene.node(scene_cube)) {
             cube->get().transform.translation =
                 glm::vec3(3.0F, 2.0F, -7.0F);
@@ -2106,7 +2117,9 @@ int main() {
         source_scene.build_node_records(source_records);
         loaded_scene.build_node_records(loaded_records);
         expect(
-            loaded_records.size() == 5U &&
+            loaded_records.size() == 6U &&
+                loaded_records[5].value.kind == vcr::SceneNodeKind::ocean &&
+                loaded_records[5].value.transform.translation.y == -2.0F &&
                 source_records.size() == loaded_records.size() &&
                 loaded_records[1].parent_record_index == 0U &&
                 loaded_records[1].value.name == "Cube" &&

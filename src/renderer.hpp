@@ -715,6 +715,7 @@ private:
 #endif
     DeviceObject<VkPipeline> aa_terrain_pipeline_{};
     DeviceObject<VkPipeline> aa_sky_pipeline_{};
+    DeviceObject<VkPipeline> ocean_pipeline_{}, aa_ocean_pipeline_{};
     // Spatial AA needs only HDR color; temporal AA additionally writes motion
     // and depth. Prewarm both paths so switching methods does not compile.
     struct SpatialPipelines {
@@ -724,6 +725,7 @@ private:
         DeviceObject<VkPipeline> tessellated_models{};
         DeviceObject<VkPipeline> terrain{};
         DeviceObject<VkPipeline> sky{};
+        DeviceObject<VkPipeline> ocean{};
     } smaa_geometry_{};
     // All variants are prewarmed and retire with the other swapchain pipelines.
     // Depth-only variants use the exact corresponding color-pass vertex module.
@@ -812,6 +814,7 @@ private:
     bool temporal_history_valid_ = false;
     float fsr_frame_time_ms_ = 16.6667F;
     std::chrono::steady_clock::time_point last_frame_time_{};
+    double ocean_time_seconds_ = 0.0;
     std::optional<ScreenshotCapture> completed_screenshot_{};
 #if VCR_EDITOR_ENABLED
     EditorViewportResources editor_viewport_{};
@@ -903,6 +906,8 @@ private:
     bool editor_terrain_visible_ = false;
     bool editor_sky_visible_ = false;
     bool editor_sun_visible_ = false;
+    bool editor_ocean_visible_ = false;
+    float editor_ocean_height_ = 0.0F;
     bool authored_scene_enabled_ = false;
     bool editor_output_enabled_ = false;
 #endif

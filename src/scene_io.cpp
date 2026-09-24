@@ -41,6 +41,7 @@ using Json = nlohmann::json;
     case SceneNodeKind::point_light: return "point_light";
     case SceneNodeKind::spot_light: return "spot_light";
     case SceneNodeKind::environment: return "environment";
+    case SceneNodeKind::ocean: return "ocean";
     }
     return "folder";
 }
@@ -51,6 +52,7 @@ using Json = nlohmann::json;
     if (value == "cube") return SceneNodeKind::cube;
     if (value == "model") return SceneNodeKind::model;
     if (value == "ground") return SceneNodeKind::ground;
+    if (value == "ocean") return SceneNodeKind::ocean;
     if (value == "terrain") return SceneNodeKind::terrain;
     if (value == "camera") return SceneNodeKind::camera;
     if (value == "directional_light") {

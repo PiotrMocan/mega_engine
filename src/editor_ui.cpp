@@ -402,6 +402,7 @@ struct EditorViewportRay {
     case SceneNodeKind::cube: return EditorIcon::cube;
     case SceneNodeKind::model: return EditorIcon::model;
     case SceneNodeKind::ground: return EditorIcon::ground;
+    case SceneNodeKind::ocean: return EditorIcon::ground;
     case SceneNodeKind::terrain: return EditorIcon::terrain;
     case SceneNodeKind::camera: return EditorIcon::camera;
     case SceneNodeKind::directional_light:
@@ -1923,6 +1924,15 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
                 scene.mark_content_changed();
             }
             selected_node_ = cube;
+        }
+        if (ImGui::MenuItem("Add ocean", nullptr, false,
+                            play_state_ == EditorPlayState::edit)) {
+            checkpoint_scene(scene);
+            selected_node_ = scene.create_node("Ocean", SceneNodeKind::ocean, parent);
+            if (auto node = scene.node(selected_node_)) {
+                node->get().transform.translation.y = -2.0F;
+                scene.mark_content_changed();
+            }
         }
         const bool can_add_light =
             play_state_ == EditorPlayState::edit &&

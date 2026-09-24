@@ -48,6 +48,7 @@ using Json = nlohmann::json;
     case SceneNodeKind::point_light: return "point_light";
     case SceneNodeKind::spot_light: return "spot_light";
     case SceneNodeKind::environment: return "environment";
+    case SceneNodeKind::ocean: return "ocean";
     case SceneNodeKind::model: return "model";
     }
     return "unknown";

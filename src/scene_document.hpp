@@ -49,6 +49,7 @@ enum class SceneNodeKind : std::uint8_t {
     spot_light,
     environment,
     model,
+    ocean,
 };
 
 struct SceneTransform {
@@ -126,6 +127,8 @@ struct SceneRenderView {
     bool terrain_visible = false;
     bool sky_visible = false;
     bool sun_visible = false;
+    bool ocean_visible = false;
+    float ocean_height = 0.0F;
     bool local_lights_overflow = false;
     SceneNodeId ground_id{};
     std::span<const SceneNodeId> cube_ids{};

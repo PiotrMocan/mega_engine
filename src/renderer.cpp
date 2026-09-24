@@ -85,6 +85,8 @@ struct alignas(16) FrameUniforms {
     glm::vec4 shadow_map_parameters{0.0F};
     glm::mat4 unjittered_view_projection{1.0F};
     glm::mat4 previous_unjittered_view_projection{1.0F};
+    // X: world water level; Y: animation time in seconds.
+    glm::vec4 ocean_parameters{0.0F};
 };
 
 struct alignas(16) InstanceData {
@@ -107,7 +109,7 @@ struct TerrainVertex {
     std::int16_t normal_z;
 };
 
-static_assert(sizeof(FrameUniforms) == 416);
+static_assert(sizeof(FrameUniforms) == 432);
 static_assert(sizeof(InstanceData) == 64);
 static_assert(sizeof(PbrInstanceData) == 96);
 static_assert(offsetof(PbrInstanceData, material) == 48U);
@@ -795,6 +797,7 @@ void Renderer::initialize(VulkanContext &context, SDL_Window *window,
         render_static_shadow_map();
     }
     last_frame_time_ = std::chrono::steady_clock::now();
+    ocean_time_seconds_ = 0.0;
 }
 
 void Renderer::shutdown() noexcept {
@@ -829,6 +832,8 @@ void Renderer::shutdown() noexcept {
     authored_scene_triangle_count_ = 0U;
     editor_terrain_visible_ = false;
     editor_sky_visible_ = false;
+    editor_ocean_visible_ = false;
+    editor_ocean_height_ = 0.0F;
     editor_sun_visible_ = false;
     authored_scene_enabled_ = false;
     editor_output_enabled_ = false;
@@ -1960,17 +1965,21 @@ bool Renderer::update_editor_scene(
     editor_terrain_visible_ = view.terrain_visible;
     editor_sky_visible_ = view.sky_visible;
     editor_sun_visible_ = view.sun_visible;
+    editor_ocean_visible_ = view.ocean_visible;
+    editor_ocean_height_ = view.ocean_height;
     authored_scene_object_count_ =
         static_cast<std::uint32_t>(
             ground_count + view.cubes.size() + view.models.size()) +
-        static_cast<std::uint32_t>(view.terrain_visible);
+        static_cast<std::uint32_t>(view.terrain_visible) +
+        static_cast<std::uint32_t>(view.ocean_visible);
     authored_scene_triangle_count_ =
         static_cast<std::uint64_t>(ground_count) *
             plane_triangle_count +
         static_cast<std::uint64_t>(view.cubes.size()) *
             cube_triangle_count +
         (view.terrain_visible ? terrain_triangle_count : 0U) +
-        (view.sky_visible ? sky_triangle_count : 0U);
+        (view.sky_visible ? sky_triangle_count : 0U) +
+        (view.ocean_visible ? 1U : 0U);
     for (const EditorModelDraw& draw : editor_model_draws_) {
         authored_scene_triangle_count_ +=
             static_cast<std::uint64_t>(draw.index_count / 3U) *
@@ -4883,6 +4892,8 @@ void Renderer::update_frame_uniform(
     if (authored_scene_enabled_ && !editor_sun_visible_) {
         uniforms.sun_direction_intensity.w = 0.0F;
     }
+    uniforms.ocean_parameters = glm::vec4(
+        editor_ocean_height_, static_cast<float>(ocean_time_seconds_), 0.0F, 0.0F);
 #endif
     frame.uniform_buffer.write(
         std::as_bytes(std::span{&uniforms, std::size_t{1}}));
@@ -6324,6 +6335,51 @@ void Renderer::create_pipeline() {
         VK_OBJECT_TYPE_PIPELINE, handle_value(subsurface_temporal_.sky.get()),
         "SSS temporal sky pipeline");
 
+#if VCR_EDITOR_ENABLED
+    if (authored_scene_enabled_) {
+        // Reuse the fullscreen layout and attachment formats, but write the
+        // ray/sea intersection depth so land occludes water in every AA path.
+        const auto create_ocean = [&](VkGraphicsPipelineCreateInfo info,
+                                      const char* shader, const char* name) {
+            const ShaderModule fragment = load_shader(shader);
+            auto stages = sky_stages;
+            stages[1].module = fragment.get();
+            auto depth = sky_depth_stencil;
+            depth.depthWriteEnable = VK_TRUE;
+            info.pStages = stages.data();
+            info.pDepthStencilState = &depth;
+            DeviceObject<VkPipeline> result;
+            VK_CHECK(vkCreateGraphicsPipelines(
+                context_->device(), pipeline_cache_, 1U, &info, nullptr,
+                result.put(context_->device(), vkDestroyPipeline)));
+            context_->set_debug_name(VK_OBJECT_TYPE_PIPELINE,
+                                     handle_value(result.get()), name);
+            return result;
+        };
+        ocean_pipeline_ = create_ocean(
+            sky_pipeline_info, "ocean.frag.spv", "ocean pipeline");
+        smaa_geometry_.ocean = create_ocean(
+            spatial_sky_info, "ocean.frag.spv", "spatial ocean pipeline");
+        aa_ocean_pipeline_ = create_ocean(
+            aa_sky_pipeline_info, "ocean_aa.frag.spv", "temporal ocean pipeline");
+        subsurface_spatial_.ocean = create_ocean(
+            sss_spatial_sky_info, "ocean_sss.frag.spv", "SSS spatial ocean pipeline");
+        subsurface_temporal_.ocean = create_ocean(
+            sss_temporal_sky_info, "ocean_aa_sss.frag.spv", "SSS temporal ocean pipeline");
+        for (std::size_t index = 0U; index < msaa_samples.size(); ++index) {
+            if ((msaa_supported_sample_counts_ & msaa_samples[index]) == 0U) continue;
+            auto samples = multisampling;
+            samples.rasterizationSamples = msaa_samples[index];
+            samples.sampleShadingEnable = VK_FALSE;
+            auto info = spatial_sky_info;
+            info.pMultisampleState = &samples;
+            msaa_geometry_[index].ocean = create_ocean(
+                info, "ocean.frag.spv", index == 0U
+                    ? "MSAA 2x ocean pipeline" : "MSAA 4x ocean pipeline");
+        }
+    }
+#endif
+
     if (shadow_map_format_ == VK_FORMAT_UNDEFINED) {
         fatal("Shadow-map format was not selected before pipeline creation.");
     }
@@ -6852,7 +6908,7 @@ void Renderer::destroy_pipeline() noexcept {
              &smaa_geometry_.models,
              &smaa_geometry_.tessellated_models,
              &smaa_geometry_.terrain,
-             &smaa_geometry_.sky}) {
+             &smaa_geometry_.sky, &smaa_geometry_.ocean}) {
         pipeline->reset();
     }
     if (compute_pipeline_ != VK_NULL_HANDLE) {
@@ -6937,6 +6993,8 @@ void Renderer::destroy_pipeline() noexcept {
         }
     }
     aa_sky_pipeline_.reset();
+    ocean_pipeline_.reset();
+    aa_ocean_pipeline_.reset();
 #if VCR_EDITOR_ENABLED
     aa_editor_model_pipeline_.reset();
     aa_tessellated_editor_model_pipeline_.reset();
@@ -7054,6 +7112,8 @@ bool Renderer::draw_frame(
                 frame_now - last_frame_time_).count());
     }
     last_frame_time_ = frame_now;
+    // Double accumulation avoids frame-rate-dependent loss of small deltas.
+    ocean_time_seconds_ += static_cast<double>(fsr_frame_time_ms_) * 0.001;
     if (motion_blur_mode_actual() != MotionBlurMode::off &&
         (!std::isfinite(fsr_frame_time_ms_) || fsr_frame_time_ms_ > 250.0F)) {
         invalidate_temporal_history();
@@ -7695,6 +7755,7 @@ void Renderer::record_commands(
             const VkPipeline tessellated_editor_model_pipeline,
             const VkPipeline terrain_pipeline,
             const VkPipeline sky_pipeline,
+            const VkPipeline ocean_pipeline,
             const bool depth_only = false) {
 #if !VCR_EDITOR_ENABLED
             static_cast<void>(editor_model_pipeline);
@@ -7924,6 +7985,16 @@ void Renderer::record_commands(
                                      terrain_lod_first_[terrain_lod_], 0, 0);
                 }
             }
+#if VCR_EDITOR_ENABLED
+            if (!depth_only && mode_ != RunMode::instancing &&
+                authored_scene_enabled_ && editor_ocean_visible_) {
+                vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                  ocean_pipeline);
+                vkCmdDraw(command_buffer, 3, 1, 0, 0);
+            }
+#else
+            static_cast<void>(ocean_pipeline);
+#endif
             bool draw_sky = mode_ != RunMode::instancing;
 #if VCR_EDITOR_ENABLED
             draw_sky =
@@ -7986,7 +8057,7 @@ void Renderer::record_commands(
             : pipelines.tessellated_models.get();
         draw_geometry(extent, pipelines.cubes.get(), pipelines.scene.get(), model_depth,
                       tessellated_model_depth, pipelines.terrain.get(),
-                      VK_NULL_HANDLE, true);
+                      VK_NULL_HANDLE, VK_NULL_HANDLE, true);
         vkCmdEndRendering(command_buffer);
         // STORE/LOAD crosses dynamic rendering instances: make depth writes
         // visible to EQUAL tests, and serialize the non-prepassed model writes.
@@ -8325,7 +8396,7 @@ void Renderer::record_commands(
             prepassed_pipeline(scene_pipeline_, equal_direct_.scene),
 #endif
             prepassed_pipeline(terrain_pipeline_, equal_direct_.terrain),
-            sky_pipeline_);
+            sky_pipeline_, ocean_pipeline_.get());
         if (frame.timestamp_queries != VK_NULL_HANDLE) {
             vkCmdWriteTimestamp2(
                 command_buffer,
@@ -8565,7 +8636,7 @@ void Renderer::record_commands(
                 prepassed_pipeline(pipelines.scene.get(), equal.scene),
 #endif
                 prepassed_pipeline(pipelines.terrain.get(), equal.terrain),
-                pipelines.sky.get());
+                pipelines.sky.get(), pipelines.ocean.get());
         } else {
             const auto& pipelines = multisampled
                 ? msaa_geometry_[sample_index] : smaa_geometry_;
@@ -8594,7 +8665,8 @@ void Renderer::record_commands(
                 prepassed_pipeline((temporal ? aa_scene_pipeline_ : pipelines.scene).get(), equal.scene),
 #endif
                 prepassed_pipeline((temporal ? aa_terrain_pipeline_ : pipelines.terrain).get(), equal.terrain),
-                (temporal ? aa_sky_pipeline_ : pipelines.sky).get());
+                (temporal ? aa_sky_pipeline_ : pipelines.sky).get(),
+                (temporal ? aa_ocean_pipeline_ : pipelines.ocean).get());
         }
         vkCmdEndRendering(command_buffer);
         if (frame.timestamp_queries != VK_NULL_HANDLE) {
@@ -9289,7 +9361,8 @@ std::uint64_t Renderer::triangle_count() const noexcept {
                 ? static_cast<std::uint64_t>(terrain_triangle_count) / (1ULL << (2U * terrain_lod_))
                 : 0U;
         return visibility_statistics_.triangles + terrain_triangles +
-               (editor_sky_visible_ ? 1U : 0U);
+               (editor_sky_visible_ ? 1U : 0U) +
+               (editor_ocean_visible_ ? 1U : 0U);
     }
 #endif
     return fixture_ == RenderFixture::material_spheres ||

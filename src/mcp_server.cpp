@@ -708,7 +708,7 @@ private:
         {"type", "string"},
         {"enum", Json::array({
             "folder", "cube", "ground", "terrain", "camera",
-            "directional_light", "point_light", "spot_light", "environment", "model",
+            "directional_light", "point_light", "spot_light", "environment", "model", "ocean",
         })},
     };
     Json tools = Json::array();
@@ -1327,6 +1327,7 @@ private:
     if (value == "point_light") return SceneNodeKind::point_light;
     if (value == "spot_light") return SceneNodeKind::spot_light;
     if (value == "environment") return SceneNodeKind::environment;
+    if (value == "ocean") return SceneNodeKind::ocean;
     if (value == "model") return SceneNodeKind::model;
     return std::nullopt;
 }
