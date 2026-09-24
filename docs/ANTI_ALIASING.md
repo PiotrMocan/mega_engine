@@ -58,7 +58,8 @@ geometry, sky и уже рассчитанное shadowed lighting
 - MSAA пишет geometry/sky в `RGBA16F` color и выбранный depth format с 2/4
   coverage/depth samples. Dynamic rendering делает `AVERAGE` resolve в прежний
   single-sample HDR target; source имеет `storeOp=DONT_CARE`. Sample shading
-  выключен, depth resolve отсутствует;
+  выключен. При включённой атмосферной дымке depth разрешается через
+  `SAMPLE_ZERO` для её прохода; без дымки depth resolve не выполняется;
 - FSR получает HDR color, non-jittered motion vectors и depth, выполняет
   temporal upscale/AA, затем результат компонуется в swapchain;
 - динамическое освещение проходит fixed-exposure Reinhard после AA/FSR,

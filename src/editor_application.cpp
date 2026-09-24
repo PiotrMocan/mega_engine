@@ -300,6 +300,9 @@ void EditorApplication::initialize(const CliOptions& options) {
         fatal("Invalid local-lighting backend");
     }
     static_cast<void>(renderer_.set_tone_mapper(options.tone_mapper));
+    if (!renderer_.set_fog_settings(options.fog)) {
+        fatal("Invalid fog settings or unsupported sampled depth/HDR blending");
+    }
     if (!renderer_.set_exposure_settings(options.exposure)) {
         fatal("Invalid exposure settings");
     }

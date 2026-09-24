@@ -4418,6 +4418,33 @@ void EditorUi::build_performance(
         }
         ImGui::EndCombo();
     }
+    auto fog = renderer.fog_settings();
+    ImGui::BeginDisabled(!renderer.fog_supported());
+    bool fog_changed = ImGui::Checkbox("Atmospheric fog", &fog.enabled);
+    if (fog.enabled) {
+        fog_changed |= ImGui::ColorEdit3("Fog color", fog.color.data(),
+            ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
+        fog_changed |= ImGui::DragFloat("Fog density", &fog.density,
+            0.0001F, 0.0F, 1.0F, "%.4f", ImGuiSliderFlags_AlwaysClamp);
+        fog_changed |= ImGui::DragFloat("Fog base height", &fog.base_height,
+            0.1F, -100'000.0F, 100'000.0F, "%.1f", ImGuiSliderFlags_AlwaysClamp);
+        fog_changed |= ImGui::DragFloat("Fog height falloff", &fog.height_falloff,
+            0.001F, 0.0F, 10.0F, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+        fog_changed |= ImGui::DragFloat("Fog start distance", &fog.start_distance,
+            1.0F, 0.0F, std::nextafter(fog.maximum_distance, 0.0F),
+            "%.1f", ImGuiSliderFlags_AlwaysClamp);
+        fog_changed |= ImGui::DragFloat("Fog maximum distance", &fog.maximum_distance,
+            1.0F, std::nextafter(fog.start_distance, 100'001.0F), 100'000.0F,
+            "%.1f", ImGuiSliderFlags_AlwaysClamp);
+        fog_changed |= ImGui::SliderFloat("Fog maximum opacity", &fog.maximum_opacity,
+            0.0F, 1.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+    }
+    ImGui::EndDisabled();
+    if (!renderer.fog_supported()) ImGui::TextDisabled("Atmospheric fog unavailable on this GPU");
+    if (fog_changed) {
+        for (auto& channel : fog.color) channel = std::clamp(channel, 0.0F, 16.0F);
+        static_cast<void>(renderer.set_fog_settings(fog));
+    }
     auto motion_blur = renderer.motion_blur_settings();
     bool motion_blur_changed = false;
     if (ImGui::BeginCombo(

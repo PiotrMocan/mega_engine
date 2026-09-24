@@ -143,6 +143,15 @@ inline constexpr VkDeviceSize exposure_state_bytes =
     exposure_histogram_bytes + sizeof(ExposureGpuReadback);
 inline constexpr std::uint32_t display_push_constant_bytes = 64U;
 
+struct alignas(16) FogPushConstants {
+    glm::vec4 color_density{};
+    glm::vec4 height_distance{};
+    glm::vec4 viewport_opacity{};
+};
+static_assert(sizeof(FogPushConstants) == 48U);
+static_assert(offsetof(FogPushConstants, height_distance) == 16U);
+static_assert(offsetof(FogPushConstants, viewport_opacity) == 32U);
+
 struct alignas(16) ExposurePushConstants {
     float inverse_resolution[2];
     std::uint32_t exposure_mode;
@@ -2969,6 +2978,24 @@ void Renderer::detect_msaa_support() {
         limits.framebufferColorSampleCounts &
         limits.framebufferDepthSampleCounts & color & depth;
     msaa_supported_sample_counts_ |= VK_SAMPLE_COUNT_1_BIT;
+
+    const auto sampled_depth = exact_format_samples(
+        swapchain_.depth_format(),
+        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+    VkFormatProperties hdr_properties{};
+    vkGetPhysicalDeviceFormatProperties(
+        context_->physical_device(), aa_color_format, &hdr_properties);
+    VkPhysicalDeviceDepthStencilResolveProperties resolve_properties{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES,
+    };
+    VkPhysicalDeviceProperties2 properties{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+        .pNext = &resolve_properties,
+    };
+    vkGetPhysicalDeviceProperties2(context_->physical_device(), &properties);
+    fog_supported_ = (sampled_depth & VK_SAMPLE_COUNT_1_BIT) != 0U &&
+        (hdr_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) != 0U &&
+        (resolve_properties.supportedDepthResolveModes & VK_RESOLVE_MODE_SAMPLE_ZERO_BIT) != 0U;
 }
 
 void Renderer::prepare_msaa_targets_for_frame(const std::size_t frame_index) {
@@ -3048,7 +3075,8 @@ void Renderer::create_anti_aliasing_targets() {
             extent.width,
             extent.height,
             swapchain_.depth_format(),
-            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                (fog_supported_ ? VK_IMAGE_USAGE_SAMPLED_BIT : VkImageUsageFlags{0U}),
             VK_IMAGE_ASPECT_DEPTH_BIT,
             VK_FILTER_NEAREST,
             "AA depth attachment");
@@ -3589,7 +3617,7 @@ void Renderer::create_anti_aliasing_descriptors() {
     const std::array pool_sizes{
         VkDescriptorPoolSize{
             .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .descriptorCount = max_frames_in_flight * 13U,
+            .descriptorCount = max_frames_in_flight * 14U,
         },
         VkDescriptorPoolSize{
             .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -3677,7 +3705,7 @@ void Renderer::create_anti_aliasing_descriptors() {
                 .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             },
         };
-        std::array<VkWriteDescriptorSet, 18> writes{};
+        std::array<VkWriteDescriptorSet, 19> writes{};
         for (std::size_t source = 0; source < image_infos.size(); ++source) {
             const std::uint32_t binding = source < 6U
                 ? static_cast<std::uint32_t>(source)
@@ -3811,6 +3839,21 @@ void Renderer::create_anti_aliasing_descriptors() {
                 .pImageInfo = &motion_tile_storage_infos[tile],
             };
         }
+        // Unsupported devices retain a valid, unused sampled-image descriptor.
+        const auto& fog_depth = fog_supported_ ? resources.depth_attachment : resources.depth;
+        const VkDescriptorImageInfo fog_depth_info{
+            .sampler = fog_depth.sampler(),
+            .imageView = fog_depth.view(),
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        writes[18] = VkWriteDescriptorSet{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = resources.descriptor_set,
+            .dstBinding = 18U,
+            .descriptorCount = 1U,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &fog_depth_info,
+        };
         vkUpdateDescriptorSets(
             context_->device(),
             static_cast<std::uint32_t>(writes.size()),
@@ -4488,6 +4531,76 @@ void Renderer::record_subsurface(
     }
 }
 
+void Renderer::record_fog(
+    const VkCommandBuffer command_buffer,
+    AntiAliasingFrameResources& resources,
+    const VkExtent2D extent) {
+    if (!fog_active()) return;
+    // Fixed-function depth resolve uses COLOR_ATTACHMENT_OUTPUT/COLOR_WRITE,
+    // whereas single-sample depth writes use EARLY/LATE_FRAGMENT_TESTS.
+    // https://docs.vulkan.org/spec/latest/chapters/renderpass.html#renderpass-resolve-operations
+    transition_tracked_image(
+        command_buffer, resources.depth_attachment, resources.depth_attachment_layout,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+            VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    transition_tracked_image(
+        command_buffer, resources.color, resources.color_layout,
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    const VkRenderingAttachmentInfo attachment{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = resources.color.view(),
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+    };
+    const VkRenderingInfo rendering{
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .renderArea = VkRect2D{{0, 0}, extent},
+        .layerCount = 1U,
+        .colorAttachmentCount = 1U,
+        .pColorAttachments = &attachment,
+    };
+    const FogPushConstants push{
+        .color_density = glm::vec4(
+            fog_settings_.color[0], fog_settings_.color[1], fog_settings_.color[2],
+            fog_settings_.density),
+        .height_distance = glm::vec4(
+            fog_settings_.base_height, fog_settings_.height_falloff,
+            fog_settings_.start_distance, fog_settings_.maximum_distance),
+        .viewport_opacity = glm::vec4(
+            1.0F / static_cast<float>(extent.width),
+            1.0F / static_cast<float>(extent.height), fog_settings_.maximum_opacity, 0.0F),
+    };
+    const VkViewport viewport{0.0F, 0.0F,
+        static_cast<float>(extent.width), static_cast<float>(extent.height), 0.0F, 1.0F};
+    const VkRect2D scissor{{0, 0}, extent};
+    vkCmdBeginRendering(command_buffer, &rendering);
+    vkCmdSetViewport(command_buffer, 0U, 1U, &viewport);
+    vkCmdSetScissor(command_buffer, 0U, 1U, &scissor);
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, fog_pipeline_.get());
+    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        post_process_pipeline_layout_, 0U, 1U, &resources.descriptor_set, 0U, nullptr);
+    vkCmdPushConstants(command_buffer, post_process_pipeline_layout_,
+        VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, 0U, sizeof(push), &push);
+    vkCmdDraw(command_buffer, 3U, 1U, 0U, 0U);
+    vkCmdEndRendering(command_buffer);
+    transition_tracked_image(
+        command_buffer, resources.color, resources.color_layout,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+}
+
 void Renderer::record_auto_exposure(
     const VkCommandBuffer command_buffer,
     FrameContext& frame,
@@ -5053,7 +5166,7 @@ void Renderer::create_pipeline() {
     VK_CHECK(vkCreatePipelineLayout(
         context_->device(), &layout_info, nullptr, &pipeline_layout_));
 
-    std::array<VkDescriptorSetLayoutBinding, 18>
+    std::array<VkDescriptorSetLayoutBinding, 19>
         anti_aliasing_bindings{};
     for (std::size_t binding = 0; binding < 6U; ++binding) {
         anti_aliasing_bindings[binding] =
@@ -5126,6 +5239,12 @@ void Renderer::create_pipeline() {
             .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
         };
     }
+    anti_aliasing_bindings[18] = VkDescriptorSetLayoutBinding{
+        .binding = 18U,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .descriptorCount = 1U,
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+    };
     const VkDescriptorSetLayoutCreateInfo
         anti_aliasing_descriptor_info{
             .sType =
@@ -6465,6 +6584,18 @@ void Renderer::create_pipeline() {
             return result;
         };
 
+    if (fog_supported_) {
+        auto fog_blend_attachment = hud_blend_attachment;
+        // Fog changes radiance only; preserve scene alpha used by other passes.
+        fog_blend_attachment.colorWriteMask =
+            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
+        fog_pipeline_ = DeviceObject<VkPipeline>(
+            context_->device(),
+            create_fullscreen_pipeline(
+                "fog.frag.spv", aa_color_format, post_process_pipeline_layout_,
+                fog_blend_attachment, VK_FORMAT_UNDEFINED, "Atmospheric height fog"),
+            vkDestroyPipeline);
+    }
     constexpr std::array<const char*, 4> edge_shader_paths{
         "smaa_edge_low.frag.spv",
         "smaa_edge_medium.frag.spv",
@@ -6687,6 +6818,7 @@ void Renderer::create_pipeline() {
 }
 
 void Renderer::destroy_pipeline() noexcept {
+    fog_pipeline_.reset();
     for (std::size_t index = 0U; index < msaa_geometry_.size(); ++index) {
         msaa_geometry_[index] = {};
         depth_msaa_geometry_[index] = {};
@@ -7895,6 +8027,7 @@ void Renderer::record_commands(
     const bool editor_frame =
         editor_output_enabled_ && editor_draw_data != nullptr;
 #endif
+    const bool atmospheric_fog_active = fog_active();
     const bool motion_blur_active =
         motion_blur_mode_actual() != MotionBlurMode::off;
     const bool motion_blur_before_smaa =
@@ -8085,7 +8218,7 @@ void Renderer::record_commands(
 
     if (anti_aliasing_.method == AntiAliasingMethod::off &&
         (!lighting_settings_.dynamic || mode_ == RunMode::instancing) &&
-        !subsurface_active && !motion_blur_active) {
+        !subsurface_active && !motion_blur_active && !atmospheric_fog_active) {
 #if VCR_EDITOR_ENABLED
         if (editor_frame) {
             transition_tracked_image(
@@ -8289,25 +8422,31 @@ void Renderer::record_commands(
                 command_buffer, msaa_targets.depth, msaa_targets.depth_layout,
                 VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
                 VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
-                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT,
                 VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
                     VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                     VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
-        } else {
+        }
+        if (!multisampled || atmospheric_fog_active) {
             transition_tracked_image(
                 command_buffer,
                 aa_resources.depth_attachment,
                 aa_resources.depth_attachment_layout,
                 VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
                 VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
-                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
                 VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
         }
 
         const VkClearValue empty_color{
@@ -8376,8 +8515,14 @@ void Renderer::record_commands(
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .imageView = offscreen_depth_view,
             .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            .resolveMode = multisampled && atmospheric_fog_active
+                ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_NONE,
+            .resolveImageView = multisampled && atmospheric_fog_active
+                ? aa_resources.depth_attachment.view() : VK_NULL_HANDLE,
+            .resolveImageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
             .loadOp = depth_prepass_ == DepthPrepass::off ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
-            .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .storeOp = atmospheric_fog_active && !multisampled
+                ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
             .clearValue = VkClearValue{.depthStencil = {0.0F, 0}},
         };
         const VkRenderingInfo offscreen_rendering_info{
@@ -8498,6 +8643,7 @@ void Renderer::record_commands(
             }
         }
 
+        record_fog(command_buffer, aa_resources, current_render_extent_);
         record_auto_exposure(
             command_buffer, frame, current_render_extent_,
             aa_resources.descriptor_set);
@@ -9189,6 +9335,15 @@ bool Renderer::set_subsurface_mode(const SubsurfaceMode mode) noexcept {
     subsurface_mode_ = mode;
     subsurface_provision_pending_ = mode == SubsurfaceMode::full_resolution &&
         !subsurface_resources_provisioned_;
+    invalidate_temporal_history();
+    exposure_reset_pending_ = true;
+    return true;
+}
+
+bool Renderer::set_fog_settings(const FogSettings& settings) noexcept {
+    if (!valid_fog_settings(settings) || (settings.enabled && !fog_supported_)) return false;
+    if (settings == fog_settings_) return true;
+    fog_settings_ = settings;
     invalidate_temporal_history();
     exposure_reset_pending_ = true;
     return true;

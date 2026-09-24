@@ -461,6 +461,39 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
             result.options.tone_mapper = *mapper;
             continue;
         }
+        if (argument.name == "--fog") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            if (value != "off" && value != "height") {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.fog.enabled = value == "height";
+            continue;
+        }
+        if (argument.name == "--fog-density" || argument.name == "--fog-height-falloff" ||
+            argument.name == "--fog-base-height" || argument.name == "--fog-start" ||
+            argument.name == "--fog-distance" || argument.name == "--fog-max-opacity" ||
+            argument.name == "--fog-color-r" || argument.name == "--fog-color-g" ||
+            argument.name == "--fog-color-b") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            double number = 0.0;
+            if (!parse_finite_double(value, number) || std::abs(number) > 100'000.0) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            auto& fog = result.options.fog;
+            const float scalar = static_cast<float>(number);
+            if (argument.name == "--fog-density") fog.density = scalar;
+            else if (argument.name == "--fog-height-falloff") fog.height_falloff = scalar;
+            else if (argument.name == "--fog-base-height") fog.base_height = scalar;
+            else if (argument.name == "--fog-start") fog.start_distance = scalar;
+            else if (argument.name == "--fog-distance") fog.maximum_distance = scalar;
+            else if (argument.name == "--fog-max-opacity") fog.maximum_opacity = scalar;
+            else if (argument.name == "--fog-color-r") fog.color[0] = scalar;
+            else if (argument.name == "--fog-color-g") fog.color[1] = scalar;
+            else fog.color[2] = scalar;
+            continue;
+        }
         if (argument.name == "--subsurface") {
             if (!take_value(argument, index, argc, argv, value, result.error)) return result;
             const auto mode = parse_subsurface_mode(value);
@@ -881,6 +914,10 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
 
     // Explicit workload knobs are convenient mode selectors, while --mode
     // always wins when the user supplied it.
+    if (!valid_fog_settings(result.options.fog)) {
+        result.error = "invalid fog settings (require 0 <= start < distance <= 100000)";
+        return result;
+    }
     if (!valid_exposure_settings(result.options.exposure)) {
         result.error = "invalid exposure settings";
         return result;
@@ -1044,6 +1081,14 @@ std::string cli_usage(std::string_view executable_name) {
                   "  Up/Down                 Adjust active benchmark load\n"
                   "  --lighting dynamic|legacy  Lighting path (dynamic by default)\n"
                   "  --tone-mapper reinhard|gt7  SDR display mapping (reinhard)\n"
+                  "  --fog off|height           Atmospheric height fog (off)\n"
+                  "  --fog-density 0..1         Extinction per scene unit (0.002)\n"
+                  "  --fog-height-falloff 0..10 Height density falloff (0.05; 0 = uniform)\n"
+                  "  --fog-base-height N        World Y of the fog base (0)\n"
+                  "  --fog-start N              Clear distance from camera (10)\n"
+                  "  --fog-distance N           Maximum ray distance, > start (1000)\n"
+                  "  --fog-max-opacity 0..1     Maximum fog opacity (0.95)\n"
+                  "  --fog-color-r/g/b 0..16    Linear HDR color channels (0.55/0.65/0.8)\n"
                   "  --gi voxel|off             Dynamic diffuse GI (voxel by default)\n"
                   "  --shadow-resolution N      Atlas edge: 1024|2048|4096|8192 (2048)\n"
                   "  --shadow-depth auto|d32|d16 Startup shadow depth profile (auto)\n"

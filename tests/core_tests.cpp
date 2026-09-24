@@ -54,6 +54,38 @@ bool close_to(const double value, const double expected, const double epsilon) {
 
 int main() {
     {
+        const char* args[]{"vcr", "--fog=height", "--fog-density", "0.01",
+            "--fog-base-height=-20", "--fog-height-falloff=0.1", "--fog-start=25",
+            "--fog-distance=500", "--fog-max-opacity=0.7", "--fog-color-r=2",
+            "--fog-color-g=0.3", "--fog-color-b=0.4", "--aa=msaa4x"};
+        const auto parsed = vcr::parse_cli_options(static_cast<int>(std::size(args)), args);
+        expect(parsed && parsed.options.fog.enabled &&
+                   parsed.options.fog.density == 0.01F &&
+                   parsed.options.fog.base_height == -20.0F &&
+                   parsed.options.fog.height_falloff == 0.1F &&
+                   parsed.options.fog.start_distance == 25.0F &&
+                   parsed.options.fog.maximum_distance == 500.0F &&
+                   parsed.options.fog.maximum_opacity == 0.7F &&
+                   parsed.options.fog.color == std::array{2.0F, 0.3F, 0.4F},
+               "height fog accepts explicit HDR, distance and height parameters with MSAA");
+        for (const char* invalid : {"--fog=on", "--fog=", "--fog-density=-1",
+                                   "--fog-density=nan", "--fog-density=1.01",
+                                   "--fog-height-falloff=-1", "--fog-height-falloff=11",
+                                   "--fog-base-height=100001", "--fog-distance=0",
+                                   "--fog-start=1000", "--fog-max-opacity=1.1",
+                                   "--fog-color-r=-1", "--fog-color-g=inf", "--fog-color-b=17"}) {
+            const char* bad[]{"vcr", invalid};
+            expect(!vcr::parse_cli_options(2, bad), "invalid fog options are rejected");
+        }
+        const char* missing[]{"vcr", "--fog-density"};
+        const char* reset[]{"vcr", "--fog=height", "--fog=off"};
+        const auto disabled = vcr::parse_cli_options(3, reset);
+        expect(!vcr::parse_cli_options(2, missing) && disabled && !disabled.options.fog.enabled,
+               "fog requires option values and can be explicitly disabled");
+        expect(vcr::cli_usage("vcr").find("--fog off|height") != std::string::npos,
+               "CLI help exposes atmospheric fog");
+    }
+    {
         for (const float ior : {1.0F, 1.33F, 1.5F, 2.0F, 2.42F, 10.0F, 1.0e20F,
                                 std::numeric_limits<float>::max()}) {
             const double ratio = (static_cast<double>(ior) - 1.0) / (static_cast<double>(ior) + 1.0);

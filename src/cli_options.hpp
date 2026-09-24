@@ -3,6 +3,7 @@
 #include "anti_aliasing.hpp"
 #include "depth_prepass.hpp"
 #include "exposure.hpp"
+#include "fog.hpp"
 #include "color_grading.hpp"
 #include "lighting.hpp"
 #include "lod_transition.hpp"
@@ -77,6 +78,7 @@ struct CliOptions {
     AntiAliasingSettings anti_aliasing{};
     ToneMapper tone_mapper = ToneMapper::reinhard;
     ExposureSettings exposure{};
+    FogSettings fog{};
     ColorGrading color_grading = ColorGrading::off;
     ColorGradingLutSize color_grading_lut_size = ColorGradingLutSize::size_32;
     SubsurfaceMode subsurface = SubsurfaceMode::off;

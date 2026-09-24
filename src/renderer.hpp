@@ -8,6 +8,7 @@
 #include "frame_context.hpp"
 #include "fsr3_upscaler.hpp"
 #include "exposure.hpp"
+#include "fog.hpp"
 #include "color_grading.hpp"
 #include "subsurface.hpp"
 #include "gpu_buffer.hpp"
@@ -222,6 +223,14 @@ public:
     [[nodiscard]] bool set_smaa_mode(SmaaMode mode) noexcept;
     [[nodiscard]] bool set_motion_blur_settings(
         MotionBlurSettings settings) noexcept;
+    [[nodiscard]] bool set_fog_settings(const FogSettings& settings) noexcept;
+    [[nodiscard]] const FogSettings& fog_settings() const noexcept { return fog_settings_; }
+    [[nodiscard]] bool fog_supported() const noexcept { return fog_supported_; }
+    [[nodiscard]] bool fog_active() const noexcept {
+        return fog_supported_ && fog_settings_.enabled &&
+            fog_settings_.density > 0.0F && fog_settings_.maximum_opacity > 0.0F &&
+            mode_ != RunMode::instancing;
+    }
     [[nodiscard]] MotionBlurSettings motion_blur_settings() const noexcept {
         return motion_blur_settings_;
     }
@@ -532,6 +541,10 @@ private:
     void destroy_anti_aliasing_targets() noexcept;
     void create_display_mapping_resources();
     void destroy_display_mapping_resources() noexcept;
+    void record_fog(
+        VkCommandBuffer command_buffer,
+        AntiAliasingFrameResources& resources,
+        VkExtent2D extent);
     void record_auto_exposure(
         VkCommandBuffer command_buffer,
         FrameContext& frame,
@@ -615,6 +628,7 @@ private:
     ToneMapper tone_mapper_ = ToneMapper::reinhard;
     ExposureSettings exposure_settings_{};
     ExposureGpuReadback exposure_readback_{};
+    FogSettings fog_settings_{};
     ColorGrading color_grading_ = ColorGrading::off;
     ColorGradingLutSize color_grading_lut_size_ = ColorGradingLutSize::size_32;
     SubsurfaceMode subsurface_mode_ = SubsurfaceMode::off;
@@ -623,6 +637,7 @@ private:
     LodFadePattern lod_fade_pattern_ = LodFadePattern::off;
     float lod_fade_seconds_ = 0.25F;
     bool lighting_paused_ = false;
+    bool fog_supported_ = false;
     LightingStatistics lighting_statistics_{};
     LightingUniforms lighting_uniforms_{};
     DeviceObject<VkDescriptorSetLayout> lighting_layout_{};
@@ -632,6 +647,7 @@ private:
     DeviceObject<VkPipeline> local_light_cluster_pipeline_{};
     DeviceObject<VkImageView> voxel_storage_view_{};
     DeviceObject<VkPipeline> tonemap_pipeline_{};
+    DeviceObject<VkPipeline> fog_pipeline_{};
     DeviceObject<VkPipeline> exposure_histogram_pipeline_{};
     DeviceObject<VkPipeline> exposure_adapt_pipeline_{};
     DeviceObject<VkPipeline> subsurface_horizontal_pipeline_{};

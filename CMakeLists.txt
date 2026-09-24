@@ -643,6 +643,13 @@ add_dependencies(vulkan_editor vcr_runtime_assets)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(vcr_fog_tests tests/fog_tests.cpp)
+    target_include_directories(vcr_fog_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    if(MSVC)
+        target_compile_options(vcr_fog_tests PRIVATE /W4 /permissive- /EHsc)
+    endif()
+    add_test(NAME vcr_fog_tests COMMAND vcr_fog_tests)
+
     add_executable(vcr_exposure_tests tests/exposure_tests.cpp)
     target_include_directories(vcr_exposure_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     if(MSVC)
