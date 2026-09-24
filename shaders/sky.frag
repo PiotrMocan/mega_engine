@@ -1,6 +1,7 @@
 #version 450
 #extension GL_GOOGLE_include_directive:require
 #include "lighting_common.glsl"
+#include "sky_stars.glsl"
 #include "subsurface_output.glsl"
 
 layout(location = 0) in vec2 inNdc;
@@ -42,7 +43,12 @@ void main()
         skyTexture,
         vec2(fract(longitude), latitude)).rgb;
 
-    writeOpaqueSurface(lighting.options.x>0.5?dynamicSky(viewDirection):sky, 1.0);
+    vec3 outputSky=sky;
+    if(lighting.options.x>0.5) {
+        outputSky=addNightStars(
+            dynamicSky(viewDirection),viewDirection,lighting.sunDirectionIntensity.y);
+    }
+    writeOpaqueSurface(outputSky,1.0);
 #ifdef VCR_SSS_OUTPUT
     outDepth = gl_FragCoord.z;
 #endif
