@@ -1,8 +1,10 @@
 #pragma once
 
+#include "fog.hpp"
 #include "pbr_material.hpp"
 #include "lighting_settings.hpp"
 #include "punctual_light.hpp"
+#include "tone_mapping.hpp"
 
 #include <glm/mat4x4.hpp>
 #include <glm/vec3.hpp>
@@ -147,6 +149,8 @@ public:
     // Explicit opt-in preserves legacy documents containing placeholder camera nodes.
     SceneNodeId startup_camera{};
     std::optional<LightingSettings> lighting{};
+    std::optional<ToneMapper> tone_mapper{};
+    std::optional<FogSettings> fog{};
     [[nodiscard]] std::optional<SceneCameraPose> startup_camera_pose() const noexcept;
 
     [[nodiscard]] SceneNodeId create_node(

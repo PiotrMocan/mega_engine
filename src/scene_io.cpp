@@ -162,6 +162,37 @@ template <typename T>
                 {"cascade_cache", s.cascade_cache}};
 }
 
+[[nodiscard]] bool read_fog(const Json& source, FogSettings& settings) {
+    if (!source.is_object()) return false;
+    if (source.contains("enabled")) {
+        if (!source["enabled"].is_boolean()) return false;
+        settings.enabled = source["enabled"].get<bool>();
+    }
+    if (source.contains("color")) {
+        if (!read_float_array(source["color"], settings.color)) return false;
+    }
+    return read_setting(source, "density", settings.density, 0.0, 1.0) &&
+        read_setting(source, "height_falloff", settings.height_falloff, 0.0, 10.0) &&
+        read_setting(source, "base_height", settings.base_height, -100'000.0, 100'000.0) &&
+        read_setting(source, "start_distance", settings.start_distance, 0.0, 100'000.0) &&
+        read_setting(source, "maximum_distance", settings.maximum_distance, 0.0, 100'000.0) &&
+        read_setting(source, "maximum_opacity", settings.maximum_opacity, 0.0, 1.0) &&
+        valid_fog_settings(settings);
+}
+
+[[nodiscard]] Json fog_json(const FogSettings& settings) {
+    return Json{
+        {"enabled", settings.enabled},
+        {"color", settings.color},
+        {"density", settings.density},
+        {"height_falloff", settings.height_falloff},
+        {"base_height", settings.base_height},
+        {"start_distance", settings.start_distance},
+        {"maximum_distance", settings.maximum_distance},
+        {"maximum_opacity", settings.maximum_opacity},
+    };
+}
+
 [[nodiscard]] bool replace_scene_file(
     const std::filesystem::path& temporary,
     const std::filesystem::path& destination,
@@ -277,6 +308,21 @@ bool save_scene_file(
             return false;
         }
         metadata["lighting"] = lighting_json(*scene.lighting);
+    }
+    if (scene.tone_mapper) {
+        if (*scene.tone_mapper != ToneMapper::reinhard &&
+            *scene.tone_mapper != ToneMapper::gt7) {
+            error = "Scene tone mapper is invalid.";
+            return false;
+        }
+        metadata["tone_mapper"] = to_token(*scene.tone_mapper);
+    }
+    if (scene.fog) {
+        if (!valid_fog_settings(*scene.fog)) {
+            error = "Scene fog settings are invalid.";
+            return false;
+        }
+        metadata["fog"] = fog_json(*scene.fog);
     }
 
     std::filesystem::path temporary = destination;
@@ -763,6 +809,27 @@ bool load_scene_file(
                 return false;
             }
             loaded.lighting = settings;
+        }
+        if (root.contains("tone_mapper")) {
+            if (!root["tone_mapper"].is_string()) {
+                error = "Scene tone mapper is invalid.";
+                return false;
+            }
+            const auto mapper = parse_tone_mapper(
+                root["tone_mapper"].get_ref<const std::string&>());
+            if (!mapper) {
+                error = "Scene tone mapper is invalid.";
+                return false;
+            }
+            loaded.tone_mapper = *mapper;
+        }
+        if (root.contains("fog")) {
+            FogSettings settings;
+            if (!read_fog(root["fog"], settings)) {
+                error = "Scene fog settings are invalid.";
+                return false;
+            }
+            loaded.fog = settings;
         }
         loaded.mark_content_changed();
         output = std::move(loaded);

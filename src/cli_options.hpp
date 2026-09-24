@@ -61,6 +61,17 @@ struct LightingOverrides {
     bool cascade_cache = false;
 };
 
+struct FogOverrides {
+    bool enabled = false;
+    bool density = false;
+    bool height_falloff = false;
+    bool base_height = false;
+    bool start_distance = false;
+    bool maximum_distance = false;
+    bool maximum_opacity = false;
+    std::array<bool, 3> color{};
+};
+
 struct CliOptions {
     static constexpr std::uint32_t default_width = 1920;
     static constexpr std::uint32_t default_height = 1080;
@@ -77,8 +88,10 @@ struct CliOptions {
     PresentPreference present = PresentPreference::automatic;
     AntiAliasingSettings anti_aliasing{};
     ToneMapper tone_mapper = ToneMapper::reinhard;
+    bool tone_mapper_override = false;
     ExposureSettings exposure{};
     FogSettings fog{};
+    FogOverrides fog_overrides{};
     ColorGrading color_grading = ColorGrading::off;
     ColorGradingLutSize color_grading_lut_size = ColorGradingLutSize::size_32;
     SubsurfaceMode subsurface = SubsurfaceMode::off;
@@ -118,6 +131,10 @@ struct CliOptions {
 
 [[nodiscard]] LightingSettings resolve_scene_lighting(
     const CliOptions &options, const std::optional<LightingSettings> &authored) noexcept;
+[[nodiscard]] ToneMapper resolve_scene_tone_mapper(
+    const CliOptions& options, std::optional<ToneMapper> authored) noexcept;
+[[nodiscard]] FogSettings resolve_scene_fog(
+    const CliOptions& options, const std::optional<FogSettings>& authored) noexcept;
 
 struct CliParseResult {
     CliOptions options{};

@@ -82,6 +82,24 @@ int main() {
         const auto disabled = vcr::parse_cli_options(3, reset);
         expect(!vcr::parse_cli_options(2, missing) && disabled && !disabled.options.fog.enabled,
                "fog requires option values and can be explicitly disabled");
+        const char* partial_args[]{"vcr", "--fog-density", "0.25"};
+        const auto partial = vcr::parse_cli_options(3, partial_args);
+        vcr::FogSettings authored_fog{
+            .enabled = true,
+            .color = {1.0F, 2.0F, 3.0F},
+            .density = 0.01F,
+            .height_falloff = 0.2F,
+            .base_height = -5.0F,
+            .start_distance = 25.0F,
+            .maximum_distance = 500.0F,
+            .maximum_opacity = 0.7F,
+        };
+        const auto merged_fog = vcr::resolve_scene_fog(partial.options, authored_fog);
+        expect(partial && merged_fog.enabled && merged_fog.density == 0.25F &&
+                   merged_fog.color == authored_fog.color &&
+                   merged_fog.height_falloff == authored_fog.height_falloff &&
+                   merged_fog.maximum_distance == authored_fog.maximum_distance,
+               "CLI fog overrides only explicit authored fields");
         expect(vcr::cli_usage("vcr").find("--fog off|height") != std::string::npos,
                "CLI help exposes atmospheric fog");
     }
@@ -647,6 +665,11 @@ int main() {
         expect(!vcr::parse_cli_options(2, missing_args), "missing tone mapper rejected");
         expect(vcr::CliOptions{}.tone_mapper == vcr::ToneMapper::reinhard,
                "Reinhard baseline remains default");
+        expect(vcr::resolve_scene_tone_mapper(vcr::CliOptions{}, vcr::ToneMapper::gt7) ==
+                   vcr::ToneMapper::gt7 &&
+                   vcr::resolve_scene_tone_mapper(parsed.options, vcr::ToneMapper::reinhard) ==
+                       vcr::ToneMapper::gt7,
+               "authored tone mapper is used unless CLI explicitly overrides it");
     }
     {
         const char* arguments[]{
@@ -2100,6 +2123,17 @@ int main() {
             };
             source_scene.mark_content_changed();
         }
+        source_scene.tone_mapper = vcr::ToneMapper::gt7;
+        source_scene.fog = vcr::FogSettings{
+            .enabled = true,
+            .color = {1.5F, 0.4F, 0.2F},
+            .density = 0.015F,
+            .height_falloff = 0.12F,
+            .base_height = -4.0F,
+            .start_distance = 18.0F,
+            .maximum_distance = 640.0F,
+            .maximum_opacity = 0.82F,
+        };
         const std::filesystem::path scene_file =
             temporary_root / "roundtrip.scene.json";
         expect(
@@ -2152,8 +2186,13 @@ int main() {
                 loaded_records[3].value.light.range == 14.0F &&
                 loaded_records[4].value.kind == vcr::SceneNodeKind::spot_light &&
                 loaded_records[4].value.light.inner_cone_degrees == 12.0F &&
-                loaded_records[4].value.light.outer_cone_degrees == 27.0F,
-            "scene JSON preserves hierarchy, model, PBR and punctual-light values");
+                loaded_records[4].value.light.outer_cone_degrees == 27.0F &&
+                loaded_scene.tone_mapper == vcr::ToneMapper::gt7 &&
+                loaded_scene.fog && loaded_scene.fog->enabled &&
+                loaded_scene.fog->color == std::array{1.5F, 0.4F, 0.2F} &&
+                loaded_scene.fog->density == 0.015F &&
+                loaded_scene.fog->maximum_distance == 640.0F,
+            "scene JSON preserves hierarchy, materials, lights and rendering settings");
 
         nlohmann::json valid_material_scene;
         { std::ifstream input(scene_file); input >> valid_material_scene; }
@@ -2237,6 +2276,15 @@ int main() {
         expect(!vcr::save_scene_file(source_scene, startup_file, error),
                "scene writer rejects an invalid shadow depth enum");
         source_scene.lighting->shadow_depth = vcr::ShadowDepthFormat::d16;
+        source_scene.tone_mapper = static_cast<vcr::ToneMapper>(255);
+        expect(!vcr::save_scene_file(source_scene, startup_file, error),
+               "scene writer rejects an invalid tone mapper enum");
+        source_scene.tone_mapper = vcr::ToneMapper::gt7;
+        const auto valid_fog = *source_scene.fog;
+        source_scene.fog->density = std::numeric_limits<float>::quiet_NaN();
+        expect(!vcr::save_scene_file(source_scene, startup_file, error),
+               "scene writer rejects invalid fog settings");
+        source_scene.fog = valid_fog;
         expect(source_scene.reparent(scene_cube, camera_parent) &&
                    vcr::save_scene_file(source_scene, startup_file, error) &&
                    vcr::load_scene_file(startup_file, loaded_scene, error) &&
@@ -2258,6 +2306,14 @@ int main() {
         { std::ifstream input(startup_file); input >> startup_json; }
         expect(startup_json["lighting"]["shadow_depth"] == "d16",
                "scene JSON writes a stable string shadow depth profile");
+        expect(startup_json["tone_mapper"] == "gt7" &&
+                   startup_json["fog"]["enabled"] == true &&
+                   startup_json["fog"]["color"].is_array() &&
+                   startup_json["fog"]["color"].size() == 3U &&
+                   close_to(startup_json["fog"]["color"][0].get<double>(), 1.5, 0.0001) &&
+                   close_to(startup_json["fog"]["color"][1].get<double>(), 0.4, 0.0001) &&
+                   close_to(startup_json["fog"]["color"][2].get<double>(), 0.2, 0.0001),
+               "scene JSON writes stable tone-mapping and fog settings");
         const auto original_json = startup_json;
         const auto write_startup = [&] {
             std::ofstream output(startup_file);
@@ -2294,6 +2350,29 @@ int main() {
                        loaded_scene.lighting &&
                        loaded_scene.lighting->shadow_depth == vcr::ShadowDepthFormat::d16,
                    "invalid lighting types ranges and combinations are rejected");
+        }
+        for (const auto& bad : std::array<nlohmann::json, 4>{
+                 nlohmann::json{"GT7"}, nlohmann::json{""}, nlohmann::json{2},
+                 nlohmann::json{nullptr}}) {
+            startup_json = original_json;
+            startup_json["tone_mapper"] = bad;
+            write_startup();
+            expect(!vcr::load_scene_file(startup_file, loaded_scene, error) &&
+                       loaded_scene.tone_mapper == vcr::ToneMapper::gt7,
+                   "invalid tone mapper rejects scene transactionally");
+        }
+        for (const auto& bad : std::array<nlohmann::json, 5>{
+                 nlohmann::json{{"enabled", "yes"}},
+                 nlohmann::json{{"density", -1.0}},
+                 nlohmann::json{{"color", {1.0, 2.0}}},
+                 nlohmann::json{{"color", {1.0, 2.0, 17.0}}},
+                 nlohmann::json{{"start_distance", 500.0}, {"maximum_distance", 100.0}}}) {
+            startup_json = original_json;
+            startup_json["fog"] = bad;
+            write_startup();
+            expect(!vcr::load_scene_file(startup_file, loaded_scene, error) &&
+                       loaded_scene.fog && loaded_scene.fog->density == 0.015F,
+                   "invalid fog settings reject scene transactionally");
         }
         startup_json = original_json;
         startup_json["lighting"] = {{"hour", 17.2}, {"cycle", false}};
@@ -2345,6 +2424,7 @@ int main() {
         legacy_scene.build_node_records(legacy_records);
         expect(
             legacy_records.size() == 1U &&
+                !legacy_scene.tone_mapper && !legacy_scene.fog &&
                 close_to(
                     legacy_records[0].value.material.base_color.b,
                     0.8,

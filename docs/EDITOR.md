@@ -137,8 +137,10 @@ performance benchmark используется изолированный `vulka
 - `Undo/Redo`: bounded history на 32 scene transactions, `Ctrl+Z/Ctrl+Y`;
   structural actions, Inspector edits, целый gizmo drag, duplicate и landscape
   batches входят в историю.
-- `Renderer`: live CPU/GPU timings, управление AA и `Atmospheric fog` —
-  [дымка по расстоянию и высоте](ATMOSPHERIC_FOG.md) с настройками цвета и плотности.
+- `Renderer`: live CPU/GPU timings, управление AA, tone mapper и
+  `Atmospheric fog` — [дымка по расстоянию и высоте](ATMOSPHERIC_FOG.md) с
+  настройками цвета и плотности. Tone mapper и все параметры fog являются
+  authored-настройками сцены и сохраняются обычными Save/Undo/Redo.
 
 Первая раскладка создаётся автоматически: hierarchy слева, inspector справа,
 assets снизу, toolbar сверху и scene view в центре. После этого ImGui хранит

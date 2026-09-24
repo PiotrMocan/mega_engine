@@ -300,8 +300,9 @@ void EditorApplication::initialize(const CliOptions& options) {
     if (!renderer_.set_local_light_backend(options.local_light_backend)) {
         fatal("Invalid local-lighting backend");
     }
-    static_cast<void>(renderer_.set_tone_mapper(options.tone_mapper));
-    if (!renderer_.set_fog_settings(options.fog)) {
+    static_cast<void>(renderer_.set_tone_mapper(
+        resolve_scene_tone_mapper(options, scene_.tone_mapper)));
+    if (!renderer_.set_fog_settings(resolve_scene_fog(options, scene_.fog))) {
         fatal("Invalid fog settings or unsupported sampled depth/HDR blending");
     }
     if (!renderer_.set_exposure_settings(options.exposure)) {
@@ -415,6 +416,11 @@ void EditorApplication::main_loop() {
         if (ui_.consume_scene_replaced()) {
             if (!renderer_.set_lighting_settings(resolve_scene_lighting(options_, scene_.lighting)))
                 fatal("Scene lighting is unavailable; restart the editor with --gi voxel or a supported shadow resolution.");
+            if (!renderer_.set_tone_mapper(
+                    resolve_scene_tone_mapper(options_, scene_.tone_mapper)))
+                fatal("Scene tone mapper is invalid.");
+            if (!renderer_.set_fog_settings(resolve_scene_fog(options_, scene_.fog)))
+                fatal("Scene fog is unavailable on this GPU or invalid.");
             submitted_scene_revision_ = 0U;
             renderer_.invalidate_editor_scene();
         }

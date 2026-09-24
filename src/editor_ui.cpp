@@ -4415,8 +4415,12 @@ void EditorUi::build_performance(
     auto lighting = renderer.lighting_settings();
     if (ImGui::BeginCombo("Tone mapper", to_token(renderer.tone_mapper()).data())) {
         for (const auto mapper : {ToneMapper::reinhard, ToneMapper::gt7}) {
-            if (ImGui::Selectable(to_token(mapper).data(), renderer.tone_mapper() == mapper))
-                static_cast<void>(renderer.set_tone_mapper(mapper));
+            if (ImGui::Selectable(to_token(mapper).data(), renderer.tone_mapper() == mapper) &&
+                mapper != renderer.tone_mapper() && renderer.set_tone_mapper(mapper)) {
+                checkpoint_scene(scene);
+                scene.tone_mapper = mapper;
+                scene.mark_content_changed();
+            }
         }
         ImGui::EndCombo();
     }
@@ -4453,7 +4457,11 @@ void EditorUi::build_performance(
     if (!renderer.fog_supported()) ImGui::TextDisabled("Atmospheric fog unavailable on this GPU");
     if (fog_changed) {
         for (auto& channel : fog.color) channel = std::clamp(channel, 0.0F, 16.0F);
-        static_cast<void>(renderer.set_fog_settings(fog));
+        if (renderer.set_fog_settings(fog)) {
+            checkpoint_scene(scene);
+            scene.fog = fog;
+            scene.mark_content_changed();
+        }
     }
     auto motion_blur = renderer.motion_blur_settings();
     bool motion_blur_changed = false;
@@ -5119,6 +5127,7 @@ void EditorUi::stop_play(SceneDocument& scene) {
     if (edit_scene_snapshot_) {
         scene = std::move(*edit_scene_snapshot_);
         edit_scene_snapshot_.reset();
+        scene_replaced_ = true;
     }
     play_state_ = EditorPlayState::edit;
     external_game_window_open_ = false;

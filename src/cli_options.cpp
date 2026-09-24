@@ -459,6 +459,7 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
                 return result;
             }
             result.options.tone_mapper = *mapper;
+            result.options.tone_mapper_override = true;
             continue;
         }
         if (argument.name == "--fog") {
@@ -468,6 +469,7 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
                 return result;
             }
             result.options.fog.enabled = value == "height";
+            result.options.fog_overrides.enabled = true;
             continue;
         }
         if (argument.name == "--fog-density" || argument.name == "--fog-height-falloff" ||
@@ -482,16 +484,36 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
                 return result;
             }
             auto& fog = result.options.fog;
+            auto& overrides = result.options.fog_overrides;
             const float scalar = static_cast<float>(number);
-            if (argument.name == "--fog-density") fog.density = scalar;
-            else if (argument.name == "--fog-height-falloff") fog.height_falloff = scalar;
-            else if (argument.name == "--fog-base-height") fog.base_height = scalar;
-            else if (argument.name == "--fog-start") fog.start_distance = scalar;
-            else if (argument.name == "--fog-distance") fog.maximum_distance = scalar;
-            else if (argument.name == "--fog-max-opacity") fog.maximum_opacity = scalar;
-            else if (argument.name == "--fog-color-r") fog.color[0] = scalar;
-            else if (argument.name == "--fog-color-g") fog.color[1] = scalar;
-            else fog.color[2] = scalar;
+            if (argument.name == "--fog-density") {
+                fog.density = scalar;
+                overrides.density = true;
+            } else if (argument.name == "--fog-height-falloff") {
+                fog.height_falloff = scalar;
+                overrides.height_falloff = true;
+            } else if (argument.name == "--fog-base-height") {
+                fog.base_height = scalar;
+                overrides.base_height = true;
+            } else if (argument.name == "--fog-start") {
+                fog.start_distance = scalar;
+                overrides.start_distance = true;
+            } else if (argument.name == "--fog-distance") {
+                fog.maximum_distance = scalar;
+                overrides.maximum_distance = true;
+            } else if (argument.name == "--fog-max-opacity") {
+                fog.maximum_opacity = scalar;
+                overrides.maximum_opacity = true;
+            } else if (argument.name == "--fog-color-r") {
+                fog.color[0] = scalar;
+                overrides.color[0] = true;
+            } else if (argument.name == "--fog-color-g") {
+                fog.color[1] = scalar;
+                overrides.color[1] = true;
+            } else {
+                fog.color[2] = scalar;
+                overrides.color[2] = true;
+            }
             continue;
         }
         if (argument.name == "--subsurface") {
@@ -996,6 +1018,30 @@ LightingSettings resolve_scene_lighting(
     if (!result.dynamic) {
         result.voxel_gi = false;
         result.cycle = false;
+    }
+    return result;
+}
+
+ToneMapper resolve_scene_tone_mapper(
+    const CliOptions& options, const std::optional<ToneMapper> authored) noexcept {
+    return options.tone_mapper_override || !authored
+        ? options.tone_mapper
+        : *authored;
+}
+
+FogSettings resolve_scene_fog(
+    const CliOptions& options, const std::optional<FogSettings>& authored) noexcept {
+    auto result = authored.value_or(options.fog);
+    const auto& overrides = options.fog_overrides;
+    if (overrides.enabled) result.enabled = options.fog.enabled;
+    if (overrides.density) result.density = options.fog.density;
+    if (overrides.height_falloff) result.height_falloff = options.fog.height_falloff;
+    if (overrides.base_height) result.base_height = options.fog.base_height;
+    if (overrides.start_distance) result.start_distance = options.fog.start_distance;
+    if (overrides.maximum_distance) result.maximum_distance = options.fog.maximum_distance;
+    if (overrides.maximum_opacity) result.maximum_opacity = options.fog.maximum_opacity;
+    for (std::size_t channel = 0U; channel < overrides.color.size(); ++channel) {
+        if (overrides.color[channel]) result.color[channel] = options.fog.color[channel];
     }
     return result;
 }

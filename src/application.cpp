@@ -176,8 +176,9 @@ void Application::initialize(const CliOptions& options) {
     if (!renderer_.set_local_light_backend(options.local_light_backend)) {
         fatal("Invalid local-lighting backend");
     }
-    static_cast<void>(renderer_.set_tone_mapper(options.tone_mapper));
-    if (!renderer_.set_fog_settings(options.fog)) {
+    static_cast<void>(renderer_.set_tone_mapper(
+        resolve_scene_tone_mapper(options, scene_.tone_mapper)));
+    if (!renderer_.set_fog_settings(resolve_scene_fog(options, scene_.fog))) {
         fatal("Invalid fog settings or unsupported sampled depth/HDR blending");
     }
     if (!renderer_.set_exposure_settings(options.exposure)) {
