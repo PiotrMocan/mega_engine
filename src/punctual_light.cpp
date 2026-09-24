@@ -75,7 +75,7 @@ bool make_gpu_punctual_light(
         .position_range = glm::vec4(position, light.range),
         .direction_type = glm::vec4(direction, type == PunctualLightType::spot ? 1.0F : 0.0F),
         .color_intensity = glm::vec4(light.color, light.intensity_candela),
-        .spot_scale_offset = glm::vec4(scale, offset, 0.0F, 0.0F),
+        .spot_scale_offset = glm::vec4(scale, offset, light.night_only ? 1.0F : 0.0F, 0.0F),
     };
     return true;
 }

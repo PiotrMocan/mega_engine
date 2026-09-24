@@ -2504,6 +2504,8 @@ void EditorUi::build_inspector(SceneDocument& scene) {
             changed |= ImGui::DragFloat(
                 "##LightRange", &node.light.range, 0.05F,
                 0.05F, 1'000.0F, "%.3g", ImGuiSliderFlags_AlwaysClamp);
+            ui_kit_.property_row("Night only");
+            changed |= ImGui::Checkbox("##LightNightOnly", &node.light.night_only);
             if (node.kind == SceneNodeKind::spot_light) {
                 ui_kit_.property_row("Inner cone");
                 changed |= ImGui::DragFloat(

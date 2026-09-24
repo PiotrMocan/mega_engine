@@ -735,6 +735,7 @@ void Renderer::initialize(VulkanContext &context, SDL_Window *window,
     editor_scene_instances_.reserve(
         maximum_editor_scene_instances);
     local_lights_.reserve(maximum_local_lights);
+    local_lights_upload_.reserve(maximum_local_lights);
     editor_model_assets_.reserve(64U);
     editor_texture_assets_.reserve(128U);
     editor_model_draws_.reserve(max_scene_nodes);

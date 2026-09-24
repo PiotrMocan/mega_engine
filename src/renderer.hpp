@@ -667,6 +667,7 @@ private:
     std::array<std::uint32_t, gi_brick_count> voxel_job_mask_{};
     std::vector<GiJob> voxel_jobs_{}, voxel_batch_{};
     std::vector<GpuPunctualLight> local_lights_{};
+    std::vector<GpuPunctualLight> local_lights_upload_{};
     std::uint64_t local_light_revision_ = 1U;
     LocalLightBackend local_light_backend_ = LocalLightBackend::automatic;
     LocalLightStatistics local_light_statistics_{};

@@ -56,6 +56,7 @@ struct PunctualLight {
     float range = 10.0F;
     float inner_cone_degrees = 20.0F;
     float outer_cone_degrees = 30.0F;
+    bool night_only = false;
 
     friend bool operator==(const PunctualLight&, const PunctualLight&) = default;
 };
@@ -66,7 +67,7 @@ struct alignas(16) GpuPunctualLight {
     // XYZ is normalized world direction; W is 0 for point and 1 for spot.
     glm::vec4 direction_type{};
     glm::vec4 color_intensity{};
-    // x/y are the precomputed angular scale/offset used by spot lights.
+    // x/y are the spot angular scale/offset; z marks a night-only source.
     glm::vec4 spot_scale_offset{};
 };
 

@@ -399,6 +399,9 @@ bool save_scene_file(
                 {"intensity_candela", node.light.intensity_candela},
                 {"range", node.light.range},
             };
+            if (node.light.night_only) {
+                encoded["light"]["night_only"] = true;
+            }
             if (node.kind == SceneNodeKind::spot_light) {
                 encoded["light"]["inner_cone_degrees"] =
                     node.light.inner_cone_degrees;
@@ -639,14 +642,17 @@ bool load_scene_file(
                     return false;
                 }
                 const Json& light_json = encoded["light"];
-                const std::size_t expected_size = is_spot ? 5U : 3U;
+                const bool has_night_only = light_json.contains("night_only");
+                const std::size_t expected_size = (is_spot ? 5U : 3U) +
+                    (has_night_only ? 1U : 0U);
                 if (light_json.size() != expected_size ||
                     !light_json.contains("color") ||
                     !light_json.contains("intensity_candela") ||
                     !light_json.contains("range") ||
                     (is_spot &&
                      (!light_json.contains("inner_cone_degrees") ||
-                      !light_json.contains("outer_cone_degrees")))) {
+                      !light_json.contains("outer_cone_degrees"))) ||
+                    (has_night_only && !light_json["night_only"].is_boolean())) {
                     error = "Local light payload schema is invalid.";
                     return false;
                 }
@@ -663,6 +669,9 @@ bool load_scene_file(
                     return false;
                 }
                 light.color = {light_color[0], light_color[1], light_color[2]};
+                if (has_night_only) {
+                    light.night_only = light_json["night_only"].get<bool>();
+                }
                 if (is_spot &&
                     (!read_bounded_float(light_json["inner_cone_degrees"], 0.0F,
                                          90.0F, light.inner_cone_degrees) ||

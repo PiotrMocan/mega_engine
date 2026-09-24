@@ -387,14 +387,28 @@ void Renderer::start_voxel_job() {
 }
 void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkExtent2D extent) {
     auto &u = lighting_uniforms_;
+    const double dt = std::max(0.0, static_cast<double>(fsr_frame_time_ms_) * 0.001);
+    advance_lighting_clock(lighting_settings_, dt, lighting_paused_);
+    const double hour = wrap_day_hour(lighting_settings_.hour);
+    const bool night = hour < 6.0 || hour >= 18.0;
     const bool local_lights_changed =
-        frame.local_light_revision != local_light_revision_;
+        frame.local_light_revision != local_light_revision_ ||
+        frame.local_lights_night != night;
     if (local_lights_changed) {
         if (!local_lights_.empty()) {
+            local_lights_upload_.assign(local_lights_.begin(), local_lights_.end());
+            if (!night) {
+                for (auto &light : local_lights_upload_) {
+                    if (light.spot_scale_offset.z > 0.5F) {
+                        light.color_intensity.w = 0.0F;
+                    }
+                }
+            }
             frame.local_light_buffer.write(
-                std::as_bytes(std::span{local_lights_}));
+                std::as_bytes(std::span{local_lights_upload_}));
         }
         frame.local_light_revision = local_light_revision_;
+        frame.local_lights_night = night;
     }
     const LocalLightBackend local_backend = local_light_backend_actual();
     const std::uint32_t active_local_lights = local_backend == LocalLightBackend::off
@@ -435,8 +449,6 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
         return;
     }
     frame.lighting_was_dynamic = true;
-    const double dt = std::max(0.0, static_cast<double>(fsr_frame_time_ms_) * 0.001);
-    advance_lighting_clock(lighting_settings_, dt, lighting_paused_);
     const auto sun = evaluate_sun(lighting_settings_.hour);
     u.sun_direction_intensity = sun.direction_intensity;
     u.sun_color = sun.color;
@@ -734,6 +746,7 @@ void Renderer::destroy_lighting() noexcept {
         frame.local_light_cluster_buffer.destroy();
         frame.local_light_statistics_readback.destroy();
         frame.local_light_revision = 0U;
+        frame.local_lights_night = false;
         frame.local_light_culling_was_updated = false;
     }
     voxel_jobs_.clear();
@@ -748,6 +761,7 @@ void Renderer::destroy_lighting() noexcept {
     gi_geometry_urgent_ = false;
     lighting_shadow_initialized_ = false;
     local_lights_.clear();
+    local_lights_upload_.clear();
     local_light_revision_ = 1U;
     local_light_statistics_ = {};
 }

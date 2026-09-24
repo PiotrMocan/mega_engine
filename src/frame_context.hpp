@@ -27,6 +27,7 @@ struct FrameContext {
     GpuBuffer exposure_readback{};
     VkDescriptorSet lighting_descriptor_set = VK_NULL_HANDLE;
     std::uint64_t local_light_revision = 0U;
+    bool local_lights_night = false;
     bool local_light_culling_was_updated = false;
     bool exposure_was_updated = false;
     bool lighting_was_dynamic = false;
