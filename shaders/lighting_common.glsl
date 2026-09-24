@@ -29,8 +29,33 @@ vec3 dynamicSkyBackground(vec3 direction) {
 vec3 dynamicSky(vec3 direction) {
     vec3 color=dynamicSkyBackground(direction);
     float alignment=max(dot(direction,lighting.sunDirectionIntensity.xyz),0.0);
-    float disk=smoothstep(0.99995,0.99998,alignment);
-    return color+lighting.sunColor.rgb*lighting.sunDirectionIntensity.w*(disk*8.0+pow(alignment,64.0)*0.05);
+    // A slightly exaggerated angular diameter keeps the sun substantial at a
+    // normal game FOV. The radial profile adds center-to-limb shading instead
+    // of rendering the photosphere as a flat, hard-edged spot.
+    const float photosphereRadius=0.036;
+    float angularDistance=sqrt(max(2.0*(1.0-alignment),0.0));
+    float normalizedRadius=angularDistance/photosphereRadius;
+    float disk=1.0-smoothstep(0.92,1.04,normalizedRadius);
+    float mu=sqrt(clamp(1.0-normalizedRadius*normalizedRadius,0.0,1.0));
+    float centerWeight=pow(mu,0.35);
+
+    vec3 sunColor=max(lighting.sunColor.rgb,vec3(0.0));
+    vec3 limbColor=sunColor*vec3(1.0,0.64,0.38);
+    vec3 centerColor=mix(sunColor,vec3(1.0),0.7);
+    vec3 photosphere=mix(limbColor,centerColor,centerWeight)
+        *disk*mix(5.0,12.0,centerWeight);
+
+    // Two falloff scales approximate the bright inner corona and the much
+    // softer atmospheric aureole without requiring a full-screen bloom pass.
+    float outsideDistance=max(angularDistance-photosphereRadius,0.0);
+    float outsideMask=1.0-disk;
+    float innerCorona=exp(-outsideDistance/0.024)*outsideMask;
+    float outerCorona=exp(-outsideDistance/0.105)*outsideMask;
+    float atmosphericGlow=pow(alignment,64.0);
+    vec3 corona=sunColor
+        *(innerCorona*0.9+outerCorona*0.18+atmosphericGlow*0.04);
+
+    return color+(photosphere+corona)*lighting.sunDirectionIntensity.w;
 }
 float cascadeSample(sampler2DShadow atlas,vec3 position,vec3 normal,vec3 lightDirection,int cascade) {
     vec4 clip=lighting.shadowMatrices[cascade]*vec4(position,1);
