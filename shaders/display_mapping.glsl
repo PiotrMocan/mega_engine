@@ -80,7 +80,11 @@ vec3 displayMapping(
     if (any(isnan(radiance)) || any(isinf(radiance))) radiance = vec3(0.0);
     radiance = max(radiance, vec3(0.0));
     radiance *= exposureMode == 1u ? automaticExposure : fixedExposure;
-    if (mapper == 2u) radiance = gt7ToneMapping(radiance);
+    if (mapper == 2u) {
+        // Calibrate the engine's 0.18 middle grey to GT7's 250-nit SDR scale
+        // (reference framebuffer unit = 100 nits), before the reference curve.
+        radiance = gt7ToneMapping(radiance * 2.5);
+    }
     else {
         radiance=radiance/(vec3(1)+radiance);
     }
