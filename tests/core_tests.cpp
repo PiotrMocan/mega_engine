@@ -1597,6 +1597,8 @@ int main() {
         scene.node(ocean_parent)->get().transform.translation.y = -1.0F;
         scene.node(ocean_parent)->get().transform.scale.y = 2.0F;
         scene.node(ocean)->get().transform.translation.y = -1.0F;
+        scene.node(ocean)->get().ocean.wave_height = 2.0F;
+        scene.node(ocean)->get().ocean.wave_direction_degrees = 135.0F;
         static_cast<void>(scene.create_node(
             "Cube", vcr::SceneNodeKind::cube, root));
         const vcr::SceneNodeId model = scene.create_node(
@@ -1639,8 +1641,17 @@ int main() {
                 visible.terrain_visible &&
                 visible.sky_visible &&
                 visible.sun_visible && visible.ocean_visible &&
-                visible.ocean_height == -3.0F,
+                visible.ocean_height == -3.0F &&
+                visible.ocean == scene.node(ocean)->get().ocean,
             "scene render view exposes visible component flags");
+        scene.node(ocean)->get().ocean.wave_speed = 0.0F;
+        scene.mark_content_changed();
+        expect(scene.build_render_view(instances, models, lights).ocean.wave_speed == 0.0F,
+               "ocean settings update independently of cached transforms");
+        scene.node(ocean)->get().ocean.wave_length = 0.0F;
+        expect(!scene.build_render_view(instances, models, lights).ocean_visible,
+               "invalid ocean settings never reach the renderer");
+        scene.node(ocean)->get().ocean = {};
         if (auto root_node = scene.node(root)) {
             root_node->get().visible = false;
             scene.mark_content_changed();
@@ -2078,6 +2089,16 @@ int main() {
         const auto scene_ocean = source_scene.create_node(
             "Ocean", vcr::SceneNodeKind::ocean, scene_root);
         source_scene.node(scene_ocean)->get().transform.translation.y = -2.0F;
+        const vcr::OceanSettings authored_ocean{
+            .color = {0.02F, 0.3F, 0.4F},
+            .wave_height = 2.5F,
+            .wave_speed = 0.0F,
+            .wave_length = 40.0F,
+            .wave_direction_degrees = 270.0F,
+            .depth = 8.0F,
+            .transparency = 0.75F,
+        };
+        source_scene.node(scene_ocean)->get().ocean = authored_ocean;
         if (auto cube = source_scene.node(scene_cube)) {
             cube->get().transform.translation =
                 glm::vec3(3.0F, 2.0F, -7.0F);
@@ -2154,6 +2175,7 @@ int main() {
             loaded_records.size() == 6U &&
                 loaded_records[5].value.kind == vcr::SceneNodeKind::ocean &&
                 loaded_records[5].value.transform.translation.y == -2.0F &&
+                loaded_records[5].value.ocean == authored_ocean &&
                 source_records.size() == loaded_records.size() &&
                 loaded_records[1].parent_record_index == 0U &&
                 loaded_records[1].value.name == "Cube" &&
@@ -2197,6 +2219,47 @@ int main() {
         nlohmann::json valid_material_scene;
         { std::ifstream input(scene_file); input >> valid_material_scene; }
         const auto invalid_material_file = temporary_root / "invalid-material.scene.json";
+        for (const auto& invalid : {
+                 nlohmann::json{{"wave_height", -0.1}},
+                 nlohmann::json{{"wave_height", 11.0}},
+                 nlohmann::json{{"wave_speed", -1.0}},
+                 nlohmann::json{{"wave_length", 0.0}},
+                 nlohmann::json{{"wave_length", 201.0}},
+                 nlohmann::json{{"wave_direction_degrees", 361.0}},
+                 nlohmann::json{{"depth", -1.0}},
+                 nlohmann::json{{"depth", 1e100}},
+                 nlohmann::json{{"transparency", 1.1}},
+                 nlohmann::json{{"transparency", true}},
+                 nlohmann::json{{"color", {1.0, -0.1, 0.0}}},
+                 nlohmann::json{{"color", {1.0, 0.5}}}}) {
+            auto invalid_scene = valid_material_scene;
+            invalid_scene["nodes"][5]["ocean"].update(invalid);
+            { std::ofstream output(invalid_material_file); output << invalid_scene; }
+            const auto revision = loaded_scene.content_revision();
+            expect(!vcr::load_scene_file(invalid_material_file, loaded_scene, error) &&
+                       loaded_scene.content_revision() == revision,
+                   "invalid ocean JSON is rejected without replacing the current scene");
+        }
+        {
+            auto legacy = valid_material_scene;
+            legacy["nodes"][5].erase("ocean");
+            { std::ofstream output(invalid_material_file); output << legacy; }
+            vcr::SceneDocument legacy_scene;
+            expect(vcr::load_scene_file(invalid_material_file, legacy_scene, error),
+                   "legacy ocean without settings still loads");
+            std::vector<vcr::SceneNodeRecord> legacy_records;
+            legacy_scene.build_node_records(legacy_records);
+            expect(legacy_records.size() == 6 && legacy_records[5].value.ocean == vcr::OceanSettings{},
+                   "legacy ocean receives safe defaults");
+            legacy["nodes"][1]["ocean"] = nlohmann::json::object();
+            { std::ofstream output(invalid_material_file); output << legacy; }
+            expect(!vcr::load_scene_file(invalid_material_file, legacy_scene, error),
+                   "ocean payload cannot be attached to a cube");
+            auto invalid_save = source_scene;
+            invalid_save.node(scene_ocean)->get().ocean.depth = std::numeric_limits<float>::quiet_NaN();
+            expect(!vcr::save_scene_file(invalid_save, scene_file, error),
+                   "non-finite ocean settings are rejected before replacing the saved scene");
+        }
         for (const auto& invalid : {nlohmann::json{{"ior", 0}}, nlohmann::json{{"ior", .99}},
                 nlohmann::json{{"ior", 1e100}}, nlohmann::json{{"ior", true}},
                 nlohmann::json{{"ior", "1.5"}}, nlohmann::json{{"model", "sss"}},

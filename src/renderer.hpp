@@ -909,6 +909,7 @@ private:
     bool editor_sun_visible_ = false;
     bool editor_ocean_visible_ = false;
     float editor_ocean_height_ = 0.0F;
+    OceanSettings editor_ocean_{};
     bool authored_scene_enabled_ = false;
     bool editor_output_enabled_ = false;
 #endif

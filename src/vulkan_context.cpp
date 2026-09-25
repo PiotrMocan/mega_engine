@@ -525,6 +525,8 @@ void VulkanContext::create_device() {
     tessellation_shader_enabled_ = supported2.features.tessellationShader == VK_TRUE;
     features2.features.tessellationShader =
         tessellation_shader_enabled_ ? VK_TRUE : VK_FALSE;
+    independent_blend_enabled_ = supported2.features.independentBlend == VK_TRUE;
+    features2.features.independentBlend = independent_blend_enabled_ ? VK_TRUE : VK_FALSE;
     const VkDeviceCreateInfo create_info{
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = &features2,

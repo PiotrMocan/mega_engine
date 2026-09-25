@@ -72,10 +72,14 @@ public:
     [[nodiscard]] bool tessellation_shader_enabled() const noexcept {
         return tessellation_shader_enabled_;
     }
+    [[nodiscard]] bool independent_blend_enabled() const noexcept {
+        return independent_blend_enabled_;
+    }
 
 private:
   bool indirect_first_instance_ = false;
   bool tessellation_shader_enabled_ = false;
+  bool independent_blend_enabled_ = false;
   void create_instance(SDL_Window *window, bool validation_requested);
   void create_debug_messenger();
   void create_surface(SDL_Window *window);

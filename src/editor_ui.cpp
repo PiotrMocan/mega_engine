@@ -2518,6 +2518,40 @@ void EditorUi::build_inspector(SceneDocument& scene) {
             ui_kit_.end_property_grid();
         }
     }
+    if (node.kind == SceneNodeKind::ocean) {
+        ui_kit_.section_header(EditorIcon::ground, "Ocean");
+        if (ui_kit_.begin_property_grid("OceanProperties")) {
+            ui_kit_.property_row("Wave height (m)");
+            changed |= ImGui::SliderFloat("##WaveHeight", &node.ocean.wave_height,
+                0.0F, 10.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+            ui_kit_.property_row("Wave speed");
+            changed |= ImGui::SliderFloat("##WaveSpeed", &node.ocean.wave_speed,
+                0.0F, 10.0F, "%.2fx", ImGuiSliderFlags_AlwaysClamp);
+            ui_kit_.property_row("Wave size (m)");
+            changed |= ImGui::SliderFloat("##WaveLength", &node.ocean.wave_length,
+                1.0F, 200.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+            ui_kit_.property_row("Direction");
+            changed |= ImGui::SliderFloat("##WaveDirection", &node.ocean.wave_direction_degrees,
+                0.0F, 360.0F, "%.1f deg", ImGuiSliderFlags_AlwaysClamp);
+            ImGui::SetItemTooltip("Wave travel: 0 deg = +X, 90 deg = +Z.");
+            ui_kit_.property_row("Water color");
+            changed |= ImGui::ColorEdit3("##OceanColor", node.ocean.color.data());
+            ui_kit_.property_row("Optical depth (m)");
+            changed |= ImGui::DragFloat("##OceanDepth", &node.ocean.depth, 0.1F,
+                0.0F, 1000.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+            ImGui::SetItemTooltip("Water thickness for color absorption and transparency.");
+            ui_kit_.property_row("Transparency");
+            changed |= ImGui::SliderFloat("##OceanTransparency", &node.ocean.transparency,
+                0.0F, 1.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+            ImGui::SetItemTooltip("0 = opaque. Depth reduces transmission; grazing angles reflect the sky.");
+            ui_kit_.property_row("Defaults");
+            if (ImGui::Button("Reset ocean")) {
+                node.ocean = OceanSettings{};
+                changed = true;
+            }
+            ui_kit_.end_property_grid();
+        }
+    }
     if (node.kind == SceneNodeKind::point_light ||
         node.kind == SceneNodeKind::spot_light) {
         ui_kit_.section_header(EditorIcon::light, "Punctual Light");

@@ -3,6 +3,7 @@
 #include "fog.hpp"
 #include "pbr_material.hpp"
 #include "lighting_settings.hpp"
+#include "ocean_settings.hpp"
 #include "punctual_light.hpp"
 #include "tone_mapping.hpp"
 
@@ -69,6 +70,7 @@ struct SceneNode {
     SceneTransform transform{};
     PbrMaterial material{};
     PunctualLight light{};
+    OceanSettings ocean{};
     SceneNodeKind kind = SceneNodeKind::folder;
     bool visible = true;
     bool expanded = true;
@@ -131,6 +133,7 @@ struct SceneRenderView {
     bool sun_visible = false;
     bool ocean_visible = false;
     float ocean_height = 0.0F;
+    OceanSettings ocean{};
     bool local_lights_overflow = false;
     SceneNodeId ground_id{};
     std::span<const SceneNodeId> cube_ids{};

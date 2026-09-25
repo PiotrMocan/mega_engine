@@ -48,13 +48,14 @@ void main()
     const vec4 base = texelFetch(subsurfaceBase, pixel, 0);
     if (profile == 0u)
     {
-        outColor = base;
+        // Water clears the SSS profile while retaining transmitted diffuse light.
+        outColor = vec4(min(base.rgb + centerOriginal.rgb, vec3(65504.0)), base.a);
         return;
     }
 #else
     if (profile == 0u)
     {
-        outColor = vec4(0.0);
+        outColor = centerOriginal;
         return;
     }
 #endif

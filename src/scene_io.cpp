@@ -193,6 +193,32 @@ template <typename T>
     };
 }
 
+[[nodiscard]] bool read_ocean(const Json& source, OceanSettings& settings) {
+    if (!source.is_object()) return false;
+    if (source.contains("color") && !read_float_array(source["color"], settings.color)) {
+        return false;
+    }
+    return read_setting(source, "wave_height", settings.wave_height, 0.0, 10.0) &&
+        read_setting(source, "wave_speed", settings.wave_speed, 0.0, 10.0) &&
+        read_setting(source, "wave_length", settings.wave_length, 1.0, 200.0) &&
+        read_setting(source, "wave_direction_degrees", settings.wave_direction_degrees, 0.0, 360.0) &&
+        read_setting(source, "depth", settings.depth, 0.0, 1000.0) &&
+        read_setting(source, "transparency", settings.transparency, 0.0, 1.0) &&
+        valid_ocean_settings(settings);
+}
+
+[[nodiscard]] Json ocean_json(const OceanSettings& settings) {
+    return Json{
+        {"color", settings.color},
+        {"wave_height", settings.wave_height},
+        {"wave_speed", settings.wave_speed},
+        {"wave_length", settings.wave_length},
+        {"wave_direction_degrees", settings.wave_direction_degrees},
+        {"depth", settings.depth},
+        {"transparency", settings.transparency},
+    };
+}
+
 [[nodiscard]] bool replace_scene_file(
     const std::filesystem::path& temporary,
     const std::filesystem::path& destination,
@@ -258,6 +284,10 @@ bool save_scene_file(
     std::uint32_t local_light_count = 0U;
     for (const SceneNodeRecord& record : records) {
         const SceneNode& node = record.value;
+        if (node.kind == SceneNodeKind::ocean && !valid_ocean_settings(node.ocean)) {
+            error = "Scene ocean settings are invalid.";
+            return false;
+        }
         if (static_cast<std::uint32_t>(node.material.subsurface_profile) >
                 maximum_subsurface_profile ||
             !std::isfinite(node.material.subsurface_strength) ||
@@ -391,6 +421,9 @@ bool save_scene_file(
             : Json(record.parent_record_index);
         if (node.kind == SceneNodeKind::model) {
             encoded["asset_path"] = node.asset_path;
+        }
+        if (node.kind == SceneNodeKind::ocean) {
+            encoded["ocean"] = ocean_json(node.ocean);
         }
         if (node.kind == SceneNodeKind::point_light ||
             node.kind == SceneNodeKind::spot_light) {
@@ -634,6 +667,12 @@ bool load_scene_file(
                     color[3]},
             };
             PunctualLight light{};
+            OceanSettings ocean{};
+            if (encoded.contains("ocean") &&
+                (*kind != SceneNodeKind::ocean || !read_ocean(encoded["ocean"], ocean))) {
+                error = "Ocean settings are invalid or assigned to a non-ocean node.";
+                return false;
+            }
             const bool is_point = *kind == SceneNodeKind::point_light;
             const bool is_spot = *kind == SceneNodeKind::spot_light;
             if (is_point || is_spot) {
@@ -796,6 +835,7 @@ bool load_scene_file(
             };
             node->get().material = material;
             node->get().light = light;
+            node->get().ocean = ocean;
             node->get().asset_path = std::move(asset_path);
             ids.push_back(id);
         }

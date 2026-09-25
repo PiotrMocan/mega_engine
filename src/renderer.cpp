@@ -10,6 +10,7 @@
 
 #include <array>
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -85,8 +86,11 @@ struct alignas(16) FrameUniforms {
     glm::vec4 shadow_map_parameters{0.0F};
     glm::mat4 unjittered_view_projection{1.0F};
     glm::mat4 previous_unjittered_view_projection{1.0F};
-    // X: world water level; Y: animation time in seconds.
+    // X: world water level; Y: speed-integrated time; Z: wave height; W: size / 18.
     glm::vec4 ocean_parameters{0.0F};
+    glm::vec4 ocean_color_depth{0.0F};
+    // XY: rotation from the original wave spectrum; Z: transparency.
+    glm::vec4 ocean_direction_transparency{0.0F};
 };
 
 struct alignas(16) InstanceData {
@@ -109,7 +113,10 @@ struct TerrainVertex {
     std::int16_t normal_z;
 };
 
-static_assert(sizeof(FrameUniforms) == 432);
+static_assert(sizeof(FrameUniforms) == 464);
+static_assert(offsetof(FrameUniforms, ocean_parameters) == 416);
+static_assert(offsetof(FrameUniforms, ocean_color_depth) == 432);
+static_assert(offsetof(FrameUniforms, ocean_direction_transparency) == 448);
 static_assert(sizeof(InstanceData) == 64);
 static_assert(sizeof(PbrInstanceData) == 96);
 static_assert(offsetof(PbrInstanceData, material) == 48U);
@@ -835,6 +842,7 @@ void Renderer::shutdown() noexcept {
     editor_sky_visible_ = false;
     editor_ocean_visible_ = false;
     editor_ocean_height_ = 0.0F;
+    editor_ocean_ = {};
     editor_sun_visible_ = false;
     authored_scene_enabled_ = false;
     editor_output_enabled_ = false;
@@ -1968,6 +1976,7 @@ bool Renderer::update_editor_scene(
     editor_sun_visible_ = view.sun_visible;
     editor_ocean_visible_ = view.ocean_visible;
     editor_ocean_height_ = view.ocean_height;
+    editor_ocean_ = view.ocean;
     authored_scene_object_count_ =
         static_cast<std::uint32_t>(
             ground_count + view.cubes.size() + view.models.size()) +
@@ -4894,7 +4903,14 @@ void Renderer::update_frame_uniform(
         uniforms.sun_direction_intensity.w = 0.0F;
     }
     uniforms.ocean_parameters = glm::vec4(
-        editor_ocean_height_, static_cast<float>(ocean_time_seconds_), 0.0F, 0.0F);
+        editor_ocean_height_, static_cast<float>(ocean_time_seconds_),
+        editor_ocean_.wave_height, editor_ocean_.wave_length / 18.0F);
+    uniforms.ocean_color_depth = glm::vec4(
+        editor_ocean_.color[0], editor_ocean_.color[1], editor_ocean_.color[2], editor_ocean_.depth);
+    const float ocean_angle = glm::radians(editor_ocean_.wave_direction_degrees - 20.0F);
+    uniforms.ocean_direction_transparency = glm::vec4(
+        std::cos(ocean_angle), std::sin(ocean_angle),
+        context_->independent_blend_enabled() ? editor_ocean_.transparency : 0.0F, 0.0F);
 #endif
     frame.uniform_buffer.write(
         std::as_bytes(std::span{&uniforms, std::size_t{1}}));
@@ -6338,17 +6354,44 @@ void Renderer::create_pipeline() {
 
 #if VCR_EDITOR_ENABLED
     if (authored_scene_enabled_) {
+        if (!context_->independent_blend_enabled()) {
+            std::cerr << "Ocean transparency unavailable: independentBlend is unsupported; "
+                         "using opaque water.\n";
+        }
         // Reuse the fullscreen layout and attachment formats, but write the
         // ray/sea intersection depth so land occludes water in every AA path.
         const auto create_ocean = [&](VkGraphicsPipelineCreateInfo info,
-                                      const char* shader, const char* name) {
+                                      const char* shader, const char* name,
+                                      const bool subsurface = false) {
             const ShaderModule fragment = load_shader(shader);
             auto stages = sky_stages;
             stages[1].module = fragment.get();
             auto depth = sky_depth_stencil;
             depth.depthWriteEnable = VK_TRUE;
+            auto blend = *info.pColorBlendState;
+            std::array<VkPipelineColorBlendAttachmentState, 4> attachments{};
+            assert(blend.attachmentCount <= attachments.size());
+            std::copy_n(blend.pAttachments, blend.attachmentCount, attachments.begin());
+            if (context_->independent_blend_enabled()) {
+                // Blend radiance only; motion vectors and depth describe the surface.
+                for (std::size_t index = 0; index < (subsurface ? 2U : 1U); ++index) {
+                    auto& attachment = attachments[index];
+                    attachment.blendEnable = VK_TRUE;
+                    attachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+                    attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+                    attachment.colorBlendOp = VK_BLEND_OP_ADD;
+                    // Keep final image alpha opaque for ImGui composition. The
+                    // SSS diffuse attachment instead clears its encoded profile.
+                    attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+                    attachment.dstAlphaBlendFactor = subsurface && index == 0U
+                        ? VK_BLEND_FACTOR_ZERO : VK_BLEND_FACTOR_ONE;
+                    attachment.alphaBlendOp = VK_BLEND_OP_ADD;
+                }
+            }
+            blend.pAttachments = attachments.data();
             info.pStages = stages.data();
             info.pDepthStencilState = &depth;
+            info.pColorBlendState = &blend;
             DeviceObject<VkPipeline> result;
             VK_CHECK(vkCreateGraphicsPipelines(
                 context_->device(), pipeline_cache_, 1U, &info, nullptr,
@@ -6364,9 +6407,9 @@ void Renderer::create_pipeline() {
         aa_ocean_pipeline_ = create_ocean(
             aa_sky_pipeline_info, "ocean_aa.frag.spv", "temporal ocean pipeline");
         subsurface_spatial_.ocean = create_ocean(
-            sss_spatial_sky_info, "ocean_sss.frag.spv", "SSS spatial ocean pipeline");
+            sss_spatial_sky_info, "ocean_sss.frag.spv", "SSS spatial ocean pipeline", true);
         subsurface_temporal_.ocean = create_ocean(
-            sss_temporal_sky_info, "ocean_aa_sss.frag.spv", "SSS temporal ocean pipeline");
+            sss_temporal_sky_info, "ocean_aa_sss.frag.spv", "SSS temporal ocean pipeline", true);
         for (std::size_t index = 0U; index < msaa_samples.size(); ++index) {
             if ((msaa_supported_sample_counts_ & msaa_samples[index]) == 0U) continue;
             auto samples = multisampling;
@@ -7114,7 +7157,10 @@ bool Renderer::draw_frame(
     }
     last_frame_time_ = frame_now;
     // Double accumulation avoids frame-rate-dependent loss of small deltas.
-    ocean_time_seconds_ += static_cast<double>(fsr_frame_time_ms_) * 0.001;
+#if VCR_EDITOR_ENABLED
+    ocean_time_seconds_ += static_cast<double>(fsr_frame_time_ms_) * 0.001 *
+        static_cast<double>(editor_ocean_.wave_speed);
+#endif
     if (motion_blur_mode_actual() != MotionBlurMode::off &&
         (!std::isfinite(fsr_frame_time_ms_) || fsr_frame_time_ms_ > 250.0F)) {
         invalidate_temporal_history();
@@ -7986,6 +8032,21 @@ void Renderer::record_commands(
                                      terrain_lod_first_[terrain_lod_], 0, 0);
                 }
             }
+            bool draw_sky = mode_ != RunMode::instancing;
+#if VCR_EDITOR_ENABLED
+            draw_sky =
+                draw_sky &&
+                (!authored_scene_enabled_ ||
+                 editor_sky_visible_);
+#endif
+            if (draw_sky && !depth_only) {
+                // Fill the background before compositing translucent water.
+                vkCmdBindPipeline(
+                    command_buffer,
+                    VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    sky_pipeline);
+                vkCmdDraw(command_buffer, 3, 1, 0, 0);
+            }
 #if VCR_EDITOR_ENABLED
             if (!depth_only && mode_ != RunMode::instancing &&
                 authored_scene_enabled_ && editor_ocean_visible_) {
@@ -7996,21 +8057,6 @@ void Renderer::record_commands(
 #else
             static_cast<void>(ocean_pipeline);
 #endif
-            bool draw_sky = mode_ != RunMode::instancing;
-#if VCR_EDITOR_ENABLED
-            draw_sky =
-                draw_sky &&
-                (!authored_scene_enabled_ ||
-                 editor_sky_visible_);
-#endif
-            if (draw_sky && !depth_only) {
-                // The triangle sits at reverse-Z far depth 0.0 and is drawn last.
-                vkCmdBindPipeline(
-                    command_buffer,
-                    VK_PIPELINE_BIND_POINT_GRAPHICS,
-                    sky_pipeline);
-                vkCmdDraw(command_buffer, 3, 1, 0, 0);
-            }
         };
 
     const auto prepassed_pipeline = [this](VkPipeline normal, const DeviceObject<VkPipeline> &equal,

@@ -18,6 +18,8 @@ layout(set = 0, binding = 0, std140) uniform FrameUniforms
     mat4 unjitteredViewProjection;
     mat4 previousUnjitteredViewProjection;
     vec4 oceanParameters;
+    vec4 oceanColorDepth;
+    vec4 oceanDirectionTransparency;
 } frame;
 layout(set = 0, binding = 3) uniform sampler2D skyTexture;
 
@@ -33,7 +35,9 @@ vec3 reflectedSky(vec3 direction)
     return textureLod(skyTexture, vec2(fract(uv.x), uv.y), 2.0).rgb;
 }
 
-vec3 oceanNormal(vec2 position, float footprint)
+// X: displacement, YZ: its analytic gradient. The six amplitudes sum to
+// half the authored crest-to-trough height, independently of wavelength.
+vec3 oceanSurface(vec2 position, float footprint, float horizonFade)
 {
     // Analytic wave slopes need no textures or per-frame mesh uploads. Filter
     // wavelengths smaller than a pixel to keep the distant sea from sparkling.
@@ -43,22 +47,30 @@ vec3 oceanNormal(vec2 position, float footprint)
     const float wavelengths[6] = float[6](18.0, 9.0, 4.2, 1.9, 0.8, 0.34);
     const float slopes[6] = float[6](0.085, 0.065, 0.055, 0.045, 0.035, 0.025);
     vec2 gradient = vec2(0.0);
+    float height = 0.0;
+    vec2 rotation = frame.oceanDirectionTransparency.xy;
+    mat2 waveRotation = mat2(rotation.x, rotation.y, -rotation.y, rotation.x);
     for (int i = 0; i < 6; ++i)
     {
-        float frequency = 2.0 * pi / wavelengths[i];
-        float phase = dot(directions[i], position) * frequency
+        vec2 direction = waveRotation * directions[i];
+        float wavelength = wavelengths[i] * frame.oceanParameters.w;
+        float frequency = 2.0 * pi / wavelength;
+        float amplitude = 0.5 * frame.oceanParameters.z
+            * (slopes[i] * wavelengths[i] / 2.468) * horizonFade;
+        float phase = dot(direction, position) * frequency
             - sqrt(9.81 * frequency) * frame.oceanParameters.y + float(i) * 1.73;
         // Bend each crest across its travel direction to avoid parallel stripes.
-        vec2 crossDirection = vec2(-directions[i].y, directions[i].x);
+        vec2 crossDirection = vec2(-direction.y, direction.x);
         float crossPhase = dot(crossDirection, position) * frequency * 0.57
             + frame.oceanParameters.y * 0.23;
-        vec2 phaseGradient = directions[i] + crossDirection * (0.57 * cos(crossPhase));
+        vec2 phaseGradient = direction + crossDirection * (0.57 * cos(crossPhase));
         phase += sin(crossPhase);
         float filterWeight = 1.0 - smoothstep(0.15, 0.65,
-                                              footprint / wavelengths[i]);
-        gradient += phaseGradient * cos(phase) * slopes[i] * filterWeight;
+                                              footprint / wavelength);
+        height += sin(phase) * amplitude * filterWeight;
+        gradient += phaseGradient * cos(phase) * amplitude * frequency * filterWeight;
     }
-    return normalize(vec3(-gradient.x, 1.0, -gradient.y));
+    return vec3(height, gradient);
 }
 
 void main()
@@ -72,6 +84,29 @@ void main()
         discard;
     float distanceToWater = (level - frame.cameraPosition.y) / ray.y;
     vec3 position = frame.cameraPosition.xyz + ray * distanceToWater;
+    float footprint = max(length(dFdx(position.xz)), length(dFdy(position.xz)));
+    float horizonFade = smoothstep(0.0, 0.10, -ray.y);
+    float amplitudeBound = 0.5 * frame.oceanParameters.z * horizonFade;
+    // A fixed, safeguarded Newton solve intersects the displaced height field.
+    // Its bracket is bounded by the sum of wave amplitudes, even for steep waves.
+    float nearDistance = max(0.0, (level + amplitudeBound - frame.cameraPosition.y) / ray.y);
+    float farDistance = (level - amplitudeBound - frame.cameraPosition.y) / ray.y;
+    if (amplitudeBound > 0.0)
+    {
+        for (int iteration = 0; iteration < 6; ++iteration)
+        {
+            vec3 surface = oceanSurface(position.xz, footprint, horizonFade);
+            float error = position.y - level - surface.x;
+            if (abs(error) < 0.001) break;
+            if (error > 0.0) nearDistance = distanceToWater;
+            else farDistance = distanceToWater;
+            float derivative = ray.y - dot(surface.yz, ray.xz);
+            float candidate = distanceToWater - error / min(derivative, -0.0001);
+            distanceToWater = candidate > nearDistance && candidate < farDistance
+                ? candidate : 0.5 * (nearDistance + farDistance);
+            position = frame.cameraPosition.xyz + ray * distanceToWater;
+        }
+    }
     vec4 clip = frame.viewProjection * vec4(position, 1.0);
     // The background ocean extends past the finite geometry far plane. Keep
     // those pixels just in front of sky (reverse-Z zero), behind all geometry.
@@ -80,10 +115,8 @@ void main()
         discard;
     gl_FragDepth = depth;
 
-    float footprint = max(length(dFdx(position.xz)), length(dFdy(position.xz)));
-    vec3 normal = oceanNormal(position.xz, footprint);
-    normal = normalize(mix(vec3(0.0, 1.0, 0.0), normal,
-                           smoothstep(0.0, 0.10, -ray.y)));
+    vec3 surface = oceanSurface(position.xz, footprint, horizonFade);
+    vec3 normal = normalize(vec3(-surface.y, 1.0, -surface.z));
     vec3 view = -ray;
     float nDotV = max(dot(normal, view), 0.001);
     float fresnel = 0.0204 + 0.9796 * pow(1.0 - nDotV, 5.0);
@@ -110,17 +143,27 @@ void main()
         / max(4.0 * nDotV, 0.001);
     vec3 ambient = lighting.options.x > 0.5
         ? lighting.skyHorizon.rgb : frame.skyAmbient.rgb;
-    vec3 deepWater = vec3(0.012, 0.085, 0.115)
+    float opticalDepth = frame.oceanColorDepth.a / max(-ray.y, 0.15);
+    float transmission = frame.oceanDirectionTransparency.z * exp(-opticalDepth * 0.04);
+    vec3 waterTint = frame.oceanColorDepth.rgb
+        * mix(vec3(2.0, 1.6, 1.25), vec3(1.0), 1.0 - exp(-opticalDepth * 0.12));
+    vec3 deepWater = waterTint
         * (ambient * 0.7 + sun * (0.12 + 0.25 * nDotL));
-    vec3 color = mix(deepWater, reflectedSky(reflection), fresnel) + glint;
+    float opacity = 1.0 - transmission * (1.0 - fresnel);
+    // Unpremultiply for SRC_ALPHA blending: reflections remain visible on clear water.
+    vec3 color = (deepWater * ((1.0 - fresnel) * (1.0 - transmission))
+        + reflectedSky(reflection) * fresnel + glint) / max(opacity, 0.0001);
     // A soft aerial haze joins the sea and sky without exposing a mesh edge.
     float haze = 1.0 - exp(-distanceToWater * 0.00012);
     vec3 horizon = reflectedSky(normalize(vec3(ray.x, 0.01, ray.z)));
     color = mix(color, horizon, haze * 0.85);
-    writeOpaqueSurface(color, 1.0);
+    writeOpaqueSurface(color, opacity);
+#ifdef VCR_SSS_OUTPUT
+    // Attenuate the existing diffuse layer and clear its encoded SSS profile.
+    outColor = vec4(0.0, 0.0, 0.0, opacity);
+#endif
 #ifdef VCR_SSS_TEMPORAL
-    // The mean water plane is stationary; reproject its world position instead
-    // of using the sky's infinite-depth motion (which ignores translation).
+    // Reproject the surface position rather than the infinite sky background.
     vec4 currentClip = frame.unjitteredViewProjection * vec4(position, 1.0);
     vec4 previousClip = frame.previousUnjitteredViewProjection * vec4(position, 1.0);
     outMotionVector = previousClip.xy / previousClip.w - currentClip.xy / currentClip.w;
