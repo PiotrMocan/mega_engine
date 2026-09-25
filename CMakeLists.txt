@@ -438,6 +438,8 @@ endif()
 set(VCR_RENDERER_SOURCES
     src/cli_options.cpp
     src/fly_camera.cpp
+    src/gameplay.cpp
+    src/gameplay_session.cpp
     src/fsr3_upscaler.cpp
     src/gpu_buffer.cpp
     src/gpu_texture.cpp
@@ -643,6 +645,23 @@ add_dependencies(vulkan_editor vcr_runtime_assets)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(vcr_gameplay_tests
+        tests/gameplay_tests.cpp
+        src/gameplay.cpp
+    )
+    target_include_directories(vcr_gameplay_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+    target_link_libraries(vcr_gameplay_tests PRIVATE glm::glm)
+    if(MSVC)
+        target_compile_options(vcr_gameplay_tests PRIVATE /W4 /permissive- /EHsc)
+    else()
+        target_compile_options(vcr_gameplay_tests PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+        )
+    endif()
+    add_test(NAME vcr_gameplay_tests COMMAND vcr_gameplay_tests)
+
     add_executable(vcr_fog_tests tests/fog_tests.cpp)
     target_include_directories(vcr_fog_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     if(MSVC)

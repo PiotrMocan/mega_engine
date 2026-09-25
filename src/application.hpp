@@ -2,6 +2,7 @@
 
 #include "cli_options.hpp"
 #include "fly_camera.hpp"
+#include "gameplay_session.hpp"
 #include "mcp_server.hpp"
 #include "renderer.hpp"
 #include "scene_document.hpp"
@@ -38,6 +39,7 @@ public:
 private:
     void initialize(const CliOptions& options);
     void load_canonical_scene();
+    void initialize_gameplay(const SceneRenderView& initial_view);
     void set_lighting_room_roof(bool enabled);
     SceneNodeId lighting_room_roof_{};
     void main_loop();
@@ -56,7 +58,7 @@ private:
         McpInputKey key,
         McpInputAction action);
     void set_mouse_capture(bool enabled) noexcept;
-    void update_camera(float delta_seconds) noexcept;
+    void update_camera(float delta_seconds);
     void update_window_title();
     void finish_benchmark();
     void shutdown() noexcept;
@@ -72,6 +74,7 @@ private:
     bool stream_asset_placed_ = false;
     double camera_animation_time_ = 0;
     FlyCamera camera_{};
+    GameplaySession gameplay_{};
     CliOptions options_{};
     BenchmarkController benchmark_{};
     BenchmarkFrameSamples benchmark_samples_{};

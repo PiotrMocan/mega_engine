@@ -105,6 +105,7 @@ public:
     [[nodiscard]] EditorPlayState play_state() const noexcept {
         return play_state_;
     }
+    void stop_play(SceneDocument& scene);
     [[nodiscard]] SceneNodeId selected_node() const noexcept {
         return selected_node_;
     }
@@ -228,8 +229,9 @@ private:
     void push_undo_snapshot(SceneDocument snapshot);
     void apply_deferred_scene_commands(SceneDocument& scene);
     void update_camera_input();
+    void set_game_mouse_capture(SDL_Window* window) noexcept;
+    void update_game_mouse_capture(bool viewport_clicked);
     void start_play(SceneDocument& scene);
-    void stop_play(SceneDocument& scene);
     void request_viewport_extent(
         VkExtent2D extent,
         std::chrono::steady_clock::time_point now) noexcept;
@@ -282,6 +284,12 @@ private:
     std::vector<SceneDocument> undo_history_{};
     std::vector<SceneDocument> redo_history_{};
     EditorPlayState play_state_ = EditorPlayState::edit;
+    // Resolve the ID on use: ImGui owns and may destroy platform windows.
+    SDL_WindowID game_mouse_window_id_ = 0U;
+    ImGuiConfigFlags game_mouse_saved_config_ = 0;
+    float pending_game_mouse_delta_x_ = 0.0F;
+    float pending_game_mouse_delta_y_ = 0.0F;
+    bool game_mouse_capture_requested_ = false;
     bool external_game_window_open_ = false;
     bool viewport_hovered_ = false;
     bool viewport_focused_ = false;

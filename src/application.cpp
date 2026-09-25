@@ -201,9 +201,11 @@ void Application::initialize(const CliOptions& options) {
         fatal("Invalid model LOD fade settings");
     }
     load_canonical_scene();
-    camera_ = scene_startup_camera(scene_,
-        options.camera_z_explicit || options.animate_camera
-            ? std::optional<double>(options.camera_z) : std::nullopt);
+    if (!gameplay_.active()) {
+        camera_ = scene_startup_camera(scene_,
+            options.camera_z_explicit || options.animate_camera
+                ? std::optional<double>(options.camera_z) : std::nullopt);
+    }
     VisibilitySettings visibility{options.frustum_culling, options.occlusion_culling, options.lod,
                                   options.dynamic_shadows};
     visibility.coarse_front_to_back = options.coarse_front_to_back;
@@ -244,10 +246,17 @@ void Application::initialize(const CliOptions& options) {
         if (!options.mcp_stdio) {
             set_mouse_capture(true);
         }
-        std::cout
-            << "Controls: mouse look, WASD move, Shift boost, "
-               "Space/E up, Ctrl/Q down, F6 AA type, "
-               "F7/F8 AA quality, Esc release/exit\n";
+        if (gameplay_.active()) {
+            std::cout
+                << "Controls: mouse orbit, WASD move/turn, Shift run, "
+                   "Space jump, F6 AA type, F7/F8 AA quality, "
+                   "Esc release/exit\n";
+        } else {
+            std::cout
+                << "Controls: mouse look, WASD move, Shift boost, "
+                   "Space/E up, Ctrl/Q down, F6 AA type, "
+                   "F7/F8 AA quality, Esc release/exit\n";
+        }
     }
 }
 
@@ -374,8 +383,13 @@ void Application::load_canonical_scene() {
     }
     scene_instances_.reserve(max_scene_nodes);
     scene_models_.reserve(max_scene_nodes);
-    const SceneRenderView view =
+    SceneRenderView view =
         scene_.build_render_view(scene_instances_, scene_models_, scene_lights_);
+    initialize_gameplay(view);
+    if (gameplay_.active()) {
+        view = scene_.build_render_view(
+            scene_instances_, scene_models_, scene_lights_);
+    }
     if (!view.cubes.empty()) {
         animated_node_ = view.cube_ids.front();
         const auto &instance = view.cubes.front();
@@ -395,6 +409,25 @@ void Application::load_canonical_scene() {
     std::cout
         << "Loaded scene: " << scene_path
         << " (" << scene_.size() << " nodes)\n";
+}
+
+void Application::initialize_gameplay(const SceneRenderView& initial_view) {
+    if (options_.benchmark || options_.animate_camera ||
+        options_.render_fixture != RenderFixture::none ||
+        options_.lighting_room || options_.scene_count != 0U) {
+        return;
+    }
+
+    const FlyCamera startup_camera = scene_startup_camera(
+        scene_,
+        options_.camera_z_explicit
+            ? std::optional<double>(options_.camera_z)
+            : std::nullopt);
+    std::string error;
+    if (!gameplay_.start(
+            scene_, initial_view, startup_camera, camera_, error)) {
+        fatal(error);
+    }
 }
 
 void Application::set_lighting_room_roof(bool enabled) {
@@ -714,8 +747,9 @@ void Application::set_mouse_capture(const bool enabled) noexcept {
     pending_mouse_delta_y_ = 0.0F;
 }
 
-void Application::update_camera(const float delta_seconds) noexcept {
+void Application::update_camera(const float delta_seconds) {
     FlyCameraInput input{};
+    bool character_jump = false;
     if (mouse_captured_ && !options_.benchmark) {
         input.mouse_delta_x = pending_mouse_delta_x_;
         input.mouse_delta_y = pending_mouse_delta_y_;
@@ -733,6 +767,7 @@ void Application::update_camera(const float delta_seconds) noexcept {
         input.right = key_down(SDL_SCANCODE_D);
         input.up =
             key_down(SDL_SCANCODE_SPACE) || key_down(SDL_SCANCODE_E);
+        character_jump = key_down(SDL_SCANCODE_SPACE);
         input.down =
             key_down(SDL_SCANCODE_LCTRL) ||
             key_down(SDL_SCANCODE_RCTRL) ||
@@ -758,6 +793,8 @@ void Application::update_camera(const float delta_seconds) noexcept {
         mcp_key_active(McpInputKey::q);
     input.boost =
         input.boost || mcp_key_active(McpInputKey::shift);
+    character_jump =
+        character_jump || mcp_key_active(McpInputKey::space);
     input.mouse_delta_x += pending_mcp_mouse_delta_x_;
     input.mouse_delta_y += pending_mcp_mouse_delta_y_;
     pending_mouse_delta_x_ = 0.0F;
@@ -765,7 +802,29 @@ void Application::update_camera(const float delta_seconds) noexcept {
     pending_mcp_mouse_delta_x_ = 0.0F;
     pending_mcp_mouse_delta_y_ = 0.0F;
     mcp_keys_pressed_.reset();
-    camera_.update(input, delta_seconds);
+    if (!gameplay_.active()) {
+        camera_.update(input, delta_seconds);
+        return;
+    }
+
+    if (!gameplay_.update(
+        GameplayFrameInput{
+            .character = CharacterInput{
+                .forward = input.forward,
+                .backward = input.backward,
+                .left = input.left,
+                .right = input.right,
+                .jump = character_jump,
+                .run = input.boost,
+            },
+            .mouse_delta_x = input.mouse_delta_x,
+            .mouse_delta_y = input.mouse_delta_y,
+        },
+        delta_seconds,
+        renderer_,
+        camera_)) {
+        fatal("Gameplay runtime lost its player scene node.");
+    }
 }
 
 void Application::complete_mcp_result(

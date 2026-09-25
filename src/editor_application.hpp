@@ -3,6 +3,7 @@
 #include "cli_options.hpp"
 #include "editor_ui.hpp"
 #include "fly_camera.hpp"
+#include "gameplay_session.hpp"
 #include "mcp_server.hpp"
 #include "renderer.hpp"
 #include "scene_document.hpp"
@@ -47,6 +48,8 @@ private:
         bool success,
         std::string message,
         std::string structured_json = "{}");
+    void synchronize_gameplay_state();
+    void update_gameplay(float delta_seconds);
     void update_scene_snapshot();
     void update_window_title();
     void shutdown() noexcept;
@@ -57,6 +60,8 @@ private:
     EditorUi ui_{};
     SceneDocument scene_{};
     FlyCamera camera_{};
+    FlyCamera edit_camera_before_play_{};
+    GameplaySession gameplay_{};
     std::vector<SceneGpuInstance> scene_instances_{};
     std::vector<SceneModelInstance> scene_models_{};
     std::vector<ScenePunctualLight> scene_lights_{};
@@ -64,6 +69,7 @@ private:
     McpControlPlane mcp_control_{};
     McpServer mcp_server_{mcp_control_, McpServerProfile::editor};
     std::uint64_t submitted_scene_revision_ = 0U;
+    EditorPlayState observed_play_state_ = EditorPlayState::edit;
     std::uint32_t main_window_id_ = 0U;
     bool running_ = false;
     std::uint64_t pending_screenshot_token_ = 0U;

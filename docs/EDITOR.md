@@ -105,8 +105,15 @@ performance benchmark используется изолированный `vulka
   `F` кадрирует выбранный объект, `Ctrl+D` дублирует весь subtree, `Delete`
   удаляет выбранное с возможностью Undo. Fly camera: `RMB + WASD`, `E/Q`,
   `Shift`.
-- `Play/Stop` (`F5`): authoring scene сохраняется перед Play, редактирование
-  блокируется, а Stop восстанавливает исходный снимок.
+- `Play/Stop` (`F5`): authoring scene сохраняется перед Play, запускается общая
+  с `vulkan_cube` игровая сессия с runtime-персонажем и камерой от третьего
+  лица, редактирование блокируется, а Stop восстанавливает исходный снимок и
+  редакторскую камеру. В Play: `WASD` — движение и разворот, `Shift` — бег,
+  `Space` — прыжок, мышь — вращение камеры без удержания кнопок. Вход в Play
+  захватывает мышь и скрывает курсор; `Esc` освобождает мышь, не останавливая
+  игру, а `ЛКМ` по изображению вьюпорта возвращает захват. Потеря фокуса окна,
+  Pause и Stop освобождают мышь; Resume снова захватывает её.
+  Pause замораживает симуляцию.
 - `Save/Open` (`Ctrl+S`/`Ctrl+O`): versioned JSON в
   `assets/scenes/editor_scene.json`, запись через complete temporary file,
   транзакционная загрузка и защита от потери несохранённых изменений при
@@ -114,7 +121,7 @@ performance benchmark используется изолированный `vulka
   при старте, а `vulkan_cube` загружает тот же документ и referenced assets.
 - `Game in separate window` (`F6` во время Play): secondary OS window через
   ImGui multi-viewport. Оно использует тот же scene image и отдельный swapchain
-  backend; resize окна меняет реальное scene resolution, а fly-camera input
+  backend; resize окна меняет реальное scene resolution, а gameplay input
   принимается и в detached viewport.
 - `Assets`: sandboxed browser исходного project `assets` (с fallback на
   packaged copy), сортировка, типы, drag payload, ручной refresh, явное

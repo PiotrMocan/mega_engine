@@ -343,6 +343,8 @@ void EditorApplication::initialize(const CliOptions& options) {
     ui_.initialize(context_, window_.get(), renderer_);
     camera_ = scene_startup_camera(scene_, options.camera_z_explicit
         ? std::optional<double>(options.camera_z) : std::nullopt);
+    edit_camera_before_play_ = camera_;
+    observed_play_state_ = ui_.play_state();
     update_scene_snapshot();
     renderer_.enable_async_assets();
 
@@ -352,7 +354,9 @@ void EditorApplication::initialize(const CliOptions& options) {
     running_ = true;
     std::cout
         << "Editor controls: LMB select, W/E/R gizmo, F focus, Ctrl+D "
-           "duplicate, Delete remove, RMB + WASD fly camera.\n";
+           "duplicate, Delete remove, RMB + WASD fly camera. Play controls: "
+           "WASD move/turn, Shift run, Space jump, mouse orbit, "
+           "Esc release mouse, LMB viewport recapture.\n";
 }
 
 void EditorApplication::main_loop() {
@@ -434,12 +438,16 @@ void EditorApplication::main_loop() {
                 renderer_.invalidate_editor_scene();
             }
         }
-        if (ui_.play_state() != EditorPlayState::paused) {
+        synchronize_gameplay_state();
+        renderer_.set_lighting_paused(
+            ui_.play_state() == EditorPlayState::paused);
+        update_scene_snapshot();
+        if (ui_.play_state() == EditorPlayState::playing) {
+            update_gameplay(delta_seconds);
+        } else if (ui_.play_state() == EditorPlayState::edit) {
             camera_.update(
                 ui_.camera_input(), delta_seconds);
         }
-        renderer_.set_lighting_paused(ui_.play_state() == EditorPlayState::paused);
-        update_scene_snapshot();
         ImDrawData* const draw_data = ui_.end_frame();
 
         FrameTimings timings{};
@@ -467,6 +475,65 @@ void EditorApplication::main_loop() {
             std::chrono::duration<double, std::milli>(
                 Clock::now() - frame_begin).count();
         renderer_.record_metrics(timings);
+    }
+}
+
+void EditorApplication::synchronize_gameplay_state() {
+    const EditorPlayState requested_state = ui_.play_state();
+    if (requested_state == observed_play_state_) {
+        return;
+    }
+
+    if (observed_play_state_ == EditorPlayState::edit &&
+        requested_state != EditorPlayState::edit) {
+        edit_camera_before_play_ = camera_;
+        const SceneRenderView initial_view = scene_.build_render_view(
+            scene_instances_, scene_models_, scene_lights_);
+        const FlyCamera startup_camera = scene_startup_camera(
+            scene_,
+            options_.camera_z_explicit
+                ? std::optional<double>(options_.camera_z)
+                : std::nullopt);
+        std::string error;
+        if (!gameplay_.start(
+                scene_, initial_view, startup_camera, camera_, error)) {
+            ui_.report_asset_error(std::move(error));
+            ui_.stop_play(scene_);
+            camera_ = edit_camera_before_play_;
+            submitted_scene_revision_ = 0U;
+            renderer_.invalidate_editor_scene();
+            observed_play_state_ = EditorPlayState::edit;
+            return;
+        }
+        submitted_scene_revision_ = 0U;
+    } else if (requested_state == EditorPlayState::edit) {
+        gameplay_.stop();
+        camera_ = edit_camera_before_play_;
+    }
+
+    observed_play_state_ = requested_state;
+}
+
+void EditorApplication::update_gameplay(
+    const float delta_seconds) {
+    const FlyCameraInput input = ui_.camera_input();
+    if (!gameplay_.update(
+            GameplayFrameInput{
+                .character = CharacterInput{
+                    .forward = input.forward,
+                    .backward = input.backward,
+                    .left = input.left,
+                    .right = input.right,
+                    .jump = input.up,
+                    .run = input.boost,
+                },
+                .mouse_delta_x = input.mouse_delta_x,
+                .mouse_delta_y = input.mouse_delta_y,
+            },
+            delta_seconds,
+            renderer_,
+            camera_)) {
+        fatal("Gameplay runtime lost its player scene node.");
     }
 }
 
@@ -1493,6 +1560,7 @@ void EditorApplication::shutdown() noexcept {
     running_ = false;
     mcp_server_.stop();
     pending_screenshot_token_ = 0U;
+    gameplay_.stop();
     ui_.shutdown();
     renderer_.shutdown();
     context_.shutdown();

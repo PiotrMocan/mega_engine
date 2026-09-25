@@ -29,6 +29,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <span>
 #include <stop_token>
 #include <string_view>
 #include <thread>
@@ -1379,6 +1380,21 @@ void EditorUi::shutdown() noexcept {
 
 void EditorUi::process_event(const SDL_Event& event) {
     if (context_ != nullptr) {
+        if (game_mouse_window_id_ != 0U) {
+            if ((event.type == SDL_EVENT_WINDOW_FOCUS_LOST ||
+                 event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) &&
+                event.window.windowID == game_mouse_window_id_) {
+                set_game_mouse_capture(nullptr);
+            } else if (event.type == SDL_EVENT_KEY_DOWN &&
+                       event.key.key == SDLK_ESCAPE) {
+                set_game_mouse_capture(nullptr);
+                return;
+            } else if (event.type == SDL_EVENT_MOUSE_MOTION &&
+                       event.motion.windowID == game_mouse_window_id_) {
+                pending_game_mouse_delta_x_ += event.motion.xrel;
+                pending_game_mouse_delta_y_ += event.motion.yrel;
+            }
+        }
         static_cast<void>(ImGui_ImplSDL3_ProcessEvent(&event));
         if (event.type == SDL_EVENT_KEY_DOWN &&
             !event.key.repeat) {
@@ -1572,6 +1588,13 @@ void EditorUi::begin_frame(
     FlyCamera& camera,
     const PerformanceSnapshot& performance,
     const std::chrono::steady_clock::time_point now) {
+    if (game_mouse_window_id_ != 0U) {
+        const SDL_Window* const captured =
+            SDL_GetWindowFromID(game_mouse_window_id_);
+        if (captured == nullptr || SDL_GetKeyboardFocus() != captured) {
+            set_game_mouse_capture(nullptr);
+        }
+    }
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
@@ -1628,6 +1651,7 @@ void EditorUi::begin_frame(
     if (toggle_external_window_requested_ &&
         platform_windows_enabled_ &&
         play_state_ != EditorPlayState::edit) {
+        set_game_mouse_capture(nullptr);
         external_game_window_open_ =
             !external_game_window_open_;
     }
@@ -1791,6 +1815,7 @@ void EditorUi::initialize_vulkan_backend(Renderer& renderer) {
 }
 
 void EditorUi::shutdown_vulkan_backend() noexcept {
+    set_game_mouse_capture(nullptr);
     // Init may fail after publishing backend data but before returning true.
     if (ImGui::GetCurrentContext() != nullptr &&
         ImGui::GetIO().BackendRendererUserData != nullptr) {
@@ -2078,6 +2103,7 @@ void EditorUi::build_toolbar(SceneDocument& scene) {
                     "Pause",
                     EditorIcon::pause,
                     "Pause")) {
+                set_game_mouse_capture(nullptr);
                 play_state_ = EditorPlayState::paused;
             }
         } else {
@@ -2089,6 +2115,7 @@ void EditorUi::build_toolbar(SceneDocument& scene) {
                     true,
                     true)) {
                 play_state_ = EditorPlayState::playing;
+                game_mouse_capture_requested_ = true;
             }
         }
     }
@@ -2105,6 +2132,7 @@ void EditorUi::build_toolbar(SceneDocument& scene) {
             EditorButtonStyle::secondary,
             can_open_external,
             external_game_window_open_)) {
+        set_game_mouse_capture(nullptr);
         external_game_window_open_ =
             !external_game_window_open_;
     }
@@ -2701,6 +2729,9 @@ void EditorUi::build_viewport(
         ImVec2(1.0F, 1.0F));
     const bool viewport_clicked =
         ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    if (!external_game_window_open_ || viewport_clicked) {
+        update_game_mouse_capture(viewport_clicked);
+    }
     const bool viewport_activated =
         viewport_clicked ||
         ImGui::IsItemClicked(ImGuiMouseButton_Right);
@@ -2753,7 +2784,11 @@ void EditorUi::build_viewport(
         ImVec2(
             image_minimum.x + 10.0F,
             image_maximum.y - 34.0F),
-        "LMB SELECT  /  RMB + WASD  /  F FOCUS",
+        play_state_ == EditorPlayState::edit
+            ? "LMB SELECT  /  RMB + WASD  /  F FOCUS"
+            : game_mouse_window_id_ != 0U
+            ? "WASD MOVE  /  SHIFT RUN  /  SPACE JUMP  /  ESC RELEASE"
+            : "LMB CAPTURE MOUSE  /  WASD MOVE  /  SPACE JUMP",
         EditorTone::purple);
 
     const float image_width = image_maximum.x - image_minimum.x;
@@ -2948,6 +2983,8 @@ void EditorUi::build_external_game_window(
             available,
             ImVec2(0.0F, 0.0F),
             ImVec2(1.0F, 1.0F));
+        update_game_mouse_capture(
+            ImGui::IsItemClicked(ImGuiMouseButton_Left));
         const bool external_viewport_activated =
             ImGui::IsItemClicked(ImGuiMouseButton_Left) ||
             ImGui::IsItemClicked(ImGuiMouseButton_Right);
@@ -5082,24 +5119,59 @@ void EditorUi::apply_deferred_scene_commands(
 }
 
 void EditorUi::update_camera_input() {
-    const bool navigate =
-        ((viewport_hovered_ && viewport_focused_) ||
-         (external_viewport_hovered_ &&
-          external_viewport_focused_)) &&
-        ImGui::IsMouseDown(ImGuiMouseButton_Right);
-    if (!navigate) {
+    const float mouse_delta_x = std::exchange(pending_game_mouse_delta_x_, 0.0F);
+    const float mouse_delta_y = std::exchange(pending_game_mouse_delta_y_, 0.0F);
+    if (play_state_ != EditorPlayState::edit) {
+        if (play_state_ != EditorPlayState::playing ||
+            game_mouse_window_id_ == 0U) {
+            return;
+        }
+        // Relative motion is independent of ImGui hover/absolute cursor position.
+        camera_input_.mouse_delta_x = mouse_delta_x;
+        camera_input_.mouse_delta_y = mouse_delta_y;
+        int key_count = 0;
+        const bool* const keys = SDL_GetKeyboardState(&key_count);
+        const std::span<const bool> keyboard = keys != nullptr && key_count > 0
+            ? std::span<const bool>(keys, static_cast<std::size_t>(key_count))
+            : std::span<const bool>{};
+        const auto key_down = [keyboard](const SDL_Scancode scancode) {
+            const auto index = static_cast<std::size_t>(scancode);
+            return index < keyboard.size() && keyboard[index];
+        };
+        camera_input_.forward = key_down(SDL_SCANCODE_W);
+        camera_input_.backward = key_down(SDL_SCANCODE_S);
+        camera_input_.left = key_down(SDL_SCANCODE_A);
+        camera_input_.right = key_down(SDL_SCANCODE_D);
+        camera_input_.up = key_down(SDL_SCANCODE_SPACE);
+        camera_input_.boost =
+            key_down(SDL_SCANCODE_LSHIFT) || key_down(SDL_SCANCODE_RSHIFT);
+        return;
+    }
+    const bool viewport_active =
+        (viewport_hovered_ && viewport_focused_) ||
+        (external_viewport_hovered_ && external_viewport_focused_);
+    if (!viewport_active) {
         return;
     }
     const ImGuiIO& io = ImGui::GetIO();
-    camera_input_.mouse_delta_x = io.MouseDelta.x;
-    camera_input_.mouse_delta_y = io.MouseDelta.y;
+    const bool navigate =
+        ImGui::IsMouseDown(ImGuiMouseButton_Right);
+    if (navigate) {
+        camera_input_.mouse_delta_x = io.MouseDelta.x;
+        camera_input_.mouse_delta_y = io.MouseDelta.y;
+    }
+    if (!navigate) {
+        return;
+    }
+    if (io.WantTextInput) {
+        return;
+    }
     camera_input_.forward = ImGui::IsKeyDown(ImGuiKey_W);
     camera_input_.backward = ImGui::IsKeyDown(ImGuiKey_S);
     camera_input_.left = ImGui::IsKeyDown(ImGuiKey_A);
     camera_input_.right = ImGui::IsKeyDown(ImGuiKey_D);
     camera_input_.up =
-        ImGui::IsKeyDown(ImGuiKey_E) ||
-        ImGui::IsKeyDown(ImGuiKey_Space);
+        ImGui::IsKeyDown(ImGuiKey_E) || ImGui::IsKeyDown(ImGuiKey_Space);
     camera_input_.down =
         ImGui::IsKeyDown(ImGuiKey_Q) ||
         ImGui::IsKeyDown(ImGuiKey_LeftCtrl) ||
@@ -5107,6 +5179,65 @@ void EditorUi::update_camera_input() {
     camera_input_.boost =
         ImGui::IsKeyDown(ImGuiKey_LeftShift) ||
         ImGui::IsKeyDown(ImGuiKey_RightShift);
+}
+
+void EditorUi::set_game_mouse_capture(SDL_Window* const window) noexcept {
+    const SDL_WindowID requested_id =
+        window != nullptr ? SDL_GetWindowID(window) : 0U;
+    game_mouse_capture_requested_ = false;
+    if (requested_id == game_mouse_window_id_) {
+        return;
+    }
+    constexpr ImGuiConfigFlags capture_flags =
+        ImGuiConfigFlags_NoMouse | ImGuiConfigFlags_NoMouseCursorChange |
+        ImGuiConfigFlags_NavEnableKeyboard;
+    ImGuiIO& io = ImGui::GetIO();
+    if (game_mouse_window_id_ != 0U) {
+        if (SDL_Window* const previous = SDL_GetWindowFromID(game_mouse_window_id_);
+            previous != nullptr && !SDL_SetWindowRelativeMouseMode(previous, false)) {
+            std::fprintf(stderr, "Unable to release game mouse: %s\n", SDL_GetError());
+            return;
+        }
+        io.ConfigFlags = (io.ConfigFlags & ~capture_flags) | game_mouse_saved_config_;
+        game_mouse_window_id_ = 0U;
+    }
+    camera_input_ = {};
+    pending_game_mouse_delta_x_ = 0.0F;
+    pending_game_mouse_delta_y_ = 0.0F;
+    if (window == nullptr) {
+        return;
+    }
+    if (!SDL_SetWindowRelativeMouseMode(window, true)) {
+        std::fprintf(stderr, "Unable to capture game mouse: %s\n", SDL_GetError());
+        return;
+    }
+    game_mouse_window_id_ = requested_id;
+    game_mouse_saved_config_ = io.ConfigFlags & capture_flags;
+    // SDL owns the hidden cursor while playing; ImGui must not show it or
+    // activate editor controls with gameplay clicks/Space.
+    io.ConfigFlags = (io.ConfigFlags & ~ImGuiConfigFlags_NavEnableKeyboard) |
+        ImGuiConfigFlags_NoMouse | ImGuiConfigFlags_NoMouseCursorChange;
+    ImGui::ClearActiveID();
+}
+
+void EditorUi::update_game_mouse_capture(const bool viewport_clicked) {
+    if (play_state_ != EditorPlayState::playing ||
+        game_mouse_window_id_ != 0U ||
+        (!game_mouse_capture_requested_ && !viewport_clicked)) {
+        return;
+    }
+    SDL_Window* const window = viewport_sdl_window(ImGui::GetWindowViewport());
+    if (window == nullptr) {
+        return; // A detached ImGui viewport may not have its SDL window yet.
+    }
+    ImGui::SetWindowFocus();
+    if (SDL_GetKeyboardFocus() != window) {
+        if (!SDL_RaiseWindow(window)) {
+            std::fprintf(stderr, "Unable to focus game viewport: %s\n", SDL_GetError());
+        }
+        return;
+    }
+    set_game_mouse_capture(window);
 }
 
 void EditorUi::start_play(SceneDocument& scene) {
@@ -5120,12 +5251,14 @@ void EditorUi::start_play(SceneDocument& scene) {
     }
     edit_scene_snapshot_ = scene;
     play_state_ = EditorPlayState::playing;
+    game_mouse_capture_requested_ = true;
 }
 
 void EditorUi::stop_play(SceneDocument& scene) {
     if (play_state_ == EditorPlayState::edit) {
         return;
     }
+    set_game_mouse_capture(nullptr);
     if (edit_scene_snapshot_) {
         scene = std::move(*edit_scene_snapshot_);
         edit_scene_snapshot_.reset();
