@@ -48,7 +48,7 @@ vec3 gt7Rec2020ToICtCp(vec3 rgb) {
         dot(rgb, vec3(99.0, 309.0, 3688.0))) / 4096.0;
     vec3 pq = gt7InverseEotfSt2084(lms);
     return vec3(
-        (pq.x + pq.y) * 0.5,
+        0.5 * pq.x + 0.5 * pq.y,
         dot(pq, vec3(6610.0, -13613.0, 7003.0)) / 4096.0,
         dot(pq, vec3(17933.0, -17390.0, -543.0)) / 4096.0);
 }
@@ -98,7 +98,7 @@ vec3 gt7ToneMapping(vec3 linearRec709) {
     const float targetUcs = 0.602559154990751;
     float chromaScale = 1.0 - smoothstep(0.98, 1.16, ucs.x / targetUcs);
     vec3 scaledRgb = gt7ICtCpToRec2020(vec3(skewedUcs.x, ucs.yz * chromaScale));
-    vec3 mappedRec2020 = min(mix(skewedRgb, scaledRgb, 0.6), vec3(2.5)) * 0.4;
+    vec3 mappedRec2020 = min(mix(skewedRgb, scaledRgb, 0.6), vec3(2.5)) / 2.5;
 
     // Conversion can leave the smaller Rec.709 gamut. Clip only at this output
     // boundary; the sRGB attachment subsequently performs the sole OETF encoding.

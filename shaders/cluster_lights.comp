@@ -47,9 +47,10 @@ uint appendLight(uint cluster, uint lightIndex)
     const uint capacity = lighting.clusterDimensions.w;
     const uint clusterCount = lighting.clusterDimensions.x
         * lighting.clusterDimensions.y * lighting.clusterDimensions.z;
+    const uint indexBase = clusterCount * 2u;
+    const uint statisticsBase = indexBase + clusterCount * capacity;
     const uint header = cluster * 2u;
     const uint previous = atomicAdd(clusterData[header], 1u);
-    const uint indexBase = clusterCount * 2u;
     if (previous < capacity)
     {
         clusterData[indexBase + cluster * capacity + previous] = lightIndex;
@@ -57,7 +58,6 @@ uint appendLight(uint cluster, uint lightIndex)
     else if (previous == capacity)
     {
         atomicExchange(clusterData[header + 1u], 1u);
-        const uint statisticsBase = indexBase + clusterCount * capacity;
         atomicAdd(clusterData[statisticsBase + 1u], 1u);
     }
     return previous + 1u;
@@ -139,16 +139,16 @@ void main()
         const uint cluster = minimumTileShared.x + xOffset + dimensions.x *
             (minimumTileShared.y + yOffset + dimensions.y *
                 (minimumSliceShared + sliceOffset));
-        localMaximum = max(localMaximum, appendLight(cluster, lightIndex));
+        localMaximum = max(localMaximum,
+                           appendLight(cluster, lightIndex));
     }
     atomicMax(maximumListLengthShared, localMaximum);
     barrier();
     if (localIndex == 0u)
     {
-        const uint clusterCount = dimensions.x * dimensions.y
-            * lighting.clusterDimensions.z;
-        const uint statisticsBase = clusterCount * 2u
-            + clusterCount * lighting.clusterDimensions.w;
+        const uint capacity = lighting.clusterDimensions.w;
+        const uint clusterCount = dimensions.x * dimensions.y * lighting.clusterDimensions.z;
+        const uint statisticsBase = clusterCount * (2u + capacity);
         atomicAdd(clusterData[statisticsBase], assignmentCount);
         atomicMax(clusterData[statisticsBase + 2u], maximumListLengthShared);
     }

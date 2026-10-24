@@ -64,7 +64,8 @@ float cascadeSample(sampler2DShadow atlas,vec3 position,vec3 normal,vec3 lightDi
     vec2 offset=vec2(cascade&1,cascade>>1)*0.5;
     vec2 uv=offset+(p.xy*0.5+0.5)*0.5;
     // Keep the comparison filter inside its tile, including cascade boundaries.
-    vec2 texel=1.0/vec2(textureSize(atlas,0));
+    vec2 atlasSize=vec2(textureSize(atlas,0));
+    vec2 texel=1.0/atlasSize;
     uv=clamp(uv,offset+texel*2.0,offset+0.5-texel*2.0);
     // Bias is a fraction of this cascade's world texel, not a fixed fraction
     // of its hundreds-of-metres depth interval. The caller supplies geometric normal.
@@ -73,7 +74,7 @@ float cascadeSample(sampler2DShadow atlas,vec3 position,vec3 normal,vec3 lightDi
     // Factor the separable [1,2,1] tent into two bilinear fetches per axis.
     // At fractional texel f its four coefficients are [1-f,2-f,1+f,f].
     // Pair adjacent coefficients to retain the footprint with four PCF fetches.
-    vec2 texelPosition=uv/texel-0.5;
+    vec2 texelPosition=uv*atlasSize-0.5;
     vec2 base=floor(texelPosition)+0.5;
     vec2 f=fract(texelPosition);
     vec2 lowWeight=3.0-2.0*f, highWeight=1.0+2.0*f;

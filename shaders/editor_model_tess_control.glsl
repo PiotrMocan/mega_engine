@@ -16,10 +16,12 @@ layout(push_constant) uniform TessellationPush
 } tessellation;
 
 layout(location = 0) in vec3 inWorldPosition[];
-layout(location = 1) in vec3 inPreviousWorldPosition[];
 layout(location = 2) in vec3 inWorldNormal[];
-layout(location = 3) in vec3 inPreviousWorldNormal[];
 layout(location = 4) in vec2 inUv[];
+layout(location = 15) in vec3 inWorldDisplacement[];
+#ifndef VCR_TESSELLATION_SHADOW
+layout(location = 1) in vec3 inPreviousWorldPosition[];
+layout(location = 3) in vec3 inPreviousWorldNormal[];
 layout(location = 5) in vec3 inWorldTangent[];
 layout(location = 6) in vec3 inWorldBitangent[];
 layout(location = 7) in vec4 inBaseColor[];
@@ -30,14 +32,16 @@ layout(location = 11) flat in uint inMaterialModel[];
 layout(location = 12) flat in uint inLodToken[];
 layout(location = 13) flat in uint inSubsurfaceProfile[];
 layout(location = 14) flat in float inSubsurfaceStrength[];
-layout(location = 15) in vec3 inWorldDisplacement[];
 layout(location = 16) in vec3 inPreviousWorldDisplacement[];
+#endif
 
 layout(location = 0) out vec3 outWorldPosition[];
-layout(location = 1) out vec3 outPreviousWorldPosition[];
 layout(location = 2) out vec3 outWorldNormal[];
-layout(location = 3) out vec3 outPreviousWorldNormal[];
 layout(location = 4) out vec2 outUv[];
+layout(location = 15) out vec3 outWorldDisplacement[];
+#ifndef VCR_TESSELLATION_SHADOW
+layout(location = 1) out vec3 outPreviousWorldPosition[];
+layout(location = 3) out vec3 outPreviousWorldNormal[];
 layout(location = 5) out vec3 outWorldTangent[];
 layout(location = 6) out vec3 outWorldBitangent[];
 layout(location = 7) out vec4 outBaseColor[];
@@ -48,8 +52,8 @@ layout(location = 11) flat out uint outMaterialModel[];
 layout(location = 12) flat out uint outLodToken[];
 layout(location = 13) flat out uint outSubsurfaceProfile[];
 layout(location = 14) flat out float outSubsurfaceStrength[];
-layout(location = 15) out vec3 outWorldDisplacement[];
 layout(location = 16) out vec3 outPreviousWorldDisplacement[];
+#endif
 
 // Bound the complete displaced patch, including non-uniform instance scaling
 // and the optional geometric-normal direction. Do not cull just the base mesh:
@@ -105,12 +109,13 @@ float edgeLevel(vec4 firstClip, vec4 secondClip)
 void main()
 {
     const uint index = gl_InvocationID;
-    gl_out[gl_InvocationID].gl_Position = gl_in[index].gl_Position;
     outWorldPosition[gl_InvocationID] = inWorldPosition[index];
-    outPreviousWorldPosition[gl_InvocationID] = inPreviousWorldPosition[index];
     outWorldNormal[gl_InvocationID] = inWorldNormal[index];
-    outPreviousWorldNormal[gl_InvocationID] = inPreviousWorldNormal[index];
     outUv[gl_InvocationID] = inUv[index];
+    outWorldDisplacement[gl_InvocationID] = inWorldDisplacement[index];
+#ifndef VCR_TESSELLATION_SHADOW
+    outPreviousWorldPosition[gl_InvocationID] = inPreviousWorldPosition[index];
+    outPreviousWorldNormal[gl_InvocationID] = inPreviousWorldNormal[index];
     outWorldTangent[gl_InvocationID] = inWorldTangent[index];
     outWorldBitangent[gl_InvocationID] = inWorldBitangent[index];
     outBaseColor[gl_InvocationID] = inBaseColor[index];
@@ -121,9 +126,9 @@ void main()
     outLodToken[gl_InvocationID] = inLodToken[index];
     outSubsurfaceProfile[gl_InvocationID] = inSubsurfaceProfile[index];
     outSubsurfaceStrength[gl_InvocationID] = inSubsurfaceStrength[index];
-    outWorldDisplacement[gl_InvocationID] = inWorldDisplacement[index];
     outPreviousWorldDisplacement[gl_InvocationID] =
         inPreviousWorldDisplacement[index];
+#endif
 
     if (index == 0U) {
 #ifdef VCR_TESSELLATION_SHADOW

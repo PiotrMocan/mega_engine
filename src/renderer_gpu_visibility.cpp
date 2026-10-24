@@ -118,8 +118,7 @@ void Renderer::create_gpu_visibility() {
     for (auto &frame : frames_) {
         auto &f = frame.visibility;
         device_buffer(f.indirect, command_capacity,
-                      storage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
-                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                      storage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
                       "GPU indirect draws");
         device_buffer(f.metadata, groups_offset, storage, "GPU visibility source bounds");
         device_buffer(f.groups, group_capacity * sizeof(VisibilityGroup), storage,
@@ -128,7 +127,7 @@ void Renderer::create_gpu_visibility() {
                       "GPU visibility uniforms");
         mapped_buffer(f.staging, commands_offset + command_capacity,
                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT, "GPU visibility static upload");
-        mapped_buffer(f.readback, 32 + command_capacity, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        mapped_buffer(f.readback, 32, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                       "GPU visibility statistics", true);
         f.dirty_records.reserve(source_capacity);
         f.dirty_flags.resize(source_capacity, 0);
@@ -514,11 +513,10 @@ void Renderer::record_gpu_visibility(VkCommandBuffer command, FrameContext &fram
             VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT);
     barrier(command, f.indirect.handle(), VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-            VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT);
-    const VkBufferCopy counters{0, 0, 32}, read_commands{0, 32, commands_bytes};
+            VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+            VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
+    const VkBufferCopy counters{0, 0, 32};
     vkCmdCopyBuffer(command, f.visible.handle(), f.readback.handle(), 1, &counters);
-    vkCmdCopyBuffer(command, f.indirect.handle(), f.readback.handle(), 1, &read_commands);
     barrier(command, f.readback.handle(), VK_PIPELINE_STAGE_2_TRANSFER_BIT,
             VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT,
             VK_ACCESS_2_HOST_READ_BIT);
@@ -537,8 +535,7 @@ void Renderer::read_gpu_visibility(FrameContext &frame) {
         return;
     }
     // The frame fence has already completed. No GPU wait or allocation here.
-    const auto bytes = f.readback.read_completed_bytes(
-        32 + std::size_t(f.statistics_groups) * 3 * sizeof(VkDrawIndexedIndirectCommand));
+    const auto bytes = f.readback.read_completed_bytes(32);
     std::array<std::uint32_t, 8> counters{};
     std::memcpy(counters.data(), bytes.data(), 32);
     auto &stats = visibility_statistics_;
@@ -548,12 +545,8 @@ void Renderer::read_gpu_visibility(FrameContext &frame) {
     stats.frustum_rejected = counters[1];
     stats.occlusion_rejected = counters[2];
     stats.lod_instances = {counters[3], counters[4], counters[5]};
+    stats.triangles = counters[6];
     stats.packet_revision = packet_revision_;
-    for (unsigned i = 0; i < f.statistics_groups * 3; ++i) {
-        VkDrawIndexedIndirectCommand draw;
-        std::memcpy(&draw, bytes.data() + 32 + i * sizeof(draw), sizeof(draw));
-        stats.triangles += std::uint64_t(draw.indexCount / 3) * draw.instanceCount;
-    }
     assert(stats.visible + stats.frustum_rejected + stats.occlusion_rejected == stats.submitted);
 }
 } // namespace vcr

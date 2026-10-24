@@ -31,22 +31,22 @@ void main()
     const vec3 viewDirection =
         normalize(worldPosition - frame.cameraPosition.xyz);
 
-    // Equirectangular lookup: +Y is the zenith. The U coordinate repeats so
-    // the generated panorama remains continuous while the camera rotates.
-    const float longitude =
-        atan(viewDirection.x, -viewDirection.z) * inverseTwoPi
-        + 0.5
-        + frame.sunColorSkyYaw.w;
-    const float latitude =
-        acos(clamp(viewDirection.y, -1.0, 1.0)) / pi;
-    const vec3 sky = texture(
-        skyTexture,
-        vec2(fract(longitude), latitude)).rgb;
-
-    vec3 outputSky=sky;
+    vec3 outputSky;
     if(lighting.options.x>0.5) {
         outputSky=addNightStars(
             dynamicSky(viewDirection),viewDirection,lighting.sunDirectionIntensity.y);
+    } else {
+        // Equirectangular lookup: +Y is the zenith. The U coordinate repeats so
+        // the generated panorama remains continuous while the camera rotates.
+        const float longitude =
+            atan(viewDirection.x, -viewDirection.z) * inverseTwoPi
+            + 0.5
+            + frame.sunColorSkyYaw.w;
+        const float latitude =
+            acos(clamp(viewDirection.y, -1.0, 1.0)) / pi;
+        outputSky = texture(
+            skyTexture,
+            vec2(fract(longitude), latitude)).rgb;
     }
     writeOpaqueSurface(outputSky,1.0);
 #ifdef VCR_SSS_OUTPUT

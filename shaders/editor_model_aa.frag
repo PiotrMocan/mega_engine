@@ -91,24 +91,26 @@ vec3 sampleWorldNormal(vec2 uvDx, vec2 uvDy)
         inWorldTangent
         - geometricNormal
           * dot(geometricNormal, inWorldTangent);
-    const vec3 tangentFallbackAxis =
-        abs(geometricNormal.z) < 0.999
-        ? vec3(0.0, 0.0, 1.0)
-        : vec3(0.0, 1.0, 0.0);
-    tangent = safeNormalize(
-        tangent,
-        safeNormalize(
+    const float tangentLenSq = dot(tangent, tangent);
+    if (tangentLenSq > 1.0e-12)
+    {
+        tangent *= inversesqrt(tangentLenSq);
+    }
+    else
+    {
+        const vec3 tangentFallbackAxis =
+            abs(geometricNormal.z) < 0.999
+            ? vec3(0.0, 0.0, 1.0)
+            : vec3(0.0, 1.0, 0.0);
+        tangent = safeNormalize(
             cross(tangentFallbackAxis, geometricNormal),
-            vec3(1.0, 0.0, 0.0)));
-    const float handedness =
-        dot(cross(geometricNormal, tangent), inWorldBitangent) < 0.0
-        ? -1.0
-        : 1.0;
+            vec3(1.0, 0.0, 0.0));
+    }
+    const vec3 unorientedBitangent = cross(geometricNormal, tangent);
     const vec3 bitangent =
-        safeNormalize(
-            cross(geometricNormal, tangent),
-            vec3(0.0, 0.0, 1.0))
-        * handedness;
+        dot(unorientedBitangent, inWorldBitangent) < 0.0
+        ? -unorientedBitangent
+        : unorientedBitangent;
     const vec3 tangentNormal = safeNormalize(
         textureGrad(materialNormalTexture, inUv, uvDx, uvDy).xyz * 2.0 - 1.0,
         vec3(0.0, 0.0, 1.0));

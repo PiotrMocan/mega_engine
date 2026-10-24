@@ -13,22 +13,9 @@ layout(push_constant) uniform ShadowAndTessellationPush
 } pushData;
 
 layout(location = 0) in vec3 inWorldPosition[];
-layout(location = 1) in vec3 inPreviousWorldPosition[];
 layout(location = 2) in vec3 inWorldNormal[];
-layout(location = 3) in vec3 inPreviousWorldNormal[];
 layout(location = 4) in vec2 inUv[];
-layout(location = 5) in vec3 inWorldTangent[];
-layout(location = 6) in vec3 inWorldBitangent[];
-layout(location = 7) in vec4 inBaseColor[];
-layout(location = 8) flat in uint inInstanceIndex[];
-layout(location = 9) in vec4 inMaterialParameters[];
-layout(location = 10) flat in float inDielectricF0[];
-layout(location = 11) flat in uint inMaterialModel[];
-layout(location = 12) flat in uint inLodToken[];
-layout(location = 13) flat in uint inSubsurfaceProfile[];
-layout(location = 14) flat in float inSubsurfaceStrength[];
 layout(location = 15) in vec3 inWorldDisplacement[];
-layout(location = 16) in vec3 inPreviousWorldDisplacement[];
 invariant gl_Position;
 
 #define INTERPOLATE(values) \

@@ -74,12 +74,12 @@ vec3 displayMapping(
     float fixedExposure,
     uint grading,
     uint lutSize) {
-    const float automaticExposure = exposureState.exposure > 0.0 &&
-        !isnan(exposureState.exposure) && !isinf(exposureState.exposure)
-        ? exposureState.exposure : 1.0;
+    const float autoExp = exposureState.exposure;
+    const float safeAuto = autoExp > 0.0 && !isnan(autoExp) && !isinf(autoExp)
+        ? autoExp : 1.0;
+    const float exposure = exposureMode == 1u ? safeAuto : fixedExposure;
     if (any(isnan(radiance)) || any(isinf(radiance))) radiance = vec3(0.0);
-    radiance = max(radiance, vec3(0.0));
-    radiance *= exposureMode == 1u ? automaticExposure : fixedExposure;
+    radiance = max(radiance, vec3(0.0)) * exposure;
     if (mapper == 2u) {
         // Calibrate the engine's 0.18 middle grey to GT7's 250-nit SDR scale
         // (reference framebuffer unit = 100 nits), before the reference curve.

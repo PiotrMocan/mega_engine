@@ -129,11 +129,11 @@ uint classify(uint id,out uint groupIndex,out uint lod) {
     if(pattern==0u) lodHistory[id*4u]=lod; else storeHistory(id,history);
     return 0;
 }
-shared uint localCounts[6];
+shared uint localCounts[7];
 shared uint reservations[3];
 void main() {
     uint lane=gl_LocalInvocationID.x,id=gl_GlobalInvocationID.x;
-    if (lane<6) localCounts[lane]=0;
+    if (lane<7) localCounts[lane]=0;
     barrier();
     uint groupIndex=0,lod=0,offset=0,oldOffset=0;
     uint result=id<config.flags.x ? classify(id,groupIndex,lod) : 3;
@@ -146,8 +146,13 @@ void main() {
             fading = history.x != history.y && uintBitsToFloat(history.z) < 1.0;
         }
         offset=atomicAdd(localCounts[lod],1);
-        if (fading) oldOffset=atomicAdd(localCounts[history.x],1);
+        uint triangles=groups[groupIndex].counts[lod]/3u;
+        if (fading) {
+            oldOffset=atomicAdd(localCounts[history.x],1);
+            triangles+=groups[groupIndex].counts[history.x]/3u;
+        }
         atomicAdd(localCounts[5],1); // Unique sources, independent of dual draws.
+        atomicAdd(localCounts[6],triangles);
     }
     else if (result==1) atomicAdd(localCounts[3],1);
     else if (result==2) atomicAdd(localCounts[4],1);
@@ -164,6 +169,7 @@ void main() {
         atomicAdd(counters[0],localCounts[5]);
         atomicAdd(counters[1],localCounts[3]); atomicAdd(counters[2],localCounts[4]);
         atomicAdd(counters[3],localCounts[0]); atomicAdd(counters[4],localCounts[1]); atomicAdd(counters[5],localCounts[2]);
+        atomicAdd(counters[6],localCounts[6]);
     }
     barrier();
     if (result==0) {

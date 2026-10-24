@@ -21,10 +21,9 @@ layout(set = LIGHTING_SET, binding = 8, std430) readonly buffer LocalLightCluste
 
 float punctualDistanceAttenuation(float distanceSquared, float range)
 {
-    const float distance = sqrt(max(distanceSquared, 0.0));
-    if (distance >= range) return 0.0;
-    const float ratio = distance / range;
-    const float ratioSquared = ratio * ratio;
+    const float rangeSquared = range * range;
+    if (distanceSquared >= rangeSquared || rangeSquared <= 0.0) return 0.0;
+    const float ratioSquared = max(distanceSquared, 0.0) / rangeSquared;
     const float cutoff = max(1.0 - ratioSquared * ratioSquared, 0.0);
     // A 10 cm source radius keeps the point-light singularity finite.
     return cutoff / max(distanceSquared, 0.01);
@@ -116,6 +115,7 @@ vec3 evaluatePunctualLighting(
 {
     vec3 result = vec3(0.0);
     const uint lightCount = min(lighting.localLightCounts.x, 4096u);
+    if (lightCount == 0u) return result;
     if (lighting.localLightCounts.y == 2u)
     {
         const uvec2 dimensions = lighting.clusterDimensions.xy;
@@ -162,6 +162,7 @@ PbrLightingComponents evaluatePunctualLightingComponents(
     result.diffuse = vec3(0.0);
     result.specular = vec3(0.0);
     const uint lightCount = min(lighting.localLightCounts.x, 4096u);
+    if (lightCount == 0u) return result;
     if (lighting.localLightCounts.y == 2u)
     {
         const uvec2 dimensions = lighting.clusterDimensions.xy;
