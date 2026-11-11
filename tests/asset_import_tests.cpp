@@ -426,8 +426,13 @@ int main() {
                 model_metadata["geometry"].value(
                     "index_count", 0U) == 3U &&
                 !model_metadata["materials"].empty() &&
-                !model_metadata["submeshes"].empty(),
-            "normalized OBJ metadata preserves geometry and material slots");
+                !model_metadata["submeshes"].empty() &&
+                model_metadata.contains("collision") &&
+                model_metadata["collision"].contains("local_bounds") &&
+                model_metadata["collision"].contains("boxes") &&
+                model_metadata["collision"].contains("convex_hull_vertices") &&
+                !model_metadata["collision"]["convex_hull_vertices"].empty(),
+            "normalized OBJ metadata preserves geometry, material slots, and cooked collision proxies");
 
         bool painted_material_found = false;
         for (const vcr::ImportedAssetFile& file :

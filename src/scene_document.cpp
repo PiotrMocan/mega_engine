@@ -260,6 +260,8 @@ bool SceneDocument::destroy_subtree(const SceneNodeId id) {
         Slot& slot = slots_[*iterator];
         erase_uuid_bucket(slot.uuid, *iterator);
         colliders_.remove_slot(*iterator);
+        rigid_bodies_.remove_slot(*iterator);
+        prefab_instances_.remove_slot(*iterator);
         slot.uuid = {};
         slot.value = {};
         slot.world_matrix = glm::mat4(1.0F);
@@ -434,6 +436,145 @@ SceneDocument::collider_mut(const SceneNodeId id) noexcept {
     return colliders_.get_mut(id);
 }
 
+bool SceneDocument::set_rigid_body(
+    const SceneNodeId id,
+    const RigidBodyComponent& rigid_body_value) {
+    if (!valid(id) || !valid_rigid_body_component(rigid_body_value)) {
+        return false;
+    }
+    if (const auto existing = rigid_bodies_.get(id);
+        existing && existing->get() == rigid_body_value) {
+        return true;
+    }
+    if (!rigid_bodies_.upsert(id, rigid_body_value)) {
+        return false;
+    }
+    ++content_revision_;
+    return true;
+}
+
+bool SceneDocument::remove_rigid_body(const SceneNodeId id) noexcept {
+    if (!valid(id) || !rigid_bodies_.remove(id)) {
+        return false;
+    }
+    ++content_revision_;
+    return true;
+}
+
+bool SceneDocument::has_rigid_body(const SceneNodeId id) const noexcept {
+    return valid(id) && rigid_bodies_.contains(id);
+}
+
+std::optional<std::reference_wrapper<const RigidBodyComponent>>
+SceneDocument::rigid_body(const SceneNodeId id) const noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return rigid_bodies_.get(id);
+}
+
+std::optional<std::reference_wrapper<RigidBodyComponent>>
+SceneDocument::rigid_body_mut(const SceneNodeId id) noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return rigid_bodies_.get_mut(id);
+}
+
+bool SceneDocument::set_prefab_instance(
+    const SceneNodeId id,
+    const PrefabInstanceComponent& prefab_value) {
+    if (!valid(id) || !valid_prefab_instance_component(prefab_value)) {
+        return false;
+    }
+    if (const auto existing = prefab_instances_.get(id);
+        existing && existing->get() == prefab_value) {
+        return true;
+    }
+    if (!prefab_instances_.upsert(id, prefab_value)) {
+        return false;
+    }
+    ++structure_revision_;
+    return true;
+}
+
+bool SceneDocument::remove_prefab_instance(const SceneNodeId id) noexcept {
+    if (!valid(id) || !prefab_instances_.remove(id)) {
+        return false;
+    }
+    ++structure_revision_;
+    return true;
+}
+
+bool SceneDocument::has_prefab_instance(const SceneNodeId id) const noexcept {
+    return valid(id) && prefab_instances_.contains(id);
+}
+
+std::optional<std::reference_wrapper<const PrefabInstanceComponent>>
+SceneDocument::prefab_instance(const SceneNodeId id) const noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return prefab_instances_.get(id);
+}
+
+SceneNodeId SceneDocument::enclosing_prefab_root(
+    SceneNodeId current) const noexcept {
+    if (!valid(current)) {
+        return {};
+    }
+    SceneNodeId fallback{};
+    std::uint32_t steps = 0U;
+    while (current && steps < max_scene_nodes) {
+        if (const auto inst = prefab_instances_.get(current)) {
+            if (inst->get().is_prefab_root) {
+                return current;
+            }
+            if (!fallback) {
+                fallback = current;
+            }
+        }
+        current = parent(current);
+        ++steps;
+    }
+    return fallback;
+}
+
+std::uint32_t SceneDocument::unpack_prefab_instance(const SceneNodeId id) {
+    const SceneNodeId root = enclosing_prefab_root(id);
+    if (!root) {
+        return 0U;
+    }
+    traversal_scratch_.clear();
+    traversal_scratch_.push_back(root.index);
+    for (std::size_t cursor = 0U;
+         cursor < traversal_scratch_.size();
+         ++cursor) {
+        const std::uint32_t current = traversal_scratch_[cursor];
+        for (std::uint32_t child = slots_[current].first_child;
+             child != invalid_scene_node_index;
+             child = slots_[child].next_sibling) {
+            const SceneNodeId child_id = id_for_index(child);
+            if (const auto child_inst = prefab_instances_.get(child_id);
+                child_inst && child_inst->get().is_prefab_root) {
+                continue;
+            }
+            traversal_scratch_.push_back(child);
+        }
+    }
+    std::uint32_t removed = 0U;
+    for (const std::uint32_t slot_index : traversal_scratch_) {
+        const SceneNodeId target_id = id_for_index(slot_index);
+        if (prefab_instances_.remove(target_id)) {
+            ++removed;
+        }
+    }
+    if (removed > 0U) {
+        ++structure_revision_;
+    }
+    return removed;
+}
+
 void SceneDocument::mark_content_changed() noexcept {
     ++content_revision_;
 }
@@ -496,11 +637,21 @@ void SceneDocument::build_node_records(
         if (const auto attached = colliders_.get(current_id)) {
             node_collider = attached->get();
         }
+        std::optional<RigidBodyComponent> node_rigid_body{};
+        if (const auto attached_rb = rigid_bodies_.get(current_id)) {
+            node_rigid_body = attached_rb->get();
+        }
+        std::optional<PrefabInstanceComponent> node_prefab{};
+        if (const auto attached_pf = prefab_instances_.get(current_id)) {
+            node_prefab = attached_pf->get();
+        }
         output.push_back(SceneNodeRecord{
             .id = current_id,
             .uuid = slots_[index].uuid,
             .value = slots_[index].value,
             .collider = node_collider,
+            .rigid_body = node_rigid_body,
+            .prefab_instance = node_prefab,
             .parent_record_index = parent_record,
         });
         if (ancestor_records.size() <= depth) {

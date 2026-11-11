@@ -6,6 +6,7 @@
 #include "mcp_control.hpp"
 #include "performance_metrics.hpp"
 #include "png_encoder.hpp"
+#include "prefab_io.hpp"
 #include "render_fixture_scene.hpp"
 #include "scene_document.hpp"
 #include "scene_io.hpp"
@@ -1369,7 +1370,7 @@ int main() {
             "camera pitch is clamped below the singularity");
     }
 
-    {
+    ([]() {
         vcr::McpControlPlane control;
         vcr::McpCommand submitted{
             .token = 42,
@@ -1400,9 +1401,9 @@ int main() {
                 result.success &&
                 result.structured_json == "{\"ok\":true}",
             "MCP result queue preserves ownership and ordering");
-    }
+    })();
 
-    {
+    ([]() {
         constexpr std::uint64_t command_count = 100'000;
         vcr::McpControlPlane control;
         std::atomic<bool> producer_failed{false};
@@ -1455,7 +1456,7 @@ int main() {
             !ordering_failed &&
                 !producer_failed.load(std::memory_order_relaxed),
             "MCP SPSC queues preserve ordering under concurrent stress");
-    }
+    })();
 
     {
         constexpr std::array<std::uint8_t, 8> pixels{
@@ -2564,7 +2565,7 @@ int main() {
             "asset browser test directory is removed");
     }
 
-    {
+    const auto run_uuid_tests = []() {
         const vcr::SceneUuid generated = vcr::generate_scene_uuid();
         const std::string text = vcr::format_scene_uuid(generated);
         const auto reparsed = vcr::parse_scene_uuid(text);
@@ -2742,7 +2743,180 @@ int main() {
             "scene_io transactionally rejects unknown node components");
 
         std::filesystem::remove_all(uuid_dir, fs_err);
-    }
+    };
+    run_uuid_tests();
+
+    const auto run_prefab_tests = []() {
+        std::error_code fs_err;
+        const auto prefab_dir =
+            std::filesystem::temp_directory_path(fs_err) /
+            ("vcr_prefab_io_" +
+             std::to_string(
+                 std::chrono::steady_clock::now().time_since_epoch().count()));
+        const auto asset_root = prefab_dir / "assets";
+        std::filesystem::create_directories(asset_root, fs_err);
+        std::string error;
+
+        vcr::SceneDocument source_scene;
+        const auto crate_root = source_scene.create_node(
+            "Crate Rig!", vcr::SceneNodeKind::folder);
+        source_scene.node(crate_root)->get().transform.translation =
+            {12.0F, 4.0F, -7.0F};
+        const auto crate_mesh = source_scene.create_node(
+            "CrateCube", vcr::SceneNodeKind::cube, crate_root);
+        source_scene.node(crate_mesh)->get().transform.translation =
+            {0.0F, 0.5F, 0.0F};
+        source_scene.node(crate_mesh)->get().material.base_color =
+            {0.8F, 0.4F, 0.2F, 1.0F};
+        const auto crate_lamp = source_scene.create_node(
+            "CrateLamp", vcr::SceneNodeKind::point_light, crate_root);
+        source_scene.node(crate_lamp)->get().light.intensity_candela = 250.0F;
+
+        const vcr::ColliderComponent mesh_col{
+            .center_offset = {0.0F, 0.0F, 0.0F},
+            .half_extents = {0.5F, 0.5F, 0.5F},
+            .shape = vcr::ColliderShape::convex_hull,
+            .enabled = true,
+            .is_trigger = false,
+        };
+        const vcr::RigidBodyComponent mesh_rb{
+            .mass = 18.5F,
+            .linear_damping = 0.25F,
+            .angular_damping = 0.5F,
+            .restitution = 0.2F,
+            .friction = 0.65F,
+            .gravity_scale = 1.0F,
+            .motion_type = vcr::RigidBodyMotionType::dynamic,
+            .lock_rotation = false,
+            .enabled = true,
+        };
+        expect(
+            source_scene.set_collider(crate_mesh, mesh_col) &&
+                source_scene.set_rigid_body(crate_mesh, mesh_rb),
+            "attach convex_hull collider and dynamic rigid_body to prefab node");
+
+        const std::string rel_path =
+            vcr::make_default_prefab_relative_path("Crate Rig!");
+        expect(
+            rel_path == "prefabs/crate_rig.vcrprefab.json" &&
+                vcr::valid_prefab_asset_path(rel_path) &&
+                !vcr::valid_prefab_asset_path("../escape.vcrprefab.json") &&
+                !vcr::save_prefab_file(
+                    source_scene, crate_root, asset_root,
+                    "../escape.vcrprefab.json", error),
+            "prefab relative paths enforce sandbox and naming rules");
+
+        expect(
+            vcr::save_prefab_file(
+                source_scene, crate_root, asset_root, rel_path, error),
+            "save_prefab_file writes hierarchical prefab with components");
+
+        vcr::AssetBrowser browser;
+        std::string browser_error;
+        expect(
+            browser.initialize(asset_root, browser_error) &&
+                browser.navigate_to("prefabs", browser_error) &&
+                browser.entries().size() == 1U &&
+                browser.entries()[0].kind == vcr::AssetEntryKind::prefab,
+            "AssetBrowser classifies .vcrprefab.json files as AssetEntryKind::prefab");
+
+        const auto src_mesh_uuid = *source_scene.uuid(crate_mesh);
+        vcr::SceneDocument target_scene;
+        const std::array<vcr::PrefabNodeOverride, 2> overrides{{
+            vcr::PrefabNodeOverride{
+                .source_node_uuid = src_mesh_uuid,
+                .rigid_body = vcr::RigidBodyComponent{
+                    .mass = 42.0F,
+                    .motion_type = vcr::RigidBodyMotionType::kinematic,
+                },
+            },
+            vcr::PrefabNodeOverride{
+                .node_index = 2U,
+                .name = std::string("OverriddenLamp"),
+                .visible = false,
+            },
+        }};
+        vcr::PrefabInstantiateResult inst_result{};
+        expect(
+            vcr::instantiate_prefab_file(
+                target_scene,
+                asset_root,
+                rel_path,
+                vcr::PrefabInstantiateOptions{
+                    .root_name = std::string("SpawnedCrate"),
+                    .root_translation = glm::vec3{3.0F, 1.0F, -2.0F},
+                    .overrides = overrides,
+                },
+                inst_result,
+                error) &&
+                inst_result.instantiated_nodes == 3U &&
+                target_scene.size() == 3U,
+            "instantiate_prefab_file spawns all hierarchy nodes with overrides");
+
+        std::vector<vcr::SceneNodeRecord> inst_records;
+        target_scene.build_node_records(inst_records);
+        expect(
+            inst_records.size() == 3U &&
+                inst_records[0].value.name == "SpawnedCrate" &&
+                close_to(inst_records[0].value.transform.translation.x, 3.0, 1e-4) &&
+                inst_records[0].uuid != *source_scene.uuid(crate_root) &&
+                inst_records[1].uuid != src_mesh_uuid &&
+                inst_records[1].collider == mesh_col &&
+                inst_records[1].rigid_body &&
+                close_to(inst_records[1].rigid_body->mass, 42.0, 1e-4) &&
+                inst_records[1].rigid_body->motion_type ==
+                    vcr::RigidBodyMotionType::kinematic &&
+                inst_records[2].value.name == "OverriddenLamp" &&
+                !inst_records[2].value.visible &&
+                inst_records[0].prefab_instance &&
+                inst_records[0].prefab_instance->is_prefab_root &&
+                inst_records[1].prefab_instance &&
+                !inst_records[1].prefab_instance->is_prefab_root &&
+                inst_records[1].prefab_instance->source_node_uuid == src_mesh_uuid,
+            "instantiated prefab mints fresh UUIDs, preserves source UUID links, and applies overrides");
+
+        // Nested prefab preservation during unpack_prefab_instance:
+        vcr::PrefabInstantiateResult nested_result{};
+        expect(
+            vcr::instantiate_prefab_file(
+                target_scene,
+                asset_root,
+                rel_path,
+                vcr::PrefabInstantiateOptions{
+                    .parent = inst_result.root_id,
+                    .root_name = std::string("NestedCrate"),
+                },
+                nested_result,
+                error),
+            "instantiate nested prefab child");
+        expect(
+            target_scene.enclosing_prefab_root(nested_result.root_id) ==
+                nested_result.root_id &&
+                target_scene.unpack_prefab_instance(inst_result.root_id) == 3U &&
+                !target_scene.has_prefab_instance(inst_result.root_id) &&
+                target_scene.has_prefab_instance(nested_result.root_id) &&
+                target_scene.prefab_instances().size() == 3U,
+            "unpack_prefab_instance detaches outer prefab while preserving nested prefab roots");
+
+        // Round-trip scene_io with RigidBodyComponent, PrefabInstanceComponent, and triangle_mesh collider:
+        const auto tri_node = target_scene.create_node(
+            "StaticMesh", vcr::SceneNodeKind::cube);
+        vcr::ColliderComponent tri_col{};
+        tri_col.shape = vcr::ColliderShape::triangle_mesh;
+        expect(target_scene.set_collider(tri_node, tri_col), "set triangle_mesh collider");
+        const auto scene_path = prefab_dir / "prefab_rb_roundtrip.scene.json";
+        vcr::SceneDocument reloaded;
+        expect(
+            vcr::save_scene_file(target_scene, scene_path, error) &&
+                vcr::load_scene_file(scene_path, reloaded, error) &&
+                reloaded.rigid_bodies().size() == target_scene.rigid_bodies().size() &&
+                reloaded.prefab_instances().size() ==
+                    target_scene.prefab_instances().size(),
+            "scene_io round-trips RigidBodyComponent, PrefabInstanceComponent, and triangle_mesh colliders");
+
+        std::filesystem::remove_all(prefab_dir, fs_err);
+    };
+    run_prefab_tests();
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";

@@ -441,6 +441,7 @@ set(VCR_RENDERER_SOURCES
     src/fly_camera.cpp
     src/gameplay.cpp
     src/gameplay_session.cpp
+    src/physics_world.cpp
     src/scene_uuid.cpp
     src/fsr3_upscaler.cpp
     src/gpu_buffer.cpp
@@ -473,6 +474,7 @@ add_executable(vulkan_cube
     src/mcp_server.cpp
     src/scene_document.cpp
     src/scene_io.cpp
+    src/prefab_io.cpp
     ${VCR_RENDERER_SOURCES}
 )
 
@@ -486,6 +488,7 @@ add_executable(vulkan_editor
     src/asset_browser.cpp
     src/scene_document.cpp
     src/scene_io.cpp
+    src/prefab_io.cpp
     ${VCR_RENDERER_SOURCES}
 )
 
@@ -651,6 +654,7 @@ if(BUILD_TESTING)
         tests/gameplay_tests.cpp
         src/collision.cpp
         src/gameplay.cpp
+        src/physics_world.cpp
         src/punctual_light.cpp
         src/scene_document.cpp
         src/scene_uuid.cpp
@@ -724,6 +728,7 @@ if(BUILD_TESTING)
         src/render_fixture_scene.cpp
         src/scene_document.cpp
         src/scene_io.cpp
+        src/prefab_io.cpp
         src/scene_uuid.cpp
         src/collision.cpp
     )

@@ -263,6 +263,23 @@ SceneNodeId duplicate_scene_subtree(
             static_cast<void>(scene.destroy_subtree(duplicate_root));
             return {};
         }
+        if (record.rigid_body &&
+            !scene.set_rigid_body(copy, *record.rigid_body)) {
+            error = "Unable to copy rigid body component to duplicated node.";
+            static_cast<void>(scene.destroy_subtree(duplicate_root));
+            return {};
+        }
+        const bool copy_prefab_link =
+            record.prefab_instance.has_value() &&
+            (record_index != begin ||
+             record.prefab_instance->is_prefab_root ||
+             (parent && scene.has_prefab_instance(parent)));
+        if (copy_prefab_link &&
+            !scene.set_prefab_instance(copy, *record.prefab_instance)) {
+            error = "Unable to copy prefab instance metadata to duplicated node.";
+            static_cast<void>(scene.destroy_subtree(duplicate_root));
+            return {};
+        }
     }
     duplicated_nodes = static_cast<std::uint32_t>(subtree_size);
     return duplicate_root;

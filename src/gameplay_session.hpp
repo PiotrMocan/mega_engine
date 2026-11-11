@@ -2,6 +2,7 @@
 
 #include "collision.hpp"
 #include "gameplay.hpp"
+#include "physics_world.hpp"
 #include "scene_document.hpp"
 
 #include <cstdint>
@@ -46,6 +47,9 @@ public:
     [[nodiscard]] const CollisionWorld& collision_world() const noexcept {
         return collision_world_;
     }
+    [[nodiscard]] const PhysicsWorld& physics_world() const noexcept {
+        return physics_world_;
+    }
     [[nodiscard]] std::span<const TriggerOverlap> active_triggers()
         const noexcept {
         return trigger_tracker_.active_overlaps();
@@ -59,6 +63,7 @@ private:
     CharacterController character_{};
     ThirdPersonCamera camera_{};
     CollisionWorld collision_world_{};
+    PhysicsWorld physics_world_{};
     TriggerOverlapTracker trigger_tracker_{};
     SceneNodeId player_node_{};
     std::uint64_t cached_content_revision_ = 0U;

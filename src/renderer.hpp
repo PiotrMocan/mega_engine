@@ -400,6 +400,8 @@ public:
         glm::vec3 ray_direction) const noexcept;
     [[nodiscard]] std::optional<Bounds> editor_node_bounds(
         SceneNodeId id) const noexcept;
+    [[nodiscard]] const CookedModelCollision* editor_model_collision(
+        std::string_view relative_path) const noexcept;
     [[nodiscard]] std::uint64_t swapchain_generation() const noexcept {
         return swapchain_generation_;
     }
@@ -449,6 +451,7 @@ private:
     };
 
     struct EditorModelSubmesh {
+        std::uint32_t coverage = 0U;
         std::string material_relative_path{};
         PbrMaterial material{};
         VkDescriptorSet material_descriptor_set = VK_NULL_HANDLE;
@@ -469,12 +472,14 @@ private:
         GpuBuffer index_buffer{};
         std::vector<EditorModelSubmesh> submeshes{};
         SceneTransform recommended_transform{};
+        CookedModelCollision collision{};
         VkDeviceSize gpu_bytes = 0U;
         Bounds bounds{};
         bool ready = true;
     };
 
     struct EditorModelDraw {
+        std::uint32_t coverage = 0U;
         VkDescriptorSet material_descriptor_set = VK_NULL_HANDLE;
         MaterialTessellation tessellation{};
         glm::vec4 tessellation_uv_bounds{0, 0, 1, 1};

@@ -425,6 +425,7 @@ struct EditorViewportRay {
     case AssetEntryKind::image: return EditorIcon::environment;
     case AssetEntryKind::shader: return EditorIcon::renderer;
     case AssetEntryKind::scene: return EditorIcon::cube;
+    case AssetEntryKind::prefab: return EditorIcon::model;
     case AssetEntryKind::binary: return EditorIcon::import_asset;
     case AssetEntryKind::other: return EditorIcon::import_asset;
     }
@@ -2619,7 +2620,9 @@ void EditorUi::build_inspector(SceneDocument& scene) {
                              ColliderShape::auto_bounds,
                              ColliderShape::box,
                              ColliderShape::sphere,
-                             ColliderShape::capsule}) {
+                             ColliderShape::capsule,
+                             ColliderShape::convex_hull,
+                             ColliderShape::triangle_mesh}) {
                         if (ImGui::Selectable(
                                 to_token(candidate_shape).data(),
                                 edited_collider.shape == candidate_shape)) {
@@ -2747,6 +2750,185 @@ void EditorUi::build_inspector(SceneDocument& scene) {
                     initial.shape = ColliderShape::box;
                 }
                 static_cast<void>(scene.set_collider(selected_node_, initial));
+            }
+        }
+    }
+    {
+        ui_kit_.section_header(EditorIcon::play, "Rigid Body");
+        if (const auto attached_rb = scene.rigid_body(selected_node_)) {
+            RigidBodyComponent edited_rb = attached_rb->get();
+            bool rb_changed = false;
+            bool remove_rb_requested = false;
+            if (ui_kit_.begin_property_grid("RigidBodyProperties")) {
+                ui_kit_.property_row("Enabled");
+                rb_changed |= ImGui::Checkbox(
+                    "##RigidBodyEnabled", &edited_rb.enabled);
+                ui_kit_.property_row("Motion");
+                if (ImGui::BeginCombo(
+                        "##RigidBodyMotion",
+                        to_token(edited_rb.motion_type).data())) {
+                    for (const auto candidate_motion : {
+                             RigidBodyMotionType::dynamic,
+                             RigidBodyMotionType::kinematic}) {
+                        if (ImGui::Selectable(
+                                to_token(candidate_motion).data(),
+                                edited_rb.motion_type == candidate_motion)) {
+                            rb_changed |=
+                                edited_rb.motion_type != candidate_motion;
+                            edited_rb.motion_type = candidate_motion;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                if (edited_rb.motion_type == RigidBodyMotionType::dynamic) {
+                    ui_kit_.property_row("Mass (kg)");
+                    rb_changed |= ImGui::DragFloat(
+                        "##RigidBodyMass",
+                        &edited_rb.mass,
+                        0.1F,
+                        minimum_rigid_body_mass,
+                        maximum_rigid_body_mass,
+                        "%.3f",
+                        ImGuiSliderFlags_AlwaysClamp);
+                    ui_kit_.property_row("Gravity scale");
+                    rb_changed |= ImGui::DragFloat(
+                        "##RigidBodyGravityScale",
+                        &edited_rb.gravity_scale,
+                        0.05F,
+                        -maximum_rigid_body_gravity_scale,
+                        maximum_rigid_body_gravity_scale,
+                        "%.2f",
+                        ImGuiSliderFlags_AlwaysClamp);
+                    ui_kit_.property_row("Linear damping");
+                    rb_changed |= ImGui::DragFloat(
+                        "##RigidBodyLinearDamping",
+                        &edited_rb.linear_damping,
+                        0.01F,
+                        0.0F,
+                        maximum_rigid_body_damping,
+                        "%.3f",
+                        ImGuiSliderFlags_AlwaysClamp);
+                    ui_kit_.property_row("Angular damping");
+                    rb_changed |= ImGui::DragFloat(
+                        "##RigidBodyAngularDamping",
+                        &edited_rb.angular_damping,
+                        0.01F,
+                        0.0F,
+                        maximum_rigid_body_damping,
+                        "%.3f",
+                        ImGuiSliderFlags_AlwaysClamp);
+                    ui_kit_.property_row("Lock rotation");
+                    rb_changed |= ImGui::Checkbox(
+                        "##RigidBodyLockRotation", &edited_rb.lock_rotation);
+                }
+                ui_kit_.property_row("Friction");
+                rb_changed |= ImGui::SliderFloat(
+                    "##RigidBodyFriction",
+                    &edited_rb.friction,
+                    0.0F,
+                    2.0F,
+                    "%.2f",
+                    ImGuiSliderFlags_AlwaysClamp);
+                ui_kit_.property_row("Restitution");
+                rb_changed |= ImGui::SliderFloat(
+                    "##RigidBodyRestitution",
+                    &edited_rb.restitution,
+                    0.0F,
+                    1.0F,
+                    "%.2f",
+                    ImGuiSliderFlags_AlwaysClamp);
+                ui_kit_.property_row("Component");
+                if (ImGui::SmallButton("Remove rigid body")) {
+                    remove_rb_requested = true;
+                }
+                ui_kit_.end_property_grid();
+            }
+            if (remove_rb_requested) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                static_cast<void>(scene.remove_rigid_body(selected_node_));
+            } else if (rb_changed) {
+                edited_rb = sanitize_rigid_body_component(edited_rb);
+                if (!inspector_edit_snapshot_) {
+                    inspector_edit_snapshot_ = scene;
+                    if (auto previous =
+                            inspector_edit_snapshot_->node(selected_node_)) {
+                        previous->get() = node_before_edit;
+                    }
+                }
+                static_cast<void>(
+                    scene.set_rigid_body(selected_node_, edited_rb));
+            }
+        } else {
+            ui_kit_.status_text(
+                "Static in world. Add Rigid Body for dynamic simulation or kinematic platforms.",
+                EditorTone::neutral);
+            if (ui_kit_.action_button(
+                    "AddRigidBodyButton",
+                    EditorIcon::add,
+                    "Add Rigid Body",
+                    EditorButtonStyle::secondary,
+                    editable)) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                static_cast<void>(scene.set_rigid_body(
+                    selected_node_, RigidBodyComponent{}));
+            }
+        }
+    }
+    {
+        ui_kit_.section_header(EditorIcon::model, "Prefab");
+        const SceneNodeId enclosing_root =
+            scene.enclosing_prefab_root(selected_node_);
+        if (enclosing_root) {
+            if (const auto inst = scene.prefab_instance(enclosing_root)) {
+                ImGui::TextWrapped(
+                    "Source: %s", inst->get().prefab_path.data());
+            }
+            if (ui_kit_.action_button(
+                    "UnpackPrefabButton",
+                    EditorIcon::revert,
+                    "Unpack Prefab",
+                    EditorButtonStyle::secondary,
+                    editable)) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                static_cast<void>(
+                    scene.unpack_prefab_instance(enclosing_root));
+                scene_file_status_ = "Unpacked prefab instance.";
+            }
+            ImGui::SameLine();
+        }
+        if (ui_kit_.action_button(
+                "SaveNodeAsPrefabButton",
+                EditorIcon::save,
+                "Save as Prefab",
+                EditorButtonStyle::secondary,
+                editable && asset_import_enabled_)) {
+            if (inspector_edit_snapshot_) {
+                push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                inspector_edit_snapshot_.reset();
+            }
+            std::string saved_path;
+            std::string prefab_error;
+            if (!save_node_as_prefab(
+                    scene,
+                    selected_node_,
+                    {},
+                    true,
+                    true,
+                    saved_path,
+                    prefab_error)) {
+                asset_error_ = std::move(prefab_error);
             }
         }
     }
@@ -2941,20 +3123,107 @@ void draw_collider_wireframe(
         return;
     }
 
-    if (col.shape == ColliderShape::auto_bounds &&
-        kind == SceneNodeKind::model) {
-        if (const auto bounds = renderer.editor_node_bounds(node_id)) {
-            const glm::vec3 offset =
-                c0 * col.center_offset.x +
-                c1 * col.center_offset.y +
-                c2 * col.center_offset.z;
-            draw_obb(
-                bounds->center + offset,
-                glm::vec3(1.0F, 0.0F, 0.0F),
-                glm::vec3(0.0F, 1.0F, 0.0F),
-                glm::vec3(0.0F, 0.0F, 1.0F),
-                bounds->extent);
+    if (kind == SceneNodeKind::model) {
+        const CookedModelCollision* const cooked =
+            renderer.editor_model_collision(node_opt->get().asset_path);
+        const glm::vec3 world_offset =
+            c0 * col.center_offset.x +
+            c1 * col.center_offset.y +
+            c2 * col.center_offset.z;
+
+        if (col.shape == ColliderShape::triangle_mesh &&
+            cooked != nullptr &&
+            cooked->triangle_indices.size() >= 3U) {
+            const std::size_t tri_count =
+                cooked->triangle_indices.size() / 3U;
+            constexpr std::size_t max_drawn_tris = 256U;
+            const std::size_t stride =
+                std::max<std::size_t>(1U, tri_count / max_drawn_tris);
+            for (std::size_t t = 0U; t < tri_count; t += stride) {
+                const auto i0 = cooked->triangle_indices[t * 3U + 0U];
+                const auto i1 = cooked->triangle_indices[t * 3U + 1U];
+                const auto i2 = cooked->triangle_indices[t * 3U + 2U];
+                if (i0 >= cooked->triangle_positions.size() ||
+                    i1 >= cooked->triangle_positions.size() ||
+                    i2 >= cooked->triangle_positions.size()) {
+                    continue;
+                }
+                const auto xf = [&](const std::array<float, 3>& p) noexcept {
+                    return glm::vec3(
+                               world * glm::vec4(p[0], p[1], p[2], 1.0F)) +
+                           world_offset;
+                };
+                const glm::vec3 v0 = xf(cooked->triangle_positions[i0]);
+                const glm::vec3 v1 = xf(cooked->triangle_positions[i1]);
+                const glm::vec3 v2 = xf(cooked->triangle_positions[i2]);
+                draw_segment(v0, v1);
+                draw_segment(v1, v2);
+                draw_segment(v2, v0);
+            }
             return;
+        }
+
+        if (col.shape == ColliderShape::convex_hull &&
+            cooked != nullptr &&
+            cooked->convex_hull_vertices.size() >= 4U) {
+            const std::size_t n = cooked->convex_hull_vertices.size();
+            for (std::size_t i = 0U; i < n; ++i) {
+                const auto& pa = cooked->convex_hull_vertices[i];
+                const auto& pb = cooked->convex_hull_vertices[(i + 1U) % n];
+                const glm::vec3 wa =
+                    glm::vec3(world * glm::vec4(pa[0], pa[1], pa[2], 1.0F)) +
+                    world_offset;
+                const glm::vec3 wb =
+                    glm::vec3(world * glm::vec4(pb[0], pb[1], pb[2], 1.0F)) +
+                    world_offset;
+                draw_segment(wa, wb);
+            }
+            const glm::vec3 lc{
+                cooked->local_bounds.center[0],
+                cooked->local_bounds.center[1],
+                cooked->local_bounds.center[2],
+            };
+            const glm::vec3 le{
+                cooked->local_bounds.half_extents[0],
+                cooked->local_bounds.half_extents[1],
+                cooked->local_bounds.half_extents[2],
+            };
+            draw_obb(
+                glm::vec3(world * glm::vec4(lc, 1.0F)) + world_offset,
+                ax0,
+                ax1,
+                ax2,
+                le * sx_sy_sz);
+            return;
+        }
+
+        if (col.shape == ColliderShape::auto_bounds) {
+            if (cooked != nullptr && !cooked->submesh_boxes.empty()) {
+                for (const CookedCollisionBox& sb : cooked->submesh_boxes) {
+                    const glm::vec3 lc{sb.center[0], sb.center[1], sb.center[2]};
+                    const glm::vec3 le{
+                        sb.half_extents[0],
+                        sb.half_extents[1],
+                        sb.half_extents[2],
+                    };
+                    draw_obb(
+                        glm::vec3(world * glm::vec4(lc, 1.0F)) + world_offset,
+                        ax0,
+                        ax1,
+                        ax2,
+                        le * sx_sy_sz);
+                }
+                return;
+            }
+            if (const auto bounds = renderer.editor_node_bounds(node_id)) {
+                draw_obb(
+                    bounds->center + world_offset,
+                    glm::vec3(1.0F, 0.0F, 0.0F),
+                    glm::vec3(0.0F, 1.0F, 0.0F),
+                    glm::vec3(0.0F, 0.0F, 1.0F),
+                    bounds->extent);
+                return;
+            }
         }
     }
 
@@ -3450,7 +3719,8 @@ void EditorUi::build_assets(
     const bool can_add_selected_model =
         play_state_ == EditorPlayState::edit &&
         selected_asset_.has_value() &&
-        selected_asset_->kind == AssetEntryKind::model;
+        (selected_asset_->kind == AssetEntryKind::model ||
+         selected_asset_->kind == AssetEntryKind::prefab);
     if (ui_kit_.action_button(
             "AddSelectedAsset",
             EditorIcon::add,
@@ -3467,7 +3737,7 @@ void EditorUi::build_assets(
         ImGui::IsItemHovered(
             ImGuiHoveredFlags_AllowWhenDisabled)) {
         ImGui::SetTooltip(
-            "Select an imported .vcrasset.json model.");
+            "Select an imported .vcrasset.json model or .vcrprefab.json prefab.");
     }
     ImGui::SameLine();
     ui_kit_.badge(
@@ -3538,8 +3808,10 @@ void EditorUi::build_assets(
                                AssetEntryKind::material) {
                     open_material_editor(entry.relative_path);
                 } else if (row_result.double_clicked &&
-                           entry.kind ==
-                               AssetEntryKind::model) {
+                           (entry.kind ==
+                                AssetEntryKind::model ||
+                            entry.kind ==
+                                AssetEntryKind::prefab)) {
                     static_cast<void>(add_model_asset_to_scene(
                         scene,
                         renderer,
@@ -3561,7 +3833,8 @@ void EditorUi::build_assets(
                     ImGui::MenuItem("Open in Material Editor")) {
                     open_material_editor(entry.relative_path);
                 }
-                if (entry.kind == AssetEntryKind::model &&
+                if ((entry.kind == AssetEntryKind::model ||
+                     entry.kind == AssetEntryKind::prefab) &&
                     ImGui::MenuItem("Add to Scene")) {
                     static_cast<void>(add_model_asset_to_scene(
                         scene,
@@ -3824,6 +4097,191 @@ void EditorUi::build_landscape(
     ImGui::End();
 }
 
+void EditorUi::refresh_asset_browser() noexcept {
+    std::string ignored_error;
+    if (asset_browser_.refresh(ignored_error) && selected_asset_) {
+        bool still_present = false;
+        for (const AssetEntry& entry : asset_browser_.entries()) {
+            if (entry.relative_path == selected_asset_->relative_path) {
+                still_present = true;
+                break;
+            }
+        }
+        if (!still_present) {
+            selected_asset_.reset();
+        }
+    }
+}
+
+bool EditorUi::save_node_as_prefab(
+    SceneDocument& scene,
+    const SceneNodeId root_id,
+    const std::string_view custom_relative_path,
+    const bool zero_root_translation,
+    const bool attach_instance,
+    std::string& saved_relative_path,
+    std::string& error) {
+    error.clear();
+    saved_relative_path.clear();
+    if (play_state_ != EditorPlayState::edit) {
+        error = "Prefabs can be saved only in Edit mode.";
+        return false;
+    }
+    const auto node_opt = scene.node(root_id);
+    if (!node_opt) {
+        error = "Select a valid scene node before saving a prefab.";
+        return false;
+    }
+    if (asset_browser_.root().empty()) {
+        error = "The configured asset root is unavailable.";
+        return false;
+    }
+
+    std::string target_path;
+    if (!custom_relative_path.empty()) {
+        target_path = std::string(custom_relative_path);
+    } else if (const auto existing_inst = scene.prefab_instance(root_id);
+               existing_inst &&
+               existing_inst->get().is_prefab_root &&
+               valid_prefab_asset_path(existing_inst->get().path_view())) {
+        target_path = std::string(existing_inst->get().path_view());
+    } else {
+        target_path = make_default_prefab_relative_path(node_opt->get().name);
+    }
+
+    if (!save_prefab_file(
+            scene,
+            root_id,
+            asset_browser_.root(),
+            target_path,
+            error,
+            PrefabSaveOptions{
+                .zero_root_translation = zero_root_translation,
+            })) {
+        return false;
+    }
+
+    if (attach_instance) {
+        checkpoint_scene(scene);
+        std::vector<SceneHierarchyRow> rows;
+        rows.reserve(scene.size());
+        scene.build_hierarchy_rows(rows, {}, SceneHierarchyScope::all);
+        bool in_subtree = false;
+        std::uint32_t root_depth = 0U;
+        std::optional<std::uint32_t> nested_prefab_depth{};
+        for (const SceneHierarchyRow& row : rows) {
+            if (!in_subtree) {
+                if (row.id == root_id) {
+                    in_subtree = true;
+                    root_depth = row.depth;
+                    if (const auto u = scene.uuid(row.id)) {
+                        PrefabInstanceComponent inst{};
+                        if (inst.set_path(target_path)) {
+                            inst.source_node_uuid = *u;
+                            inst.is_prefab_root = true;
+                            static_cast<void>(
+                                scene.set_prefab_instance(row.id, inst));
+                        }
+                    }
+                }
+                continue;
+            }
+            if (row.depth <= root_depth) {
+                break;
+            }
+            if (nested_prefab_depth && row.depth > *nested_prefab_depth) {
+                continue;
+            }
+            nested_prefab_depth.reset();
+            if (const auto child_inst = scene.prefab_instance(row.id);
+                child_inst && child_inst->get().is_prefab_root) {
+                nested_prefab_depth = row.depth;
+                continue;
+            }
+            if (const auto u = scene.uuid(row.id)) {
+                PrefabInstanceComponent inst{};
+                if (inst.set_path(target_path)) {
+                    inst.source_node_uuid = *u;
+                    inst.is_prefab_root = false;
+                    static_cast<void>(
+                        scene.set_prefab_instance(row.id, inst));
+                }
+            }
+        }
+    }
+
+    refresh_asset_browser();
+    asset_error_.clear();
+    saved_relative_path = target_path;
+    scene_file_status_ = "Saved prefab: " + target_path;
+    return true;
+}
+
+bool EditorUi::instantiate_prefab_in_scene(
+    SceneDocument& scene,
+    Renderer& renderer,
+    const std::string_view relative_path,
+    const PrefabInstantiateOptions& options,
+    PrefabInstantiateResult& result,
+    std::string& error) {
+    error.clear();
+    result = {};
+    if (play_state_ != EditorPlayState::edit) {
+        error = "Prefabs can be instantiated only in Edit mode.";
+        return false;
+    }
+    if (asset_browser_.root().empty()) {
+        error = "The configured asset root is unavailable.";
+        return false;
+    }
+
+    SceneDocument snapshot = scene;
+    if (!instantiate_prefab_file(
+            scene,
+            asset_browser_.root(),
+            relative_path,
+            options,
+            result,
+            error)) {
+        return false;
+    }
+
+    std::vector<SceneHierarchyRow> rows;
+    rows.reserve(scene.size());
+    scene.build_hierarchy_rows(rows, {}, SceneHierarchyScope::all);
+    bool in_subtree = false;
+    std::uint32_t root_depth = 0U;
+    for (const SceneHierarchyRow& row : rows) {
+        if (!in_subtree) {
+            if (row.id == result.root_id) {
+                in_subtree = true;
+                root_depth = row.depth;
+            } else {
+                continue;
+            }
+        } else if (row.depth <= root_depth) {
+            break;
+        }
+        if (const auto created_node = scene.node(row.id);
+            created_node && created_node->get().kind == SceneNodeKind::model &&
+            valid_scene_asset_path(created_node->get().asset_path)) {
+            SceneTransform unused_transform{};
+            std::string prep_error;
+            static_cast<void>(renderer.prepare_editor_model(
+                asset_browser_.root(),
+                created_node->get().asset_path,
+                unused_transform,
+                prep_error));
+        }
+    }
+
+    push_undo_snapshot(std::move(snapshot));
+    static_cast<void>(select_node(scene, result.root_id));
+    asset_error_.clear();
+    scene_file_status_ = "Instantiated prefab: " + std::string(relative_path);
+    return true;
+}
+
 bool EditorUi::add_model_asset_to_scene(
     SceneDocument& scene,
     Renderer& renderer,
@@ -3837,6 +4295,26 @@ bool EditorUi::add_model_asset_to_scene(
         asset_error_ =
             "Models can be added to the scene only in Edit mode.";
         return false;
+    }
+    if (valid_prefab_asset_path(relative_path)) {
+        SceneNodeId parent{};
+        if (const auto selected = scene.node(selected_node_);
+            selected && selected->get().kind == SceneNodeKind::folder) {
+            parent = selected_node_;
+        }
+        PrefabInstantiateResult prefab_result{};
+        std::string prefab_error;
+        if (!instantiate_prefab_in_scene(
+                scene,
+                renderer,
+                relative_path,
+                PrefabInstantiateOptions{.parent = parent},
+                prefab_result,
+                prefab_error)) {
+            asset_error_ = std::move(prefab_error);
+            return false;
+        }
+        return true;
     }
     if (!valid_scene_asset_path(relative_path)) {
         asset_error_ =

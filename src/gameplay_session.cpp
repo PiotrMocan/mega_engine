@@ -34,6 +34,51 @@ constexpr float radians_to_degrees = 57.2957795131F;
 #endif
 }
 
+[[nodiscard]] ModelCollisionProvider make_renderer_collision_provider(
+    const Renderer* const renderer) noexcept {
+    if (renderer == nullptr) {
+        return {};
+    }
+#if VCR_EDITOR_ENABLED
+    return ModelCollisionProvider{
+        .context = renderer,
+        .query = +[](const void* const ctx,
+                     const std::string_view path) noexcept
+                     -> const CookedModelCollision* {
+            return static_cast<const Renderer*>(ctx)
+                ->editor_model_collision(path);
+        },
+    };
+#else
+    return {};
+#endif
+}
+
+[[nodiscard]] glm::vec3 compute_desired_planar_velocity(
+    const CharacterInput& input,
+    glm::vec3 planar_forward,
+    const CharacterConfig& cfg) noexcept {
+    planar_forward.y = 0.0F;
+    const float f_sq = glm::dot(planar_forward, planar_forward);
+    if (!std::isfinite(f_sq) || f_sq <= 1.0e-8F) {
+        planar_forward = {0.0F, 0.0F, -1.0F};
+    } else {
+        planar_forward *= 1.0F / std::sqrt(f_sq);
+    }
+    const glm::vec3 planar_right{-planar_forward.z, 0.0F, planar_forward.x};
+    const float fwd =
+        static_cast<float>(input.forward) - static_cast<float>(input.backward);
+    const float rgt =
+        static_cast<float>(input.right) - static_cast<float>(input.left);
+    const glm::vec3 raw = planar_forward * fwd + planar_right * rgt;
+    const float raw_sq = glm::dot(raw, raw);
+    if (raw_sq <= 1.0e-8F) {
+        return glm::vec3(0.0F);
+    }
+    const float speed = input.run ? cfg.run_speed : cfg.walk_speed;
+    return raw * (speed / std::sqrt(raw_sq));
+}
+
 [[nodiscard]] TransformRows player_transform(
     const glm::vec3 feet_position,
     const float facing_yaw) noexcept {
@@ -65,6 +110,7 @@ bool GameplaySession::start(
     }
     player_node_ = {};
     collision_world_.clear();
+    physics_world_.clear();
     trigger_tracker_.reset();
 
     glm::vec3 movement_forward = startup_camera.forward();
@@ -91,8 +137,21 @@ bool GameplaySession::start(
         return false;
     }
 
+    const ModelBoundsProvider bounds_provider =
+        make_renderer_bounds_provider(renderer);
+    const ModelCollisionProvider collision_provider =
+        make_renderer_collision_provider(renderer);
     collision_world_.rebuild_from_scene(
-        scene, player_node_, make_renderer_bounds_provider(renderer));
+        scene,
+        player_node_,
+        bounds_provider,
+        collision_provider,
+        true);
+    physics_world_.rebuild_from_scene(
+        scene,
+        player_node_,
+        bounds_provider,
+        collision_provider);
 
     const float fallback_ground = initial_view.has_ground
         ? initial_view.ground.model_row_1.w
@@ -127,6 +186,10 @@ bool GameplaySession::start(
 
     const float facing_yaw = std::atan2(movement_forward.x, movement_forward.z);
     character_.reset(spawn, facing_yaw);
+    physics_world_.resolve_character_post_step(
+        character_,
+        collision_world_,
+        0.0F);
 
     SceneNode& player = player_node->get();
     player.transform.translation =
@@ -152,7 +215,10 @@ bool GameplaySession::start(
     const glm::vec3 startup_forward = startup_camera.forward();
     camera_.reset(std::atan2(startup_forward.z, startup_forward.x));
     output_camera = FlyCamera(
-        camera_.position(character_.position(), collision_world_),
+        camera_.position(
+            character_.position(),
+            collision_world_,
+            physics_world_),
         camera_.yaw(),
         camera_.pitch());
     active_ = true;
@@ -170,18 +236,59 @@ bool GameplaySession::update(
     }
     if (scene.content_revision() != cached_content_revision_ ||
         scene.structure_revision() != cached_structure_revision_) {
+        const ModelBoundsProvider bounds_provider =
+            make_renderer_bounds_provider(&renderer);
+        const ModelCollisionProvider collision_provider =
+            make_renderer_collision_provider(&renderer);
         collision_world_.rebuild_from_scene(
-            scene, player_node_, make_renderer_bounds_provider(&renderer));
+            scene,
+            player_node_,
+            bounds_provider,
+            collision_provider,
+            true);
+        physics_world_.rebuild_from_scene(
+            scene,
+            player_node_,
+            bounds_provider,
+            collision_provider);
         cached_content_revision_ = scene.content_revision();
         cached_structure_revision_ = scene.structure_revision();
     }
 
     camera_.rotate(input.mouse_delta_x, input.mouse_delta_y);
+    const glm::vec3 cam_forward = camera_.planar_forward();
     character_.update(
         input.character,
-        camera_.planar_forward(),
+        cam_forward,
         delta_seconds,
         collision_world_);
+
+    if (!physics_world_.empty()) {
+        const glm::vec3 desired_vel = compute_desired_planar_velocity(
+            input.character,
+            cam_forward,
+            character_.config());
+        physics_world_.apply_character_push(
+            character_,
+            desired_vel,
+            delta_seconds);
+        physics_world_.step(delta_seconds, collision_world_);
+        physics_world_.resolve_character_post_step(
+            character_,
+            collision_world_,
+            delta_seconds);
+
+        const std::size_t body_count = physics_world_.body_count();
+        for (std::size_t i = 0U; i < body_count; ++i) {
+            const SceneNodeId id = physics_world_.body_node_id(i);
+            if (id) {
+                static_cast<void>(renderer.set_runtime_transform(
+                    id,
+                    physics_world_.body_transform_rows(i)));
+            }
+        }
+    }
+
     trigger_tracker_.update(
         collision_world_,
         character_.position(),
@@ -194,7 +301,10 @@ bool GameplaySession::update(
         return false;
     }
     output_camera = FlyCamera(
-        camera_.position(character_.position(), collision_world_),
+        camera_.position(
+            character_.position(),
+            collision_world_,
+            physics_world_),
         camera_.yaw(),
         camera_.pitch());
     return true;
@@ -202,6 +312,7 @@ bool GameplaySession::update(
 
 void GameplaySession::stop() noexcept {
     collision_world_.clear();
+    physics_world_.clear();
     trigger_tracker_.reset();
     player_node_ = {};
     cached_content_revision_ = 0U;

@@ -73,7 +73,7 @@ constexpr std::array<std::string_view, 30> runtime_tool_names{
     "engine.quit",
 };
 
-constexpr std::array<std::string_view, 29> editor_tool_names{
+constexpr std::array<std::string_view, 34> editor_tool_names{
     "render.set_exposure",
     "render.set_color_grading",
     "render.set_subsurface",
@@ -91,6 +91,11 @@ constexpr std::array<std::string_view, 29> editor_tool_names{
     "editor.scene.duplicate_node",
     "editor.scene.set_collider",
     "editor.scene.remove_collider",
+    "editor.scene.set_rigid_body",
+    "editor.scene.remove_rigid_body",
+    "editor.prefab.save",
+    "editor.prefab.instantiate",
+    "editor.prefab.unpack",
     "editor.camera.focus_selection",
     "editor.scene.save",
     "editor.history.undo",
@@ -801,13 +806,13 @@ private:
         }, Json::array({"uuid"})), true, false, true));
     tools.push_back(tool_definition(
         "editor.scene.set_collider", "Set scene node collider",
-        "Attach or replace a ColliderComponent (auto_bounds, box, sphere, or capsule; solid or trigger) on a scene node.",
+        "Attach or replace a ColliderComponent (auto_bounds, box, sphere, capsule, convex_hull, or triangle_mesh; solid or trigger) on a scene node.",
         object_schema(Json{
             {"id", handle_schema},
             {"enabled", Json{{"type", "boolean"}}},
             {"is_trigger", Json{{"type", "boolean"}}},
             {"shape", Json{{"type", "string"},
-                {"enum", Json::array({"auto_bounds", "box", "sphere", "capsule"})}}},
+                {"enum", Json::array({"auto_bounds", "box", "sphere", "capsule", "convex_hull", "triangle_mesh"})}}},
             {"center_offset", vec3_schema},
             {"half_extents", vec3_schema},
             {"radius", Json{{"type", "number"},
@@ -822,6 +827,70 @@ private:
     tools.push_back(tool_definition(
         "editor.scene.remove_collider", "Remove scene node collider",
         "Detach the authored ColliderComponent from a scene node.",
+        object_schema(Json{{"id", handle_schema}}, Json::array({"id"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.set_rigid_body", "Set scene node rigid body",
+        "Attach or replace a RigidBodyComponent (dynamic or kinematic) on a scene node.",
+        object_schema(Json{
+            {"id", handle_schema},
+            {"enabled", Json{{"type", "boolean"}}},
+            {"motion_type", Json{{"type", "string"},
+                {"enum", Json::array({"dynamic", "kinematic"})}}},
+            {"mass", Json{{"type", "number"},
+                {"minimum", minimum_rigid_body_mass},
+                {"maximum", maximum_rigid_body_mass}}},
+            {"gravity_scale", Json{{"type", "number"},
+                {"minimum", -maximum_rigid_body_gravity_scale},
+                {"maximum", maximum_rigid_body_gravity_scale}}},
+            {"linear_damping", Json{{"type", "number"},
+                {"minimum", 0.0},
+                {"maximum", maximum_rigid_body_damping}}},
+            {"angular_damping", Json{{"type", "number"},
+                {"minimum", 0.0},
+                {"maximum", maximum_rigid_body_damping}}},
+            {"lock_rotation", Json{{"type", "boolean"}}},
+            {"friction", Json{{"type", "number"},
+                {"minimum", 0.0},
+                {"maximum", maximum_rigid_body_friction}}},
+            {"restitution", Json{{"type", "number"},
+                {"minimum", 0.0},
+                {"maximum", 1.0}}},
+        }, Json::array({"id"})), false, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.remove_rigid_body", "Remove scene node rigid body",
+        "Detach the authored RigidBodyComponent from a scene node.",
+        object_schema(Json{{"id", handle_schema}}, Json::array({"id"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "editor.prefab.save", "Save scene subtree as prefab",
+        "Atomically save a scene node and its descendants to a sandboxed .vcrprefab.json asset.",
+        object_schema(Json{
+            {"id", handle_schema},
+            {"path", Json{{"type", "string"},
+                {"maxLength", max_prefab_path_bytes}}},
+            {"zero_root_translation", Json{{"type", "boolean"}}},
+            {"attach_instance", Json{{"type", "boolean"}}},
+        }, Json::array({"id"})), false, false, true));
+    tools.push_back(tool_definition(
+        "editor.prefab.instantiate", "Instantiate prefab into scene",
+        "Transactionally instantiate a .vcrprefab.json asset with fresh node UUIDs and optional node overrides.",
+        object_schema(Json{
+            {"path", Json{{"type", "string"},
+                {"minLength", 1},
+                {"maxLength", max_prefab_path_bytes}}},
+            {"parent", optional_parent_schema},
+            {"root_name", Json{{"type", "string"},
+                {"minLength", 1},
+                {"maxLength", max_scene_node_name_bytes}}},
+            {"translation", vec3_schema},
+            {"rotation_degrees", vec3_schema},
+            {"scale", vec3_schema},
+            {"overrides", Json{{"type", "array"}, {"maxItems", 16}}},
+        }, Json::array({"path"})), false, false, false));
+    tools.push_back(tool_definition(
+        "editor.prefab.unpack", "Unpack prefab instance",
+        "Detach PrefabInstanceComponent links from the enclosing prefab instance while preserving nested prefabs.",
         object_schema(Json{{"id", handle_schema}}, Json::array({"id"})),
         false, false, true));
     tools.push_back(tool_definition(
@@ -1476,6 +1545,315 @@ private:
                      0.0F, 90.0F, McpCommand::edit_spot_outer);
 }
 
+[[nodiscard]] bool parse_collider_fields(
+    const Json& object,
+    const bool allow_id,
+    ColliderComponent& collider,
+    std::string& error) {
+    if (!object.is_object()) {
+        error = "collider must be a JSON object";
+        return false;
+    }
+    const bool keys_ok = allow_id
+        ? only_keys(object, {
+              "id", "enabled", "is_trigger", "shape", "center_offset",
+              "half_extents", "radius", "half_height",
+              "collision_layer", "collision_mask"})
+        : only_keys(object, {
+              "enabled", "is_trigger", "shape", "center_offset",
+              "half_extents", "radius", "half_height",
+              "collision_layer", "collision_mask"});
+    if (!keys_ok) {
+        error = "collider contains unknown fields";
+        return false;
+    }
+    if (object.contains("enabled")) {
+        const auto v = get_bool(object, "enabled");
+        if (!v) {
+            error = "enabled must be a boolean";
+            return false;
+        }
+        collider.enabled = *v;
+    }
+    if (object.contains("is_trigger")) {
+        const auto v = get_bool(object, "is_trigger");
+        if (!v) {
+            error = "is_trigger must be a boolean";
+            return false;
+        }
+        collider.is_trigger = *v;
+    }
+    if (object.contains("shape")) {
+        const auto s = get_string(object, "shape");
+        const auto parsed_shape = s ? parse_collider_shape(*s) : std::nullopt;
+        if (!parsed_shape) {
+            error = "shape must be auto_bounds, box, sphere, capsule, convex_hull, or triangle_mesh";
+            return false;
+        }
+        collider.shape = *parsed_shape;
+    }
+    if (object.contains("center_offset") &&
+        !parse_vec3(object, "center_offset", collider.center_offset)) {
+        error = "center_offset must contain three finite numbers";
+        return false;
+    }
+    if (object.contains("half_extents") &&
+        !parse_vec3(object, "half_extents", collider.half_extents)) {
+        error = "half_extents must contain three finite numbers";
+        return false;
+    }
+    if (object.contains("radius")) {
+        const auto r = get_finite_float(
+            object, "radius",
+            minimum_collider_dimension, maximum_collider_dimension);
+        if (!r) {
+            error = "radius is outside the valid collider range";
+            return false;
+        }
+        collider.radius = *r;
+    }
+    if (object.contains("half_height")) {
+        const auto hh = get_finite_float(
+            object, "half_height", 0.0F, maximum_collider_dimension);
+        if (!hh) {
+            error = "half_height is outside the valid collider range";
+            return false;
+        }
+        collider.half_height = *hh;
+    }
+    if (object.contains("collision_layer")) {
+        const auto layer = get_u32(
+            object, "collision_layer", 0U, UINT32_MAX);
+        if (!layer) {
+            error = "collision_layer must be a uint32";
+            return false;
+        }
+        collider.collision_layer = *layer;
+    }
+    if (object.contains("collision_mask")) {
+        const auto mask = get_u32(
+            object, "collision_mask", 0U, UINT32_MAX);
+        if (!mask) {
+            error = "collision_mask must be a uint32";
+            return false;
+        }
+        collider.collision_mask = *mask;
+    }
+    if (!valid_collider_component(collider)) {
+        error = "collider dimensions or offsets are outside engine bounds";
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] bool parse_rigid_body_fields(
+    const Json& object,
+    const bool allow_id,
+    RigidBodyComponent& body,
+    std::string& error) {
+    if (!object.is_object()) {
+        error = "rigid_body must be a JSON object";
+        return false;
+    }
+    const bool keys_ok = allow_id
+        ? only_keys(object, {
+              "id", "enabled", "motion_type", "mass", "gravity_scale",
+              "linear_damping", "angular_damping", "lock_rotation",
+              "friction", "restitution"})
+        : only_keys(object, {
+              "enabled", "motion_type", "mass", "gravity_scale",
+              "linear_damping", "angular_damping", "lock_rotation",
+              "friction", "restitution"});
+    if (!keys_ok) {
+        error = "rigid_body contains unknown fields";
+        return false;
+    }
+    if (object.contains("enabled")) {
+        const auto v = get_bool(object, "enabled");
+        if (!v) {
+            error = "enabled must be a boolean";
+            return false;
+        }
+        body.enabled = *v;
+    }
+    if (object.contains("motion_type")) {
+        const auto m = get_string(object, "motion_type");
+        const auto parsed = m ? parse_rigid_body_motion_type(*m) : std::nullopt;
+        if (!parsed) {
+            error = "motion_type must be dynamic or kinematic";
+            return false;
+        }
+        body.motion_type = *parsed;
+    }
+    if (object.contains("mass")) {
+        const auto v = get_finite_float(
+            object, "mass", minimum_rigid_body_mass, maximum_rigid_body_mass);
+        if (!v) {
+            error = "mass is outside the valid rigid_body range";
+            return false;
+        }
+        body.mass = *v;
+    }
+    if (object.contains("gravity_scale")) {
+        const auto v = get_finite_float(
+            object, "gravity_scale",
+            -maximum_rigid_body_gravity_scale, maximum_rigid_body_gravity_scale);
+        if (!v) {
+            error = "gravity_scale is outside the valid rigid_body range";
+            return false;
+        }
+        body.gravity_scale = *v;
+    }
+    if (object.contains("linear_damping")) {
+        const auto v = get_finite_float(
+            object, "linear_damping", 0.0F, maximum_rigid_body_damping);
+        if (!v) {
+            error = "linear_damping is outside the valid rigid_body range";
+            return false;
+        }
+        body.linear_damping = *v;
+    }
+    if (object.contains("angular_damping")) {
+        const auto v = get_finite_float(
+            object, "angular_damping", 0.0F, maximum_rigid_body_damping);
+        if (!v) {
+            error = "angular_damping is outside the valid rigid_body range";
+            return false;
+        }
+        body.angular_damping = *v;
+    }
+    if (object.contains("lock_rotation")) {
+        const auto v = get_bool(object, "lock_rotation");
+        if (!v) {
+            error = "lock_rotation must be a boolean";
+            return false;
+        }
+        body.lock_rotation = *v;
+    }
+    if (object.contains("friction")) {
+        const auto v = get_finite_float(
+            object, "friction", 0.0F, maximum_rigid_body_friction);
+        if (!v) {
+            error = "friction is outside the valid rigid_body range";
+            return false;
+        }
+        body.friction = *v;
+    }
+    if (object.contains("restitution")) {
+        const auto v = get_finite_float(object, "restitution", 0.0F, 1.0F);
+        if (!v) {
+            error = "restitution must be between 0 and 1";
+            return false;
+        }
+        body.restitution = *v;
+    }
+    if (!valid_rigid_body_component(body)) {
+        error = "rigid_body fields are outside engine bounds";
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] bool validate_prefab_overrides(
+    const Json& overrides_json,
+    std::string& error) {
+    if (!overrides_json.is_array() || overrides_json.size() > 16U) {
+        error = "overrides must be an array of at most 16 node overrides";
+        return false;
+    }
+    for (const auto& entry : overrides_json) {
+        if (!entry.is_object() ||
+            !only_keys(entry, {
+                "source_node_uuid", "node_index", "name", "visible",
+                "translation", "rotation_degrees", "scale",
+                "base_color", "metallic", "roughness", "ambient_occlusion",
+                "collider", "rigid_body"})) {
+            error = "each prefab override must be an object with known fields";
+            return false;
+        }
+        const bool has_uuid = entry.contains("source_node_uuid");
+        const bool has_index = entry.contains("node_index");
+        if (!has_uuid && !has_index) {
+            error = "each prefab override requires source_node_uuid or node_index";
+            return false;
+        }
+        if (has_uuid) {
+            const auto uuid_str = get_string(entry, "source_node_uuid");
+            if (!uuid_str || !parse_scene_uuid(*uuid_str)) {
+                error = "override source_node_uuid must be a canonical non-zero UUID";
+                return false;
+            }
+        }
+        if (has_index && !get_u32(entry, "node_index", 0U, max_scene_nodes - 1U)) {
+            error = "override node_index must be a valid scene node index";
+            return false;
+        }
+        if (entry.contains("name")) {
+            const auto n = get_string(entry, "name");
+            if (!n || n->empty() || n->size() > max_scene_node_name_bytes) {
+                error = "override name must be a non-empty bounded string";
+                return false;
+            }
+        }
+        if (entry.contains("visible") && !get_bool(entry, "visible")) {
+            error = "override visible must be a boolean";
+            return false;
+        }
+        glm::vec3 vec_tmp{};
+        if (entry.contains("translation") &&
+            !parse_vec3(entry, "translation", vec_tmp)) {
+            error = "override translation must contain three finite numbers";
+            return false;
+        }
+        if (entry.contains("rotation_degrees") &&
+            !parse_vec3(entry, "rotation_degrees", vec_tmp)) {
+            error = "override rotation_degrees must contain three finite numbers";
+            return false;
+        }
+        if (entry.contains("scale")) {
+            if (!parse_vec3(entry, "scale", vec_tmp) ||
+                vec_tmp.x < 0.0001F || vec_tmp.y < 0.0001F || vec_tmp.z < 0.0001F) {
+                error = "override scale must contain three finite values >= 0.0001";
+                return false;
+            }
+        }
+        glm::vec4 color_tmp{};
+        if (entry.contains("base_color") &&
+            !parse_color(entry, "base_color", color_tmp)) {
+            error = "override base_color must contain four values in [0, 1]";
+            return false;
+        }
+        if (entry.contains("metallic") &&
+            !get_finite_float(entry, "metallic", 0.0F, 1.0F)) {
+            error = "override metallic must be in [0, 1]";
+            return false;
+        }
+        if (entry.contains("roughness") &&
+            !get_finite_float(entry, "roughness", minimum_pbr_roughness, 1.0F)) {
+            error = "override roughness is outside the PBR range";
+            return false;
+        }
+        if (entry.contains("ambient_occlusion") &&
+            !get_finite_float(entry, "ambient_occlusion", 0.0F, 1.0F)) {
+            error = "override ambient_occlusion must be in [0, 1]";
+            return false;
+        }
+        if (entry.contains("collider")) {
+            ColliderComponent col{};
+            if (!parse_collider_fields(entry["collider"], false, col, error)) {
+                return false;
+            }
+        }
+        if (entry.contains("rigid_body")) {
+            RigidBodyComponent rb{};
+            if (!parse_rigid_body_fields(entry["rigid_body"], false, rb, error)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 [[nodiscard]] bool command_from_editor_tool(
     const std::string_view name,
     const Json& arguments,
@@ -1681,94 +2059,157 @@ private:
         return true;
     }
     if (name == "editor.scene.set_collider") {
-        if (!only_keys(arguments, {
-                "id", "enabled", "is_trigger", "shape", "center_offset",
-                "half_extents", "radius", "half_height",
-                "collision_layer", "collision_mask"}) ||
-            !arguments.contains("id") ||
+        if (!arguments.contains("id") ||
             !parse_node_handle(arguments["id"], command.node_id)) {
-            error = "set_collider requires a valid id and known collider fields";
+            error = "set_collider requires a valid id";
             return false;
         }
         ColliderComponent collider{};
-        if (arguments.contains("enabled")) {
-            const auto v = get_bool(arguments, "enabled");
-            if (!v) {
-                error = "enabled must be a boolean";
-                return false;
-            }
-            collider.enabled = *v;
-        }
-        if (arguments.contains("is_trigger")) {
-            const auto v = get_bool(arguments, "is_trigger");
-            if (!v) {
-                error = "is_trigger must be a boolean";
-                return false;
-            }
-            collider.is_trigger = *v;
-        }
-        if (arguments.contains("shape")) {
-            const auto s = get_string(arguments, "shape");
-            const auto parsed_shape = s ? parse_collider_shape(*s) : std::nullopt;
-            if (!parsed_shape) {
-                error = "shape must be auto_bounds, box, sphere, or capsule";
-                return false;
-            }
-            collider.shape = *parsed_shape;
-        }
-        if (arguments.contains("center_offset") &&
-            !parse_vec3(arguments, "center_offset", collider.center_offset)) {
-            error = "center_offset must contain three finite numbers";
-            return false;
-        }
-        if (arguments.contains("half_extents") &&
-            !parse_vec3(arguments, "half_extents", collider.half_extents)) {
-            error = "half_extents must contain three finite numbers";
-            return false;
-        }
-        if (arguments.contains("radius")) {
-            const auto r = get_finite_float(
-                arguments, "radius",
-                minimum_collider_dimension, maximum_collider_dimension);
-            if (!r) {
-                error = "radius is outside the valid collider range";
-                return false;
-            }
-            collider.radius = *r;
-        }
-        if (arguments.contains("half_height")) {
-            const auto hh = get_finite_float(
-                arguments, "half_height", 0.0F, maximum_collider_dimension);
-            if (!hh) {
-                error = "half_height is outside the valid collider range";
-                return false;
-            }
-            collider.half_height = *hh;
-        }
-        if (arguments.contains("collision_layer")) {
-            const auto layer = get_u32(
-                arguments, "collision_layer", 0U, UINT32_MAX);
-            if (!layer) {
-                error = "collision_layer must be a uint32";
-                return false;
-            }
-            collider.collision_layer = *layer;
-        }
-        if (arguments.contains("collision_mask")) {
-            const auto mask = get_u32(
-                arguments, "collision_mask", 0U, UINT32_MAX);
-            if (!mask) {
-                error = "collision_mask must be a uint32";
-                return false;
-            }
-            collider.collision_mask = *mask;
-        }
-        if (!valid_collider_component(collider)) {
-            error = "collider dimensions or offsets are outside engine bounds";
+        if (!parse_collider_fields(arguments, true, collider, error)) {
             return false;
         }
         command.type = McpCommandType::editor_set_collider;
         command.collider = collider;
+        return true;
+    }
+    if (name == "editor.scene.remove_rigid_body") {
+        if (arguments.size() != 1U || !arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "id must be the only argument and contain index/generation";
+            return false;
+        }
+        command.type = McpCommandType::editor_remove_rigid_body;
+        return true;
+    }
+    if (name == "editor.scene.set_rigid_body") {
+        if (!arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "set_rigid_body requires a valid id";
+            return false;
+        }
+        RigidBodyComponent body{};
+        if (!parse_rigid_body_fields(arguments, true, body, error)) {
+            return false;
+        }
+        command.type = McpCommandType::editor_set_rigid_body;
+        command.rigid_body = body;
+        return true;
+    }
+    if (name == "editor.prefab.save") {
+        if (!only_keys(arguments, {
+                "id", "path", "zero_root_translation", "attach_instance"}) ||
+            !arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "prefab.save requires a valid id and known prefab options";
+            return false;
+        }
+        command.type = McpCommandType::editor_prefab_save;
+        command.enabled = true;
+        command.prefab_attach_instance = true;
+        if (arguments.contains("zero_root_translation")) {
+            const auto z = get_bool(arguments, "zero_root_translation");
+            if (!z) {
+                error = "zero_root_translation must be a boolean";
+                return false;
+            }
+            command.enabled = *z;
+        }
+        if (arguments.contains("attach_instance")) {
+            const auto a = get_bool(arguments, "attach_instance");
+            if (!a) {
+                error = "attach_instance must be a boolean";
+                return false;
+            }
+            command.prefab_attach_instance = *a;
+        }
+        if (arguments.contains("path")) {
+            const auto path = get_string(arguments, "path");
+            if (!path || (!path->empty() && !valid_prefab_asset_path(*path)) ||
+                !copy_command_text(*path, command.text, error, "path")) {
+                if (error.empty()) {
+                    error = "path must be a sandboxed relative .vcrprefab.json path";
+                }
+                return false;
+            }
+        }
+        return true;
+    }
+    if (name == "editor.prefab.instantiate") {
+        if (!only_keys(arguments, {
+                "path", "parent", "root_name", "translation",
+                "rotation_degrees", "scale", "overrides"}) ||
+            !arguments.contains("path")) {
+            error = "prefab.instantiate requires path and known instantiate options";
+            return false;
+        }
+        const auto path = get_string(arguments, "path");
+        if (!path || !valid_prefab_asset_path(*path) ||
+            !copy_command_text(*path, command.text, error, "path") ||
+            !parse_optional_parent(arguments, command, false, error)) {
+            if (error.empty()) {
+                error = "path must be a sandboxed relative .vcrprefab.json path";
+            }
+            return false;
+        }
+        if (arguments.contains("root_name")) {
+            const auto root_name = get_string(arguments, "root_name");
+            if (!root_name || root_name->empty() ||
+                !copy_command_text(*root_name, command.name, error, "root_name")) {
+                if (error.empty()) {
+                    error = "root_name must be a non-empty bounded string";
+                }
+                return false;
+            }
+            command.edit_mask |= McpCommand::edit_name;
+        }
+        if (arguments.contains("translation")) {
+            if (!parse_vec3(arguments, "translation", command.transform.translation)) {
+                error = "translation must contain three finite numbers";
+                return false;
+            }
+            command.edit_mask |= McpCommand::edit_translation;
+        }
+        if (arguments.contains("rotation_degrees")) {
+            if (!parse_vec3(
+                    arguments, "rotation_degrees", command.transform.rotation_degrees)) {
+                error = "rotation_degrees must contain three finite numbers";
+                return false;
+            }
+            command.edit_mask |= McpCommand::edit_rotation;
+        }
+        if (arguments.contains("scale")) {
+            if (!parse_vec3(arguments, "scale", command.transform.scale) ||
+                command.transform.scale.x < 0.0001F ||
+                command.transform.scale.y < 0.0001F ||
+                command.transform.scale.z < 0.0001F) {
+                error = "scale must contain three finite values >= 0.0001";
+                return false;
+            }
+            command.edit_mask |= McpCommand::edit_scale;
+        }
+        if (arguments.contains("overrides")) {
+            if (!validate_prefab_overrides(arguments["overrides"], error)) {
+                return false;
+            }
+            if (!arguments["overrides"].empty() &&
+                !copy_command_text(
+                    arguments["overrides"].dump(),
+                    command.secondary_text,
+                    error,
+                    "overrides")) {
+                return false;
+            }
+        }
+        command.type = McpCommandType::editor_prefab_instantiate;
+        return true;
+    }
+    if (name == "editor.prefab.unpack") {
+        if (arguments.size() != 1U || !arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "id must be the only argument and contain index/generation";
+            return false;
+        }
+        command.type = McpCommandType::editor_prefab_unpack;
         return true;
     }
     if (name == "editor.scene.get_node" ||

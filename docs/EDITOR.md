@@ -110,7 +110,7 @@ performance benchmark используется изолированный `vulka
 - `Scene Hierarchy`: иерархический forest с generational handles,
   работающими chevrons, `Expand all`/`Collapse all`, drag-and-drop reparenting,
   защитой от циклов, фильтром и clipped-отрисовкой.
-- `Inspector`: имя, персистентный `UUID` (с кнопкой копирования), visibility и position/rotation/scale для всех nodes; компонент `Collision` (`Auto Bounds`/`Box`/`Sphere`/`Capsule`, `Trigger`, offset, размеры, слои) с 3D wireframe-отображением в `Scene View`;
+- `Inspector`: имя, персистентный `UUID` (с кнопкой копирования), visibility и position/rotation/scale для всех nodes; секция `Prefab` (сохранение выбранного поддерева в `*.vcrprefab.json`, индикация инстанса префаба и распаковка через `Unpack Prefab`); компонент `Collision` (`Auto Bounds`/`Box`/`Sphere`/`Capsule`/`Convex Hull`/`Triangle Mesh`, `Trigger`, offset, размеры, слои) с 3D wireframe-отображением (включая cooked hull/mesh/compound boxes) в `Scene View`; компонент `Rigid Body` (`Dynamic`/`Kinematic`, масса, линейное/угловое затухание, трение, упругость, гравитация, фиксация вращения, старт во сне);
   asset path для model
   nodes; PBR base color, metallic, roughness и ambient occlusion для
   cubes/ground. Terrain, sky и sun visibility уже
@@ -148,11 +148,11 @@ performance benchmark используется изолированный `vulka
   внешний drag-and-drop в `Assets`. Model cook создаёт versioned mesh,
   model manifest, отдельные material/texture assets и сохраняет source.
   Публикация транзакционная и не заменяет существующий asset.
-- `Add to Scene`: model manifest добавляется кнопкой, двойным кликом,
+- `Add to Scene`: model manifest (`*.vcrasset.json`) и префабы (`*.vcrprefab.json`) добавляются кнопкой, двойным кликом,
   context menu или drag-and-drop на `Scene View`. Renderer безопасно проверяет
   cooked данные, загружает immutable GPU buffers и группирует одинаковые
   model/submesh instances. Начальный transform явно центрирует model на земле
-  у камеры и равномерно вписывает его в размер 3 world units.
+  у камеры и равномерно вписывает его в размер 3 world units, а префаб создаёт новое поддерево со свежими `SceneUuid` и сохранёнными компонентами.
 - `Material Editor`: отдельное dockable окно открывает импортированные
   `*.vcrmaterial.json`, редактирует PBR factors и сохраняет complete temporary
   file перед атомарной заменой.
@@ -198,8 +198,7 @@ Resize viewport coalesced с задержкой 140 ms и ограничен `38
 
 ## Осознанные ограничения текущего этапа
 
-- Play имеет корректную границу authoring/runtime snapshot, но gameplay
-  scripting, physics и runtime component systems в renderer пока отсутствуют.
+- Play имеет корректную границу authoring/runtime snapshot, статические/cooked коллизии (`CollisionWorld`), капсульный `CharacterController` и фиксированный 3D-солвер твёрдых тел (`PhysicsWorld`), но полноценный gameplay scripting и скелетная анимация пока отсутствуют.
 - Отдельное окно — окно текущего процесса с зеркалом одной camera, не отдельный
   процесс и не независимо отрендеренная game camera. Main window сейчас
   present-ится до secondary viewport, поэтому FIFO на main window может
@@ -224,9 +223,9 @@ Resize viewport coalesced с задержкой 140 ms и ограничен `38
   set. Cooked UV/tangent передаются в dedicated direct/AA model pipelines.
   Подробности:
   [ASSET_IMPORT.md](ASSET_IMPORT.md).
-- Save/Open уже сохраняет иерархию и authored properties. Undo/Redo использует
+- Save/Open уже сохраняет иерархию, компоненты и authored properties. Undo/Redo использует
   bounded full-scene snapshots; для очень больших сцен следующий этап — delta
-  history с byte budget. Save As, prefabs, component inspector и произвольный
+  history с byte budget. Save As, произвольный
   node graph и multi-selection ещё не реализованы.
   Текущая иерархия намеренно остаётся tree/forest, чтобы ownership и transform
   propagation были однозначными. Context-menu Delete требует подтверждения,

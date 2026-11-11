@@ -851,6 +851,50 @@ int main() {
     const auto empty_lods = vcr::load_cooked_model_asset(asset_root, authored.metadata_relative);
     expect(empty_lods && empty_lods->lods.empty(), "empty authored list preserves automatic LOD fallback");
 
+    // Verify legacy synthesized collision + authored collision metadata:
+    expect(
+        loaded &&
+            !loaded->collision.authored_in_metadata &&
+            !loaded->collision.submesh_boxes.empty() &&
+            !loaded->collision.convex_hull_vertices.empty() &&
+            loaded->collision.triangle_positions.size() == 3U &&
+            loaded->collision.triangle_indices.size() == 3U,
+        "legacy cooked models synthesize local_bounds, submesh boxes, convex hull, and triangle proxy");
+
+    auto coll_fixture = create_fixture(asset_root, "authored_collision");
+    coll_fixture.metadata["collision"] = Json{
+        {"local_bounds", Json{{"center", {0.25F, 0.5F, -0.25F}}, {"half_extents", {1.5F, 2.0F, 1.0F}}}},
+        {"boxes", Json::array({
+            Json{{"center", {0.0F, 0.5F, 0.0F}}, {"half_extents", {0.75F, 1.0F, 0.5F}}},
+        })},
+        {"convex_hull_vertices", Json::array({
+            {-1.0F, 0.0F, -1.0F},
+            {1.0F, 0.0F, -1.0F},
+            {0.0F, 2.0F, 0.0F},
+            {0.0F, 0.0F, 1.0F},
+        })},
+    };
+    expect(
+        write_json(coll_fixture.metadata_absolute, coll_fixture.metadata),
+        "authored collision metadata written");
+    const auto coll_loaded = vcr::load_cooked_model_asset(
+        asset_root, coll_fixture.metadata_relative);
+    expect(
+        coll_loaded &&
+            coll_loaded->collision.authored_in_metadata &&
+            coll_loaded->collision.local_bounds.half_extents[1] == 2.0F &&
+            coll_loaded->collision.submesh_boxes.size() == 1U &&
+            coll_loaded->collision.convex_hull_vertices.size() == 4U,
+        "authored collision metadata loads exact bounds, boxes, and convex hull");
+
+    coll_fixture.metadata["collision"]["convex_hull_vertices"] = Json::array();
+    expect(
+        write_json(coll_fixture.metadata_absolute, coll_fixture.metadata) &&
+            has_error(
+                vcr::load_cooked_model_asset(asset_root, coll_fixture.metadata_relative),
+                CookedModelLoadErrorCode::limit_exceeded),
+        "empty authored convex_hull_vertices array is rejected");
+
     if (failures != 0) {
         std::cerr << failures << " cooked model test(s) failed\n";
         return 1;

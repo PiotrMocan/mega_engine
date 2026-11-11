@@ -14,6 +14,7 @@ enum class AssetEntryKind : std::uint8_t {
     directory,
     model,
     material,
+    prefab,
     image,
     shader,
     scene,

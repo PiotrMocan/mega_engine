@@ -1,5 +1,6 @@
 #include "gameplay.hpp"
 #include "collision.hpp"
+#include "physics_world.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -462,6 +463,28 @@ void CharacterController::update(
     }
 }
 
+void CharacterController::apply_external_resolution(
+    const glm::vec3 resolved_feet,
+    const bool grounded_on_body,
+    const bool hit_ceiling_on_body) noexcept {
+    if (finite(resolved_feet)) {
+        position_ = resolved_feet;
+    }
+    if (hit_ceiling_on_body && vertical_velocity_ > 0.0F) {
+        vertical_velocity_ = 0.0F;
+    }
+    if (grounded_on_body && vertical_velocity_ <= 0.0F) {
+        vertical_velocity_ = 0.0F;
+        grounded_ = true;
+    }
+    constexpr float abyss_floor = -500.0F;
+    if (position_.y < abyss_floor) {
+        position_.y = abyss_floor;
+        vertical_velocity_ = 0.0F;
+        grounded_ = true;
+    }
+}
+
 ThirdPersonCamera::ThirdPersonCamera(ThirdPersonCameraConfig config) noexcept
     : config_(config) {
     config_.distance = positive_or(config_.distance, 6.0F);
@@ -568,6 +591,47 @@ glm::vec3 ThirdPersonCamera::position(
         arm_distance = std::min(
             arm_distance,
             std::max(pulled, std::min(config_.minimum_distance, hit->distance * 0.85F)));
+        arm_distance = std::max(arm_distance, 0.1F);
+    }
+    return target + arm_dir * arm_distance;
+}
+
+glm::vec3 ThirdPersonCamera::position(
+    const glm::vec3 character_feet,
+    const CollisionWorld& world,
+    const PhysicsWorld& physics_world,
+    const std::uint32_t layer_mask) const noexcept {
+    if (!finite(character_feet)) {
+        return {};
+    }
+    if (world.empty() && physics_world.empty()) {
+        return position(character_feet);
+    }
+    const glm::vec3 target = character_feet +
+        glm::vec3(0.0F, config_.target_height, 0.0F);
+    const glm::vec3 arm_dir = -forward();
+    const float max_probe = config_.distance + config_.collision_probe_radius;
+    std::optional<RaycastHit> best_hit =
+        world.empty()
+            ? std::nullopt
+            : world.raycast(target, arm_dir, max_probe, layer_mask, false);
+    if (!physics_world.empty()) {
+        if (const auto dyn_hit =
+                physics_world.raycast(target, arm_dir, max_probe, layer_mask)) {
+            if (!best_hit || dyn_hit->distance < best_hit->distance) {
+                best_hit = dyn_hit;
+            }
+        }
+    }
+    float arm_distance = config_.distance;
+    if (best_hit) {
+        const float pulled =
+            best_hit->distance - config_.collision_probe_radius;
+        arm_distance = std::min(
+            arm_distance,
+            std::max(
+                pulled,
+                std::min(config_.minimum_distance, best_hit->distance * 0.85F)));
         arm_distance = std::max(arm_distance, 0.1F);
     }
     return target + arm_dir * arm_distance;

@@ -2,6 +2,7 @@
 
 #include "asset_browser.hpp"
 #include "cooked_model_asset.hpp"
+#include "prefab_io.hpp"
 #include "editor_ui_kit.hpp"
 #include "fly_camera.hpp"
 #include "performance_metrics.hpp"
@@ -173,6 +174,22 @@ public:
         return import_activity_pending();
     }
     [[nodiscard]] std::string_view asset_import_status() const noexcept;
+    void refresh_asset_browser() noexcept;
+    [[nodiscard]] bool save_node_as_prefab(
+        SceneDocument& scene,
+        SceneNodeId root_id,
+        std::string_view custom_relative_path,
+        bool zero_root_translation,
+        bool attach_instance,
+        std::string& saved_relative_path,
+        std::string& error);
+    [[nodiscard]] bool instantiate_prefab_in_scene(
+        SceneDocument& scene,
+        Renderer& renderer,
+        std::string_view relative_path,
+        const PrefabInstantiateOptions& options,
+        PrefabInstantiateResult& result,
+        std::string& error);
     [[nodiscard]] bool inspect_material(
         const std::filesystem::path& relative_path,
         MaterialEditorSnapshot& snapshot,

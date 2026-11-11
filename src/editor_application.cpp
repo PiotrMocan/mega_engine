@@ -2,6 +2,7 @@
 
 #include "asset_browser.hpp"
 #include "editor_scene_tools.hpp"
+#include "prefab_io.hpp"
 #include "runtime_assets.hpp"
 #include "scene_io.hpp"
 #include "vulkan_common.hpp"
@@ -141,6 +142,32 @@ using Json = nlohmann::json;
     } else {
         result["collider"] = nullptr;
     }
+    if (const auto rb = scene.rigid_body(id)) {
+        const RigidBodyComponent& r = rb->get();
+        result["rigid_body"] = Json{
+            {"enabled", r.enabled},
+            {"motion_type", to_token(r.motion_type)},
+            {"mass", r.mass},
+            {"gravity_scale", r.gravity_scale},
+            {"linear_damping", r.linear_damping},
+            {"angular_damping", r.angular_damping},
+            {"lock_rotation", r.lock_rotation},
+            {"friction", r.friction},
+            {"restitution", r.restitution},
+        };
+    } else {
+        result["rigid_body"] = nullptr;
+    }
+    if (const auto prefab = scene.prefab_instance(id)) {
+        const PrefabInstanceComponent& p = prefab->get();
+        result["prefab_instance"] = Json{
+            {"prefab_path", std::string(p.path_view())},
+            {"source_node_uuid", format_scene_uuid(p.source_node_uuid)},
+            {"is_prefab_root", p.is_prefab_root},
+        };
+    } else {
+        result["prefab_instance"] = nullptr;
+    }
     if (depth) {
         result["depth"] = *depth;
     }
@@ -234,6 +261,118 @@ void apply_light_patch(
         light.inner_cone_degrees = command.light.inner_cone_degrees;
     if ((command.edit_mask & McpCommand::edit_spot_outer) != 0U)
         light.outer_cone_degrees = command.light.outer_cone_degrees;
+}
+
+[[nodiscard]] bool decode_mcp_prefab_overrides(
+    const std::string_view json_text,
+    std::vector<PrefabNodeOverride>& overrides,
+    std::string& error) {
+    overrides.clear();
+    if (json_text.empty()) {
+        return true;
+    }
+    const Json parsed = Json::parse(json_text, nullptr, false);
+    if (parsed.is_discarded() || !parsed.is_array()) {
+        error = "invalid prefab overrides payload";
+        return false;
+    }
+    overrides.reserve(parsed.size());
+    const auto read_vec3 = [](const Json& arr) noexcept {
+        return glm::vec3{
+            arr[0].get<float>(),
+            arr[1].get<float>(),
+            arr[2].get<float>(),
+        };
+    };
+    for (const auto& entry : parsed) {
+        PrefabNodeOverride ov{};
+        if (entry.contains("source_node_uuid")) {
+            ov.source_node_uuid = parse_scene_uuid(
+                entry["source_node_uuid"].get<std::string_view>());
+        }
+        if (entry.contains("node_index")) {
+            ov.node_index = entry["node_index"].get<std::uint32_t>();
+        }
+        if (entry.contains("name")) {
+            ov.name = entry["name"].get<std::string>();
+        }
+        if (entry.contains("visible")) {
+            ov.visible = entry["visible"].get<bool>();
+        }
+        if (entry.contains("translation")) {
+            ov.translation = read_vec3(entry["translation"]);
+        }
+        if (entry.contains("rotation_degrees")) {
+            ov.rotation_degrees = read_vec3(entry["rotation_degrees"]);
+        }
+        if (entry.contains("scale")) {
+            ov.scale = read_vec3(entry["scale"]);
+        }
+        if (entry.contains("base_color") ||
+            entry.contains("metallic") ||
+            entry.contains("roughness") ||
+            entry.contains("ambient_occlusion")) {
+            PbrMaterial mat{};
+            if (entry.contains("base_color")) {
+                const auto& c = entry["base_color"];
+                mat.base_color = glm::vec4{
+                    c[0].get<float>(),
+                    c[1].get<float>(),
+                    c[2].get<float>(),
+                    c[3].get<float>(),
+                };
+            }
+            if (entry.contains("metallic")) {
+                mat.metallic = entry["metallic"].get<float>();
+            }
+            if (entry.contains("roughness")) {
+                mat.roughness = entry["roughness"].get<float>();
+            }
+            if (entry.contains("ambient_occlusion")) {
+                mat.ambient_occlusion = entry["ambient_occlusion"].get<float>();
+            }
+            ov.material = mat;
+        }
+        if (entry.contains("collider")) {
+            const auto& c = entry["collider"];
+            ColliderComponent col{};
+            if (c.contains("enabled")) col.enabled = c["enabled"].get<bool>();
+            if (c.contains("is_trigger")) col.is_trigger = c["is_trigger"].get<bool>();
+            if (c.contains("shape")) {
+                if (const auto s = parse_collider_shape(c["shape"].get<std::string_view>())) {
+                    col.shape = *s;
+                }
+            }
+            if (c.contains("center_offset")) col.center_offset = read_vec3(c["center_offset"]);
+            if (c.contains("half_extents")) col.half_extents = read_vec3(c["half_extents"]);
+            if (c.contains("radius")) col.radius = c["radius"].get<float>();
+            if (c.contains("half_height")) col.half_height = c["half_height"].get<float>();
+            if (c.contains("collision_layer")) col.collision_layer = c["collision_layer"].get<std::uint32_t>();
+            if (c.contains("collision_mask")) col.collision_mask = c["collision_mask"].get<std::uint32_t>();
+            ov.collider = col;
+        }
+        if (entry.contains("rigid_body")) {
+            const auto& r = entry["rigid_body"];
+            RigidBodyComponent rb{};
+            if (r.contains("enabled")) rb.enabled = r["enabled"].get<bool>();
+            if (r.contains("motion_type")) {
+                if (const auto m = parse_rigid_body_motion_type(
+                        r["motion_type"].get<std::string_view>())) {
+                    rb.motion_type = *m;
+                }
+            }
+            if (r.contains("mass")) rb.mass = r["mass"].get<float>();
+            if (r.contains("gravity_scale")) rb.gravity_scale = r["gravity_scale"].get<float>();
+            if (r.contains("linear_damping")) rb.linear_damping = r["linear_damping"].get<float>();
+            if (r.contains("angular_damping")) rb.angular_damping = r["angular_damping"].get<float>();
+            if (r.contains("lock_rotation")) rb.lock_rotation = r["lock_rotation"].get<bool>();
+            if (r.contains("friction")) rb.friction = r["friction"].get<float>();
+            if (r.contains("restitution")) rb.restitution = r["restitution"].get<float>();
+            ov.rigid_body = rb;
+        }
+        overrides.push_back(std::move(ov));
+    }
+    return true;
 }
 
 } // namespace
@@ -634,6 +773,8 @@ void EditorApplication::execute_mcp_command(
                 {"mode", play_state},
                 {"node_count", scene_.size()},
                 {"collider_count", scene_.colliders().size()},
+                {"rigid_body_count", scene_.rigid_bodies().size()},
+                {"prefab_instance_count", scene_.prefab_instances().size()},
                 {"local_light_count", scene_.local_light_count()},
                 {"local_light_backend_requested",
                  to_token(renderer_.local_light_backend())},
@@ -878,6 +1019,175 @@ void EditorApplication::execute_mcp_command(
             Json{{"node", scene_node_json(scene_, command.node_id)},
                  {"changed", true}});
         return;
+    case McpCommandType::editor_set_rigid_body: {
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!valid_rigid_body_component(command.rigid_body)) {
+            fail("rigid_body component values are outside engine bounds");
+            return;
+        }
+        if (const auto existing = scene_.rigid_body(command.node_id);
+            existing && existing->get() == command.rigid_body) {
+            succeed(
+                "rigid_body component already matches",
+                Json{{"node", scene_node_json(scene_, command.node_id)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        if (!scene_.set_rigid_body(command.node_id, command.rigid_body)) {
+            fail("unable to attach rigid_body component");
+            return;
+        }
+        succeed(
+            "rigid_body component updated",
+            Json{{"node", scene_node_json(scene_, command.node_id)},
+                 {"changed", true}});
+        return;
+    }
+    case McpCommandType::editor_remove_rigid_body:
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!scene_.has_rigid_body(command.node_id)) {
+            succeed(
+                "node has no rigid_body component",
+                Json{{"node", scene_node_json(scene_, command.node_id)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        static_cast<void>(scene_.remove_rigid_body(command.node_id));
+        succeed(
+            "rigid_body component removed",
+            Json{{"node", scene_node_json(scene_, command.node_id)},
+                 {"changed", true}});
+        return;
+    case McpCommandType::editor_prefab_save: {
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        std::string saved_path;
+        std::string error;
+        if (!ui_.save_node_as_prefab(
+                scene_,
+                command.node_id,
+                command.text.data(),
+                command.enabled,
+                command.prefab_attach_instance,
+                saved_path,
+                error)) {
+            fail(error);
+            return;
+        }
+        succeed(
+            "prefab saved",
+            Json{
+                {"path", saved_path},
+                {"root", scene_node_json(scene_, command.node_id)},
+                {"attached_instance", command.prefab_attach_instance},
+            });
+        return;
+    }
+    case McpCommandType::editor_prefab_instantiate: {
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!valid_parent()) {
+            fail("parent node handle is stale or invalid");
+            return;
+        }
+        std::vector<PrefabNodeOverride> overrides;
+        std::string error;
+        if (!decode_mcp_prefab_overrides(
+                command.secondary_text.data(), overrides, error)) {
+            fail(error);
+            return;
+        }
+        PrefabInstantiateOptions options{
+            .parent = command.parent_supplied ? command.parent_id : SceneNodeId{},
+            .overrides = overrides,
+        };
+        if ((command.edit_mask & McpCommand::edit_name) != 0U) {
+            options.root_name = std::string(command.name.data());
+        }
+        if ((command.edit_mask & McpCommand::edit_translation) != 0U) {
+            options.root_translation = command.transform.translation;
+        }
+        if ((command.edit_mask & McpCommand::edit_rotation) != 0U) {
+            options.root_rotation_degrees = command.transform.rotation_degrees;
+        }
+        if ((command.edit_mask & McpCommand::edit_scale) != 0U) {
+            options.root_scale = command.transform.scale;
+        }
+        PrefabInstantiateResult inst_result{};
+        if (!ui_.instantiate_prefab_in_scene(
+                scene_,
+                renderer_,
+                command.text.data(),
+                options,
+                inst_result,
+                error)) {
+            fail(error);
+            return;
+        }
+        succeed(
+            "prefab instantiated",
+            Json{
+                {"path", std::string(command.text.data())},
+                {"instantiated_nodes", inst_result.instantiated_nodes},
+                {"root", scene_node_json(scene_, inst_result.root_id)},
+            });
+        return;
+    }
+    case McpCommandType::editor_prefab_unpack: {
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        const SceneNodeId prefab_root =
+            scene_.enclosing_prefab_root(command.node_id);
+        if (!prefab_root) {
+            succeed(
+                "node is not part of a prefab instance",
+                Json{{"node", scene_node_json(scene_, command.node_id)},
+                     {"unpacked_nodes", 0U},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        const std::uint32_t unpacked =
+            scene_.unpack_prefab_instance(prefab_root);
+        succeed(
+            "prefab instance unpacked",
+            Json{
+                {"root", scene_node_json(scene_, prefab_root)},
+                {"unpacked_nodes", unpacked},
+                {"changed", unpacked > 0U},
+            });
+        return;
+    }
     case McpCommandType::editor_get_node:
         if (!scene_.valid(command.node_id)) {
             fail("scene node handle is stale or invalid");

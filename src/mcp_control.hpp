@@ -52,6 +52,11 @@ enum class McpCommandType : std::uint8_t {
     editor_find_by_uuid,
     editor_set_collider,
     editor_remove_collider,
+    editor_set_rigid_body,
+    editor_remove_rigid_body,
+    editor_prefab_save,
+    editor_prefab_instantiate,
+    editor_prefab_unpack,
     editor_create_node,
     editor_update_node,
     editor_delete_node,
@@ -157,6 +162,8 @@ struct McpCommand {
     SceneNodeId parent_id{};
     SceneUuid node_uuid{};
     ColliderComponent collider{};
+    RigidBodyComponent rigid_body{};
+    bool prefab_attach_instance = true;
     SceneNodeKind node_kind = SceneNodeKind::folder;
     SceneTransform transform{};
     PbrMaterial material{};

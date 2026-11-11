@@ -68,6 +68,9 @@ struct CookedModelMaterial {
     std::optional<std::filesystem::path> metallic_roughness_texture{};
     std::optional<std::filesystem::path> displacement_texture{};
     MaterialTessellation tessellation{};
+    // Bits 0/1 select alpha masking/two-sided shading; high 16 bits hold cutoff.
+    // Matches the per-draw fragment push constant without changing instance ABI.
+    std::uint32_t coverage = 0U;
 };
 
 struct CookedModelLodReference {
@@ -75,6 +78,24 @@ struct CookedModelLodReference {
     std::filesystem::path model{};
     // Conservative deviation from LOD0 in model-local units, including removals.
     float geometric_error = 0;
+};
+
+inline constexpr std::size_t maximum_cooked_collision_boxes = 64U;
+inline constexpr std::size_t maximum_cooked_convex_hull_vertices = 64U;
+inline constexpr std::size_t maximum_cooked_collision_triangles = 16'384U;
+
+struct CookedCollisionBox {
+    std::array<float, 3U> center{};
+    std::array<float, 3U> half_extents{0.5F, 0.5F, 0.5F};
+};
+
+struct CookedModelCollision {
+    CookedCollisionBox local_bounds{};
+    std::vector<CookedCollisionBox> submesh_boxes{};
+    std::vector<std::array<float, 3U>> convex_hull_vertices{};
+    std::vector<std::array<float, 3U>> triangle_positions{};
+    std::vector<std::uint32_t> triangle_indices{};
+    bool authored_in_metadata = false;
 };
 
 struct CookedModelAsset {
@@ -85,6 +106,7 @@ struct CookedModelAsset {
     std::vector<CookedModelSubmesh> submeshes{};
     std::vector<CookedModelMaterial> materials{};
     std::vector<CookedModelLodReference> lods{};
+    CookedModelCollision collision{};
 };
 
 enum class CookedModelLoadErrorCode : std::uint8_t {

@@ -849,6 +849,34 @@ parse_material(
             .path = file.absolute,
         };
     }
+    std::uint32_t coverage = 0U;
+    if (const auto mode = metadata.find("alpha_mode"); mode != metadata.end()) {
+        if (!mode->is_string() || (*mode != "opaque" && *mode != "mask")) {
+            return CookedModelLoadError{.code = CookedModelLoadErrorCode::invalid_material,
+                .message = "Material alpha_mode must be opaque or mask.", .path = file.absolute};
+        }
+        coverage = *mode == "mask" ? 1U : 0U;
+    }
+    float alpha_cutoff = 0.5F;
+    if (metadata.contains("alpha_cutoff") &&
+        !json_float_in_range(metadata, "alpha_cutoff", 0.0F, 1.0F, alpha_cutoff)) {
+        return CookedModelLoadError{.code = CookedModelLoadErrorCode::invalid_material,
+            .message = "Material alpha_cutoff must be finite and inside [0, 1].", .path = file.absolute};
+    }
+    if (const auto two_sided = metadata.find("double_sided"); two_sided != metadata.end()) {
+        if (!two_sided->is_boolean()) {
+            return CookedModelLoadError{.code = CookedModelLoadErrorCode::invalid_material,
+                .message = "Material double_sided must be boolean.", .path = file.absolute};
+        }
+        if (two_sided->get<bool>()) coverage |= 2U;
+    }
+    if ((coverage & 1U) != 0U) {
+        coverage |= static_cast<std::uint32_t>(std::lround(alpha_cutoff * 65535.0F)) << 16U;
+        if (tessellation.enabled()) {
+            return CookedModelLoadError{.code = CookedModelLoadErrorCode::invalid_material,
+                .message = "Alpha-masked tessellation is not supported.", .path = file.absolute};
+        }
+    }
     output = CookedModelMaterial{
         .relative_path = file.relative,
         .name = std::move(name),
@@ -858,6 +886,7 @@ parse_material(
         .metallic_roughness_texture = std::move(metallic_roughness_texture),
         .displacement_texture = std::move(displacement_texture),
         .tessellation = tessellation,
+        .coverage = coverage,
     };
     return std::nullopt;
 }
@@ -1033,6 +1062,282 @@ parse_mesh(
             .path = file.absolute,
         };
     }
+    return std::nullopt;
+}
+
+constexpr std::array<std::array<float, 3U>, 42U> hull_sample_directions{{
+    {{1.0F, 0.0F, 0.0F}},   {{-1.0F, 0.0F, 0.0F}},  {{0.0F, 1.0F, 0.0F}},
+    {{0.0F, -1.0F, 0.0F}},  {{0.0F, 0.0F, 1.0F}},   {{0.0F, 0.0F, -1.0F}},
+    {{1.0F, 1.0F, 0.0F}},   {{1.0F, -1.0F, 0.0F}},  {{-1.0F, 1.0F, 0.0F}},
+    {{-1.0F, -1.0F, 0.0F}}, {{1.0F, 0.0F, 1.0F}},   {{1.0F, 0.0F, -1.0F}},
+    {{-1.0F, 0.0F, 1.0F}},  {{-1.0F, 0.0F, -1.0F}}, {{0.0F, 1.0F, 1.0F}},
+    {{0.0F, 1.0F, -1.0F}},  {{0.0F, -1.0F, 1.0F}},  {{0.0F, -1.0F, -1.0F}},
+    {{1.0F, 1.0F, 1.0F}},   {{1.0F, 1.0F, -1.0F}},  {{1.0F, -1.0F, 1.0F}},
+    {{1.0F, -1.0F, -1.0F}}, {{-1.0F, 1.0F, 1.0F}},  {{-1.0F, 1.0F, -1.0F}},
+    {{-1.0F, -1.0F, 1.0F}}, {{-1.0F, -1.0F, -1.0F}},
+    {{2.0F, 1.0F, 0.0F}},   {{-2.0F, 1.0F, 0.0F}},  {{2.0F, -1.0F, 0.0F}},
+    {{-2.0F, -1.0F, 0.0F}}, {{0.0F, 2.0F, 1.0F}},   {{0.0F, -2.0F, 1.0F}},
+    {{0.0F, 2.0F, -1.0F}},  {{0.0F, -2.0F, -1.0F}}, {{1.0F, 0.0F, 2.0F}},
+    {{-1.0F, 0.0F, 2.0F}},  {{1.0F, 0.0F, -2.0F}},  {{-1.0F, 0.0F, -2.0F}},
+    {{2.0F, 1.0F, 1.0F}},   {{-2.0F, 1.0F, 1.0F}},  {{1.0F, 2.0F, 1.0F}},
+    {{1.0F, 1.0F, 2.0F}},
+}};
+
+[[nodiscard]] bool read_vec3_json(
+    const Json& node,
+    std::array<float, 3U>& out) {
+    if (!node.is_array() || node.size() != 3U) {
+        return false;
+    }
+    for (std::size_t idx = 0U; idx < 3U; ++idx) {
+        if (!node[idx].is_number()) {
+            return false;
+        }
+        const double v = node[idx].get<double>();
+        if (!std::isfinite(v) ||
+            v < -static_cast<double>(std::numeric_limits<float>::max()) ||
+            v > static_cast<double>(std::numeric_limits<float>::max())) {
+            return false;
+        }
+        out[idx] = static_cast<float>(v);
+    }
+    return true;
+}
+
+[[nodiscard]] bool read_collision_box_json(
+    const Json& node,
+    CookedCollisionBox& out) {
+    if (!node.is_object() ||
+        !node.contains("center") ||
+        !node.contains("half_extents")) {
+        return false;
+    }
+    if (!read_vec3_json(node["center"], out.center) ||
+        !read_vec3_json(node["half_extents"], out.half_extents)) {
+        return false;
+    }
+    return out.half_extents[0] >= 0.0005F &&
+           out.half_extents[1] >= 0.0005F &&
+           out.half_extents[2] >= 0.0005F;
+}
+
+void build_triangle_collision_proxy(CookedModelAsset& asset) {
+    const std::size_t total_triangles = asset.indices.size() / 3U;
+    if (total_triangles == 0U || asset.vertices.empty()) {
+        return;
+    }
+    const std::size_t target_triangles =
+        std::min(total_triangles, maximum_cooked_collision_triangles);
+    asset.collision.triangle_positions.clear();
+    asset.collision.triangle_indices.clear();
+    asset.collision.triangle_indices.reserve(target_triangles * 3U);
+
+    if (total_triangles <= maximum_cooked_collision_triangles) {
+        asset.collision.triangle_positions.reserve(asset.vertices.size());
+        for (const CookedModelVertex& v : asset.vertices) {
+            asset.collision.triangle_positions.push_back(v.position);
+        }
+        asset.collision.triangle_indices.assign(
+            asset.indices.begin(),
+            asset.indices.begin() +
+                static_cast<std::ptrdiff_t>(target_triangles * 3U));
+        return;
+    }
+
+    std::vector<std::uint32_t> remap(asset.vertices.size(), UINT32_MAX);
+    asset.collision.triangle_positions.reserve(
+        std::min(asset.vertices.size(), target_triangles * 3U));
+    for (std::size_t t = 0U; t < target_triangles; ++t) {
+        const std::size_t src_tri =
+            (t * total_triangles) / target_triangles;
+        for (std::size_t corner = 0U; corner < 3U; ++corner) {
+            const std::uint32_t old_idx =
+                asset.indices[src_tri * 3U + corner];
+            if (remap[old_idx] == UINT32_MAX) {
+                remap[old_idx] = static_cast<std::uint32_t>(
+                    asset.collision.triangle_positions.size());
+                asset.collision.triangle_positions.push_back(
+                    asset.vertices[old_idx].position);
+            }
+            asset.collision.triangle_indices.push_back(remap[old_idx]);
+        }
+    }
+}
+
+void synthesize_collision_geometry(CookedModelAsset& asset) {
+    if (asset.vertices.empty()) {
+        return;
+    }
+    std::array<float, 3U> min_pt = asset.vertices.front().position;
+    std::array<float, 3U> max_pt = min_pt;
+    for (const CookedModelVertex& v : asset.vertices) {
+        for (std::size_t axis = 0U; axis < 3U; ++axis) {
+            min_pt[axis] = std::min(min_pt[axis], v.position[axis]);
+            max_pt[axis] = std::max(max_pt[axis], v.position[axis]);
+        }
+    }
+    for (std::size_t axis = 0U; axis < 3U; ++axis) {
+        asset.collision.local_bounds.center[axis] =
+            0.5F * (min_pt[axis] + max_pt[axis]);
+        asset.collision.local_bounds.half_extents[axis] =
+            std::max(0.5F * (max_pt[axis] - min_pt[axis]), 0.001F);
+    }
+
+    asset.collision.submesh_boxes.clear();
+    const std::size_t box_limit =
+        std::min(asset.submeshes.size(), maximum_cooked_collision_boxes);
+    asset.collision.submesh_boxes.reserve(box_limit);
+    for (std::size_t s = 0U; s < box_limit; ++s) {
+        const CookedModelSubmesh& sub = asset.submeshes[s];
+        if (sub.index_count == 0U) {
+            continue;
+        }
+        std::array<float, 3U> smin =
+            asset.vertices[asset.indices[static_cast<std::size_t>(sub.first_index)]]
+                .position;
+        std::array<float, 3U> smax = smin;
+        for (std::uint64_t idx = sub.first_index;
+             idx < sub.first_index + sub.index_count;
+             ++idx) {
+            const auto& p =
+                asset.vertices[asset.indices[static_cast<std::size_t>(idx)]]
+                    .position;
+            for (std::size_t axis = 0U; axis < 3U; ++axis) {
+                smin[axis] = std::min(smin[axis], p[axis]);
+                smax[axis] = std::max(smax[axis], p[axis]);
+            }
+        }
+        CookedCollisionBox box{};
+        for (std::size_t axis = 0U; axis < 3U; ++axis) {
+            box.center[axis] = 0.5F * (smin[axis] + smax[axis]);
+            box.half_extents[axis] =
+                std::max(0.5F * (smax[axis] - smin[axis]), 0.001F);
+        }
+        asset.collision.submesh_boxes.push_back(box);
+    }
+
+    asset.collision.convex_hull_vertices.clear();
+    asset.collision.convex_hull_vertices.reserve(hull_sample_directions.size());
+    for (const auto& dir : hull_sample_directions) {
+        float best_dot = -std::numeric_limits<float>::infinity();
+        std::array<float, 3U> best_pos = asset.vertices.front().position;
+        for (const CookedModelVertex& v : asset.vertices) {
+            const float d = dir[0] * v.position[0] +
+                            dir[1] * v.position[1] +
+                            dir[2] * v.position[2];
+            if (d > best_dot) {
+                best_dot = d;
+                best_pos = v.position;
+            }
+        }
+        const bool duplicate = std::ranges::any_of(
+            asset.collision.convex_hull_vertices,
+            [&](const std::array<float, 3U>& existing) noexcept {
+                const float dx = existing[0] - best_pos[0];
+                const float dy = existing[1] - best_pos[1];
+                const float dz = existing[2] - best_pos[2];
+                return (dx * dx + dy * dy + dz * dz) <= 1.0e-8F;
+            });
+        if (!duplicate &&
+            asset.collision.convex_hull_vertices.size() <
+                maximum_cooked_convex_hull_vertices) {
+            asset.collision.convex_hull_vertices.push_back(best_pos);
+        }
+    }
+}
+
+[[nodiscard]] std::optional<CookedModelLoadError> parse_collision_metadata(
+    const Json& metadata,
+    const std::filesystem::path& file_path,
+    CookedModelAsset& asset) {
+    const auto collision_it = metadata.find("collision");
+    if (collision_it == metadata.end()) {
+        synthesize_collision_geometry(asset);
+        build_triangle_collision_proxy(asset);
+        return std::nullopt;
+    }
+    if (!collision_it->is_object()) {
+        return CookedModelLoadError{
+            .code = CookedModelLoadErrorCode::invalid_json,
+            .message = "Model collision metadata must be an object.",
+            .path = file_path,
+        };
+    }
+    const Json& coll = *collision_it;
+    if (!coll.contains("local_bounds") ||
+        !read_collision_box_json(
+            coll["local_bounds"], asset.collision.local_bounds)) {
+        return CookedModelLoadError{
+            .code = CookedModelLoadErrorCode::invalid_json,
+            .message = "Model collision local_bounds is invalid.",
+            .path = file_path,
+        };
+    }
+    if (coll.contains("boxes")) {
+        if (!coll["boxes"].is_array() ||
+            coll["boxes"].size() > maximum_cooked_collision_boxes) {
+            return CookedModelLoadError{
+                .code = CookedModelLoadErrorCode::limit_exceeded,
+                .message =
+                    "Model collision boxes table is invalid or exceeds limit.",
+                .path = file_path,
+            };
+        }
+        asset.collision.submesh_boxes.reserve(coll["boxes"].size());
+        for (const Json& box_json : coll["boxes"]) {
+            CookedCollisionBox box{};
+            if (!read_collision_box_json(box_json, box)) {
+                return CookedModelLoadError{
+                    .code = CookedModelLoadErrorCode::invalid_json,
+                    .message = "Model collision box entry is invalid.",
+                    .path = file_path,
+                };
+            }
+            asset.collision.submesh_boxes.push_back(box);
+        }
+    }
+    if (coll.contains("convex_hull_vertices")) {
+        if (!coll["convex_hull_vertices"].is_array() ||
+            coll["convex_hull_vertices"].empty() ||
+            coll["convex_hull_vertices"].size() >
+                maximum_cooked_convex_hull_vertices) {
+            return CookedModelLoadError{
+                .code = CookedModelLoadErrorCode::limit_exceeded,
+                .message =
+                    "Model convex_hull_vertices is empty or exceeds limit.",
+                .path = file_path,
+            };
+        }
+        asset.collision.convex_hull_vertices.reserve(
+            coll["convex_hull_vertices"].size());
+        for (const Json& pt_json : coll["convex_hull_vertices"]) {
+            std::array<float, 3U> pt{};
+            if (!read_vec3_json(pt_json, pt)) {
+                return CookedModelLoadError{
+                    .code = CookedModelLoadErrorCode::invalid_json,
+                    .message = "Model convex_hull_vertices entry is invalid.",
+                    .path = file_path,
+                };
+            }
+            asset.collision.convex_hull_vertices.push_back(pt);
+        }
+    }
+    if (asset.collision.submesh_boxes.empty() ||
+        asset.collision.convex_hull_vertices.empty()) {
+        const CookedCollisionBox saved_bounds = asset.collision.local_bounds;
+        const auto saved_boxes = asset.collision.submesh_boxes;
+        const auto saved_hull = asset.collision.convex_hull_vertices;
+        synthesize_collision_geometry(asset);
+        asset.collision.local_bounds = saved_bounds;
+        if (!saved_boxes.empty()) {
+            asset.collision.submesh_boxes = saved_boxes;
+        }
+        if (!saved_hull.empty()) {
+            asset.collision.convex_hull_vertices = saved_hull;
+        }
+    }
+    asset.collision.authored_in_metadata = true;
+    build_triangle_collision_proxy(asset);
     return std::nullopt;
 }
 
@@ -1326,6 +1631,10 @@ CookedModelLoadResult load_cooked_model_asset(
             CookedModelLoadErrorCode::invalid_mesh,
             "Submeshes do not cover the complete index buffer.",
             model_file.absolute);
+    }
+    if (auto collision_error = parse_collision_metadata(
+            metadata, model_file.absolute, asset)) {
+        return CookedModelLoadResult(std::move(*collision_error));
     }
     return CookedModelLoadResult(std::move(asset));
 }

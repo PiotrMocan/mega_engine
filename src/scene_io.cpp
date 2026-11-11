@@ -322,6 +322,143 @@ template <typename T>
     return valid_collider_component(collider);
 }
 
+[[nodiscard]] Json rigid_body_json(const RigidBodyComponent& body) {
+    return Json{
+        {"enabled", body.enabled},
+        {"motion_type", to_token(body.motion_type)},
+        {"mass", body.mass},
+        {"linear_damping", body.linear_damping},
+        {"angular_damping", body.angular_damping},
+        {"restitution", body.restitution},
+        {"friction", body.friction},
+        {"gravity_scale", body.gravity_scale},
+        {"lock_rotation", body.lock_rotation},
+    };
+}
+
+[[nodiscard]] bool read_rigid_body(
+    const Json& source,
+    RigidBodyComponent& body) {
+    if (!source.is_object()) {
+        return false;
+    }
+    for (const auto& [key, _] : source.items()) {
+        if (key != "enabled" &&
+            key != "motion_type" &&
+            key != "mass" &&
+            key != "linear_damping" &&
+            key != "angular_damping" &&
+            key != "restitution" &&
+            key != "friction" &&
+            key != "gravity_scale" &&
+            key != "lock_rotation") {
+            return false;
+        }
+    }
+    if (source.contains("enabled")) {
+        if (!source["enabled"].is_boolean()) return false;
+        body.enabled = source["enabled"].get<bool>();
+    }
+    if (source.contains("lock_rotation")) {
+        if (!source["lock_rotation"].is_boolean()) return false;
+        body.lock_rotation = source["lock_rotation"].get<bool>();
+    }
+    if (source.contains("motion_type")) {
+        if (!source["motion_type"].is_string()) return false;
+        const auto motion = parse_rigid_body_motion_type(
+            source["motion_type"].get_ref<const std::string&>());
+        if (!motion) return false;
+        body.motion_type = *motion;
+    }
+    if (source.contains("mass") &&
+        !read_bounded_float(
+            source["mass"],
+            minimum_rigid_body_mass,
+            maximum_rigid_body_mass,
+            body.mass)) {
+        return false;
+    }
+    if (source.contains("linear_damping") &&
+        !read_bounded_float(
+            source["linear_damping"],
+            0.0F,
+            maximum_rigid_body_damping,
+            body.linear_damping)) {
+        return false;
+    }
+    if (source.contains("angular_damping") &&
+        !read_bounded_float(
+            source["angular_damping"],
+            0.0F,
+            maximum_rigid_body_damping,
+            body.angular_damping)) {
+        return false;
+    }
+    if (source.contains("restitution") &&
+        !read_bounded_float(
+            source["restitution"], 0.0F, 1.0F, body.restitution)) {
+        return false;
+    }
+    if (source.contains("friction") &&
+        !read_bounded_float(
+            source["friction"],
+            0.0F,
+            maximum_rigid_body_friction,
+            body.friction)) {
+        return false;
+    }
+    if (source.contains("gravity_scale") &&
+        !read_bounded_float(
+            source["gravity_scale"],
+            -maximum_rigid_body_gravity_scale,
+            maximum_rigid_body_gravity_scale,
+            body.gravity_scale)) {
+        return false;
+    }
+    return valid_rigid_body_component(body);
+}
+
+[[nodiscard]] Json prefab_instance_json(
+    const PrefabInstanceComponent& instance) {
+    return Json{
+        {"prefab_path", std::string(instance.path_view())},
+        {"source_node_uuid", format_scene_uuid(instance.source_node_uuid)},
+        {"is_prefab_root", instance.is_prefab_root},
+    };
+}
+
+[[nodiscard]] bool read_prefab_instance(
+    const Json& source,
+    PrefabInstanceComponent& instance) {
+    if (!source.is_object() ||
+        source.size() != 3U ||
+        !source.contains("prefab_path") ||
+        !source["prefab_path"].is_string() ||
+        !source.contains("source_node_uuid") ||
+        !source["source_node_uuid"].is_string() ||
+        !source.contains("is_prefab_root") ||
+        !source["is_prefab_root"].is_boolean()) {
+        return false;
+    }
+    const auto uuid = parse_scene_uuid(
+        source["source_node_uuid"].get_ref<const std::string&>());
+    if (!uuid) {
+        return false;
+    }
+    PrefabInstanceComponent parsed{};
+    if (!parsed.set_path(
+            source["prefab_path"].get_ref<const std::string&>())) {
+        return false;
+    }
+    parsed.source_node_uuid = *uuid;
+    parsed.is_prefab_root = source["is_prefab_root"].get<bool>();
+    if (!valid_prefab_instance_component(parsed)) {
+        return false;
+    }
+    instance = parsed;
+    return true;
+}
+
 [[nodiscard]] bool replace_scene_file(
     const std::filesystem::path& temporary,
     const std::filesystem::path& destination,
@@ -392,6 +529,16 @@ bool save_scene_file(
         }
         if (record.collider && !valid_collider_component(*record.collider)) {
             error = "Scene collider component values are invalid.";
+            return false;
+        }
+        if (record.rigid_body &&
+            !valid_rigid_body_component(*record.rigid_body)) {
+            error = "Scene rigid body component values are invalid.";
+            return false;
+        }
+        if (record.prefab_instance &&
+            !valid_prefab_instance_component(*record.prefab_instance)) {
+            error = "Scene prefab instance component values are invalid.";
             return false;
         }
         const SceneNode& node = record.value;
@@ -554,10 +701,19 @@ bool save_scene_file(
                     node.light.outer_cone_degrees;
             }
         }
-        if (record.collider) {
-            encoded["components"] = Json{
-                {"collider", collider_json(*record.collider)},
-            };
+        if (record.collider || record.rigid_body || record.prefab_instance) {
+            Json components = Json::object();
+            if (record.collider) {
+                components["collider"] = collider_json(*record.collider);
+            }
+            if (record.rigid_body) {
+                components["rigid_body"] = rigid_body_json(*record.rigid_body);
+            }
+            if (record.prefab_instance) {
+                components["prefab_instance"] =
+                    prefab_instance_json(*record.prefab_instance);
+            }
+            encoded["components"] = std::move(components);
         }
         if (index != 0U) {
             output.put(',');
@@ -939,6 +1095,8 @@ bool load_scene_file(
                 }
             }
             std::optional<ColliderComponent> parsed_collider{};
+            std::optional<RigidBodyComponent> parsed_rigid_body{};
+            std::optional<PrefabInstanceComponent> parsed_prefab_instance{};
             if (encoded.contains("components")) {
                 const Json& components = encoded["components"];
                 if (!components.is_object()) {
@@ -946,7 +1104,9 @@ bool load_scene_file(
                     return false;
                 }
                 for (const auto& [component_key, _] : components.items()) {
-                    if (component_key != "collider") {
+                    if (component_key != "collider" &&
+                        component_key != "rigid_body" &&
+                        component_key != "prefab_instance") {
                         error = "Scene node contains an unknown component.";
                         return false;
                     }
@@ -959,6 +1119,24 @@ bool load_scene_file(
                     }
                     parsed_collider = collider_value;
                 }
+                if (components.contains("rigid_body")) {
+                    RigidBodyComponent rb_value{};
+                    if (!read_rigid_body(components["rigid_body"], rb_value)) {
+                        error = "Scene node rigid_body component is invalid.";
+                        return false;
+                    }
+                    parsed_rigid_body = rb_value;
+                }
+                if (components.contains("prefab_instance")) {
+                    PrefabInstanceComponent pf_value{};
+                    if (!read_prefab_instance(
+                            components["prefab_instance"], pf_value)) {
+                        error =
+                            "Scene node prefab_instance component is invalid.";
+                        return false;
+                    }
+                    parsed_prefab_instance = pf_value;
+                }
             }
             const SceneNodeId id = parsed_uuid
                 ? loaded.create_node_with_uuid(name, *kind, *parsed_uuid, parent_id)
@@ -970,6 +1148,16 @@ bool load_scene_file(
             }
             if (parsed_collider && !loaded.set_collider(id, *parsed_collider)) {
                 error = "Unable to attach scene collider component.";
+                return false;
+            }
+            if (parsed_rigid_body &&
+                !loaded.set_rigid_body(id, *parsed_rigid_body)) {
+                error = "Unable to attach scene rigid_body component.";
+                return false;
+            }
+            if (parsed_prefab_instance &&
+                !loaded.set_prefab_instance(id, *parsed_prefab_instance)) {
+                error = "Unable to attach scene prefab_instance component.";
                 return false;
             }
             auto node = loaded.node(id);

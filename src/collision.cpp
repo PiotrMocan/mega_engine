@@ -2,6 +2,7 @@
 #include "terrain_height.hpp"
 
 #include <glm/geometric.hpp>
+#include <glm/gtc/matrix_inverse.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <algorithm>
@@ -13,6 +14,30 @@ namespace vcr {
 namespace {
 
 constexpr float epsilon = 1.0e-6F;
+
+constexpr std::array<glm::vec3, 21U> canonical_dop_axes{{
+    {1.0F, 0.0F, 0.0F},
+    {0.0F, 1.0F, 0.0F},
+    {0.0F, 0.0F, 1.0F},
+    {0.70710678F, 0.70710678F, 0.0F},
+    {0.70710678F, -0.70710678F, 0.0F},
+    {0.70710678F, 0.0F, 0.70710678F},
+    {0.70710678F, 0.0F, -0.70710678F},
+    {0.0F, 0.70710678F, 0.70710678F},
+    {0.0F, 0.70710678F, -0.70710678F},
+    {0.57735027F, 0.57735027F, 0.57735027F},
+    {0.57735027F, 0.57735027F, -0.57735027F},
+    {0.57735027F, -0.57735027F, 0.57735027F},
+    {0.57735027F, -0.57735027F, -0.57735027F},
+    {0.89442719F, 0.44721360F, 0.0F},
+    {0.89442719F, -0.44721360F, 0.0F},
+    {0.0F, 0.89442719F, 0.44721360F},
+    {0.0F, 0.89442719F, -0.44721360F},
+    {0.44721360F, 0.0F, 0.89442719F},
+    {-0.44721360F, 0.0F, 0.89442719F},
+    {0.81649658F, 0.40824829F, 0.40824829F},
+    {0.40824829F, 0.81649658F, 0.40824829F},
+}};
 
 struct WorldFrame {
     glm::vec3 origin{0.0F};
@@ -92,6 +117,52 @@ struct WorldFrame {
     return Bounds{.center = center, .extent = world_extent};
 }
 
+[[nodiscard]] Bounds transform_aabb_matrix(
+    const Bounds& local,
+    const glm::mat4& m) noexcept {
+    const glm::vec3 world_center =
+        glm::vec3(m * glm::vec4(local.center, 1.0F));
+    glm::vec3 world_extent{0.0F};
+    for (int row = 0; row < 3; ++row) {
+        world_extent[row] =
+            std::abs(m[0][row]) * local.extent.x +
+            std::abs(m[1][row]) * local.extent.y +
+            std::abs(m[2][row]) * local.extent.z;
+    }
+    return Bounds{.center = world_center, .extent = world_extent};
+}
+
+[[nodiscard]] bool ray_intersects_aabb(
+    const glm::vec3 origin,
+    const glm::vec3 dir,
+    const float max_dist,
+    const Bounds& aabb) noexcept {
+    const glm::vec3 bmin = aabb.center - aabb.extent;
+    const glm::vec3 bmax = aabb.center + aabb.extent;
+    float t_min = 0.0F;
+    float t_max = max_dist;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (std::abs(dir[axis]) <= epsilon) {
+            if (origin[axis] < bmin[axis] || origin[axis] > bmax[axis]) {
+                return false;
+            }
+            continue;
+        }
+        const float inv = 1.0F / dir[axis];
+        float t1 = (bmin[axis] - origin[axis]) * inv;
+        float t2 = (bmax[axis] - origin[axis]) * inv;
+        if (t1 > t2) {
+            std::swap(t1, t2);
+        }
+        t_min = std::max(t_min, t1);
+        t_max = std::min(t_max, t2);
+        if (t_min > t_max) {
+            return false;
+        }
+    }
+    return true;
+}
+
 [[nodiscard]] bool segment_aabb_interval(
     const glm::vec3 p0,
     const glm::vec3 p1,
@@ -126,7 +197,6 @@ struct WorldFrame {
     return true;
 }
 
-// Exact minimum-distance parameter t in [0, 1] from segment [p0, p1] to AABB [-E, +E].
 [[nodiscard]] float closest_segment_param_to_aabb(
     const glm::vec3 p0,
     const glm::vec3 p1,
@@ -149,7 +219,9 @@ struct WorldFrame {
             }
         }
     }
-    std::sort(breaks.begin(), breaks.begin() + static_cast<std::ptrdiff_t>(count));
+    std::sort(
+        breaks.begin(),
+        breaks.begin() + static_cast<std::ptrdiff_t>(count));
 
     const auto dist_sq_at = [&](const float t) noexcept {
         const glm::vec3 p = p0 + d * t;
@@ -247,8 +319,95 @@ void closest_points_segments(
     c2_out = p2 + d2 * t;
 }
 
+[[nodiscard]] glm::vec3 closest_point_on_triangle(
+    const glm::vec3 p,
+    const glm::vec3 a,
+    const glm::vec3 b,
+    const glm::vec3 c) noexcept {
+    const glm::vec3 ab = b - a;
+    const glm::vec3 ac = c - a;
+    const glm::vec3 ap = p - a;
+    const float d1 = glm::dot(ab, ap);
+    const float d2 = glm::dot(ac, ap);
+    if (d1 <= 0.0F && d2 <= 0.0F) {
+        return a;
+    }
+
+    const glm::vec3 bp = p - b;
+    const float d3 = glm::dot(ab, bp);
+    const float d4 = glm::dot(ac, bp);
+    if (d3 >= 0.0F && d4 <= d3) {
+        return b;
+    }
+
+    const float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0F && d1 >= 0.0F && d3 <= 0.0F) {
+        const float v = d1 / (d1 - d3);
+        return a + v * ab;
+    }
+
+    const glm::vec3 cp = p - c;
+    const float d5 = glm::dot(ab, cp);
+    const float d6 = glm::dot(ac, cp);
+    if (d6 >= 0.0F && d5 <= d6) {
+        return c;
+    }
+
+    const float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0F && d2 >= 0.0F && d6 <= 0.0F) {
+        const float w = d2 / (d2 - d6);
+        return a + w * ac;
+    }
+
+    const float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0F && (d4 - d3) >= 0.0F && (d5 - d6) >= 0.0F) {
+        const float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return b + w * (c - b);
+    }
+
+    const float denom = 1.0F / (va + vb + vc);
+    const float v = vb * denom;
+    const float w = vc * denom;
+    return a + ab * v + ac * w;
+}
+
+[[nodiscard]] bool segment_intersects_triangle(
+    const glm::vec3 p0,
+    const glm::vec3 p1,
+    const glm::vec3 a,
+    const glm::vec3 b,
+    const glm::vec3 c,
+    float& t_out) noexcept {
+    const glm::vec3 dir = p1 - p0;
+    const glm::vec3 e1 = b - a;
+    const glm::vec3 e2 = c - a;
+    const glm::vec3 h = glm::cross(dir, e2);
+    const float det = glm::dot(e1, h);
+    if (std::abs(det) <= 1.0e-8F) {
+        return false;
+    }
+    const float inv_det = 1.0F / det;
+    const glm::vec3 s = p0 - a;
+    const float u = inv_det * glm::dot(s, h);
+    if (u < 0.0F || u > 1.0F) {
+        return false;
+    }
+    const glm::vec3 q = glm::cross(s, e1);
+    const float v = inv_det * glm::dot(dir, q);
+    if (v < 0.0F || u + v > 1.0F) {
+        return false;
+    }
+    const float t = inv_det * glm::dot(e2, q);
+    if (t < 0.0F || t > 1.0F) {
+        return false;
+    }
+    t_out = t;
+    return true;
+}
+
 struct Penetration {
     glm::vec3 normal{0.0F, 1.0F, 0.0F};
+    glm::vec3 contact_point{0.0F};
     float depth = 0.0F;
 };
 
@@ -284,8 +443,11 @@ struct Penetration {
                 best_local_normal[axis] = -1.0F;
             }
         }
+        const glm::vec3 wn = glm::normalize(box_axes * best_local_normal);
+        const glm::vec3 mid = 0.5F * (cap_a + cap_b);
         return Penetration{
-            .normal = glm::normalize(box_axes * best_local_normal),
+            .normal = wn,
+            .contact_point = mid - wn * cap_radius,
             .depth = std::max(best_push, 0.0F),
         };
     };
@@ -313,6 +475,7 @@ struct Penetration {
     const glm::vec3 local_normal = diff / dist;
     return Penetration{
         .normal = glm::normalize(box_axes * local_normal),
+        .contact_point = box_center + box_axes * q_box,
         .depth = cap_radius - dist,
     };
 }
@@ -343,11 +506,14 @@ struct Penetration {
     if (dist <= epsilon) {
         return Penetration{
             .normal = glm::vec3(0.0F, 1.0F, 0.0F),
+            .contact_point = sphere_center + glm::vec3(0.0F, sphere_radius, 0.0F),
             .depth = combined,
         };
     }
+    const glm::vec3 n = diff / dist;
     return Penetration{
-        .normal = diff / dist,
+        .normal = n,
+        .contact_point = sphere_center + n * sphere_radius,
         .depth = combined - dist,
     };
 }
@@ -372,12 +538,196 @@ struct Penetration {
     if (dist <= epsilon) {
         return Penetration{
             .normal = glm::vec3(0.0F, 1.0F, 0.0F),
+            .contact_point = c2 + glm::vec3(0.0F, other_radius, 0.0F),
             .depth = combined,
         };
     }
+    const glm::vec3 n = diff / dist;
     return Penetration{
-        .normal = diff / dist,
+        .normal = n,
+        .contact_point = c2 + n * other_radius,
         .depth = combined - dist,
+    };
+}
+
+[[nodiscard]] std::optional<Penetration> capsule_convex_hull_penetration(
+    const glm::vec3 cap_a,
+    const glm::vec3 cap_b,
+    const float cap_radius,
+    const std::span<const glm::vec3> hull_vertices,
+    const glm::vec3 hull_centroid,
+    const glm::mat3& hull_axes) noexcept {
+    if (hull_vertices.empty()) {
+        return std::nullopt;
+    }
+    float best_depth = std::numeric_limits<float>::max();
+    glm::vec3 best_normal{0.0F, 1.0F, 0.0F};
+
+    const auto test_axis = [&](const glm::vec3 raw_axis) noexcept -> bool {
+        const float len_sq = glm::dot(raw_axis, raw_axis);
+        if (len_sq <= 1.0e-8F) {
+            return true;
+        }
+        const glm::vec3 axis = raw_axis * (1.0F / std::sqrt(len_sq));
+        float hull_min = std::numeric_limits<float>::max();
+        float hull_max = -std::numeric_limits<float>::max();
+        for (const glm::vec3 v : hull_vertices) {
+            const float proj = glm::dot(axis, v);
+            hull_min = std::min(hull_min, proj);
+            hull_max = std::max(hull_max, proj);
+        }
+        const float pa = glm::dot(axis, cap_a);
+        const float pb = glm::dot(axis, cap_b);
+        const float cap_min = std::min(pa, pb) - cap_radius;
+        const float cap_max = std::max(pa, pb) + cap_radius;
+        if (cap_max <= hull_min || cap_min >= hull_max) {
+            return false;
+        }
+        const float push_pos = hull_max - cap_min;
+        const float push_neg = cap_max - hull_min;
+        if (push_pos <= push_neg) {
+            if (push_pos < best_depth) {
+                best_depth = push_pos;
+                best_normal = axis;
+            }
+        } else {
+            if (push_neg < best_depth) {
+                best_depth = push_neg;
+                best_normal = -axis;
+            }
+        }
+        return true;
+    };
+
+    const glm::vec3 seg_dir = cap_b - cap_a;
+    for (const glm::vec3 local_dir : canonical_dop_axes) {
+        const glm::vec3 world_axis = hull_axes * local_dir;
+        if (!test_axis(world_axis)) {
+            return std::nullopt;
+        }
+        if (glm::dot(seg_dir, seg_dir) > 1.0e-6F) {
+            if (!test_axis(glm::cross(seg_dir, world_axis))) {
+                return std::nullopt;
+            }
+        }
+    }
+    const glm::vec3 seg_mid = 0.5F * (cap_a + cap_b);
+    if (!test_axis(seg_mid - hull_centroid)) {
+        return std::nullopt;
+    }
+
+    // Closest vertex to capsule segment axis catches spherical cap bevels.
+    const float seg_len_sq = glm::dot(seg_dir, seg_dir);
+    glm::vec3 nearest_diff{0.0F};
+    float nearest_dist_sq = std::numeric_limits<float>::max();
+    for (const glm::vec3 v : hull_vertices) {
+        float t = 0.0F;
+        if (seg_len_sq > epsilon) {
+            t = std::clamp(glm::dot(v - cap_a, seg_dir) / seg_len_sq, 0.0F, 1.0F);
+        }
+        const glm::vec3 diff = (cap_a + seg_dir * t) - v;
+        const float d2 = glm::dot(diff, diff);
+        if (d2 < nearest_dist_sq) {
+            nearest_dist_sq = d2;
+            nearest_diff = diff;
+        }
+    }
+    if (!test_axis(nearest_diff)) {
+        return std::nullopt;
+    }
+
+    if (best_depth <= 0.0F ||
+        best_depth == std::numeric_limits<float>::max()) {
+        return std::nullopt;
+    }
+    float max_sup = -std::numeric_limits<float>::max();
+    glm::vec3 support_pt = hull_centroid;
+    for (const glm::vec3 v : hull_vertices) {
+        const float d = glm::dot(best_normal, v);
+        if (d > max_sup) {
+            max_sup = d;
+            support_pt = v;
+        }
+    }
+    return Penetration{
+        .normal = best_normal,
+        .contact_point = support_pt,
+        .depth = best_depth,
+    };
+}
+
+[[nodiscard]] std::optional<Penetration> capsule_triangle_penetration(
+    const glm::vec3 cap_a,
+    const glm::vec3 cap_b,
+    const float cap_radius,
+    const glm::vec3 v0,
+    const glm::vec3 v1,
+    const glm::vec3 v2) noexcept {
+    const glm::vec3 raw_n = glm::cross(v1 - v0, v2 - v0);
+    const float raw_n_len = glm::length(raw_n);
+    if (raw_n_len <= 1.0e-8F) {
+        return std::nullopt;
+    }
+    const glm::vec3 tri_normal = raw_n / raw_n_len;
+
+    float hit_t = 0.0F;
+    if (segment_intersects_triangle(cap_a, cap_b, v0, v1, v2, hit_t)) {
+        const glm::vec3 mid = 0.5F * (cap_a + cap_b);
+        const float side = glm::dot(mid - v0, tri_normal);
+        const glm::vec3 push_n = side >= 0.0F ? tri_normal : -tri_normal;
+        const float d0 = glm::dot(cap_a - v0, push_n);
+        const float d1 = glm::dot(cap_b - v0, push_n);
+        const float depth = cap_radius - std::min(d0, d1);
+        if (depth <= 0.0F) {
+            return std::nullopt;
+        }
+        return Penetration{
+            .normal = push_n,
+            .contact_point = cap_a + (cap_b - cap_a) * hit_t,
+            .depth = depth,
+        };
+    }
+
+    float best_dist_sq = std::numeric_limits<float>::max();
+    glm::vec3 best_seg_pt = cap_a;
+    glm::vec3 best_tri_pt = v0;
+
+    const auto consider = [&](const glm::vec3 sp, const glm::vec3 tp) noexcept {
+        const glm::vec3 diff = sp - tp;
+        const float d2 = glm::dot(diff, diff);
+        if (d2 < best_dist_sq) {
+            best_dist_sq = d2;
+            best_seg_pt = sp;
+            best_tri_pt = tp;
+        }
+    };
+
+    consider(cap_a, closest_point_on_triangle(cap_a, v0, v1, v2));
+    consider(cap_b, closest_point_on_triangle(cap_b, v0, v1, v2));
+
+    glm::vec3 s_pt{0.0F};
+    glm::vec3 e_pt{0.0F};
+    closest_points_segments(cap_a, cap_b, v0, v1, s_pt, e_pt);
+    consider(s_pt, e_pt);
+    closest_points_segments(cap_a, cap_b, v1, v2, s_pt, e_pt);
+    consider(s_pt, e_pt);
+    closest_points_segments(cap_a, cap_b, v2, v0, s_pt, e_pt);
+    consider(s_pt, e_pt);
+
+    if (best_dist_sq >= cap_radius * cap_radius) {
+        return std::nullopt;
+    }
+    const float dist = std::sqrt(best_dist_sq);
+    glm::vec3 normal = tri_normal;
+    if (dist > epsilon) {
+        normal = (best_seg_pt - best_tri_pt) / dist;
+    } else if (glm::dot(0.5F * (cap_a + cap_b) - v0, tri_normal) < 0.0F) {
+        normal = -tri_normal;
+    }
+    return Penetration{
+        .normal = normal,
+        .contact_point = best_tri_pt,
+        .depth = cap_radius - dist,
     };
 }
 
@@ -531,6 +881,109 @@ struct Penetration {
     return best;
 }
 
+[[nodiscard]] std::optional<RaycastHit> raycast_convex_hull(
+    const glm::vec3 origin,
+    const glm::vec3 dir,
+    const float max_dist,
+    const std::span<const glm::vec3> hull_vertices,
+    const glm::mat3& hull_axes) noexcept {
+    if (hull_vertices.empty()) {
+        return std::nullopt;
+    }
+    float t_enter = -std::numeric_limits<float>::infinity();
+    float t_exit = max_dist;
+    glm::vec3 enter_normal = -dir;
+
+    for (const glm::vec3 local_axis : canonical_dop_axes) {
+        const glm::vec3 n = glm::normalize(hull_axes * local_axis);
+        float s_min = std::numeric_limits<float>::max();
+        float s_max = -std::numeric_limits<float>::max();
+        for (const glm::vec3 v : hull_vertices) {
+            const float proj = glm::dot(n, v);
+            s_min = std::min(s_min, proj);
+            s_max = std::max(s_max, proj);
+        }
+        const float o_proj = glm::dot(n, origin);
+        const float d_proj = glm::dot(n, dir);
+        if (std::abs(d_proj) <= epsilon) {
+            if (o_proj < s_min || o_proj > s_max) {
+                return std::nullopt;
+            }
+            continue;
+        }
+        const float inv = 1.0F / d_proj;
+        float t1 = (s_min - o_proj) * inv;
+        float t2 = (s_max - o_proj) * inv;
+        glm::vec3 n_in = -n;
+        if (t1 > t2) {
+            std::swap(t1, t2);
+            n_in = n;
+        }
+        if (t1 > t_enter) {
+            t_enter = t1;
+            enter_normal = n_in;
+        }
+        t_exit = std::min(t_exit, t2);
+        if (t_enter > t_exit || t_exit < 0.0F) {
+            return std::nullopt;
+        }
+    }
+    if (t_enter > max_dist) {
+        return std::nullopt;
+    }
+    const float hit_t = std::max(t_enter, 0.0F);
+    return RaycastHit{
+        .point = origin + dir * hit_t,
+        .normal = t_enter >= 0.0F ? enter_normal : -dir,
+        .distance = hit_t,
+    };
+}
+
+[[nodiscard]] bool raycast_triangle_double_sided(
+    const glm::vec3 origin,
+    const glm::vec3 dir,
+    const float max_t,
+    const glm::vec3 a,
+    const glm::vec3 b,
+    const glm::vec3 c,
+    float& t_out,
+    glm::vec3& normal_out) noexcept {
+    const glm::vec3 e1 = b - a;
+    const glm::vec3 e2 = c - a;
+    const glm::vec3 h = glm::cross(dir, e2);
+    const float det = glm::dot(e1, h);
+    if (std::abs(det) <= 1.0e-8F) {
+        return false;
+    }
+    const float inv_det = 1.0F / det;
+    const glm::vec3 s = origin - a;
+    const float u = inv_det * glm::dot(s, h);
+    if (u < 0.0F || u > 1.0F) {
+        return false;
+    }
+    const glm::vec3 q = glm::cross(s, e1);
+    const float v = inv_det * glm::dot(dir, q);
+    if (v < 0.0F || u + v > 1.0F) {
+        return false;
+    }
+    const float t = inv_det * glm::dot(e2, q);
+    if (t < 0.0F || t > max_t) {
+        return false;
+    }
+    glm::vec3 n = glm::cross(e1, e2);
+    const float n_len = glm::length(n);
+    if (n_len <= 1.0e-8F) {
+        return false;
+    }
+    n /= n_len;
+    if (glm::dot(n, dir) > 0.0F) {
+        n = -n;
+    }
+    t_out = t;
+    normal_out = n;
+    return true;
+}
+
 [[nodiscard]] std::optional<RaycastHit> raycast_procedural_terrain(
     const glm::vec3 origin,
     const glm::vec3 dir,
@@ -627,6 +1080,9 @@ CollisionWorld::CollisionWorld() {
     boxes_.reserve(256U);
     spheres_.reserve(64U);
     capsules_.reserve(64U);
+    convex_hulls_.reserve(32U);
+    shared_meshes_.reserve(16U);
+    triangle_meshes_.reserve(32U);
     world_nodes_scratch_.reserve(256U);
     ancestor_scratch_.reserve(256U);
 }
@@ -635,6 +1091,9 @@ void CollisionWorld::clear() noexcept {
     boxes_.clear();
     spheres_.clear();
     capsules_.clear();
+    convex_hulls_.clear();
+    shared_meshes_.clear();
+    triangle_meshes_.clear();
     terrain_node_id_ = {};
     terrain_node_uuid_ = {};
     solid_count_ = 0U;
@@ -642,10 +1101,92 @@ void CollisionWorld::clear() noexcept {
     terrain_enabled_ = false;
 }
 
+std::optional<std::uint32_t> CollisionWorld::intern_triangle_mesh(
+    const std::string_view key,
+    const CookedModelCollision& collision) {
+    if (collision.triangle_positions.empty() ||
+        collision.triangle_indices.size() < 3U) {
+        return std::nullopt;
+    }
+    for (std::uint32_t idx = 0U; idx < shared_meshes_.size(); ++idx) {
+        if (!key.empty() && shared_meshes_[idx].key == key) {
+            return idx;
+        }
+    }
+
+    SharedTriangleMesh mesh{};
+    mesh.key = std::string(key);
+    mesh.positions.reserve(collision.triangle_positions.size());
+    glm::vec3 min_p(std::numeric_limits<float>::max());
+    glm::vec3 max_p(std::numeric_limits<float>::lowest());
+    for (const auto& p : collision.triangle_positions) {
+        const glm::vec3 v{p[0], p[1], p[2]};
+        if (!finite_vec3(v)) {
+            return std::nullopt;
+        }
+        min_p = glm::min(min_p, v);
+        max_p = glm::max(max_p, v);
+        mesh.positions.push_back(v);
+    }
+    mesh.local_aabb = Bounds{
+        .center = 0.5F * (min_p + max_p),
+        .extent = glm::max(0.5F * (max_p - min_p), glm::vec3(0.001F)),
+    };
+
+    const std::size_t tri_count = collision.triangle_indices.size() / 3U;
+    mesh.indices.reserve(tri_count * 3U);
+    for (std::size_t t = 0U; t < tri_count; ++t) {
+        const std::uint32_t i0 = collision.triangle_indices[t * 3U + 0U];
+        const std::uint32_t i1 = collision.triangle_indices[t * 3U + 1U];
+        const std::uint32_t i2 = collision.triangle_indices[t * 3U + 2U];
+        if (i0 >= mesh.positions.size() ||
+            i1 >= mesh.positions.size() ||
+            i2 >= mesh.positions.size()) {
+            return std::nullopt;
+        }
+        mesh.indices.push_back(i0);
+        mesh.indices.push_back(i1);
+        mesh.indices.push_back(i2);
+    }
+
+    constexpr std::uint32_t triangles_per_chunk = 32U;
+    const auto total_tris = static_cast<std::uint32_t>(tri_count);
+    mesh.chunks.reserve((total_tris + triangles_per_chunk - 1U) /
+                        triangles_per_chunk);
+    for (std::uint32_t first = 0U; first < total_tris;
+         first += triangles_per_chunk) {
+        const std::uint32_t count =
+            std::min(triangles_per_chunk, total_tris - first);
+        glm::vec3 cmin(std::numeric_limits<float>::max());
+        glm::vec3 cmax(std::numeric_limits<float>::lowest());
+        for (std::uint32_t t = first; t < first + count; ++t) {
+            for (std::uint32_t corner = 0U; corner < 3U; ++corner) {
+                const glm::vec3 v = mesh.positions[mesh.indices[t * 3U + corner]];
+                cmin = glm::min(cmin, v);
+                cmax = glm::max(cmax, v);
+            }
+        }
+        mesh.chunks.push_back(TriangleChunk{
+            .local_aabb = Bounds{
+                .center = 0.5F * (cmin + cmax),
+                .extent = glm::max(0.5F * (cmax - cmin), glm::vec3(0.001F)),
+            },
+            .first_triangle = first,
+            .triangle_count = count,
+        });
+    }
+
+    const auto out_idx = static_cast<std::uint32_t>(shared_meshes_.size());
+    shared_meshes_.push_back(std::move(mesh));
+    return out_idx;
+}
+
 void CollisionWorld::rebuild_from_scene(
     const SceneDocument& scene,
     const SceneNodeId excluded_node,
-    const ModelBoundsProvider model_bounds) {
+    const ModelBoundsProvider model_bounds,
+    const ModelCollisionProvider model_collision,
+    const bool skip_enabled_rigid_bodies) {
     clear();
     scene.build_world_nodes(world_nodes_scratch_, ancestor_scratch_);
 
@@ -653,6 +1194,12 @@ void CollisionWorld::rebuild_from_scene(
     for (const SceneWorldNode& entry : world_nodes_scratch_) {
         if (!entry.world_visible || entry.id == excluded_node) {
             continue;
+        }
+        if (skip_enabled_rigid_bodies) {
+            if (const auto rb = scene.rigid_body(entry.id);
+                rb && rb->get().enabled) {
+                continue;
+            }
         }
 
         const auto explicit_collider = scene.collider(entry.id);
@@ -706,6 +1253,17 @@ void CollisionWorld::rebuild_from_scene(
                 ++solid_count_;
             }
         };
+
+        std::string_view asset_path{};
+        if (entry.kind == SceneNodeKind::model) {
+            if (const auto node_ref = scene.node(entry.id)) {
+                asset_path = node_ref->get().asset_path;
+            }
+        }
+        const CookedModelCollision* const cooked =
+            entry.kind == SceneNodeKind::model
+                ? model_collision(asset_path)
+                : nullptr;
 
         if (resolved.shape == ColliderShape::sphere) {
             const float max_scale = std::max(
@@ -779,7 +1337,103 @@ void CollisionWorld::rebuild_from_scene(
             continue;
         }
 
-        // ColliderShape::auto_bounds
+        if (resolved.shape == ColliderShape::convex_hull) {
+            if (cooked != nullptr && !cooked->convex_hull_vertices.empty()) {
+                ConvexHullCollider hull{
+                    .axes = frame->axes,
+                    .node_id = entry.id,
+                    .node_uuid = entry.uuid,
+                    .layer = resolved.collision_layer,
+                    .mask = resolved.collision_mask,
+                    .is_trigger = resolved.is_trigger,
+                };
+                glm::vec3 hmin(std::numeric_limits<float>::max());
+                glm::vec3 hmax(std::numeric_limits<float>::lowest());
+                glm::vec3 sum{0.0F};
+                const std::size_t limit = std::min(
+                    cooked->convex_hull_vertices.size(),
+                    maximum_cooked_convex_hull_vertices);
+                for (std::size_t idx = 0U; idx < limit; ++idx) {
+                    const auto& lv = cooked->convex_hull_vertices[idx];
+                    const glm::vec3 local_pt =
+                        glm::vec3(lv[0], lv[1], lv[2]) + resolved.center_offset;
+                    const glm::vec3 wp =
+                        glm::vec3(entry.world_matrix * glm::vec4(local_pt, 1.0F));
+                    if (!finite_vec3(wp)) {
+                        continue;
+                    }
+                    hull.vertices[hull.vertex_count++] = wp;
+                    hmin = glm::min(hmin, wp);
+                    hmax = glm::max(hmax, wp);
+                    sum += wp;
+                }
+                if (hull.vertex_count >= 1U) {
+                    hull.centroid = sum / static_cast<float>(hull.vertex_count);
+                    hull.world_aabb = Bounds{
+                        .center = 0.5F * (hmin + hmax),
+                        .extent = glm::max(
+                            0.5F * (hmax - hmin),
+                            glm::vec3(minimum_collider_dimension)),
+                    };
+                    convex_hulls_.push_back(hull);
+                    record_counts(resolved.is_trigger);
+                    continue;
+                }
+            }
+            // Fallback to OBB when convex hull vertices are not yet resident.
+            const glm::vec3 local_ext = entry.kind == SceneNodeKind::cube
+                ? glm::vec3(1.0F)
+                : resolved.half_extents;
+            const glm::vec3 world_extents = glm::max(
+                local_ext * frame->scale, glm::vec3(minimum_collider_dimension));
+            boxes_.push_back(OrientedBox{
+                .center = base_center,
+                .axes = frame->axes,
+                .half_extents = world_extents,
+                .world_aabb = compute_obb_aabb(
+                    base_center, frame->axes, world_extents),
+                .node_id = entry.id,
+                .node_uuid = entry.uuid,
+                .layer = resolved.collision_layer,
+                .mask = resolved.collision_mask,
+                .is_trigger = resolved.is_trigger,
+            });
+            record_counts(resolved.is_trigger);
+            continue;
+        }
+
+        if (resolved.shape == ColliderShape::triangle_mesh) {
+            if (cooked != nullptr) {
+                const glm::mat4 world_from_local =
+                    glm::translate(entry.world_matrix, resolved.center_offset);
+                const float det = glm::determinant(world_from_local);
+                if (std::isfinite(det) && std::abs(det) > 1.0e-8F) {
+                    if (const auto mesh_idx =
+                            intern_triangle_mesh(asset_path, *cooked)) {
+                        const SharedTriangleMesh& shared =
+                            shared_meshes_[*mesh_idx];
+                        triangle_meshes_.push_back(TriangleMeshCollider{
+                            .shared_mesh_index = *mesh_idx,
+                            .world_from_local = world_from_local,
+                            .local_from_world = glm::inverse(world_from_local),
+                            .normal_matrix = glm::inverseTranspose(
+                                glm::mat3(world_from_local)),
+                            .world_aabb = transform_aabb_matrix(
+                                shared.local_aabb, world_from_local),
+                            .node_id = entry.id,
+                            .node_uuid = entry.uuid,
+                            .layer = resolved.collision_layer,
+                            .mask = resolved.collision_mask,
+                            .is_trigger = resolved.is_trigger,
+                        });
+                        record_counts(resolved.is_trigger);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // ColliderShape::auto_bounds (or fallback when cooked mesh isn't loaded)
         if (entry.kind == SceneNodeKind::ground) {
             constexpr float slab_half_thickness = 0.25F;
             const glm::vec3 world_extents{
@@ -803,7 +1457,36 @@ void CollisionWorld::rebuild_from_scene(
             });
             record_counts(resolved.is_trigger);
         } else if (entry.kind == SceneNodeKind::model) {
-            if (const auto bounds = model_bounds(entry.id)) {
+            if (cooked != nullptr && !cooked->submesh_boxes.empty()) {
+                for (const CookedCollisionBox& sbox : cooked->submesh_boxes) {
+                    const glm::vec3 local_c =
+                        glm::vec3(sbox.center[0], sbox.center[1], sbox.center[2]) +
+                        resolved.center_offset;
+                    const glm::vec3 world_c = glm::vec3(
+                        entry.world_matrix * glm::vec4(local_c, 1.0F));
+                    const glm::vec3 local_e{
+                        sbox.half_extents[0],
+                        sbox.half_extents[1],
+                        sbox.half_extents[2],
+                    };
+                    const glm::vec3 world_e = glm::max(
+                        local_e * frame->scale,
+                        glm::vec3(minimum_collider_dimension));
+                    boxes_.push_back(OrientedBox{
+                        .center = world_c,
+                        .axes = frame->axes,
+                        .half_extents = world_e,
+                        .world_aabb = compute_obb_aabb(
+                            world_c, frame->axes, world_e),
+                        .node_id = entry.id,
+                        .node_uuid = entry.uuid,
+                        .layer = resolved.collision_layer,
+                        .mask = resolved.collision_mask,
+                        .is_trigger = resolved.is_trigger,
+                    });
+                }
+                record_counts(resolved.is_trigger);
+            } else if (const auto bounds = model_bounds(entry.id)) {
                 const glm::vec3 world_extents = glm::max(
                     bounds->extent,
                     glm::vec3(minimum_collider_dimension));
@@ -842,7 +1525,6 @@ void CollisionWorld::rebuild_from_scene(
                 record_counts(resolved.is_trigger);
             }
         } else {
-            // Cube or folder/other node with explicit auto_bounds collider.
             const glm::vec3 local_extents =
                 entry.kind == SceneNodeKind::cube
                     ? glm::vec3(1.0F)
@@ -947,6 +1629,109 @@ std::optional<RaycastHit> CollisionWorld::raycast(
             hit->is_trigger = cap.is_trigger;
             best_dist = hit->distance;
             closest = hit;
+        }
+    }
+
+    for (const ConvexHullCollider& hull : convex_hulls_) {
+        if ((hull.layer & layer_mask) == 0U ||
+            (hull.is_trigger && !include_triggers) ||
+            !ray_intersects_aabb(origin, unit_dir, best_dist, hull.world_aabb)) {
+            continue;
+        }
+        if (auto hit = raycast_convex_hull(
+                origin,
+                unit_dir,
+                best_dist,
+                std::span<const glm::vec3>(
+                    hull.vertices.data(), hull.vertex_count),
+                hull.axes)) {
+            hit->node_id = hull.node_id;
+            hit->node_uuid = hull.node_uuid;
+            hit->collision_layer = hull.layer;
+            hit->is_trigger = hull.is_trigger;
+            best_dist = hit->distance;
+            closest = hit;
+        }
+    }
+
+    for (const TriangleMeshCollider& tmesh : triangle_meshes_) {
+        if ((tmesh.layer & layer_mask) == 0U ||
+            (tmesh.is_trigger && !include_triggers) ||
+            !ray_intersects_aabb(origin, unit_dir, best_dist, tmesh.world_aabb)) {
+            continue;
+        }
+        const SharedTriangleMesh& shared =
+            shared_meshes_[tmesh.shared_mesh_index];
+        const glm::vec3 local_o =
+            glm::vec3(tmesh.local_from_world * glm::vec4(origin, 1.0F));
+        const glm::vec3 end_world = origin + unit_dir * best_dist;
+        const glm::vec3 local_end =
+            glm::vec3(tmesh.local_from_world * glm::vec4(end_world, 1.0F));
+        const glm::vec3 local_seg = local_end - local_o;
+        const float local_max_t = glm::length(local_seg);
+        if (!std::isfinite(local_max_t) || local_max_t <= epsilon) {
+            continue;
+        }
+        const glm::vec3 local_d = local_seg / local_max_t;
+        if (!ray_intersects_aabb(
+                local_o, local_d, local_max_t, shared.local_aabb)) {
+            continue;
+        }
+
+        float best_local_t = local_max_t;
+        glm::vec3 best_local_n{0.0F, 1.0F, 0.0F};
+        bool found_tri = false;
+        for (const TriangleChunk& chunk : shared.chunks) {
+            if (!ray_intersects_aabb(
+                    local_o, local_d, best_local_t, chunk.local_aabb)) {
+                continue;
+            }
+            for (std::uint32_t t = chunk.first_triangle;
+                 t < chunk.first_triangle + chunk.triangle_count;
+                 ++t) {
+                const glm::vec3 a = shared.positions[shared.indices[t * 3U + 0U]];
+                const glm::vec3 b = shared.positions[shared.indices[t * 3U + 1U]];
+                const glm::vec3 c = shared.positions[shared.indices[t * 3U + 2U]];
+                float tri_t = 0.0F;
+                glm::vec3 tri_n{0.0F};
+                if (raycast_triangle_double_sided(
+                        local_o,
+                        local_d,
+                        best_local_t,
+                        a,
+                        b,
+                        c,
+                        tri_t,
+                        tri_n)) {
+                    best_local_t = tri_t;
+                    best_local_n = tri_n;
+                    found_tri = true;
+                }
+            }
+        }
+        if (found_tri) {
+            const glm::vec3 local_hit = local_o + local_d * best_local_t;
+            const glm::vec3 world_hit = glm::vec3(
+                tmesh.world_from_local * glm::vec4(local_hit, 1.0F));
+            const float world_dist = glm::length(world_hit - origin);
+            if (world_dist <= best_dist) {
+                glm::vec3 wn = tmesh.normal_matrix * best_local_n;
+                const float wn_len = glm::length(wn);
+                wn = wn_len > epsilon ? (wn / wn_len) : -unit_dir;
+                if (glm::dot(wn, unit_dir) > 0.0F) {
+                    wn = -wn;
+                }
+                best_dist = world_dist;
+                closest = RaycastHit{
+                    .point = world_hit,
+                    .normal = wn,
+                    .distance = world_dist,
+                    .node_id = tmesh.node_id,
+                    .node_uuid = tmesh.node_uuid,
+                    .collision_layer = tmesh.layer,
+                    .is_trigger = tmesh.is_trigger,
+                };
+            }
         }
     }
 
@@ -1125,6 +1910,83 @@ CapsuleContactResult CollisionWorld::resolve_capsule(
             }
         }
 
+        for (const ConvexHullCollider& hull : convex_hulls_) {
+            if (hull.is_trigger || (hull.layer & layer_mask) == 0U) {
+                continue;
+            }
+            const Bounds cap_aabb{
+                .center = glm::vec3(feet.x, feet.y + 0.5F * safe_height, feet.z),
+                .extent = glm::vec3(radius, 0.5F * safe_height, radius),
+            };
+            if (!aabb_overlaps(cap_aabb, hull.world_aabb)) {
+                continue;
+            }
+            const glm::vec3 cap_a = feet + glm::vec3(0.0F, radius, 0.0F);
+            const glm::vec3 cap_b =
+                feet + glm::vec3(0.0F, safe_height - radius, 0.0F);
+            if (const auto pen = capsule_convex_hull_penetration(
+                    cap_a,
+                    cap_b,
+                    radius,
+                    std::span<const glm::vec3>(
+                        hull.vertices.data(), hull.vertex_count),
+                    hull.centroid,
+                    hull.axes)) {
+                apply_contact(*pen, hull.node_id);
+            }
+        }
+
+        for (const TriangleMeshCollider& tmesh : triangle_meshes_) {
+            if (tmesh.is_trigger || (tmesh.layer & layer_mask) == 0U) {
+                continue;
+            }
+            const Bounds cap_aabb{
+                .center = glm::vec3(feet.x, feet.y + 0.5F * safe_height, feet.z),
+                .extent = glm::vec3(radius, 0.5F * safe_height, radius),
+            };
+            if (!aabb_overlaps(cap_aabb, tmesh.world_aabb)) {
+                continue;
+            }
+            const SharedTriangleMesh& shared =
+                shared_meshes_[tmesh.shared_mesh_index];
+            const Bounds local_cap_aabb =
+                transform_aabb_matrix(cap_aabb, tmesh.local_from_world);
+            if (!aabb_overlaps(local_cap_aabb, shared.local_aabb)) {
+                continue;
+            }
+            for (const TriangleChunk& chunk : shared.chunks) {
+                if (!aabb_overlaps(local_cap_aabb, chunk.local_aabb)) {
+                    continue;
+                }
+                for (std::uint32_t t = chunk.first_triangle;
+                     t < chunk.first_triangle + chunk.triangle_count;
+                     ++t) {
+                    const glm::vec3 v0 = glm::vec3(
+                        tmesh.world_from_local *
+                        glm::vec4(
+                            shared.positions[shared.indices[t * 3U + 0U]],
+                            1.0F));
+                    const glm::vec3 v1 = glm::vec3(
+                        tmesh.world_from_local *
+                        glm::vec4(
+                            shared.positions[shared.indices[t * 3U + 1U]],
+                            1.0F));
+                    const glm::vec3 v2 = glm::vec3(
+                        tmesh.world_from_local *
+                        glm::vec4(
+                            shared.positions[shared.indices[t * 3U + 2U]],
+                            1.0F));
+                    const glm::vec3 cap_a = feet + glm::vec3(0.0F, radius, 0.0F);
+                    const glm::vec3 cap_b =
+                        feet + glm::vec3(0.0F, safe_height - radius, 0.0F);
+                    if (const auto pen = capsule_triangle_penetration(
+                            cap_a, cap_b, radius, v0, v1, v2)) {
+                        apply_contact(*pen, tmesh.node_id);
+                    }
+                }
+            }
+        }
+
         if (!any_penetration) {
             break;
         }
@@ -1132,6 +1994,167 @@ CapsuleContactResult CollisionWorld::resolve_capsule(
 
     result.resolved_feet = feet;
     return result;
+}
+
+void CollisionWorld::gather_sphere_contacts(
+    const glm::vec3 center,
+    const float radius,
+    const std::uint32_t layer_mask,
+    std::vector<SphereContact>& output) const {
+    output.clear();
+    if (!finite_vec3(center) ||
+        !std::isfinite(radius) ||
+        radius < minimum_collider_dimension) {
+        return;
+    }
+
+    if (terrain_enabled_ &&
+        (layer_mask & 1U) != 0U &&
+        inside_procedural_terrain_xz(center.x, center.z)) {
+        const float terrain_y = procedural_landscape_height(center.x, center.z);
+        const glm::vec3 terrain_n =
+            procedural_landscape_normal(center.x, center.z);
+        const glm::vec3 surf_pt{center.x, terrain_y, center.z};
+        const float signed_dist = glm::dot(center - surf_pt, terrain_n);
+        if (signed_dist < radius) {
+            output.push_back(SphereContact{
+                .point = center - terrain_n * signed_dist,
+                .normal = terrain_n,
+                .penetration = radius - signed_dist,
+                .node_id = terrain_node_id_,
+            });
+        }
+    }
+
+    const Bounds sphere_aabb{.center = center, .extent = glm::vec3(radius)};
+    for (const OrientedBox& box : boxes_) {
+        if (box.is_trigger ||
+            (box.layer & layer_mask) == 0U ||
+            !aabb_overlaps(sphere_aabb, box.world_aabb)) {
+            continue;
+        }
+        if (const auto pen = capsule_obb_penetration(
+                center,
+                center,
+                radius,
+                box.center,
+                box.axes,
+                box.half_extents)) {
+            output.push_back(SphereContact{
+                .point = pen->contact_point,
+                .normal = pen->normal,
+                .penetration = pen->depth,
+                .node_id = box.node_id,
+            });
+        }
+    }
+
+    for (const SphereCollider& sphere : spheres_) {
+        if (sphere.is_trigger ||
+            (sphere.layer & layer_mask) == 0U ||
+            !aabb_overlaps(sphere_aabb, sphere.world_aabb)) {
+            continue;
+        }
+        if (const auto pen = capsule_sphere_penetration(
+                center, center, radius, sphere.center, sphere.radius)) {
+            output.push_back(SphereContact{
+                .point = pen->contact_point,
+                .normal = pen->normal,
+                .penetration = pen->depth,
+                .node_id = sphere.node_id,
+            });
+        }
+    }
+
+    for (const CapsuleCollider& cap : capsules_) {
+        if (cap.is_trigger ||
+            (cap.layer & layer_mask) == 0U ||
+            !aabb_overlaps(sphere_aabb, cap.world_aabb)) {
+            continue;
+        }
+        if (const auto pen = capsule_capsule_penetration(
+                center,
+                center,
+                radius,
+                cap.point_a,
+                cap.point_b,
+                cap.radius)) {
+            output.push_back(SphereContact{
+                .point = pen->contact_point,
+                .normal = pen->normal,
+                .penetration = pen->depth,
+                .node_id = cap.node_id,
+            });
+        }
+    }
+
+    for (const ConvexHullCollider& hull : convex_hulls_) {
+        if (hull.is_trigger ||
+            (hull.layer & layer_mask) == 0U ||
+            !aabb_overlaps(sphere_aabb, hull.world_aabb)) {
+            continue;
+        }
+        if (const auto pen = capsule_convex_hull_penetration(
+                center,
+                center,
+                radius,
+                std::span<const glm::vec3>(
+                    hull.vertices.data(), hull.vertex_count),
+                hull.centroid,
+                hull.axes)) {
+            output.push_back(SphereContact{
+                .point = pen->contact_point,
+                .normal = pen->normal,
+                .penetration = pen->depth,
+                .node_id = hull.node_id,
+            });
+        }
+    }
+
+    for (const TriangleMeshCollider& tmesh : triangle_meshes_) {
+        if (tmesh.is_trigger ||
+            (tmesh.layer & layer_mask) == 0U ||
+            !aabb_overlaps(sphere_aabb, tmesh.world_aabb)) {
+            continue;
+        }
+        const SharedTriangleMesh& shared =
+            shared_meshes_[tmesh.shared_mesh_index];
+        const Bounds local_aabb =
+            transform_aabb_matrix(sphere_aabb, tmesh.local_from_world);
+        if (!aabb_overlaps(local_aabb, shared.local_aabb)) {
+            continue;
+        }
+        for (const TriangleChunk& chunk : shared.chunks) {
+            if (!aabb_overlaps(local_aabb, chunk.local_aabb)) {
+                continue;
+            }
+            for (std::uint32_t t = chunk.first_triangle;
+                 t < chunk.first_triangle + chunk.triangle_count;
+                 ++t) {
+                const glm::vec3 v0 = glm::vec3(
+                    tmesh.world_from_local *
+                    glm::vec4(
+                        shared.positions[shared.indices[t * 3U + 0U]], 1.0F));
+                const glm::vec3 v1 = glm::vec3(
+                    tmesh.world_from_local *
+                    glm::vec4(
+                        shared.positions[shared.indices[t * 3U + 1U]], 1.0F));
+                const glm::vec3 v2 = glm::vec3(
+                    tmesh.world_from_local *
+                    glm::vec4(
+                        shared.positions[shared.indices[t * 3U + 2U]], 1.0F));
+                if (const auto pen = capsule_triangle_penetration(
+                        center, center, radius, v0, v1, v2)) {
+                    output.push_back(SphereContact{
+                        .point = pen->contact_point,
+                        .normal = pen->normal,
+                        .penetration = pen->depth,
+                        .node_id = tmesh.node_id,
+                    });
+                }
+            }
+        }
+    }
 }
 
 void CollisionWorld::query_capsule_triggers(
@@ -1212,6 +2235,67 @@ void CollisionWorld::query_capsule_triggers(
                 cap.point_b,
                 cap.radius)) {
             push_unique(cap.node_id, cap.node_uuid);
+        }
+    }
+
+    for (const ConvexHullCollider& hull : convex_hulls_) {
+        if (!hull.is_trigger ||
+            (hull.layer & layer_mask) == 0U ||
+            !aabb_overlaps(cap_aabb, hull.world_aabb)) {
+            continue;
+        }
+        if (capsule_convex_hull_penetration(
+                cap_a,
+                cap_b,
+                radius,
+                std::span<const glm::vec3>(
+                    hull.vertices.data(), hull.vertex_count),
+                hull.centroid,
+                hull.axes)) {
+            push_unique(hull.node_id, hull.node_uuid);
+        }
+    }
+
+    for (const TriangleMeshCollider& tmesh : triangle_meshes_) {
+        if (!tmesh.is_trigger ||
+            (tmesh.layer & layer_mask) == 0U ||
+            !aabb_overlaps(cap_aabb, tmesh.world_aabb)) {
+            continue;
+        }
+        const SharedTriangleMesh& shared =
+            shared_meshes_[tmesh.shared_mesh_index];
+        const Bounds local_cap_aabb =
+            transform_aabb_matrix(cap_aabb, tmesh.local_from_world);
+        if (!aabb_overlaps(local_cap_aabb, shared.local_aabb)) {
+            continue;
+        }
+        bool hit_any = false;
+        for (const TriangleChunk& chunk : shared.chunks) {
+            if (hit_any || !aabb_overlaps(local_cap_aabb, chunk.local_aabb)) {
+                continue;
+            }
+            for (std::uint32_t t = chunk.first_triangle;
+                 t < chunk.first_triangle + chunk.triangle_count;
+                 ++t) {
+                const glm::vec3 v0 = glm::vec3(
+                    tmesh.world_from_local *
+                    glm::vec4(
+                        shared.positions[shared.indices[t * 3U + 0U]], 1.0F));
+                const glm::vec3 v1 = glm::vec3(
+                    tmesh.world_from_local *
+                    glm::vec4(
+                        shared.positions[shared.indices[t * 3U + 1U]], 1.0F));
+                const glm::vec3 v2 = glm::vec3(
+                    tmesh.world_from_local *
+                    glm::vec4(
+                        shared.positions[shared.indices[t * 3U + 2U]], 1.0F));
+                if (capsule_triangle_penetration(
+                        cap_a, cap_b, radius, v0, v1, v2)) {
+                    push_unique(tmesh.node_id, tmesh.node_uuid);
+                    hit_any = true;
+                    break;
+                }
+            }
         }
     }
 

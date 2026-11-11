@@ -1,5 +1,6 @@
 #include "collision.hpp"
 #include "gameplay.hpp"
+#include "physics_world.hpp"
 #include "scene_document.hpp"
 #include "terrain_height.hpp"
 
@@ -372,6 +373,290 @@ int main() {
                 tracker.events()[0].node_id == trigger_box &&
                 tracker.events()[0].kind == vcr::TriggerEventKind::exited,
             "leaving a trigger volume emits one exited event");
+    }
+
+    // Cooked convex_hull, triangle_mesh, and compound submesh_boxes in CollisionWorld:
+    {
+        vcr::CookedModelCollision pyramid_collision{};
+        pyramid_collision.local_bounds = vcr::CookedCollisionBox{
+            .center = {0.0F, 1.0F, 0.0F},
+            .half_extents = {2.0F, 1.0F, 2.0F},
+        };
+        pyramid_collision.submesh_boxes = {
+            vcr::CookedCollisionBox{
+                .center = {-1.0F, 0.5F, 0.0F},
+                .half_extents = {0.5F, 0.5F, 0.5F},
+            },
+            vcr::CookedCollisionBox{
+                .center = {1.0F, 0.5F, 0.0F},
+                .half_extents = {0.5F, 0.5F, 0.5F},
+            },
+        };
+        pyramid_collision.convex_hull_vertices = {
+            {-2.0F, 0.0F, -2.0F},
+            {2.0F, 0.0F, -2.0F},
+            {2.0F, 0.0F, 2.0F},
+            {-2.0F, 0.0F, 2.0F},
+            {0.0F, 2.0F, 0.0F},
+        };
+        pyramid_collision.triangle_positions = pyramid_collision.convex_hull_vertices;
+        pyramid_collision.triangle_indices = {
+            0U, 1U, 4U,
+            1U, 2U, 4U,
+            2U, 3U, 4U,
+            3U, 0U, 4U,
+            0U, 3U, 2U,
+            0U, 2U, 1U,
+        };
+
+        const vcr::ModelCollisionProvider provider{
+            .context = &pyramid_collision,
+            .query = [](const void* const ctx,
+                        const std::string_view path) noexcept
+                -> const vcr::CookedModelCollision* {
+                return path == "models/pyramid.vcrasset.json"
+                    ? static_cast<const vcr::CookedModelCollision*>(ctx)
+                    : nullptr;
+            },
+        };
+
+        vcr::SceneDocument scene;
+        const auto compound_model = scene.create_node(
+            "CompoundPillars", vcr::SceneNodeKind::model);
+        scene.node(compound_model)->get().asset_path =
+            "models/pyramid.vcrasset.json";
+
+        const auto hull_model = scene.create_node(
+            "HullPyramid", vcr::SceneNodeKind::model);
+        scene.node(hull_model)->get().asset_path =
+            "models/pyramid.vcrasset.json";
+        scene.node(hull_model)->get().transform.translation = {8.0F, 0.0F, 0.0F};
+        vcr::ColliderComponent hull_col{};
+        hull_col.shape = vcr::ColliderShape::convex_hull;
+        expect(scene.set_collider(hull_model, hull_col), "attach convex_hull collider");
+
+        const auto tri_model = scene.create_node(
+            "TriPyramid", vcr::SceneNodeKind::model);
+        scene.node(tri_model)->get().asset_path =
+            "models/pyramid.vcrasset.json";
+        scene.node(tri_model)->get().transform.translation = {16.0F, 0.0F, 0.0F};
+        vcr::ColliderComponent tri_col{};
+        tri_col.shape = vcr::ColliderShape::triangle_mesh;
+        expect(scene.set_collider(tri_model, tri_col), "attach triangle_mesh collider");
+
+        vcr::CollisionWorld world;
+        world.rebuild_from_scene(scene, {}, {}, provider);
+
+        // Gap between the two submesh boxes at x = 0 should NOT hit!
+        const auto gap_miss = world.raycast({0.0F, 0.5F, 5.0F}, {0.0F, 0.0F, -1.0F}, 10.0F);
+        const auto left_hit = world.raycast({-1.0F, 0.5F, 5.0F}, {0.0F, 0.0F, -1.0F}, 10.0F);
+        expect(
+            !gap_miss.has_value() &&
+                left_hit.has_value() && left_hit->node_id == compound_model,
+            "auto_bounds model builds per-submesh compound OBBs preserving interior gaps");
+
+        const auto hull_hit = world.raycast({8.0F, 5.0F, 0.0F}, {0.0F, -1.0F, 0.0F}, 10.0F);
+        expect(
+            hull_hit.has_value() &&
+                hull_hit->node_id == hull_model &&
+                close_to(hull_hit->point.y, 2.0F, 0.05F),
+            "convex_hull collider raycasts against pyramid apex");
+
+        const auto tri_hit = world.raycast({16.0F, 5.0F, 1.0F}, {0.0F, -1.0F, 0.0F}, 10.0F);
+        expect(
+            tri_hit.has_value() &&
+                tri_hit->node_id == tri_model &&
+                close_to(tri_hit->point.y, 1.0F, 0.05F),
+            "triangle_mesh collider raycasts accurately against sloped pyramid face");
+
+        const auto tri_capsule =
+            world.resolve_capsule({16.0F, 0.8F, 1.0F}, 0.35F, 1.6F, 0.7F);
+        expect(
+            tri_capsule.resolved_feet.y > 0.95F,
+            "triangle_mesh collider resolves capsule penetration upward on sloped face");
+    }
+
+    // PhysicsWorld: free-fall, sleep, elastic bounce, stacking, raycast, and TransformRows:
+    {
+        vcr::SceneDocument scene;
+        const auto ground = scene.create_node("Ground", vcr::SceneNodeKind::ground);
+        scene.node(ground)->get().transform.translation = {0.0F, 0.0F, 0.0F};
+        scene.node(ground)->get().transform.scale = {20.0F, 1.0F, 20.0F};
+
+        const auto crate_a = scene.create_node("CrateA", vcr::SceneNodeKind::cube);
+        scene.node(crate_a)->get().transform.translation = {0.0F, 1.8F, 0.0F};
+        scene.node(crate_a)->get().transform.scale = {0.5F, 0.5F, 0.5F};
+        expect(
+            scene.set_rigid_body(
+                crate_a,
+                vcr::RigidBodyComponent{
+                    .mass = 15.0F,
+                    .linear_damping = 0.25F,
+                    .angular_damping = 0.5F,
+                    .restitution = 0.05F,
+                    .friction = 0.7F,
+                    .motion_type = vcr::RigidBodyMotionType::dynamic,
+                }),
+            "attach dynamic rigid_body to CrateA");
+
+        const auto crate_b = scene.create_node("CrateB", vcr::SceneNodeKind::cube);
+        scene.node(crate_b)->get().transform.translation = {0.0F, 3.1F, 0.0F};
+        scene.node(crate_b)->get().transform.scale = {0.5F, 0.5F, 0.5F};
+        expect(
+            scene.set_rigid_body(
+                crate_b,
+                vcr::RigidBodyComponent{
+                    .mass = 10.0F,
+                    .linear_damping = 0.25F,
+                    .angular_damping = 0.5F,
+                    .restitution = 0.05F,
+                    .friction = 0.7F,
+                    .motion_type = vcr::RigidBodyMotionType::dynamic,
+                }),
+            "attach dynamic rigid_body to stacked CrateB");
+
+        const auto bouncy_ball = scene.create_node("BouncyBall", vcr::SceneNodeKind::cube);
+        scene.node(bouncy_ball)->get().transform.translation = {4.0F, 5.0F, 0.0F};
+        vcr::ColliderComponent sphere_col{};
+        sphere_col.shape = vcr::ColliderShape::sphere;
+        sphere_col.radius = 0.5F;
+        expect(scene.set_collider(bouncy_ball, sphere_col), "attach sphere collider");
+        expect(
+            scene.set_rigid_body(
+                bouncy_ball,
+                vcr::RigidBodyComponent{
+                    .mass = 2.0F,
+                    .linear_damping = 0.0F,
+                    .angular_damping = 0.0F,
+                    .restitution = 0.9F,
+                    .friction = 0.2F,
+                    .motion_type = vcr::RigidBodyMotionType::dynamic,
+                }),
+            "attach high-restitution rigid_body to BouncyBall");
+
+        vcr::CollisionWorld static_world;
+        static_world.rebuild_from_scene(scene, {}, {}, {}, true);
+        expect(
+            static_world.solid_count() == 1U,
+            "CollisionWorld skips enabled rigid bodies when skip_enabled_rigid_bodies is true");
+
+        vcr::PhysicsWorld physics;
+        physics.rebuild_from_scene(scene);
+        expect(physics.body_count() == 3U, "PhysicsWorld builds three rigid bodies");
+
+        // Verify scale and translation TransformRows preservation at t=0:
+        const vcr::TransformRows rows_t0 = physics.body_transform_rows(0U);
+        expect(
+            close_to(rows_t0.x.x, 0.5F, 0.001F) &&
+                close_to(rows_t0.y.y, 0.5F, 0.001F) &&
+                close_to(rows_t0.z.z, 0.5F, 0.001F) &&
+                close_to(rows_t0.y.w, 1.8F, 0.001F),
+            "PhysicsWorld reconstructs exact scale and translation in TransformRows");
+
+        float max_rebound_y = 0.5F;
+        bool touched_ground = false;
+        for (int frame = 0; frame < 240; ++frame) {
+            physics.step(1.0F / 60.0F, static_world);
+            const auto ball_state = physics.body_state(bouncy_ball);
+            if (ball_state) {
+                if (ball_state->position.y < 0.85F) {
+                    touched_ground = true;
+                } else if (touched_ground) {
+                    max_rebound_y = std::max(max_rebound_y, ball_state->position.y);
+                }
+            }
+        }
+        expect(
+            touched_ground && max_rebound_y > 2.8F,
+            "high-restitution dynamic sphere rebounds strongly off static ground");
+
+        // Step another 3 seconds so stacked crates settle and sleep:
+        for (int frame = 0; frame < 180; ++frame) {
+            physics.step(1.0F / 60.0F, static_world);
+        }
+        const auto state_a = physics.body_state(crate_a);
+        const auto state_b = physics.body_state(crate_b);
+        expect(
+            state_a && state_b &&
+                close_to(state_a->position.y, 0.5F, 0.04F) &&
+                close_to(state_b->position.y, 1.5F, 0.06F) &&
+                std::abs(state_b->position.x) < 0.1F &&
+                state_a->sleeping && state_b->sleeping,
+            "two stacked dynamic crates settle stably at y=0.5 and y=1.5 and enter sleep");
+
+        const auto dyn_ray = physics.raycast({-5.0F, 1.5F, 0.0F}, {1.0F, 0.0F, 0.0F}, 10.0F);
+        expect(
+            dyn_ray.has_value() && dyn_ray->node_id == crate_b,
+            "PhysicsWorld::raycast hits dynamic stacked crate");
+    }
+
+    // PhysicsWorld + two-way CharacterController push & platform support:
+    {
+        vcr::SceneDocument scene;
+        const auto ground = scene.create_node("Ground", vcr::SceneNodeKind::ground);
+        scene.node(ground)->get().transform.translation = {0.0F, 0.0F, 0.0F};
+        scene.node(ground)->get().transform.scale = {20.0F, 1.0F, 20.0F};
+
+        const auto push_crate = scene.create_node("PushCrate", vcr::SceneNodeKind::cube);
+        scene.node(push_crate)->get().transform.translation = {0.0F, 0.5F, -1.1F};
+        scene.node(push_crate)->get().transform.scale = {0.5F, 0.5F, 0.5F};
+        expect(
+            scene.set_rigid_body(
+                push_crate,
+                vcr::RigidBodyComponent{
+                    .mass = 8.0F,
+                    .linear_damping = 0.1F,
+                    .angular_damping = 0.4F,
+                    .restitution = 0.05F,
+                    .friction = 0.25F,
+                    .motion_type = vcr::RigidBodyMotionType::dynamic,
+                    .lock_rotation = true,
+                }),
+            "attach light pushable rigid_body");
+
+        const auto platform = scene.create_node("Platform", vcr::SceneNodeKind::cube);
+        scene.node(platform)->get().transform.translation = {6.0F, 0.5F, 0.0F};
+        scene.node(platform)->get().transform.scale = {1.5F, 0.5F, 1.5F};
+        expect(
+            scene.set_rigid_body(
+                platform,
+                vcr::RigidBodyComponent{
+                    .mass = 100.0F,
+                    .motion_type = vcr::RigidBodyMotionType::kinematic,
+                }),
+            "attach kinematic platform rigid_body");
+
+        vcr::CollisionWorld static_world;
+        static_world.rebuild_from_scene(scene, {}, {}, {}, true);
+        vcr::PhysicsWorld physics;
+        physics.rebuild_from_scene(scene);
+
+        vcr::CharacterController character;
+        character.reset({0.0F, 0.0F, 0.0F}, 0.0F);
+        const vcr::CharacterInput walk_forward{.forward = true};
+        const float dt = 1.0F / 60.0F;
+        for (int frame = 0; frame < 60; ++frame) {
+            character.update(walk_forward, camera_forward, dt, static_world);
+            physics.apply_character_push(
+                character, {0.0F, 0.0F, -3.5F}, dt);
+            physics.step(dt, static_world);
+            physics.resolve_character_post_step(character, static_world, dt);
+        }
+        const auto pushed_state = physics.body_state(push_crate);
+        expect(
+            pushed_state && pushed_state->position.z < -1.5F,
+            "CharacterController walking into a dynamic crate pushes it forward");
+
+        // Drop character onto kinematic platform at (6, 1.0, 0):
+        character.reset({6.0F, 2.0F, 0.0F}, 0.0F);
+        for (int frame = 0; frame < 45; ++frame) {
+            character.update({}, camera_forward, dt, static_world);
+            physics.step(dt, static_world);
+            physics.resolve_character_post_step(character, static_world, dt);
+        }
+        expect(
+            character.grounded() && close_to(character.position().y, 1.0F, 0.05F),
+            "CharacterController lands and stands grounded on top of a kinematic rigid body");
     }
 
     if (failures != 0) {

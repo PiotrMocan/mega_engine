@@ -30,6 +30,8 @@ if (-not $process.Start()) {
     throw "Unable to start $ExePath"
 }
 $stderrTask = $process.StandardError.ReadToEndAsync()
+$smokePrefabFile = $null
+$smokePrefabDirCreated = $false
 
 function Send-McpMessage {
     param(
@@ -81,6 +83,11 @@ try {
         "editor.scene.duplicate_node",
         "editor.scene.set_collider",
         "editor.scene.remove_collider",
+        "editor.scene.set_rigid_body",
+        "editor.scene.remove_rigid_body",
+        "editor.prefab.save",
+        "editor.prefab.instantiate",
+        "editor.prefab.unpack",
         "editor.selection.set",
         "editor.camera.focus_selection",
         "editor.landscape.create_flat_ground",
@@ -393,6 +400,130 @@ try {
         throw "editor.scene.remove_collider failed to detach collider"
     }
 
+    $dupId = $duplicate.structuredContent.node.id
+    $setRb = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 804; method = "tools/call"
+        params = @{
+            name = "editor.scene.set_rigid_body"
+            arguments = @{
+                id = $dupId
+                motion_type = "dynamic"
+                mass = 24.5
+                restitution = 0.35
+                friction = 0.65
+            }
+        }
+    } 804
+    if ($setRb.isError -or
+        $setRb.structuredContent.node.rigid_body.motion_type -cne "dynamic" -or
+        [double]$setRb.structuredContent.node.rigid_body.mass -ne 24.5) {
+        throw "editor.scene.set_rigid_body failed to attach dynamic rigid body"
+    }
+
+    $assetRootPath = [string]$before.structuredContent.asset_root
+    if (-not [string]::IsNullOrWhiteSpace($assetRootPath)) {
+        $prefabsDir = Join-Path $assetRootPath "prefabs"
+        if (-not (Test-Path $prefabsDir)) {
+            $script:smokePrefabDirCreated = $true
+        }
+        $script:smokePrefabFile = Join-Path $prefabsDir "_mcp_smoke_test.vcrprefab.json"
+    }
+
+    $savePrefab = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 805; method = "tools/call"
+        params = @{
+            name = "editor.prefab.save"
+            arguments = @{
+                id = $dupId
+                path = "prefabs/_mcp_smoke_test.vcrprefab.json"
+                zero_root_translation = $true
+                attach_instance = $false
+            }
+        }
+    } 805
+    if ($savePrefab.isError -or
+        $savePrefab.structuredContent.path -cne "prefabs/_mcp_smoke_test.vcrprefab.json") {
+        throw "editor.prefab.save failed to write sandboxed prefab asset"
+    }
+
+    $instPrefab = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 806; method = "tools/call"
+        params = @{
+            name = "editor.prefab.instantiate"
+            arguments = @{
+                path = "prefabs/_mcp_smoke_test.vcrprefab.json"
+                root_name = "MCP Spawned Prefab"
+                translation = @(4.0, 2.0, -3.0)
+                overrides = @(
+                    @{
+                        node_index = 0
+                        rigid_body = @{
+                            motion_type = "kinematic"
+                            mass = 55.0
+                        }
+                    }
+                )
+            }
+        }
+    } 806
+    if ($instPrefab.isError -or
+        $instPrefab.structuredContent.instantiated_nodes -ne 1 -or
+        $instPrefab.structuredContent.root.uuid -ceq $duplicate.structuredContent.node.uuid -or
+        -not $instPrefab.structuredContent.root.prefab_instance.is_prefab_root -or
+        $instPrefab.structuredContent.root.rigid_body.motion_type -cne "kinematic" -or
+        [double]$instPrefab.structuredContent.root.rigid_body.mass -ne 55.0) {
+        throw "editor.prefab.instantiate failed to spawn overridden prefab instance"
+    }
+
+    $spawnedId = $instPrefab.structuredContent.root.id
+    $unpackPrefab = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 807; method = "tools/call"
+        params = @{
+            name = "editor.prefab.unpack"
+            arguments = @{ id = $spawnedId }
+        }
+    } 807
+    if ($unpackPrefab.isError -or
+        $unpackPrefab.structuredContent.unpacked_nodes -ne 1 -or
+        $null -ne $unpackPrefab.structuredContent.root.prefab_instance) {
+        throw "editor.prefab.unpack failed to detach prefab instance metadata"
+    }
+
+    $deleteSpawned = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 808; method = "tools/call"
+        params = @{
+            name = "editor.scene.delete_node"
+            arguments = @{ id = $spawnedId }
+        }
+    } 808
+    if ($deleteSpawned.isError) {
+        throw "editor.scene.delete_node failed to clean up spawned prefab"
+    }
+
+    $removeRb = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 809; method = "tools/call"
+        params = @{
+            name = "editor.scene.remove_rigid_body"
+            arguments = @{ id = $dupId }
+        }
+    } 809
+    if ($removeRb.isError -or
+        -not $removeRb.structuredContent.changed -or
+        $null -ne $removeRb.structuredContent.node.rigid_body) {
+        throw "editor.scene.remove_rigid_body failed to detach rigid body"
+    }
+
+    $reselectDup = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 810; method = "tools/call"
+        params = @{
+            name = "editor.selection.set"
+            arguments = @{ id = $dupId }
+        }
+    } 810
+    if ($reselectDup.isError) {
+        throw "editor.selection.set failed to restore duplicate selection"
+    }
+
     $focus = Send-McpMessage @{
         jsonrpc = "2.0"; id = 10; method = "tools/call"
         params = @{
@@ -574,4 +705,12 @@ finally {
         $process.WaitForExit()
     }
     $process.Dispose()
+    if (-not [string]::IsNullOrWhiteSpace($smokePrefabFile) -and (Test-Path $smokePrefabFile)) {
+        Remove-Item -LiteralPath $smokePrefabFile -Force -ErrorAction SilentlyContinue
+        $prefabParent = Split-Path -Parent $smokePrefabFile
+        if ($smokePrefabDirCreated -and (Test-Path $prefabParent) -and
+            @(Get-ChildItem -LiteralPath $prefabParent -Force).Count -eq 0) {
+            Remove-Item -LiteralPath $prefabParent -Force -ErrorAction SilentlyContinue
+        }
+    }
 }

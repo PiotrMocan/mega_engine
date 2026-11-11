@@ -1,16 +1,21 @@
 #pragma once
 
+#include "cooked_model_asset.hpp"
 #include "scene_components.hpp"
 #include "scene_document.hpp"
 #include "scene_uuid.hpp"
 #include "scene_visibility.hpp"
 
 #include <glm/mat3x3.hpp>
+#include <glm/mat4x4.hpp>
 #include <glm/vec3.hpp>
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace vcr {
@@ -32,6 +37,23 @@ struct ModelBoundsProvider {
     }
 };
 
+struct ModelCollisionProvider {
+    using Callback = const CookedModelCollision* (*)(
+        const void* context,
+        std::string_view asset_path) noexcept;
+
+    const void* context = nullptr;
+    Callback query = nullptr;
+
+    [[nodiscard]] const CookedModelCollision* operator()(
+        const std::string_view asset_path) const noexcept {
+        if (query == nullptr || asset_path.empty()) {
+            return nullptr;
+        }
+        return query(context, asset_path);
+    }
+};
+
 struct RaycastHit {
     glm::vec3 point{0.0F};
     glm::vec3 normal{0.0F, 1.0F, 0.0F};
@@ -50,6 +72,13 @@ struct CapsuleContactResult {
     bool grounded = false;
     bool hit_wall = false;
     bool hit_ceiling = false;
+};
+
+struct SphereContact {
+    glm::vec3 point{0.0F};
+    glm::vec3 normal{0.0F, 1.0F, 0.0F};
+    float penetration = 0.0F;
+    SceneNodeId node_id{};
 };
 
 enum class TriggerEventKind : std::uint8_t {
@@ -85,12 +114,16 @@ public:
     void rebuild_from_scene(
         const SceneDocument& scene,
         SceneNodeId excluded_node = {},
-        ModelBoundsProvider model_bounds = {});
+        ModelBoundsProvider model_bounds = {},
+        ModelCollisionProvider model_collision = {},
+        bool skip_enabled_rigid_bodies = false);
 
     [[nodiscard]] bool empty() const noexcept {
         return boxes_.empty() &&
                spheres_.empty() &&
                capsules_.empty() &&
+               convex_hulls_.empty() &&
+               triangle_meshes_.empty() &&
                !terrain_enabled_;
     }
 
@@ -126,6 +159,14 @@ public:
         float height,
         float walkable_normal_y,
         std::uint32_t layer_mask = 0xFFFFFFFFU) const noexcept;
+
+    // Collects contacts between a world-space sphere (or point/hull vertex with
+    // radius > 0) and all non-trigger static colliders + procedural terrain.
+    void gather_sphere_contacts(
+        glm::vec3 center,
+        float radius,
+        std::uint32_t layer_mask,
+        std::vector<SphereContact>& output) const;
 
     void query_capsule_triggers(
         glm::vec3 feet,
@@ -170,9 +211,56 @@ private:
         bool is_trigger = false;
     };
 
+    struct ConvexHullCollider {
+        std::array<glm::vec3, maximum_cooked_convex_hull_vertices> vertices{};
+        std::uint32_t vertex_count = 0U;
+        glm::vec3 centroid{0.0F};
+        glm::mat3 axes{1.0F};
+        Bounds world_aabb{};
+        SceneNodeId node_id{};
+        SceneUuid node_uuid{};
+        std::uint32_t layer = 1U;
+        std::uint32_t mask = 0xFFFFFFFFU;
+        bool is_trigger = false;
+    };
+
+    struct TriangleChunk {
+        Bounds local_aabb{};
+        std::uint32_t first_triangle = 0U;
+        std::uint32_t triangle_count = 0U;
+    };
+
+    struct SharedTriangleMesh {
+        std::string key{};
+        std::vector<glm::vec3> positions{};
+        std::vector<std::uint32_t> indices{};
+        std::vector<TriangleChunk> chunks{};
+        Bounds local_aabb{};
+    };
+
+    struct TriangleMeshCollider {
+        std::uint32_t shared_mesh_index = 0U;
+        glm::mat4 world_from_local{1.0F};
+        glm::mat4 local_from_world{1.0F};
+        glm::mat3 normal_matrix{1.0F};
+        Bounds world_aabb{};
+        SceneNodeId node_id{};
+        SceneUuid node_uuid{};
+        std::uint32_t layer = 1U;
+        std::uint32_t mask = 0xFFFFFFFFU;
+        bool is_trigger = false;
+    };
+
+    [[nodiscard]] std::optional<std::uint32_t> intern_triangle_mesh(
+        std::string_view key,
+        const CookedModelCollision& collision);
+
     std::vector<OrientedBox> boxes_{};
     std::vector<SphereCollider> spheres_{};
     std::vector<CapsuleCollider> capsules_{};
+    std::vector<ConvexHullCollider> convex_hulls_{};
+    std::vector<SharedTriangleMesh> shared_meshes_{};
+    std::vector<TriangleMeshCollider> triangle_meshes_{};
     std::vector<SceneWorldNode> world_nodes_scratch_{};
     std::vector<std::uint32_t> ancestor_scratch_{};
     SceneNodeId terrain_node_id_{};

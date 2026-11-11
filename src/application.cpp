@@ -1579,6 +1579,11 @@ void Application::execute_mcp_command(const McpCommand& command) {
     case McpCommandType::editor_find_by_uuid:
     case McpCommandType::editor_set_collider:
     case McpCommandType::editor_remove_collider:
+    case McpCommandType::editor_set_rigid_body:
+    case McpCommandType::editor_remove_rigid_body:
+    case McpCommandType::editor_prefab_save:
+    case McpCommandType::editor_prefab_instantiate:
+    case McpCommandType::editor_prefab_unpack:
     case McpCommandType::editor_scatter_model:
         fail("editor-only MCP command is unavailable in the runtime profile");
         return;

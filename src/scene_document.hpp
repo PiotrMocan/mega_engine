@@ -94,6 +94,8 @@ struct SceneNodeRecord {
     SceneUuid uuid{};
     SceneNode value{};
     std::optional<ColliderComponent> collider{};
+    std::optional<RigidBodyComponent> rigid_body{};
+    std::optional<PrefabInstanceComponent> prefab_instance{};
     std::uint32_t parent_record_index =
         invalid_scene_node_index;
 };
@@ -215,6 +217,42 @@ public:
         return colliders_;
     }
 
+    [[nodiscard]] bool set_rigid_body(
+        SceneNodeId id,
+        const RigidBodyComponent& rigid_body);
+    [[nodiscard]] bool remove_rigid_body(SceneNodeId id) noexcept;
+    [[nodiscard]] bool has_rigid_body(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<
+        std::reference_wrapper<const RigidBodyComponent>>
+        rigid_body(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<
+        std::reference_wrapper<RigidBodyComponent>>
+        rigid_body_mut(SceneNodeId id) noexcept;
+    [[nodiscard]] const SparseComponentPool<
+        SceneNodeId,
+        RigidBodyComponent,
+        max_scene_nodes>& rigid_bodies() const noexcept {
+        return rigid_bodies_;
+    }
+
+    [[nodiscard]] bool set_prefab_instance(
+        SceneNodeId id,
+        const PrefabInstanceComponent& prefab_instance);
+    [[nodiscard]] bool remove_prefab_instance(SceneNodeId id) noexcept;
+    [[nodiscard]] bool has_prefab_instance(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<
+        std::reference_wrapper<const PrefabInstanceComponent>>
+        prefab_instance(SceneNodeId id) const noexcept;
+    [[nodiscard]] SceneNodeId enclosing_prefab_root(
+        SceneNodeId id) const noexcept;
+    [[nodiscard]] std::uint32_t unpack_prefab_instance(SceneNodeId id);
+    [[nodiscard]] const SparseComponentPool<
+        SceneNodeId,
+        PrefabInstanceComponent,
+        max_scene_nodes>& prefab_instances() const noexcept {
+        return prefab_instances_;
+    }
+
     void mark_content_changed() noexcept;
     [[nodiscard]] std::uint32_t last_transform_updates() const noexcept {
         return last_transform_updates_;
@@ -304,6 +342,14 @@ private:
         SceneNodeId,
         ColliderComponent,
         max_scene_nodes> colliders_{};
+    SparseComponentPool<
+        SceneNodeId,
+        RigidBodyComponent,
+        max_scene_nodes> rigid_bodies_{};
+    SparseComponentPool<
+        SceneNodeId,
+        PrefabInstanceComponent,
+        max_scene_nodes> prefab_instances_{};
     std::uint32_t first_root_ = invalid_scene_node_index;
     std::uint32_t last_root_ = invalid_scene_node_index;
     std::uint32_t live_count_ = 0U;

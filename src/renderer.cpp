@@ -1455,6 +1455,7 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
 
     EditorModelAsset gpu_asset{};
     gpu_asset.bounds = Bounds{(minimum + maximum) * 0.5F, (maximum - minimum) * 0.5F};
+    gpu_asset.collision = std::move(model.collision);
     gpu_asset.relative_path = relative_path;
     const glm::vec3 dimensions = maximum - minimum;
     const float largest_dimension = std::max(
@@ -1607,6 +1608,7 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
         VkDescriptorSet material_descriptor =
             material_descriptors.front();
         MaterialTessellation tessellation{};
+        std::uint32_t coverage = 0U;
         if (source.material_index < model.materials.size()) {
             material =
                 model.materials[source.material_index].factors;
@@ -1617,6 +1619,7 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
                 material_descriptors[source.material_index];
             tessellation =
                 model.materials[source.material_index].tessellation;
+            coverage = model.materials[source.material_index].coverage;
         }
         glm::vec3 gi_albedo(1);
         if (source.material_index < model.materials.size()) {
@@ -1657,6 +1660,7 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
             maximum_uv = glm::max(maximum_uv, coordinate);
         }
         gpu_asset.submeshes.push_back(EditorModelSubmesh{
+            .coverage = coverage,
             .material_relative_path = std::move(material_relative_path),
             .material = sanitize_pbr_material(material),
             .material_descriptor_set = material_descriptor,
@@ -1801,6 +1805,19 @@ std::optional<Bounds> Renderer::editor_node_bounds(
     };
 }
 
+const CookedModelCollision* Renderer::editor_model_collision(
+    const std::string_view relative_path) const noexcept {
+    if (relative_path.empty()) {
+        return nullptr;
+    }
+    for (const EditorModelAsset& asset : editor_model_assets_) {
+        if (asset.ready && asset.relative_path == relative_path) {
+            return &asset.collision;
+        }
+    }
+    return nullptr;
+}
+
 bool Renderer::update_editor_scene(
     const SceneRenderView& view,
     const std::filesystem::path& asset_root,
@@ -1927,6 +1944,7 @@ bool Renderer::update_editor_scene(
                 scene_metadata_.push_back({model.id, asset.bounds, false});
             }
             editor_model_draws_.push_back(EditorModelDraw{
+                .coverage = submesh.coverage,
                 .material_descriptor_set = submesh.material_descriptor_set,
                 .tessellation = submesh.tessellation,
                 .tessellation_uv_bounds = submesh.tessellation_uv_bounds,
@@ -4080,6 +4098,10 @@ void Renderer::record_shadow_map(VkCommandBuffer command_buffer, FrameContext &f
                         desired_pipeline);
                     bound_model_shadow_pipeline = desired_pipeline;
                 }
+                vkCmdSetCullMode(command_buffer, (draw.coverage & 2U) != 0U
+                    ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT);
+                vkCmdPushConstants(command_buffer, pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT,
+                                   12U, sizeof(draw.coverage), &draw.coverage);
                 if (draw.material_descriptor_set != bound_shadow_material_set) {
                     vkCmdBindDescriptorSets(
                         command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -5545,6 +5567,14 @@ void Renderer::create_pipeline() {
         .dynamicStateCount = static_cast<std::uint32_t>(dynamic_states.size()),
         .pDynamicStates = dynamic_states.data(),
     };
+    // Cull mode is core Vulkan 1.3; opaque geometry retains its static state.
+    const std::array model_dynamic_states{
+        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_CULL_MODE};
+    const VkPipelineDynamicStateCreateInfo model_dynamic_state{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = static_cast<std::uint32_t>(model_dynamic_states.size()),
+        .pDynamicStates = model_dynamic_states.data(),
+    };
     const VkFormat color_format = swapchain_.color_format();
     const VkPipelineRenderingCreateInfo rendering_info{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
@@ -5568,7 +5598,7 @@ void Renderer::create_pipeline() {
         .layout = pipeline_layout_,
     };
     const auto create_prepass_variants =
-        [this, &depth_stencil, &cached_shader](
+        [this, &depth_stencil, &cached_shader, &model_dynamic_state](
             const VkGraphicsPipelineCreateInfo &source,
             DeviceObject<VkPipeline> &equal,
             DeviceObject<VkPipeline> &depth,
@@ -5592,6 +5622,30 @@ void Renderer::create_pipeline() {
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
             };
             info.pNext = &rendering;
+            if (source.pDynamicState == &model_dynamic_state) {
+                // Use the color vertex/evaluation path so masked prepass depth,
+                // UVs and LOD coverage agree exactly with EQUAL color shading.
+                std::array<VkPipelineShaderStageCreateInfo, 4U> stages{};
+                std::copy_n(source.pStages, source.stageCount, stages.begin());
+                stages[source.stageCount - 1U] = VkPipelineShaderStageCreateInfo{
+                    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                    .module = cached_shader("editor_model_depth.frag.spv"), .pName = "main"};
+                info.pStages = stages.data();
+                info.pDepthStencilState = &depth_stencil;
+                info.pColorBlendState = &no_color;
+                VK_CHECK(vkCreateGraphicsPipelines(context_->device(), pipeline_cache_, 1, &info,
+                    nullptr, depth.put(context_->device(), vkDestroyPipeline)));
+                context_->set_debug_name(VK_OBJECT_TYPE_PIPELINE, handle_value(depth.get()),
+                                        "model alpha and LOD depth coverage pipeline");
+                if (fade_depth != nullptr) {
+                    VK_CHECK(vkCreateGraphicsPipelines(context_->device(), pipeline_cache_, 1, &info,
+                        nullptr, fade_depth->put(context_->device(), vkDestroyPipeline)));
+                    context_->set_debug_name(VK_OBJECT_TYPE_PIPELINE, handle_value(fade_depth->get()),
+                                            "model LOD and alpha depth coverage pipeline");
+                }
+                return;
+            }
             const bool tessellated = source.pTessellationState != nullptr;
             std::array<VkPipelineShaderStageCreateInfo, 3U>
                 tessellated_depth_stages{};
@@ -5720,6 +5774,7 @@ void Renderer::create_pipeline() {
             editor_model_stages.data();
         editor_model_pipeline_info.pVertexInputState =
             &editor_model_vertex_input;
+        editor_model_pipeline_info.pDynamicState = &model_dynamic_state;
         create_prepass_variants(editor_model_pipeline_info, equal_direct_.models,
                                 depth_geometry_.models, &lod_depth_model_);
         VK_CHECK(vkCreateGraphicsPipelines(
@@ -5842,7 +5897,7 @@ void Renderer::create_pipeline() {
     const auto create_aa_geometry_pipeline =
         [this, &gi_specialization, &pipeline_info, &aa_rendering_info, &aa_color_blend,
          &spatial_rendering_info, &color_blend, &create_prepass_variants,
-         &patch_input_assembly, &tessellation_state, &cached_shader](
+         &patch_input_assembly, &tessellation_state, &cached_shader, &model_dynamic_state](
             const std::filesystem::path &vertex_path, const std::filesystem::path &fragment_path,
             const VkPipelineVertexInputStateCreateInfo &vertex_input_state,
             const VkPipelineInputAssemblyStateCreateInfo &input_assembly_state,
@@ -5909,6 +5964,8 @@ void Renderer::create_pipeline() {
             info.stageCount = shader_stage_count;
             info.pStages = shader_stages.data();
             info.pVertexInputState = &vertex_input_state;
+            if (vertex_path.string().starts_with("editor_model"))
+                info.pDynamicState = &model_dynamic_state;
             info.pInputAssemblyState = &input_assembly_state;
             if (tessellated_model) {
                 info.pInputAssemblyState = &patch_input_assembly;
@@ -6086,7 +6143,7 @@ void Renderer::create_pipeline() {
         [this, &gi_specialization, &pipeline_info, &create_prepass_variants,
          &sss_spatial_rendering, &sss_temporal_rendering,
          &sss_spatial_blend, &sss_temporal_blend,
-         &patch_input_assembly, &tessellation_state, &cached_shader](
+         &patch_input_assembly, &tessellation_state, &cached_shader, &model_dynamic_state](
             const std::filesystem::path& vertex_path,
             const std::filesystem::path& fragment_path,
             const VkPipelineVertexInputStateCreateInfo& vertex_input_state,
@@ -6147,6 +6204,8 @@ void Renderer::create_pipeline() {
             info.stageCount = stage_count;
             info.pStages = stages.data();
             info.pVertexInputState = &vertex_input_state;
+            if (vertex_path.string().starts_with("editor_model"))
+                info.pDynamicState = &model_dynamic_state;
             info.pInputAssemblyState = &input_assembly_state;
             if (tessellated_model) {
                 info.pInputAssemblyState = &patch_input_assembly;
@@ -6508,9 +6567,20 @@ void Renderer::create_pipeline() {
         context_->device(), pipeline_cache_, 1, &authored_shadow_info, nullptr,
         authored_shadow_pipeline_.put(context_->device(), vkDestroyPipeline)));
     auto model_shadow_input = editor_model_vertex_input;
-    model_shadow_input.vertexAttributeDescriptionCount = 1U;
+    model_shadow_input.vertexAttributeDescriptionCount = 3U;
+    const auto model_shadow_shader = load_shader("editor_model_shadow.vert.spv");
+    const auto model_shadow_fragment = load_shader("editor_model_depth.frag.spv");
+    const std::array model_shadow_stages{
+        VkPipelineShaderStageCreateInfo{.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = model_shadow_shader.get(), .pName = "main"},
+        VkPipelineShaderStageCreateInfo{.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = model_shadow_fragment.get(), .pName = "main"},
+    };
     VkGraphicsPipelineCreateInfo model_shadow_info = authored_shadow_info;
     model_shadow_info.pVertexInputState = &model_shadow_input;
+    model_shadow_info.stageCount = static_cast<std::uint32_t>(model_shadow_stages.size());
+    model_shadow_info.pStages = model_shadow_stages.data();
+    model_shadow_info.pDynamicState = &model_dynamic_state;
     VK_CHECK(vkCreateGraphicsPipelines(
         context_->device(), pipeline_cache_, 1, &model_shadow_info, nullptr,
         model_shadow_pipeline_.put(context_->device(), vkDestroyPipeline)));
@@ -7877,6 +7947,10 @@ void Renderer::record_commands(
                     for (std::size_t draw_index = 0; include_models && draw_index < model_draws.size();
                          ++draw_index) {
                         const auto &draw = model_draws[draw_index];
+                        vkCmdSetCullMode(command_buffer, (draw.coverage & 2U) != 0U
+                            ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT);
+                        vkCmdPushConstants(command_buffer, pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT,
+                                           12U, sizeof(draw.coverage), &draw.coverage);
                         const bool tessellated_draw =
                             model_tessellation_enabled_ &&
                             draw.tessellation.enabled();

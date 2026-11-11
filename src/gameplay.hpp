@@ -8,6 +8,7 @@
 namespace vcr {
 
 class CollisionWorld;
+class PhysicsWorld;
 
 struct CharacterInput {
     bool forward = false;
@@ -49,6 +50,10 @@ public:
         float delta_seconds,
         const CollisionWorld& world,
         std::uint32_t layer_mask = 0xFFFFFFFFU) noexcept;
+    void apply_external_resolution(
+        glm::vec3 resolved_feet,
+        bool grounded_on_body,
+        bool hit_ceiling_on_body) noexcept;
 
     [[nodiscard]] const CharacterConfig& config() const noexcept { return config_; }
     [[nodiscard]] glm::vec3 position() const noexcept { return position_; }
@@ -89,6 +94,11 @@ public:
     [[nodiscard]] glm::vec3 position(
         glm::vec3 character_feet,
         const CollisionWorld& world,
+        std::uint32_t layer_mask = 0xFFFFFFFFU) const noexcept;
+    [[nodiscard]] glm::vec3 position(
+        glm::vec3 character_feet,
+        const CollisionWorld& world,
+        const PhysicsWorld& physics_world,
         std::uint32_t layer_mask = 0xFFFFFFFFU) const noexcept;
     [[nodiscard]] float yaw() const noexcept { return yaw_radians_; }
     [[nodiscard]] float pitch() const noexcept { return pitch_radians_; }

@@ -46,6 +46,7 @@
 #include <assimp/config.h>
 #include <assimp/Importer.hpp>
 #include <assimp/material.h>
+#include <assimp/GltfMaterial.h>
 #include <assimp/postprocess.h>
 #include <assimp/scene.h>
 #endif
@@ -1598,11 +1599,20 @@ import_materials(
             std::filesystem::path("materials") /
             (std::to_string(material_index) + "_" +
              material_name + ".vcrmaterial.json");
+        aiString alpha_mode;
+        static_cast<void>(material_observer->Get(AI_MATKEY_GLTF_ALPHAMODE, alpha_mode));
+        float alpha_cutoff = 0.5F;
+        static_cast<void>(material_observer->Get(AI_MATKEY_GLTF_ALPHACUTOFF, alpha_cutoff));
+        int double_sided = 0;
+        static_cast<void>(material_observer->Get(AI_MATKEY_TWOSIDED, double_sided));
         const Json metadata{
             {"schema", asset_schema},
             {"version", asset_schema_version},
             {"kind", "material"},
             {"name", material_name},
+            {"alpha_mode", std::string_view(alpha_mode.C_Str()) == "MASK" ? "mask" : "opaque"},
+            {"alpha_cutoff", std::isfinite(alpha_cutoff) ? std::clamp(alpha_cutoff, 0.0F, 1.0F) : 0.5F},
+            {"double_sided", double_sided != 0},
             {"pbr",
              {
                  {"base_color",
@@ -2027,6 +2037,116 @@ import_model(
         }
         submesh_metadata.push_back(std::move(entry));
     }
+    Json collision_metadata = Json::object();
+    if (!vertices.empty()) {
+        std::array<float, 3U> min_pt = vertices.front().position;
+        std::array<float, 3U> max_pt = min_pt;
+        for (const MeshVertex& v : vertices) {
+            for (std::size_t axis = 0U; axis < 3U; ++axis) {
+                min_pt[axis] = std::min(min_pt[axis], v.position[axis]);
+                max_pt[axis] = std::max(max_pt[axis], v.position[axis]);
+            }
+        }
+        const std::array<float, 3U> bounds_center{
+            0.5F * (min_pt[0] + max_pt[0]),
+            0.5F * (min_pt[1] + max_pt[1]),
+            0.5F * (min_pt[2] + max_pt[2]),
+        };
+        const std::array<float, 3U> bounds_extents{
+            std::max(0.5F * (max_pt[0] - min_pt[0]), 0.001F),
+            std::max(0.5F * (max_pt[1] - min_pt[1]), 0.001F),
+            std::max(0.5F * (max_pt[2] - min_pt[2]), 0.001F),
+        };
+
+        Json boxes_json = Json::array();
+        const std::size_t max_boxes =
+            std::min<std::size_t>(submeshes.size(), 64U);
+        for (std::size_t s = 0U; s < max_boxes; ++s) {
+            const MeshSubmesh& sub = submeshes[s];
+            if (sub.index_count == 0U) {
+                continue;
+            }
+            std::array<float, 3U> smin =
+                vertices[indices[static_cast<std::size_t>(sub.first_index)]]
+                    .position;
+            std::array<float, 3U> smax = smin;
+            for (std::uint64_t idx = sub.first_index;
+                 idx < sub.first_index + sub.index_count;
+                 ++idx) {
+                const auto& p =
+                    vertices[indices[static_cast<std::size_t>(idx)]].position;
+                for (std::size_t axis = 0U; axis < 3U; ++axis) {
+                    smin[axis] = std::min(smin[axis], p[axis]);
+                    smax[axis] = std::max(smax[axis], p[axis]);
+                }
+            }
+            boxes_json.push_back(Json{
+                {"center",
+                 {0.5F * (smin[0] + smax[0]),
+                  0.5F * (smin[1] + smax[1]),
+                  0.5F * (smin[2] + smax[2])}},
+                {"half_extents",
+                 {std::max(0.5F * (smax[0] - smin[0]), 0.001F),
+                  std::max(0.5F * (smax[1] - smin[1]), 0.001F),
+                  std::max(0.5F * (smax[2] - smin[2]), 0.001F)}},
+            });
+        }
+
+        constexpr std::array<std::array<float, 3U>, 42U> hull_dirs{{
+            {{1.0F, 0.0F, 0.0F}},   {{-1.0F, 0.0F, 0.0F}},  {{0.0F, 1.0F, 0.0F}},
+            {{0.0F, -1.0F, 0.0F}},  {{0.0F, 0.0F, 1.0F}},   {{0.0F, 0.0F, -1.0F}},
+            {{1.0F, 1.0F, 0.0F}},   {{1.0F, -1.0F, 0.0F}},  {{-1.0F, 1.0F, 0.0F}},
+            {{-1.0F, -1.0F, 0.0F}}, {{1.0F, 0.0F, 1.0F}},   {{1.0F, 0.0F, -1.0F}},
+            {{-1.0F, 0.0F, 1.0F}},  {{-1.0F, 0.0F, -1.0F}}, {{0.0F, 1.0F, 1.0F}},
+            {{0.0F, 1.0F, -1.0F}},  {{0.0F, -1.0F, 1.0F}},  {{0.0F, -1.0F, -1.0F}},
+            {{1.0F, 1.0F, 1.0F}},   {{1.0F, 1.0F, -1.0F}},  {{1.0F, -1.0F, 1.0F}},
+            {{1.0F, -1.0F, -1.0F}}, {{-1.0F, 1.0F, 1.0F}},  {{-1.0F, 1.0F, -1.0F}},
+            {{-1.0F, -1.0F, 1.0F}}, {{-1.0F, -1.0F, -1.0F}},
+            {{2.0F, 1.0F, 0.0F}},   {{-2.0F, 1.0F, 0.0F}},  {{2.0F, -1.0F, 0.0F}},
+            {{-2.0F, -1.0F, 0.0F}}, {{0.0F, 2.0F, 1.0F}},   {{0.0F, -2.0F, 1.0F}},
+            {{0.0F, 2.0F, -1.0F}},  {{0.0F, -2.0F, -1.0F}}, {{1.0F, 0.0F, 2.0F}},
+            {{-1.0F, 0.0F, 2.0F}},  {{1.0F, 0.0F, -2.0F}},  {{-1.0F, 0.0F, -2.0F}},
+            {{2.0F, 1.0F, 1.0F}},   {{-2.0F, 1.0F, 1.0F}},  {{1.0F, 2.0F, 1.0F}},
+            {{1.0F, 1.0F, 2.0F}},
+        }};
+        std::vector<std::array<float, 3U>> hull_pts;
+        hull_pts.reserve(hull_dirs.size());
+        for (const auto& dir : hull_dirs) {
+            float best_dot = -std::numeric_limits<float>::infinity();
+            std::array<float, 3U> best_pos = vertices.front().position;
+            for (const MeshVertex& v : vertices) {
+                const float d = dir[0] * v.position[0] +
+                                dir[1] * v.position[1] +
+                                dir[2] * v.position[2];
+                if (d > best_dot) {
+                    best_dot = d;
+                    best_pos = v.position;
+                }
+            }
+            const bool dup = std::ranges::any_of(
+                hull_pts, [&](const std::array<float, 3U>& existing) noexcept {
+                    const float dx = existing[0] - best_pos[0];
+                    const float dy = existing[1] - best_pos[1];
+                    const float dz = existing[2] - best_pos[2];
+                    return (dx * dx + dy * dy + dz * dz) <= 1.0e-8F;
+                });
+            if (!dup && hull_pts.size() < 64U) {
+                hull_pts.push_back(best_pos);
+            }
+        }
+        Json hull_json = Json::array();
+        for (const auto& pt : hull_pts) {
+            hull_json.push_back({pt[0], pt[1], pt[2]});
+        }
+        collision_metadata = Json{
+            {"local_bounds",
+             {{"center", bounds_center}, {"half_extents", bounds_extents}}},
+            {"boxes", std::move(boxes_json)},
+            {"convex_hull_vertices", std::move(hull_json)},
+            {"triangle_count", indices.size() / 3U},
+        };
+    }
+
     Json material_metadata = Json::array();
     for (const std::filesystem::path& material : *materials) {
         material_metadata.push_back(material.generic_string());
@@ -2059,6 +2179,7 @@ import_model(
          }},
         {"submeshes", std::move(submesh_metadata)},
         {"materials", std::move(material_metadata)},
+        {"collision", std::move(collision_metadata)},
         {"coordinate_space", "assimp_pretransformed_source"},
     };
     const auto metadata_written = write_json_file(

@@ -6,6 +6,7 @@
 #include "voxel_sampling.glsl"
 #include "punctual_lighting.glsl"
 #include "lod_fade.glsl"
+#include "material_coverage.glsl"
 #include "subsurface_output.glsl"
 
 // Locations 0..7 intentionally match scene_aa.frag's vertex interface.
@@ -114,11 +115,11 @@ vec3 sampleWorldNormal(vec2 uvDx, vec2 uvDy)
     const vec3 tangentNormal = safeNormalize(
         textureGrad(materialNormalTexture, inUv, uvDx, uvDy).xyz * 2.0 - 1.0,
         vec3(0.0, 0.0, 1.0));
-    return safeNormalize(
+    return materialFaceNormal(pushConstants.padding, safeNormalize(
         tangent * tangentNormal.x
         + bitangent * tangentNormal.y
         + geometricNormal * tangentNormal.z,
-        geometricNormal);
+        geometricNormal));
 }
 
 float sunVisibility(vec3 normal, vec3 lightDirection)
@@ -173,6 +174,7 @@ void main()
     const vec4 sampledBaseColor =
         textureGrad(materialBaseColorTexture, inUv, uvDx, uvDy);
     const vec4 baseColor = sampledBaseColor * inBaseColor;
+    if (!materialKeepsAlpha(pushConstants.padding, baseColor.a)) discard;
     vec3 shadedColor = clamp(baseColor.rgb, vec3(0.0), vec3(1.0));
     PbrLightingComponents lightingComponents;
     lightingComponents.diffuse = vec3(0.0);
@@ -183,7 +185,7 @@ void main()
             normalize(frame.cameraPosition.xyz - inWorldPosition);
         const vec3 lightDirection =
             normalize(frame.sunDirectionIntensity.xyz);
-        const float visibility = sunVisibility(normalize(inWorldNormal), lightDirection);
+        const float visibility = sunVisibility(materialFaceNormal(pushConstants.padding, normalize(inWorldNormal)), lightDirection);
         vec3 diffuseAmbient=frame.skyAmbient.rgb*frame.skyAmbient.a;
         if(lighting.options.x>0.5) diffuseAmbient=(lighting.skyZenith.rgb+lighting.skyHorizon.rgb)*0.175;
         if(voxelGiCompiled && lighting.options.y>0.5) diffuseAmbient=voxelDiffuse(inWorldPosition,normal);
