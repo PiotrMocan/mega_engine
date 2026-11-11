@@ -5,6 +5,7 @@
 
 #include <glm/vec2.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -140,6 +141,21 @@ struct RtMaskedTriangle {
     float effective_cutoff = 0.0F;
 };
 static_assert(sizeof(RtMaskedTriangle) == 32U);
+
+inline constexpr std::uint32_t rt_initial_masked_triangle_capacity = 524'288U;
+// TLAS instanceCustomIndex is 24-bit. Keep the complete triangle range inside
+// that address space, including the opaque sentinel at index zero.
+inline constexpr std::uint32_t rt_max_masked_triangle_capacity = 16'000'000U;
+[[nodiscard]] constexpr std::uint32_t rt_masked_triangle_capacity(
+    std::uint32_t current, std::uint64_t required, std::uint64_t storage_range) noexcept {
+    const auto device_limit = storage_range / sizeof(RtMaskedTriangle);
+    const auto limit = std::min<std::uint64_t>(device_limit, rt_max_masked_triangle_capacity);
+    if (required > limit || current > limit) return 0;
+    std::uint64_t capacity = current;
+    if (capacity == 0) capacity = std::min<std::uint64_t>(rt_initial_masked_triangle_capacity, limit);
+    while (capacity < required) capacity = capacity > limit / 2 ? limit : capacity * 2;
+    return static_cast<std::uint32_t>(capacity);
+}
 
 // Packs a base-color texture's alpha channel into a 1024x1024 R8_UNORM table
 // (4 texels per little-endian uint32 word = 1 MiB) in the exact top-to-bottom

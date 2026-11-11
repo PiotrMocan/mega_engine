@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <ranges>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -11,9 +12,10 @@ namespace vcr {
 void prepare_authored_model_lods(CookedModelAsset &model,
                                 std::span<const CookedModelAsset> levels,
                                 const std::size_t maximum_geometry_bytes) {
-    if (levels.size() != 2 || model.lods.size() != 2) {
-        throw std::invalid_argument("Authored LOD requires exactly two levels");
+    if ((levels.size() != 2 && levels.size() != 3) || model.lods.size() != levels.size()) {
+        throw std::invalid_argument("Authored LOD requires LOD1/LOD2 and optional LOD3");
     }
+    const auto supplied_count = levels.size() + 1;
     float previous_error = 0;
     for (const auto &reference : model.lods) {
         if (!std::isfinite(reference.geometric_error) ||
@@ -32,12 +34,12 @@ void prepare_authored_model_lods(CookedModelAsset &model,
     // Store indices, not borrowed pointers, while validating every source before
     // allocating the combined buffers. All output remains local until commit.
     using Buckets = std::vector<std::vector<std::size_t>>;
-    std::array<Buckets, 3> buckets;
+    std::array<Buckets, model_lod_count> buckets;
     const auto source = [&](std::size_t level) -> const CookedModelAsset & {
         return level == 0 ? model : levels[level - 1];
     };
     std::size_t vertex_count = 0, index_count = 0, bytes = 0;
-    for (std::size_t level = 0; level < 3; ++level) {
+    for (std::size_t level = 0; level < supplied_count; ++level) {
         const auto &asset = source(level);
         if (asset.vertices.empty() || asset.indices.empty() ||
             (level != 0 && !asset.lods.empty())) {
@@ -85,7 +87,8 @@ void prepare_authored_model_lods(CookedModelAsset &model,
     }
     for (std::size_t material = 0; material < model.materials.size(); ++material) {
         if (buckets[0][material].empty() &&
-            (!buckets[1][material].empty() || !buckets[2][material].empty())) {
+            std::ranges::any_of(buckets | std::views::take(supplied_count),
+                [&](const auto &bucket) { return !bucket[material].empty(); })) {
             throw std::invalid_argument("Authored LOD material needs geometry in LOD0");
         }
     }
@@ -95,8 +98,8 @@ void prepare_authored_model_lods(CookedModelAsset &model,
     vertices.reserve(vertex_count);
     indices.reserve(index_count);
     submeshes.reserve(model.materials.size());
-    std::array<std::uint32_t, 3> vertex_offsets{};
-    for (std::size_t level = 0; level < 3; ++level) {
+    std::array<std::uint32_t, model_lod_count> vertex_offsets{};
+    for (std::size_t level = 0; level < supplied_count; ++level) {
         vertex_offsets[level] = static_cast<std::uint32_t>(vertices.size());
         const auto &asset = source(level);
         vertices.insert(vertices.end(), asset.vertices.begin(), asset.vertices.end());
@@ -111,9 +114,9 @@ void prepare_authored_model_lods(CookedModelAsset &model,
             .material_index = static_cast<std::uint32_t>(material),
             .name = model.materials[material].name,
         };
-        mesh.lod_error = {0.0F, model.lods[0].geometric_error, model.lods[1].geometric_error,
-                          std::numeric_limits<float>::infinity()};
-        for (std::size_t level = 0; level < 3; ++level) {
+        for (std::size_t level = 1; level < supplied_count; ++level)
+            mesh.lod_error[level] = model.lods[level - 1].geometric_error;
+        for (std::size_t level = 0; level < supplied_count; ++level) {
             mesh.lod_first[level] = static_cast<std::uint32_t>(indices.size());
             const auto &asset = source(level);
             for (const auto submesh_index : buckets[level][material]) {
@@ -124,13 +127,46 @@ void prepare_authored_model_lods(CookedModelAsset &model,
             }
             mesh.lod_count[level] = static_cast<std::uint32_t>(indices.size()) - mesh.lod_first[level];
         }
-        mesh.lod_first[3] = mesh.lod_first[0];
-        mesh.lod_count[3] = 0;
         mesh.first_index = mesh.lod_first[0];
         mesh.index_count = mesh.lod_count[0];
         submeshes.push_back(std::move(mesh));
     }
-    model.vertices = std::move(vertices);
+    if (levels.size() == 2) {
+        // Existing three-level packages stay compatible. Generate the missing
+        // fourth level from their authored LOD2, sharing its uploaded vertices.
+        auto last = levels.back();
+        last.generate_lods = true;
+        prepare_model_lods(last);
+        for (auto &mesh : submeshes) {
+            mesh.lod_first[3] = static_cast<std::uint32_t>(indices.size());
+            float extra_error = 0;
+            for (const auto &part : last.submeshes) {
+                if (last.materials[part.material_index].name != model.materials[mesh.material_index].name)
+                    continue;
+                const auto count = part.lod_count[1];
+                if (count > (maximum_geometry_bytes - bytes) / sizeof(std::uint32_t) ||
+                    count > std::numeric_limits<std::uint32_t>::max() - indices.size())
+                    throw std::length_error("Generated authored LOD3 exceeds geometry capacity");
+                for (std::uint32_t i = 0; i < count; ++i)
+                    indices.push_back(last.indices[static_cast<std::size_t>(part.lod_first[1]) + i] + vertex_offsets[2]);
+                bytes += static_cast<std::size_t>(count) * sizeof(std::uint32_t);
+                extra_error = std::max(extra_error, part.lod_error[1]);
+            }
+            mesh.lod_count[3] = static_cast<std::uint32_t>(indices.size()) - mesh.lod_first[3];
+            mesh.lod_error[3] = model.lods.back().geometric_error + std::max(extra_error, 1.0e-5F);
+        }
+    }
+    // Authored derivatives commonly reuse exact LOD0 vertices. Share identical
+    // position/normal/UV/tangent tuples across all four levels instead of storing
+    // four copies on the GPU. This is lossless and keeps attribute seams intact.
+    std::vector<unsigned> remap(vertices.size());
+    const auto shared_count = meshopt_generateVertexRemap(remap.data(), indices.data(), indices.size(),
+        vertices.data(), vertices.size(), sizeof(CookedModelVertex));
+    std::vector<CookedModelVertex> shared_vertices(shared_count);
+    meshopt_remapVertexBuffer(shared_vertices.data(), vertices.data(), vertices.size(),
+        sizeof(CookedModelVertex), remap.data());
+    meshopt_remapIndexBuffer(indices.data(), indices.data(), indices.size(), remap.data());
+    model.vertices = std::move(shared_vertices);
     model.indices = std::move(indices);
     model.submeshes = std::move(submeshes);
 }
@@ -143,20 +179,7 @@ void prepare_model_lods(CookedModelAsset &model) {
     if (model.indices.size() > max_indices / 2) {
         throw std::length_error("LOD index capacity exceeded");
     }
-    const float scale = meshopt_simplifyScale(model.vertices.front().position.data(),
-                                              model.vertices.size(), sizeof(CookedModelVertex));
-    constexpr std::array opaque_weights{0.08F, 0.08F, 0.08F, 0.1F, 0.1F};
-    constexpr std::array foliage_weights{0.03F, 0.03F, 0.03F, 0.5F, 0.5F};
-    constexpr std::array opaque_error_limits{0.0F, 0.01F, 0.03F, 0.08F};
-    constexpr std::array foliage_error_limits{0.0F, 0.06F, 0.18F, 0.40F};
-    constexpr std::array foliage_ratios{1.0F, 0.35F, 0.12F, 0.04F};
-    // Disconnected foliage cards report pruned component diameter in result_error,
-    // which is much larger than silhouette/coverage change inside a dense crown.
-    constexpr std::array foliage_visual_error_caps{0.0F, 0.00085F, 0.00190F, 0.00400F};
     const auto original_count = model.indices.size();
-    model.indices.reserve(std::min(max_indices, original_count * 3));
-    std::vector<unsigned> scratch;
-    std::vector<unsigned> sloppy_scratch;
     for (auto &mesh : model.submeshes) {
         if (mesh.first_index > original_count ||
             mesh.index_count > original_count - mesh.first_index) {
@@ -168,7 +191,26 @@ void prepare_model_lods(CookedModelAsset &model) {
         mesh.lod_first = {first, first, first, first};
         mesh.lod_count = {count, 0, 0, 0};
         mesh.lod_error = {0.0F, infinity, infinity, infinity};
+    }
+    if (!model.generate_lods) {
+        return;
+    }
+    const float scale = meshopt_simplifyScale(model.vertices.front().position.data(),
+                                              model.vertices.size(), sizeof(CookedModelVertex));
+    constexpr std::array opaque_weights{0.08F, 0.08F, 0.08F, 0.1F, 0.1F};
+    constexpr std::array foliage_weights{0.03F, 0.03F, 0.03F, 0.5F, 0.5F};
+    constexpr std::array opaque_error_limits{0.0F, 0.01F, 0.03F, 0.08F};
+    constexpr std::array foliage_error_limits{0.0F, 0.01F, 0.025F, 0.05F};
+    constexpr std::array foliage_ratios{1.0F, 0.60F, 0.32F, 0.15F};
+    model.indices.reserve(std::min(max_indices, original_count * 3));
+    std::vector<unsigned> scratch;
+    for (auto &mesh : model.submeshes) {
+        const auto first = static_cast<std::uint32_t>(mesh.first_index);
+        const auto count = static_cast<std::uint32_t>(mesh.index_count);
+        const float epsilon = 1.0e-6F * std::max(scale, 1.0F);
         if (count < 96) {
+            mesh.lod_count.fill(count);
+            mesh.lod_error = {0, epsilon, 2 * epsilon, 3 * epsilon};
             continue;
         }
         const bool alpha_masked =
@@ -187,7 +229,7 @@ void prepare_model_lods(CookedModelAsset &model) {
             const float error_limit =
                 alpha_masked ? foliage_error_limits[level] : opaque_error_limits[level];
             const unsigned options = alpha_masked
-                ? (meshopt_SimplifyPrune | meshopt_SimplifyPermissive)
+                ? static_cast<unsigned>(meshopt_SimplifyPermissive)
                 : static_cast<unsigned>(meshopt_SimplifyLockBorder);
             auto reduced = meshopt_simplifyWithAttributes(
                 scratch.data(), model.indices.data() + first, count,
@@ -201,31 +243,17 @@ void prepare_model_lods(CookedModelAsset &model) {
                     model.vertices.front().position.data(), model.vertices.size(),
                     sizeof(CookedModelVertex), model.vertices.front().normal.data(),
                     sizeof(CookedModelVertex), weights.data(), weights.size(), nullptr, target,
-                    error_limit, meshopt_SimplifyPermissive | meshopt_SimplifyPrune, &error);
-            }
-            if (alpha_masked && (reduced == 0 || reduced >= previous_count ||
-                                 (level >= 2 && reduced > target * 2))) {
-                sloppy_scratch.resize(count);
-                float sloppy_error = 0.0F;
-                const auto sloppy_reduced = meshopt_simplifySloppy(
-                    sloppy_scratch.data(), model.indices.data() + first, count,
-                    model.vertices.front().position.data(), model.vertices.size(),
-                    sizeof(CookedModelVertex), nullptr, target, error_limit, &sloppy_error);
-                if (sloppy_reduced > 0 && sloppy_reduced < previous_count &&
-                    (reduced == 0 || reduced >= previous_count || sloppy_reduced < reduced)) {
-                    scratch.swap(sloppy_scratch);
-                    reduced = sloppy_reduced;
-                    error = sloppy_error;
-                }
+                    error_limit, meshopt_SimplifyPermissive, &error);
             }
             if (reduced >= previous_count || reduced == 0 ||
                 model.indices.size() > max_indices - reduced) {
+                mesh.lod_first[level] = mesh.lod_first[level - 1];
+                mesh.lod_count[level] = previous_count;
+                mesh.lod_error[level] = previous_error + epsilon;
+                previous_error = mesh.lod_error[level];
                 continue;
             }
-            const float relative_error =
-                alpha_masked ? std::min(error, foliage_visual_error_caps[level]) : error;
-            const float epsilon = 1.0e-6F * std::max(scale, 1.0F);
-            const float level_error = std::max(previous_error + epsilon, relative_error * scale);
+            const float level_error = std::max(previous_error + epsilon, error * scale);
             mesh.lod_first[level] = static_cast<std::uint32_t>(model.indices.size());
             mesh.lod_count[level] = static_cast<std::uint32_t>(reduced);
             mesh.lod_error[level] = level_error;

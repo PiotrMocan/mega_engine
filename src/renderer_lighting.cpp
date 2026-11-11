@@ -69,8 +69,11 @@ bool Renderer::set_lighting_settings(LightingSettings settings) noexcept {
         }
         if (settings.ray_tracing != RayTracingMode::off && !rt_provisioned_) {
             if (context_ != nullptr && context_->ray_query_supported() &&
-                context_->properties().limits.maxPerStageDescriptorStorageBuffers >= 7U &&
-                context_->properties().limits.maxDescriptorSetStorageBuffers >= 10U) {
+                context_->properties().limits.maxPerStageDescriptorStorageBuffers >= 8U &&
+                context_->properties().limits.maxDescriptorSetStorageBuffers >= 11U) {
+                if (rt_masked_triangle_capacity(0, resident_rt_masked_triangle_count(),
+                        context_->properties().limits.maxStorageBufferRange) == 0)
+                    return false;
                 rt_provision_pending_ = true;
             }
         }
@@ -127,8 +130,8 @@ void Renderer::create_lighting_resources() {
     rt_provision_pending_ = false;
     if (lighting_settings_.ray_tracing != RayTracingMode::off) {
         if (context_->ray_query_supported() &&
-            limits.maxPerStageDescriptorStorageBuffers >= 7U &&
-            limits.maxDescriptorSetStorageBuffers >= 10U) {
+            limits.maxPerStageDescriptorStorageBuffers >= 8U &&
+            limits.maxDescriptorSetStorageBuffers >= 11U) {
             rt_provisioned_ = true;
         } else {
             std::cerr << "warning: hardware ray query is unavailable on this GPU; "
@@ -141,9 +144,11 @@ void Renderer::create_lighting_resources() {
         *context_, gi_provisioned_ ? 4ULL * gi_resolution * gi_resolution * gi_resolution : 32ULL,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, 0, "GI voxel surfaces");
+    voxel_triangle_capacity_ = gi_provisioned_ ? gi_max_triangles : 1U;
     voxel_triangles_.create(*context_,
-                            sizeof(GiTriangle) * (gi_provisioned_ ? gi_max_triangles : 1U),
-                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                            sizeof(GiTriangle) * voxel_triangle_capacity_,
+                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                             VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, 0, "GI triangle cache");
     voxel_radiance_.create_volume(*context_, gi_provisioned_ ? gi_resolution : 2U,
                                   gi_provisioned_ ? 7U : 1U, radiance_format,
@@ -223,14 +228,18 @@ void Renderer::create_lighting_descriptor_layout() {
         VkDescriptorSetLayoutBinding{10, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1,
                                      VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
                                      nullptr},
+        VkDescriptorSetLayoutBinding{11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+                                     nullptr},
     };
-    const std::uint32_t binding_count = rt_provisioned_ ? 11U : 9U;
+    const std::uint32_t binding_count = rt_provisioned_ ? 12U : 9U;
     const VkDescriptorSetLayoutCreateInfo layout{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0,
         binding_count, bindings.data()};
     VK_CHECK(vkCreateDescriptorSetLayout(
         context_->device(), &layout, nullptr,
         lighting_layout_.put(context_->device(), vkDestroyDescriptorSetLayout)));
+    lighting_layout_has_rt_ = rt_provisioned_;
     context_->set_debug_name(VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT,
                              handle_value(lighting_layout_.get()), "lighting descriptors");
 }
@@ -238,7 +247,7 @@ void Renderer::create_lighting_pipelines() {
     const std::array sizes{
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2},
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rt_provisioned_ ? 14U : 12U},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rt_provisioned_ ? 16U : 12U},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 2},
     };
@@ -274,6 +283,7 @@ void Renderer::create_lighting_pipelines() {
                                    frame.local_light_cluster_buffer.size()},
             VkDescriptorBufferInfo{rt_opacity_micromaps_.handle(), 0,
                                    rt_opacity_micromaps_.size()},
+            VkDescriptorBufferInfo{rt_alpha_texels_.handle(), 0, rt_alpha_texels_.size()},
         };
         const std::array images{
             VkDescriptorImageInfo{voxel_radiance_.sampler(), voxel_radiance_.view(),
@@ -287,7 +297,7 @@ void Renderer::create_lighting_pipelines() {
             .accelerationStructureCount = 1U,
             .pAccelerationStructures = &tlas_handle,
         };
-        std::array<VkWriteDescriptorSet, 11> writes{};
+        std::array<VkWriteDescriptorSet, 12> writes{};
         for (unsigned i = 0; i < 9U; ++i) {
             auto &w = writes[i];
             w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -323,9 +333,15 @@ void Renderer::create_lighting_pipelines() {
                 .descriptorCount = 1U,
                 .descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
             };
+            writes[11] = VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = frame.lighting_descriptor_set, .dstBinding = 11U,
+                .descriptorCount = 1U, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pBufferInfo = &buffers[8],
+            };
         }
         vkUpdateDescriptorSets(
-            context_->device(), rt_provisioned_ ? 11U : 9U,
+            context_->device(), rt_provisioned_ ? 12U : 9U,
             writes.data(), 0, nullptr);
     }
     const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
@@ -371,11 +387,60 @@ void Renderer::create_lighting_pipelines() {
             "cluster local lights");
     }
 }
+void Renderer::ensure_gi_triangle_capacity(const std::uint64_t required) {
+    if (!gi_provisioned_ || required <= voxel_triangle_capacity_) return;
+    const auto capacity = gi_cache_capacity(voxel_triangle_capacity_, required,
+        context_->properties().limits.maxStorageBufferRange);
+    if (capacity == 0)
+        fatal("GI geometry exceeds the bounded cache or device storage-buffer range");
+    // Only the submission owner calls this, before starting an asset batch or
+    // recording the next frame. Retire all readers before replacing descriptors.
+    assert(!asset_upload_.recording());
+    asset_upload_.wait();
+    std::array<VkFence, max_frames_in_flight> fences{};
+    std::transform(frames_.begin(), frames_.end(), fences.begin(),
+                   [](const FrameContext &frame) noexcept { return frame.fence; });
+    VK_CHECK(vkWaitForFences(context_->device(), static_cast<std::uint32_t>(fences.size()),
+                            fences.data(), VK_TRUE, UINT64_MAX));
+    GpuBuffer replacement;
+    replacement.create(*context_, sizeof(GiTriangle) * static_cast<VkDeviceSize>(capacity),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, 0, "GI triangle cache");
+    if (voxel_triangle_count_ != 0) {
+        // Reuse the asset command pool; no readback or device-wide idle is needed.
+        asset_upload_.begin(*context_, UploadBatch::alignment);
+        const auto command = asset_upload_.command_buffer();
+        memory_barrier(command, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        const VkBufferCopy copy{0, 0,
+            sizeof(GiTriangle) * static_cast<VkDeviceSize>(voxel_triangle_count_)};
+        vkCmdCopyBuffer(command, voxel_triangles_.handle(), replacement.handle(), 1, &copy);
+        memory_barrier(command, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                       compute, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        asset_upload_.submit();
+        asset_upload_.wait();
+    }
+    const VkDescriptorBufferInfo buffer{replacement.handle(), 0, replacement.size()};
+    for (const auto &frame : frames_) {
+        const VkWriteDescriptorSet write{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = frame.lighting_descriptor_set, .dstBinding = 3,
+            .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &buffer};
+        vkUpdateDescriptorSets(context_->device(), 1, &write, 0, nullptr);
+    }
+    // The copy and every old descriptor user have completed. Moving retires the
+    // old allocation now, while keeping all existing triangle offsets unchanged.
+    voxel_triangles_ = std::move(replacement);
+    voxel_triangle_capacity_ = capacity;
+    std::clog << "GI triangle cache grew to " << capacity << " triangles\n";
+}
 std::uint32_t Renderer::append_gi_triangles(std::span<const GiTriangle> triangles) {
     if (!gi_provisioned_ || triangles.empty())
         return 0;
-    if (triangles.size() > gi_max_triangles - voxel_triangle_count_)
-        fatal("GI mesh cache exceeds 1 million triangles; use --gi off");
+    if (triangles.size() > voxel_triangle_capacity_ - voxel_triangle_count_)
+        fatal("GI triangle cache capacity was not reserved before asset publication");
     const auto first = voxel_triangle_count_;
     if (asset_upload_.recording())
         memory_barrier(asset_upload_.command_buffer(), compute, VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
@@ -385,19 +450,18 @@ std::uint32_t Renderer::append_gi_triangles(std::span<const GiTriangle> triangle
     lighting_statistics_.mesh_bytes = sizeof(GiTriangle) * voxel_triangle_count_;
     return first;
 }
-std::size_t Renderer::gi_model_upload_bytes(const PreparedModel &prepared) const {
+std::size_t Renderer::gi_model_upload_bytes(const PreparedModel &prepared) {
     if (!gi_provisioned_ || !prepared.model)
         return 0;
     std::uint64_t triangles = 0;
     for (const auto &submesh : prepared.model->submeshes)
         triangles += submesh.index_count / 3;
-    if (triangles > gi_max_triangles - voxel_triangle_count_)
-        fatal("GI mesh cache exceeds 1 million triangles; use --gi off");
     // Every submesh is staged separately; its alignment gap also consumes the arena.
     const auto bytes = triangles * sizeof(GiTriangle) +
                        prepared.model->submeshes.size() * (UploadBatch::alignment - 1);
     if (prepared.upload_bytes + bytes > 512ULL * 1024 * 1024)
         fatal("GI asset upload exceeds the 512 MiB batch budget");
+    ensure_gi_triangle_capacity(static_cast<std::uint64_t>(voxel_triangle_count_) + triangles);
     return static_cast<std::size_t>(bytes);
 }
 void Renderer::snapshot_voxel_scene() {
@@ -826,6 +890,7 @@ void Renderer::destroy_lighting() noexcept {
     lighting_compute_layout_.reset();
     lighting_pool_.reset();
     lighting_layout_.reset();
+    lighting_layout_has_rt_ = false;
     voxel_storage_view_.reset();
     voxel_radiance_.destroy();
     voxel_geometry_.destroy();
@@ -854,6 +919,7 @@ void Renderer::destroy_lighting() noexcept {
     voxel_job_active_ = false;
     voxel_radiance_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     voxel_triangle_count_ = 0;
+    voxel_triangle_capacity_ = 0;
     gi_scene_revision_ = 0;
     gi_geometry_urgent_ = false;
     lighting_shadow_initialized_ = false;

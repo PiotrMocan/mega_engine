@@ -468,7 +468,8 @@ void EditorApplication::initialize(const CliOptions& options) {
             options.color_grading, options.color_grading_lut_size)) {
         fatal("Invalid color grading settings");
     }
-    if (!renderer_.set_subsurface_mode(options.subsurface)) {
+    if (!renderer_.set_subsurface_mode(
+            resolve_scene_subsurface(options, scene_.subsurface))) {
         fatal("Invalid subsurface mode");
     }
     if (!renderer_.set_motion_blur_settings(options.motion_blur)) {
@@ -579,6 +580,9 @@ void EditorApplication::main_loop() {
             if (!renderer_.set_tone_mapper(
                     resolve_scene_tone_mapper(options_, scene_.tone_mapper)))
                 fatal("Scene tone mapper is invalid.");
+            if (!renderer_.set_subsurface_mode(
+                    resolve_scene_subsurface(options_, scene_.subsurface)))
+                fatal("Scene subsurface mode is invalid.");
             if (!renderer_.set_fog_settings(resolve_scene_fog(options_, scene_.fog)))
                 fatal("Scene fog is unavailable on this GPU or invalid.");
             submitted_scene_revision_ = 0U;
@@ -1764,6 +1768,7 @@ void EditorApplication::execute_mcp_command(
             fail("Invalid subsurface mode");
             return;
         }
+        scene_.subsurface = command.subsurface;
         renderer_.reset_metrics();
         succeed("Subsurface mode requested; lazy resources apply at the next rendered frame", Json{
             {"mode_requested", to_token(renderer_.subsurface_mode())},

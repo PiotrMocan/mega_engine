@@ -539,6 +539,9 @@ private:
     void destroy_lighting() noexcept;
     void create_ray_tracing_resources();
     void provision_ray_tracing_resources();
+    [[nodiscard]] std::uint64_t resident_rt_masked_triangle_count() const noexcept;
+    void ensure_rt_masked_triangle_capacity(std::uint64_t required);
+    [[nodiscard]] bool reserve_rt_model_metadata(const PreparedModel &model, std::string &error);
     void destroy_ray_tracing() noexcept;
     void prepare_ray_tracing(FrameContext &frame);
     void record_ray_tracing_tlas(VkCommandBuffer command, FrameContext &frame);
@@ -564,7 +567,8 @@ private:
     void start_voxel_job();
     void snapshot_voxel_scene();
     [[nodiscard]] std::uint32_t append_gi_triangles(std::span<const GiTriangle> triangles);
-    [[nodiscard]] std::size_t gi_model_upload_bytes(const PreparedModel &model) const;
+    void ensure_gi_triangle_capacity(std::uint64_t required);
+    [[nodiscard]] std::size_t gi_model_upload_bytes(const PreparedModel &model);
     void create_frame_contexts();
     void prepare_scene_packet(const glm::mat4 &view_projection, glm::vec3 camera,
                               VkExtent2D extent);
@@ -745,6 +749,7 @@ private:
     VoxelSceneTracker voxel_scene_{};
     glm::vec4 gi_last_sun_{}, gi_last_sun_color_{};
     std::uint32_t voxel_job_index_ = 0, voxel_job_triangle_ = 0, voxel_triangle_count_ = 0;
+    std::uint32_t voxel_triangle_capacity_ = 0;
     std::uint32_t voxel_batch_triangles_ = 0;
     std::uint32_t gi_cube_first_ = 0, gi_plane_first_ = 0, gi_terrain_first_ = 0,
                   gi_terrain_count_ = 0;
@@ -752,10 +757,12 @@ private:
     bool gi_provisioned_ = false, voxel_job_active_ = false, voxel_job_start_ = false;
     bool voxel_ready_ = false, voxel_light_due_ = false, voxel_job_finishes_ = false;
     bool rt_provisioned_ = false, rt_provision_pending_ = false;
+    bool lighting_layout_has_rt_ = false;
     bool rt_tlas_build_due_ = false, gi_last_rt_active_ = false;
     AccelerationStructure blas_cube_{}, blas_plane_{}, blas_sphere_{}, blas_terrain_{};
-    GpuBuffer rt_opacity_micromaps_{}, rt_upload_scratch_{};
+    GpuBuffer rt_opacity_micromaps_{}, rt_alpha_texels_{}, rt_upload_scratch_{};
     std::uint32_t rt_opacity_triangle_count_ = 0U;
+    std::uint32_t rt_opacity_triangle_capacity_ = 0U;
     std::uint32_t rt_alpha_texel_words_used_ = 0U;
 #if VCR_EDITOR_ENABLED
     std::vector<RtAlphaMapEntry> rt_alpha_maps_{};

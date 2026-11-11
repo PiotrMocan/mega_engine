@@ -938,7 +938,7 @@ private:
                 {"model", Json{{"type", "string"},
                                   {"enum", Json::array({"standard", "unlit", "subsurface"})}}},
                 {"subsurface_profile", Json{{"type", "string"},
-                    {"enum", Json::array({"none", "narrow", "medium", "wide"})}}},
+                    {"enum", Json::array({"none", "narrow", "medium", "wide", "foliage"})}}},
                 {"subsurface_strength", Json{{"type", "number"},
                     {"minimum", 0.0}, {"maximum", 1.0}}},
                 {"light_color", light_color_schema},
@@ -980,7 +980,7 @@ private:
             {"model", Json{{"type", "string"},
                               {"enum", Json::array({"standard", "unlit", "subsurface"})}}},
             {"subsurface_profile", Json{{"type", "string"},
-                {"enum", Json::array({"none", "narrow", "medium", "wide"})}}},
+                {"enum", Json::array({"none", "narrow", "medium", "wide", "foliage"})}}},
             {"subsurface_strength", Json{{"type", "number"},
                 {"minimum", 0.0}, {"maximum", 1.0}}},
             {"light_color", light_color_schema},
@@ -1512,7 +1512,7 @@ private:
         const auto token = get_string(arguments, "subsurface_profile");
         const auto profile = token ? parse_subsurface_profile(*token) : std::nullopt;
         if (!profile) {
-            error = "subsurface_profile must be none, narrow, medium or wide";
+            error = "subsurface_profile must be none, narrow, medium, wide or foliage";
             return false;
         }
         command.material.subsurface_profile = *profile;

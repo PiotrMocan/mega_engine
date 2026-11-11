@@ -76,4 +76,22 @@ vec3 voxelDiffuseSurface(vec3 position,vec3 normal,vec3 geometricNormal) {
 vec3 voxelDiffuse(vec3 position,vec3 normal) {
     return voxelDiffuseSurface(position,normal,normal);
 }
+vec3 voxelBackTranslucency(vec3 position,vec3 backNormal) {
+    float invExtent=1.0/lighting.volumeParameters.x;
+    vec3 volumePosition=(position-lighting.volumeOriginCell.xyz)*invExtent;
+    vec3 edge=min(volumePosition,vec3(1)-volumePosition);
+    float edgeDistance=min(edge.x,min(edge.y,edge.z));
+    vec3 fallback=dynamicSkyHemisphereAmbient(backNormal);
+    if(edgeDistance<=0) return fallback;
+    float cellUv=lighting.volumeOriginCell.w*invExtent;
+    vec3 sampleUv=clamp(
+        volumePosition+backNormal*(cellUv*2.0),
+        vec3(0.5/lighting.volumeParameters.y),
+        vec3(1.0-0.5/lighting.volumeParameters.y));
+    vec4 sampleValue=textureLod(voxelRadiance,sampleUv,2.25);
+    float skyVisibility=1.0-clamp(sampleValue.a,0.0,1.0);
+    vec3 indirect=sampleValue.rgb*(3.14159265359*lighting.options.z*2.2)
+        +dynamicSkyBackground(backNormal)*(skyVisibility*1.75);
+    return mix(fallback,indirect*0.2,smoothstep(0,2.0/lighting.volumeParameters.y,edgeDistance));
+}
 #endif

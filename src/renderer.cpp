@@ -56,7 +56,9 @@ inline constexpr VkDeviceSize maximum_editor_model_gpu_bytes =
 inline constexpr VkDeviceSize maximum_single_editor_model_gpu_bytes =
     512ULL * 1024ULL * 1024ULL;
 inline constexpr VkDeviceSize maximum_editor_texture_gpu_bytes =
-    2ULL * 1024ULL * 1024ULL * 1024ULL;
+    // Full vegetation set plus landscape; accounting reserves 2x base RGBA
+    // bytes per texture, including mipmaps. This is still a bounded cache.
+    4ULL * 1024ULL * 1024ULL * 1024ULL;
 inline constexpr VkDeviceSize maximum_single_editor_texture_gpu_bytes =
     512ULL * 1024ULL * 1024ULL;
 inline constexpr std::size_t maximum_editor_scene_instances =

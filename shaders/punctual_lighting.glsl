@@ -150,13 +150,71 @@ vec3 evaluatePunctualLighting(
     return max(result, vec3(0.0));
 }
 
-PbrLightingComponents evaluatePunctualLightingComponents(
+PbrLightingComponents evaluatePunctualLightSubsurfaceComponents(
+    uint index,
     vec3 baseColor,
     vec3 materialParameters,
     vec3 normal,
     vec3 viewDirection,
     vec3 worldPosition,
-    float dielectricF0)
+    float dielectricF0,
+    uint materialModel,
+    uint subsurfaceProfile,
+    float subsurfaceStrength)
+{
+    const GpuPunctualLight light = localLights[index];
+    const vec3 toLight = light.positionRange.xyz - worldPosition;
+    const float distanceSquared = dot(toLight, toLight);
+    const float attenuation = punctualDistanceAttenuation(
+        distanceSquared, light.positionRange.w);
+    if (attenuation <= 0.0) {
+        PbrLightingComponents empty;
+        empty.diffuse = vec3(0.0);
+        empty.specular = vec3(0.0);
+        return empty;
+    }
+
+    const vec3 lightDirection = distanceSquared > 1.0e-12
+        ? toLight * inversesqrt(distanceSquared)
+        : normal;
+    float angular = 1.0;
+    if (light.directionType.w > 0.5)
+    {
+        const float cosine = dot(light.directionType.xyz, -lightDirection);
+        const float cone = clamp(
+            cosine * light.spotScaleOffset.x + light.spotScaleOffset.y,
+            0.0,
+            1.0);
+        angular = cone * cone;
+    }
+    const vec3 radiance =
+        light.colorIntensity.rgb * light.colorIntensity.w
+        * attenuation * angular;
+    return evaluatePbrDirectSubsurfaceComponents(
+        baseColor,
+        materialParameters,
+        normal,
+        viewDirection,
+        lightDirection,
+        radiance,
+        1.0,
+        1.0,
+        dielectricF0,
+        materialModel,
+        subsurfaceProfile,
+        subsurfaceStrength);
+}
+
+PbrLightingComponents evaluatePunctualLightingSubsurfaceComponents(
+    vec3 baseColor,
+    vec3 materialParameters,
+    vec3 normal,
+    vec3 viewDirection,
+    vec3 worldPosition,
+    float dielectricF0,
+    uint materialModel,
+    uint subsurfaceProfile,
+    float subsurfaceStrength)
 {
     PbrLightingComponents result;
     result.diffuse = vec3(0.0);
@@ -182,9 +240,10 @@ PbrLightingComponents evaluatePunctualLightingComponents(
             for (uint entry = 0u;
                  entry < min(count, lighting.clusterDimensions.w);
                  ++entry) {
-                const PbrLightingComponents light = evaluatePunctualLightComponents(
+                const PbrLightingComponents light = evaluatePunctualLightSubsurfaceComponents(
                     clusterData[first + entry], baseColor, materialParameters,
-                    normal, viewDirection, worldPosition, dielectricF0);
+                    normal, viewDirection, worldPosition, dielectricF0,
+                    materialModel, subsurfaceProfile, subsurfaceStrength);
                 result.diffuse += light.diffuse;
                 result.specular += light.specular;
             }
@@ -194,15 +253,29 @@ PbrLightingComponents evaluatePunctualLightingComponents(
         }
     }
     for (uint index = 0u; index < lightCount; ++index) {
-        const PbrLightingComponents light = evaluatePunctualLightComponents(
+        const PbrLightingComponents light = evaluatePunctualLightSubsurfaceComponents(
             index, baseColor, materialParameters, normal, viewDirection,
-            worldPosition, dielectricF0);
+            worldPosition, dielectricF0,
+            materialModel, subsurfaceProfile, subsurfaceStrength);
         result.diffuse += light.diffuse;
         result.specular += light.specular;
     }
     result.diffuse = max(result.diffuse, vec3(0.0));
     result.specular = max(result.specular, vec3(0.0));
     return result;
+}
+
+PbrLightingComponents evaluatePunctualLightingComponents(
+    vec3 baseColor,
+    vec3 materialParameters,
+    vec3 normal,
+    vec3 viewDirection,
+    vec3 worldPosition,
+    float dielectricF0)
+{
+    return evaluatePunctualLightingSubsurfaceComponents(
+        baseColor, materialParameters, normal, viewDirection, worldPosition,
+        dielectricF0, 0u, 0u, 0.0);
 }
 
 #endif

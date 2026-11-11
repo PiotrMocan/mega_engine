@@ -21,9 +21,23 @@ void advance_lighting_clock(LightingSettings &settings, double seconds, bool pau
 inline constexpr unsigned gi_resolution = 64, gi_brick_size = 8, gi_bricks_axis = 8;
 inline constexpr unsigned gi_brick_count = 512;
 inline constexpr unsigned gi_max_triangles = 1'000'000;
+inline constexpr unsigned gi_triangle_cache_limit = 16'000'000;
 struct alignas(16) GiTriangle {
     glm::vec4 a{}, b{}, c{};
 };
+// Cold asset publication grows the cache; steady-state frames never resize it.
+// Zero means the requested geometry exceeds the bounded cache/device range.
+[[nodiscard]] constexpr std::uint32_t gi_cache_capacity(
+    std::uint32_t current, std::uint64_t required, std::uint64_t storage_range) noexcept {
+    const auto device_limit = storage_range / sizeof(GiTriangle);
+    const auto limit = device_limit < gi_triangle_cache_limit
+        ? device_limit : gi_triangle_cache_limit;
+    if (required > limit || current > limit) return 0;
+    std::uint64_t capacity = current;
+    if (capacity == 0) capacity = limit < gi_max_triangles ? limit : gi_max_triangles;
+    while (capacity < required) capacity = capacity > limit / 2 ? limit : capacity * 2;
+    return static_cast<std::uint32_t>(capacity);
+}
 struct alignas(16) LightingUniforms {
     std::array<glm::mat4, 4> shadow_matrices{};
     glm::mat4 camera_view{1.0F};

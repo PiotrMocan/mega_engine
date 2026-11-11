@@ -96,6 +96,7 @@ struct CliOptions {
     ColorGrading color_grading = ColorGrading::off;
     ColorGradingLutSize color_grading_lut_size = ColorGradingLutSize::size_32;
     SubsurfaceMode subsurface = SubsurfaceMode::off;
+    bool subsurface_override = false;
     DepthPrepass depth_prepass = DepthPrepass::off;
     LodFadePattern lod_fade = LodFadePattern::off;
     MotionBlurSettings motion_blur{};
@@ -134,6 +135,8 @@ struct CliOptions {
     const CliOptions &options, const std::optional<LightingSettings> &authored) noexcept;
 [[nodiscard]] ToneMapper resolve_scene_tone_mapper(
     const CliOptions& options, std::optional<ToneMapper> authored) noexcept;
+[[nodiscard]] SubsurfaceMode resolve_scene_subsurface(
+    const CliOptions& options, std::optional<SubsurfaceMode> authored) noexcept;
 [[nodiscard]] FogSettings resolve_scene_fog(
     const CliOptions& options, const std::optional<FogSettings>& authored) noexcept;
 

@@ -399,6 +399,17 @@ int main() {
                    second_subsurface->materials[0].factors.subsurface_strength ==
                        factors.subsurface_strength,
                "cooked subsurface factors round-trip without quantization");
+        subsurface.material["pbr"]["subsurface_profile"] = "foliage";
+        subsurface.material["pbr"]["subsurface_strength"] = 0.78F;
+        expect(write_json(subsurface.material_absolute, subsurface.material),
+               "foliage subsurface material written");
+        const auto foliage_subsurface = vcr::load_cooked_model_asset(
+            asset_root, subsurface.metadata_relative);
+        expect(foliage_subsurface &&
+                   foliage_subsurface->materials[0].factors.subsurface_profile ==
+                       vcr::SubsurfaceProfile::foliage &&
+                   foliage_subsurface->materials[0].factors.subsurface_strength == 0.78F,
+               "cooked foliage subsurface profile loads cleanly");
     }
     const std::array invalid_profiles{
         Json(""), Json("Medium"), Json("medium "), Json("skin"),
@@ -826,6 +837,17 @@ int main() {
                message);
     };
     auto invalid_lods = valid_lods;
+    {
+        auto four = valid_lods;
+        four.push_back({{"model",lod2.metadata_relative.generic_string()},{"geometric_error",.4}});
+        authored.metadata["lods"] = four;
+        expect(write_json(authored.metadata_absolute, authored.metadata), "four-level chain written");
+        const auto loaded_four = vcr::load_cooked_model_asset(asset_root, authored.metadata_relative);
+        expect(loaded_four && loaded_four->lods.size() == 3 && loaded_four->lods[2].geometric_error == .4F,
+               "cooked metadata accepts all three references for four LOD levels");
+        four.push_back(four.back());
+        check_lods(four, CookedModelLoadErrorCode::invalid_json, "five LOD levels are rejected");
+    }
     invalid_lods[0]["model"] = "../outside.vcrasset.json";
     check_lods(invalid_lods, CookedModelLoadErrorCode::invalid_path, "LOD traversal rejected");
     invalid_lods = valid_lods;
@@ -903,6 +925,16 @@ int main() {
     const auto masked = vcr::load_cooked_model_asset(asset_root, foliage.metadata_relative);
     expect(masked && masked->materials[0].coverage == ((16384U << 16U) | 3U),
            "masked two-sided coverage survives cooked load");
+    foliage.material["occlusion_in_metallic_roughness"] = true;
+    expect(write_json(foliage.material_absolute, foliage.material), "packed occlusion material written");
+    const auto with_ao = vcr::load_cooked_model_asset(asset_root, foliage.metadata_relative);
+    expect(with_ao && with_ao->materials[0].coverage == ((16384U << 16U) | 7U),
+           "packed occlusion preserves alpha masking, cutoff and two-sided flags");
+    foliage.material["occlusion_in_metallic_roughness"] = "true";
+    expect(write_json(foliage.material_absolute, foliage.material) &&
+        has_error(vcr::load_cooked_model_asset(asset_root, foliage.metadata_relative),
+                  CookedModelLoadErrorCode::invalid_material), "nonboolean packed occlusion is rejected");
+    foliage.material.erase("occlusion_in_metallic_roughness");
     for (const auto& invalid : {Json(-0.01), Json(1.01), Json("0.5")}) {
         foliage.material["alpha_cutoff"] = invalid;
         expect(write_json(foliage.material_absolute, foliage.material) &&
@@ -914,6 +946,16 @@ int main() {
     expect(write_json(foliage.material_absolute, foliage.material) &&
         has_error(vcr::load_cooked_model_asset(asset_root, foliage.metadata_relative),
                   CookedModelLoadErrorCode::invalid_material), "nonboolean double_sided is rejected");
+
+    auto source_quality = create_fixture(asset_root, "source_quality");
+    source_quality.metadata["generate_lods"] = false;
+    expect(write_json(source_quality.metadata_absolute, source_quality.metadata), "source-quality flag written");
+    const auto source_loaded = vcr::load_cooked_model_asset(asset_root, source_quality.metadata_relative);
+    expect(source_loaded && !source_loaded->generate_lods, "source-quality flag survives cooked loading");
+    source_quality.metadata["generate_lods"] = "false";
+    expect(write_json(source_quality.metadata_absolute, source_quality.metadata) &&
+        has_error(vcr::load_cooked_model_asset(asset_root, source_quality.metadata_relative),
+                  CookedModelLoadErrorCode::invalid_json), "nonboolean source-quality flag is rejected");
 
     if (failures != 0) {
         std::cerr << failures << " cooked model test(s) failed\n";

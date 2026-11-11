@@ -870,6 +870,15 @@ parse_material(
         }
         if (two_sided->get<bool>()) coverage |= 2U;
     }
+    if (const auto packed_ao = metadata.find("occlusion_in_metallic_roughness");
+        packed_ao != metadata.end()) {
+        if (!packed_ao->is_boolean()) {
+            return CookedModelLoadError{.code = CookedModelLoadErrorCode::invalid_material,
+                .message = "Material occlusion_in_metallic_roughness must be boolean.",
+                .path = file.absolute};
+        }
+        if (packed_ao->get<bool>()) coverage |= 4U;
+    }
     if ((coverage & 1U) != 0U) {
         coverage |= static_cast<std::uint32_t>(std::lround(alpha_cutoff * 65535.0F)) << 16U;
         if (tessellation.enabled()) {
@@ -1450,10 +1459,17 @@ CookedModelLoadResult load_cooked_model_asset(
     CookedModelAsset asset{
         .metadata_relative_path = model_file.relative,
     };
-    if (const auto lods = metadata.find("lods"); lods != metadata.end()) {
-        if (!lods->is_array() || (!lods->empty() && lods->size() != 2)) {
+    if (const auto setting = metadata.find("generate_lods"); setting != metadata.end()) {
+        if (!setting->is_boolean()) {
             return fail(CookedModelLoadErrorCode::invalid_json,
-                        "Authored lods must be empty or contain exactly LOD1 and LOD2.",
+                        "generate_lods must be boolean.", model_file.absolute);
+        }
+        asset.generate_lods = setting->get<bool>();
+    }
+    if (const auto lods = metadata.find("lods"); lods != metadata.end()) {
+        if (!lods->is_array() || (!lods->empty() && lods->size() != 2 && lods->size() != 3)) {
+            return fail(CookedModelLoadErrorCode::invalid_json,
+                        "Authored lods must be empty or contain LOD1/LOD2 with optional LOD3.",
                         model_file.absolute);
         }
         float previous_error = 0;

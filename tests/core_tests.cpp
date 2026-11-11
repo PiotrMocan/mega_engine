@@ -537,10 +537,11 @@ int main() {
                    vcr::cli_usage("vcr").find("--subsurface") != std::string::npos,
                "SSS stays default-off and rejects unsupported modes");
         for (const auto profile : {
-                 Profile::narrow, Profile::medium, Profile::wide}) {
-            for (const float strength : {0.0F, 0.5F, 1.0F}) {
+                 Profile::narrow, Profile::medium, Profile::wide, Profile::foliage}) {
+            for (const float strength : {0.0F, 0.5F, 0.78F, 1.0F}) {
                 const float packed = vcr::pack_subsurface_control(profile, strength);
-                expect(vcr::unpack_subsurface_profile(packed) == profile &&
+                expect(packed <= 2048.0F &&
+                           vcr::unpack_subsurface_profile(packed) == profile &&
                            close_to(vcr::unpack_subsurface_strength(packed),
                                     std::round(strength * 255.0F) / 255.0F, 0.000001),
                        "FP16-safe SSS control round-trips profile and quantized strength");
@@ -549,11 +550,26 @@ int main() {
         const auto narrow = vcr::subsurface_profile_parameters(Profile::narrow);
         const auto medium = vcr::subsurface_profile_parameters(Profile::medium);
         const auto wide = vcr::subsurface_profile_parameters(Profile::wide);
+        const auto foliage = vcr::subsurface_profile_parameters(Profile::foliage);
         expect(narrow.scatter_distance[0] < medium.scatter_distance[0] &&
                    medium.scatter_distance[0] < wide.scatter_distance[0] &&
                    wide.scatter_distance[0] > wide.scatter_distance[1] &&
                    wide.scatter_distance[1] > wide.scatter_distance[2],
                "reference SSS profiles widen monotonically and scatter red furthest");
+        expect(vcr::to_token(Profile::foliage) == "foliage" &&
+                   vcr::parse_subsurface_profile("foliage") == Profile::foliage &&
+                   foliage.scatter_distance[1] > foliage.scatter_distance[0] &&
+                   foliage.scatter_distance[0] > foliage.scatter_distance[2],
+               "foliage SSS profile parses cleanly and scatters chlorophyll green furthest");
+        vcr::CliOptions msaa_defaults{};
+        msaa_defaults.anti_aliasing.method = vcr::AntiAliasingMethod::msaa4x;
+        expect(vcr::resolve_scene_subsurface(vcr::CliOptions{}, Mode::full_resolution) ==
+                   Mode::full_resolution &&
+                   vcr::resolve_scene_subsurface(msaa_defaults, Mode::full_resolution) ==
+                   Mode::off &&
+                   vcr::resolve_scene_subsurface(parsed.options, Mode::off) ==
+                   Mode::full_resolution,
+               "scene subsurface resolves authored mode, CLI override, and MSAA fallback");
     }
     {
         using Mode = vcr::MotionBlurMode;

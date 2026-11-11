@@ -122,16 +122,16 @@ vec3 sampleWorldNormal(vec2 uvDx, vec2 uvDy)
         geometricNormal));
 }
 
-float sunVisibility(vec3 normal, vec3 lightDirection)
+float sunVisibilityAt(vec3 worldPos, vec3 normal, vec3 lightDirection)
 {
 #ifdef VCR_RAY_QUERY
     if (lighting.options.x > 0.5 && lighting.volumeParameters.z > 0.5) {
-        return rayTracedSunVisibility(inWorldPosition, normal, lightDirection);
+        return rayTracedSunVisibility(worldPos, normal, lightDirection);
     }
 #endif
-    if(lighting.options.x>0.5) return cascadedVisibility(shadowMap,inWorldPosition,normal,lightDirection);
-    const vec3 projected =
-        inShadowPosition.xyz / inShadowPosition.w;
+    if(lighting.options.x>0.5) return cascadedVisibility(shadowMap,worldPos,normal,lightDirection);
+    const vec4 shadowClip = frame.lightViewProjection * vec4(worldPos, 1.0);
+    const vec3 projected = shadowClip.xyz / shadowClip.w;
     const vec2 shadowUv = projected.xy * 0.5 + 0.5;
     if (projected.z <= 0.0 || projected.z >= 1.0
         || any(lessThan(shadowUv, vec2(0.0)))
@@ -146,6 +146,44 @@ float sunVisibility(vec3 normal, vec3 lightDirection)
     const float receiverDepth =
         projected.z - max(frame.shadowMapParameters.w, normalOffset);
     return textureLod(shadowMap, vec3(shadowUv, receiverDepth), 0.0);
+}
+
+float sunVisibility(vec3 normal, vec3 lightDirection)
+{
+    return sunVisibilityAt(inWorldPosition, normal, lightDirection);
+}
+
+float sunSubsurfaceTransmittance(
+    vec3 geomNormal,
+    vec3 shadingNormal,
+    vec3 lightDirection,
+    float directVis)
+{
+    if (inMaterialModel != 2u || inSubsurfaceProfile == 0u ||
+        inSubsurfaceProfile > 4u || inSubsurfaceStrength <= 0.0)
+    {
+        return directVis;
+    }
+    const vec3 sunFacingNormal =
+        dot(geomNormal, lightDirection) >= 0.0 ? geomNormal : -geomNormal;
+    if (inSubsurfaceProfile == 4u)
+    {
+#ifdef VCR_RAY_QUERY
+        if (lighting.options.x > 0.5 && lighting.volumeParameters.z > 0.5) {
+            return rayTracedFoliageTransmittance(
+                inWorldPosition, sunFacingNormal, lightDirection);
+        }
+#endif
+        const float rawTrans = sunVisibilityAt(
+            inWorldPosition + lightDirection * 0.04, sunFacingNormal, lightDirection);
+        return pow(max(rawTrans, 0.0), 0.70);
+    }
+    if (dot(geomNormal, lightDirection) < 0.0 && dot(shadingNormal, lightDirection) > -0.55)
+    {
+        return sunVisibilityAt(
+            inWorldPosition + lightDirection * 0.015, sunFacingNormal, lightDirection);
+    }
+    return directVis;
 }
 
 vec3 sampleEnvironment(
@@ -193,10 +231,26 @@ void main()
             normalize(frame.sunDirectionIntensity.xyz);
         const vec3 geomNormal = materialFaceNormal(
             pushConstants.padding, safeNormalize(inWorldNormal, vec3(0.0, 1.0, 0.0)));
-        const float visibility = sunVisibility(geomNormal, lightDirection);
+        const float rawVisibility = sunVisibility(geomNormal, lightDirection);
+        const float transmissionVisibility = sunSubsurfaceTransmittance(
+            geomNormal, normal, lightDirection, rawVisibility);
+        const float visibility = (inMaterialModel == 2u && inSubsurfaceProfile == 4u)
+            ? mix(rawVisibility, transmissionVisibility, 0.28 * clamp(inSubsurfaceStrength, 0.0, 1.0))
+            : rawVisibility;
         vec3 diffuseAmbient=frame.skyAmbient.rgb*frame.skyAmbient.a;
-        if(lighting.options.x>0.5) diffuseAmbient=(lighting.skyZenith.rgb+lighting.skyHorizon.rgb)*0.175;
-        if(voxelGiCompiled && lighting.options.y>0.5) diffuseAmbient=voxelDiffuseSurface(inWorldPosition,normal,geomNormal);
+        vec3 backDiffuseAmbient=diffuseAmbient;
+        if(lighting.options.x>0.5) {
+            diffuseAmbient=dynamicSkyHemisphereAmbient(normal);
+            backDiffuseAmbient=dynamicSkyHemisphereAmbient(-normal);
+        }
+        if(voxelGiCompiled && lighting.options.y>0.5) {
+            diffuseAmbient=voxelDiffuseSurface(inWorldPosition,normal,geomNormal);
+            if(inMaterialModel == 2u && inSubsurfaceProfile == 4u && inSubsurfaceStrength > 0.0) {
+                backDiffuseAmbient=voxelBackTranslucency(inWorldPosition,-normal);
+            } else {
+                backDiffuseAmbient=diffuseAmbient;
+            }
+        }
         const vec3 directRadiance =
             frame.sunColorSkyYaw.rgb
             * frame.sunDirectionIntensity.w;
@@ -205,7 +259,8 @@ void main()
         const vec3 materialParameters = vec3(
             inMaterialParameters.x * sampledMetallicRoughness.b,
             inMaterialParameters.y * sampledMetallicRoughness.g,
-            inMaterialParameters.z);
+            inMaterialParameters.z * ((pushConstants.padding & 4u) != 0u
+                ? sampledMetallicRoughness.r : 1.0));
         const float roughness =
             clamp(
                 materialParameters.y,
@@ -214,7 +269,7 @@ void main()
         const vec3 environmentRadiance =
             sampleEnvironment(normal, viewDirection, roughness)
             * frame.skyAmbient.a;
-        lightingComponents = evaluatePbrLightingComponents(
+        lightingComponents = evaluatePbrLightingSubsurfaceComponents(
             clamp(baseColor.rgb, vec3(0.0), vec3(1.0)),
             materialParameters,
             normal,
@@ -222,16 +277,24 @@ void main()
             lightDirection,
             directRadiance,
             diffuseAmbient,
+            backDiffuseAmbient,
             environmentRadiance,
             visibility,
-            inDielectricF0);
-        const PbrLightingComponents punctual = evaluatePunctualLightingComponents(
+            transmissionVisibility,
+            inDielectricF0,
+            inMaterialModel,
+            inSubsurfaceProfile,
+            inSubsurfaceStrength);
+        const PbrLightingComponents punctual = evaluatePunctualLightingSubsurfaceComponents(
             clamp(baseColor.rgb, vec3(0.0), vec3(1.0)),
             materialParameters,
             normal,
             viewDirection,
             inWorldPosition,
-            inDielectricF0);
+            inDielectricF0,
+            inMaterialModel,
+            inSubsurfaceProfile,
+            inSubsurfaceStrength);
         lightingComponents.diffuse += punctual.diffuse;
         lightingComponents.specular += punctual.specular;
         shadedColor = lightingComponents.diffuse + lightingComponents.specular;

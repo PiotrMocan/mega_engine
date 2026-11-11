@@ -65,11 +65,12 @@ struct CookedModelMaterial {
     PbrMaterial factors{};
     std::optional<std::filesystem::path> base_color_texture{};
     std::optional<std::filesystem::path> normal_texture{};
-    // Linear glTF packing: G roughness, B metallic; multiplied by factors.
+    // Linear glTF packing: G roughness, B metallic; optional R occlusion.
     std::optional<std::filesystem::path> metallic_roughness_texture{};
     std::optional<std::filesystem::path> displacement_texture{};
     MaterialTessellation tessellation{};
-    // Bits 0/1 select alpha masking/two-sided shading; high 16 bits hold cutoff.
+    // Bits 0/1 select alpha masking/two-sided shading, bit 2 packed occlusion;
+    // high 16 bits hold cutoff.
     // Matches the per-draw fragment push constant without changing instance ABI.
     std::uint32_t coverage = 0U;
 };
@@ -108,6 +109,8 @@ struct CookedModelAsset {
     std::vector<CookedModelMaterial> materials{};
     std::vector<CookedModelLodReference> lods{};
     CookedModelCollision collision{};
+    // Imported source-quality assets may opt out of runtime simplification.
+    bool generate_lods = true;
 };
 
 enum class CookedModelLoadErrorCode : std::uint8_t {

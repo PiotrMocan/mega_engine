@@ -245,6 +245,155 @@ PbrLightingComponents evaluatePbrLightingComponents(
     return result;
 }
 
+vec3 evaluateSubsurfaceTint(vec3 baseColor, uint subsurfaceProfile)
+{
+    const vec3 safeColor = max(baseColor, vec3(1.0e-4));
+    if (subsurfaceProfile == 4u)
+    {
+        const vec3 chlorophyllLift =
+            sqrt(safeColor) * vec3(0.96, 1.12, 0.54);
+        return clamp(mix(baseColor, chlorophyllLift, 0.65), vec3(0.0), vec3(1.0));
+    }
+    const vec3 warmSubdermal =
+        pow(safeColor, vec3(0.76, 0.96, 1.16)) * vec3(1.08, 0.88, 0.72);
+    return clamp(mix(baseColor, warmSubdermal, 0.55), vec3(0.0), vec3(1.0));
+}
+
+PbrLightingComponents evaluatePbrDirectSubsurfaceComponents(
+    vec3 baseColor,
+    vec3 materialParameters,
+    vec3 normal,
+    vec3 viewDirection,
+    vec3 lightDirection,
+    vec3 directRadiance,
+    float directVisibility,
+    float transmissionVisibility,
+    float dielectricF0,
+    uint materialModel,
+    uint subsurfaceProfile,
+    float subsurfaceStrength)
+{
+    PbrLightingComponents direct = evaluatePbrDirectComponents(
+        baseColor, materialParameters, normal, viewDirection, lightDirection,
+        directRadiance, directVisibility, dielectricF0);
+    const float strength = clamp(subsurfaceStrength, 0.0, 1.0);
+    if (materialModel != 2u || subsurfaceProfile == 0u || subsurfaceProfile > 4u || strength <= 0.0)
+    {
+        return direct;
+    }
+
+    const float metallic = clamp(materialParameters.x, 0.0, 1.0);
+    const float normalDotView = max(dot(normal, viewDirection), 1.0e-4);
+    const vec3 reflectanceAtNormal = mix(vec3(dielectricF0), baseColor, metallic);
+    const vec3 fresnelView = fresnelSchlick(normalDotView, reflectanceAtNormal);
+    const vec3 diffuseWeight = (vec3(1.0) - fresnelView) * (1.0 - metallic) * pbrInversePi;
+    const vec3 sssTint = evaluateSubsurfaceTint(baseColor, subsurfaceProfile);
+
+    // Energy-conserving Green wrap across the terminator with chromatic scatter.
+    const float rawNdotL = dot(normal, lightDirection);
+    const float clampedNdotL = max(rawNdotL, 0.0);
+    const float wrap =
+        (subsurfaceProfile == 4u ? 0.45 : (0.18 + 0.10 * float(subsurfaceProfile))) * strength;
+    const float invWrapNorm = 1.0 / ((1.0 + wrap) * (1.0 + wrap));
+    const float wrappedNdotL = clamp((rawNdotL + wrap) * invWrapNorm, 0.0, 1.0);
+    const float frontVis = clamp(directVisibility, 0.0, 1.0);
+    const float transVis = clamp(transmissionVisibility, 0.0, 1.0);
+
+    // Blend front Lambertian diffuse toward wrapped + terminator-tinted scatter.
+    const float wrapVis = rawNdotL > 0.0 ? frontVis : mix(frontVis, transVis, 0.85);
+    const float terminatorMask = 1.0 - smoothstep(0.0, 0.45, clampedNdotL);
+    const vec3 wrappedAlbedo = mix(baseColor, sssTint, terminatorMask * 0.65 * strength);
+    const vec3 wrappedDiffuse =
+        diffuseWeight * wrappedAlbedo * directRadiance * wrappedNdotL * wrapVis;
+    direct.diffuse = mix(direct.diffuse, wrappedDiffuse, strength * 0.85);
+
+    // Thin-slab foliage back-lit transmission + normal-distorted forward Mie lobe.
+    if (subsurfaceProfile == 4u && transVis > 0.0)
+    {
+        const float backRaw = -rawNdotL;
+        const float backDiffuse = clamp((backRaw + 0.25) * 0.8, 0.0, 1.0) * 0.48;
+        const vec3 backHalf = normalize(lightDirection + normal * 0.35);
+        const float backGate = smoothstep(-0.18, 0.35, backRaw);
+        const float forwardBroad =
+            pow(clamp(dot(viewDirection, -backHalf), 0.0, 1.0), 3.5) * 0.88;
+        const float forwardPeak =
+            pow(clamp(dot(viewDirection, -lightDirection), 0.0, 1.0), 10.0) * 0.36;
+        const float transmissionFactor = backDiffuse + (forwardBroad + forwardPeak) * backGate;
+        direct.diffuse +=
+            diffuseWeight * sssTint * directRadiance * (transmissionFactor * strength * transVis);
+    }
+
+    direct.diffuse = max(direct.diffuse, vec3(0.0));
+    return direct;
+}
+
+PbrLightingComponents evaluatePbrLightingSubsurfaceComponents(
+    vec3 baseColor,
+    vec3 materialParameters,
+    vec3 normal,
+    vec3 viewDirection,
+    vec3 lightDirection,
+    vec3 directRadiance,
+    vec3 diffuseAmbient,
+    vec3 backDiffuseAmbient,
+    vec3 environmentRadiance,
+    float directVisibility,
+    float transmissionVisibility,
+    float dielectricF0,
+    uint materialModel,
+    uint subsurfaceProfile,
+    float subsurfaceStrength)
+{
+    const float metallic = clamp(materialParameters.x, 0.0, 1.0);
+    const float roughness = clamp(materialParameters.y, pbrMinimumRoughness, 1.0);
+    const float ambientOcclusion = clamp(materialParameters.z, 0.0, 1.0);
+    const float normalDotView = max(dot(normal, viewDirection), 1.0e-4);
+    const vec3 reflectanceAtNormal = mix(vec3(dielectricF0), baseColor, metallic);
+
+    PbrLightingComponents result = evaluatePbrDirectSubsurfaceComponents(
+        baseColor,
+        materialParameters,
+        normal,
+        viewDirection,
+        lightDirection,
+        directRadiance,
+        directVisibility,
+        transmissionVisibility,
+        dielectricF0,
+        materialModel,
+        subsurfaceProfile,
+        subsurfaceStrength);
+
+    const vec3 ambientFresnel =
+        fresnelSchlickRoughness(normalDotView, reflectanceAtNormal, roughness);
+    const vec3 diffuseWeight = (vec3(1.0) - ambientFresnel) * (1.0 - metallic);
+    const vec2 integratedBrdf = environmentBrdfApprox(normalDotView, roughness);
+    const vec3 ambientSpecular =
+        environmentRadiance * (reflectanceAtNormal * integratedBrdf.x + integratedBrdf.y);
+    vec3 ambientDiffuse = diffuseWeight * baseColor * diffuseAmbient;
+
+    const float strength = clamp(subsurfaceStrength, 0.0, 1.0);
+    if (materialModel == 2u && subsurfaceProfile != 0u && subsurfaceProfile <= 4u && strength > 0.0)
+    {
+        const vec3 sssTint = evaluateSubsurfaceTint(baseColor, subsurfaceProfile);
+        if (subsurfaceProfile == 4u)
+        {
+            ambientDiffuse += diffuseWeight * sssTint * backDiffuseAmbient * (0.42 * strength);
+        }
+        else
+        {
+            ambientDiffuse = mix(
+                ambientDiffuse,
+                diffuseWeight * mix(baseColor, sssTint, 0.35) * diffuseAmbient,
+                strength * 0.5);
+        }
+    }
+
+    result.diffuse = max(result.diffuse + ambientDiffuse * ambientOcclusion, vec3(0.0));
+    result.specular = max(result.specular + ambientSpecular * ambientOcclusion, vec3(0.0));
+    return result;
+}
+
 vec3 evaluatePbrLighting(
     vec3 baseColor,
     vec3 materialParameters,

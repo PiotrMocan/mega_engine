@@ -669,13 +669,13 @@ inline constexpr std::uintmax_t maximum_material_file_bytes =
         }
         if (pbr.contains("subsurface_profile")) {
             if (!pbr["subsurface_profile"].is_string()) {
-                error = "Material subsurface profile must be none, narrow, medium or wide.";
+                error = "Material subsurface profile must be none, narrow, medium, wide or foliage.";
                 return false;
             }
             const auto profile = parse_subsurface_profile(
                 pbr["subsurface_profile"].get_ref<const std::string&>());
             if (!profile) {
-                error = "Material subsurface profile must be none, narrow, medium or wide.";
+                error = "Material subsurface profile must be none, narrow, medium, wide or foliage.";
                 return false;
             }
             material.subsurface_profile = *profile;
@@ -2505,6 +2505,14 @@ void EditorUi::build_inspector(SceneDocument& scene) {
                     if (ImGui::Selectable(to_token(model).data(), node.material.model == model)) {
                         changed |= node.material.model != model;
                         node.material.model = model;
+                        if (model == MaterialModel::subsurface) {
+                            if (node.material.subsurface_profile == SubsurfaceProfile::none) {
+                                node.material.subsurface_profile = SubsurfaceProfile::medium;
+                            }
+                            if (node.material.subsurface_strength <= 0.0F) {
+                                node.material.subsurface_strength = 0.65F;
+                            }
+                        }
                     }
                 }
                 ImGui::EndCombo();
@@ -2515,7 +2523,8 @@ void EditorUi::build_inspector(SceneDocument& scene) {
                         "##SubsurfaceProfile", to_token(node.material.subsurface_profile).data())) {
                     for (const auto profile : {
                              SubsurfaceProfile::none, SubsurfaceProfile::narrow,
-                             SubsurfaceProfile::medium, SubsurfaceProfile::wide}) {
+                             SubsurfaceProfile::medium, SubsurfaceProfile::wide,
+                             SubsurfaceProfile::foliage}) {
                         if (ImGui::Selectable(
                                 to_token(profile).data(),
                                 node.material.subsurface_profile == profile)) {
@@ -4972,14 +4981,63 @@ void EditorUi::build_material_editor(Renderer& renderer) {
                 ui_kit_.property_row("Shading model");
                 if (ImGui::BeginCombo(
                         "##MaterialModel", to_token(material_editor_->material.model).data())) {
-                    for (const auto model : {MaterialModel::standard, MaterialModel::unlit}) {
+                    for (const auto model : {
+                             MaterialModel::standard,
+                             MaterialModel::unlit,
+                             MaterialModel::subsurface}) {
                         if (ImGui::Selectable(
                                 to_token(model).data(), material_editor_->material.model == model)) {
                             changed |= material_editor_->material.model != model;
                             material_editor_->material.model = model;
+                            if (model == MaterialModel::subsurface) {
+                                if (material_editor_->material.subsurface_profile ==
+                                    SubsurfaceProfile::none) {
+                                    const bool thin_foliage =
+                                        (material_editor_->document.contains("double_sided") &&
+                                         material_editor_->document["double_sided"].is_boolean() &&
+                                         material_editor_->document["double_sided"].get<bool>()) ||
+                                        (material_editor_->document.contains("alpha_mode") &&
+                                         material_editor_->document["alpha_mode"].is_string() &&
+                                         material_editor_->document["alpha_mode"] == "mask");
+                                    material_editor_->material.subsurface_profile = thin_foliage
+                                        ? SubsurfaceProfile::foliage
+                                        : SubsurfaceProfile::medium;
+                                }
+                                if (material_editor_->material.subsurface_strength <= 0.0F) {
+                                    material_editor_->material.subsurface_strength = 0.70F;
+                                }
+                            }
                         }
                     }
                     ImGui::EndCombo();
+                }
+                if (material_editor_->material.model == MaterialModel::subsurface) {
+                    ui_kit_.property_row("SSS profile");
+                    if (ImGui::BeginCombo(
+                            "##MaterialSubsurfaceProfile",
+                            to_token(material_editor_->material.subsurface_profile).data())) {
+                        for (const auto profile : {
+                                 SubsurfaceProfile::none,
+                                 SubsurfaceProfile::narrow,
+                                 SubsurfaceProfile::medium,
+                                 SubsurfaceProfile::wide,
+                                 SubsurfaceProfile::foliage}) {
+                            if (ImGui::Selectable(
+                                    to_token(profile).data(),
+                                    material_editor_->material.subsurface_profile == profile)) {
+                                changed |= material_editor_->material.subsurface_profile != profile;
+                                material_editor_->material.subsurface_profile = profile;
+                            }
+                        }
+                        ImGui::EndCombo();
+                    }
+                    ui_kit_.property_row("SSS strength");
+                    changed |= ImGui::SliderFloat(
+                        "##MaterialSubsurfaceStrength",
+                        &material_editor_->material.subsurface_strength,
+                        0.0F,
+                        1.0F,
+                        "%.2f");
                 }
                 ui_kit_.end_property_grid();
             }
@@ -5332,8 +5390,11 @@ void EditorUi::build_performance(
     }
     if (ImGui::BeginCombo("Subsurface", to_token(renderer.subsurface_mode()).data())) {
         for (const auto mode : {SubsurfaceMode::off, SubsurfaceMode::full_resolution}) {
-            if (ImGui::Selectable(to_token(mode).data(), renderer.subsurface_mode() == mode)) {
-                static_cast<void>(renderer.set_subsurface_mode(mode));
+            if (ImGui::Selectable(to_token(mode).data(), renderer.subsurface_mode() == mode) &&
+                mode != renderer.subsurface_mode() && renderer.set_subsurface_mode(mode)) {
+                checkpoint_scene(scene);
+                scene.subsurface = mode;
+                scene.mark_content_changed();
             }
         }
         ImGui::EndCombo();

@@ -167,6 +167,7 @@ public:
     SceneNodeId startup_camera{};
     std::optional<LightingSettings> lighting{};
     std::optional<ToneMapper> tone_mapper{};
+    std::optional<SubsurfaceMode> subsurface{};
     std::optional<FogSettings> fog{};
     [[nodiscard]] std::optional<SceneCameraPose> startup_camera_pose() const noexcept;
 

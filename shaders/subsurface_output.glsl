@@ -39,7 +39,7 @@ void writeLitSurface(
 {
 #ifdef VCR_SSS_OUTPUT
     const float strength = clamp(subsurfaceStrength, 0.0, 1.0);
-    const uint profile = subsurfaceProfile <= 3u ? subsurfaceProfile : 0u;
+    const uint profile = subsurfaceProfile <= 4u ? subsurfaceProfile : 0u;
     const uint strengthUnorm = uint(round(strength * 255.0));
     if (materialModel == 2u && profile != 0u && strengthUnorm != 0u)
     {

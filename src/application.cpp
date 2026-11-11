@@ -189,7 +189,8 @@ void Application::initialize(const CliOptions& options) {
             options.color_grading, options.color_grading_lut_size)) {
         fatal("Invalid color grading settings");
     }
-    if (!renderer_.set_subsurface_mode(options.subsurface)) {
+    if (!renderer_.set_subsurface_mode(
+            resolve_scene_subsurface(options, scene_.subsurface))) {
         fatal("Invalid subsurface mode");
     }
     if (!renderer_.set_motion_blur_settings(options.motion_blur)) {

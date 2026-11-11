@@ -24,7 +24,7 @@ PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,
         if (model.lods.empty()) {
             prepare_model_lods(model);
         } else {
-            std::array<CookedModelAsset, 2> levels;
+            std::vector<CookedModelAsset> levels(model.lods.size());
             std::size_t geometry_bytes = model.vertices.size() * sizeof(CookedModelVertex) +
                                          model.indices.size() * sizeof(std::uint32_t);
             constexpr auto geometry_budget = maximum_prepared_asset_bytes - 512;

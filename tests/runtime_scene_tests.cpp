@@ -233,24 +233,23 @@ void authored_lod_tests() {
     levels[1].submeshes = {{.index_count = 3}};
     auto prepared = base;
     vcr::prepare_authored_model_lods(prepared, levels, 4096);
-    expect(prepared.vertices.size() == 12 && prepared.indices.size() == 18 &&
+    expect(prepared.vertices.size() < 12 && prepared.indices.size() == 21 &&
                prepared.submeshes.size() == 2, "authored geometry aggregates per material");
     const auto &metal = prepared.submeshes[0];
     const auto &detail = prepared.submeshes[1];
-    expect(metal.lod_count == std::array<std::uint32_t, 4>{6, 3, 3, 0} && !std::isfinite(metal.lod_error[3]) &&
-               detail.lod_count == std::array<std::uint32_t, 4>{3, 3, 0, 0} && !std::isfinite(detail.lod_error[3]),
-           "authored LOD supports merged submeshes and removed material geometry");
-    expect(prepared.indices[metal.lod_first[1]] == 4 &&
-               prepared.indices[metal.lod_first[2]] == 9 &&
-               prepared.indices[detail.lod_first[1] + 1] == 6,
-           "authored LOD rebases indices and maps material names, not slots");
-    expect(prepared.vertices[4].position[1] == .05F &&
-               prepared.vertices[4].normal == base.vertices[0].normal &&
-               prepared.vertices[4].texcoord == base.vertices[0].texcoord &&
-               prepared.vertices[4].tangent == base.vertices[0].tangent,
-           "authored vertex attributes remain exact");
-    expect(vcr::select_lod(detail.lod_error, 1, 1000, 500, 0) == 2 &&
-               detail.lod_count[2] == 0,
+    expect(metal.lod_count == std::array<std::uint32_t, 4>{6, 3, 3, 3} && metal.lod_error[3] > metal.lod_error[2] &&
+               detail.lod_count == std::array<std::uint32_t, 4>{3, 3, 0, 0} && std::isfinite(detail.lod_error[3]),
+           "legacy authored assets receive a fourth LOD while preserving intentional material removal");
+    const auto &shifted = prepared.vertices[prepared.indices[metal.lod_first[1]]];
+    expect(shifted.position[1] == .05F &&
+               prepared.vertices[prepared.indices[metal.lod_first[2]]].position == levels[1].vertices[1].position &&
+               prepared.vertices[prepared.indices[detail.lod_first[1]+1]].position == levels[0].vertices[2].position,
+           "authored LOD maps material names and preserves indexed positions after lossless sharing");
+    expect(shifted.normal == base.vertices[0].normal &&
+               shifted.texcoord == base.vertices[0].texcoord && shifted.tangent == base.vertices[0].tangent,
+           "shared authored vertices preserve normal, UV and tangent seams exactly");
+    const auto removed_level = vcr::select_lod(detail.lod_error, 1, 1000, 500, 0);
+    expect(removed_level >= 2 && detail.lod_count[removed_level] == 0,
            "finite error selects authored removal using existing pixel criterion");
     for (const auto &mesh : prepared.submeshes) {
         for (unsigned level = 0; level < vcr::model_lod_count; ++level) {
@@ -267,6 +266,15 @@ void authored_lod_tests() {
         return false;
     };
     expect(rejects(base, levels, 64), "authored combined upload budget is enforced");
+    {
+        auto four_level = base;
+        four_level.lods.push_back({"lod3.vcrasset.json", .4F});
+        const std::array full_chain{levels[0], levels[1], levels[1]};
+        vcr::prepare_authored_model_lods(four_level, full_chain, 4096);
+        expect(four_level.submeshes[0].lod_count == std::array<std::uint32_t, 4>{6,3,3,3} &&
+                   four_level.submeshes[0].lod_error[3] == .4F,
+               "explicit LOD0..LOD3 chain loads all four authored ranges");
+    }
     auto bad_levels = levels;
     bad_levels[1].materials[0].name = "unknown";
     expect(rejects(base, bad_levels, 4096), "unknown LOD material is rejected");
@@ -421,6 +429,18 @@ int main() {
     }
     const auto original_indices = model.indices;
     model.submeshes.push_back({.index_count = model.indices.size()});
+    {
+        auto source_quality = model;
+        source_quality.generate_lods = false;
+        const auto vertices = source_quality.vertices;
+        vcr::prepare_model_lods(source_quality);
+        expect(source_quality.indices == original_indices && source_quality.vertices.size() == vertices.size(),
+               "source-quality asset preserves every original triangle");
+        const auto& source_mesh = source_quality.submeshes.front();
+        expect(source_mesh.lod_count[0] == original_indices.size() && source_mesh.lod_count[1] == 0 &&
+                   source_mesh.lod_count[2] == 0 && source_mesh.lod_count[3] == 0,
+               "source-quality asset never selects pruned foliage LODs");
+    }
     vcr::prepare_model_lods(model);
     const auto &mesh = model.submeshes.front();
     expect(std::equal(original_indices.begin(), original_indices.end(), model.indices.begin()),
@@ -463,16 +483,33 @@ int main() {
         const auto &cards = foliage.submeshes.front();
         expect(std::equal(foliage_lod0.begin(), foliage_lod0.end(), foliage.indices.begin()),
                "foliage LOD0 preserves disconnected alpha-masked cards bit-exact");
-        expect(cards.lod_count[0] > cards.lod_count[1] && cards.lod_count[1] > cards.lod_count[2] &&
-                   cards.lod_count[2] > cards.lod_count[3] && cards.lod_count[3] > 0U,
-               "foliage simplification unlocks open card borders across LOD1..LOD3");
+        expect(cards.lod_count[0] >= cards.lod_count[1] && cards.lod_count[1] >= cards.lod_count[2] &&
+                   cards.lod_count[2] >= cards.lod_count[3] && cards.lod_count[3] > 0U,
+               "all four foliage LOD ranges stay valid even at the minimum card topology");
         for (unsigned level = 1; level < vcr::model_lod_count; ++level) {
+            std::array<bool,64> surviving{};
+            for (unsigned i = 0; i < cards.lod_count[level]; ++i)
+                surviving[foliage.indices[cards.lod_first[level]+i]/4] = true;
+            expect(std::ranges::all_of(surviving, [](bool present) { return present; }),
+                   "foliage LOD never removes disconnected leaf islands");
             expect(std::isfinite(cards.lod_error[level]) && cards.lod_error[level] > cards.lod_error[level - 1],
                    "foliage geometric errors remain finite and strictly increasing");
         }
     }
     {
         std::array<vcr::CookedModelVertex, 3> tri_vertices{};
+        constexpr auto range = 4ULL * 1024 * 1024 * 1024 - 1;
+        expect(vcr::rt_masked_triangle_capacity(0, 1, range) == vcr::rt_initial_masked_triangle_capacity,
+               "small RT scenes retain the original metadata allocation");
+        expect(vcr::rt_masked_triangle_capacity(0, 6'000'001, range) == 8'388'608 &&
+                   vcr::rt_masked_triangle_capacity(524'288, 600'000, range) == 1'048'576,
+               "resident foliage and streaming RT geometry grow past the former triangle limit");
+        const auto limited = 700'000ULL * sizeof(vcr::RtMaskedTriangle) + 17;
+        expect(vcr::rt_masked_triangle_capacity(524'288, 650'000, limited) == 700'000 &&
+                   vcr::rt_masked_triangle_capacity(524'288, 700'001, limited) == 0 &&
+                   vcr::rt_masked_triangle_capacity(0, UINT64_MAX, range) == 0 &&
+                   vcr::rt_masked_triangle_capacity(0, 16'000'001, range) == 0,
+               "RT metadata obeys whole-record device bounds and the 24-bit custom index budget");
         tri_vertices[0].texcoord = {0.0F, 0.0F};
         tri_vertices[1].texcoord = {1.0F, 0.0F};
         tri_vertices[2].texcoord = {0.0F, 1.0F};

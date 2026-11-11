@@ -70,6 +70,31 @@ $env:VK_VALIDATION_VALIDATE_SYNC = 'true'
 После проверки переменную можно убрать через
 `Remove-Item Env:VK_VALIDATION_VALIDATE_SYNC`.
 
+Кеш геометрии voxel GI начинает с 1 млн треугольников и расширяется только
+при публикации новых ассетов, до 16 млн и в пределах `maxStorageBufferRange`
+выбранного GPU. Расширение сохраняет данные на GPU и ждёт fence старых
+потребителей перед заменой descriptors. Полные меши для рендера не упрощаются.
+В steady-state кадрах расширение не выполняется; новая ёмкость сохраняется
+до завершения renderer. Превышение конечного бюджета имеет отдельную диагностику.
+
+Для тяжёлых импортированных моделей готовьте четыре уровня до запуска сцены:
+
+```powershell
+cmake --build build/windows-release --target vcr_asset_lod_cooker
+build/windows-release/bin/vcr_asset_lod_cooker.exe cook assets pine_environment/SM_Pine_Tree_01.vcrasset.json
+build/windows-release/bin/vcr_asset_lod_cooker.exe inspect assets pine_environment/SM_Pine_Tree_01.vcrasset.json
+```
+
+`cook` сохраняет исходный LOD0, создаёт компактные LOD1/LOD2/LOD3 и обновляет
+ссылки модели. Alpha-masked геометрия упрощается без удаления disconnected
+components и без искусственного занижения geometric error. Минимальная
+геометрия сохраняется, когда дальнейшее упрощение разрушило бы её.
+Существующие модели с двумя authored references совместимы: недостающий LOD3
+готовится из LOD2. Загрузчик поддерживает три authored references, а одинаковые
+position/normal/UV/tangent tuples всех уровней разделяют один vertex buffer.
+`inspect` проверяет цепочку тем же CPU-путём, которым её готовит renderer,
+и выводит triangle counts, ошибки и размер геометрии без запуска GPU.
+
 Автоматическая проверка повторных startup/shutdown, resize, FIFO/IMMEDIATE,
 off/SMAA/FSR, instancing и compute workload:
 

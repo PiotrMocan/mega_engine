@@ -19,7 +19,7 @@ const int maximumKernelRadius = 24;
 uint decodeProfile(float control)
 {
     if (isnan(control) || isinf(control) || control < 256.0) return 0u;
-    return min(uint(round(control)) / 256u, 3u);
+    return min(uint(round(control)) / 256u, 4u);
 }
 
 vec3 profileSigma(uint profile)
@@ -27,6 +27,7 @@ vec3 profileSigma(uint profile)
     if (profile == 1u) return vec3(0.02, 0.009, 0.004);
     if (profile == 2u) return vec3(0.06, 0.028, 0.012);
     if (profile == 3u) return vec3(0.15, 0.075, 0.032);
+    if (profile == 4u) return vec3(0.035, 0.060, 0.014);
     return vec3(0.0);
 }
 
@@ -72,7 +73,7 @@ void main()
     const float worldPerPixel = max(
         centerDistance / pushConstants.depthParameters.z, 1.0e-6);
     const vec3 sigma = profileSigma(profile);
-    const float maximumSigma = sigma.x;
+    const float maximumSigma = max(sigma.x, max(sigma.y, sigma.z));
     const int pixelStep = clamp(
         int(round(maximumSigma / worldPerPixel)),
         0,

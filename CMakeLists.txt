@@ -403,6 +403,17 @@ else()
     endif()
 endif()
 
+# Explicit offline asset step. LOD meshes share materials and are compacted;
+# ordinary scene loading reads the prepared four-level chain without simplifying.
+add_executable(vcr_asset_lod_cooker EXCLUDE_FROM_ALL
+    tools/asset_lod_cooker.cpp src/model_lod.cpp)
+target_link_libraries(vcr_asset_lod_cooker PRIVATE
+    vcr_cooked_model_asset meshoptimizer nlohmann_json::nlohmann_json)
+set_target_properties(vcr_asset_lod_cooker PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+if(MSVC)
+    target_compile_options(vcr_asset_lod_cooker PRIVATE /W4 /permissive- /EHsc /GR-)
+endif()
+
 add_library(vcr_cooked_texture_asset STATIC
     src/cooked_texture_asset.cpp
 )

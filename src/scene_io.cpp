@@ -613,6 +613,14 @@ bool save_scene_file(
         }
         metadata["tone_mapper"] = to_token(*scene.tone_mapper);
     }
+    if (scene.subsurface) {
+        if (*scene.subsurface != SubsurfaceMode::off &&
+            *scene.subsurface != SubsurfaceMode::full_resolution) {
+            error = "Scene subsurface mode is invalid.";
+            return false;
+        }
+        metadata["subsurface"] = to_token(*scene.subsurface);
+    }
     if (scene.fog) {
         if (!valid_fog_settings(*scene.fog)) {
             error = "Scene fog settings are invalid.";
@@ -1240,6 +1248,19 @@ bool load_scene_file(
                 return false;
             }
             loaded.tone_mapper = *mapper;
+        }
+        if (root.contains("subsurface")) {
+            if (!root["subsurface"].is_string()) {
+                error = "Scene subsurface mode is invalid.";
+                return false;
+            }
+            const auto mode = parse_subsurface_mode(
+                root["subsurface"].get_ref<const std::string&>());
+            if (!mode) {
+                error = "Scene subsurface mode is invalid.";
+                return false;
+            }
+            loaded.subsurface = *mode;
         }
         if (root.contains("fog")) {
             FogSettings settings;

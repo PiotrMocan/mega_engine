@@ -16,12 +16,12 @@
 namespace vcr {
 namespace {
 
-constexpr std::uint32_t rt_opacity_max_triangles = 524'288U;
 constexpr std::uint32_t rt_alpha_max_maps = 32U;
-constexpr std::uint32_t rt_alpha_texel_base_word =
-    rt_opacity_max_triangles * static_cast<std::uint32_t>(sizeof(RtMaskedTriangle) / sizeof(std::uint32_t));
+// Zero means no alpha map in a triangle record. Alpha texels have their own
+// buffer so growing triangle metadata never invalidates these stable offsets.
+constexpr std::uint32_t rt_alpha_texel_base_word = 4U;
 constexpr std::uint32_t rt_alpha_max_texel_words = rt_alpha_max_maps * rt_alpha_map_word_count;
-constexpr VkDeviceSize rt_opacity_buffer_bytes =
+constexpr VkDeviceSize rt_alpha_buffer_bytes =
     static_cast<VkDeviceSize>(rt_alpha_texel_base_word + rt_alpha_max_texel_words) *
     sizeof(std::uint32_t);
 constexpr std::uint32_t rt_initial_tlas_capacity = 256U;
@@ -322,17 +322,93 @@ private:
 
 } // namespace
 
+std::uint64_t Renderer::resident_rt_masked_triangle_count() const noexcept {
+    std::uint64_t count = 1; // Opaque sentinel.
+#if VCR_EDITOR_ENABLED
+    for (const auto &asset : editor_model_assets_)
+        for (const auto &part : asset.submeshes)
+            count += part.cpu_rt_triangles.size();
+#endif
+    return count;
+}
+
+void Renderer::ensure_rt_masked_triangle_capacity(const std::uint64_t required) {
+    if (!rt_provisioned_ || required <= rt_opacity_triangle_capacity_) return;
+    const auto capacity = rt_masked_triangle_capacity(rt_opacity_triangle_capacity_, required,
+        context_->properties().limits.maxStorageBufferRange);
+    if (capacity == 0) fatal("RT metadata exceeds its bounded cache or device storage range");
+    // Asset publication occurs on the submission owner before recording a
+    // frame/upload batch. Retire descriptor users before changing the buffer.
+    assert(!asset_upload_.recording());
+    asset_upload_.wait();
+    std::array<VkFence, max_frames_in_flight> fences{};
+    std::transform(frames_.begin(), frames_.end(), fences.begin(),
+        [](const FrameContext &frame) noexcept { return frame.fence; });
+    VK_CHECK(vkWaitForFences(context_->device(), static_cast<std::uint32_t>(fences.size()),
+        fences.data(), VK_TRUE, UINT64_MAX));
+    GpuBuffer replacement;
+    replacement.create(*context_, sizeof(RtMaskedTriangle) * static_cast<VkDeviceSize>(capacity),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, 0, "RT masked triangle cache");
+    {
+        RtImmediateCommands commands(*context_);
+        const auto cmd = commands.command_buffer();
+        rt_memory_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        const VkBufferCopy copy{0, 0,
+            sizeof(RtMaskedTriangle) * static_cast<VkDeviceSize>(rt_opacity_triangle_count_)};
+        vkCmdCopyBuffer(cmd, rt_opacity_micromaps_.handle(), replacement.handle(), 1, &copy);
+        rt_memory_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        commands.submit_and_wait();
+    }
+    const VkDescriptorBufferInfo buffer{replacement.handle(), 0, replacement.size()};
+    for (const auto &frame : frames_) {
+        const VkWriteDescriptorSet write{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = frame.lighting_descriptor_set, .dstBinding = 9U,
+            .descriptorCount = 1U, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &buffer};
+        vkUpdateDescriptorSets(context_->device(), 1, &write, 0, nullptr);
+    }
+    rt_opacity_micromaps_ = std::move(replacement);
+    rt_opacity_triangle_capacity_ = capacity;
+    std::clog << "RT masked triangle cache grew to " << capacity << " records\n";
+}
+
+bool Renderer::reserve_rt_model_metadata(const PreparedModel &prepared, std::string &error) {
+    if (!rt_provisioned_ || !prepared.model) return true;
+    std::uint64_t required = rt_opacity_triangle_count_;
+    for (const auto &triangles : prepared.submesh_rt_triangles) required += triangles.size();
+    if (rt_masked_triangle_capacity(rt_opacity_triangle_capacity_, required,
+            context_->properties().limits.maxStorageBufferRange) == 0) {
+        error = "Model exceeds the bounded RT metadata cache or device storage range";
+        return false;
+    }
+    ensure_rt_masked_triangle_capacity(required);
+    return true;
+}
+
 void Renderer::create_ray_tracing_resources() {
     if (!rt_provisioned_ || context_ == nullptr) {
         return;
     }
+    rt_opacity_triangle_capacity_ = rt_masked_triangle_capacity(0, resident_rt_masked_triangle_count(),
+        context_->properties().limits.maxStorageBufferRange);
+    if (rt_opacity_triangle_capacity_ == 0)
+        fatal("Resident RT geometry exceeds the bounded metadata cache or device storage range");
     rt_opacity_micromaps_.create(
         *context_,
-        rt_opacity_buffer_bytes,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        sizeof(RtMaskedTriangle) * static_cast<VkDeviceSize>(rt_opacity_triangle_capacity_),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
-        "RT masked triangle & R8 alpha cache");
+        "RT masked triangle cache");
+    rt_alpha_texels_.create(*context_, rt_alpha_buffer_bytes,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, 0, "RT R8 alpha texels");
     const RtMaskedTriangle sentinel_opaque{};
     upload_to_device_buffer(
         rt_opacity_micromaps_,
@@ -583,7 +659,9 @@ void Renderer::destroy_ray_tracing() noexcept {
     blas_cube_.destroy();
     rt_upload_scratch_.destroy();
     rt_opacity_micromaps_.destroy();
+    rt_alpha_texels_.destroy();
     rt_opacity_triangle_count_ = 0U;
+    rt_opacity_triangle_capacity_ = 0U;
     rt_alpha_texel_words_used_ = 0U;
     rt_tlas_instances_.clear();
     rt_provisioned_ = false;
@@ -673,7 +751,9 @@ void Renderer::ensure_frame_tlas_capacity(
     frame.tlas_capacity = new_capacity;
     frame.tlas_built_once = false;
 
-    if (frame.lighting_descriptor_set != VK_NULL_HANDLE) {
+    // Lazy provisioning builds TLAS before replacing the old non-RT layout.
+    // Its sets have no binding 10; the new RT sets are populated afterwards.
+    if (frame.lighting_descriptor_set != VK_NULL_HANDLE && lighting_layout_has_rt_) {
         const VkAccelerationStructureKHR tlas_handle = frame.tlas.handle();
         const VkWriteDescriptorSetAccelerationStructureKHR tlas_write{
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,
@@ -970,7 +1050,7 @@ std::uint32_t Renderer::find_or_upload_rt_alpha_map(
             VK_ACCESS_2_TRANSFER_WRITE_BIT);
     }
     upload_to_device_buffer(
-        rt_opacity_micromaps_,
+        rt_alpha_texels_,
         std::as_bytes(std::span{found->cpu_words}),
         static_cast<VkDeviceSize>(word_offset) * sizeof(std::uint32_t));
     found->gpu_word_offset = word_offset;
@@ -984,8 +1064,9 @@ std::uint32_t Renderer::append_rt_masked_triangles(
     if (!rt_provisioned_ || triangles.empty()) {
         return 0U;
     }
-    if (triangles.size() > rt_opacity_max_triangles - rt_opacity_triangle_count_) {
-        fatal("RT masked triangle cache exceeds 524,288 triangles; use --rt off");
+    if (rt_opacity_triangle_count_ > rt_opacity_triangle_capacity_ ||
+        triangles.size() > rt_opacity_triangle_capacity_ - rt_opacity_triangle_count_) {
+        fatal("RT metadata capacity was not reserved before asset publication");
     }
     const std::uint32_t first = rt_opacity_triangle_count_;
     if (asset_upload_.recording()) {

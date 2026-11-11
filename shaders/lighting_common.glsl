@@ -26,6 +26,12 @@ vec3 dynamicSkyBackground(vec3 direction) {
     color*=mix(0.12,1.0,smoothstep(-0.3,0.02,direction.y));
     return color;
 }
+vec3 dynamicSkyHemisphereAmbient(vec3 normal) {
+    float upWeight = clamp(normal.y * 0.5 + 0.5, 0.0, 1.0);
+    vec3 skyDome = mix(lighting.skyHorizon.rgb, lighting.skyZenith.rgb, 0.58) * 0.255;
+    vec3 groundBounce = (lighting.skyHorizon.rgb * vec3(0.95, 0.86, 0.70) + lighting.skyZenith.rgb * 0.22) * 0.095;
+    return mix(groundBounce, skyDome, upWeight);
+}
 vec3 dynamicSky(vec3 direction) {
     vec3 color=dynamicSkyBackground(direction);
     float alignment=max(dot(direction,lighting.sunDirectionIntensity.xyz),0.0);
@@ -104,6 +110,9 @@ layout(set=LIGHTING_SET,binding=9,std430) readonly buffer RtOpacityDataBuffer {
     uint words[];
 } rtOpacityData;
 layout(set=LIGHTING_SET,binding=10) uniform accelerationStructureEXT sceneTlas;
+layout(set=LIGHTING_SET,binding=11,std430) readonly buffer RtAlphaTexelBuffer {
+    uint words[];
+} rtAlphaTexels;
 
 float rayScaleForPosition(vec3 worldPosition) {
     return max(1.0, max(abs(worldPosition.x), max(abs(worldPosition.y), abs(worldPosition.z))));
@@ -120,7 +129,7 @@ float rayMinT(vec3 worldPosition) {
 
 float rtFetchAlphaTexel1024(uint baseWord, uint x, uint y) {
     uint pixelIndex = (y << 10u) + x;
-    uint word = rtOpacityData.words[baseWord + (pixelIndex >> 2u)];
+    uint word = rtAlphaTexels.words[baseWord + (pixelIndex >> 2u)];
     uint byteVal = (word >> ((pixelIndex & 3u) << 3u)) & 0xFFu;
     return float(byteVal) * (1.0 / 255.0);
 }
@@ -197,6 +206,66 @@ float rayTracedSunVisibilityWorld(
 
 float rayTracedSunVisibility(vec3 worldPosition, vec3 geometricNormal, vec3 lightDirection) {
     return rayTracedSunVisibilityWorld(worldPosition, geometricNormal, lightDirection, 250.0);
+}
+
+float rayTracedFoliageTransmittanceWorld(
+    vec3 worldPosition,
+    vec3 sunFacingNormal,
+    vec3 lightDirection,
+    float maxDistance) {
+    float scale = rayScaleForPosition(worldPosition);
+    vec3 origin = worldPosition
+        + sunFacingNormal * (1.5e-3 * scale)
+        + lightDirection * (5.0e-4 * scale);
+    float transmittance = 1.0;
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(
+        rq,
+        sceneTlas,
+        0u,
+        0xFFu,
+        origin,
+        1.0e-3 * scale,
+        lightDirection,
+        maxDistance);
+    while (rayQueryProceedEXT(rq)) {
+        if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+            int customIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false);
+            int primitiveIndex = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+            uint base = (uint(customIndex) + uint(primitiveIndex)) * 8u;
+            uint texelWordOffset = rtOpacityData.words[base + 6u];
+            if (texelWordOffset == 0u) {
+                float effectiveCutoff = uintBitsToFloat(rtOpacityData.words[base + 7u]);
+                if (effectiveCutoff <= 1.0) {
+                    transmittance = 0.0;
+                    rayQueryTerminateEXT(rq);
+                }
+            } else if (rtAlphaMaskKeep(
+                rayQueryGetIntersectionBarycentricsEXT(rq, false),
+                customIndex,
+                primitiveIndex)) {
+                transmittance *= 0.48;
+                if (transmittance < 0.06) {
+                    transmittance = 0.0;
+                    rayQueryTerminateEXT(rq);
+                }
+            }
+        } else {
+            transmittance = 0.0;
+            rayQueryTerminateEXT(rq);
+        }
+    }
+    if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+        return 0.0;
+    }
+    return transmittance;
+}
+
+float rayTracedFoliageTransmittance(
+    vec3 worldPosition,
+    vec3 sunFacingNormal,
+    vec3 lightDirection) {
+    return rayTracedFoliageTransmittanceWorld(worldPosition, sunFacingNormal, lightDirection, 250.0);
 }
 #endif
 #endif

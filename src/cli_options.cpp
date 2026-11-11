@@ -535,6 +535,7 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
                 return result;
             }
             result.options.subsurface = *mode;
+            result.options.subsurface_override = true;
             continue;
         }
         if (argument.name == "--exposure") {
@@ -1051,6 +1052,17 @@ ToneMapper resolve_scene_tone_mapper(
     return options.tone_mapper_override || !authored
         ? options.tone_mapper
         : *authored;
+}
+
+SubsurfaceMode resolve_scene_subsurface(
+    const CliOptions& options, const std::optional<SubsurfaceMode> authored) noexcept {
+    const SubsurfaceMode resolved = options.subsurface_override || !authored
+        ? options.subsurface
+        : *authored;
+    if (!options.subsurface_override && is_msaa(options.anti_aliasing.method)) {
+        return SubsurfaceMode::off;
+    }
+    return resolved;
 }
 
 FogSettings resolve_scene_fog(

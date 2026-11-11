@@ -5,7 +5,8 @@ namespace vcr {
 // Cold asset-preparation step, also usable by the background loader. Position,
 // normal/UV seams and submesh borders are preserved; vertices are shared.
 void prepare_model_lods(CookedModelAsset &model);
-// Cold preparation. Names map LOD materials to LOD0; absent materials have a
+// Cold preparation of LOD1..LOD3. Legacy two-reference assets get a generated
+// fourth level from LOD2. Names map materials to LOD0; absent materials have a
 // finite error and an empty range, distinguishing authored removal from no LOD.
 // Each supplied model uses the same local coordinate system as LOD0.
 void prepare_authored_model_lods(CookedModelAsset &model,

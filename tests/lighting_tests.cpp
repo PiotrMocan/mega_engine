@@ -15,6 +15,21 @@ void expect(bool ok, const char *message) {
 int main() {
     using namespace vcr;
     {
+        constexpr std::uint64_t large_range = 4ULL * 1024 * 1024 * 1024 - 1;
+        expect(gi_cache_capacity(gi_max_triangles, gi_max_triangles, large_range) == gi_max_triangles,
+               "small scenes keep the initial GI allocation");
+        expect(gi_cache_capacity(gi_max_triangles, 9'123'381, large_range) == gi_triangle_cache_limit,
+               "full source forest fits the bounded GI cache");
+        const auto limited_range = 2'500'000ULL * sizeof(GiTriangle) + 17;
+        expect(gi_cache_capacity(2'000'000, 2'400'000, limited_range) == 2'500'000 &&
+                   gi_cache_capacity(2'000'000, 2'500'001, limited_range) == 0,
+               "GI growth clamps to whole triangles within the device storage range");
+        expect(gi_cache_capacity(gi_max_triangles, UINT64_MAX, large_range) == 0 &&
+                   gi_cache_capacity(gi_max_triangles, gi_triangle_cache_limit + 1ULL, large_range) == 0 &&
+                   gi_cache_capacity(0, 1, sizeof(GiTriangle)-1) == 0,
+               "GI cache rejects overflow, hard-budget exhaustion and undersized buffers");
+    }
+    {
         const PunctualLight point{.color = {1.0F, 0.5F, 0.25F},
                                   .intensity_candela = 120.0F,
                                   .range = 4.0F};
