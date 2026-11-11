@@ -451,6 +451,17 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
             result.options.lighting_overrides.cascade_cache = true;
             continue;
         }
+        if (argument.name == "--rt") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            const auto mode = parse_ray_tracing_mode(value, true);
+            if (!mode) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.lighting.ray_tracing = *mode;
+            result.options.lighting_overrides.ray_tracing = true;
+            continue;
+        }
         if (argument.name == "--tone-mapper") {
             if (!take_value(argument, index, argc, argv, value, result.error)) return result;
             const auto mapper = parse_tone_mapper(value);
@@ -605,9 +616,10 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
                 overrides.dynamic = true;
                 s.dynamic = value == "dynamic";
                 if (!s.dynamic) {
-                    overrides.voxel_gi = overrides.cycle = true;
+                    overrides.voxel_gi = overrides.cycle = overrides.ray_tracing = true;
                     s.voxel_gi = false;
                     s.cycle = false;
+                    s.ray_tracing = RayTracingMode::off;
                 }
             } else if (argument.name == "--gi") {
                 valid = value == "voxel" || value == "off";
@@ -944,6 +956,11 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
         result.error = "invalid exposure settings";
         return result;
     }
+    if (!result.options.lighting.dynamic &&
+        result.options.lighting.ray_tracing != RayTracingMode::off) {
+        result.error = "--rt requires --lighting dynamic";
+        return result;
+    }
     if (!valid_motion_blur_settings(result.options.motion_blur)) {
         result.error = "invalid motion blur settings";
         return result;
@@ -1014,10 +1031,12 @@ LightingSettings resolve_scene_lighting(
     if (options.lighting_overrides.shadow_resolution) result.shadow_resolution = options.lighting.shadow_resolution;
     if (options.lighting_overrides.shadow_depth) result.shadow_depth = options.lighting.shadow_depth;
     if (options.lighting_overrides.cascade_cache) result.cascade_cache = options.lighting.cascade_cache;
+    if (options.lighting_overrides.ray_tracing) result.ray_tracing = options.lighting.ray_tracing;
     // Selecting legacy lighting disables features that require the dynamic path.
     if (!result.dynamic) {
         result.voxel_gi = false;
         result.cycle = false;
+        result.ray_tracing = RayTracingMode::off;
     }
     return result;
 }
@@ -1139,6 +1158,7 @@ std::string cli_usage(std::string_view executable_name) {
                   "  --shadow-resolution N      Atlas edge: 1024|2048|4096|8192 (2048)\n"
                   "  --shadow-depth auto|d32|d16 Startup shadow depth profile (auto)\n"
                   "  --shadow-cache full|cascade Cascade refresh policy (full)\n"
+                  "  --rt off|on|shadows|gi|full Hardware ray query path (off by default)\n"
                   "  --time-of-day 0..24         Initial hour (14)\n"
                   "  --day-cycle on|off          Advance time (on)\n"
                   "  --day-length SECONDS        Full day duration (600)\n"

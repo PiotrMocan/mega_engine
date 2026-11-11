@@ -4,8 +4,10 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <glm/vec2.hpp>
 #include <glm/vec3.hpp>
 #include <mutex>
+#include <span>
 #include <thread>
 
 namespace vcr {
@@ -20,9 +22,13 @@ struct PreparedModel {
     std::string path, error;
     std::optional<CookedModelAsset> model;
     std::vector<PreparedTexture> textures;
+    std::vector<std::vector<glm::uvec2>> submesh_opacity_micromaps;
     std::size_t upload_bytes = 0;
 };
-[[nodiscard]] PreparedModel prepare_model_asset(std::filesystem::path root, std::string path);
+// Resident paths are an owned snapshot at the queue boundary. GPU texture cache
+// entries live until renderer shutdown; masked base colors still decode for OMM.
+[[nodiscard]] PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,
+    std::span<const std::string> resident_textures = {});
 
 // Two outstanding jobs at most, including results not consumed by the owner.
 // One persistent I/O/LOD worker leaves the submission thread and other engine
@@ -37,7 +43,8 @@ class AssetPreparation final {
     AssetPreparation &operator=(const AssetPreparation &) = delete;
     void start();
     void stop() noexcept;
-    [[nodiscard]] bool request(std::filesystem::path root, std::string path);
+    [[nodiscard]] bool request(std::filesystem::path root, std::string path,
+        std::vector<std::string> resident_textures = {});
     [[nodiscard]] std::optional<PreparedModel> poll();
     [[nodiscard]] std::size_t high_water() const noexcept {
         return high_water_;
@@ -47,6 +54,7 @@ class AssetPreparation final {
     struct Request {
         std::filesystem::path root;
         std::string path;
+        std::vector<std::string> resident_textures;
     };
     std::mutex mutex_;
     std::condition_variable wake_;

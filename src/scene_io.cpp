@@ -131,6 +131,12 @@ template <typename T>
         if (!depth) return false;
         s.shadow_depth = *depth;
     }
+    if (source.contains("ray_tracing")) {
+        if (!source["ray_tracing"].is_string()) return false;
+        const auto rt = parse_ray_tracing_mode(source["ray_tracing"].get<std::string_view>(), false);
+        if (!rt) return false;
+        s.ray_tracing = *rt;
+    }
     for (const auto &[key, target] : std::array{
              std::pair{"dynamic", &s.dynamic}, std::pair{"voxel_gi", &s.voxel_gi},
              std::pair{"cycle", &s.cycle}, std::pair{"cascade_cache", &s.cascade_cache}}) {
@@ -142,6 +148,7 @@ template <typename T>
     if (!s.dynamic) {
         if (!source.contains("voxel_gi")) s.voxel_gi = false;
         if (!source.contains("cycle")) s.cycle = false;
+        if (!source.contains("ray_tracing")) s.ray_tracing = RayTracingMode::off;
     }
     return read_setting(source, "hour", s.hour, 0, 24) && s.hour < 24 &&
         read_setting(source, "day_seconds", s.day_seconds, 1, 864000) &&
@@ -159,7 +166,8 @@ template <typename T>
                 {"gi_strength", s.gi_strength}, {"triangle_budget", s.triangle_budget},
                 {"gi_update_hz", s.gi_update_hz}, {"shadow_resolution", s.shadow_resolution},
                 {"shadow_depth", to_token(s.shadow_depth)},
-                {"cascade_cache", s.cascade_cache}};
+                {"cascade_cache", s.cascade_cache},
+                {"ray_tracing", to_token(s.ray_tracing)}};
 }
 
 [[nodiscard]] bool read_fog(const Json& source, FogSettings& settings) {

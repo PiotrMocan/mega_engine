@@ -24,7 +24,8 @@ public:
         VkBufferUsageFlags usage,
         VmaMemoryUsage memory_usage,
         VmaAllocationCreateFlags allocation_flags = 0,
-        std::string_view debug_name = {});
+        std::string_view debug_name = {},
+        VkDeviceSize min_alignment = 0);
     void destroy() noexcept;
 
     void write(std::span<const std::byte> bytes, VkDeviceSize offset = 0);
@@ -38,6 +39,7 @@ public:
     [[nodiscard]] VmaAllocation allocation() const noexcept { return allocation_; }
     [[nodiscard]] VkDeviceSize size() const noexcept { return size_; }
     [[nodiscard]] void* mapped_data() const noexcept { return mapped_data_; }
+    [[nodiscard]] VkDeviceAddress device_address() const noexcept;
     [[nodiscard]] explicit operator bool() const noexcept {
         return buffer_ != VK_NULL_HANDLE;
     }

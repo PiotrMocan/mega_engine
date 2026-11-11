@@ -36,7 +36,8 @@ void GpuBuffer::create(
     const VkBufferUsageFlags usage,
     const VmaMemoryUsage memory_usage,
     const VmaAllocationCreateFlags allocation_flags,
-    const std::string_view debug_name) {
+    const std::string_view debug_name,
+    const VkDeviceSize min_alignment) {
     destroy();
     context_ = &context;
     size_ = size;
@@ -52,13 +53,24 @@ void GpuBuffer::create(
         .usage = memory_usage,
     };
     VmaAllocationInfo result_info{};
-    VK_CHECK(vmaCreateBuffer(
-        context.allocator(),
-        &buffer_info,
-        &allocation_info,
-        &buffer_,
-        &allocation_,
-        &result_info));
+    if (min_alignment > 0) {
+        VK_CHECK(vmaCreateBufferWithAlignment(
+            context.allocator(),
+            &buffer_info,
+            &allocation_info,
+            min_alignment,
+            &buffer_,
+            &allocation_,
+            &result_info));
+    } else {
+        VK_CHECK(vmaCreateBuffer(
+            context.allocator(),
+            &buffer_info,
+            &allocation_info,
+            &buffer_,
+            &allocation_,
+            &result_info));
+    }
     mapped_data_ = result_info.pMappedData;
 
     if (!debug_name.empty()) {
@@ -119,6 +131,18 @@ std::span<const std::byte> GpuBuffer::read_completed_bytes(VkDeviceSize size) {
     size = size == VK_WHOLE_SIZE ? size_ : size;
     invalidate(0, size);
     return {static_cast<const std::byte *>(mapped_data_), static_cast<std::size_t>(size)};
+}
+
+VkDeviceAddress GpuBuffer::device_address() const noexcept {
+    if (buffer_ == VK_NULL_HANDLE || context_ == nullptr ||
+        !context_->buffer_device_address_enabled()) {
+        return 0;
+    }
+    const VkBufferDeviceAddressInfo info{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+        .buffer = buffer_,
+    };
+    return vkGetBufferDeviceAddress(context_->device(), &info);
 }
 
 } // namespace vcr

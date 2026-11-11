@@ -1,5 +1,8 @@
-#version 450
+#version 460
 #extension GL_GOOGLE_include_directive : require
+#ifdef VCR_RAY_QUERY
+#extension GL_EXT_ray_query : require
+#endif
 
 #include "pbr_lighting.glsl"
 #include "voxel_sampling.glsl"
@@ -60,6 +63,11 @@ uint mixBits(uint value)
 
 float sunVisibility(vec3 normal, vec3 lightDirection)
 {
+#ifdef VCR_RAY_QUERY
+    if (lighting.options.x > 0.5 && lighting.volumeParameters.z > 0.5) {
+        return rayTracedSunVisibility(inWorldPosition, normal, lightDirection);
+    }
+#endif
     if(lighting.options.x>0.5) return cascadedVisibility(shadowMap,inWorldPosition,normal,lightDirection);
     const vec3 projected =
         inShadowPosition.xyz / inShadowPosition.w;

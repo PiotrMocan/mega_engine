@@ -819,6 +819,19 @@ void EditorApplication::execute_mcp_command(
                     {"render_height", renderer_.render_extent().height},
                     {"resident_bytes", renderer_.subsurface_resident_bytes()},
                 }},
+                {"ray_tracing", Json{
+                    {"mode_requested", to_token(renderer_.lighting_settings().ray_tracing)},
+                    {"mode_actual", to_token(renderer_.ray_tracing_mode_actual())},
+                    {"supported", renderer_.ray_tracing_supported()},
+                    {"provisioned", renderer_.ray_tracing_provisioned()},
+                    {"blas_count", renderer_.lighting_statistics().blas_count},
+                    {"tlas_instances", renderer_.lighting_statistics().tlas_instances},
+                    {"tlas_builds", renderer_.lighting_statistics().tlas_builds},
+                    {"acceleration_structure_bytes",
+                     renderer_.lighting_statistics().acceleration_structure_bytes},
+                    {"opacity_micromap_bytes",
+                     renderer_.lighting_statistics().opacity_micromap_bytes},
+                }},
                 {"motion_blur", Json{
                     {"mode_requested", to_token(renderer_.motion_blur_settings().mode)},
                     {"mode_actual", to_token(renderer_.motion_blur_mode_actual())},
@@ -1758,6 +1771,30 @@ void EditorApplication::execute_mcp_command(
             {"provisioned", renderer_.subsurface_resources_provisioned()},
             {"resident_bytes", renderer_.subsurface_resident_bytes()},
         });
+        return;
+    }
+    case McpCommandType::render_set_ray_tracing: {
+        auto settings = renderer_.lighting_settings();
+        settings.ray_tracing = command.ray_tracing;
+        if (!renderer_.set_lighting_settings(settings)) {
+            fail("Ray tracing requires dynamic lighting (and provisioned Voxel GI for gi/full)");
+            return;
+        }
+        if (ui_.play_state() == EditorPlayState::edit &&
+            (!scene_.lighting || scene_.lighting->ray_tracing != settings.ray_tracing)) {
+            ui_.checkpoint_scene(scene_);
+            scene_.lighting = settings;
+            scene_.mark_content_changed();
+        }
+        renderer_.reset_metrics();
+        succeed(
+            "Ray tracing mode requested; lazy acceleration structures apply at the next rendered frame",
+            Json{
+                {"mode_requested", to_token(renderer_.lighting_settings().ray_tracing)},
+                {"mode_actual", to_token(renderer_.ray_tracing_mode_actual())},
+                {"supported", renderer_.ray_tracing_supported()},
+                {"provisioned", renderer_.ray_tracing_provisioned()},
+            });
         return;
     }
     case McpCommandType::render_set_motion_blur: {

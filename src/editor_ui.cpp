@@ -5541,6 +5541,10 @@ void EditorUi::build_performance(
     }
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
         ImGui::SetTooltip("Partial covers terrain and primitives; full also includes imported opaque models.");
+    if (renderer.depth_prepass_actual() != renderer.depth_prepass()) {
+        ImGui::TextDisabled("Actual %s (promoted for hardware RT)",
+                            to_token(renderer.depth_prepass_actual()).data());
+    }
     if (ImGui::BeginCombo("Model LOD fade", to_token(renderer.lod_fade_pattern()).data())) {
         for (const auto pattern : {LodFadePattern::off, LodFadePattern::bayer4, LodFadePattern::bayer8}) {
             if (ImGui::Selectable(to_token(pattern).data(), renderer.lod_fade_pattern() == pattern))
@@ -5594,15 +5598,45 @@ void EditorUi::build_performance(
     lighting_changed |=
         ImGui::SliderFloat("Indirect intensity", &lighting.gi_strength, 0, 2, "%.2f");
     ImGui::EndDisabled();
+    ImGui::BeginDisabled(!renderer.ray_tracing_supported() || !lighting.dynamic);
+    if (ImGui::BeginCombo("Ray tracing", to_token(lighting.ray_tracing).data())) {
+        for (const auto mode : {RayTracingMode::off, RayTracingMode::shadows,
+                                RayTracingMode::gi, RayTracingMode::full}) {
+            const bool needs_gi = ray_tracing_uses_gi(mode) && !renderer.gi_provisioned();
+            ImGui::BeginDisabled(needs_gi);
+            if (ImGui::Selectable(to_token(mode).data(), lighting.ray_tracing == mode)) {
+                lighting.ray_tracing = mode;
+                lighting_changed = true;
+            }
+            ImGui::EndDisabled();
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort | ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Inline VK_KHR_ray_query sun shadows and hybrid near-field RT + far-field voxel GI.");
     if (lighting_changed) {
-        if (!lighting.dynamic)
+        if (!lighting.dynamic) {
             lighting.voxel_gi = false;
+            lighting.ray_tracing = RayTracingMode::off;
+        }
         if (renderer.set_lighting_settings(lighting)) {
             checkpoint_scene(scene);
             scene.lighting = lighting;
             scene.mark_content_changed();
         }
     }
+    ImGui::TextDisabled(
+        "RT actual %s (%s), %u BLAS, %u TLAS instances, %.2f MiB AS, TLAS %.3f ms",
+        to_token(renderer.ray_tracing_mode_actual()).data(),
+        renderer.ray_tracing_supported()
+            ? (renderer.ray_tracing_provisioned() ? "provisioned" : "supported")
+            : "unavailable",
+        renderer.lighting_statistics().blas_count,
+        renderer.lighting_statistics().tlas_instances,
+        static_cast<double>(renderer.lighting_statistics().acceleration_structure_bytes) /
+            (1024.0 * 1024.0),
+        performance.average.gpu_tlas_ms);
     ImGui::Text("GI geometry %.3f ms, lighting %.3f ms", performance.average.gpu_voxel_geometry_ms,
                 performance.average.gpu_voxel_light_ms);
     ImGui::Text("GI pending regions: %u", renderer.lighting_statistics().pending_bricks);

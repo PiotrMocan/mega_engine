@@ -108,6 +108,37 @@ int main() {
     settings.gi_extent = 64;
     settings.gi_update_hz = std::numeric_limits<float>::quiet_NaN();
     expect(!valid_lighting_settings(settings), "reject nonfinite update rate");
+    settings = LightingSettings{};
+    expect(settings.ray_tracing == RayTracingMode::off &&
+               to_token(RayTracingMode::off) == "off" &&
+               to_token(RayTracingMode::shadows) == "shadows" &&
+               to_token(RayTracingMode::gi) == "gi" &&
+               to_token(RayTracingMode::full) == "full" &&
+               parse_ray_tracing_mode("off") == RayTracingMode::off &&
+               parse_ray_tracing_mode("shadows") == RayTracingMode::shadows &&
+               parse_ray_tracing_mode("gi") == RayTracingMode::gi &&
+               parse_ray_tracing_mode("full") == RayTracingMode::full &&
+               !parse_ray_tracing_mode("on", false) &&
+               parse_ray_tracing_mode("on", true) == RayTracingMode::full &&
+               !parse_ray_tracing_mode("FULL", true),
+           "ray tracing tokens and CLI alias parse strictly");
+    expect(resolve_ray_tracing_mode(RayTracingMode::full, false, true, true) == RayTracingMode::off &&
+               resolve_ray_tracing_mode(RayTracingMode::full, true, false, true) == RayTracingMode::off &&
+               resolve_ray_tracing_mode(RayTracingMode::full, true, true, false) == RayTracingMode::shadows &&
+               resolve_ray_tracing_mode(RayTracingMode::gi, true, true, false) == RayTracingMode::off &&
+               resolve_ray_tracing_mode(RayTracingMode::full, true, true, true) == RayTracingMode::full,
+           "ray tracing resolution degrades cleanly when unsupported or without GI");
+    for (const auto rt_mode : {RayTracingMode::shadows, RayTracingMode::gi, RayTracingMode::full}) {
+        settings.dynamic = true;
+        settings.ray_tracing = rt_mode;
+        expect(valid_lighting_settings(settings), "ray tracing modes valid under dynamic lighting");
+        settings.dynamic = false;
+        settings.voxel_gi = false;
+        expect(!valid_lighting_settings(settings), "ray tracing requires dynamic lighting");
+    }
+    settings = LightingSettings{};
+    settings.ray_tracing = static_cast<RayTracingMode>(99);
+    expect(!valid_lighting_settings(settings), "unknown ray tracing enum rejected");
     DirtyVoxelBricks dirty;
     dirty.reset({0, 0, 0}, 1);
     expect(dirty.count() == 512, "new volume requires complete initialization");

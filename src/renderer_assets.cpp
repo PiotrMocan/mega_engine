@@ -1,6 +1,7 @@
 #include "renderer.hpp"
 #include <algorithm>
 #include <cassert>
+#include <SDL3/SDL.h>
 
 namespace vcr {
 #if VCR_EDITOR_ENABLED
@@ -8,6 +9,12 @@ void Renderer::enable_async_assets() {
     asset_requests_.reserve(1024);
     asset_preparation_.start();
     async_assets_ = true;
+}
+std::vector<std::string> Renderer::resident_editor_texture_paths() const {
+    std::vector<std::string> paths;
+    paths.reserve(editor_texture_assets_.size());
+    for (const auto& texture : editor_texture_assets_) paths.push_back(texture.relative_path);
+    return paths;
 }
 std::optional<std::uint32_t> Renderer::find_or_load_editor_model(const std::filesystem::path &root,
                                                                  std::string_view path,
@@ -36,7 +43,12 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_model(const std::file
     }
     // Initial scene loading is explicitly synchronous, outside all measured
     // frames. Each model's buffers/textures share one command submission.
-    auto prepared = prepare_model_asset(root, std::string(path));
+    // Initialization runs on the SDL/submission owner. Keep native window
+    // messages moving between cold asset jobs without discarding queued events.
+    SDL_PumpEvents();
+    const auto resident_textures = resident_editor_texture_paths();
+    auto prepared = prepare_model_asset(root, std::string(path), resident_textures);
+    SDL_PumpEvents();
     if (!prepared.model) {
         error = prepared.error;
         return {};
@@ -45,6 +57,10 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_model(const std::file
     auto index = publish_editor_model(prepared, error);
     asset_upload_.submit();
     asset_upload_.wait();
+    SDL_PumpEvents();
+    if (index && rt_provisioned_) {
+        compact_model_blas(editor_model_assets_[*index]);
+    }
     return index;
 }
 bool Renderer::poll_assets() {
@@ -58,6 +74,9 @@ bool Renderer::poll_assets() {
         }
         if (uploading_model_) {
             editor_model_assets_[*uploading_model_].ready = true;
+            if (rt_provisioned_) {
+                compact_model_blas(editor_model_assets_[*uploading_model_]);
+            }
         }
         asset_requests_[*uploading_request_].done = true;
         --asset_requests_pending_;
@@ -89,7 +108,7 @@ bool Renderer::poll_assets() {
     }
     for (auto &request : asset_requests_) {
         if (!request.done && !request.queued) {
-            if (!asset_preparation_.request(request.root, request.path)) {
+            if (!asset_preparation_.request(request.root, request.path, resident_editor_texture_paths())) {
                 break;
             }
             request.queued = true;

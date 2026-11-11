@@ -99,4 +99,89 @@ float cascadedVisibility(sampler2DShadow atlas,vec3 position,vec3 normal,vec3 li
     }
     return value;
 }
+#ifdef VCR_RAY_QUERY
+layout(set=LIGHTING_SET,binding=9,std430) readonly buffer RtOpacityMicromapBuffer {
+    uvec2 masks[];
+} rtOpacityMicromaps;
+layout(set=LIGHTING_SET,binding=10) uniform accelerationStructureEXT sceneTlas;
+
+float rayScaleForPosition(vec3 worldPosition) {
+    return max(1.0, max(abs(worldPosition.x), max(abs(worldPosition.y), abs(worldPosition.z))));
+}
+
+vec3 rayOffsetOrigin(vec3 worldPosition, vec3 geometricNormal) {
+    float scale = rayScaleForPosition(worldPosition);
+    return worldPosition + geometricNormal * (1.5e-3 * scale);
+}
+
+float rayMinT(vec3 worldPosition) {
+    return 1.0e-3 * rayScaleForPosition(worldPosition);
+}
+
+bool rtAlphaMaskKeep(vec2 bc, int customIndex, int primitiveIndex) {
+    float s = bc.x + bc.y;
+    float t = s > 1.0e-5 ? bc.y / s : 0.0;
+    uvec2 cell = min(uvec2(vec2(s, t) * 8.0), uvec2(7u));
+    uint bit = cell.y * 8u + cell.x;
+    uint idx = uint(customIndex) + uint(primitiveIndex);
+    uvec2 mask = rtOpacityMicromaps.masks[idx];
+    uint word = bit < 32u ? mask.x : mask.y;
+    return ((word >> (bit & 31u)) & 1u) != 0u;
+}
+
+float rayTracedSunVisibilityOpaque(vec3 worldPosition, vec3 geometricNormal, vec3 lightDirection) {
+    float scale = rayScaleForPosition(worldPosition);
+    vec3 origin = worldPosition
+        + geometricNormal * (1.5e-3 * scale)
+        + lightDirection * (5.0e-4 * scale);
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(
+        rq,
+        sceneTlas,
+        gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+        0xFFu,
+        origin,
+        1.0e-3 * scale,
+        lightDirection,
+        200.0);
+    while (rayQueryProceedEXT(rq)) {}
+    return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT
+        ? 0.0
+        : 1.0;
+}
+
+float rayTracedSunVisibility(vec3 worldPosition, vec3 geometricNormal, vec3 lightDirection) {
+    float viewDepth = -(lighting.cameraView * vec4(worldPosition, 1.0)).z;
+    if (viewDepth >= 28.0) {
+        return rayTracedSunVisibilityOpaque(worldPosition, geometricNormal, lightDirection);
+    }
+    float scale = rayScaleForPosition(worldPosition);
+    vec3 origin = worldPosition
+        + geometricNormal * (1.5e-3 * scale)
+        + lightDirection * (5.0e-4 * scale);
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(
+        rq,
+        sceneTlas,
+        gl_RayFlagsTerminateOnFirstHitEXT,
+        0xFFu,
+        origin,
+        1.0e-3 * scale,
+        lightDirection,
+        200.0);
+    uint candidates = 0u;
+    while (rayQueryProceedEXT(rq)) {
+        if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT
+            && (++candidates >= 8u || rtAlphaMaskKeep(
+                rayQueryGetIntersectionBarycentricsEXT(rq, false),
+                rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false),
+                rayQueryGetIntersectionPrimitiveIndexEXT(rq, false)))) {
+            rayQueryConfirmIntersectionEXT(rq);
+        }
+    }
+    return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT
+        ? 0.0
+        : 1.0;
+}
+#endif
 #endif

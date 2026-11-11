@@ -40,7 +40,7 @@ using namespace std::chrono_literals;
 
 constexpr std::string_view protocol_version{"2025-11-25"};
 constexpr std::size_t maximum_input_message_bytes = 1024U * 1024U;
-constexpr std::array<std::string_view, 30> runtime_tool_names{
+constexpr std::array<std::string_view, 31> runtime_tool_names{
     "debug.get_capabilities",
     "debug.get_state",
     "debug.get_metrics",
@@ -57,6 +57,7 @@ constexpr std::array<std::string_view, 30> runtime_tool_names{
     "render.set_exposure",
     "render.set_color_grading",
     "render.set_subsurface",
+    "render.set_ray_tracing",
     "render.set_motion_blur",
     "render.set_anti_aliasing",
     "render.set_depth_prepass",
@@ -73,10 +74,11 @@ constexpr std::array<std::string_view, 30> runtime_tool_names{
     "engine.quit",
 };
 
-constexpr std::array<std::string_view, 34> editor_tool_names{
+constexpr std::array<std::string_view, 35> editor_tool_names{
     "render.set_exposure",
     "render.set_color_grading",
     "render.set_subsurface",
+    "render.set_ray_tracing",
     "render.set_motion_blur",
     "render.set_anti_aliasing",
     "editor.get_state",
@@ -485,6 +487,13 @@ private:
             {"enum", Json::array({"off", "full"})}}}}, Json::array({"mode"})),
         false, false, true));
     tools.push_back(tool_definition(
+        "render.set_ray_tracing", "Set hardware ray tracing",
+        "Select optional VK_KHR_ray_query ray tracing mode (off, shadows, gi, full; on aliases full). "
+        "Lazily provisions acceleration structures and RT pipelines on the next rendered frame when supported.",
+        object_schema(Json{{"mode", Json{{"type", "string"},
+            {"enum", Json::array({"off", "on", "shadows", "gi", "full"})}}}}, Json::array({"mode"})),
+        false, false, true));
+    tools.push_back(tool_definition(
         "render.set_motion_blur", "Set motion blur",
         "Atomically set optional depth-aware TileMax/NeighborMax motion blur. "
         "Active blur supports AA off, SMAA 1x, and FSR native-aa.",
@@ -749,6 +758,13 @@ private:
         "Enable or disable the lazily provisioned full-resolution masked separable SSS passes.",
         object_schema(Json{{"mode", Json{{"type", "string"},
             {"enum", Json::array({"off", "full"})}}}}, Json::array({"mode"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "render.set_ray_tracing", "Set hardware ray tracing",
+        "Select optional VK_KHR_ray_query ray tracing mode (off, shadows, gi, full; on aliases full). "
+        "Lazily provisions acceleration structures and RT pipelines on the next rendered frame when supported.",
+        object_schema(Json{{"mode", Json{{"type", "string"},
+            {"enum", Json::array({"off", "on", "shadows", "gi", "full"})}}}}, Json::array({"mode"})),
         false, false, true));
     tools.push_back(tool_definition(
         "render.set_motion_blur", "Set motion blur",
@@ -1941,6 +1957,22 @@ private:
         command.subsurface = *mode;
         return true;
     }
+    if (name == "render.set_ray_tracing") {
+        if (arguments.size() != 1U || !arguments.contains("mode") ||
+            !arguments["mode"].is_string()) {
+            error = "mode must be off, on, shadows, gi or full";
+            return false;
+        }
+        const auto mode = parse_ray_tracing_mode(
+            arguments["mode"].get<std::string_view>(), true);
+        if (!mode) {
+            error = "mode must be off, on, shadows, gi or full";
+            return false;
+        }
+        command.type = McpCommandType::render_set_ray_tracing;
+        command.ray_tracing = *mode;
+        return true;
+    }
     if (name == "render.set_motion_blur") {
         return parse_motion_blur_arguments(arguments, command, error);
     }
@@ -2850,6 +2882,22 @@ private:
         }
         command.type = McpCommandType::render_set_subsurface;
         command.subsurface = *mode;
+        return true;
+    }
+    if (name == "render.set_ray_tracing") {
+        if (arguments.size() != 1U || !arguments.contains("mode") ||
+            !arguments["mode"].is_string()) {
+            error = "mode must be off, on, shadows, gi or full";
+            return false;
+        }
+        const auto mode = parse_ray_tracing_mode(
+            arguments["mode"].get<std::string_view>(), true);
+        if (!mode) {
+            error = "mode must be off, on, shadows, gi or full";
+            return false;
+        }
+        command.type = McpCommandType::render_set_ray_tracing;
+        command.ray_tracing = *mode;
         return true;
     }
     if (name == "render.set_motion_blur") {

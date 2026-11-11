@@ -345,6 +345,8 @@ enum TimestampQuery : std::uint32_t {
     timestamp_exposure_end,
     timestamp_motion_blur_begin,
     timestamp_motion_blur_end,
+    timestamp_tlas_begin,
+    timestamp_tlas_end,
     timestamp_query_count,
 };
 
@@ -794,7 +796,9 @@ void Renderer::shutdown() noexcept {
     asset_preparation_.stop();
     asset_upload_.stop();
     destroy_gpu_visibility();
+    destroy_ray_tracing();
     destroy_lighting();
+    demo_rt_transforms_.clear();
     asset_requests_.clear();
     asset_requests_pending_ = 0;
     async_assets_ = false;
@@ -1235,6 +1239,7 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_texture(const Prepare
     EditorTextureAsset gpu_texture{};
     gpu_texture.relative_path = cache_key;
     gpu_texture.semantic = texture.semantic;
+    gpu_texture.average_linear = prepared.average_linear;
     gpu_texture.color_space = texture.color_space;
     gpu_texture.gpu_bytes = gpu_bytes;
     if (mipmaps_supported) {
@@ -1510,6 +1515,18 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
                 }
                 std::string texture_error;
                 const auto key = reference->lexically_normal().generic_string();
+                const auto resident = std::ranges::find_if(editor_texture_assets_,
+                    [&](const auto& texture) { return texture.relative_path == key; });
+                if (resident != editor_texture_assets_.end()) {
+                    if (resident->semantic == expected_semantic && resident->color_space == expected_color_space) {
+                        destination = static_cast<std::uint32_t>(resident - editor_texture_assets_.begin());
+                    } else {
+                        std::cerr << "warning: model '" << relative_path
+                                  << "' has a texture semantic/color-space mismatch in '"
+                                  << reference->generic_string() << "'; using the safe fallback\n";
+                    }
+                    return;
+                }
                 const auto source = std::ranges::find_if(
                     prepared.textures, [&](const auto &texture) { return texture.path == key; });
                 if (source == prepared.textures.end()) {
@@ -1602,7 +1619,8 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
         material_descriptors[material_index] = *descriptor;
     }
 
-    for (const CookedModelSubmesh& source : model.submeshes) {
+    for (std::size_t submesh_index = 0; submesh_index < model.submeshes.size(); ++submesh_index) {
+        const CookedModelSubmesh& source = model.submeshes[submesh_index];
         PbrMaterial material{};
         std::string material_relative_path;
         VkDescriptorSet material_descriptor =
@@ -1630,6 +1648,10 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
                     prepared.textures, [&](const auto &t) { return t.path == key; });
                 if (found != prepared.textures.end() && found->texture)
                     gi_albedo = found->average_linear;
+                else if (const auto resident = std::ranges::find_if(editor_texture_assets_,
+                             [&](const auto& t) { return t.relative_path == key; });
+                         resident != editor_texture_assets_.end())
+                    gi_albedo = resident->average_linear;
             }
         }
         std::uint32_t gi_first = 0, gi_count = 0;
@@ -1659,6 +1681,19 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
             minimum_uv = glm::min(minimum_uv, coordinate);
             maximum_uv = glm::max(maximum_uv, coordinate);
         }
+        std::uint32_t rt_opacity_first = 0U;
+        std::uint32_t rt_opacity_count = 0U;
+        std::vector<glm::uvec2> cpu_opacity_micromap{};
+        if (submesh_index < prepared.submesh_opacity_micromaps.size() &&
+            !prepared.submesh_opacity_micromaps[submesh_index].empty()) {
+            const auto& masks = prepared.submesh_opacity_micromaps[submesh_index];
+            if (rt_provisioned_) {
+                rt_opacity_first = append_rt_opacity_micromaps(masks);
+                rt_opacity_count = static_cast<std::uint32_t>(masks.size());
+            } else {
+                cpu_opacity_micromap = masks;
+            }
+        }
         gpu_asset.submeshes.push_back(EditorModelSubmesh{
             .coverage = coverage,
             .material_relative_path = std::move(material_relative_path),
@@ -1671,6 +1706,9 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
             .gi_first = gi_first,
             .gi_count = gi_count,
             .gi_albedo = gi_albedo,
+            .rt_opacity_first = rt_opacity_first,
+            .rt_opacity_count = rt_opacity_count,
+            .cpu_opacity_micromap = std::move(cpu_opacity_micromap),
             .lod_first = source.lod_first,
             .lod_count = source.lod_count,
             .lod_error = source.lod_error,
@@ -1695,11 +1733,16 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
     }
     gpu_asset.bounds.extent += glm::vec3(maximum_displacement);
 
+    const VkBufferUsageFlags rt_geometry_usage = context_->ray_query_supported()
+        ? (VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+           VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR)
+        : 0U;
     gpu_asset.vertex_buffer.create(
         *context_,
         static_cast<VkDeviceSize>(vertex_bytes),
         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            rt_geometry_usage,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
         "editor imported model vertex buffer");
@@ -1707,7 +1750,8 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
         *context_,
         static_cast<VkDeviceSize>(index_bytes),
         VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            rt_geometry_usage,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
         "editor imported model index buffer");
@@ -1717,6 +1761,9 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
     upload_to_device_buffer(
         gpu_asset.index_buffer,
         std::as_bytes(std::span{model.indices}));
+    if (rt_provisioned_) {
+        build_model_blas_on_upload(gpu_asset);
+    }
 
     editor_model_assets_.push_back(std::move(gpu_asset));
     editor_model_gpu_bytes_ += gpu_bytes;
@@ -2199,17 +2246,23 @@ void Renderer::create_scene_resources() {
         context_->properties().limits.maxDrawIndexedIndexValue) {
         fatal("Terrain vertex count exceeds maxDrawIndexedIndexValue.");
     }
+    const VkBufferUsageFlags rt_geometry_usage = context_->ray_query_supported()
+        ? (VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+           VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR)
+        : 0U;
     vertex_buffer_.create(
         *context_,
         sizeof(kGeometryVertices),
-        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            rt_geometry_usage,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
         "scene vertex buffer");
     index_buffer_.create(
         *context_,
         sizeof(kGeometryIndices),
-        VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            rt_geometry_usage,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
         "scene index buffer");
@@ -2370,6 +2423,20 @@ void Renderer::create_scene_resources() {
                 };
             }
         }
+    }
+    demo_rt_transforms_.resize(demo_instances.size());
+    for (std::size_t i = 0ULL; i < demo_instances.size(); ++i) {
+        const PbrInstanceData& inst = demo_instances[i];
+        const glm::quat q(inst.rotation.w, inst.rotation.x, inst.rotation.y, inst.rotation.z);
+        const glm::mat4 m =
+            glm::translate(glm::mat4(1.0F), glm::vec3(inst.translation)) *
+            glm::mat4_cast(q) *
+            glm::scale(glm::mat4(1.0F), glm::vec3(inst.scale));
+        demo_rt_transforms_[i] = TransformRows{
+            .x = glm::vec4(m[0][0], m[1][0], m[2][0], m[3][0]),
+            .y = glm::vec4(m[0][1], m[1][1], m[2][1], m[3][1]),
+            .z = glm::vec4(m[0][2], m[1][2], m[2][2], m[3][2]),
+        };
     }
     const PbrSampleMesh sample_mesh = create_pbr_sample_mesh();
 
@@ -2554,7 +2621,8 @@ void Renderer::create_scene_resources() {
         static_cast<VkDeviceSize>(sample_mesh.vertices.size()) *
             sizeof(Vertex),
         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            rt_geometry_usage,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
         "PBR sample sphere vertex buffer");
@@ -2563,7 +2631,8 @@ void Renderer::create_scene_resources() {
         static_cast<VkDeviceSize>(sample_mesh.indices.size()) *
             sizeof(std::uint16_t),
         VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            rt_geometry_usage,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
         "PBR sample sphere index buffer");
@@ -2572,7 +2641,8 @@ void Renderer::create_scene_resources() {
         static_cast<VkDeviceSize>(terrain_vertices.size()) *
             sizeof(TerrainVertex),
         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+            rt_geometry_usage,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
         "simplified heightfield vertex buffer");
@@ -2613,6 +2683,9 @@ void Renderer::create_scene_resources() {
         create_editor_material_resources();
     }
 #endif
+    if (rt_provisioned_) {
+        create_ray_tracing_resources();
+    }
 }
 
 void Renderer::create_sky_texture() {
@@ -5816,10 +5889,28 @@ void Renderer::create_pipeline() {
         scene_vertex_shader = "editor_scene.vert.spv";
     }
 #endif
+    const char* const scene_frag_spv =
+        rt_provisioned_ ? "scene_rt.frag.spv" : "scene.frag.spv";
+    const char* const scene_aa_frag_spv =
+        rt_provisioned_ ? "scene_aa_rt.frag.spv" : "scene_aa.frag.spv";
+    const char* const scene_sss_frag_spv =
+        rt_provisioned_ ? "scene_sss_rt.frag.spv" : "scene_sss.frag.spv";
+    const char* const scene_aa_sss_frag_spv =
+        rt_provisioned_ ? "scene_aa_sss_rt.frag.spv" : "scene_aa_sss.frag.spv";
+#if VCR_EDITOR_ENABLED
+    const char* const editor_model_frag_spv =
+        rt_provisioned_ ? "editor_model_rt.frag.spv" : "editor_model.frag.spv";
+    const char* const editor_model_aa_frag_spv =
+        rt_provisioned_ ? "editor_model_aa_rt.frag.spv" : "editor_model_aa.frag.spv";
+    const char* const editor_model_sss_frag_spv =
+        rt_provisioned_ ? "editor_model_sss_rt.frag.spv" : "editor_model_sss.frag.spv";
+    const char* const editor_model_aa_sss_frag_spv =
+        rt_provisioned_ ? "editor_model_aa_sss_rt.frag.spv" : "editor_model_aa_sss.frag.spv";
+#endif
     const VkShaderModule scene_vertex_module =
         cached_shader(scene_vertex_shader);
     const VkShaderModule scene_fragment_module =
-        cached_shader("scene.frag.spv");
+        cached_shader(scene_frag_spv);
     const std::array scene_stages{
         VkPipelineShaderStageCreateInfo{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -5856,7 +5947,7 @@ void Renderer::create_pipeline() {
         const VkShaderModule editor_model_vertex_module =
             cached_shader("editor_model.vert.spv");
         const VkShaderModule editor_model_fragment_module =
-            cached_shader("editor_model.frag.spv");
+            cached_shader(editor_model_frag_spv);
         const std::array editor_model_stages{
             VkPipelineShaderStageCreateInfo{
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -6109,7 +6200,7 @@ void Renderer::create_pipeline() {
 #endif
     aa_scene_pipeline_ = create_aa_geometry_pipeline(
         aa_scene_vertex_shader,
-        "scene_aa.frag.spv",
+        scene_aa_frag_spv,
         vertex_input,
         input_assembly,
         "AA shadowed scene graphics pipeline", equal_temporal_.scene, depth_temporal_geometry_.scene);
@@ -6118,7 +6209,7 @@ void Renderer::create_pipeline() {
         aa_editor_model_pipeline_ =
             create_aa_geometry_pipeline(
                 "editor_model_aa.vert.spv",
-                "editor_model_aa.frag.spv",
+                editor_model_aa_frag_spv,
                 editor_model_vertex_input,
                 input_assembly,
                 "AA textured editor model graphics pipeline", equal_temporal_.models,
@@ -6128,7 +6219,7 @@ void Renderer::create_pipeline() {
             aa_tessellated_editor_model_pipeline_ =
                 create_aa_geometry_pipeline(
                     "editor_model_aa.vert.spv",
-                    "editor_model_aa.frag.spv",
+                    editor_model_aa_frag_spv,
                     editor_model_vertex_input,
                     input_assembly,
                     "AA tessellated editor model graphics pipeline",
@@ -6141,7 +6232,7 @@ void Renderer::create_pipeline() {
 #endif
     aa_terrain_pipeline_ = create_aa_geometry_pipeline(
         "terrain_aa.vert.spv",
-        "scene_aa.frag.spv",
+        scene_aa_frag_spv,
         terrain_vertex_input,
         terrain_input_assembly,
         "AA indexed heightfield graphics pipeline", equal_temporal_.terrain, depth_temporal_geometry_.terrain);
@@ -6150,19 +6241,19 @@ void Renderer::create_pipeline() {
         "cube.vert.spv", "cube.frag.spv", vertex_input, input_assembly,
         "SMAA color-only instancing pipeline", equal_spatial_.cubes, depth_geometry_.cubes, false);
     smaa_geometry_.scene = create_aa_geometry_pipeline(
-        scene_vertex_shader, "scene.frag.spv", vertex_input, input_assembly,
+        scene_vertex_shader, scene_frag_spv, vertex_input, input_assembly,
         "SMAA color-only scene pipeline", equal_spatial_.scene, depth_geometry_.scene, false);
 #if VCR_EDITOR_ENABLED
     if (authored_scene_enabled_) {
         smaa_geometry_.models = create_aa_geometry_pipeline(
-            "editor_model.vert.spv", "editor_model.frag.spv",
+            "editor_model.vert.spv", editor_model_frag_spv,
             editor_model_vertex_input, input_assembly,
             "SMAA color-only model pipeline", equal_spatial_.models,
             depth_geometry_.models, false);
         if (model_tessellation_enabled_) {
             smaa_geometry_.tessellated_models =
                 create_aa_geometry_pipeline(
-                    "editor_model.vert.spv", "editor_model.frag.spv",
+                    "editor_model.vert.spv", editor_model_frag_spv,
                     editor_model_vertex_input, input_assembly,
                     "SMAA color-only tessellated model pipeline",
                     equal_spatial_.tessellated_models,
@@ -6172,7 +6263,7 @@ void Renderer::create_pipeline() {
     }
 #endif
     smaa_geometry_.terrain = create_aa_geometry_pipeline(
-        "terrain.vert.spv", "scene.frag.spv",
+        "terrain.vert.spv", scene_frag_spv,
         terrain_vertex_input, terrain_input_assembly,
         "SMAA color-only terrain pipeline", equal_spatial_.terrain, depth_geometry_.terrain, false);
 
@@ -6187,20 +6278,20 @@ void Renderer::create_pipeline() {
             debug_name, equal_msaa_[index].cubes,
             depth_msaa_geometry_[index].cubes, false, msaa_samples[index]);
         msaa_geometry_[index].scene = create_aa_geometry_pipeline(
-            scene_vertex_shader, "scene.frag.spv", vertex_input, input_assembly,
+            scene_vertex_shader, scene_frag_spv, vertex_input, input_assembly,
             debug_name, equal_msaa_[index].scene,
             depth_msaa_geometry_[index].scene, false, msaa_samples[index]);
 #if VCR_EDITOR_ENABLED
         if (authored_scene_enabled_) {
             msaa_geometry_[index].models = create_aa_geometry_pipeline(
-                "editor_model.vert.spv", "editor_model.frag.spv",
+                "editor_model.vert.spv", editor_model_frag_spv,
                 editor_model_vertex_input, input_assembly, debug_name,
                 equal_msaa_[index].models, depth_msaa_geometry_[index].models,
                 false, msaa_samples[index], &lod_depth_msaa_model_[index]);
             if (model_tessellation_enabled_) {
                 msaa_geometry_[index].tessellated_models =
                     create_aa_geometry_pipeline(
-                        "editor_model.vert.spv", "editor_model.frag.spv",
+                        "editor_model.vert.spv", editor_model_frag_spv,
                         editor_model_vertex_input, input_assembly, debug_name,
                         equal_msaa_[index].tessellated_models,
                         depth_msaa_geometry_[index].tessellated_models,
@@ -6210,7 +6301,7 @@ void Renderer::create_pipeline() {
         }
 #endif
         msaa_geometry_[index].terrain = create_aa_geometry_pipeline(
-            "terrain.vert.spv", "scene.frag.spv", terrain_vertex_input,
+            "terrain.vert.spv", scene_frag_spv, terrain_vertex_input,
             terrain_input_assembly, debug_name, equal_msaa_[index].terrain,
             depth_msaa_geometry_[index].terrain, false, msaa_samples[index]);
     }
@@ -6332,11 +6423,11 @@ void Renderer::create_pipeline() {
         false, equal_subsurface_spatial_.cubes, depth_geometry_.cubes,
         "SSS spatial instancing pipeline");
     subsurface_spatial_.scene = create_subsurface_geometry_pipeline(
-        scene_vertex_shader, "scene_sss.frag.spv", vertex_input, input_assembly,
+        scene_vertex_shader, scene_sss_frag_spv, vertex_input, input_assembly,
         false, equal_subsurface_spatial_.scene, depth_geometry_.scene,
         "SSS spatial scene pipeline");
     subsurface_spatial_.terrain = create_subsurface_geometry_pipeline(
-        "terrain.vert.spv", "scene_sss.frag.spv", terrain_vertex_input,
+        "terrain.vert.spv", scene_sss_frag_spv, terrain_vertex_input,
         terrain_input_assembly, false, equal_subsurface_spatial_.terrain,
         depth_geometry_.terrain, "SSS spatial terrain pipeline");
     subsurface_temporal_.cubes = create_subsurface_geometry_pipeline(
@@ -6344,29 +6435,29 @@ void Renderer::create_pipeline() {
         true, equal_subsurface_temporal_.cubes, depth_temporal_geometry_.cubes,
         "SSS temporal instancing pipeline");
     subsurface_temporal_.scene = create_subsurface_geometry_pipeline(
-        aa_scene_vertex_shader, "scene_aa_sss.frag.spv", vertex_input,
+        aa_scene_vertex_shader, scene_aa_sss_frag_spv, vertex_input,
         input_assembly, true, equal_subsurface_temporal_.scene,
         depth_temporal_geometry_.scene, "SSS temporal scene pipeline");
     subsurface_temporal_.terrain = create_subsurface_geometry_pipeline(
-        "terrain_aa.vert.spv", "scene_aa_sss.frag.spv", terrain_vertex_input,
+        "terrain_aa.vert.spv", scene_aa_sss_frag_spv, terrain_vertex_input,
         terrain_input_assembly, true, equal_subsurface_temporal_.terrain,
         depth_temporal_geometry_.terrain, "SSS temporal terrain pipeline");
 #if VCR_EDITOR_ENABLED
     if (authored_scene_enabled_) {
         subsurface_spatial_.models = create_subsurface_geometry_pipeline(
-            "editor_model.vert.spv", "editor_model_sss.frag.spv",
+            "editor_model.vert.spv", editor_model_sss_frag_spv,
             editor_model_vertex_input, input_assembly, false,
             equal_subsurface_spatial_.models, depth_geometry_.models,
             "SSS spatial editor model pipeline");
         subsurface_temporal_.models = create_subsurface_geometry_pipeline(
-            "editor_model_aa.vert.spv", "editor_model_aa_sss.frag.spv",
+            "editor_model_aa.vert.spv", editor_model_aa_sss_frag_spv,
             editor_model_vertex_input, input_assembly, true,
             equal_subsurface_temporal_.models, depth_temporal_geometry_.models,
             "SSS temporal editor model pipeline");
         if (model_tessellation_enabled_) {
             subsurface_spatial_.tessellated_models =
                 create_subsurface_geometry_pipeline(
-                    "editor_model.vert.spv", "editor_model_sss.frag.spv",
+                    "editor_model.vert.spv", editor_model_sss_frag_spv,
                     editor_model_vertex_input, input_assembly, false,
                     equal_subsurface_spatial_.tessellated_models,
                     depth_geometry_.tessellated_models,
@@ -6374,7 +6465,7 @@ void Renderer::create_pipeline() {
             subsurface_temporal_.tessellated_models =
                 create_subsurface_geometry_pipeline(
                     "editor_model_aa.vert.spv",
-                    "editor_model_aa_sss.frag.spv",
+                    editor_model_aa_sss_frag_spv,
                     editor_model_vertex_input, input_assembly, true,
                     equal_subsurface_temporal_.tessellated_models,
                     depth_temporal_geometry_.tessellated_models,
@@ -6697,7 +6788,7 @@ void Renderer::create_pipeline() {
             load_shader("editor_model_tess_shadow.tesc.spv");
         const ShaderModule model_shadow_evaluation =
             load_shader("editor_model_tess_shadow.tese.spv");
-        const std::array model_shadow_stages{
+        const std::array model_tess_shadow_stages{
             VkPipelineShaderStageCreateInfo{
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                 .stage = VK_SHADER_STAGE_VERTEX_BIT,
@@ -6720,8 +6811,8 @@ void Renderer::create_pipeline() {
         auto model_shadow_tess_input = editor_model_vertex_input;
         model_shadow_tess_input.vertexAttributeDescriptionCount = 3U;
         model_shadow_info.stageCount =
-            static_cast<std::uint32_t>(model_shadow_stages.size());
-        model_shadow_info.pStages = model_shadow_stages.data();
+            static_cast<std::uint32_t>(model_tess_shadow_stages.size());
+        model_shadow_info.pStages = model_tess_shadow_stages.data();
         model_shadow_info.pVertexInputState = &model_shadow_tess_input;
         model_shadow_info.pInputAssemblyState = &patch_input_assembly;
         model_shadow_info.pTessellationState = &tessellation_state;
@@ -7355,6 +7446,7 @@ bool Renderer::draw_frame(
         apply_shadow_resolution();
     prepare_msaa_targets_for_frame(frame_index_);
     if (subsurface_provision_pending_) provision_subsurface_resources();
+    if (rt_provision_pending_) provision_ray_tracing_resources();
 
     std::uint32_t image_index = 0;
     begin = Clock::now();
@@ -7645,6 +7737,20 @@ void Renderer::read_gpu_timestamps(
                 VK_CHECK(query_result);
         }
     }
+    timings.gpu_tlas_ms = 0.0;
+    if (frame.tlas_was_updated) {
+        const auto tlas_result = vkGetQueryPoolResults(
+            context_->device(), frame.timestamp_queries, timestamp_tlas_begin, 2U,
+            2U * sizeof(std::uint64_t), timestamps.data() + timestamp_tlas_begin,
+            sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
+        if (tlas_result == VK_SUCCESS) {
+            timings.gpu_tlas_ms = elapsed(timestamp_tlas_begin, timestamp_tlas_end);
+        } else if (tlas_result == VK_NOT_READY) {
+            timings.gpu_tlas_ms = unavailable_timing_ms;
+        } else {
+            VK_CHECK(tlas_result);
+        }
+    }
     frame.timestamps_valid = false;
 }
 
@@ -7756,11 +7862,12 @@ void Renderer::record_commands(
     };
     VK_CHECK(vkBeginCommandBuffer(command_buffer, &begin_info));
 
+    const DepthPrepass active_depth_prepass = depth_prepass_actual();
     auto& frame = frames_[frame_index_];
     frame.postprocess_was_enabled = false;
     frame.subsurface_was_enabled = false;
     frame.motion_blur_was_enabled = false;
-    frame.depth_prepass_was_enabled = depth_prepass_ != DepthPrepass::off;
+    frame.depth_prepass_was_enabled = active_depth_prepass != DepthPrepass::off;
     vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 2, 1,
                             &frame.lighting_descriptor_set, 0, nullptr);
     if (frame.timestamp_queries != VK_NULL_HANDLE) {
@@ -7867,18 +7974,54 @@ void Renderer::record_commands(
         vkCmdPipelineBarrier2(command_buffer, &dependency);
     }
 
+    const bool tlas_update =
+        rt_provisioned_ && rt_tlas_build_due_ && mode_ != RunMode::instancing;
+    if (tlas_update && frame.timestamp_queries != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp2(
+            command_buffer,
+            VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+            frame.timestamp_queries,
+            timestamp_tlas_begin);
+    }
+    record_ray_tracing_tlas(command_buffer, frame);
+    if (tlas_update && frame.timestamp_queries != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp2(
+            command_buffer,
+            VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+            frame.timestamp_queries,
+            timestamp_tlas_end);
+    }
+
 #if VCR_EDITOR_ENABLED
-    frame.shadow_was_updated =
-        (shadow_dirty_ || shadow_matrix_dirty_mask_ != 0) && mode_ != RunMode::instancing;
-    if (frame.shadow_was_updated) {
-        if (frame.timestamp_queries != VK_NULL_HANDLE) {
-            vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                                 frame.timestamp_queries, timestamp_shadow_begin);
+    const bool rt_shadows_active = ray_tracing_uses_shadows(ray_tracing_mode_actual());
+    if (rt_shadows_active) {
+        frame.shadow_was_updated = false;
+        if (shadow_layout_ == VK_IMAGE_LAYOUT_UNDEFINED) {
+            transition_image(
+                command_buffer,
+                shadow_map_.image(),
+                VK_IMAGE_ASPECT_DEPTH_BIT,
+                VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_NONE,
+                VK_ACCESS_2_NONE,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            shadow_layout_ = VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL;
         }
-        record_shadow_map(command_buffer, frame);
-        if (frame.timestamp_queries != VK_NULL_HANDLE) {
-            vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,
-                                 frame.timestamp_queries, timestamp_shadow_end);
+    } else {
+        frame.shadow_was_updated =
+            (shadow_dirty_ || shadow_matrix_dirty_mask_ != 0) && mode_ != RunMode::instancing;
+        if (frame.shadow_was_updated) {
+            if (frame.timestamp_queries != VK_NULL_HANDLE) {
+                vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                     frame.timestamp_queries, timestamp_shadow_begin);
+            }
+            record_shadow_map(command_buffer, frame);
+            if (frame.timestamp_queries != VK_NULL_HANDLE) {
+                vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,
+                                     frame.timestamp_queries, timestamp_shadow_end);
+            }
         }
     }
 #endif
@@ -8053,7 +8196,8 @@ void Renderer::record_commands(
                     }
                     const auto &model_draws =
                         gpu_visibility_active_ ? editor_model_draws_ : visible_model_draws_;
-                    const bool include_models = !depth_only || depth_prepass_ == DepthPrepass::full;
+                    const bool include_models =
+                        !depth_only || depth_prepass_actual() == DepthPrepass::full;
                     VkPipeline bound_model_pipeline = VK_NULL_HANDLE;
                     VkDescriptorSet bound_material_set = VK_NULL_HANDLE;
                     std::size_t bound_asset_index = std::numeric_limits<std::size_t>::max();
@@ -8272,15 +8416,17 @@ void Renderer::record_commands(
 #endif
         };
 
-    const auto prepassed_pipeline = [this](VkPipeline normal, const DeviceObject<VkPipeline> &equal,
-                                          bool imported_model = false) {
-        return depth_prepass_ != DepthPrepass::off &&
-                       (!imported_model || depth_prepass_ == DepthPrepass::full)
+    const auto prepassed_pipeline = [active_depth_prepass](
+                                        VkPipeline normal,
+                                        const DeviceObject<VkPipeline> &equal,
+                                        bool imported_model = false) {
+        return active_depth_prepass != DepthPrepass::off &&
+                       (!imported_model || active_depth_prepass == DepthPrepass::full)
                    ? equal.get() : normal;
     };
     const auto record_depth_prepass = [&](VkImage image, VkImageView view, VkExtent2D extent,
                                          bool temporal) {
-        if (depth_prepass_ == DepthPrepass::off) return;
+        if (active_depth_prepass == DepthPrepass::off) return;
         const VkRenderingAttachmentInfo attachment{
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .imageView = view,
@@ -8625,7 +8771,9 @@ void Renderer::record_commands(
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .imageView = scene_depth_view,
             .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-            .loadOp = depth_prepass_ == DepthPrepass::off ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+            .loadOp = active_depth_prepass == DepthPrepass::off
+                ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                : VK_ATTACHMENT_LOAD_OP_LOAD,
             .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
             .clearValue = VkClearValue{.depthStencil = {0.0F, 0}},
         };
@@ -8870,7 +9018,9 @@ void Renderer::record_commands(
                     (atmospheric_fog_active || hiz_build_this_frame)
                 ? aa_resources.depth_attachment.view() : VK_NULL_HANDLE,
             .resolveImageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-            .loadOp = depth_prepass_ == DepthPrepass::off ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+            .loadOp = active_depth_prepass == DepthPrepass::off
+                ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                : VK_ATTACHMENT_LOAD_OP_LOAD,
             .storeOp = (atmospheric_fog_active || hiz_build_this_frame) && !multisampled
                 ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
             .clearValue = VkClearValue{.depthStencil = {0.0F, 0}},
@@ -9982,6 +10132,8 @@ void Renderer::print_metrics() const {
               << "  anti-aliasing: "
               << to_string(anti_aliasing_) << ' '
               << anti_aliasing_quality_name() << '\n'
+              << "  ray tracing: " << to_token(ray_tracing_mode_actual())
+              << " (requested " << to_token(lighting_settings_.ray_tracing) << ")\n"
               << "  frames: " << stats.frames_rendered << '\n'
               << "  FPS (1 s): " << stats.one_second_average_fps << '\n'
               << "  FPS (average): " << stats.average_fps << '\n'
@@ -10003,6 +10155,7 @@ void Renderer::print_metrics() const {
               << "  GPU subsurface: " << stats.average.gpu_subsurface_ms << " ms\n"
               << "  GPU motion blur: " << stats.average.gpu_motion_blur_ms << " ms\n"
               << "  GPU depth prepass: " << stats.average.gpu_depth_prepass_ms << " ms\n"
+              << "  GPU TLAS build: " << stats.average.gpu_tlas_ms << " ms\n"
               << "  GPU workload: " << stats.average.gpu_workload_ms << " ms\n"
               << "  instances: " << instance_count() << '\n'
               << "  max instance capacity: " << max_instance_capacity_ << '\n'

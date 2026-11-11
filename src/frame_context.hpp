@@ -3,6 +3,7 @@
 #include "vulkan_common.hpp"
 #include "gpu_buffer.hpp"
 #include "gpu_visibility.hpp"
+#include "ray_tracing.hpp"
 
 #include <cstdint>
 
@@ -32,6 +33,16 @@ struct FrameContext {
     bool exposure_was_updated = false;
     bool lighting_was_dynamic = false;
     bool voxel_geometry_was_updated = false, voxel_light_was_updated = false;
+    AccelerationStructure tlas{};
+    GpuBuffer tlas_instance_buffer{};
+    GpuBuffer tlas_scratch_buffer{};
+    std::uint32_t tlas_capacity = 0U;
+    std::uint32_t tlas_instance_count = 0U;
+    std::uint64_t tlas_scene_revision = 0U;
+    std::uint64_t tlas_runtime_revision = 0U;
+    bool tlas_terrain_visible = false;
+    bool tlas_built_once = false;
+    bool tlas_was_updated = false;
     GpuBuffer workload_buffer{};
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
     VkDescriptorSet scene_descriptor_set = VK_NULL_HANDLE;

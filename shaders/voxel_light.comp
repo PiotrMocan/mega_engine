@@ -1,5 +1,8 @@
-#version 450
+#version 460
 #extension GL_GOOGLE_include_directive:require
+#ifdef VCR_RAY_QUERY
+#extension GL_EXT_ray_query:require
+#endif
 #define LIGHTING_SET 0
 #include "lighting_common.glsl"
 layout(local_size_x=64) in;
@@ -33,7 +36,19 @@ void main() {
     if(normal.z<0) normal.xy=(1.0-abs(normal.yx))*mix(vec2(-1),vec2(1),greaterThanEqual(normal.xy,vec2(0)));
     normal=normalize(normal);
     vec3 sun=lighting.sunDirectionIntensity.xyz;
-    float visibility=dot(normal,sun)>0 && lighting.sunDirectionIntensity.w>0?sunVisibility(p,normal,sun):0;
+    float visibility=0.0;
+    if(dot(normal,sun)>0 && lighting.sunDirectionIntensity.w>0) {
+#ifdef VCR_RAY_QUERY
+        if(lighting.volumeParameters.w>0.5) {
+            vec3 worldPos=lighting.volumeOriginCell.xyz
+                +(vec3(p)+0.5+normal*0.35)*lighting.volumeOriginCell.w;
+            visibility=rayTracedSunVisibilityOpaque(worldPos,normal,sun);
+        } else
+#endif
+        {
+            visibility=sunVisibility(p,normal,sun);
+        }
+    }
     vec3 light=lighting.sunColor.rgb*lighting.sunDirectionIntensity.w*max(dot(normal,sun),0)*visibility;
     // Single diffuse bounce. Sky enters the receiver cones through unoccluded directions.
     imageStore(radiance,p,vec4(albedo*light*0.31830988618,1));

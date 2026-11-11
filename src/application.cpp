@@ -79,6 +79,7 @@ using Json = nlohmann::json;
         {"gpu_depth_prepass_ms", timings.gpu_depth_prepass_ms},
         {"gpu_voxel_geometry_ms", timings.gpu_voxel_geometry_ms},
         {"gpu_voxel_light_ms", timings.gpu_voxel_light_ms},
+        {"gpu_tlas_ms", timings.gpu_tlas_ms},
         {"gpu_visibility_ms", timings.gpu_visibility_ms},
         {"scene_prepare_ms", timings.scene_prepare_ms},
     };
@@ -385,10 +386,18 @@ void Application::load_canonical_scene() {
     scene_models_.reserve(max_scene_nodes);
     SceneRenderView view =
         scene_.build_render_view(scene_instances_, scene_models_, scene_lights_);
+    // Cooked collision geometry must exist before the gameplay session samples
+    // the spawn surface (especially imported heightfields without a ground plane).
+    if (!renderer_.update_editor_scene(view, asset_root->path, error)) {
+        fatal(error);
+    }
     initialize_gameplay(view);
     if (gameplay_.active()) {
         view = scene_.build_render_view(
             scene_instances_, scene_models_, scene_lights_);
+        if (!renderer_.update_editor_scene(view, asset_root->path, error)) {
+            fatal(error);
+        }
     }
     if (!view.cubes.empty()) {
         animated_node_ = view.cube_ids.front();
@@ -398,13 +407,6 @@ void Application::load_canonical_scene() {
         const auto &instance = view.models.front();
         animated_node_ = instance.id;
         animation_origin_ = {instance.model_row_0, instance.model_row_1, instance.model_row_2};
-    }
-    if (!renderer_.update_editor_scene(
-            view, asset_root->path, error)) {
-        std::cerr
-            << "Unable to prepare canonical editor/game scene: "
-            << scene_path << '\n';
-        fatal(error);
     }
     std::cout
         << "Loaded scene: " << scene_path
@@ -912,6 +914,10 @@ void Application::execute_mcp_command(const McpCommand& command) {
                     {"maximum_factor",
                      context_.properties().limits.maxTessellationGenerationLevel},
                 }},
+                {"ray_tracing", Json{
+                    {"supported", renderer_.ray_tracing_supported()},
+                    {"modes", Json::array({"off", "shadows", "gi", "full"})},
+                }},
                 {"anti_aliasing", Json{
                     {"methods", Json::array({
                         "off", "smaa", "fsr3", "msaa2x", "msaa4x"})},
@@ -1029,6 +1035,7 @@ void Application::execute_mcp_command(const McpCommand& command) {
                           {"camera_fade_end", renderer_.motion_blur_settings().camera_fade_end},
                       }},
                       {"depth_prepass", to_token(renderer_.depth_prepass())},
+                      {"depth_prepass_actual", to_token(renderer_.depth_prepass_actual())},
                      {"lod_fade_requested", to_token(renderer_.lod_fade_pattern())},
                      {"lod_fade_actual", to_token(renderer_.lod_fade_actual())},
                      {"lod_fade_seconds_requested", renderer_.lod_fade_seconds()},
@@ -1070,7 +1077,20 @@ void Application::execute_mcp_command(const McpCommand& command) {
                            {"radiance_updates", renderer_.lighting_statistics().radiance_updates},
                            {"pending_bricks", renderer_.lighting_statistics().pending_bricks},
                            {"oldest_geometry_ms",
-                            renderer_.lighting_statistics().oldest_geometry_ms}}},
+                            renderer_.lighting_statistics().oldest_geometry_ms},
+                           {"ray_tracing_requested",
+                            to_token(renderer_.lighting_settings().ray_tracing)},
+                           {"ray_tracing_actual",
+                            to_token(renderer_.ray_tracing_mode_actual())},
+                           {"ray_tracing_supported", renderer_.ray_tracing_supported()},
+                           {"ray_tracing_provisioned", renderer_.ray_tracing_provisioned()},
+                           {"blas_count", renderer_.lighting_statistics().blas_count},
+                           {"tlas_instances", renderer_.lighting_statistics().tlas_instances},
+                           {"tlas_builds", renderer_.lighting_statistics().tlas_builds},
+                           {"acceleration_structure_bytes",
+                            renderer_.lighting_statistics().acceleration_structure_bytes},
+                           {"opacity_micromap_bytes",
+                            renderer_.lighting_statistics().opacity_micromap_bytes}}},
                      {"assets_pending", renderer_.assets_pending()},
                      {"visibility_backend", renderer_.visibility_backend()},
                      {"upload_high_water_bytes", renderer_.upload_high_water()},
@@ -1336,6 +1356,24 @@ void Application::execute_mcp_command(const McpCommand& command) {
             {"provisioned", renderer_.subsurface_resources_provisioned()},
             {"resident_bytes", renderer_.subsurface_resident_bytes()},
         });
+        return;
+    }
+    case McpCommandType::render_set_ray_tracing: {
+        auto settings = renderer_.lighting_settings();
+        settings.ray_tracing = command.ray_tracing;
+        if (!renderer_.set_lighting_settings(settings)) {
+            fail("Ray tracing requires dynamic lighting (and provisioned Voxel GI for gi/full)");
+            return;
+        }
+        renderer_.reset_metrics();
+        succeed(
+            "Ray tracing mode requested; lazy acceleration structures apply at the next rendered frame",
+            Json{
+                {"mode_requested", to_token(renderer_.lighting_settings().ray_tracing)},
+                {"mode_actual", to_token(renderer_.ray_tracing_mode_actual())},
+                {"supported", renderer_.ray_tracing_supported()},
+                {"provisioned", renderer_.ray_tracing_provisioned()},
+            });
         return;
     }
     case McpCommandType::render_set_motion_blur: {
@@ -1723,6 +1761,9 @@ void Application::finish_benchmark() {
     result.animated_camera = options_.animate_camera;
     result.visibility_backend = renderer_.visibility_backend();
     result.lighting = renderer_.lighting_settings();
+    result.ray_tracing_supported = renderer_.ray_tracing_supported();
+    result.ray_tracing_provisioned = renderer_.ray_tracing_provisioned();
+    result.ray_tracing_actual = to_token(renderer_.ray_tracing_mode_actual());
     result.shadow_depth_actual = renderer_.shadow_depth_format();
     result.shadow_linear_filter = renderer_.shadow_linear_filter();
     result.tone_mapper = renderer_.tone_mapper();
@@ -1762,7 +1803,7 @@ void Application::finish_benchmark() {
     result.msaa_4x_supported = renderer_.supports_msaa(AntiAliasingMethod::msaa4x);
     result.msaa_resident_bytes = renderer_.msaa_resident_bytes();
     result.depth_prepass_requested = to_token(options_.depth_prepass);
-    result.depth_prepass_actual = to_token(renderer_.depth_prepass());
+    result.depth_prepass_actual = to_token(renderer_.depth_prepass_actual());
     result.lod_fade_requested = to_token(options_.lod_fade);
     result.lod_fade_actual = to_token(renderer_.lod_fade_actual());
     result.lod_fade_seconds_requested = options_.lod_fade_seconds;

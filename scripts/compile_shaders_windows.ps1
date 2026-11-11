@@ -108,6 +108,27 @@ Compile-Shader -Source 'ocean.frag' -Output 'ocean_aa.frag.spv' `
     -ExtraArguments @('-DVCR_SSS_TEMPORAL=1')
 Compile-Shader -Source 'ocean.frag' -Output 'ocean_aa_sss.frag.spv' `
     -ExtraArguments @('-DVCR_SSS_TEMPORAL=1', '-DVCR_SSS_OUTPUT=1')
+$rayQueryFragmentShaders = @(
+    'scene.frag',
+    'scene_aa.frag',
+    'editor_model.frag',
+    'editor_model_aa.frag'
+)
+foreach ($shader in $rayQueryFragmentShaders) {
+    $stem = [System.IO.Path]::GetFileNameWithoutExtension($shader)
+    Compile-Shader `
+        -Source $shader `
+        -Output ($stem + '_rt.frag.spv') `
+        -ExtraArguments @('-DVCR_RAY_QUERY=1')
+    Compile-Shader `
+        -Source $shader `
+        -Output ($stem + '_sss_rt.frag.spv') `
+        -ExtraArguments @('-DVCR_SSS_OUTPUT=1', '-DVCR_RAY_QUERY=1')
+}
+Compile-Shader `
+    -Source 'voxel_light.comp' `
+    -Output 'voxel_light_rt.comp.spv' `
+    -ExtraArguments @('-DVCR_RAY_QUERY=1')
 Compile-Shader `
     -Source 'subsurface_blur.frag' `
     -Output 'subsurface_blur_vertical.frag.spv' `

@@ -163,6 +163,7 @@ void PerformanceMetrics::record_frame(const FrameTimings& timings) noexcept {
     accumulate(TimingIndex::gpu_voxel_geometry, timings.gpu_voxel_geometry_ms);
     accumulate(TimingIndex::gpu_voxel_light, timings.gpu_voxel_light_ms);
     accumulate(TimingIndex::gpu_visibility, timings.gpu_visibility_ms);
+    accumulate(TimingIndex::gpu_tlas, timings.gpu_tlas_ms);
     accumulate(TimingIndex::scene_prepare, timings.scene_prepare_ms);
 
     if (std::isfinite(timings.cpu_frame_ms) &&
@@ -202,6 +203,7 @@ PerformanceSnapshot PerformanceMetrics::snapshot(const bool include_percentile) 
     result.average.gpu_voxel_geometry_ms = average(TimingIndex::gpu_voxel_geometry);
     result.average.gpu_voxel_light_ms = average(TimingIndex::gpu_voxel_light);
     result.average.gpu_visibility_ms = average(TimingIndex::gpu_visibility);
+    result.average.gpu_tlas_ms = average(TimingIndex::gpu_tlas);
     result.average.scene_prepare_ms = average(TimingIndex::scene_prepare);
 
     if (window_size_ == 0) {
@@ -453,6 +455,7 @@ BenchmarkResult make_benchmark_result(
     result.average_gpu_voxel_geometry_ms = snapshot.average.gpu_voxel_geometry_ms;
     result.average_gpu_voxel_light_ms = snapshot.average.gpu_voxel_light_ms;
     result.average_gpu_visibility_ms = snapshot.average.gpu_visibility_ms;
+    result.average_gpu_tlas_ms = snapshot.average.gpu_tlas_ms;
     result.average_scene_prepare_ms = snapshot.average.scene_prepare_ms;
     return result;
 }
@@ -540,6 +543,7 @@ std::string benchmark_result_to_json(const BenchmarkResult& result) {
     timing("average_gpu_voxel_geometry_ms", result.average_gpu_voxel_geometry_ms);
     timing("average_gpu_voxel_light_ms", result.average_gpu_voxel_light_ms);
     timing("average_gpu_visibility_ms", result.average_gpu_visibility_ms);
+    timing("average_gpu_tlas_ms", result.average_gpu_tlas_ms);
     append_key(output, "visibility_backend");
     append_json_string(output, result.visibility_backend);
     output += ",\n";
@@ -589,6 +593,19 @@ std::string benchmark_result_to_json(const BenchmarkResult& result) {
     boolean("cascade_cache", result.lighting.cascade_cache);
     integer("shadow_passes_total", result.lighting_statistics.shadow_passes);
     integer("shadow_tiles_total", result.lighting_statistics.shadow_tiles);
+    boolean("ray_tracing_supported", result.ray_tracing_supported);
+    boolean("ray_tracing_provisioned", result.ray_tracing_provisioned);
+    append_key(output, "ray_tracing_requested");
+    append_json_string(output, to_token(result.lighting.ray_tracing));
+    output.append(",\n");
+    append_key(output, "ray_tracing_actual");
+    append_json_string(output, result.ray_tracing_actual);
+    output.append(",\n");
+    integer("blas_count", result.lighting_statistics.blas_count);
+    integer("tlas_instances", result.lighting_statistics.tlas_instances);
+    integer("tlas_builds_total", result.lighting_statistics.tlas_builds);
+    integer("acceleration_structure_bytes", result.lighting_statistics.acceleration_structure_bytes);
+    integer("opacity_micromap_bytes", result.lighting_statistics.opacity_micromap_bytes);
     append_key(output, "tone_mapper");
     append_json_string(output, to_token(result.tone_mapper));
     output.append(",\n");

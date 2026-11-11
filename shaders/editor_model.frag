@@ -1,5 +1,8 @@
-#version 450
+#version 460
 #extension GL_GOOGLE_include_directive : require
+#ifdef VCR_RAY_QUERY
+#extension GL_EXT_ray_query : require
+#endif
 
 #include "pbr_lighting.glsl"
 #include "voxel_sampling.glsl"
@@ -121,6 +124,11 @@ vec3 sampleWorldNormal(vec2 uvDx, vec2 uvDy)
 
 float sunVisibility(vec3 normal, vec3 lightDirection)
 {
+#ifdef VCR_RAY_QUERY
+    if (lighting.options.x > 0.5 && lighting.volumeParameters.z > 0.5) {
+        return rayTracedSunVisibility(inWorldPosition, normal, lightDirection);
+    }
+#endif
     if(lighting.options.x>0.5) return cascadedVisibility(shadowMap,inWorldPosition,normal,lightDirection);
     const vec3 projected =
         inShadowPosition.xyz / inShadowPosition.w;
@@ -183,10 +191,12 @@ void main()
             normalize(frame.cameraPosition.xyz - inWorldPosition);
         const vec3 lightDirection =
             normalize(frame.sunDirectionIntensity.xyz);
-        const float visibility = sunVisibility(materialFaceNormal(pushConstants.padding, normalize(inWorldNormal)), lightDirection);
+        const vec3 geomNormal = materialFaceNormal(
+            pushConstants.padding, safeNormalize(inWorldNormal, vec3(0.0, 1.0, 0.0)));
+        const float visibility = sunVisibility(geomNormal, lightDirection);
         vec3 diffuseAmbient=frame.skyAmbient.rgb*frame.skyAmbient.a;
         if(lighting.options.x>0.5) diffuseAmbient=(lighting.skyZenith.rgb+lighting.skyHorizon.rgb)*0.175;
-        if(voxelGiCompiled && lighting.options.y>0.5) diffuseAmbient=voxelDiffuse(inWorldPosition,normal);
+        if(voxelGiCompiled && lighting.options.y>0.5) diffuseAmbient=voxelDiffuseSurface(inWorldPosition,normal,geomNormal);
         const vec3 directRadiance =
             frame.sunColorSkyYaw.rgb
             * frame.sunDirectionIntensity.w;

@@ -56,6 +56,11 @@ struct LightingStatistics {
     std::uint32_t pending_bricks = 0, processed_triangles = 0;
     double oldest_geometry_ms = 0.0;
     std::uint64_t mesh_bytes = 0;
+    std::uint32_t blas_count = 0;
+    std::uint32_t tlas_instances = 0;
+    std::uint64_t tlas_builds = 0;
+    std::uint64_t acceleration_structure_bytes = 0;
+    std::uint64_t opacity_micromap_bytes = 0;
 };
 class DirtyVoxelBricks {
   public:

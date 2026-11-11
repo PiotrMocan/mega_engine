@@ -32,6 +32,7 @@ enum class McpCommandType : std::uint8_t {
     render_set_exposure,
     render_set_color_grading,
     render_set_subsurface,
+    render_set_ray_tracing,
     render_set_motion_blur,
     render_set_anti_aliasing,
     render_set_depth_prepass,
@@ -155,6 +156,7 @@ struct McpCommand {
     ColorGrading color_grading = ColorGrading::off;
     ColorGradingLutSize color_grading_lut_size = ColorGradingLutSize::size_32;
     SubsurfaceMode subsurface = SubsurfaceMode::off;
+    RayTracingMode ray_tracing = RayTracingMode::off;
     MotionBlurSettings motion_blur{};
     SmaaMode smaa_mode = SmaaMode::x1;
     bool smaa_mode_supplied = false;

@@ -454,6 +454,7 @@ set(VCR_RENDERER_SOURCES
     src/lighting.cpp
     src/punctual_light.cpp
     src/renderer_lighting.cpp
+    src/renderer_ray_tracing.cpp
     src/renderer_gpu_visibility.cpp
     src/model_lod.cpp
     src/asset_preparation.cpp

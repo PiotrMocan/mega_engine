@@ -58,6 +58,24 @@ bool Renderer::set_lighting_settings(LightingSettings settings) noexcept {
     if (settings.dynamic != lighting_settings_.dynamic) {
         exposure_reset_pending_ = true;
     }
+    if (settings.ray_tracing != lighting_settings_.ray_tracing) {
+        if (ray_tracing_uses_shadows(lighting_settings_.ray_tracing) &&
+            !ray_tracing_uses_shadows(settings.ray_tracing)) {
+            shadow_dirty_ = true;
+        }
+        if (ray_tracing_uses_gi(lighting_settings_.ray_tracing) !=
+            ray_tracing_uses_gi(settings.ray_tracing)) {
+            voxel_ready_ = false;
+        }
+        if (settings.ray_tracing != RayTracingMode::off && !rt_provisioned_) {
+            if (context_ != nullptr && context_->ray_query_supported() &&
+                context_->properties().limits.maxPerStageDescriptorStorageBuffers >= 7U &&
+                context_->properties().limits.maxDescriptorSetStorageBuffers >= 10U) {
+                rt_provision_pending_ = true;
+            }
+        }
+        invalidate_temporal_history();
+    }
     if (settings.gi_extent != lighting_settings_.gi_extent)
         gi_scene_revision_ = 0;
     gi_light_elapsed_ = 1000;
@@ -92,6 +110,18 @@ void Renderer::create_lighting_resources() {
     if (support != VK_SUCCESS || (properties.optimalTilingFeatures & features) != features)
         fatal("Lighting requires filterable RGBA16F 3D storage images");
     gi_provisioned_ = lighting_settings_.voxel_gi;
+    rt_provisioned_ = false;
+    rt_provision_pending_ = false;
+    if (lighting_settings_.ray_tracing != RayTracingMode::off) {
+        if (context_->ray_query_supported() &&
+            limits.maxPerStageDescriptorStorageBuffers >= 7U &&
+            limits.maxDescriptorSetStorageBuffers >= 10U) {
+            rt_provisioned_ = true;
+        } else {
+            std::cerr << "warning: hardware ray query is unavailable on this GPU; "
+                         "falling back to rasterized shadows and voxel GI\n";
+        }
+    }
     if (gi_provisioned_ &&
         (limits.maxStorageBufferRange < sizeof(GiTriangle) * gi_max_triangles ||
          limits.maxComputeWorkGroupInvocations < 64 || limits.maxComputeWorkGroupSize[0] < 64 ||
@@ -120,37 +150,7 @@ void Renderer::create_lighting_resources() {
                                voxel_storage_view_.put(context_->device(), vkDestroyImageView)));
     context_->set_debug_name(VK_OBJECT_TYPE_IMAGE_VIEW, handle_value(voxel_storage_view_.get()),
                              "GI mip zero storage view");
-    const std::array bindings{
-        VkDescriptorSetLayoutBinding{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
-                                     VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
-                                     nullptr},
-        VkDescriptorSetLayoutBinding{1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
-                                     VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
-        VkDescriptorSetLayoutBinding{2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
-                                     VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-        VkDescriptorSetLayoutBinding{3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
-                                     VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-        VkDescriptorSetLayoutBinding{4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
-                                     VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-        VkDescriptorSetLayoutBinding{5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
-                                     VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-        VkDescriptorSetLayoutBinding{6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,
-                                     VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-        VkDescriptorSetLayoutBinding{7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
-                                     VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
-                                     nullptr},
-        VkDescriptorSetLayoutBinding{8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
-                                     VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
-                                     nullptr},
-    };
-    const VkDescriptorSetLayoutCreateInfo layout{
-        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0,
-        static_cast<std::uint32_t>(bindings.size()), bindings.data()};
-    VK_CHECK(vkCreateDescriptorSetLayout(
-        context_->device(), &layout, nullptr,
-        lighting_layout_.put(context_->device(), vkDestroyDescriptorSetLayout)));
-    context_->set_debug_name(VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT,
-                             handle_value(lighting_layout_.get()), "lighting descriptors");
+    create_lighting_descriptor_layout();
     for (auto &frame : frames_) {
         frame.lighting_uniform_buffer.create(
             *context_, sizeof(LightingUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
@@ -187,16 +187,57 @@ void Renderer::create_lighting_resources() {
         voxel_scene_.reserve();
     }
 }
+void Renderer::create_lighting_descriptor_layout() {
+    const std::array bindings{
+        VkDescriptorSetLayoutBinding{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+                                     nullptr},
+        VkDescriptorSetLayoutBinding{1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        VkDescriptorSetLayoutBinding{2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                                     VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        VkDescriptorSetLayoutBinding{3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                                     VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        VkDescriptorSetLayoutBinding{4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                                     VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        VkDescriptorSetLayoutBinding{5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                                     VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        VkDescriptorSetLayoutBinding{6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,
+                                     VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        VkDescriptorSetLayoutBinding{7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+                                     nullptr},
+        VkDescriptorSetLayoutBinding{8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+                                     nullptr},
+        VkDescriptorSetLayoutBinding{9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+                                     nullptr},
+        VkDescriptorSetLayoutBinding{10, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+                                     nullptr},
+    };
+    const std::uint32_t binding_count = rt_provisioned_ ? 11U : 9U;
+    const VkDescriptorSetLayoutCreateInfo layout{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0,
+        binding_count, bindings.data()};
+    VK_CHECK(vkCreateDescriptorSetLayout(
+        context_->device(), &layout, nullptr,
+        lighting_layout_.put(context_->device(), vkDestroyDescriptorSetLayout)));
+    context_->set_debug_name(VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT,
+                             handle_value(lighting_layout_.get()), "lighting descriptors");
+}
 void Renderer::create_lighting_pipelines() {
     const std::array sizes{
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2},
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 12},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rt_provisioned_ ? 14U : 12U},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 2},
     };
     const VkDescriptorPoolCreateInfo pool{
-        VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr,     0, 2,
-        static_cast<std::uint32_t>(sizes.size()),      sizes.data()};
+        VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, 2,
+        rt_provisioned_ ? 5U : 4U, sizes.data()};
     VK_CHECK(
         vkCreateDescriptorPool(context_->device(), &pool, nullptr,
                                lighting_pool_.put(context_->device(), vkDestroyDescriptorPool)));
@@ -224,6 +265,8 @@ void Renderer::create_lighting_pipelines() {
                                    frame.local_light_buffer.size()},
             VkDescriptorBufferInfo{frame.local_light_cluster_buffer.handle(), 0,
                                    frame.local_light_cluster_buffer.size()},
+            VkDescriptorBufferInfo{rt_opacity_micromaps_.handle(), 0,
+                                   rt_opacity_micromaps_.size()},
         };
         const std::array images{
             VkDescriptorImageInfo{voxel_radiance_.sampler(), voxel_radiance_.view(),
@@ -231,8 +274,14 @@ void Renderer::create_lighting_pipelines() {
             VkDescriptorImageInfo{VK_NULL_HANDLE, voxel_storage_view_.get(),
                                   VK_IMAGE_LAYOUT_GENERAL},
         };
-        std::array<VkWriteDescriptorSet, 9> writes{};
-        for (unsigned i = 0; i < writes.size(); ++i) {
+        const VkAccelerationStructureKHR tlas_handle = frame.tlas.handle();
+        const VkWriteDescriptorSetAccelerationStructureKHR tlas_write{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,
+            .accelerationStructureCount = 1U,
+            .pAccelerationStructures = &tlas_handle,
+        };
+        std::array<VkWriteDescriptorSet, 11> writes{};
+        for (unsigned i = 0; i < 9U; ++i) {
             auto &w = writes[i];
             w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             w.dstSet = frame.lighting_descriptor_set;
@@ -250,8 +299,26 @@ void Renderer::create_lighting_pipelines() {
                 w.pBufferInfo = &buffers[buffer_index];
             }
         }
+        if (rt_provisioned_) {
+            writes[9] = VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = frame.lighting_descriptor_set,
+                .dstBinding = 9U,
+                .descriptorCount = 1U,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pBufferInfo = &buffers[7],
+            };
+            writes[10] = VkWriteDescriptorSet{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = &tlas_write,
+                .dstSet = frame.lighting_descriptor_set,
+                .dstBinding = 10U,
+                .descriptorCount = 1U,
+                .descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
+            };
+        }
         vkUpdateDescriptorSets(
-            context_->device(), static_cast<std::uint32_t>(writes.size()),
+            context_->device(), rt_provisioned_ ? 11U : 9U,
             writes.data(), 0, nullptr);
     }
     const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
@@ -264,7 +331,9 @@ void Renderer::create_lighting_pipelines() {
                              handle_value(lighting_compute_layout_.get()), "lighting compute layout");
     if (gi_provisioned_) for (unsigned i = 0; i < 2; ++i) {
         const auto shader =
-            load_shader(i == 0 ? "voxel_geometry.comp.spv" : "voxel_light.comp.spv");
+            load_shader(i == 0 ? "voxel_geometry.comp.spv"
+                               : (rt_provisioned_ ? "voxel_light_rt.comp.spv"
+                                                  : "voxel_light.comp.spv"));
         VkComputePipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pipeline.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                           nullptr,
@@ -439,9 +508,12 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
     if (!lighting_settings_.dynamic) {
         voxel_light_due_ = false;
         voxel_job_finishes_ = false;
+        rt_tlas_build_due_ = false;
         if (frame.lighting_was_dynamic || local_lights_changed ||
             local_backend == LocalLightBackend::clustered) {
             lighting_uniforms_.options = {};
+            lighting_uniforms_.volume_parameters.z = 0.0F;
+            lighting_uniforms_.volume_parameters.w = 0.0F;
             frame.lighting_uniform_buffer.write(
                 std::as_bytes(std::span{&lighting_uniforms_, std::size_t{1}}));
             frame.lighting_was_dynamic = false;
@@ -485,6 +557,14 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
         lighting_shadow_view_ = view;
         lighting_shadow_hour_ = shadow_hour;
         lighting_shadow_aspect_ = aspect;
+    }
+    const RayTracingMode rt_actual = ray_tracing_mode_actual();
+    const bool rt_shadows = ray_tracing_uses_shadows(rt_actual);
+    const bool rt_gi = ray_tracing_uses_gi(rt_actual);
+    if (rt_actual != RayTracingMode::off) {
+        prepare_ray_tracing(frame);
+    } else {
+        rt_tlas_build_due_ = false;
     }
     gi_light_elapsed_ += dt;
     gi_geometry_elapsed_ += dt;
@@ -551,8 +631,9 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
         voxel_light_due_ =
             voxel_job_finishes_ ||
             (!voxel_job_active_ &&
-             (!voxel_ready_ ||
-              (sun_changed && gi_light_elapsed_ >= 1.0 / lighting_settings_.gi_update_hz)));
+             (!voxel_ready_ || rt_gi != gi_last_rt_active_ ||
+              ((sun_changed || (rt_gi && rt_tlas_build_due_)) &&
+               gi_light_elapsed_ >= 1.0 / lighting_settings_.gi_update_hz)));
         lighting_statistics_.pending_bricks = static_cast<std::uint32_t>(voxel_dirty_.count());
         if (voxel_job_active_)
             lighting_statistics_.pending_bricks += static_cast<std::uint32_t>(
@@ -566,7 +647,11 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
                       .count();
     }
     u.volume_origin_cell = glm::vec4(voxel_dirty_.origin(), voxel_dirty_.cell());
-    u.volume_parameters = glm::vec4(lighting_settings_.gi_extent, gi_resolution, 0, 0);
+    u.volume_parameters = glm::vec4(
+        lighting_settings_.gi_extent,
+        gi_resolution,
+        rt_shadows ? 1.0F : 0.0F,
+        rt_gi ? 1.0F : 0.0F);
     u.options = glm::vec4(lighting_settings_.dynamic ? 1 : 0,
                           lighting_settings_.voxel_gi && (voxel_ready_ || voxel_job_finishes_) &&
                                   mode_ != RunMode::instancing
@@ -722,6 +807,7 @@ void Renderer::record_voxel_light(VkCommandBuffer command, FrameContext &frame) 
                      0, 7);
     gi_last_sun_ = lighting_uniforms_.sun_direction_intensity;
     gi_last_sun_color_ = lighting_uniforms_.sun_color;
+    gi_last_rt_active_ = ray_tracing_uses_gi(ray_tracing_mode_actual());
     voxel_ready_ = true;
     gi_light_elapsed_ = 0;
     ++lighting_statistics_.radiance_updates;
@@ -738,6 +824,7 @@ void Renderer::destroy_lighting() noexcept {
     voxel_geometry_.destroy();
     voxel_triangles_.destroy();
     for (auto &frame : frames_) {
+        frame.lighting_descriptor_set = VK_NULL_HANDLE;
         frame.lighting_uniform_buffer.destroy();
         frame.voxel_job_buffer.destroy();
         frame.voxel_dirty_buffer.destroy();
@@ -752,6 +839,10 @@ void Renderer::destroy_lighting() noexcept {
     voxel_batch_.clear();
     voxel_scene_.clear();
     gi_provisioned_ = false;
+    rt_provisioned_ = false;
+    rt_provision_pending_ = false;
+    rt_tlas_build_due_ = false;
+    gi_last_rt_active_ = false;
     voxel_ready_ = false;
     voxel_job_active_ = false;
     voxel_radiance_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;

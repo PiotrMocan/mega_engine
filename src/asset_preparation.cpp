@@ -1,12 +1,14 @@
 #include "asset_preparation.hpp"
 #include "model_lod.hpp"
+#include "opacity_micromap.hpp"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <exception>
 
 namespace vcr {
-PreparedModel prepare_model_asset(std::filesystem::path root, std::string path) {
+PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,
+    const std::span<const std::string> resident_textures) {
     PreparedModel result{.root = std::move(root), .path = std::move(path)};
     try {
         CookedModelLoadOptions options;
@@ -59,11 +61,15 @@ PreparedModel prepare_model_asset(std::filesystem::path root, std::string path) 
             result.error = "Prepared mesh exceeds the 512 MiB upload budget";
             return result;
         }
-        const auto texture = [&](const std::optional<std::filesystem::path> &reference) {
+        const auto texture = [&](const std::optional<std::filesystem::path> &reference,
+                                 const bool needs_opacity_pixels = false) {
             if (!reference) {
                 return;
             }
             const auto key = reference->lexically_normal().generic_string();
+            if (!needs_opacity_pixels && std::ranges::find(resident_textures, key) != resident_textures.end()) {
+                return;
+            }
             if (std::ranges::any_of(result.textures,
                                     [&](const auto &t) { return t.path == key; })) {
                 return;
@@ -102,10 +108,51 @@ PreparedModel prepare_model_asset(std::filesystem::path root, std::string path) 
             result.textures.push_back(std::move(entry));
         };
         for (const auto &material : model.materials) {
-            texture(material.base_color_texture);
+            texture(material.base_color_texture, (material.coverage & 1U) != 0U);
             texture(material.normal_texture);
             texture(material.metallic_roughness_texture);
             texture(material.displacement_texture);
+        }
+        result.submesh_opacity_micromaps.resize(model.submeshes.size());
+        for (std::size_t submesh_index = 0U; submesh_index < model.submeshes.size();
+             ++submesh_index) {
+            const auto &submesh = model.submeshes[submesh_index];
+            if (submesh.material_index >= model.materials.size()) {
+                continue;
+            }
+            const auto &material = model.materials[submesh.material_index];
+            if ((material.coverage & 1U) == 0U) {
+                continue;
+            }
+            const CookedTextureAsset *base_texture = nullptr;
+            if (material.base_color_texture) {
+                const auto key =
+                    material.base_color_texture->lexically_normal().generic_string();
+                const auto found = std::ranges::find_if(
+                    result.textures, [&](const auto &t) { return t.path == key; });
+                if (found != result.textures.end() && found->texture &&
+                    found->texture->semantic == CookedTextureSemantic::base_color &&
+                    found->texture->color_space == CookedTextureColorSpace::srgb) {
+                    base_texture = &(*found->texture);
+                }
+            }
+            auto masks = bake_opacity_micromap(
+                model.vertices,
+                model.indices,
+                static_cast<std::size_t>(submesh.first_index),
+                static_cast<std::size_t>(submesh.index_count),
+                base_texture,
+                material.factors.base_color.a,
+                material.coverage);
+            if (!masks.empty()) {
+                const std::size_t mask_bytes = masks.size() * sizeof(glm::uvec2) + 256U;
+                if (mask_bytes > maximum_prepared_asset_bytes - result.upload_bytes) {
+                    result.error = "Prepared opacity micromaps exceed the 512 MiB upload budget";
+                    return result;
+                }
+                result.upload_bytes += mask_bytes;
+                result.submesh_opacity_micromaps[submesh_index] = std::move(masks);
+            }
         }
         result.model = std::move(model);
     } catch (const std::exception &e) {
@@ -138,7 +185,8 @@ void AssetPreparation::start() {
                 request = std::move(request_slot->value());
                 request_slot->reset();
             }
-            auto result = prepare_model_asset(std::move(request.root), std::move(request.path));
+            auto result = prepare_model_asset(std::move(request.root), std::move(request.path),
+                                              request.resident_textures);
             {
                 std::lock_guard lock(mutex_);
                 if (stopping_) {
@@ -172,13 +220,14 @@ void AssetPreparation::stop() noexcept {
     ready_.store(0, std::memory_order_relaxed);
     outstanding_ = 0;
 }
-bool AssetPreparation::request(std::filesystem::path root, std::string path) {
+bool AssetPreparation::request(std::filesystem::path root, std::string path,
+    std::vector<std::string> resident_textures) {
     std::lock_guard lock(mutex_);
     if (stopping_ || !worker_.joinable() || outstanding_ == requests_.size()) {
         return false;
     }
     const auto slot = std::ranges::find_if(requests_, [](const auto &r) { return !r.has_value(); });
-    slot->emplace(Request{std::move(root), std::move(path)});
+    slot->emplace(Request{std::move(root), std::move(path), std::move(resident_textures)});
     high_water_ = std::max(high_water_, static_cast<std::size_t>(++outstanding_));
     wake_.notify_one();
     return true;

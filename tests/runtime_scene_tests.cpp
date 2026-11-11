@@ -3,6 +3,9 @@
 #include "camera_projection.hpp"
 #include "model_lod.hpp"
 #include "asset_preparation.hpp"
+#include <filesystem>
+#include <fstream>
+#include "opacity_micromap.hpp"
 #include <glm/gtc/matrix_transform.hpp>
 #include <cstdio>
 #include <cstdlib>
@@ -467,6 +470,105 @@ int main() {
             expect(std::isfinite(cards.lod_error[level]) && cards.lod_error[level] > cards.lod_error[level - 1],
                    "foliage geometric errors remain finite and strictly increasing");
         }
+    }
+    {
+        std::array<vcr::CookedModelVertex, 3> tri_vertices{};
+        tri_vertices[0].texcoord = {0.0F, 0.0F};
+        tri_vertices[1].texcoord = {1.0F, 0.0F};
+        tri_vertices[2].texcoord = {0.0F, 1.0F};
+        const std::array<std::uint32_t, 3> tri_indices{0U, 1U, 2U};
+        constexpr std::uint32_t masked_half = (32768U << 16U) | 1U;
+        expect(vcr::bake_opacity_micromap(tri_vertices, tri_indices, 0U, 3U, nullptr, 1.0F, 0U).empty(),
+               "opaque coverage skips software opacity micromap allocation");
+        const auto transparent_masks =
+            vcr::bake_opacity_micromap(tri_vertices, tri_indices, 0U, 3U, nullptr, 0.1F, masked_half);
+        expect(transparent_masks.size() == 1U && transparent_masks[0] == glm::uvec2{0U, 0U},
+               "alpha factor below cutoff produces an all-transparent 8x8 micromap");
+        const auto fallback_masks =
+            vcr::bake_opacity_micromap(tri_vertices, tri_indices, 0U, 3U, nullptr, 1.0F, masked_half);
+        expect(fallback_masks.size() == 1U &&
+                   fallback_masks[0] == glm::uvec2{0xFFFFFFFFU, 0xFFFFFFFFU},
+               "masked material without texture bakes an all-opaque 8x8 micromap");
+        vcr::CookedTextureAsset alpha_tex{};
+        alpha_tex.width = 1U;
+        alpha_tex.height = 4U;
+        alpha_tex.row_stride_bytes = 4U;
+        // Top rows (v < 0.5 => authoring uv.y > 0.5 after 1-v flip) opaque, bottom rows transparent.
+        alpha_tex.pixels = {
+            255U, 255U, 255U, 255U,
+            255U, 255U, 255U, 255U,
+            255U, 255U, 255U, 0U,
+            255U, 255U, 255U, 0U,
+        };
+        const auto split_masks = vcr::bake_opacity_micromap(
+            tri_vertices, tri_indices, 0U, 3U, &alpha_tex, 1.0F, masked_half);
+        // At (ix=0, iy=0): s=0.0625, t=0.0625 => uv.y = b2 = s*t ~= 0.0039 => v ~= 0.996 => alpha=0 (bit 0 clear).
+        // At (ix=7, iy=7): s=0.9375, t=0.9375 => uv.y = b2 = s*t ~= 0.8789 => v ~= 0.121 => alpha=1 (bit 63 set).
+        expect(split_masks.size() == 1U &&
+                   (split_masks[0].x & 1U) == 0U &&
+                   (split_masks[0].y & 0x80000000U) != 0U,
+               "8x8 software opacity micromap respects authoring V-flip and alpha cutoff");
+    }
+    {
+        // A missing image proves the second model does not even reopen/decode
+        // an opaque texture that is already resident. Alpha pixels remain
+        // necessary for opacity micromaps, including on cache hits.
+        const auto root = std::filesystem::temp_directory_path() /
+            ("vcr-resident-texture-" + std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count()));
+        expect(std::filesystem::create_directory(root), "create owned resident-texture fixture");
+        std::filesystem::create_directory(root / "materials");
+        std::filesystem::create_directory(root / "textures");
+        const auto write_text = [](const auto& path, const char* text) {
+            std::ofstream stream(path, std::ios::binary);
+            stream << text;
+        };
+        write_text(root / "triangle.vcrasset.json", R"({"schema":"vcr.asset","version":1,"kind":"model","name":"triangle","mesh":"triangle.vcrmesh","geometry":{"vertex_count":3,"index_count":3,"index_type":"uint32","primitive":"triangles","vertex_stride":48},"materials":["materials/shared.vcrmaterial.json"],"submeshes":[{"name":"triangle","first_index":0,"index_count":3,"material_index":0,"material":"materials/shared.vcrmaterial.json"}]})");
+        const auto write_material = [&](bool masked) {
+            std::ofstream stream(root / "materials/shared.vcrmaterial.json");
+            stream << R"({"schema":"vcr.asset","version":1,"kind":"material","name":"shared","pbr":{"base_color":[1,1,1,1],"metallic":0,"roughness":0.7,"ambient_occlusion":1},"textures":{"base_color":"textures/shared.vcrtexture.json"},"alpha_mode":")"
+                   << (masked ? "mask" : "opaque") << R"("})";
+        };
+        write_material(false);
+        write_text(root / "textures/shared.vcrtexture.json", R"({"schema":"vcr.asset","version":1,"kind":"texture","name":"shared","source":"textures/missing.png","usage":"base_color","color_space":"srgb"})");
+        {
+            std::ofstream stream(root / "triangle.vcrmesh", std::ios::binary);
+            stream.write("VCRMESH\0", 8);
+            const auto u32 = [&](std::uint32_t value) { stream.write(reinterpret_cast<const char*>(&value),4); };
+            const auto u64 = [&](std::uint64_t value) { stream.write(reinterpret_cast<const char*>(&value),8); };
+            u32(1); u32(48); u64(3); u64(3); u32(1); u32(0);
+            u64(0); u64(3); u32(0); u32(0);
+            std::array<vcr::CookedModelVertex,3> vertices{};
+            vertices[0].position = {-1,0,0}; vertices[1].position = {1,0,0}; vertices[2].position = {0,1,0};
+            for (auto& vertex : vertices) { vertex.normal = {0,0,1}; vertex.tangent = {1,0,0,1}; }
+            stream.write(reinterpret_cast<const char*>(vertices.data()),sizeof(vertices));
+            u32(0); u32(1); u32(2);
+        }
+        const std::vector<std::string> resident{"textures/shared.vcrtexture.json"};
+        const auto first = vcr::prepare_model_asset(root, "triangle.vcrasset.json");
+        expect(first.model && first.textures.size() == 1 && !first.textures[0].error.empty(),
+               "nonresident texture still attempts decode and reports missing image");
+        const auto reused = vcr::prepare_model_asset(root, "triangle.vcrasset.json", resident);
+        expect(reused.model && reused.textures.empty(), "resident opaque texture is not decoded twice");
+        write_material(true);
+        const auto alpha = vcr::prepare_model_asset(root, "triangle.vcrasset.json", resident);
+        expect(alpha.model && alpha.textures.size() == 1 && !alpha.textures[0].error.empty(),
+               "masked resident texture still obtains alpha pixels for OMM");
+        write_material(false);
+        vcr::AssetPreparation resident_worker;
+        resident_worker.start();
+        auto owned_snapshot = resident;
+        expect(resident_worker.request(root, "triangle.vcrasset.json", owned_snapshot), "queue resident-texture snapshot");
+        owned_snapshot.clear();
+        std::optional<vcr::PreparedModel> result;
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!result && std::chrono::steady_clock::now() < until) {
+            result = resident_worker.poll();
+            if (!result) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        expect(result && result->model && result->textures.empty(), "worker owns resident snapshot after caller clears it");
+        resident_worker.stop();
+        std::filesystem::remove_all(root);
     }
     vcr::AssetPreparation worker;
     worker.start();

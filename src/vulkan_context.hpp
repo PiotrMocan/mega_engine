@@ -78,12 +78,27 @@ public:
     [[nodiscard]] bool independent_blend_enabled() const noexcept {
         return independent_blend_enabled_;
     }
+    [[nodiscard]] bool buffer_device_address_enabled() const noexcept {
+        return buffer_device_address_enabled_;
+    }
+    [[nodiscard]] bool ray_query_supported() const noexcept {
+        return ray_query_supported_;
+    }
+    [[nodiscard]] const VkPhysicalDeviceAccelerationStructurePropertiesKHR&
+    acceleration_structure_properties() const noexcept {
+        return acceleration_structure_properties_;
+    }
 
 private:
   bool indirect_first_instance_ = false;
   bool multi_draw_indirect_ = false;
   bool tessellation_shader_enabled_ = false;
   bool independent_blend_enabled_ = false;
+  bool buffer_device_address_enabled_ = false;
+  bool ray_query_supported_ = false;
+  VkPhysicalDeviceAccelerationStructurePropertiesKHR acceleration_structure_properties_{
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR,
+  };
   void create_instance(SDL_Window *window, bool validation_requested);
   void create_debug_messenger();
   void create_surface(SDL_Window *window);

@@ -115,9 +115,32 @@ public:
         return local_light_statistics_;
     }
     [[nodiscard]] bool gi_provisioned() const noexcept { return gi_provisioned_; }
+    [[nodiscard]] bool ray_tracing_supported() const noexcept {
+        return context_ != nullptr && context_->ray_query_supported();
+    }
+    [[nodiscard]] bool ray_tracing_provisioned() const noexcept { return rt_provisioned_; }
+    [[nodiscard]] RayTracingMode ray_tracing_mode_actual() const noexcept {
+        return resolve_ray_tracing_mode(
+            lighting_settings_.ray_tracing,
+            rt_provisioned_,
+            lighting_settings_.dynamic && mode_ != RunMode::instancing,
+            gi_provisioned_ && lighting_settings_.voxel_gi
+#if VCR_EDITOR_ENABLED
+                && authored_scene_enabled_
+#endif
+        );
+    }
     [[nodiscard]] bool set_lighting_settings(LightingSettings settings) noexcept;
     [[nodiscard]] ToneMapper tone_mapper() const noexcept { return tone_mapper_; }
     [[nodiscard]] DepthPrepass depth_prepass() const noexcept { return depth_prepass_; }
+    [[nodiscard]] DepthPrepass depth_prepass_actual() const noexcept {
+        if (depth_prepass_ != DepthPrepass::off) {
+            return depth_prepass_;
+        }
+        return ray_tracing_mode_actual() != RayTracingMode::off
+            ? DepthPrepass::full
+            : DepthPrepass::off;
+    }
     [[nodiscard]] LodFadePattern lod_fade_pattern() const noexcept { return lod_fade_pattern_; }
     [[nodiscard]] float lod_fade_seconds() const noexcept { return lod_fade_seconds_; }
     [[nodiscard]] LodFadePattern lod_fade_actual() const noexcept {
@@ -461,6 +484,10 @@ private:
         std::uint32_t index_count = 0U;
         std::uint32_t gi_first = 0, gi_count = 0;
         glm::vec3 gi_albedo{1};
+        AccelerationStructure blas{};
+        std::uint32_t rt_opacity_first = 0U;
+        std::uint32_t rt_opacity_count = 0U;
+        std::vector<glm::uvec2> cpu_opacity_micromap{};
         std::array<std::uint32_t, model_lod_count> lod_first{};
         std::array<std::uint32_t, model_lod_count> lod_count{};
         std::array<float, model_lod_count> lod_error{};
@@ -494,6 +521,7 @@ private:
     };
 
     struct EditorTextureAsset {
+        glm::vec3 average_linear{1};
         std::string relative_path{};
         GpuTexture texture{};
         CookedTextureSemantic semantic =
@@ -505,8 +533,21 @@ private:
 #endif
 
     void create_lighting_resources();
+    void create_lighting_descriptor_layout();
     void create_lighting_pipelines();
     void destroy_lighting() noexcept;
+    void create_ray_tracing_resources();
+    void provision_ray_tracing_resources();
+    void destroy_ray_tracing() noexcept;
+    void prepare_ray_tracing(FrameContext &frame);
+    void record_ray_tracing_tlas(VkCommandBuffer command, FrameContext &frame);
+    void ensure_frame_tlas_capacity(FrameContext &frame, std::uint32_t required_instances);
+    void refresh_ray_tracing_statistics() noexcept;
+#if VCR_EDITOR_ENABLED
+    void build_model_blas_on_upload(EditorModelAsset &asset);
+    void compact_model_blas(EditorModelAsset &asset);
+    [[nodiscard]] std::uint32_t append_rt_opacity_micromaps(std::span<const glm::uvec2> masks);
+#endif
     void prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkExtent2D extent);
     void record_voxel_geometry(VkCommandBuffer command, FrameContext &frame);
     void record_voxel_light(VkCommandBuffer command, FrameContext &frame);
@@ -630,6 +671,7 @@ private:
     void record_editor_scene_upload(
         VkCommandBuffer command_buffer,
         FrameContext& frame);
+    [[nodiscard]] std::vector<std::string> resident_editor_texture_paths() const;
     [[nodiscard]] std::optional<std::uint32_t> publish_editor_model(const PreparedModel &prepared,
                                                                     std::string &error);
 #endif
@@ -699,6 +741,13 @@ private:
     std::uint64_t gi_scene_revision_ = 0;
     bool gi_provisioned_ = false, voxel_job_active_ = false, voxel_job_start_ = false;
     bool voxel_ready_ = false, voxel_light_due_ = false, voxel_job_finishes_ = false;
+    bool rt_provisioned_ = false, rt_provision_pending_ = false;
+    bool rt_tlas_build_due_ = false, gi_last_rt_active_ = false;
+    AccelerationStructure blas_cube_{}, blas_plane_{}, blas_sphere_{}, blas_terrain_{};
+    GpuBuffer rt_opacity_micromaps_{}, rt_upload_scratch_{};
+    std::uint32_t rt_opacity_triangle_count_ = 0U;
+    std::vector<VkAccelerationStructureInstanceKHR> rt_tlas_instances_{};
+    std::vector<TransformRows> demo_rt_transforms_{};
     bool lighting_shadow_initialized_ = false;
     glm::mat4 lighting_shadow_view_{1};
     double lighting_shadow_hour_ = 0;
