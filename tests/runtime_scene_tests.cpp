@@ -508,6 +508,20 @@ int main() {
                    (split_masks[0].x & 1U) == 0U &&
                    (split_masks[0].y & 0x80000000U) != 0U,
                "8x8 software opacity micromap respects authoring V-flip and alpha cutoff");
+
+        const auto packed_alpha = vcr::pack_alpha_r8_1024_words(alpha_tex);
+        expect(packed_alpha.size() == vcr::rt_alpha_map_word_count &&
+                   (packed_alpha[256U * 256U] & 0xFFU) == 255U &&
+                   (packed_alpha[768U * 256U] & 0xFFU) == 0U,
+               "1024x1024 R8 alpha table preserves top-to-bottom alpha polarity");
+        const auto masked_tris =
+            vcr::bake_rt_masked_triangles(tri_vertices, tri_indices, 0U, 3U, true, 1.0F, masked_half);
+        expect(masked_tris.size() == 1U &&
+                   std::abs(masked_tris[0].uv0[1] - 1.0F) < 1e-6F &&
+                   std::abs(masked_tris[0].uv2[1] - 0.0F) < 1e-6F &&
+                   masked_tris[0].effective_cutoff > 0.49F &&
+                   masked_tris[0].effective_cutoff < 0.51F,
+               "RT masked triangle baker V-flips UVs and computes effective alpha cutoff");
     }
     {
         // A missing image proves the second model does not even reopen/decode

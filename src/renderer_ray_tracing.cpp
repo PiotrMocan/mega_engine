@@ -17,6 +17,13 @@ namespace vcr {
 namespace {
 
 constexpr std::uint32_t rt_opacity_max_triangles = 524'288U;
+constexpr std::uint32_t rt_alpha_max_maps = 32U;
+constexpr std::uint32_t rt_alpha_texel_base_word =
+    rt_opacity_max_triangles * static_cast<std::uint32_t>(sizeof(RtMaskedTriangle) / sizeof(std::uint32_t));
+constexpr std::uint32_t rt_alpha_max_texel_words = rt_alpha_max_maps * rt_alpha_map_word_count;
+constexpr VkDeviceSize rt_opacity_buffer_bytes =
+    static_cast<VkDeviceSize>(rt_alpha_texel_base_word + rt_alpha_max_texel_words) *
+    sizeof(std::uint32_t);
 constexpr std::uint32_t rt_initial_tlas_capacity = 256U;
 constexpr VkDeviceSize rt_vertex_stride_bytes = 24ULL;
 constexpr VkDeviceSize rt_terrain_vertex_stride_bytes = 16ULL;
@@ -321,17 +328,18 @@ void Renderer::create_ray_tracing_resources() {
     }
     rt_opacity_micromaps_.create(
         *context_,
-        static_cast<VkDeviceSize>(rt_opacity_max_triangles) * sizeof(glm::uvec2),
+        rt_opacity_buffer_bytes,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
-        "RT software opacity micromaps");
-    const glm::uvec2 full_opaque_mask{0xFFFFFFFFU, 0xFFFFFFFFU};
+        "RT masked triangle & R8 alpha cache");
+    const RtMaskedTriangle sentinel_opaque{};
     upload_to_device_buffer(
         rt_opacity_micromaps_,
-        std::as_bytes(std::span{&full_opaque_mask, std::size_t{1U}}),
+        std::as_bytes(std::span{&sentinel_opaque, std::size_t{1U}}),
         0ULL);
     rt_opacity_triangle_count_ = 1U;
+    rt_alpha_texel_words_used_ = 0U;
 
     blas_cube_ = build_compacted_static_blas(
         *context_,
@@ -401,18 +409,30 @@ void Renderer::create_ray_tracing_resources() {
     }
 
 #if VCR_EDITOR_ENABLED
+    for (const auto& entry : rt_alpha_maps_) {
+        static_cast<void>(find_or_upload_rt_alpha_map(entry.relative_path, nullptr));
+    }
     for (auto& asset : editor_model_assets_) {
         if (!asset.vertex_buffer || !asset.index_buffer) {
             continue;
         }
         for (auto& submesh : asset.submeshes) {
-            if ((submesh.coverage & 1U) != 0U && !submesh.cpu_opacity_micromap.empty() &&
+            if ((submesh.coverage & 1U) != 0U && !submesh.cpu_rt_triangles.empty() &&
                 submesh.rt_opacity_count == 0U) {
+                const std::uint32_t alpha_word_offset = submesh.rt_alpha_texture_path.empty()
+                    ? 0U
+                    : find_or_upload_rt_alpha_map(submesh.rt_alpha_texture_path, nullptr);
+                if (!submesh.rt_alpha_texture_path.empty()) {
+                    for (auto& tri : submesh.cpu_rt_triangles) {
+                        if (tri.effective_cutoff <= 1.0F) {
+                            tri.texel_word_offset = alpha_word_offset;
+                        }
+                    }
+                }
                 submesh.rt_opacity_first =
-                    append_rt_opacity_micromaps(submesh.cpu_opacity_micromap);
+                    append_rt_masked_triangles(submesh.cpu_rt_triangles);
                 submesh.rt_opacity_count =
-                    static_cast<std::uint32_t>(submesh.cpu_opacity_micromap.size());
-                std::vector<glm::uvec2>{}.swap(submesh.cpu_opacity_micromap);
+                    static_cast<std::uint32_t>(submesh.cpu_rt_triangles.size());
             }
         }
         build_model_blas_on_upload(asset);
@@ -546,6 +566,9 @@ void Renderer::destroy_ray_tracing() noexcept {
         frame.tlas_was_updated = false;
     }
 #if VCR_EDITOR_ENABLED
+    for (auto& entry : rt_alpha_maps_) {
+        entry.gpu_word_offset = 0U;
+    }
     for (auto& asset : editor_model_assets_) {
         for (auto& submesh : asset.submeshes) {
             submesh.blas.destroy();
@@ -561,6 +584,7 @@ void Renderer::destroy_ray_tracing() noexcept {
     rt_upload_scratch_.destroy();
     rt_opacity_micromaps_.destroy();
     rt_opacity_triangle_count_ = 0U;
+    rt_alpha_texel_words_used_ = 0U;
     rt_tlas_instances_.clear();
     rt_provisioned_ = false;
     rt_provision_pending_ = false;
@@ -902,16 +926,66 @@ void Renderer::refresh_ray_tracing_statistics() noexcept {
     lighting_statistics_.blas_count = blas_count;
     lighting_statistics_.acceleration_structure_bytes = as_bytes;
     lighting_statistics_.opacity_micromap_bytes =
-        static_cast<std::uint64_t>(rt_opacity_triangle_count_) * sizeof(glm::uvec2);
+        static_cast<std::uint64_t>(rt_opacity_triangle_count_) * sizeof(RtMaskedTriangle) +
+        static_cast<std::uint64_t>(rt_alpha_texel_words_used_) * sizeof(std::uint32_t);
 }
 
 #if VCR_EDITOR_ENABLED
-std::uint32_t Renderer::append_rt_opacity_micromaps(const std::span<const glm::uvec2> masks) {
-    if (!rt_provisioned_ || masks.empty()) {
+std::uint32_t Renderer::find_or_upload_rt_alpha_map(
+    const std::string_view path,
+    const std::vector<std::uint32_t>* const words_if_new) {
+    if (path.empty()) {
         return 0U;
     }
-    if (masks.size() > rt_opacity_max_triangles - rt_opacity_triangle_count_) {
-        fatal("RT opacity micromap cache exceeds 524,288 masked triangles; use --rt off");
+    auto found = std::ranges::find_if(
+        rt_alpha_maps_, [&](const RtAlphaMapEntry& e) { return e.relative_path == path; });
+    if (found == rt_alpha_maps_.end()) {
+        if (words_if_new == nullptr || words_if_new->empty()) {
+            return 0U;
+        }
+        rt_alpha_maps_.push_back(RtAlphaMapEntry{
+            .relative_path = std::string(path),
+            .gpu_word_offset = 0U,
+            .cpu_words = *words_if_new,
+        });
+        found = rt_alpha_maps_.end() - 1;
+    }
+    if (!rt_provisioned_ || found->cpu_words.empty()) {
+        return 0U;
+    }
+    if (found->gpu_word_offset != 0U) {
+        return found->gpu_word_offset;
+    }
+    if (found->cpu_words.size() > rt_alpha_max_texel_words - rt_alpha_texel_words_used_) {
+        std::fprintf(stderr, "warning: RT R8 alpha map cache reached 32-texture limit\n");
+        return 0U;
+    }
+    const std::uint32_t word_offset = rt_alpha_texel_base_word + rt_alpha_texel_words_used_;
+    if (asset_upload_.recording()) {
+        rt_memory_barrier(
+            asset_upload_.command_buffer(),
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    }
+    upload_to_device_buffer(
+        rt_opacity_micromaps_,
+        std::as_bytes(std::span{found->cpu_words}),
+        static_cast<VkDeviceSize>(word_offset) * sizeof(std::uint32_t));
+    found->gpu_word_offset = word_offset;
+    rt_alpha_texel_words_used_ += static_cast<std::uint32_t>(found->cpu_words.size());
+    refresh_ray_tracing_statistics();
+    return word_offset;
+}
+
+std::uint32_t Renderer::append_rt_masked_triangles(
+    const std::span<const RtMaskedTriangle> triangles) {
+    if (!rt_provisioned_ || triangles.empty()) {
+        return 0U;
+    }
+    if (triangles.size() > rt_opacity_max_triangles - rt_opacity_triangle_count_) {
+        fatal("RT masked triangle cache exceeds 524,288 triangles; use --rt off");
     }
     const std::uint32_t first = rt_opacity_triangle_count_;
     if (asset_upload_.recording()) {
@@ -924,11 +998,10 @@ std::uint32_t Renderer::append_rt_opacity_micromaps(const std::span<const glm::u
     }
     upload_to_device_buffer(
         rt_opacity_micromaps_,
-        std::as_bytes(masks),
-        static_cast<VkDeviceSize>(first) * sizeof(glm::uvec2));
-    rt_opacity_triangle_count_ += static_cast<std::uint32_t>(masks.size());
-    lighting_statistics_.opacity_micromap_bytes =
-        static_cast<std::uint64_t>(rt_opacity_triangle_count_) * sizeof(glm::uvec2);
+        std::as_bytes(triangles),
+        static_cast<VkDeviceSize>(first) * sizeof(RtMaskedTriangle));
+    rt_opacity_triangle_count_ += static_cast<std::uint32_t>(triangles.size());
+    refresh_ray_tracing_statistics();
     return first;
 }
 

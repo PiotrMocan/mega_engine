@@ -109,7 +109,20 @@ void Renderer::create_lighting_resources() {
         VK_CHECK(support);
     if (support != VK_SUCCESS || (properties.optimalTilingFeatures & features) != features)
         fatal("Lighting requires filterable RGBA16F 3D storage images");
-    gi_provisioned_ = lighting_settings_.voxel_gi;
+    const bool gi_supported =
+        limits.maxStorageBufferRange >= sizeof(GiTriangle) * gi_max_triangles &&
+        limits.maxComputeWorkGroupInvocations >= 64U &&
+        limits.maxComputeWorkGroupSize[0] >= 64U &&
+        limits.maxComputeWorkGroupCount[0] >= 4096U &&
+        image_properties.maxExtent.width >= gi_resolution;
+    if (lighting_settings_.voxel_gi && !gi_supported) {
+        fatal("Voxel GI exceeds compute/storage limits; start with --gi off");
+    }
+    gi_provisioned_ = lighting_settings_.voxel_gi
+#if VCR_EDITOR_ENABLED
+        || (editor_output_enabled_ && gi_supported)
+#endif
+        ;
     rt_provisioned_ = false;
     rt_provision_pending_ = false;
     if (lighting_settings_.ray_tracing != RayTracingMode::off) {
@@ -122,12 +135,6 @@ void Renderer::create_lighting_resources() {
                          "falling back to rasterized shadows and voxel GI\n";
         }
     }
-    if (gi_provisioned_ &&
-        (limits.maxStorageBufferRange < sizeof(GiTriangle) * gi_max_triangles ||
-         limits.maxComputeWorkGroupInvocations < 64 || limits.maxComputeWorkGroupSize[0] < 64 ||
-         limits.maxComputeWorkGroupCount[0] < 4096 ||
-         image_properties.maxExtent.width < gi_resolution))
-        fatal("Voxel GI exceeds compute/storage limits; start with --gi off");
     constexpr auto host =
         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
     voxel_geometry_.create(

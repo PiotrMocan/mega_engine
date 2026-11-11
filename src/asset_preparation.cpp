@@ -113,7 +113,8 @@ PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,
             texture(material.metallic_roughness_texture);
             texture(material.displacement_texture);
         }
-        result.submesh_opacity_micromaps.resize(model.submeshes.size());
+        result.submesh_rt_alpha_paths.resize(model.submeshes.size());
+        result.submesh_rt_triangles.resize(model.submeshes.size());
         for (std::size_t submesh_index = 0U; submesh_index < model.submeshes.size();
              ++submesh_index) {
             const auto &submesh = model.submeshes[submesh_index];
@@ -124,34 +125,61 @@ PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,
             if ((material.coverage & 1U) == 0U) {
                 continue;
             }
-            const CookedTextureAsset *base_texture = nullptr;
+            std::string alpha_path{};
+            bool has_alpha_texture = false;
             if (material.base_color_texture) {
                 const auto key =
                     material.base_color_texture->lexically_normal().generic_string();
-                const auto found = std::ranges::find_if(
-                    result.textures, [&](const auto &t) { return t.path == key; });
-                if (found != result.textures.end() && found->texture &&
-                    found->texture->semantic == CookedTextureSemantic::base_color &&
-                    found->texture->color_space == CookedTextureColorSpace::srgb) {
-                    base_texture = &(*found->texture);
+                const auto existing_alpha = std::ranges::find_if(
+                    result.alpha_maps, [&](const auto &m) { return m.path == key; });
+                if (existing_alpha != result.alpha_maps.end()) {
+                    alpha_path = key;
+                    has_alpha_texture = true;
+                } else {
+                    const auto found = std::ranges::find_if(
+                        result.textures, [&](const auto &t) { return t.path == key; });
+                    if (found != result.textures.end() && found->texture &&
+                        found->texture->semantic == CookedTextureSemantic::base_color &&
+                        found->texture->color_space == CookedTextureColorSpace::srgb) {
+                        auto words = pack_alpha_r8_1024_words(*found->texture);
+                        if (!words.empty()) {
+                            const std::size_t alpha_bytes =
+                                words.size() * sizeof(std::uint32_t) + 256U;
+                            if (alpha_bytes > maximum_prepared_asset_bytes - result.upload_bytes) {
+                                result.error =
+                                    "Prepared RT alpha maps exceed the 512 MiB upload budget";
+                                return result;
+                            }
+                            result.upload_bytes += alpha_bytes;
+                            result.alpha_maps.push_back(PreparedAlphaMap{
+                                .path = key,
+                                .words = std::move(words),
+                            });
+                            alpha_path = key;
+                            has_alpha_texture = true;
+                        }
+                    }
                 }
             }
-            auto masks = bake_opacity_micromap(
+            auto triangles = bake_rt_masked_triangles(
                 model.vertices,
                 model.indices,
                 static_cast<std::size_t>(submesh.first_index),
                 static_cast<std::size_t>(submesh.index_count),
-                base_texture,
+                has_alpha_texture,
                 material.factors.base_color.a,
                 material.coverage);
-            if (!masks.empty()) {
-                const std::size_t mask_bytes = masks.size() * sizeof(glm::uvec2) + 256U;
-                if (mask_bytes > maximum_prepared_asset_bytes - result.upload_bytes) {
-                    result.error = "Prepared opacity micromaps exceed the 512 MiB upload budget";
+            if (!triangles.empty()) {
+                const std::size_t tri_bytes =
+                    triangles.size() * sizeof(RtMaskedTriangle) + 256U;
+                if (tri_bytes > maximum_prepared_asset_bytes - result.upload_bytes) {
+                    result.error =
+                        "Prepared RT masked triangles exceed the 512 MiB upload budget";
                     return result;
                 }
-                result.upload_bytes += mask_bytes;
-                result.submesh_opacity_micromaps[submesh_index] = std::move(masks);
+                result.upload_bytes += tri_bytes;
+                result.submesh_rt_alpha_paths[submesh_index] = std::move(alpha_path);
+                result.submesh_rt_triangles[submesh_index] = std::move(triangles);
             }
         }
         result.model = std::move(model);

@@ -42,7 +42,7 @@ void main() {
         if(lighting.volumeParameters.w>0.5) {
             vec3 worldPos=lighting.volumeOriginCell.xyz
                 +(vec3(p)+0.5+normal*0.35)*lighting.volumeOriginCell.w;
-            visibility=rayTracedSunVisibilityOpaque(worldPos,normal,sun);
+            visibility=rayTracedSunVisibilityWorld(worldPos,normal,sun,200.0);
         } else
 #endif
         {

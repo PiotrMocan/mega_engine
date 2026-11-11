@@ -100,9 +100,9 @@ float cascadedVisibility(sampler2DShadow atlas,vec3 position,vec3 normal,vec3 li
     return value;
 }
 #ifdef VCR_RAY_QUERY
-layout(set=LIGHTING_SET,binding=9,std430) readonly buffer RtOpacityMicromapBuffer {
-    uvec2 masks[];
-} rtOpacityMicromaps;
+layout(set=LIGHTING_SET,binding=9,std430) readonly buffer RtOpacityDataBuffer {
+    uint words[];
+} rtOpacityData;
 layout(set=LIGHTING_SET,binding=10) uniform accelerationStructureEXT sceneTlas;
 
 float rayScaleForPosition(vec3 worldPosition) {
@@ -118,43 +118,55 @@ float rayMinT(vec3 worldPosition) {
     return 1.0e-3 * rayScaleForPosition(worldPosition);
 }
 
+float rtFetchAlphaTexel1024(uint baseWord, uint x, uint y) {
+    uint pixelIndex = (y << 10u) + x;
+    uint word = rtOpacityData.words[baseWord + (pixelIndex >> 2u)];
+    uint byteVal = (word >> ((pixelIndex & 3u) << 3u)) & 0xFFu;
+    return float(byteVal) * (1.0 / 255.0);
+}
+
+float rtSampleAlpha1024(uint baseWord, vec2 uv) {
+    vec2 wrapped = fract(uv);
+    vec2 coord = wrapped * 1024.0 - 0.5;
+    ivec2 p0 = ivec2(floor(coord));
+    vec2 f = coord - vec2(p0);
+    uint x0 = uint(p0.x) & 1023u;
+    uint x1 = uint(p0.x + 1) & 1023u;
+    uint y0 = uint(p0.y) & 1023u;
+    uint y1 = uint(p0.y + 1) & 1023u;
+    float a00 = rtFetchAlphaTexel1024(baseWord, x0, y0);
+    float a10 = rtFetchAlphaTexel1024(baseWord, x1, y0);
+    float a01 = rtFetchAlphaTexel1024(baseWord, x0, y1);
+    float a11 = rtFetchAlphaTexel1024(baseWord, x1, y1);
+    return mix(mix(a00, a10, f.x), mix(a01, a11, f.x), f.y);
+}
+
 bool rtAlphaMaskKeep(vec2 bc, int customIndex, int primitiveIndex) {
-    float s = bc.x + bc.y;
-    float t = s > 1.0e-5 ? bc.y / s : 0.0;
-    uvec2 cell = min(uvec2(vec2(s, t) * 8.0), uvec2(7u));
-    uint bit = cell.y * 8u + cell.x;
-    uint idx = uint(customIndex) + uint(primitiveIndex);
-    uvec2 mask = rtOpacityMicromaps.masks[idx];
-    uint word = bit < 32u ? mask.x : mask.y;
-    return ((word >> (bit & 31u)) & 1u) != 0u;
-}
-
-float rayTracedSunVisibilityOpaque(vec3 worldPosition, vec3 geometricNormal, vec3 lightDirection) {
-    float scale = rayScaleForPosition(worldPosition);
-    vec3 origin = worldPosition
-        + geometricNormal * (1.5e-3 * scale)
-        + lightDirection * (5.0e-4 * scale);
-    rayQueryEXT rq;
-    rayQueryInitializeEXT(
-        rq,
-        sceneTlas,
-        gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
-        0xFFu,
-        origin,
-        1.0e-3 * scale,
-        lightDirection,
-        200.0);
-    while (rayQueryProceedEXT(rq)) {}
-    return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT
-        ? 0.0
-        : 1.0;
-}
-
-float rayTracedSunVisibility(vec3 worldPosition, vec3 geometricNormal, vec3 lightDirection) {
-    float viewDepth = -(lighting.cameraView * vec4(worldPosition, 1.0)).z;
-    if (viewDepth >= 28.0) {
-        return rayTracedSunVisibilityOpaque(worldPosition, geometricNormal, lightDirection);
+    uint base = (uint(customIndex) + uint(primitiveIndex)) * 8u;
+    uint texelWordOffset = rtOpacityData.words[base + 6u];
+    float effectiveCutoff = uintBitsToFloat(rtOpacityData.words[base + 7u]);
+    if (effectiveCutoff > 1.0) {
+        return false;
     }
+    if (texelWordOffset == 0u) {
+        return true;
+    }
+    vec2 uv0 = vec2(uintBitsToFloat(rtOpacityData.words[base + 0u]),
+                    uintBitsToFloat(rtOpacityData.words[base + 1u]));
+    vec2 uv1 = vec2(uintBitsToFloat(rtOpacityData.words[base + 2u]),
+                    uintBitsToFloat(rtOpacityData.words[base + 3u]));
+    vec2 uv2 = vec2(uintBitsToFloat(rtOpacityData.words[base + 4u]),
+                    uintBitsToFloat(rtOpacityData.words[base + 5u]));
+    float b0 = 1.0 - bc.x - bc.y;
+    vec2 uv = b0 * uv0 + bc.x * uv1 + bc.y * uv2;
+    return rtSampleAlpha1024(texelWordOffset, uv) >= effectiveCutoff;
+}
+
+float rayTracedSunVisibilityWorld(
+    vec3 worldPosition,
+    vec3 geometricNormal,
+    vec3 lightDirection,
+    float maxDistance) {
     float scale = rayScaleForPosition(worldPosition);
     vec3 origin = worldPosition
         + geometricNormal * (1.5e-3 * scale)
@@ -168,20 +180,23 @@ float rayTracedSunVisibility(vec3 worldPosition, vec3 geometricNormal, vec3 ligh
         origin,
         1.0e-3 * scale,
         lightDirection,
-        200.0);
-    uint candidates = 0u;
+        maxDistance);
     while (rayQueryProceedEXT(rq)) {
         if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT
-            && (++candidates >= 8u || rtAlphaMaskKeep(
+            && rtAlphaMaskKeep(
                 rayQueryGetIntersectionBarycentricsEXT(rq, false),
                 rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false),
-                rayQueryGetIntersectionPrimitiveIndexEXT(rq, false)))) {
+                rayQueryGetIntersectionPrimitiveIndexEXT(rq, false))) {
             rayQueryConfirmIntersectionEXT(rq);
         }
     }
     return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT
         ? 0.0
         : 1.0;
+}
+
+float rayTracedSunVisibility(vec3 worldPosition, vec3 geometricNormal, vec3 lightDirection) {
+    return rayTracedSunVisibilityWorld(worldPosition, geometricNormal, lightDirection, 250.0);
 }
 #endif
 #endif

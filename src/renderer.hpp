@@ -487,7 +487,8 @@ private:
         AccelerationStructure blas{};
         std::uint32_t rt_opacity_first = 0U;
         std::uint32_t rt_opacity_count = 0U;
-        std::vector<glm::uvec2> cpu_opacity_micromap{};
+        std::string rt_alpha_texture_path{};
+        std::vector<RtMaskedTriangle> cpu_rt_triangles{};
         std::array<std::uint32_t, model_lod_count> lod_first{};
         std::array<std::uint32_t, model_lod_count> lod_count{};
         std::array<float, model_lod_count> lod_error{};
@@ -544,9 +545,18 @@ private:
     void ensure_frame_tlas_capacity(FrameContext &frame, std::uint32_t required_instances);
     void refresh_ray_tracing_statistics() noexcept;
 #if VCR_EDITOR_ENABLED
+    struct RtAlphaMapEntry {
+        std::string relative_path{};
+        std::uint32_t gpu_word_offset = 0U;
+        std::vector<std::uint32_t> cpu_words{};
+    };
     void build_model_blas_on_upload(EditorModelAsset &asset);
     void compact_model_blas(EditorModelAsset &asset);
-    [[nodiscard]] std::uint32_t append_rt_opacity_micromaps(std::span<const glm::uvec2> masks);
+    [[nodiscard]] std::uint32_t find_or_upload_rt_alpha_map(
+        std::string_view path,
+        const std::vector<std::uint32_t> *words_if_new);
+    [[nodiscard]] std::uint32_t append_rt_masked_triangles(
+        std::span<const RtMaskedTriangle> triangles);
 #endif
     void prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkExtent2D extent);
     void record_voxel_geometry(VkCommandBuffer command, FrameContext &frame);
@@ -746,6 +756,10 @@ private:
     AccelerationStructure blas_cube_{}, blas_plane_{}, blas_sphere_{}, blas_terrain_{};
     GpuBuffer rt_opacity_micromaps_{}, rt_upload_scratch_{};
     std::uint32_t rt_opacity_triangle_count_ = 0U;
+    std::uint32_t rt_alpha_texel_words_used_ = 0U;
+#if VCR_EDITOR_ENABLED
+    std::vector<RtAlphaMapEntry> rt_alpha_maps_{};
+#endif
     std::vector<VkAccelerationStructureInstanceKHR> rt_tlas_instances_{};
     std::vector<TransformRows> demo_rt_transforms_{};
     bool lighting_shadow_initialized_ = false;

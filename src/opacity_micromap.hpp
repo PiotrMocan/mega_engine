@@ -128,4 +128,120 @@ namespace vcr {
     return masks;
 }
 
+inline constexpr std::uint32_t rt_alpha_map_resolution = 1024U;
+inline constexpr std::uint32_t rt_alpha_map_word_count =
+    (rt_alpha_map_resolution * rt_alpha_map_resolution) / 4U;
+
+struct RtMaskedTriangle {
+    float uv0[2]{0.0F, 0.0F};
+    float uv1[2]{0.0F, 0.0F};
+    float uv2[2]{0.0F, 0.0F};
+    std::uint32_t texel_word_offset = 0U;
+    float effective_cutoff = 0.0F;
+};
+static_assert(sizeof(RtMaskedTriangle) == 32U);
+
+// Packs a base-color texture's alpha channel into a 1024x1024 R8_UNORM table
+// (4 texels per little-endian uint32 word = 1 MiB) in the exact top-to-bottom
+// row order uploaded to VkImage so inline rayQueryEXT evaluates texel-accurate
+// bilinear alpha cutouts for needles, leaves, and fences at all distances.
+[[nodiscard]] inline std::vector<std::uint32_t> pack_alpha_r8_1024_words(
+    const CookedTextureAsset& texture) {
+    if (texture.width == 0U || texture.height == 0U || texture.pixels.empty()) {
+        return {};
+    }
+    const std::size_t stride = texture.row_stride_bytes >= texture.width * 4U
+        ? static_cast<std::size_t>(texture.row_stride_bytes)
+        : static_cast<std::size_t>(texture.width) * 4ULL;
+    if (texture.pixels.size() < stride * static_cast<std::size_t>(texture.height - 1U) +
+            static_cast<std::size_t>(texture.width) * 4ULL) {
+        return {};
+    }
+
+    std::vector<std::uint32_t> words(rt_alpha_map_word_count, 0U);
+    if (texture.width == rt_alpha_map_resolution && texture.height == rt_alpha_map_resolution) {
+        for (std::uint32_t y = 0U; y < rt_alpha_map_resolution; ++y) {
+            const std::size_t row = static_cast<std::size_t>(y) * stride;
+            const std::uint32_t word_row = y * (rt_alpha_map_resolution / 4U);
+            for (std::uint32_t wx = 0U; wx < rt_alpha_map_resolution / 4U; ++wx) {
+                const std::size_t px = row + static_cast<std::size_t>(wx) * 16ULL;
+                const std::uint32_t b0 = texture.pixels[px + 3ULL];
+                const std::uint32_t b1 = texture.pixels[px + 7ULL];
+                const std::uint32_t b2 = texture.pixels[px + 11ULL];
+                const std::uint32_t b3 = texture.pixels[px + 15ULL];
+                words[word_row + wx] = b0 | (b1 << 8U) | (b2 << 16U) | (b3 << 24U);
+            }
+        }
+        return words;
+    }
+
+    constexpr float inv_res = 1.0F / static_cast<float>(rt_alpha_map_resolution);
+    for (std::uint32_t y = 0U; y < rt_alpha_map_resolution; ++y) {
+        const float v = (static_cast<float>(y) + 0.5F) * inv_res;
+        const std::uint32_t word_row = y * (rt_alpha_map_resolution / 4U);
+        for (std::uint32_t wx = 0U; wx < rt_alpha_map_resolution / 4U; ++wx) {
+            std::uint32_t packed = 0U;
+            for (std::uint32_t lane = 0U; lane < 4U; ++lane) {
+                const float u = (static_cast<float>(wx * 4U + lane) + 0.5F) * inv_res;
+                const float a = sample_rgba8_alpha_repeat_bilinear(texture, u, v);
+                const float clamped = a < 0.0F ? 0.0F : (a > 1.0F ? 1.0F : a);
+                const auto byte_val = static_cast<std::uint32_t>(clamped * 255.0F + 0.5F);
+                packed |= (byte_val & 0xFFU) << (lane * 8U);
+            }
+            words[word_row + wx] = packed;
+        }
+    }
+    return words;
+}
+
+[[nodiscard]] inline std::vector<RtMaskedTriangle> bake_rt_masked_triangles(
+    const std::span<const CookedModelVertex> vertices,
+    const std::span<const std::uint32_t> indices,
+    const std::size_t first_index,
+    const std::size_t index_count,
+    const bool has_alpha_texture,
+    const float alpha_factor,
+    const std::uint32_t coverage) {
+    if ((coverage & 1U) == 0U || index_count < 3U || first_index > indices.size() ||
+        index_count > indices.size() - first_index) {
+        return {};
+    }
+    const std::size_t triangle_count = index_count / 3U;
+    const float cutoff = static_cast<float>(coverage >> 16U) / 65535.0F;
+    if (!(alpha_factor >= cutoff) || alpha_factor <= 1.0e-5F) {
+        return std::vector<RtMaskedTriangle>(
+            triangle_count,
+            RtMaskedTriangle{.texel_word_offset = 0U, .effective_cutoff = 2.0F});
+    }
+    if (!has_alpha_texture) {
+        return std::vector<RtMaskedTriangle>(
+            triangle_count,
+            RtMaskedTriangle{.texel_word_offset = 0U, .effective_cutoff = 0.0F});
+    }
+
+    const float effective_cutoff = cutoff / alpha_factor;
+    std::vector<RtMaskedTriangle> triangles(triangle_count);
+    for (std::size_t tri = 0U; tri < triangle_count; ++tri) {
+        const std::uint32_t i0 = indices[first_index + tri * 3U + 0U];
+        const std::uint32_t i1 = indices[first_index + tri * 3U + 1U];
+        const std::uint32_t i2 = indices[first_index + tri * 3U + 2U];
+        if (i0 >= vertices.size() || i1 >= vertices.size() || i2 >= vertices.size()) {
+            triangles[tri] = RtMaskedTriangle{.texel_word_offset = 0U, .effective_cutoff = 2.0F};
+            continue;
+        }
+        const auto& uv0 = vertices[i0].texcoord;
+        const auto& uv1 = vertices[i1].texcoord;
+        const auto& uv2 = vertices[i2].texcoord;
+        // Store V-flipped coordinates matching editor_model.vert (1.0 - inUv.y).
+        triangles[tri] = RtMaskedTriangle{
+            .uv0 = {uv0[0], 1.0F - uv0[1]},
+            .uv1 = {uv1[0], 1.0F - uv1[1]},
+            .uv2 = {uv2[0], 1.0F - uv2[1]},
+            .texel_word_offset = 0U,
+            .effective_cutoff = effective_cutoff,
+        };
+    }
+    return triangles;
+}
+
 } // namespace vcr

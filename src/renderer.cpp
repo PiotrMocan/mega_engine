@@ -797,6 +797,9 @@ void Renderer::shutdown() noexcept {
     asset_upload_.stop();
     destroy_gpu_visibility();
     destroy_ray_tracing();
+#if VCR_EDITOR_ENABLED
+    rt_alpha_maps_.clear();
+#endif
     destroy_lighting();
     demo_rt_transforms_.clear();
     asset_requests_.clear();
@@ -1619,6 +1622,10 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
         material_descriptors[material_index] = *descriptor;
     }
 
+    for (const auto& alpha_map : prepared.alpha_maps) {
+        static_cast<void>(find_or_upload_rt_alpha_map(alpha_map.path, &alpha_map.words));
+    }
+
     for (std::size_t submesh_index = 0; submesh_index < model.submeshes.size(); ++submesh_index) {
         const CookedModelSubmesh& source = model.submeshes[submesh_index];
         PbrMaterial material{};
@@ -1683,15 +1690,27 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
         }
         std::uint32_t rt_opacity_first = 0U;
         std::uint32_t rt_opacity_count = 0U;
-        std::vector<glm::uvec2> cpu_opacity_micromap{};
-        if (submesh_index < prepared.submesh_opacity_micromaps.size() &&
-            !prepared.submesh_opacity_micromaps[submesh_index].empty()) {
-            const auto& masks = prepared.submesh_opacity_micromaps[submesh_index];
+        std::string rt_alpha_texture_path{};
+        std::vector<RtMaskedTriangle> cpu_rt_triangles{};
+        if (submesh_index < prepared.submesh_rt_triangles.size() &&
+            !prepared.submesh_rt_triangles[submesh_index].empty()) {
+            cpu_rt_triangles = prepared.submesh_rt_triangles[submesh_index];
+            if (submesh_index < prepared.submesh_rt_alpha_paths.size()) {
+                rt_alpha_texture_path = prepared.submesh_rt_alpha_paths[submesh_index];
+            }
             if (rt_provisioned_) {
-                rt_opacity_first = append_rt_opacity_micromaps(masks);
-                rt_opacity_count = static_cast<std::uint32_t>(masks.size());
-            } else {
-                cpu_opacity_micromap = masks;
+                const std::uint32_t alpha_word_offset = rt_alpha_texture_path.empty()
+                    ? 0U
+                    : find_or_upload_rt_alpha_map(rt_alpha_texture_path, nullptr);
+                if (!rt_alpha_texture_path.empty()) {
+                    for (auto& tri : cpu_rt_triangles) {
+                        if (tri.effective_cutoff <= 1.0F) {
+                            tri.texel_word_offset = alpha_word_offset;
+                        }
+                    }
+                }
+                rt_opacity_first = append_rt_masked_triangles(cpu_rt_triangles);
+                rt_opacity_count = static_cast<std::uint32_t>(cpu_rt_triangles.size());
             }
         }
         gpu_asset.submeshes.push_back(EditorModelSubmesh{
@@ -1708,7 +1727,8 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
             .gi_albedo = gi_albedo,
             .rt_opacity_first = rt_opacity_first,
             .rt_opacity_count = rt_opacity_count,
-            .cpu_opacity_micromap = std::move(cpu_opacity_micromap),
+            .rt_alpha_texture_path = std::move(rt_alpha_texture_path),
+            .cpu_rt_triangles = std::move(cpu_rt_triangles),
             .lod_first = source.lod_first,
             .lod_count = source.lod_count,
             .lod_error = source.lod_error,

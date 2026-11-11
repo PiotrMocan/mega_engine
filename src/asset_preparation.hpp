@@ -1,6 +1,7 @@
 #pragma once
 #include "cooked_model_asset.hpp"
 #include "cooked_texture_asset.hpp"
+#include "opacity_micromap.hpp"
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -17,12 +18,18 @@ struct PreparedTexture {
     std::optional<CookedTextureAsset> texture;
     glm::vec3 average_linear{1};
 };
+struct PreparedAlphaMap {
+    std::string path;
+    std::vector<std::uint32_t> words;
+};
 struct PreparedModel {
     std::filesystem::path root;
     std::string path, error;
     std::optional<CookedModelAsset> model;
     std::vector<PreparedTexture> textures;
-    std::vector<std::vector<glm::uvec2>> submesh_opacity_micromaps;
+    std::vector<PreparedAlphaMap> alpha_maps;
+    std::vector<std::string> submesh_rt_alpha_paths;
+    std::vector<std::vector<RtMaskedTriangle>> submesh_rt_triangles;
     std::size_t upload_bytes = 0;
 };
 // Resident paths are an owned snapshot at the queue boundary. GPU texture cache

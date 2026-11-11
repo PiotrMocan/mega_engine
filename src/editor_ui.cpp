@@ -5594,7 +5594,14 @@ void EditorUi::build_performance(
         lighting_changed = true;
     }
     ImGui::BeginDisabled(!renderer.gi_provisioned() || !lighting.dynamic);
-    lighting_changed |= ImGui::Checkbox("Voxel indirect lighting", &lighting.voxel_gi);
+    if (ImGui::Checkbox("Voxel indirect lighting", &lighting.voxel_gi)) {
+        lighting_changed = true;
+        if (!lighting.voxel_gi && ray_tracing_uses_gi(lighting.ray_tracing)) {
+            lighting.ray_tracing = lighting.ray_tracing == RayTracingMode::full
+                ? RayTracingMode::shadows
+                : RayTracingMode::off;
+        }
+    }
     lighting_changed |=
         ImGui::SliderFloat("Indirect intensity", &lighting.gi_strength, 0, 2, "%.2f");
     ImGui::EndDisabled();
@@ -5606,6 +5613,9 @@ void EditorUi::build_performance(
             ImGui::BeginDisabled(needs_gi);
             if (ImGui::Selectable(to_token(mode).data(), lighting.ray_tracing == mode)) {
                 lighting.ray_tracing = mode;
+                if (ray_tracing_uses_gi(mode) && renderer.gi_provisioned()) {
+                    lighting.voxel_gi = true;
+                }
                 lighting_changed = true;
             }
             ImGui::EndDisabled();

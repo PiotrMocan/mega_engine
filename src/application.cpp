@@ -1361,6 +1361,9 @@ void Application::execute_mcp_command(const McpCommand& command) {
     case McpCommandType::render_set_ray_tracing: {
         auto settings = renderer_.lighting_settings();
         settings.ray_tracing = command.ray_tracing;
+        if (ray_tracing_uses_gi(command.ray_tracing) && renderer_.gi_provisioned()) {
+            settings.voxel_gi = true;
+        }
         if (!renderer_.set_lighting_settings(settings)) {
             fail("Ray tracing requires dynamic lighting (and provisioned Voxel GI for gi/full)");
             return;

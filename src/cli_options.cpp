@@ -1031,7 +1031,12 @@ LightingSettings resolve_scene_lighting(
     if (options.lighting_overrides.shadow_resolution) result.shadow_resolution = options.lighting.shadow_resolution;
     if (options.lighting_overrides.shadow_depth) result.shadow_depth = options.lighting.shadow_depth;
     if (options.lighting_overrides.cascade_cache) result.cascade_cache = options.lighting.cascade_cache;
-    if (options.lighting_overrides.ray_tracing) result.ray_tracing = options.lighting.ray_tracing;
+    if (options.lighting_overrides.ray_tracing) {
+        result.ray_tracing = options.lighting.ray_tracing;
+        if (ray_tracing_uses_gi(result.ray_tracing) && !options.lighting_overrides.voxel_gi) {
+            result.voxel_gi = true;
+        }
+    }
     // Selecting legacy lighting disables features that require the dynamic path.
     if (!result.dynamic) {
         result.voxel_gi = false;

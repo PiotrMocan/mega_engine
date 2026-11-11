@@ -46,8 +46,16 @@ vec3 voxelDiffuseSurface(vec3 position,vec3 normal,vec3 geometricNormal) {
         float tMin = rayMinT(position);
         rayQueryEXT rq;
         rayQueryInitializeEXT(
-            rq, sceneTlas, gl_RayFlagsOpaqueEXT, 0xFFu, rayOrigin, tMin, normal, shortRange);
-        while (rayQueryProceedEXT(rq)) {}
+            rq, sceneTlas, 0u, 0xFFu, rayOrigin, tMin, normal, shortRange);
+        while (rayQueryProceedEXT(rq)) {
+            if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT
+                && rtAlphaMaskKeep(
+                    rayQueryGetIntersectionBarycentricsEXT(rq, false),
+                    rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false),
+                    rayQueryGetIntersectionPrimitiveIndexEXT(rq, false))) {
+                rayQueryConfirmIntersectionEXT(rq);
+            }
+        }
         if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
             float hitT = rayQueryGetIntersectionTEXT(rq, true);
             float nearWeight = 1.0 - smoothstep(cell * 0.5, shortRange, hitT);

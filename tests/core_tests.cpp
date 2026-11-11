@@ -2434,6 +2434,13 @@ int main() {
         const auto legacy_lighting = vcr::resolve_scene_lighting(legacy_options.options, source_scene.lighting);
         expect(!legacy_lighting.dynamic && !legacy_lighting.voxel_gi && !legacy_lighting.cycle,
                "CLI legacy lighting disables dependent GI and clock");
+        auto scene_without_gi = *source_scene.lighting;
+        scene_without_gi.voxel_gi = false;
+        const char *rt_full_args[]{"test", "--rt", "full"};
+        const auto rt_full_options = vcr::parse_cli_options(3, rt_full_args);
+        const auto rt_full_lighting = vcr::resolve_scene_lighting(rt_full_options.options, scene_without_gi);
+        expect(rt_full_lighting.ray_tracing == vcr::RayTracingMode::full && rt_full_lighting.voxel_gi,
+               "--rt full auto-enables voxel_gi on scenes authored with voxel_gi=false");
         nlohmann::json startup_json;
         { std::ifstream input(startup_file); input >> startup_json; }
         expect(startup_json["lighting"]["shadow_depth"] == "d16",
