@@ -425,7 +425,7 @@ void Application::initialize_gameplay(const SceneRenderView& initial_view) {
             : std::nullopt);
     std::string error;
     if (!gameplay_.start(
-            scene_, initial_view, startup_camera, camera_, error)) {
+            scene_, initial_view, startup_camera, camera_, error, &renderer_)) {
         fatal(error);
     }
 }
@@ -821,6 +821,7 @@ void Application::update_camera(const float delta_seconds) {
             .mouse_delta_y = input.mouse_delta_y,
         },
         delta_seconds,
+        scene_,
         renderer_,
         camera_)) {
         fatal("Gameplay runtime lost its player scene node.");
@@ -1575,6 +1576,9 @@ void Application::execute_mcp_command(const McpCommand& command) {
     case McpCommandType::editor_get_material:
     case McpCommandType::editor_set_material_tessellation:
     case McpCommandType::editor_create_flat_ground:
+    case McpCommandType::editor_find_by_uuid:
+    case McpCommandType::editor_set_collider:
+    case McpCommandType::editor_remove_collider:
     case McpCommandType::editor_scatter_model:
         fail("editor-only MCP command is unavailable in the runtime profile");
         return;

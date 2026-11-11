@@ -91,6 +91,7 @@ using Json = nlohmann::json;
     const SceneNode& value = node->get();
     Json result{
         {"id", node_id_json(id)},
+        {"uuid", scene.uuid(id) ? Json(format_scene_uuid(*scene.uuid(id))) : Json(nullptr)},
         {"parent", node_id_json(scene.parent(id))},
         {"name", value.name},
         {"kind", std::string(scene_kind_token(value.kind))},
@@ -124,6 +125,22 @@ using Json = nlohmann::json;
             {"outer_cone_degrees", value.light.outer_cone_degrees},
         }},
     };
+    if (const auto collider = scene.collider(id)) {
+        const ColliderComponent& c = collider->get();
+        result["collider"] = Json{
+            {"enabled", c.enabled},
+            {"is_trigger", c.is_trigger},
+            {"shape", to_token(c.shape)},
+            {"center_offset", vec3_json(c.center_offset)},
+            {"half_extents", vec3_json(c.half_extents)},
+            {"radius", c.radius},
+            {"half_height", c.half_height},
+            {"collision_layer", c.collision_layer},
+            {"collision_mask", c.collision_mask},
+        };
+    } else {
+        result["collider"] = nullptr;
+    }
     if (depth) {
         result["depth"] = *depth;
     }
@@ -496,7 +513,7 @@ void EditorApplication::synchronize_gameplay_state() {
                 : std::nullopt);
         std::string error;
         if (!gameplay_.start(
-                scene_, initial_view, startup_camera, camera_, error)) {
+                scene_, initial_view, startup_camera, camera_, error, &renderer_)) {
             ui_.report_asset_error(std::move(error));
             ui_.stop_play(scene_);
             camera_ = edit_camera_before_play_;
@@ -531,6 +548,7 @@ void EditorApplication::update_gameplay(
                 .mouse_delta_y = input.mouse_delta_y,
             },
             delta_seconds,
+            scene_,
             renderer_,
             camera_)) {
         fatal("Gameplay runtime lost its player scene node.");
@@ -615,6 +633,7 @@ void EditorApplication::execute_mcp_command(
                 {"protocol_version", "2025-11-25"},
                 {"mode", play_state},
                 {"node_count", scene_.size()},
+                {"collider_count", scene_.colliders().size()},
                 {"local_light_count", scene_.local_light_count()},
                 {"local_light_backend_requested",
                  to_token(renderer_.local_light_backend())},
@@ -793,6 +812,72 @@ void EditorApplication::execute_mcp_command(
             });
         return;
     }
+    case McpCommandType::editor_find_by_uuid: {
+        const SceneNodeId found = scene_.find_by_uuid(command.node_uuid);
+        if (!found) {
+            fail("no live scene node matches the requested UUID");
+            return;
+        }
+        succeed(
+            "scene node found by UUID",
+            Json{{"node", scene_node_json(scene_, found)}});
+        return;
+    }
+    case McpCommandType::editor_set_collider: {
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!valid_collider_component(command.collider)) {
+            fail("collider component values are outside engine bounds");
+            return;
+        }
+        if (const auto existing = scene_.collider(command.node_id);
+            existing && existing->get() == command.collider) {
+            succeed(
+                "collider component already matches",
+                Json{{"node", scene_node_json(scene_, command.node_id)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        if (!scene_.set_collider(command.node_id, command.collider)) {
+            fail("unable to attach collider component");
+            return;
+        }
+        succeed(
+            "collider component updated",
+            Json{{"node", scene_node_json(scene_, command.node_id)},
+                 {"changed", true}});
+        return;
+    }
+    case McpCommandType::editor_remove_collider:
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!scene_.has_collider(command.node_id)) {
+            succeed(
+                "node has no collider component",
+                Json{{"node", scene_node_json(scene_, command.node_id)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        static_cast<void>(scene_.remove_collider(command.node_id));
+        succeed(
+            "collider component removed",
+            Json{{"node", scene_node_json(scene_, command.node_id)},
+                 {"changed", true}});
+        return;
     case McpCommandType::editor_get_node:
         if (!scene_.valid(command.node_id)) {
             fail("scene node handle is stale or invalid");

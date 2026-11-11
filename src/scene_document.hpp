@@ -1,10 +1,12 @@
 #pragma once
 
 #include "fog.hpp"
-#include "pbr_material.hpp"
 #include "lighting_settings.hpp"
 #include "ocean_settings.hpp"
+#include "pbr_material.hpp"
 #include "punctual_light.hpp"
+#include "scene_components.hpp"
+#include "scene_uuid.hpp"
 #include "tone_mapping.hpp"
 
 #include <glm/mat4x4.hpp>
@@ -59,7 +61,7 @@ struct SceneTransform {
     glm::vec3 translation{0.0F};
     glm::vec3 rotation_degrees{0.0F};
     glm::vec3 scale{1.0F};
-    friend bool operator==(const SceneTransform &, const SceneTransform &) = default;
+    friend bool operator==(const SceneTransform&, const SceneTransform&) = default;
 };
 
 struct SceneNode {
@@ -89,9 +91,19 @@ struct SceneHierarchyRow {
 
 struct SceneNodeRecord {
     SceneNodeId id{};
+    SceneUuid uuid{};
     SceneNode value{};
+    std::optional<ColliderComponent> collider{};
     std::uint32_t parent_record_index =
         invalid_scene_node_index;
+};
+
+struct SceneWorldNode {
+    SceneNodeId id{};
+    SceneUuid uuid{};
+    glm::mat4 world_matrix{1.0F};
+    SceneNodeKind kind = SceneNodeKind::folder;
+    bool world_visible = false;
 };
 
 struct alignas(16) SceneGpuInstance {
@@ -160,6 +172,11 @@ public:
         std::string name,
         SceneNodeKind kind,
         SceneNodeId parent = {});
+    [[nodiscard]] SceneNodeId create_node_with_uuid(
+        std::string name,
+        SceneNodeKind kind,
+        SceneUuid uuid,
+        SceneNodeId parent = {});
     [[nodiscard]] bool destroy_subtree(SceneNodeId id);
     [[nodiscard]] bool reparent(
         SceneNodeId id,
@@ -169,12 +186,34 @@ public:
         std::string name);
 
     [[nodiscard]] bool valid(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<SceneUuid> uuid(
+        SceneNodeId id) const noexcept;
+    [[nodiscard]] SceneNodeId find_by_uuid(
+        SceneUuid uuid) const noexcept;
     [[nodiscard]] std::optional<std::reference_wrapper<SceneNode>>
         node(SceneNodeId id) noexcept;
     [[nodiscard]] std::optional<
         std::reference_wrapper<const SceneNode>>
         node(SceneNodeId id) const noexcept;
     [[nodiscard]] SceneNodeId parent(SceneNodeId id) const noexcept;
+
+    [[nodiscard]] bool set_collider(
+        SceneNodeId id,
+        const ColliderComponent& collider);
+    [[nodiscard]] bool remove_collider(SceneNodeId id) noexcept;
+    [[nodiscard]] bool has_collider(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<
+        std::reference_wrapper<const ColliderComponent>>
+        collider(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<
+        std::reference_wrapper<ColliderComponent>>
+        collider_mut(SceneNodeId id) noexcept;
+    [[nodiscard]] const SparseComponentPool<
+        SceneNodeId,
+        ColliderComponent,
+        max_scene_nodes>& colliders() const noexcept {
+        return colliders_;
+    }
 
     void mark_content_changed() noexcept;
     [[nodiscard]] std::uint32_t last_transform_updates() const noexcept {
@@ -188,6 +227,9 @@ public:
         SceneHierarchyScope scope = SceneHierarchyScope::expanded) const;
     void build_node_records(
         std::vector<SceneNodeRecord>& output) const;
+    void build_world_nodes(
+        std::vector<SceneWorldNode>& output,
+        std::vector<std::uint32_t>& ancestor_scratch) const;
     [[nodiscard]] SceneRenderView build_render_view(
         std::vector<SceneGpuInstance>& cube_output,
         std::vector<SceneModelInstance>& model_output,
@@ -208,6 +250,7 @@ public:
 
 private:
     struct Slot {
+        SceneUuid uuid{};
         SceneNode value{};
         glm::mat4 world_matrix{1.0F};
         SceneTransform cached_transform{};
@@ -223,6 +266,16 @@ private:
         bool alive = false;
         bool world_visible = true;
     };
+
+    static constexpr std::uint32_t uuid_bucket_empty =
+        invalid_scene_node_index;
+    static constexpr std::uint32_t uuid_bucket_tombstone =
+        invalid_scene_node_index - 1U;
+
+    void ensure_uuid_table_capacity();
+    void rehash_uuid_table(std::size_t new_capacity);
+    void insert_uuid_bucket(SceneUuid uuid, std::uint32_t index) noexcept;
+    void erase_uuid_bucket(SceneUuid uuid, std::uint32_t index) noexcept;
 
     [[nodiscard]] SceneNodeId id_for_index(
         std::uint32_t index) const noexcept;
@@ -245,6 +298,12 @@ private:
     std::vector<std::uint32_t> free_indices_{};
     std::vector<std::uint32_t> traversal_scratch_{};
     std::vector<SceneNodeId> render_cube_ids_{};
+    std::vector<std::uint32_t> uuid_buckets_{};
+    std::size_t uuid_tombstones_ = 0U;
+    SparseComponentPool<
+        SceneNodeId,
+        ColliderComponent,
+        max_scene_nodes> colliders_{};
     std::uint32_t first_root_ = invalid_scene_node_index;
     std::uint32_t last_root_ = invalid_scene_node_index;
     std::uint32_t live_count_ = 0U;

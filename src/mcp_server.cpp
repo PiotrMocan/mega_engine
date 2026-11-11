@@ -73,7 +73,7 @@ constexpr std::array<std::string_view, 30> runtime_tool_names{
     "engine.quit",
 };
 
-constexpr std::array<std::string_view, 26> editor_tool_names{
+constexpr std::array<std::string_view, 29> editor_tool_names{
     "render.set_exposure",
     "render.set_color_grading",
     "render.set_subsurface",
@@ -83,11 +83,14 @@ constexpr std::array<std::string_view, 26> editor_tool_names{
     "editor.selection.set",
     "editor.scene.list_nodes",
     "editor.scene.get_node",
+    "editor.scene.find_by_uuid",
     "editor.scene.create_node",
     "editor.scene.update_node",
     "editor.scene.delete_node",
     "editor.scene.reparent_node",
     "editor.scene.duplicate_node",
+    "editor.scene.set_collider",
+    "editor.scene.remove_collider",
     "editor.camera.focus_selection",
     "editor.scene.save",
     "editor.history.undo",
@@ -790,6 +793,37 @@ private:
         "Return all authored properties for one generational node handle.",
         object_schema(Json{{"id", handle_schema}}, Json::array({"id"})),
         true, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.find_by_uuid", "Find scene node by UUID",
+        "Resolve a persistent RFC 9562 UUID string to the live generational node handle and properties.",
+        object_schema(Json{
+            {"uuid", Json{{"type", "string"}, {"minLength", 36}, {"maxLength", 36}}},
+        }, Json::array({"uuid"})), true, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.set_collider", "Set scene node collider",
+        "Attach or replace a ColliderComponent (auto_bounds, box, sphere, or capsule; solid or trigger) on a scene node.",
+        object_schema(Json{
+            {"id", handle_schema},
+            {"enabled", Json{{"type", "boolean"}}},
+            {"is_trigger", Json{{"type", "boolean"}}},
+            {"shape", Json{{"type", "string"},
+                {"enum", Json::array({"auto_bounds", "box", "sphere", "capsule"})}}},
+            {"center_offset", vec3_schema},
+            {"half_extents", vec3_schema},
+            {"radius", Json{{"type", "number"},
+                {"minimum", minimum_collider_dimension},
+                {"maximum", maximum_collider_dimension}}},
+            {"half_height", Json{{"type", "number"},
+                {"minimum", 0.0},
+                {"maximum", maximum_collider_dimension}}},
+            {"collision_layer", Json{{"type", "integer"}, {"minimum", 0}, {"maximum", UINT32_MAX}}},
+            {"collision_mask", Json{{"type", "integer"}, {"minimum", 0}, {"maximum", UINT32_MAX}}},
+        }, Json::array({"id"})), false, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.remove_collider", "Remove scene node collider",
+        "Detach the authored ColliderComponent from a scene node.",
+        object_schema(Json{{"id", handle_schema}}, Json::array({"id"})),
+        false, false, true));
     tools.push_back(tool_definition(
         "editor.scene.create_node", "Create scene node",
         "Create a node with optional parent, transform, visibility, model asset path, and cube/ground material factors.",
@@ -1616,6 +1650,125 @@ private:
             }
             command.count = *limit;
         }
+        return true;
+    }
+    if (name == "editor.scene.find_by_uuid") {
+        if (arguments.size() != 1U || !arguments.contains("uuid")) {
+            error = "uuid must be the only argument";
+            return false;
+        }
+        const auto uuid_str = get_string(arguments, "uuid");
+        if (!uuid_str) {
+            error = "uuid must be a canonical UUID string";
+            return false;
+        }
+        const auto parsed = parse_scene_uuid(*uuid_str);
+        if (!parsed) {
+            error = "uuid is malformed or zero";
+            return false;
+        }
+        command.type = McpCommandType::editor_find_by_uuid;
+        command.node_uuid = *parsed;
+        return true;
+    }
+    if (name == "editor.scene.remove_collider") {
+        if (arguments.size() != 1U || !arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "id must be the only argument and contain index/generation";
+            return false;
+        }
+        command.type = McpCommandType::editor_remove_collider;
+        return true;
+    }
+    if (name == "editor.scene.set_collider") {
+        if (!only_keys(arguments, {
+                "id", "enabled", "is_trigger", "shape", "center_offset",
+                "half_extents", "radius", "half_height",
+                "collision_layer", "collision_mask"}) ||
+            !arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "set_collider requires a valid id and known collider fields";
+            return false;
+        }
+        ColliderComponent collider{};
+        if (arguments.contains("enabled")) {
+            const auto v = get_bool(arguments, "enabled");
+            if (!v) {
+                error = "enabled must be a boolean";
+                return false;
+            }
+            collider.enabled = *v;
+        }
+        if (arguments.contains("is_trigger")) {
+            const auto v = get_bool(arguments, "is_trigger");
+            if (!v) {
+                error = "is_trigger must be a boolean";
+                return false;
+            }
+            collider.is_trigger = *v;
+        }
+        if (arguments.contains("shape")) {
+            const auto s = get_string(arguments, "shape");
+            const auto parsed_shape = s ? parse_collider_shape(*s) : std::nullopt;
+            if (!parsed_shape) {
+                error = "shape must be auto_bounds, box, sphere, or capsule";
+                return false;
+            }
+            collider.shape = *parsed_shape;
+        }
+        if (arguments.contains("center_offset") &&
+            !parse_vec3(arguments, "center_offset", collider.center_offset)) {
+            error = "center_offset must contain three finite numbers";
+            return false;
+        }
+        if (arguments.contains("half_extents") &&
+            !parse_vec3(arguments, "half_extents", collider.half_extents)) {
+            error = "half_extents must contain three finite numbers";
+            return false;
+        }
+        if (arguments.contains("radius")) {
+            const auto r = get_finite_float(
+                arguments, "radius",
+                minimum_collider_dimension, maximum_collider_dimension);
+            if (!r) {
+                error = "radius is outside the valid collider range";
+                return false;
+            }
+            collider.radius = *r;
+        }
+        if (arguments.contains("half_height")) {
+            const auto hh = get_finite_float(
+                arguments, "half_height", 0.0F, maximum_collider_dimension);
+            if (!hh) {
+                error = "half_height is outside the valid collider range";
+                return false;
+            }
+            collider.half_height = *hh;
+        }
+        if (arguments.contains("collision_layer")) {
+            const auto layer = get_u32(
+                arguments, "collision_layer", 0U, UINT32_MAX);
+            if (!layer) {
+                error = "collision_layer must be a uint32";
+                return false;
+            }
+            collider.collision_layer = *layer;
+        }
+        if (arguments.contains("collision_mask")) {
+            const auto mask = get_u32(
+                arguments, "collision_mask", 0U, UINT32_MAX);
+            if (!mask) {
+                error = "collision_mask must be a uint32";
+                return false;
+            }
+            collider.collision_mask = *mask;
+        }
+        if (!valid_collider_component(collider)) {
+            error = "collider dimensions or offsets are outside engine bounds";
+            return false;
+        }
+        command.type = McpCommandType::editor_set_collider;
+        command.collider = collider;
         return true;
     }
     if (name == "editor.scene.get_node" ||

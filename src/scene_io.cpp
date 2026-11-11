@@ -219,6 +219,109 @@ template <typename T>
     };
 }
 
+[[nodiscard]] Json collider_json(const ColliderComponent& collider) {
+    return Json{
+        {"enabled", collider.enabled},
+        {"is_trigger", collider.is_trigger},
+        {"shape", to_token(collider.shape)},
+        {"center_offset",
+         {collider.center_offset.x,
+          collider.center_offset.y,
+          collider.center_offset.z}},
+        {"half_extents",
+         {collider.half_extents.x,
+          collider.half_extents.y,
+          collider.half_extents.z}},
+        {"radius", collider.radius},
+        {"half_height", collider.half_height},
+        {"collision_layer", collider.collision_layer},
+        {"collision_mask", collider.collision_mask},
+    };
+}
+
+[[nodiscard]] bool read_collider(
+    const Json& source,
+    ColliderComponent& collider) {
+    if (!source.is_object()) {
+        return false;
+    }
+    for (const auto& [key, _] : source.items()) {
+        if (key != "enabled" &&
+            key != "is_trigger" &&
+            key != "shape" &&
+            key != "center_offset" &&
+            key != "half_extents" &&
+            key != "radius" &&
+            key != "half_height" &&
+            key != "collision_layer" &&
+            key != "collision_mask") {
+            return false;
+        }
+    }
+    if (source.contains("enabled")) {
+        if (!source["enabled"].is_boolean()) return false;
+        collider.enabled = source["enabled"].get<bool>();
+    }
+    if (source.contains("is_trigger")) {
+        if (!source["is_trigger"].is_boolean()) return false;
+        collider.is_trigger = source["is_trigger"].get<bool>();
+    }
+    if (source.contains("shape")) {
+        if (!source["shape"].is_string()) return false;
+        const auto shape = parse_collider_shape(
+            source["shape"].get_ref<const std::string&>());
+        if (!shape) return false;
+        collider.shape = *shape;
+    }
+    if (source.contains("center_offset")) {
+        std::array<float, 3> offset{};
+        if (!read_float_array(source["center_offset"], offset)) {
+            return false;
+        }
+        collider.center_offset = {offset[0], offset[1], offset[2]};
+    }
+    if (source.contains("half_extents")) {
+        std::array<float, 3> extents{};
+        if (!read_float_array(source["half_extents"], extents)) {
+            return false;
+        }
+        collider.half_extents = {extents[0], extents[1], extents[2]};
+    }
+    if (source.contains("radius") &&
+        !read_bounded_float(
+            source["radius"],
+            minimum_collider_dimension,
+            maximum_collider_dimension,
+            collider.radius)) {
+        return false;
+    }
+    if (source.contains("half_height") &&
+        !read_bounded_float(
+            source["half_height"],
+            0.0F,
+            maximum_collider_dimension,
+            collider.half_height)) {
+        return false;
+    }
+    if (source.contains("collision_layer")) {
+        if (!source["collision_layer"].is_number_unsigned()) {
+            return false;
+        }
+        const auto layer = source["collision_layer"].get<std::uint64_t>();
+        if (layer > UINT32_MAX) return false;
+        collider.collision_layer = static_cast<std::uint32_t>(layer);
+    }
+    if (source.contains("collision_mask")) {
+        if (!source["collision_mask"].is_number_unsigned()) {
+            return false;
+        }
+        const auto mask = source["collision_mask"].get<std::uint64_t>();
+        if (mask > UINT32_MAX) return false;
+        collider.collision_mask = static_cast<std::uint32_t>(mask);
+    }
+    return valid_collider_component(collider);
+}
+
 [[nodiscard]] bool replace_scene_file(
     const std::filesystem::path& temporary,
     const std::filesystem::path& destination,
@@ -283,6 +386,14 @@ bool save_scene_file(
     }
     std::uint32_t local_light_count = 0U;
     for (const SceneNodeRecord& record : records) {
+        if (!record.uuid) {
+            error = "Scene node UUID is missing.";
+            return false;
+        }
+        if (record.collider && !valid_collider_component(*record.collider)) {
+            error = "Scene collider component values are invalid.";
+            return false;
+        }
         const SceneNode& node = record.value;
         if (node.kind == SceneNodeKind::ocean && !valid_ocean_settings(node.ocean)) {
             error = "Scene ocean settings are invalid.";
@@ -376,6 +487,7 @@ bool save_scene_file(
         const PbrMaterial material =
             sanitize_pbr_material(node.material);
         Json encoded{
+            {"uuid", format_scene_uuid(record.uuid)},
             {"name", node.name},
             {"kind", std::string(serialized_kind(node.kind))},
             {"visible", node.visible},
@@ -441,6 +553,11 @@ bool save_scene_file(
                 encoded["light"]["outer_cone_degrees"] =
                     node.light.outer_cone_degrees;
             }
+        }
+        if (record.collider) {
+            encoded["components"] = Json{
+                {"collider", collider_json(*record.collider)},
+            };
         }
         if (index != 0U) {
             output.put(',');
@@ -804,10 +921,55 @@ bool load_scene_file(
                 }
             }
 
-            const SceneNodeId id = loaded.create_node(
+            std::optional<SceneUuid> parsed_uuid{};
+            if (encoded.contains("uuid")) {
+                if (!encoded["uuid"].is_string()) {
+                    error = "Scene node UUID must be a canonical UUID string.";
+                    return false;
+                }
+                parsed_uuid = parse_scene_uuid(
+                    encoded["uuid"].get_ref<const std::string&>());
+                if (!parsed_uuid) {
+                    error = "Scene node UUID is malformed or zero.";
+                    return false;
+                }
+                if (loaded.find_by_uuid(*parsed_uuid)) {
+                    error = "Scene contains duplicate node UUIDs.";
+                    return false;
+                }
+            }
+            std::optional<ColliderComponent> parsed_collider{};
+            if (encoded.contains("components")) {
+                const Json& components = encoded["components"];
+                if (!components.is_object()) {
+                    error = "Scene node components must be an object.";
+                    return false;
+                }
+                for (const auto& [component_key, _] : components.items()) {
+                    if (component_key != "collider") {
+                        error = "Scene node contains an unknown component.";
+                        return false;
+                    }
+                }
+                if (components.contains("collider")) {
+                    ColliderComponent collider_value{};
+                    if (!read_collider(components["collider"], collider_value)) {
+                        error = "Scene node collider component is invalid.";
+                        return false;
+                    }
+                    parsed_collider = collider_value;
+                }
+            }
+            const SceneNodeId id = parsed_uuid
+                ? loaded.create_node_with_uuid(name, *kind, *parsed_uuid, parent_id)
+                : loaded.create_node(
                 name, *kind, parent_id);
             if (!id) {
                 error = "Unable to create a bounded scene node.";
+                return false;
+            }
+            if (parsed_collider && !loaded.set_collider(id, *parsed_collider)) {
+                error = "Unable to attach scene collider component.";
                 return false;
             }
             auto node = loaded.node(id);
@@ -841,11 +1003,22 @@ bool load_scene_file(
         }
         if (root.contains("startup_camera")) {
             const auto &camera = root["startup_camera"];
-            if (!camera.is_number_unsigned() || camera.get<std::uint64_t>() >= ids.size()) {
+            bool valid_camera_ref = false;
+            if (camera.is_number_unsigned() && camera.get<std::uint64_t>() < ids.size()) {
+                const auto camera_index = camera.get<std::size_t>();
+                loaded.startup_camera = ids[camera_index];
+                valid_camera_ref = true;
+            } else if (camera.is_string()) {
+                if (const auto camera_uuid = parse_scene_uuid(camera.get_ref<const std::string&>())) {
+                    loaded.startup_camera = loaded.find_by_uuid(*camera_uuid);
+                    valid_camera_ref = static_cast<bool>(loaded.startup_camera);
+                }
+            }
+            if (!valid_camera_ref) {
                 error = "Scene startup_camera must be a valid node index.";
                 return false;
             }
-            loaded.startup_camera = ids[camera.get<std::size_t>()];
+            // Startup camera resolved above.
             if (!loaded.startup_camera_pose()) {
                 error = "Scene startup_camera must reference a camera with a finite world pose.";
                 return false;

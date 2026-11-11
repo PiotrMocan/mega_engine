@@ -257,6 +257,12 @@ SceneNodeId duplicate_scene_subtree(
         }
         copy_node->get() = record.value;
         copy_node->get().name = std::move(name);
+        if (record.collider &&
+            !scene.set_collider(copy, *record.collider)) {
+            error = "Unable to copy collider component to duplicated node.";
+            static_cast<void>(scene.destroy_subtree(duplicate_root));
+            return {};
+        }
     }
     duplicated_nodes = static_cast<std::uint32_t>(subtree_size);
     return duplicate_root;

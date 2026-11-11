@@ -13,7 +13,7 @@ build\windows-debug\bin\vulkan_editor.exe --mcp-stdio --no-validation
 | --- | --- |
 | `editor` | `get_state` |
 | `editor.selection` | `set` |
-| `editor.scene` | `list_nodes`, `get_node`, `create_node`, `update_node`, `delete_node`, `reparent_node`, `duplicate_node`, `save` |
+| `editor.scene` | `list_nodes`, `get_node`, `find_by_uuid`, `create_node`, `update_node`, `delete_node`, `reparent_node`, `duplicate_node`, `set_collider`, `remove_collider`, `save` |
 | `editor.camera` | `focus_selection` |
 | `editor.history` | `undo`, `redo` |
 | `editor.assets` | `list`, `import` |

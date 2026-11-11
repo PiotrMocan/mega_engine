@@ -76,8 +76,11 @@ try {
         "render.set_motion_blur",
         "render.set_anti_aliasing",
         "editor.scene.list_nodes",
+        "editor.scene.find_by_uuid",
         "editor.scene.create_node",
         "editor.scene.duplicate_node",
+        "editor.scene.set_collider",
+        "editor.scene.remove_collider",
         "editor.selection.set",
         "editor.camera.focus_selection",
         "editor.landscape.create_flat_ground",
@@ -328,6 +331,41 @@ try {
         throw "Unable to select the authored ground"
     }
 
+    $groundUuid = $ground.structuredContent.node.uuid
+    if ([string]::IsNullOrWhiteSpace($groundUuid)) {
+        throw "Created node did not expose a persistent uuid"
+    }
+    $foundByUuid = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 801; method = "tools/call"
+        params = @{
+            name = "editor.scene.find_by_uuid"
+            arguments = @{ uuid = $groundUuid }
+        }
+    } 801
+    if ($foundByUuid.isError -or
+        $foundByUuid.structuredContent.node.id.index -ne $groundId.index -or
+        $foundByUuid.structuredContent.node.uuid -cne $groundUuid) {
+        throw "editor.scene.find_by_uuid failed to resolve created node"
+    }
+    $setCollider = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 802; method = "tools/call"
+        params = @{
+            name = "editor.scene.set_collider"
+            arguments = @{
+                id = $groundId
+                shape = "box"
+                half_extents = @(10.0, 0.5, 6.0)
+                is_trigger = $false
+                collision_layer = 3
+            }
+        }
+    } 802
+    if ($setCollider.isError -or
+        $setCollider.structuredContent.node.collider.shape -cne "box" -or
+        $setCollider.structuredContent.node.collider.collision_layer -ne 3) {
+        throw "editor.scene.set_collider failed to attach box collider"
+    }
+
     $duplicate = Send-McpMessage @{
         jsonrpc = "2.0"; id = 9; method = "tools/call"
         params = @{
@@ -336,8 +374,23 @@ try {
         }
     } 9
     if ($duplicate.isError -or
-        $duplicate.structuredContent.duplicated_nodes -ne 1) {
-        throw "Unable to duplicate the selected authored ground"
+        $duplicate.structuredContent.duplicated_nodes -ne 1 -or
+        $duplicate.structuredContent.node.uuid -ceq $groundUuid -or
+        $duplicate.structuredContent.node.collider.shape -cne "box") {
+        throw "Unable to duplicate the selected authored ground with fresh UUID and collider"
+    }
+
+    $removeCollider = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 803; method = "tools/call"
+        params = @{
+            name = "editor.scene.remove_collider"
+            arguments = @{ id = $duplicate.structuredContent.node.id }
+        }
+    } 803
+    if ($removeCollider.isError -or
+        -not $removeCollider.structuredContent.changed -or
+        $null -ne $removeCollider.structuredContent.node.collider) {
+        throw "editor.scene.remove_collider failed to detach collider"
     }
 
     $focus = Send-McpMessage @{
@@ -451,7 +504,7 @@ try {
     } 18
     if ($clusterState.isError -or
         $clusterState.structuredContent.local_light_backend_actual -cne $LocalLighting -or
-        $clusterState.structuredContent.local_light_count -ne 2 -or
+        $clusterState.structuredContent.local_light_count -ne ($before.structuredContent.local_light_count + 2) -or
         ($LocalLighting -eq 'clustered' -and
          $clusterState.structuredContent.local_light_assignments -le 0) -or
         $clusterState.structuredContent.local_light_dropped -ne 0) {

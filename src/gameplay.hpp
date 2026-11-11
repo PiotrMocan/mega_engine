@@ -2,9 +2,12 @@
 
 #include <glm/vec3.hpp>
 
+#include <cstdint>
 #include <type_traits>
 
 namespace vcr {
+
+class CollisionWorld;
 
 struct CharacterInput {
     bool forward = false;
@@ -25,6 +28,10 @@ struct CharacterConfig {
     float turn_speed_radians = 12.0F;
     float maximum_delta_seconds = 0.05F;
     float ground_height = 0.0F;
+    float capsule_radius = 0.38F;
+    float capsule_height = 1.8F;
+    float step_height = 0.45F;
+    float max_slope_degrees = 48.0F;
 };
 
 class CharacterController final {
@@ -36,7 +43,14 @@ public:
         const CharacterInput& input,
         glm::vec3 camera_forward,
         float delta_seconds) noexcept;
+    void update(
+        const CharacterInput& input,
+        glm::vec3 camera_forward,
+        float delta_seconds,
+        const CollisionWorld& world,
+        std::uint32_t layer_mask = 0xFFFFFFFFU) noexcept;
 
+    [[nodiscard]] const CharacterConfig& config() const noexcept { return config_; }
     [[nodiscard]] glm::vec3 position() const noexcept { return position_; }
     [[nodiscard]] float facing_yaw() const noexcept { return facing_yaw_radians_; }
     [[nodiscard]] float vertical_velocity() const noexcept { return vertical_velocity_; }
@@ -58,6 +72,8 @@ struct ThirdPersonCameraConfig {
     float default_pitch_radians = -0.3490658504F;
     float minimum_pitch_radians = -1.308996939F;
     float maximum_pitch_radians = -0.1745329252F;
+    float collision_probe_radius = 0.22F;
+    float minimum_distance = 0.55F;
 };
 
 class ThirdPersonCamera final {
@@ -70,6 +86,10 @@ public:
     [[nodiscard]] glm::vec3 forward() const noexcept;
     [[nodiscard]] glm::vec3 planar_forward() const noexcept;
     [[nodiscard]] glm::vec3 position(glm::vec3 character_feet) const noexcept;
+    [[nodiscard]] glm::vec3 position(
+        glm::vec3 character_feet,
+        const CollisionWorld& world,
+        std::uint32_t layer_mask = 0xFFFFFFFFU) const noexcept;
     [[nodiscard]] float yaw() const noexcept { return yaw_radians_; }
     [[nodiscard]] float pitch() const noexcept { return pitch_radians_; }
 

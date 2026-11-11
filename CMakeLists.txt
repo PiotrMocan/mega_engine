@@ -437,9 +437,11 @@ endif()
 
 set(VCR_RENDERER_SOURCES
     src/cli_options.cpp
+    src/collision.cpp
     src/fly_camera.cpp
     src/gameplay.cpp
     src/gameplay_session.cpp
+    src/scene_uuid.cpp
     src/fsr3_upscaler.cpp
     src/gpu_buffer.cpp
     src/gpu_texture.cpp
@@ -647,10 +649,18 @@ include(CTest)
 if(BUILD_TESTING)
     add_executable(vcr_gameplay_tests
         tests/gameplay_tests.cpp
+        src/collision.cpp
         src/gameplay.cpp
+        src/punctual_light.cpp
+        src/scene_document.cpp
+        src/scene_uuid.cpp
     )
     target_include_directories(vcr_gameplay_tests PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+    target_compile_definitions(vcr_gameplay_tests PRIVATE
+        GLM_FORCE_DEPTH_ZERO_TO_ONE
+        GLM_FORCE_RADIANS
     )
     target_link_libraries(vcr_gameplay_tests PRIVATE glm::glm)
     if(MSVC)
@@ -693,7 +703,7 @@ if(BUILD_TESTING)
     add_test(NAME vcr_lighting_tests COMMAND vcr_lighting_tests)
     add_executable(vcr_runtime_tests tests/runtime_scene_tests.cpp
         src/runtime_scene.cpp src/scene_visibility.cpp src/bounds_hierarchy.cpp src/scene_document.cpp
-        src/model_lod.cpp src/asset_preparation.cpp src/punctual_light.cpp)
+        src/model_lod.cpp src/asset_preparation.cpp src/punctual_light.cpp src/scene_uuid.cpp)
     target_include_directories(vcr_runtime_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_link_libraries(vcr_runtime_tests PRIVATE glm::glm meshoptimizer
         vcr_cooked_model_asset vcr_cooked_texture_asset Threads::Threads)
@@ -714,6 +724,8 @@ if(BUILD_TESTING)
         src/render_fixture_scene.cpp
         src/scene_document.cpp
         src/scene_io.cpp
+        src/scene_uuid.cpp
+        src/collision.cpp
     )
     target_include_directories(vcr_core_tests PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src"

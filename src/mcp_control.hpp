@@ -49,6 +49,9 @@ enum class McpCommandType : std::uint8_t {
     editor_set_selection,
     editor_list_nodes,
     editor_get_node,
+    editor_find_by_uuid,
+    editor_set_collider,
+    editor_remove_collider,
     editor_create_node,
     editor_update_node,
     editor_delete_node,
@@ -152,6 +155,8 @@ struct McpCommand {
     bool smaa_mode_supplied = false;
     SceneNodeId node_id{};
     SceneNodeId parent_id{};
+    SceneUuid node_uuid{};
+    ColliderComponent collider{};
     SceneNodeKind node_kind = SceneNodeKind::folder;
     SceneTransform transform{};
     PbrMaterial material{};

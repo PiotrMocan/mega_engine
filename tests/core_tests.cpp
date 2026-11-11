@@ -2564,6 +2564,186 @@ int main() {
             "asset browser test directory is removed");
     }
 
+    {
+        const vcr::SceneUuid generated = vcr::generate_scene_uuid();
+        const std::string text = vcr::format_scene_uuid(generated);
+        const auto reparsed = vcr::parse_scene_uuid(text);
+        std::string uppercase = text;
+        for (char& ch : uppercase) {
+            if (ch >= 'a' && ch <= 'f') {
+                ch = static_cast<char>(ch - 'a' + 'A');
+            }
+        }
+        expect(
+            static_cast<bool>(generated) &&
+                text.size() == vcr::scene_uuid_text_length &&
+                text[14] == '4' &&
+                reparsed == generated &&
+                vcr::parse_scene_uuid(uppercase) == generated,
+            "RFC 9562 v4 UUID formats and parses case-insensitively");
+        for (const char* bad_uuid : {
+                 "",
+                 "00000000-0000-0000-0000-000000000000",
+                 "12345678_1234_4234_8234_123456789abc",
+                 "12345678-1234-4234-8234-123456789abg",
+                 "12345678-1234-4234-8234-123456789ab",
+                 "12345678-1234-4234-8234-123456789abcd"}) {
+            expect(
+                !vcr::parse_scene_uuid(bad_uuid),
+                "UUID parser rejects zero and malformed strings");
+        }
+
+        vcr::SceneDocument scene;
+        const vcr::SceneUuid explicit_uuid =
+            vcr::deterministic_scene_uuid(0xABCD1234ULL, 1U);
+        const auto root = scene.create_node_with_uuid(
+            "Root", vcr::SceneNodeKind::folder, explicit_uuid);
+        expect(
+            root && scene.uuid(root) == explicit_uuid &&
+                scene.find_by_uuid(explicit_uuid) == root &&
+                !scene.create_node_with_uuid(
+                    "Duplicate", vcr::SceneNodeKind::cube, explicit_uuid) &&
+                !scene.create_node_with_uuid(
+                    "Zero", vcr::SceneNodeKind::cube, vcr::SceneUuid{}),
+            "SceneDocument enforces non-zero unique persistent UUIDs");
+
+        const auto child = scene.create_node(
+            "TriggerZone", vcr::SceneNodeKind::folder, root);
+        const vcr::ColliderComponent authored_collider{
+            .center_offset = {0.25F, 1.0F, -0.5F},
+            .half_extents = {2.5F, 1.5F, 3.0F},
+            .radius = 0.75F,
+            .half_height = 1.25F,
+            .collision_layer = 2U,
+            .collision_mask = 0x0000000FU,
+            .shape = vcr::ColliderShape::capsule,
+            .enabled = true,
+            .is_trigger = true,
+        };
+        expect(
+            scene.set_collider(child, authored_collider) &&
+                scene.has_collider(child) &&
+                scene.collider(child)->get() == authored_collider,
+            "ColliderComponent attaches to scene nodes via SparseComponentPool");
+        vcr::ColliderComponent bad_collider = authored_collider;
+        bad_collider.radius = -1.0F;
+        expect(
+            !scene.set_collider(child, bad_collider) &&
+                scene.collider(child)->get() == authored_collider,
+            "SceneDocument rejects out-of-range collider components");
+
+        const vcr::SceneDocument undo_snapshot = scene;
+        std::uint32_t duplicated_count = 0U;
+        std::string error;
+        const auto dup_root = vcr::duplicate_scene_subtree(
+            scene, root, duplicated_count, error);
+        std::vector<vcr::SceneNodeRecord> records;
+        scene.build_node_records(records);
+        expect(
+            dup_root && duplicated_count == 2U && records.size() == 4U &&
+                records[2].uuid != records[0].uuid &&
+                records[3].uuid != records[1].uuid &&
+                records[3].collider == authored_collider,
+            "duplicate_scene_subtree mints fresh UUIDs while preserving ColliderComponent");
+
+        expect(
+            scene.destroy_subtree(root) &&
+                !scene.find_by_uuid(explicit_uuid) &&
+                scene.colliders().size() == 1U &&
+                undo_snapshot.find_by_uuid(explicit_uuid) == root &&
+                undo_snapshot.collider(child)->get() == authored_collider,
+            "destroy_subtree cleans UUID index and component pools while value snapshots stay intact");
+
+        for (int cycle = 0; cycle < 256; ++cycle) {
+            const auto temp = scene.create_node("Temp", vcr::SceneNodeKind::cube);
+            const auto temp_uuid = *scene.uuid(temp);
+            expect(
+                scene.find_by_uuid(temp_uuid) == temp &&
+                    scene.destroy_subtree(temp) &&
+                    !scene.find_by_uuid(temp_uuid),
+                "UUID table tombstone rehashing stays accurate across churn");
+        }
+
+        std::error_code fs_err;
+        const auto uuid_dir =
+            std::filesystem::temp_directory_path(fs_err) /
+            ("vcr_uuid_io_" +
+             std::to_string(
+                 std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directories(uuid_dir, fs_err);
+        const auto uuid_scene_path = uuid_dir / "uuid_collider.scene.json";
+
+        vcr::SceneDocument io_scene;
+        const auto cam_node = io_scene.create_node(
+            "StartCam", vcr::SceneNodeKind::camera);
+        io_scene.node(cam_node)->get().transform.translation = {1.0F, 3.0F, 9.0F};
+        io_scene.startup_camera = cam_node;
+        const auto trigger_node = io_scene.create_node(
+            "Checkpoint", vcr::SceneNodeKind::folder);
+        expect(
+            io_scene.set_collider(trigger_node, authored_collider),
+            "attach collider before scene save");
+        const auto cam_uuid = *io_scene.uuid(cam_node);
+        const auto trigger_uuid = *io_scene.uuid(trigger_node);
+        expect(
+            vcr::save_scene_file(io_scene, uuid_scene_path, error),
+            "save scene with UUIDs and collider components");
+
+        vcr::SceneDocument loaded_io;
+        expect(
+            vcr::load_scene_file(uuid_scene_path, loaded_io, error),
+            "load scene with UUIDs and collider components");
+        const auto loaded_cam = loaded_io.find_by_uuid(cam_uuid);
+        const auto loaded_trigger = loaded_io.find_by_uuid(trigger_uuid);
+        expect(
+            loaded_cam && loaded_trigger &&
+                loaded_io.startup_camera == loaded_cam &&
+                loaded_io.collider(loaded_trigger) &&
+                loaded_io.collider(loaded_trigger)->get() == authored_collider,
+            "scene_io round-trips persistent UUIDs and ColliderComponent payloads");
+
+        nlohmann::json raw_json;
+        {
+            std::ifstream in(uuid_scene_path);
+            in >> raw_json;
+        }
+        raw_json["startup_camera"] = vcr::format_scene_uuid(cam_uuid);
+        {
+            std::ofstream out(uuid_scene_path);
+            out << raw_json.dump();
+        }
+        expect(
+            vcr::load_scene_file(uuid_scene_path, loaded_io, error) &&
+                loaded_io.startup_camera == loaded_io.find_by_uuid(cam_uuid),
+            "scene_io resolves startup_camera specified by UUID string");
+
+        auto dup_uuid_json = raw_json;
+        dup_uuid_json["nodes"][1]["uuid"] = dup_uuid_json["nodes"][0]["uuid"];
+        {
+            std::ofstream out(uuid_scene_path);
+            out << dup_uuid_json.dump();
+        }
+        const auto rev_before = loaded_io.content_revision();
+        expect(
+            !vcr::load_scene_file(uuid_scene_path, loaded_io, error) &&
+                loaded_io.content_revision() == rev_before,
+            "scene_io transactionally rejects duplicate node UUIDs");
+
+        auto bad_comp_json = raw_json;
+        bad_comp_json["nodes"][1]["components"]["unknown_component"] =
+            nlohmann::json::object();
+        {
+            std::ofstream out(uuid_scene_path);
+            out << bad_comp_json.dump();
+        }
+        expect(
+            !vcr::load_scene_file(uuid_scene_path, loaded_io, error) &&
+                loaded_io.content_revision() == rev_before,
+            "scene_io transactionally rejects unknown node components");
+
+        std::filesystem::remove_all(uuid_dir, fs_err);
+    }
+
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return 1;

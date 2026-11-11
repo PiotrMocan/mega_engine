@@ -2403,6 +2403,20 @@ void EditorUi::build_inspector(SceneDocument& scene) {
         ui_kit_.badge(
             to_string(node.kind).data(),
             EditorTone::info);
+        if (const auto node_uuid = scene.uuid(selected_node_)) {
+            const auto uuid_chars = format_scene_uuid_chars(*node_uuid);
+            ui_kit_.property_row("UUID");
+            ImGui::TextDisabled("%.8s...", uuid_chars.data());
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip("%s", uuid_chars.data());
+            }
+            ImGui::SameLine();
+            ImGui::EndDisabled();
+            if (ImGui::SmallButton("Copy##NodeUuid")) {
+                ImGui::SetClipboardText(uuid_chars.data());
+            }
+            ImGui::BeginDisabled(!editable);
+        }
         ui_kit_.property_row("Visible");
         changed |= ImGui::Checkbox(
             "##Visible",
@@ -2581,6 +2595,161 @@ void EditorUi::build_inspector(SceneDocument& scene) {
             ui_kit_.end_property_grid();
         }
     }
+    {
+        ui_kit_.section_header(EditorIcon::cube, "Collision");
+        if (const auto attached_collider = scene.collider(selected_node_)) {
+            ColliderComponent edited_collider = attached_collider->get();
+            bool collider_changed = false;
+            bool remove_collider_requested = false;
+            if (ui_kit_.begin_property_grid("ColliderProperties")) {
+                ui_kit_.property_row("Enabled");
+                collider_changed |= ImGui::Checkbox(
+                    "##ColliderEnabled", &edited_collider.enabled);
+                ui_kit_.property_row("Trigger");
+                collider_changed |= ImGui::Checkbox(
+                    "##ColliderTrigger", &edited_collider.is_trigger);
+                ImGui::SameLine();
+                ImGui::TextDisabled(
+                    edited_collider.is_trigger ? "Overlap zone" : "Solid");
+                ui_kit_.property_row("Shape");
+                if (ImGui::BeginCombo(
+                        "##ColliderShape",
+                        to_token(edited_collider.shape).data())) {
+                    for (const auto candidate_shape : {
+                             ColliderShape::auto_bounds,
+                             ColliderShape::box,
+                             ColliderShape::sphere,
+                             ColliderShape::capsule}) {
+                        if (ImGui::Selectable(
+                                to_token(candidate_shape).data(),
+                                edited_collider.shape == candidate_shape)) {
+                            collider_changed |=
+                                edited_collider.shape != candidate_shape;
+                            edited_collider.shape = candidate_shape;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                collider_changed |= ui_kit_.drag_vec3(
+                    "Offset",
+                    "ColliderOffset",
+                    &edited_collider.center_offset.x,
+                    0.05F,
+                    0.0F);
+                const bool uses_box_extents =
+                    edited_collider.shape == ColliderShape::box ||
+                    (edited_collider.shape == ColliderShape::auto_bounds &&
+                     node.kind != SceneNodeKind::cube &&
+                     node.kind != SceneNodeKind::ground &&
+                     node.kind != SceneNodeKind::model);
+                if (uses_box_extents) {
+                    collider_changed |= ui_kit_.drag_vec3(
+                        "Half extents",
+                        "ColliderExtents",
+                        &edited_collider.half_extents.x,
+                        0.05F,
+                        1.0F,
+                        minimum_collider_dimension,
+                        maximum_collider_dimension);
+                } else if (edited_collider.shape == ColliderShape::sphere) {
+                    ui_kit_.property_row("Radius (m)");
+                    collider_changed |= ImGui::DragFloat(
+                        "##ColliderRadius",
+                        &edited_collider.radius,
+                        0.02F,
+                        minimum_collider_dimension,
+                        maximum_collider_dimension,
+                        "%.3f",
+                        ImGuiSliderFlags_AlwaysClamp);
+                } else if (edited_collider.shape == ColliderShape::capsule) {
+                    ui_kit_.property_row("Radius (m)");
+                    collider_changed |= ImGui::DragFloat(
+                        "##ColliderRadius",
+                        &edited_collider.radius,
+                        0.02F,
+                        minimum_collider_dimension,
+                        maximum_collider_dimension,
+                        "%.3f",
+                        ImGuiSliderFlags_AlwaysClamp);
+                    ui_kit_.property_row("Half height (m)");
+                    collider_changed |= ImGui::DragFloat(
+                        "##ColliderHalfHeight",
+                        &edited_collider.half_height,
+                        0.02F,
+                        0.0F,
+                        maximum_collider_dimension,
+                        "%.3f",
+                        ImGuiSliderFlags_AlwaysClamp);
+                }
+                ui_kit_.property_row("Layer");
+                collider_changed |= ImGui::InputScalar(
+                    "##ColliderLayer",
+                    ImGuiDataType_U32,
+                    &edited_collider.collision_layer);
+                ui_kit_.property_row("Mask (hex)");
+                collider_changed |= ImGui::InputScalar(
+                    "##ColliderMask",
+                    ImGuiDataType_U32,
+                    &edited_collider.collision_mask,
+                    nullptr,
+                    nullptr,
+                    "%08X",
+                    ImGuiInputTextFlags_CharsHexadecimal);
+                ui_kit_.property_row("Component");
+                if (ImGui::SmallButton("Remove collider")) {
+                    remove_collider_requested = true;
+                }
+                ui_kit_.end_property_grid();
+            }
+            if (remove_collider_requested) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                static_cast<void>(scene.remove_collider(selected_node_));
+            } else if (collider_changed) {
+                edited_collider = sanitize_collider_component(edited_collider);
+                if (!inspector_edit_snapshot_) {
+                    inspector_edit_snapshot_ = scene;
+                    if (auto previous =
+                            inspector_edit_snapshot_->node(selected_node_)) {
+                        previous->get() = node_before_edit;
+                    }
+                }
+                static_cast<void>(
+                    scene.set_collider(selected_node_, edited_collider));
+            }
+        } else {
+            const bool implicit_solid =
+                node.kind == SceneNodeKind::cube ||
+                node.kind == SceneNodeKind::ground ||
+                node.kind == SceneNodeKind::model ||
+                node.kind == SceneNodeKind::terrain;
+            ui_kit_.status_text(
+                implicit_solid
+                    ? "Implicit solid bounds active. Add Collider to customize or turn into a trigger."
+                    : "No collider attached.",
+                EditorTone::neutral);
+            if (ui_kit_.action_button(
+                    "AddColliderButton",
+                    EditorIcon::add,
+                    "Add Collider",
+                    EditorButtonStyle::secondary,
+                    editable)) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                ColliderComponent initial{};
+                if (node.kind == SceneNodeKind::folder) {
+                    initial.shape = ColliderShape::box;
+                }
+                static_cast<void>(scene.set_collider(selected_node_, initial));
+            }
+        }
+    }
     if (changed && !inspector_edit_snapshot_) {
         inspector_edit_snapshot_ = scene;
         if (auto previous =
@@ -2632,6 +2801,182 @@ void EditorUi::build_inspector(SceneDocument& scene) {
     }
     ImGui::End();
 }
+
+namespace {
+
+void draw_collider_wireframe(
+    ImDrawList* const draw_list,
+    const SceneDocument& scene,
+    const Renderer& renderer,
+    const SceneNodeId node_id,
+    const glm::mat4& view_projection,
+    const ImVec2 image_minimum,
+    const float image_width,
+    const float image_height) noexcept {
+    if (draw_list == nullptr || !scene.valid(node_id)) {
+        return;
+    }
+    const auto attached = scene.collider(node_id);
+    if (!attached || !attached->get().enabled) {
+        return;
+    }
+    const auto node_opt = scene.node(node_id);
+    const auto world_opt = scene_world_matrix(scene, node_id);
+    if (!node_opt || !world_opt) {
+        return;
+    }
+    const ColliderComponent& col = attached->get();
+    const SceneNodeKind kind = node_opt->get().kind;
+    const glm::mat4& world = *world_opt;
+
+    const ImU32 wire_color = col.is_trigger
+        ? IM_COL32(255, 204, 64, 230)
+        : IM_COL32(72, 232, 128, 230);
+
+    const auto project_point = [&](const glm::vec3 world_pt,
+                                   ImVec2& out) noexcept -> bool {
+        const glm::vec4 clip = view_projection * glm::vec4(world_pt, 1.0F);
+        if (!std::isfinite(clip.w) || clip.w <= 0.01F) {
+            return false;
+        }
+        const glm::vec3 ndc = glm::vec3(clip) / clip.w;
+        out = ImVec2{
+            image_minimum.x + (ndc.x * 0.5F + 0.5F) * image_width,
+            image_minimum.y + (0.5F - ndc.y * 0.5F) * image_height,
+        };
+        return true;
+    };
+
+    const auto draw_segment = [&](const glm::vec3 a,
+                                  const glm::vec3 b) noexcept {
+        ImVec2 sa{};
+        ImVec2 sb{};
+        if (project_point(a, sa) && project_point(b, sb)) {
+            draw_list->AddLine(sa, sb, wire_color, 1.75F);
+        }
+    };
+
+    const glm::vec3 c0(world[0]);
+    const glm::vec3 c1(world[1]);
+    const glm::vec3 c2(world[2]);
+    const glm::vec3 sx_sy_sz{
+        glm::length(c0),
+        glm::length(c1),
+        glm::length(c2),
+    };
+    if (sx_sy_sz.x <= 1.0e-4F ||
+        sx_sy_sz.y <= 1.0e-4F ||
+        sx_sy_sz.z <= 1.0e-4F) {
+        return;
+    }
+    const glm::vec3 ax0 = c0 / sx_sy_sz.x;
+    const glm::vec3 ax1 = c1 / sx_sy_sz.y;
+    const glm::vec3 ax2 = c2 / sx_sy_sz.z;
+    const glm::vec3 center =
+        glm::vec3(world[3]) +
+        c0 * col.center_offset.x +
+        c1 * col.center_offset.y +
+        c2 * col.center_offset.z;
+
+    const auto draw_obb = [&](const glm::vec3 c,
+                              const glm::vec3 u0,
+                              const glm::vec3 u1,
+                              const glm::vec3 u2,
+                              const glm::vec3 ext) noexcept {
+        std::array<glm::vec3, 8> corners{};
+        for (int idx = 0; idx < 8; ++idx) {
+            const float sx = (idx & 1) != 0 ? 1.0F : -1.0F;
+            const float sy = (idx & 2) != 0 ? 1.0F : -1.0F;
+            const float sz = (idx & 4) != 0 ? 1.0F : -1.0F;
+            corners[static_cast<std::size_t>(idx)] =
+                c + u0 * (sx * ext.x) + u1 * (sy * ext.y) + u2 * (sz * ext.z);
+        }
+        constexpr std::array<std::pair<std::size_t, std::size_t>, 12> edges{{
+            {0U, 1U}, {2U, 3U}, {4U, 5U}, {6U, 7U},
+            {0U, 2U}, {1U, 3U}, {4U, 6U}, {5U, 7U},
+            {0U, 4U}, {1U, 5U}, {2U, 6U}, {3U, 7U},
+        }};
+        for (const auto [i0, i1] : edges) {
+            draw_segment(corners[i0], corners[i1]);
+        }
+    };
+
+    constexpr int ring_segments = 24;
+    constexpr float two_pi = 6.28318530718F;
+    const auto draw_circle = [&](const glm::vec3 ring_center,
+                                 const glm::vec3 u,
+                                 const glm::vec3 v,
+                                 const float r) noexcept {
+        for (int s = 0; s < ring_segments; ++s) {
+            const float a0 =
+                two_pi * static_cast<float>(s) / static_cast<float>(ring_segments);
+            const float a1 =
+                two_pi * static_cast<float>(s + 1) / static_cast<float>(ring_segments);
+            draw_segment(
+                ring_center + (u * std::cos(a0) + v * std::sin(a0)) * r,
+                ring_center + (u * std::cos(a1) + v * std::sin(a1)) * r);
+        }
+    };
+
+    if (col.shape == ColliderShape::sphere) {
+        const float r = col.radius *
+            std::max({sx_sy_sz.x, sx_sy_sz.y, sx_sy_sz.z});
+        draw_circle(center, ax0, ax1, r);
+        draw_circle(center, ax0, ax2, r);
+        draw_circle(center, ax1, ax2, r);
+        return;
+    }
+
+    if (col.shape == ColliderShape::capsule) {
+        const float r = col.radius * std::max(sx_sy_sz.x, sx_sy_sz.z);
+        const float hh = col.half_height * sx_sy_sz.y;
+        const glm::vec3 top = center + ax1 * hh;
+        const glm::vec3 bot = center - ax1 * hh;
+        draw_circle(top, ax0, ax2, r);
+        draw_circle(bot, ax0, ax2, r);
+        draw_segment(top + ax0 * r, bot + ax0 * r);
+        draw_segment(top - ax0 * r, bot - ax0 * r);
+        draw_segment(top + ax2 * r, bot + ax2 * r);
+        draw_segment(top - ax2 * r, bot - ax2 * r);
+        return;
+    }
+
+    if (col.shape == ColliderShape::auto_bounds &&
+        kind == SceneNodeKind::model) {
+        if (const auto bounds = renderer.editor_node_bounds(node_id)) {
+            const glm::vec3 offset =
+                c0 * col.center_offset.x +
+                c1 * col.center_offset.y +
+                c2 * col.center_offset.z;
+            draw_obb(
+                bounds->center + offset,
+                glm::vec3(1.0F, 0.0F, 0.0F),
+                glm::vec3(0.0F, 1.0F, 0.0F),
+                glm::vec3(0.0F, 0.0F, 1.0F),
+                bounds->extent);
+            return;
+        }
+    }
+
+    if (col.shape == ColliderShape::auto_bounds &&
+        kind == SceneNodeKind::ground) {
+        draw_obb(
+            center - ax1 * 0.25F,
+            ax0,
+            ax1,
+            ax2,
+            glm::vec3(sx_sy_sz.x, 0.25F, sx_sy_sz.z));
+        return;
+    }
+
+    const glm::vec3 local_ext =
+        (col.shape == ColliderShape::auto_bounds && kind == SceneNodeKind::cube)
+            ? glm::vec3(1.0F)
+            : col.half_extents;
+    draw_obb(center, ax0, ax1, ax2, local_ext * sx_sy_sz);
+}
+
+} // namespace
 
 void EditorUi::build_viewport(
     SceneDocument& scene,
@@ -2866,6 +3211,16 @@ void EditorUi::build_viewport(
                 1.5F);
         }
     }
+
+    draw_collider_wireframe(
+        ImGui::GetWindowDrawList(),
+        scene,
+        renderer,
+        selected_node_,
+        projection * view,
+        image_minimum,
+        image_width,
+        image_height);
 
     bool gizmo_over = false;
     bool gizmo_using = false;

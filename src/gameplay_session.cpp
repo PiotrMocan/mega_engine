@@ -8,12 +8,31 @@
 #include <glm/geometric.hpp>
 #include <glm/gtc/matrix_access.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/trigonometric.hpp>
 
 namespace vcr {
 namespace {
 
 constexpr glm::vec3 player_half_extents{0.45F, 0.9F, 0.3F};
 constexpr float radians_to_degrees = 57.2957795131F;
+
+[[nodiscard]] ModelBoundsProvider make_renderer_bounds_provider(
+    const Renderer* const renderer) noexcept {
+    if (renderer == nullptr) {
+        return {};
+    }
+#if VCR_EDITOR_ENABLED
+    return ModelBoundsProvider{
+        .context = renderer,
+        .query = +[](const void* const ctx,
+                     const SceneNodeId id) noexcept -> std::optional<Bounds> {
+            return static_cast<const Renderer*>(ctx)->editor_node_bounds(id);
+        },
+    };
+#else
+    return {};
+#endif
+}
 
 [[nodiscard]] TransformRows player_transform(
     const glm::vec3 feet_position,
@@ -37,13 +56,16 @@ bool GameplaySession::start(
     const SceneRenderView& initial_view,
     const FlyCamera& startup_camera,
     FlyCamera& output_camera,
-    std::string& error) {
+    std::string& error,
+    const Renderer* const renderer) {
     error.clear();
     if (active_) {
         error = "Gameplay session is already active.";
         return false;
     }
     player_node_ = {};
+    collision_world_.clear();
+    trigger_tracker_.reset();
 
     glm::vec3 movement_forward = startup_camera.forward();
     movement_forward.y = 0.0F;
@@ -55,17 +77,6 @@ bool GameplaySession::start(
     } else {
         movement_forward *= 1.0F / std::sqrt(direction_length_squared);
     }
-
-    const float ground_height = initial_view.has_ground
-        ? initial_view.ground.model_row_1.w
-        : 0.0F;
-    glm::vec3 spawn = startup_camera.position() + movement_forward * 5.0F;
-    spawn.y = ground_height;
-    const float facing_yaw = std::atan2(movement_forward.x, movement_forward.z);
-    character_ = CharacterController(CharacterConfig{
-        .ground_height = ground_height,
-    });
-    character_.reset(spawn, facing_yaw);
 
     player_node_ = scene.create_node("Runtime Player", SceneNodeKind::cube);
     if (!player_node_) {
@@ -79,9 +90,47 @@ bool GameplaySession::start(
         error = "Runtime player handle was not retained by the scene.";
         return false;
     }
+
+    collision_world_.rebuild_from_scene(
+        scene, player_node_, make_renderer_bounds_provider(renderer));
+
+    const float fallback_ground = initial_view.has_ground
+        ? initial_view.ground.model_row_1.w
+        : 0.0F;
+    glm::vec3 spawn = startup_camera.position() + movement_forward * 5.0F;
+    auto sampled_ground = collision_world_.sample_supporting_height(
+        spawn.x,
+        spawn.z,
+        startup_camera.position().y,
+        200.0F);
+    if (!sampled_ground) {
+        sampled_ground = collision_world_.sample_supporting_height(
+            spawn.x,
+            spawn.z,
+            startup_camera.position().y + 24.0F,
+            224.0F);
+    }
+    spawn.y = sampled_ground.value_or(fallback_ground);
+
+    character_ = CharacterController(CharacterConfig{
+        .ground_height = fallback_ground,
+    });
+    const float walkable_cos = std::cos(
+        glm::radians(character_.config().max_slope_degrees));
+    spawn = collision_world_
+                .resolve_capsule(
+                    spawn,
+                    character_.config().capsule_radius,
+                    character_.config().capsule_height,
+                    walkable_cos)
+                .resolved_feet;
+
+    const float facing_yaw = std::atan2(movement_forward.x, movement_forward.z);
+    character_.reset(spawn, facing_yaw);
+
     SceneNode& player = player_node->get();
     player.transform.translation =
-        spawn + glm::vec3(0.0F, player_half_extents.y, 0.0F);
+        character_.position() + glm::vec3(0.0F, player_half_extents.y, 0.0F);
     player.transform.rotation_degrees.y = facing_yaw * radians_to_degrees;
     player.transform.scale = player_half_extents;
     player.material = PbrMaterial{
@@ -91,11 +140,19 @@ bool GameplaySession::start(
         .ambient_occlusion = 1.0F,
     };
     scene.mark_content_changed();
+    cached_content_revision_ = scene.content_revision();
+    cached_structure_revision_ = scene.structure_revision();
+
+    trigger_tracker_.update(
+        collision_world_,
+        character_.position(),
+        character_.config().capsule_radius,
+        character_.config().capsule_height);
 
     const glm::vec3 startup_forward = startup_camera.forward();
     camera_.reset(std::atan2(startup_forward.z, startup_forward.x));
     output_camera = FlyCamera(
-        camera_.position(character_.position()),
+        camera_.position(character_.position(), collision_world_),
         camera_.yaw(),
         camera_.pitch());
     active_ = true;
@@ -105,30 +162,50 @@ bool GameplaySession::start(
 bool GameplaySession::update(
     const GameplayFrameInput& input,
     const float delta_seconds,
+    const SceneDocument& scene,
     Renderer& renderer,
     FlyCamera& output_camera) noexcept {
     if (!active_) {
         return false;
     }
+    if (scene.content_revision() != cached_content_revision_ ||
+        scene.structure_revision() != cached_structure_revision_) {
+        collision_world_.rebuild_from_scene(
+            scene, player_node_, make_renderer_bounds_provider(&renderer));
+        cached_content_revision_ = scene.content_revision();
+        cached_structure_revision_ = scene.structure_revision();
+    }
+
     camera_.rotate(input.mouse_delta_x, input.mouse_delta_y);
     character_.update(
         input.character,
         camera_.planar_forward(),
-        delta_seconds);
+        delta_seconds,
+        collision_world_);
+    trigger_tracker_.update(
+        collision_world_,
+        character_.position(),
+        character_.config().capsule_radius,
+        character_.config().capsule_height);
+
     if (!renderer.set_runtime_transform(
             player_node_,
             player_transform(character_.position(), character_.facing_yaw()))) {
         return false;
     }
     output_camera = FlyCamera(
-        camera_.position(character_.position()),
+        camera_.position(character_.position(), collision_world_),
         camera_.yaw(),
         camera_.pitch());
     return true;
 }
 
 void GameplaySession::stop() noexcept {
+    collision_world_.clear();
+    trigger_tracker_.reset();
     player_node_ = {};
+    cached_content_revision_ = 0U;
+    cached_structure_revision_ = 0U;
     active_ = false;
 }
 

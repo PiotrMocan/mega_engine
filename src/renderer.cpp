@@ -4,6 +4,7 @@
 
 #include "pbr_material.hpp"
 #include "model_lod.hpp"
+#include "terrain_height.hpp"
 #include "vulkan_common.hpp"
 
 #include <SDL3/SDL.h>
@@ -392,33 +393,7 @@ static_assert(terrain_triangle_count == 98'304U);
 static_assert(terrain_index_count == 98'879U);
 
 float landscape_height(const float x, const float z) noexcept {
-    const auto hill =
-        [](const float position_x,
-           const float position_z,
-           const float center_x,
-           const float center_z,
-           const float radius_x,
-           const float radius_z,
-           const float height) noexcept {
-            const float normalized_x =
-                (position_x - center_x) / radius_x;
-            const float normalized_z =
-                (position_z - center_z) / radius_z;
-            return height * std::exp(
-                -(normalized_x * normalized_x +
-                  normalized_z * normalized_z));
-        };
-
-    const float rolling_hills =
-        0.65F * std::sin(x * 0.21F) * std::cos(z * 0.17F) +
-        0.35F * std::sin(x * 0.47F + z * 0.29F);
-    const float mountain_range =
-        hill(x, z, -13.0F, -10.0F, 7.5F, 10.5F, 6.8F) +
-        hill(x, z, 12.0F, -17.0F, 6.5F, 8.0F, 4.8F) +
-        hill(x, z, 2.0F, -25.0F, 13.0F, 5.0F, 2.4F);
-    const float valley =
-        hill(x, z, 0.0F, -5.0F, 5.0F, 16.0F, -1.25F);
-    return rolling_hills + mountain_range + valley;
+    return procedural_landscape_height(x, z);
 }
 
 std::int16_t pack_snorm16(const float value) noexcept {

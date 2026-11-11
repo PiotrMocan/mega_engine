@@ -110,7 +110,7 @@ performance benchmark используется изолированный `vulka
 - `Scene Hierarchy`: иерархический forest с generational handles,
   работающими chevrons, `Expand all`/`Collapse all`, drag-and-drop reparenting,
   защитой от циклов, фильтром и clipped-отрисовкой.
-- `Inspector`: имя, visibility и position/rotation/scale для всех nodes;
+- `Inspector`: имя, персистентный `UUID` (с кнопкой копирования), visibility и position/rotation/scale для всех nodes; компонент `Collision` (`Auto Bounds`/`Box`/`Sphere`/`Capsule`, `Trigger`, offset, размеры, слои) с 3D wireframe-отображением в `Scene View`;
   asset path для model
   nodes; PBR base color, metallic, roughness и ambient occlusion для
   cubes/ground. Terrain, sky и sun visibility уже

@@ -6,11 +6,20 @@
 #include <limits>
 #include <utility>
 
-#include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 namespace vcr {
 namespace {
+
+[[nodiscard]] std::size_t hash_scene_uuid(const SceneUuid uuid) noexcept {
+    std::uint64_t mixed =
+        uuid.high ^ (uuid.low * 0x9E3779B97F4A7C15ULL);
+    mixed ^= mixed >> 33U;
+    mixed *= 0xFF51AFD7ED558CCDULL;
+    mixed ^= mixed >> 33U;
+    return static_cast<std::size_t>(mixed);
+}
 
 [[nodiscard]] bool finite_transform(
     const SceneTransform& transform) noexcept {
@@ -159,8 +168,25 @@ SceneNodeId SceneDocument::create_node(
     std::string name,
     const SceneNodeKind kind,
     const SceneNodeId parent_id) {
-    if (live_count_ >= max_scene_nodes ||
-        name.size() > max_scene_node_name_bytes) {
+    SceneUuid generated = generate_scene_uuid();
+    for (std::uint32_t attempt = 0U;
+         find_by_uuid(generated) && attempt < 64U;
+         ++attempt) {
+        generated = generate_scene_uuid();
+    }
+    return create_node_with_uuid(
+        std::move(name), kind, generated, parent_id);
+}
+
+SceneNodeId SceneDocument::create_node_with_uuid(
+    std::string name,
+    const SceneNodeKind kind,
+    const SceneUuid node_uuid,
+    const SceneNodeId parent_id) {
+    if (!node_uuid ||
+        live_count_ >= max_scene_nodes ||
+        name.size() > max_scene_node_name_bytes ||
+        find_by_uuid(node_uuid)) {
         return {};
     }
     const std::uint32_t parent_index = parent_id
@@ -171,6 +197,8 @@ SceneNodeId SceneDocument::create_node(
     if (parent_id && parent_index == invalid_scene_node_index) {
         return {};
     }
+
+    ensure_uuid_table_capacity();
 
     std::uint32_t index = invalid_scene_node_index;
     if (!free_indices_.empty()) {
@@ -185,6 +213,7 @@ SceneNodeId SceneDocument::create_node(
     }
 
     Slot& slot = slots_[index];
+    slot.uuid = node_uuid;
     slot.value = SceneNode{
         .name = std::move(name),
         .asset_path = {},
@@ -200,6 +229,7 @@ SceneNodeId SceneDocument::create_node(
     slot.alive = true;
     slot.world_visible = true;
     link_last(index, parent_index);
+    insert_uuid_bucket(node_uuid, index);
     ++live_count_;
     ++structure_revision_;
     ++content_revision_;
@@ -228,6 +258,9 @@ bool SceneDocument::destroy_subtree(const SceneNodeId id) {
          iterator != traversal_scratch_.rend();
          ++iterator) {
         Slot& slot = slots_[*iterator];
+        erase_uuid_bucket(slot.uuid, *iterator);
+        colliders_.remove_slot(*iterator);
+        slot.uuid = {};
         slot.value = {};
         slot.world_matrix = glm::mat4(1.0F);
         slot.parent = invalid_scene_node_index;
@@ -302,6 +335,37 @@ bool SceneDocument::valid(const SceneNodeId id) const noexcept {
            slots_[id.index].generation == id.generation;
 }
 
+std::optional<SceneUuid> SceneDocument::uuid(
+    const SceneNodeId id) const noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return slots_[id.index].uuid;
+}
+
+SceneNodeId SceneDocument::find_by_uuid(
+    const SceneUuid target) const noexcept {
+    if (!target || uuid_buckets_.empty()) {
+        return {};
+    }
+    const std::size_t mask = uuid_buckets_.size() - 1U;
+    std::size_t pos = hash_scene_uuid(target) & mask;
+    for (std::size_t step = 0U; step < uuid_buckets_.size(); ++step) {
+        const std::uint32_t entry = uuid_buckets_[pos];
+        if (entry == uuid_bucket_empty) {
+            return {};
+        }
+        if (entry != uuid_bucket_tombstone &&
+            entry < slots_.size() &&
+            slots_[entry].alive &&
+            slots_[entry].uuid == target) {
+            return id_for_index(entry);
+        }
+        pos = (pos + 1U) & mask;
+    }
+    return {};
+}
+
 std::optional<std::reference_wrapper<SceneNode>>
 SceneDocument::node(const SceneNodeId id) noexcept {
     if (!valid(id)) {
@@ -323,6 +387,51 @@ SceneNodeId SceneDocument::parent(const SceneNodeId id) const noexcept {
         return {};
     }
     return id_for_index(slots_[id.index].parent);
+}
+
+bool SceneDocument::set_collider(
+    const SceneNodeId id,
+    const ColliderComponent& collider_value) {
+    if (!valid(id) || !valid_collider_component(collider_value)) {
+        return false;
+    }
+    if (const auto existing = colliders_.get(id);
+        existing && existing->get() == collider_value) {
+        return true;
+    }
+    if (!colliders_.upsert(id, collider_value)) {
+        return false;
+    }
+    ++content_revision_;
+    return true;
+}
+
+bool SceneDocument::remove_collider(const SceneNodeId id) noexcept {
+    if (!valid(id) || !colliders_.remove(id)) {
+        return false;
+    }
+    ++content_revision_;
+    return true;
+}
+
+bool SceneDocument::has_collider(const SceneNodeId id) const noexcept {
+    return valid(id) && colliders_.contains(id);
+}
+
+std::optional<std::reference_wrapper<const ColliderComponent>>
+SceneDocument::collider(const SceneNodeId id) const noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return colliders_.get(id);
+}
+
+std::optional<std::reference_wrapper<ColliderComponent>>
+SceneDocument::collider_mut(const SceneNodeId id) noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return colliders_.get_mut(id);
 }
 
 void SceneDocument::mark_content_changed() noexcept {
@@ -375,6 +484,7 @@ void SceneDocument::build_node_records(
     std::uint32_t index = first_root_;
     std::uint32_t depth = 0U;
     while (index != invalid_scene_node_index) {
+        const SceneNodeId current_id = id_for_index(index);
         const std::uint32_t record_index =
             static_cast<std::uint32_t>(output.size());
         const std::uint32_t parent_record =
@@ -382,15 +492,74 @@ void SceneDocument::build_node_records(
             ? invalid_scene_node_index
             : ancestor_records[
                   static_cast<std::size_t>(depth - 1U)];
+        std::optional<ColliderComponent> node_collider{};
+        if (const auto attached = colliders_.get(current_id)) {
+            node_collider = attached->get();
+        }
         output.push_back(SceneNodeRecord{
-            .id = id_for_index(index),
+            .id = current_id,
+            .uuid = slots_[index].uuid,
             .value = slots_[index].value,
+            .collider = node_collider,
             .parent_record_index = parent_record,
         });
         if (ancestor_records.size() <= depth) {
             ancestor_records.push_back(record_index);
         } else {
             ancestor_records[depth] = record_index;
+        }
+        index = traversal_next(index, depth, true);
+    }
+}
+
+void SceneDocument::build_world_nodes(
+    std::vector<SceneWorldNode>& output,
+    std::vector<std::uint32_t>& ancestor_scratch) const {
+    output.clear();
+    ancestor_scratch.clear();
+    if (output.capacity() < live_count_) {
+        output.reserve(live_count_);
+    }
+    if (ancestor_scratch.capacity() < live_count_) {
+        ancestor_scratch.reserve(live_count_);
+    }
+
+    std::uint32_t index = first_root_;
+    std::uint32_t depth = 0U;
+    while (index != invalid_scene_node_index) {
+        const Slot& slot = slots_[index];
+        bool world_visible = slot.value.visible;
+        glm::mat4 world_matrix(1.0F);
+        if (!finite_transform(slot.value.transform)) {
+            world_visible = false;
+        } else {
+            world_matrix = local_matrix(slot.value.transform);
+            if (depth > 0U) {
+                const SceneWorldNode& parent_world =
+                    output[ancestor_scratch[depth - 1U]];
+                world_matrix =
+                    parent_world.world_matrix * world_matrix;
+                world_visible =
+                    world_visible && parent_world.world_visible;
+            }
+            if (!finite_matrix(world_matrix)) {
+                world_matrix = glm::mat4(1.0F);
+                world_visible = false;
+            }
+        }
+        const auto record_index =
+            static_cast<std::uint32_t>(output.size());
+        output.push_back(SceneWorldNode{
+            .id = id_for_index(index),
+            .uuid = slot.uuid,
+            .world_matrix = world_matrix,
+            .kind = slot.value.kind,
+            .world_visible = world_visible,
+        });
+        if (ancestor_scratch.size() <= depth) {
+            ancestor_scratch.push_back(record_index);
+        } else {
+            ancestor_scratch[depth] = record_index;
         }
         index = traversal_next(index, depth, true);
     }
@@ -556,21 +725,34 @@ std::uint32_t SceneDocument::local_light_count() const noexcept {
 }
 
 SceneDocument SceneDocument::make_default() {
+    constexpr std::uint64_t default_scene_seed =
+        0x5643525F44464C54ULL;
+    std::uint64_t next_uuid_seq = 1U;
     SceneDocument scene;
-    const SceneNodeId world = scene.create_node(
+    const auto make_node = [&](std::string name,
+                               const SceneNodeKind kind,
+                               const SceneNodeId parent_node = {}) {
+        return scene.create_node_with_uuid(
+            std::move(name),
+            kind,
+            deterministic_scene_uuid(
+                default_scene_seed, next_uuid_seq++),
+            parent_node);
+    };
+    const SceneNodeId world = make_node(
         "World", SceneNodeKind::folder);
-    const SceneNodeId environment = scene.create_node(
+    const SceneNodeId environment = make_node(
         "Environment", SceneNodeKind::folder, world);
-    static_cast<void>(scene.create_node(
+    static_cast<void>(make_node(
         "Sky", SceneNodeKind::environment, environment));
-    static_cast<void>(scene.create_node(
+    static_cast<void>(make_node(
         "Sun", SceneNodeKind::directional_light, environment));
-    static_cast<void>(scene.create_node(
+    static_cast<void>(make_node(
         "Landscape", SceneNodeKind::terrain, world));
 
-    const SceneNodeId geometry = scene.create_node(
+    const SceneNodeId geometry = make_node(
         "Geometry", SceneNodeKind::folder, world);
-    const SceneNodeId ground = scene.create_node(
+    const SceneNodeId ground = make_node(
         "Ground", SceneNodeKind::ground, geometry);
     if (auto value = scene.node(ground)) {
         value->get().transform.translation =
@@ -603,7 +785,7 @@ SceneDocument SceneDocument::make_default() {
         {4.0F, 4.6F, -26.0F},
     }};
     for (std::size_t index = 0U; index < positions.size(); ++index) {
-        const SceneNodeId cube = scene.create_node(
+        const SceneNodeId cube = make_node(
             "Cube " + std::to_string(index + 1U),
             SceneNodeKind::cube,
             geometry);
@@ -632,10 +814,89 @@ SceneDocument SceneDocument::make_default() {
             };
         }
     }
-    static_cast<void>(scene.create_node(
+    static_cast<void>(make_node(
         "Main Camera", SceneNodeKind::camera, world));
     scene.mark_content_changed();
     return scene;
+}
+
+void SceneDocument::ensure_uuid_table_capacity() {
+    constexpr std::size_t minimum_buckets = 64U;
+    if (uuid_buckets_.empty()) {
+        rehash_uuid_table(minimum_buckets);
+        return;
+    }
+    const std::size_t occupied =
+        static_cast<std::size_t>(live_count_) + 1U + uuid_tombstones_;
+    if (occupied * 10U < uuid_buckets_.size() * 7U) {
+        return;
+    }
+    const std::size_t target_live =
+        static_cast<std::size_t>(live_count_) + 1U;
+    std::size_t next_capacity = uuid_buckets_.size();
+    while (target_live * 10U >= next_capacity * 5U) {
+        next_capacity *= 2U;
+    }
+    rehash_uuid_table(next_capacity);
+}
+
+void SceneDocument::rehash_uuid_table(const std::size_t new_capacity) {
+    uuid_buckets_.assign(new_capacity, uuid_bucket_empty);
+    uuid_tombstones_ = 0U;
+    for (std::uint32_t index = 0U;
+         index < static_cast<std::uint32_t>(slots_.size());
+         ++index) {
+        if (slots_[index].alive && slots_[index].uuid) {
+            insert_uuid_bucket(slots_[index].uuid, index);
+        }
+    }
+}
+
+void SceneDocument::insert_uuid_bucket(
+    const SceneUuid node_uuid,
+    const std::uint32_t index) noexcept {
+    if (!node_uuid || uuid_buckets_.empty()) {
+        return;
+    }
+    const std::size_t mask = uuid_buckets_.size() - 1U;
+    std::size_t pos = hash_scene_uuid(node_uuid) & mask;
+    for (std::size_t step = 0U; step < uuid_buckets_.size(); ++step) {
+        const std::uint32_t entry = uuid_buckets_[pos];
+        if (entry == uuid_bucket_empty) {
+            uuid_buckets_[pos] = index;
+            return;
+        }
+        if (entry == uuid_bucket_tombstone) {
+            uuid_buckets_[pos] = index;
+            if (uuid_tombstones_ > 0U) {
+                --uuid_tombstones_;
+            }
+            return;
+        }
+        pos = (pos + 1U) & mask;
+    }
+}
+
+void SceneDocument::erase_uuid_bucket(
+    const SceneUuid node_uuid,
+    const std::uint32_t index) noexcept {
+    if (!node_uuid || uuid_buckets_.empty()) {
+        return;
+    }
+    const std::size_t mask = uuid_buckets_.size() - 1U;
+    std::size_t pos = hash_scene_uuid(node_uuid) & mask;
+    for (std::size_t step = 0U; step < uuid_buckets_.size(); ++step) {
+        const std::uint32_t entry = uuid_buckets_[pos];
+        if (entry == uuid_bucket_empty) {
+            return;
+        }
+        if (entry == index) {
+            uuid_buckets_[pos] = uuid_bucket_tombstone;
+            ++uuid_tombstones_;
+            return;
+        }
+        pos = (pos + 1U) & mask;
+    }
 }
 
 SceneNodeId SceneDocument::id_for_index(
