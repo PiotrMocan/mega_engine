@@ -1,0 +1,34 @@
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D srcDepth;
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D dstMip;
+
+layout(push_constant) uniform PushConstants {
+    uvec2 srcSize;
+    uvec2 dstSize;
+} push;
+
+void main() {
+    const uvec2 dstCoord = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(dstCoord, push.dstSize))) {
+        return;
+    }
+
+    const uvec2 base = dstCoord * 2u;
+    const uint tapsX = (push.srcSize.x > 1u && (push.srcSize.x & 1u) != 0u) ? 3u : 2u;
+    const uint tapsY = (push.srcSize.y > 1u && (push.srcSize.y & 1u) != 0u) ? 3u : 2u;
+
+    // Reverse-Z depth: 1.0 is near, 0.0 is far/sky. Conservative occlusion
+    // requires the farthest (minimum) depth across the covered source footprint.
+    float minDepth = 1.0;
+    for (uint dy = 0u; dy < tapsY; ++dy) {
+        for (uint dx = 0u; dx < tapsX; ++dx) {
+            const ivec2 sampleCoord = ivec2(min(base + uvec2(dx, dy), push.srcSize - 1u));
+            minDepth = min(minDepth, texelFetch(srcDepth, sampleCoord, 0).r);
+        }
+    }
+
+    imageStore(dstMip, ivec2(dstCoord), vec4(minDepth, 0.0, 0.0, 0.0));
+}

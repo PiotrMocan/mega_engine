@@ -185,6 +185,22 @@ void GpuTexture::create_multisampled_render_target(
         debug_name, 1U, samples);
 }
 
+void GpuTexture::create_storage_pyramid(
+    VulkanContext& context,
+    const std::uint32_t width,
+    const std::uint32_t height,
+    const std::uint32_t mip_levels,
+    const VkFormat format,
+    const std::string_view debug_name) {
+    create_impl(
+        context, width, height, mip_levels, format,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT, VK_FILTER_NEAREST,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        VK_FALSE, VK_COMPARE_OP_ALWAYS, VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK,
+        debug_name, 1U, VK_SAMPLE_COUNT_1_BIT, false);
+}
+
 void GpuTexture::create_volume(VulkanContext &context, std::uint32_t size, std::uint32_t mips,
                                VkFormat format, std::string_view name) {
     // Use depth >= 2 so the view remains 3D even for the disabled dummy volume.
@@ -222,7 +238,7 @@ void GpuTexture::create_impl(VulkanContext &context, const std::uint32_t width,
                              const VkSamplerAddressMode address_mode, const VkBool32 compare_enable,
                              const VkCompareOp compare_op, const VkBorderColor border_color,
                              const std::string_view debug_name, const std::uint32_t depth,
-                             const VkSampleCountFlagBits samples) {
+                             const VkSampleCountFlagBits samples, const bool linear_mipmaps) {
     destroy();
     if (width == 0U || height == 0U || mip_levels == 0U) {
         fatal("Attempted to create a zero-sized GPU texture.");
@@ -330,9 +346,10 @@ void GpuTexture::create_impl(VulkanContext &context, const std::uint32_t width,
         .flags = 0,
         .magFilter = filter,
         .minFilter = filter,
-        .mipmapMode = mip_levels > 1U
-            ? VK_SAMPLER_MIPMAP_MODE_LINEAR
-            : VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        // Nearest mipmap mode is used by integer/Hi-Z pyramids.
+
+
+        .mipmapMode = (mip_levels > 1U && linear_mipmaps) ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST,
         .addressModeU = address_mode,
         .addressModeV = address_mode,
         .addressModeW = address_mode,

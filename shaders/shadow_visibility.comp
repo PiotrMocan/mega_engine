@@ -1,0 +1,152 @@
+#version 450
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0, std140) uniform ShadowUniforms {
+    vec4 cascadePlanes[24];
+    vec4 cascadePixelsPerMeter;
+    uvec4 config; // x: sourceCount, y: groupCount, z: cascadeMask, w: lodEnabled
+    vec4 params;  // x: lodPixelError
+} shadowConfig;
+
+struct Instance {
+    vec4 row0, row1, row2, color, material;
+    float indexOfRefraction; uint shadingModel; uint subsurfaceProfile; float subsurfaceStrength;
+    vec4 previous0, previous1, previous2;
+};
+
+struct Source {
+    vec4 center;
+    vec4 extent;
+};
+
+struct Group {
+    uvec4 range;
+    uvec4 counts;
+    uvec4 firsts;
+    vec4 errors;
+};
+
+struct Draw {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int vertexOffset;
+    uint firstInstance;
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer Instances { Instance instances[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Sources { Source sources[]; };
+layout(set = 0, binding = 3, std430) readonly buffer Groups { Group groups[]; };
+layout(set = 0, binding = 4, std430) buffer Visible { uint counters[8]; uint indices[]; };
+layout(set = 0, binding = 5, std430) buffer ShadowCommands { Draw draws[]; };
+
+shared uint localCounts[4][4];
+shared uint reservations[4][4];
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint id = gl_GlobalInvocationID.x;
+    const uint sourceCount = shadowConfig.config.x;
+    const uint groupCount = shadowConfig.config.y;
+    const uint cascadeMask = shadowConfig.config.z;
+
+    if (lane < 16u) {
+        localCounts[lane >> 2u][lane & 3u] = 0u;
+    }
+    barrier();
+
+    uint visibleMask = 0u;
+    uint groupIndex = 0u;
+    uvec4 chosenLod = uvec4(0u);
+    uvec4 localOffset = uvec4(0u);
+    Group group;
+
+    if (id < sourceCount) {
+        const Instance instance = instances[id];
+        const Source source = sources[id];
+        const vec4 local = vec4(source.center.xyz, 1.0);
+        const vec3 center = vec3(
+            dot(instance.row0, local),
+            dot(instance.row1, local),
+            dot(instance.row2, local));
+        const vec3 extent = vec3(
+            dot(abs(instance.row0.xyz), source.extent.xyz),
+            dot(abs(instance.row1.xyz), source.extent.xyz),
+            dot(abs(instance.row2.xyz), source.extent.xyz));
+        const float scale = sqrt(
+            dot(instance.row0.xyz, instance.row0.xyz) +
+            dot(instance.row1.xyz, instance.row1.xyz) +
+            dot(instance.row2.xyz, instance.row2.xyz));
+
+        groupIndex = uint(source.center.w);
+        group = groups[groupIndex];
+        const bool allowLod = shadowConfig.config.w != 0u && group.range.w == 0u;
+
+        for (uint c = 0u; c < 4u; ++c) {
+            if ((cascadeMask & (1u << c)) == 0u) {
+                continue;
+            }
+            bool inside = true;
+            for (uint p = 0u; p < 6u; ++p) {
+                const vec4 plane = shadowConfig.cascadePlanes[c * 6u + p];
+                if (dot(plane.xyz, center) + plane.w + dot(abs(plane.xyz), extent) < -1e-4) {
+                    inside = false;
+                    break;
+                }
+            }
+            if (!inside) {
+                continue;
+            }
+
+            uint lod = 0u;
+            if (allowLod) {
+                const float ppm = shadowConfig.cascadePixelsPerMeter[c];
+                const float budget = shadowConfig.params.x;
+                for (uint i = 1u; i < 4u; ++i) {
+                    if (!isinf(group.errors[i]) &&
+                        (group.counts[i] > 0u || group.errors[i] > 0.0) &&
+                        group.errors[i] * scale * ppm <= budget) {
+                        lod = i;
+                    }
+                }
+            }
+            if (group.counts[lod] > 0u) {
+                visibleMask |= (1u << c);
+                chosenLod[c] = lod;
+                localOffset[c] = atomicAdd(localCounts[c][lod], 1u);
+            }
+        }
+    }
+    barrier();
+
+    const uint first = gl_WorkGroupID.x * 128u;
+    const uint commonGroup = uint(sources[first].center.w);
+    const bool homogeneous =
+        commonGroup == uint(sources[min(first + 127u, sourceCount - 1u)].center.w);
+    if (homogeneous && lane < 16u) {
+        const uint c = lane >> 2u;
+        const uint l = lane & 3u;
+        const uint count = localCounts[c][l];
+        if (count > 0u) {
+            reservations[c][l] = atomicAdd(
+                draws[(c * groupCount + commonGroup) * 4u + l].instanceCount, count);
+        }
+    }
+    barrier();
+
+    if (visibleMask != 0u) {
+        for (uint c = 0u; c < 4u; ++c) {
+            if ((visibleMask & (1u << c)) == 0u) {
+                continue;
+            }
+            const uint l = chosenLod[c];
+            const uint commandIndex = (c * groupCount + groupIndex) * 4u + l;
+            const uint dst = homogeneous
+                ? reservations[c][l] + localOffset[c]
+                : atomicAdd(draws[commandIndex].instanceCount, 1u);
+            const uint firstInstance = (4u + c * 4u + l) * sourceCount + group.range.x;
+            indices[firstInstance + dst] = id;
+        }
+    }
+}

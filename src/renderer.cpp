@@ -3008,6 +3008,18 @@ void Renderer::detect_msaa_support() {
     fog_supported_ = (sampled_depth & VK_SAMPLE_COUNT_1_BIT) != 0U &&
         (hdr_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) != 0U &&
         (resolve_properties.supportedDepthResolveModes & VK_RESOLVE_MODE_SAMPLE_ZERO_BIT) != 0U;
+    VkFormatProperties r32_properties{};
+    vkGetPhysicalDeviceFormatProperties(
+        context_->physical_device(), VK_FORMAT_R32_SFLOAT, &r32_properties);
+    constexpr VkFormatFeatureFlags hiz_features =
+        VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    hiz_supported_ = (sampled_depth & VK_SAMPLE_COUNT_1_BIT) != 0U &&
+        (r32_properties.optimalTilingFeatures & hiz_features) == hiz_features &&
+        limits.maxComputeWorkGroupInvocations >= 64U &&
+        limits.maxComputeWorkGroupSize[0] >= 8U &&
+        limits.maxComputeWorkGroupSize[1] >= 8U;
+    hiz_msaa_min_resolve_ =
+        (resolve_properties.supportedDepthResolveModes & VK_RESOLVE_MODE_MIN_BIT) != 0U;
 }
 
 void Renderer::prepare_msaa_targets_for_frame(const std::size_t frame_index) {
@@ -3088,7 +3100,9 @@ void Renderer::create_anti_aliasing_targets() {
             extent.height,
             swapchain_.depth_format(),
             VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
-                (fog_supported_ ? VK_IMAGE_USAGE_SAMPLED_BIT : VkImageUsageFlags{0U}),
+                ((fog_supported_ || hiz_supported_)
+                     ? VK_IMAGE_USAGE_SAMPLED_BIT
+                     : VkImageUsageFlags{0U}),
             VK_IMAGE_ASPECT_DEPTH_BIT,
             VK_FILTER_NEAREST,
             "AA depth attachment");
@@ -3134,6 +3148,9 @@ void Renderer::create_anti_aliasing_targets() {
             VK_IMAGE_ASPECT_COLOR_BIT, VK_FILTER_NEAREST,
             "motion-blur NeighborMax");
     }
+#if VCR_EDITOR_ENABLED
+    create_hiz_targets();
+#endif
 }
 
 void Renderer::create_subsurface_targets() {
@@ -3172,6 +3189,9 @@ void Renderer::destroy_subsurface_targets() noexcept {
 }
 
 void Renderer::destroy_anti_aliasing_targets() noexcept {
+#if VCR_EDITOR_ENABLED
+    destroy_hiz_targets();
+#endif
     destroy_subsurface_targets();
     for (auto& resources : anti_aliasing_frames_) {
         resources.msaa.depth.destroy();
@@ -3983,6 +4003,13 @@ void Renderer::record_shadow_map(VkCommandBuffer command_buffer, FrameContext &f
                 shadow_layout_ == VK_IMAGE_LAYOUT_UNDEFINED
             ? all_cascades : shadow_matrix_dirty_mask_ & all_cascades;
     if (update_mask == 0) return;
+#if VCR_EDITOR_ENABLED
+    if (frame.shadow_gpu_visibility) {
+        record_shadow_visibility(
+            command_buffer, frame, update_mask, cascades,
+            cascades == 4 ? shadow_map_.width() / 2U : shadow_map_.width());
+    }
+#endif
     const bool partial = update_mask != all_cascades;
     transition_image(
         command_buffer, shadow_map_.image(), VK_IMAGE_ASPECT_DEPTH_BIT, shadow_layout_,
@@ -4074,18 +4101,42 @@ void Renderer::record_shadow_map(VkCommandBuffer command_buffer, FrameContext &f
             const VkBuffer cubes = vertex_buffer_.handle();
             vkCmdBindVertexBuffers(command_buffer, 0, 1, &cubes, &vertex_offset);
             vkCmdBindIndexBuffer(command_buffer, index_buffer_.handle(), 0, VK_INDEX_TYPE_UINT16);
-            if (editor_ground_count_) {
-                vkCmdDrawIndexed(command_buffer, plane_index_count, 1, plane_first_index,
-                                 plane_vertex_offset, 0);
-            }
-            if (editor_cube_count_) {
-                vkCmdDrawIndexed(command_buffer, cube_index_count, editor_cube_count_, 0, 0,
-                                 editor_ground_count_);
+            const VkDeviceSize cascade_indirect_base =
+                VkDeviceSize{cascade} * visibility_groups_.size() * model_lod_count *
+                sizeof(VkDrawIndexedIndirectCommand);
+            if (frame.shadow_gpu_visibility) {
+                if (context_->multi_draw_indirect()) {
+                    vkCmdDrawIndexedIndirect(
+                        command_buffer, frame.visibility.shadow_indirect.handle(),
+                        cascade_indirect_base, 2U,
+                        static_cast<std::uint32_t>(
+                            model_lod_count * sizeof(VkDrawIndexedIndirectCommand)));
+                } else {
+                    vkCmdDrawIndexedIndirect(
+                        command_buffer, frame.visibility.shadow_indirect.handle(),
+                        cascade_indirect_base, 1U, sizeof(VkDrawIndexedIndirectCommand));
+                    vkCmdDrawIndexedIndirect(
+                        command_buffer, frame.visibility.shadow_indirect.handle(),
+                        cascade_indirect_base +
+                            model_lod_count * sizeof(VkDrawIndexedIndirectCommand),
+                        1U, sizeof(VkDrawIndexedIndirectCommand));
+                }
+            } else {
+                if (editor_ground_count_) {
+                    vkCmdDrawIndexed(command_buffer, plane_index_count, 1, plane_first_index,
+                                     plane_vertex_offset, 0);
+                }
+                if (editor_cube_count_) {
+                    vkCmdDrawIndexed(command_buffer, cube_index_count, editor_cube_count_, 0, 0,
+                                     editor_ground_count_);
+                }
             }
             VkPipeline bound_model_shadow_pipeline = VK_NULL_HANDLE;
             VkDescriptorSet bound_shadow_material_set = VK_NULL_HANDLE;
             std::size_t bound_shadow_asset_index = std::numeric_limits<std::size_t>::max();
-            for (const auto &draw : editor_model_draws_) {
+            for (std::size_t draw_index = 0U; draw_index < editor_model_draws_.size();
+                 ++draw_index) {
+                const auto &draw = editor_model_draws_[draw_index];
                 const bool tessellated_draw =
                     model_tessellation_enabled_ &&
                     draw.tessellation.enabled();
@@ -4141,8 +4192,51 @@ void Renderer::record_shadow_map(VkCommandBuffer command_buffer, FrameContext &f
                                          VK_INDEX_TYPE_UINT32);
                     bound_shadow_asset_index = draw.asset_index;
                 }
-                vkCmdDrawIndexed(command_buffer, draw.index_count, draw.instance_count,
-                                 draw.first_index, 0, draw.first_instance);
+                if (frame.shadow_gpu_visibility) {
+                    const VkDeviceSize group_base =
+                        cascade_indirect_base +
+                        (draw_index + 2U) * model_lod_count *
+                            sizeof(VkDrawIndexedIndirectCommand);
+                    if (tessellated_draw) {
+                        vkCmdDrawIndexedIndirect(
+                            command_buffer, frame.visibility.shadow_indirect.handle(),
+                            group_base, 1U, sizeof(VkDrawIndexedIndirectCommand));
+                    } else {
+                        const auto &submesh = asset.submeshes[draw.submesh_index];
+                        std::uint32_t contiguous_lods = 0U;
+                        bool sparse = false;
+                        for (std::size_t lod = 0U; lod < model_lod_count; ++lod) {
+                            if (submesh.lod_count[lod] > 0U) {
+                                if (lod == contiguous_lods) {
+                                    ++contiguous_lods;
+                                } else {
+                                    sparse = true;
+                                }
+                            }
+                        }
+                        if (context_->multi_draw_indirect() && !sparse &&
+                            contiguous_lods > 0U) {
+                            vkCmdDrawIndexedIndirect(
+                                command_buffer, frame.visibility.shadow_indirect.handle(),
+                                group_base, contiguous_lods,
+                                sizeof(VkDrawIndexedIndirectCommand));
+                        } else {
+                            for (std::size_t lod = 0U; lod < model_lod_count; ++lod) {
+                                if (submesh.lod_count[lod] > 0U) {
+                                    vkCmdDrawIndexedIndirect(
+                                        command_buffer,
+                                        frame.visibility.shadow_indirect.handle(),
+                                        group_base +
+                                            lod * sizeof(VkDrawIndexedIndirectCommand),
+                                        1U, sizeof(VkDrawIndexedIndirectCommand));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    vkCmdDrawIndexed(command_buffer, draw.index_count, draw.instance_count,
+                                     draw.first_index, 0, draw.first_instance);
+                }
             }
         }
         if (!authored_scene_enabled_)
@@ -4884,6 +4978,12 @@ void Renderer::update_frame_uniform(
          (!gpu_visibility_active_ || !gpu_visibility_bypassed_))
             ? 1.0F
             : 0.0F;
+    frame.shadow_gpu_visibility = false;
+#if VCR_EDITOR_ENABLED
+    frame.shadow_gpu_visibility = shadow_gpu_visibility_active();
+#endif
+    uniforms.global_rotation.y = frame.shadow_gpu_visibility ? 1.0F : 0.0F;
+    frame.rendered_view_projection = view_projection;
     uniforms.unjittered_view_projection =
         unjittered_view_projection;
     uniforms.previous_unjittered_view_projection =
@@ -4902,6 +5002,7 @@ void Renderer::update_frame_uniform(
         const glm::vec3 camera_position =
             -(inverse_view_rotation * glm::vec3(view_matrix[3]));
         uniforms.inverse_view_projection = glm::inverse(view_projection);
+        frame.rendered_camera_position = camera_position;
         uniforms.camera_position = glm::vec4(camera_position, 1.0F);
     }
 #if VCR_EDITOR_ENABLED
@@ -5627,10 +5728,15 @@ void Renderer::create_pipeline() {
                 // UVs and LOD coverage agree exactly with EQUAL color shading.
                 std::array<VkPipelineShaderStageCreateInfo, 4U> stages{};
                 std::copy_n(source.pStages, source.stageCount, stages.begin());
+                const bool temporal_model =
+                    source.pStages[0].module == cached_shader("editor_model_aa.vert.spv") ||
+                    (source.stageCount == 4U &&
+                     source.pStages[2].module == cached_shader("editor_model_tess_aa.tese.spv"));
                 stages[source.stageCount - 1U] = VkPipelineShaderStageCreateInfo{
                     .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                     .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-                    .module = cached_shader("editor_model_depth.frag.spv"), .pName = "main"};
+                    .module = cached_shader(temporal_model ? "editor_model_depth_temporal.frag.spv"
+                                                          : "editor_model_depth.frag.spv"), .pName = "main"};
                 info.pStages = stages.data();
                 info.pDepthStencilState = &depth_stencil;
                 info.pColorBlendState = &no_color;
@@ -7766,7 +7872,7 @@ void Renderer::record_commands(
         (shadow_dirty_ || shadow_matrix_dirty_mask_ != 0) && mode_ != RunMode::instancing;
     if (frame.shadow_was_updated) {
         if (frame.timestamp_queries != VK_NULL_HANDLE) {
-            vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,
+            vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                  frame.timestamp_queries, timestamp_shadow_begin);
         }
         record_shadow_map(command_buffer, frame);
@@ -7921,11 +8027,20 @@ void Renderer::record_commands(
                                              0, 0, editor_ground_count_);
                         }
                     } else if (gpu_visibility_active_) {
-                        vkCmdDrawIndexedIndirect(command_buffer, frame.visibility.indirect.handle(),
-                                                 0, 1, sizeof(VkDrawIndexedIndirectCommand));
-                        vkCmdDrawIndexedIndirect(command_buffer, frame.visibility.indirect.handle(),
-                                                 3 * sizeof(VkDrawIndexedIndirectCommand), 1,
-                                                 sizeof(VkDrawIndexedIndirectCommand));
+                        if (context_->multi_draw_indirect()) {
+                            vkCmdDrawIndexedIndirect(
+                                command_buffer, frame.visibility.indirect.handle(), 0, 2U,
+                                static_cast<std::uint32_t>(
+                                    model_lod_count * sizeof(VkDrawIndexedIndirectCommand)));
+                        } else {
+                            vkCmdDrawIndexedIndirect(
+                                command_buffer, frame.visibility.indirect.handle(), 0, 1U,
+                                sizeof(VkDrawIndexedIndirectCommand));
+                            vkCmdDrawIndexedIndirect(
+                                command_buffer, frame.visibility.indirect.handle(),
+                                model_lod_count * sizeof(VkDrawIndexedIndirectCommand), 1U,
+                                sizeof(VkDrawIndexedIndirectCommand));
+                        }
                     } else if (frame.scene_ground_count > 0U) {
                         vkCmdDrawIndexed(command_buffer, plane_index_count,
                                          frame.scene_ground_count, plane_first_index,
@@ -8027,13 +8142,42 @@ void Renderer::record_commands(
                         }
                         if (gpu_visibility_active_) {
                             const auto &submesh = asset.submeshes[draw.submesh_index];
-                            for (unsigned lod = 0; lod < 3; ++lod) {
-                                if (submesh.lod_count[lod] > 0) {
+                            const VkDeviceSize group_base =
+                                (draw_index + 2U) * model_lod_count *
+                                sizeof(VkDrawIndexedIndirectCommand);
+                            if (tessellated_draw) {
+                                vkCmdDrawIndexedIndirect(
+                                    command_buffer, frame.visibility.indirect.handle(),
+                                    group_base, 1U, sizeof(VkDrawIndexedIndirectCommand));
+                            } else {
+                                std::uint32_t contiguous_lods = 0U;
+                                bool sparse = false;
+                                for (std::size_t lod = 0U; lod < model_lod_count; ++lod) {
+                                    if (submesh.lod_count[lod] > 0U) {
+                                        if (lod == contiguous_lods) {
+                                            ++contiguous_lods;
+                                        } else {
+                                            sparse = true;
+                                        }
+                                    }
+                                }
+                                if (context_->multi_draw_indirect() && !sparse &&
+                                    contiguous_lods > 0U) {
                                     vkCmdDrawIndexedIndirect(
                                         command_buffer, frame.visibility.indirect.handle(),
-                                        ((draw_index + 2) * 3 + lod) *
-                                            sizeof(VkDrawIndexedIndirectCommand),
-                                        1, sizeof(VkDrawIndexedIndirectCommand));
+                                        group_base, contiguous_lods,
+                                        sizeof(VkDrawIndexedIndirectCommand));
+                                } else {
+                                    for (std::size_t lod = 0U; lod < model_lod_count; ++lod) {
+                                        if (submesh.lod_count[lod] > 0U) {
+                                            vkCmdDrawIndexedIndirect(
+                                                command_buffer,
+                                                frame.visibility.indirect.handle(),
+                                                group_base +
+                                                    lod * sizeof(VkDrawIndexedIndirectCommand),
+                                                1U, sizeof(VkDrawIndexedIndirectCommand));
+                                        }
+                                    }
                                 }
                             }
                         } else {
@@ -8407,6 +8551,9 @@ void Renderer::record_commands(
         (!lighting_settings_.dynamic || mode_ == RunMode::instancing) &&
         !subsurface_active && !motion_blur_active && !atmospheric_fog_active) {
 #if VCR_EDITOR_ENABLED
+        hiz_valid_ = false;
+#endif
+#if VCR_EDITOR_ENABLED
         if (editor_frame) {
             transition_tracked_image(
                 command_buffer,
@@ -8617,7 +8764,17 @@ void Renderer::record_commands(
                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                     VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
         }
-        if (!multisampled || atmospheric_fog_active) {
+        bool hiz_build_this_frame = false;
+#if VCR_EDITOR_ENABLED
+        hiz_build_this_frame =
+            should_use_hiz_occlusion() &&
+            (!hiz_valid_ || hiz_view_projection_ != frame.rendered_view_projection ||
+             hiz_source_extent_.width != current_render_extent_.width ||
+             hiz_source_extent_.height != current_render_extent_.height ||
+             hiz_runtime_revision_ != runtime_transforms_.revision() ||
+             hiz_document_revision_ != editor_scene_revision_);
+#endif
+        if (!multisampled || atmospheric_fog_active || hiz_build_this_frame) {
             transition_tracked_image(
                 command_buffer,
                 aa_resources.depth_attachment,
@@ -8626,7 +8783,8 @@ void Renderer::record_commands(
                 VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
                     VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
                     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
-                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
                     VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
                 VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
@@ -8702,13 +8860,18 @@ void Renderer::record_commands(
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .imageView = offscreen_depth_view,
             .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-            .resolveMode = multisampled && atmospheric_fog_active
-                ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_NONE,
-            .resolveImageView = multisampled && atmospheric_fog_active
+            .resolveMode = multisampled
+                ? (atmospheric_fog_active
+                       ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT
+                       : (hiz_build_this_frame ? VK_RESOLVE_MODE_MIN_BIT
+                                               : VK_RESOLVE_MODE_NONE))
+                : VK_RESOLVE_MODE_NONE,
+            .resolveImageView = multisampled &&
+                    (atmospheric_fog_active || hiz_build_this_frame)
                 ? aa_resources.depth_attachment.view() : VK_NULL_HANDLE,
             .resolveImageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
             .loadOp = depth_prepass_ == DepthPrepass::off ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
-            .storeOp = atmospheric_fog_active && !multisampled
+            .storeOp = (atmospheric_fog_active || hiz_build_this_frame) && !multisampled
                 ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
             .clearValue = VkClearValue{.depthStencil = {0.0F, 0}},
         };
@@ -8832,6 +8995,11 @@ void Renderer::record_commands(
         }
 
         record_fog(command_buffer, aa_resources, current_render_extent_);
+#if VCR_EDITOR_ENABLED
+        if (hiz_build_this_frame) {
+            record_hiz_pyramid(command_buffer, frame, aa_resources, current_render_extent_);
+        }
+#endif
         record_auto_exposure(
             command_buffer, frame, current_render_extent_,
             aa_resources.descriptor_set);
@@ -9494,6 +9662,7 @@ void Renderer::invalidate_temporal_history() noexcept {
     fsr3_upscaler_.request_reset();
 #if VCR_EDITOR_ENABLED
     runtime_transforms_.snap_history();
+    hiz_valid_ = false;
 #endif
 }
 

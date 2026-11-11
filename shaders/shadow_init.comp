@@ -1,0 +1,51 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std140) uniform ShadowUniforms {
+    vec4 cascadePlanes[24];
+    vec4 cascadePixelsPerMeter;
+    uvec4 config; // x: sourceCount, y: groupCount, z: cascadeMask, w: lodEnabled
+    vec4 params;
+} shadowConfig;
+
+struct Group {
+    uvec4 range;
+    uvec4 counts;
+    uvec4 firsts;
+    vec4 errors;
+};
+
+struct Draw {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int vertexOffset;
+    uint firstInstance;
+};
+
+layout(set = 0, binding = 3, std430) readonly buffer Groups { Group groups[]; };
+layout(set = 0, binding = 5, std430) writeonly buffer ShadowCommands { Draw draws[]; };
+
+void main() {
+    const uint slot = gl_GlobalInvocationID.x;
+    const uint groupCount = shadowConfig.config.y;
+    const uint totalSlots = groupCount * 16u;
+    if (slot >= totalSlots) {
+        return;
+    }
+
+    const uint cascade = slot / (groupCount * 4u);
+    const uint rem = slot - cascade * (groupCount * 4u);
+    const uint groupIndex = rem >> 2u;
+    const uint lod = rem & 3u;
+    const Group g = groups[groupIndex];
+
+    Draw cmd;
+    cmd.indexCount = g.counts[lod];
+    cmd.instanceCount = 0u;
+    cmd.firstIndex = g.firsts[lod];
+    cmd.vertexOffset = int(g.range.z);
+    cmd.firstInstance = (4u + cascade * 4u + lod) * shadowConfig.config.x + g.range.x;
+    draws[slot] = cmd;
+}

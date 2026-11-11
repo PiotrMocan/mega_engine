@@ -85,6 +85,7 @@ foreach ($shader in $regularShaders) {
     }
     Compile-Shader -Source $shader.Name -Output ($shader.Name + '.spv') -ExtraArguments $extraArguments
 }
+Compile-Shader -Source 'editor_model_depth.frag' -Output 'editor_model_depth_temporal.frag.spv' -ExtraArguments @('-DVCR_TEMPORAL_COVERAGE=1')
 $subsurfaceGeometryShaders = @(
     'ocean.frag',
     'cube.frag',

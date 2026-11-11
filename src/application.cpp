@@ -1796,7 +1796,7 @@ void Application::finish_benchmark() {
         result.visible_instances = result.instances;
         result.frustum_rejected = 0;
         result.occlusion_rejected = 0;
-        result.lod_instances = {result.instances, 0, 0};
+        result.lod_instances = {result.instances, 0, 0, 0};
         result.visibility_backend = "direct";
         result.frustum_culling = result.occlusion_culling = result.lod = result.dynamic_shadows =
             false;

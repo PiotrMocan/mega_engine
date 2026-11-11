@@ -70,6 +70,13 @@ public:
         VkImageAspectFlags aspect_mask,
         VkSampleCountFlagBits samples,
         std::string_view debug_name);
+    void create_storage_pyramid(
+        VulkanContext& context,
+        std::uint32_t width,
+        std::uint32_t height,
+        std::uint32_t mip_levels,
+        VkFormat format,
+        std::string_view debug_name);
     void destroy() noexcept;
 
     [[nodiscard]] VkImage image() const noexcept { return image_; }
@@ -119,7 +126,8 @@ private:
                    VkSamplerAddressMode address_mode, VkBool32 compare_enable,
                    VkCompareOp compare_op, VkBorderColor border_color, std::string_view debug_name,
                    std::uint32_t depth = 1,
-                   VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT);
+                   VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT,
+                   bool linear_mipmaps = true);
 
   VulkanContext *context_ = nullptr;
   VkImage image_ = VK_NULL_HANDLE;

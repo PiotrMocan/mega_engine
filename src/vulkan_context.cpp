@@ -522,6 +522,9 @@ void VulkanContext::create_device() {
         fsr3_device_compatible_ ? VK_TRUE : VK_FALSE;
     indirect_first_instance_ = supported2.features.drawIndirectFirstInstance == VK_TRUE;
     features2.features.drawIndirectFirstInstance = indirect_first_instance_ ? VK_TRUE : VK_FALSE;
+    multi_draw_indirect_ = supported2.features.multiDrawIndirect == VK_TRUE &&
+                           properties_.limits.maxDrawIndirectCount >= 4U;
+    features2.features.multiDrawIndirect = multi_draw_indirect_ ? VK_TRUE : VK_FALSE;
     tessellation_shader_enabled_ = supported2.features.tessellationShader == VK_TRUE;
     features2.features.tessellationShader =
         tessellation_shader_enabled_ ? VK_TRUE : VK_FALSE;

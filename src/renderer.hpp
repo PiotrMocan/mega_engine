@@ -461,9 +461,11 @@ private:
         std::uint32_t index_count = 0U;
         std::uint32_t gi_first = 0, gi_count = 0;
         glm::vec3 gi_albedo{1};
-        std::array<std::uint32_t, 3> lod_first{};
-        std::array<std::uint32_t, 3> lod_count{};
-        std::array<float, 3> lod_error{};
+        std::array<std::uint32_t, model_lod_count> lod_first{};
+        std::array<std::uint32_t, model_lod_count> lod_count{};
+        std::array<float, model_lod_count> lod_error{};
+
+
     };
 
     struct EditorModelAsset {
@@ -521,6 +523,16 @@ private:
                                     std::int32_t plane_vertex, std::uint32_t cube_count);
     void prepare_gpu_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExtent2D extent);
     void record_gpu_visibility(VkCommandBuffer command, FrameContext &frame);
+    void record_shadow_visibility(VkCommandBuffer command, FrameContext &frame,
+                                  std::uint32_t update_mask, std::uint32_t cascades,
+                                  std::uint32_t tile_resolution);
+    [[nodiscard]] bool shadow_gpu_visibility_active() const noexcept;
+    void create_hiz_targets();
+    void destroy_hiz_targets() noexcept;
+    void update_hiz_descriptors();
+    [[nodiscard]] bool should_use_hiz_occlusion() const noexcept;
+    void record_hiz_pyramid(VkCommandBuffer command, FrameContext &frame,
+                            AntiAliasingFrameResources &aa_resources, VkExtent2D source_extent);
     void read_gpu_visibility(FrameContext &frame);
     void upload_gpu_scene_records(VkCommandBuffer command, FrameContext &frame);
     void destroy_frame_contexts() noexcept;
@@ -643,6 +655,8 @@ private:
     float lod_fade_seconds_ = 0.25F;
     bool lighting_paused_ = false;
     bool fog_supported_ = false;
+    bool hiz_supported_ = false;
+    bool hiz_msaa_min_resolve_ = false;
     LightingStatistics lighting_statistics_{};
     LightingUniforms lighting_uniforms_{};
     DeviceObject<VkDescriptorSetLayout> lighting_layout_{};
@@ -877,6 +891,30 @@ private:
     std::uint64_t gpu_visibility_revision_ = 1;
     bool gpu_visibility_active_ = false, reset_lod_history_ = true;
     bool gpu_visibility_bypassed_ = false;
+    DeviceObject<VkDescriptorSetLayout> shadow_visibility_layout_;
+    DeviceObject<VkPipelineLayout> shadow_visibility_pipeline_layout_;
+    DeviceObject<VkPipeline> shadow_init_pipeline_;
+    DeviceObject<VkPipeline> shadow_visibility_pipeline_;
+    static constexpr std::size_t max_hiz_mips = 16U;
+    GpuTexture hiz_pyramid_{};
+    GpuTexture hiz_fallback_{};
+    VkImageLayout hiz_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout hiz_fallback_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+    std::array<DeviceObject<VkImageView>, max_hiz_mips> hiz_mip_views_{};
+    std::uint32_t hiz_mip_count_ = 0U;
+    DeviceObject<VkDescriptorSetLayout> hiz_downsample_layout_;
+    DeviceObject<VkPipelineLayout> hiz_downsample_pipeline_layout_;
+    DeviceObject<VkDescriptorPool> hiz_downsample_pool_;
+    DeviceObject<VkPipeline> hiz_downsample_pipeline_;
+    std::array<VkDescriptorSet, max_frames_in_flight> hiz_first_pass_sets_{};
+    std::array<VkDescriptorSet, max_hiz_mips> hiz_mip_sets_{};
+    bool hiz_valid_ = false;
+    bool packet_used_hiz_ = false;
+    glm::mat4 hiz_view_projection_{1.0F};
+    glm::vec3 hiz_camera_{0.0F};
+    VkExtent2D hiz_source_extent_{};
+    std::uint64_t hiz_runtime_revision_ = 0U;
+    std::uint64_t hiz_document_revision_ = 0U;
     AssetPreparation asset_preparation_;
     UploadBatch asset_upload_;
     struct AssetRequest {

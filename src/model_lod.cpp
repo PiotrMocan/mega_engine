@@ -111,7 +111,8 @@ void prepare_authored_model_lods(CookedModelAsset &model,
             .material_index = static_cast<std::uint32_t>(material),
             .name = model.materials[material].name,
         };
-        mesh.lod_error = {0, model.lods[0].geometric_error, model.lods[1].geometric_error};
+        mesh.lod_error = {0.0F, model.lods[0].geometric_error, model.lods[1].geometric_error,
+                          std::numeric_limits<float>::infinity()};
         for (std::size_t level = 0; level < 3; ++level) {
             mesh.lod_first[level] = static_cast<std::uint32_t>(indices.size());
             const auto &asset = source(level);
@@ -123,6 +124,8 @@ void prepare_authored_model_lods(CookedModelAsset &model,
             }
             mesh.lod_count[level] = static_cast<std::uint32_t>(indices.size()) - mesh.lod_first[level];
         }
+        mesh.lod_first[3] = mesh.lod_first[0];
+        mesh.lod_count[3] = 0;
         mesh.first_index = mesh.lod_first[0];
         mesh.index_count = mesh.lod_count[0];
         submeshes.push_back(std::move(mesh));
@@ -142,10 +145,18 @@ void prepare_model_lods(CookedModelAsset &model) {
     }
     const float scale = meshopt_simplifyScale(model.vertices.front().position.data(),
                                               model.vertices.size(), sizeof(CookedModelVertex));
-    constexpr std::array weights{0.5F, 0.5F, 0.5F, 0.1F, 0.1F};
+    constexpr std::array opaque_weights{0.08F, 0.08F, 0.08F, 0.1F, 0.1F};
+    constexpr std::array foliage_weights{0.03F, 0.03F, 0.03F, 0.5F, 0.5F};
+    constexpr std::array opaque_error_limits{0.0F, 0.01F, 0.03F, 0.08F};
+    constexpr std::array foliage_error_limits{0.0F, 0.06F, 0.18F, 0.40F};
+    constexpr std::array foliage_ratios{1.0F, 0.35F, 0.12F, 0.04F};
+    // Disconnected foliage cards report pruned component diameter in result_error,
+    // which is much larger than silhouette/coverage change inside a dense crown.
+    constexpr std::array foliage_visual_error_caps{0.0F, 0.00085F, 0.00190F, 0.00400F};
     const auto original_count = model.indices.size();
     model.indices.reserve(std::min(max_indices, original_count * 3));
     std::vector<unsigned> scratch;
+    std::vector<unsigned> sloppy_scratch;
     for (auto &mesh : model.submeshes) {
         if (mesh.first_index > original_count ||
             mesh.index_count > original_count - mesh.first_index) {
@@ -153,33 +164,77 @@ void prepare_model_lods(CookedModelAsset &model) {
         }
         const auto first = static_cast<std::uint32_t>(mesh.first_index);
         const auto count = static_cast<std::uint32_t>(mesh.index_count);
-        mesh.lod_first = {first, first, first};
-        mesh.lod_count = {count, 0, 0};
-        mesh.lod_error = {0, std::numeric_limits<float>::infinity(),
-                          std::numeric_limits<float>::infinity()};
+        constexpr auto infinity = std::numeric_limits<float>::infinity();
+        mesh.lod_first = {first, first, first, first};
+        mesh.lod_count = {count, 0, 0, 0};
+        mesh.lod_error = {0.0F, infinity, infinity, infinity};
         if (count < 96) {
             continue;
         }
+        const bool alpha_masked =
+            mesh.material_index < model.materials.size() &&
+            (model.materials[mesh.material_index].coverage & 1U) != 0U;
         scratch.resize(count);
-        for (unsigned level = 1; level < 3; ++level) {
-            float error = 0;
-            const auto target = std::max<std::size_t>(12, (std::size_t(count) >> level) / 3 * 3);
-            const auto reduced = meshopt_simplifyWithAttributes(
+        std::uint32_t previous_count = count;
+        float previous_error = 0.0F;
+        for (unsigned level = 1; level < model_lod_count; ++level) {
+            float error = 0.0F;
+            const std::size_t raw_target = alpha_masked
+                ? static_cast<std::size_t>(static_cast<double>(count) * foliage_ratios[level])
+                : (std::size_t(count) >> level);
+            const auto target = std::max<std::size_t>(12, (raw_target / 3) * 3);
+            const auto &weights = alpha_masked ? foliage_weights : opaque_weights;
+            const float error_limit =
+                alpha_masked ? foliage_error_limits[level] : opaque_error_limits[level];
+            const unsigned options = alpha_masked
+                ? (meshopt_SimplifyPrune | meshopt_SimplifyPermissive)
+                : static_cast<unsigned>(meshopt_SimplifyLockBorder);
+            auto reduced = meshopt_simplifyWithAttributes(
                 scratch.data(), model.indices.data() + first, count,
                 model.vertices.front().position.data(), model.vertices.size(),
                 sizeof(CookedModelVertex), model.vertices.front().normal.data(),
                 sizeof(CookedModelVertex), weights.data(), weights.size(), nullptr, target,
-                level == 1 ? 0.01F : 0.03F, meshopt_SimplifyLockBorder, &error);
-            if (reduced >= count || reduced == 0 || model.indices.size() > max_indices - reduced) {
+                error_limit, options, &error);
+            if (!alpha_masked && level >= 2 && (reduced == 0 || reduced >= previous_count)) {
+                reduced = meshopt_simplifyWithAttributes(
+                    scratch.data(), model.indices.data() + first, count,
+                    model.vertices.front().position.data(), model.vertices.size(),
+                    sizeof(CookedModelVertex), model.vertices.front().normal.data(),
+                    sizeof(CookedModelVertex), weights.data(), weights.size(), nullptr, target,
+                    error_limit, meshopt_SimplifyPermissive | meshopt_SimplifyPrune, &error);
+            }
+            if (alpha_masked && (reduced == 0 || reduced >= previous_count ||
+                                 (level >= 2 && reduced > target * 2))) {
+                sloppy_scratch.resize(count);
+                float sloppy_error = 0.0F;
+                const auto sloppy_reduced = meshopt_simplifySloppy(
+                    sloppy_scratch.data(), model.indices.data() + first, count,
+                    model.vertices.front().position.data(), model.vertices.size(),
+                    sizeof(CookedModelVertex), nullptr, target, error_limit, &sloppy_error);
+                if (sloppy_reduced > 0 && sloppy_reduced < previous_count &&
+                    (reduced == 0 || reduced >= previous_count || sloppy_reduced < reduced)) {
+                    scratch.swap(sloppy_scratch);
+                    reduced = sloppy_reduced;
+                    error = sloppy_error;
+                }
+            }
+            if (reduced >= previous_count || reduced == 0 ||
+                model.indices.size() > max_indices - reduced) {
                 continue;
             }
+            const float relative_error =
+                alpha_masked ? std::min(error, foliage_visual_error_caps[level]) : error;
+            const float epsilon = 1.0e-6F * std::max(scale, 1.0F);
+            const float level_error = std::max(previous_error + epsilon, relative_error * scale);
             mesh.lod_first[level] = static_cast<std::uint32_t>(model.indices.size());
             mesh.lod_count[level] = static_cast<std::uint32_t>(reduced);
-            mesh.lod_error[level] = error * scale;
+            mesh.lod_error[level] = level_error;
             const auto old = model.indices.size();
             model.indices.resize(old + reduced);
             meshopt_optimizeVertexCache(model.indices.data() + old, scratch.data(), reduced,
                                         model.vertices.size());
+            previous_count = static_cast<std::uint32_t>(reduced);
+            previous_error = level_error;
         }
     }
 }

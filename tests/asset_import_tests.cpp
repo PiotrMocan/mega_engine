@@ -741,6 +741,9 @@ int main() {
         {"metallicFactor", 0.8}, {"roughnessFactor", 0.6},
         {"metallicRoughnessTexture", {{"index", 0}}}}}}};
     packed_gltf["meshes"][0]["primitives"][0]["material"] = 0;
+    packed_gltf["materials"][0]["alphaMode"] = "MASK";
+    packed_gltf["materials"][0]["alphaCutoff"] = 0.25;
+    packed_gltf["materials"][0]["doubleSided"] = true;
     const auto check_packed_import = [&](const auto &result) {
         expect(static_cast<bool>(result), "packed PBR model imports");
         if (!result) {
@@ -762,6 +765,10 @@ int main() {
                 const auto &textures = metadata.at("textures");
                 if (textures.contains("metallic_roughness")) {
                     found_packed = true;
+                    expect(metadata.value("alpha_mode", std::string{}) == "mask" &&
+                               metadata.value("double_sided", false) &&
+                               std::abs(metadata.value("alpha_cutoff", 0.0F) - 0.25F) < 0.0001F,
+                           "glTF masked two-sided material imports coverage and cutoff");
                     expect(textures.size() == 1 &&
                                std::abs(metadata["pbr"]["metallic"].get<float>() - 0.8F) < 0.0001F &&
                                std::abs(metadata["pbr"]["roughness"].get<float>() - 0.6F) < 0.0001F,

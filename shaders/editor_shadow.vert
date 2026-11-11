@@ -16,10 +16,16 @@ struct Instance {
     vec4 previousRow0; vec4 previousRow1; vec4 previousRow2;
 };
 layout(set=0,binding=1,std430) readonly buffer Instances { Instance instances[]; };
+layout(set=0,binding=5,std430) readonly buffer VisibilityBuffer {
+    uint visibilityCounters[8];
+    uint visibleIndices[];
+};
 layout(location=0) in vec3 inPosition;
 layout(push_constant) uniform ShadowPush { layout(offset=16) mat4 light; } shadowPush;
 void main() {
-    Instance instance=instances[gl_InstanceIndex];
+    uint sourceIndex = frame.globalRotation.y > 0.5
+        ? visibleIndices[gl_InstanceIndex] : uint(gl_InstanceIndex);
+    Instance instance=instances[sourceIndex];
     vec4 p=vec4(inPosition,1);
     gl_Position=shadowPush.light*vec4(dot(instance.row0,p),dot(instance.row1,p),dot(instance.row2,p),1);
 }

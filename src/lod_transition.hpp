@@ -35,7 +35,7 @@ struct LodFadeState {
     bool initialized = false;
 };
 
-// This helper owns the initialized state's invariants: LODs 0..2 and progress
+// This helper owns the initialized state's invariants: LODs 0..3 and progress
 // 0..1. Emit both records only while previous != current and progress < 1.
 // New transitions start at zero without consuming dt. Reversals preserve the
 // existing weights; a third LOD snaps, avoiding a third record or hidden queue.
@@ -43,7 +43,7 @@ struct LodFadeState {
 inline void advance_lod_fade(
     LodFadeState& state, std::uint32_t target, float dt_seconds,
     float duration_seconds, bool enabled, bool reset) noexcept {
-    target = target <= 2U ? target : 0U;
+    target = target <= 3U ? target : 0U;
     const auto snap = [&state, target] {
         state = {target, target, 1.0F, true};
     };

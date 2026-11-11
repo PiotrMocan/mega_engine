@@ -16,6 +16,7 @@ namespace vcr {
 inline constexpr std::uint32_t cooked_model_schema_version = 1U;
 inline constexpr std::uint32_t cooked_mesh_binary_version = 1U;
 inline constexpr std::uint32_t cooked_mesh_vertex_stride = 48U;
+inline constexpr std::size_t model_lod_count = 4U;
 
 struct CookedModelVertex {
     std::array<float, 3U> position{};
@@ -32,9 +33,9 @@ struct CookedModelSubmesh {
     std::uint32_t material_index = 0U;
     std::string name{};
     // Runtime-prepared index ranges; the versioned cooked file stays LOD0.
-    std::array<std::uint32_t, 3> lod_first{};
-    std::array<std::uint32_t, 3> lod_count{};
-    std::array<float, 3> lod_error{};
+    std::array<std::uint32_t, model_lod_count> lod_first{};
+    std::array<std::uint32_t, model_lod_count> lod_count{};
+    std::array<float, model_lod_count> lod_error{};
 };
 
 struct MaterialTessellation {

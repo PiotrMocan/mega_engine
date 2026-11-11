@@ -3,7 +3,11 @@
 #include "lod_fade.glsl"
 #include "material_coverage.glsl"
 layout(location = 1) in vec4 inBaseColor;
+#ifdef VCR_TEMPORAL_COVERAGE
+layout(location = 8) in vec2 inUv;
+#else
 layout(location = 6) in vec2 inUv;
+#endif
 layout(location = 13) flat in uint inLodToken;
 layout(set = 1, binding = 0) uniform sampler2D materialBaseColorTexture;
 layout(push_constant) uniform MaterialCoveragePush { layout(offset = 12) uint coverage; } material;

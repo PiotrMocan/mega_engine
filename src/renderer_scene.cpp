@@ -44,6 +44,7 @@ void Renderer::set_visibility_settings(VisibilitySettings settings) noexcept {
                                    ? std::clamp(settings.lod_pixel_error, 0.1F, 8.0F)
                                    : 1.0F;
     visibility_settings_ = settings;
+    hiz_valid_ = false;
     packet_document_revision_ = 0;
     shadow_dirty_ = true;
 }
@@ -263,7 +264,7 @@ void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExt
                 lod_fades_active_ |= fade.previous != fade.current && fade.progress < 1.0F;
             }
         }
-        for (unsigned lod = 0; lod < 3; ++lod) {
+        for (unsigned lod = 0; lod < model_lod_count; ++lod) {
             const auto first = visibility_scratch_.size();
             auto visible = draw;
             visible.first_instance = static_cast<std::uint32_t>(visibility_scratch_.size());

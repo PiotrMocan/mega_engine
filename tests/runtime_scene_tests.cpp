@@ -234,8 +234,8 @@ void authored_lod_tests() {
                prepared.submeshes.size() == 2, "authored geometry aggregates per material");
     const auto &metal = prepared.submeshes[0];
     const auto &detail = prepared.submeshes[1];
-    expect(metal.lod_count == std::array<std::uint32_t, 3>{6, 3, 3} &&
-               detail.lod_count == std::array<std::uint32_t, 3>{3, 3, 0},
+    expect(metal.lod_count == std::array<std::uint32_t, 4>{6, 3, 3, 0} && !std::isfinite(metal.lod_error[3]) &&
+               detail.lod_count == std::array<std::uint32_t, 4>{3, 3, 0, 0} && !std::isfinite(detail.lod_error[3]),
            "authored LOD supports merged submeshes and removed material geometry");
     expect(prepared.indices[metal.lod_first[1]] == 4 &&
                prepared.indices[metal.lod_first[2]] == 9 &&
@@ -250,7 +250,7 @@ void authored_lod_tests() {
                detail.lod_count[2] == 0,
            "finite error selects authored removal using existing pixel criterion");
     for (const auto &mesh : prepared.submeshes) {
-        for (unsigned level = 0; level < 3; ++level) {
+        for (unsigned level = 0; level < vcr::model_lod_count; ++level) {
             expect(mesh.lod_first[level] + mesh.lod_count[level] <= prepared.indices.size(),
                    "every runtime authored range remains inside combined index buffer");
         }
@@ -372,8 +372,8 @@ int main() {
     transforms.begin_snapshot();
     expect(!transforms.contains({42, 2}), "removed node is not active");
     expect(transforms.set({42, 2}, a) && transforms.contains({42, 2}), "retained node rebinds");
-    const std::array errors{0.0F, .01F, .03F};
-    expect(vcr::select_lod(errors, 1, 100, 500, 0) == 2, "distant object selects reduced mesh");
+    const std::array errors{0.0F, .01F, .03F, .08F};
+    expect(vcr::select_lod(errors, 1, 100, 500, 0) == 3 && vcr::select_lod(errors, 1, 35, 500, 0) == 2, "distant object selects reduced mesh");
     expect(vcr::select_lod(errors, 1, 5, 500, 0) == 0, "coarsening has margin");
     expect(vcr::select_lod(errors, 1, 5, 500, 1) == 1, "hysteresis retains within budget");
     expect(vcr::select_lod(errors, 1, 4, 500, 1) == 0, "refinement respects error budget");
@@ -423,14 +423,49 @@ int main() {
     expect(std::equal(original_indices.begin(), original_indices.end(), model.indices.begin()),
            "LOD0 is preserved exactly");
     expect(mesh.lod_count[1] > 0 && mesh.lod_count[1] < mesh.lod_count[0] &&
-               mesh.lod_count[2] < mesh.lod_count[1],
+               mesh.lod_count[2] < mesh.lod_count[1] && mesh.lod_count[3] > 0 && mesh.lod_count[3] < mesh.lod_count[2],
            "LOD simplification reduces triangles");
-    for (unsigned level = 1; level < 3; ++level) {
+    for (unsigned level = 1; level < vcr::model_lod_count; ++level) {
         expect(std::isfinite(mesh.lod_error[level]) && mesh.lod_error[level] >= 0,
                "finite geometric error");
         for (unsigned i = 0; i < mesh.lod_count[level]; ++i) {
             expect(model.indices[mesh.lod_first[level] + i] < model.vertices.size(),
                    "LOD index stays in vertex buffer");
+        }
+    }
+    {
+        vcr::CookedModelAsset foliage;
+        for (unsigned card = 0; card < 64; ++card) {
+            const float ox = static_cast<float>(card % 8U) * 0.6F;
+            const float oy = static_cast<float>(card / 8U) * 0.6F;
+            const float oz = static_cast<float>(card) * 0.02F;
+            const auto base_v = static_cast<std::uint32_t>(foliage.vertices.size());
+            for (unsigned corner = 0; corner < 4; ++corner) {
+                vcr::CookedModelVertex v;
+                const float u = static_cast<float>(corner & 1U);
+                const float t = static_cast<float>((corner >> 1U) & 1U);
+                v.position = {ox + u * 0.35F, oy + t * 0.35F, oz};
+                v.normal = {0.0F, 0.0F, 1.0F};
+                v.texcoord = {u, t};
+                foliage.vertices.push_back(v);
+            }
+            for (const auto idx : {base_v, base_v + 1U, base_v + 2U, base_v + 2U, base_v + 1U, base_v + 3U}) {
+                foliage.indices.push_back(idx);
+            }
+        }
+        const auto foliage_lod0 = foliage.indices;
+        foliage.materials.push_back({.coverage = 1U});
+        foliage.submeshes.push_back({.index_count = foliage.indices.size(), .material_index = 0U});
+        vcr::prepare_model_lods(foliage);
+        const auto &cards = foliage.submeshes.front();
+        expect(std::equal(foliage_lod0.begin(), foliage_lod0.end(), foliage.indices.begin()),
+               "foliage LOD0 preserves disconnected alpha-masked cards bit-exact");
+        expect(cards.lod_count[0] > cards.lod_count[1] && cards.lod_count[1] > cards.lod_count[2] &&
+                   cards.lod_count[2] > cards.lod_count[3] && cards.lod_count[3] > 0U,
+               "foliage simplification unlocks open card borders across LOD1..LOD3");
+        for (unsigned level = 1; level < vcr::model_lod_count; ++level) {
+            expect(std::isfinite(cards.lod_error[level]) && cards.lod_error[level] > cards.lod_error[level - 1],
+                   "foliage geometric errors remain finite and strictly increasing");
         }
     }
     vcr::AssetPreparation worker;

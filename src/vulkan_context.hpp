@@ -69,6 +69,9 @@ public:
     [[nodiscard]] bool indirect_first_instance() const noexcept {
         return indirect_first_instance_;
     }
+    [[nodiscard]] bool multi_draw_indirect() const noexcept {
+        return multi_draw_indirect_;
+    }
     [[nodiscard]] bool tessellation_shader_enabled() const noexcept {
         return tessellation_shader_enabled_;
     }
@@ -78,6 +81,7 @@ public:
 
 private:
   bool indirect_first_instance_ = false;
+  bool multi_draw_indirect_ = false;
   bool tessellation_shader_enabled_ = false;
   bool independent_blend_enabled_ = false;
   void create_instance(SDL_Window *window, bool validation_requested);

@@ -895,6 +895,26 @@ int main() {
                 CookedModelLoadErrorCode::limit_exceeded),
         "empty authored convex_hull_vertices array is rejected");
 
+    auto foliage = create_fixture(asset_root, "foliage_coverage");
+    foliage.material["alpha_mode"] = "mask";
+    foliage.material["alpha_cutoff"] = 0.25F;
+    foliage.material["double_sided"] = true;
+    expect(write_json(foliage.material_absolute, foliage.material), "foliage material written");
+    const auto masked = vcr::load_cooked_model_asset(asset_root, foliage.metadata_relative);
+    expect(masked && masked->materials[0].coverage == ((16384U << 16U) | 3U),
+           "masked two-sided coverage survives cooked load");
+    for (const auto& invalid : {Json(-0.01), Json(1.01), Json("0.5")}) {
+        foliage.material["alpha_cutoff"] = invalid;
+        expect(write_json(foliage.material_absolute, foliage.material) &&
+            has_error(vcr::load_cooked_model_asset(asset_root, foliage.metadata_relative),
+                      CookedModelLoadErrorCode::invalid_material), "invalid alpha cutoff is rejected");
+    }
+    foliage.material["alpha_cutoff"] = 0.5F;
+    foliage.material["double_sided"] = "true";
+    expect(write_json(foliage.material_absolute, foliage.material) &&
+        has_error(vcr::load_cooked_model_asset(asset_root, foliage.metadata_relative),
+                  CookedModelLoadErrorCode::invalid_material), "nonboolean double_sided is rejected");
+
     if (failures != 0) {
         std::cerr << failures << " cooked model test(s) failed\n";
         return 1;

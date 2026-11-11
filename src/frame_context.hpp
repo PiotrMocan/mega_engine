@@ -39,6 +39,9 @@ struct FrameContext {
     bool timestamps_valid = false;
     bool workload_was_enabled = false;
     bool shadow_was_updated = false;
+    bool shadow_gpu_visibility = false;
+    glm::mat4 rendered_view_projection{1.0F};
+    glm::vec3 rendered_camera_position{0.0F};
     bool visibility_was_updated = false;
     bool postprocess_was_enabled = false;
     bool subsurface_was_enabled = false;

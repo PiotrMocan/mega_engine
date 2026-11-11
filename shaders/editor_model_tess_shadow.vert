@@ -2,6 +2,18 @@
 #extension GL_GOOGLE_include_directive : require
 #include "pbr_material.glsl"
 
+layout(set = 0, binding = 0, std140) uniform FrameUniforms
+{
+    mat4 viewProjection;
+    mat4 inverseViewProjection;
+    vec4 globalRotation;
+    vec4 cameraPosition;
+    vec4 sunDirectionIntensity;
+    vec4 sunColorSkyYaw;
+    vec4 skyAmbient;
+    mat4 lightViewProjection;
+} frame;
+
 struct EditorInstanceData
 {
     vec4 modelRow0; vec4 modelRow1; vec4 modelRow2;
@@ -12,6 +24,11 @@ struct EditorInstanceData
 layout(set = 0, binding = 1, std430) readonly buffer InstanceBuffer
 {
     EditorInstanceData instances[];
+};
+layout(set = 0, binding = 5, std430) readonly buffer VisibilityBuffer
+{
+    uint visibilityCounters[8];
+    uint visibleIndices[];
 };
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;
@@ -60,7 +77,9 @@ vec3 transformDirection(vec4 row0, vec4 row1, vec4 row2, vec3 localDirection)
 
 void main()
 {
-    const EditorInstanceData instance = instances[gl_InstanceIndex];
+    const uint sourceIndex = frame.globalRotation.y > 0.5
+        ? visibleIndices[gl_InstanceIndex] : uint(gl_InstanceIndex);
+    const EditorInstanceData instance = instances[sourceIndex];
     const vec4 localPosition = vec4(inPosition, 1.0);
     outWorldPosition = transformPosition(
         instance.modelRow0, instance.modelRow1, instance.modelRow2, localPosition);

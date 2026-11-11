@@ -5623,8 +5623,8 @@ void EditorUi::build_performance(
                 renderer.visibility_backend());
     ImGui::Text("Rejected: %u frustum, %u occlusion", visible.frustum_rejected,
                 visible.occlusion_rejected);
-    ImGui::Text("LOD instances: %u / %u / %u", visible.lod_instances[0], visible.lod_instances[1],
-                visible.lod_instances[2]);
+    ImGui::Text("LOD instances: %u / %u / %u / %u", visible.lod_instances[0],
+                visible.lod_instances[1], visible.lod_instances[2], visible.lod_instances[3]);
     ImGui::Text("GPU culling %.3f ms, shadows %.3f ms\nGPU postprocess %.3f ms, display %.3f ms, exposure %.3f ms, SSS %.3f ms, motion blur %.3f ms, depth prepass %.3f ms",
                 performance.average.gpu_visibility_ms, performance.average.gpu_shadow_ms,
                 performance.average.gpu_postprocess_ms, performance.average.gpu_display_ms,
