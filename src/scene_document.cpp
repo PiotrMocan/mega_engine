@@ -262,6 +262,9 @@ bool SceneDocument::destroy_subtree(const SceneNodeId id) {
         colliders_.remove_slot(*iterator);
         rigid_bodies_.remove_slot(*iterator);
         prefab_instances_.remove_slot(*iterator);
+        audio_sources_.remove_slot(*iterator);
+        audio_listeners_.remove_slot(*iterator);
+        reverb_zones_.remove_slot(*iterator);
         slot.uuid = {};
         slot.value = {};
         slot.world_matrix = glm::mat4(1.0F);
@@ -575,6 +578,141 @@ std::uint32_t SceneDocument::unpack_prefab_instance(const SceneNodeId id) {
     return removed;
 }
 
+bool SceneDocument::set_audio_source(
+    const SceneNodeId id,
+    const AudioSourceComponent& audio_source_value) {
+    if (!valid(id) || !valid_audio_source_component(audio_source_value)) {
+        return false;
+    }
+    if (const auto existing = audio_sources_.get(id);
+        existing && existing->get() == audio_source_value) {
+        return true;
+    }
+    if (!audio_sources_.upsert(id, audio_source_value)) {
+        return false;
+    }
+    ++content_revision_;
+    return true;
+}
+
+bool SceneDocument::remove_audio_source(const SceneNodeId id) noexcept {
+    if (!valid(id) || !audio_sources_.remove(id)) {
+        return false;
+    }
+    ++content_revision_;
+    return true;
+}
+
+bool SceneDocument::has_audio_source(const SceneNodeId id) const noexcept {
+    return valid(id) && audio_sources_.contains(id);
+}
+
+std::optional<std::reference_wrapper<const AudioSourceComponent>>
+SceneDocument::audio_source(const SceneNodeId id) const noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return audio_sources_.get(id);
+}
+
+std::optional<std::reference_wrapper<AudioSourceComponent>>
+SceneDocument::audio_source_mut(const SceneNodeId id) noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return audio_sources_.get_mut(id);
+}
+
+bool SceneDocument::set_audio_listener(
+    const SceneNodeId id,
+    const AudioListenerComponent& listener_value) {
+    if (!valid(id) || !valid_audio_listener_component(listener_value)) {
+        return false;
+    }
+    if (const auto existing = audio_listeners_.get(id);
+        existing && existing->get() == listener_value) {
+        return true;
+    }
+    if (!audio_listeners_.upsert(id, listener_value)) {
+        return false;
+    }
+    ++content_revision_;
+    return true;
+}
+
+bool SceneDocument::remove_audio_listener(const SceneNodeId id) noexcept {
+    if (!valid(id) || !audio_listeners_.remove(id)) {
+        return false;
+    }
+    ++content_revision_;
+    return true;
+}
+
+bool SceneDocument::has_audio_listener(const SceneNodeId id) const noexcept {
+    return valid(id) && audio_listeners_.contains(id);
+}
+
+std::optional<std::reference_wrapper<const AudioListenerComponent>>
+SceneDocument::audio_listener(const SceneNodeId id) const noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return audio_listeners_.get(id);
+}
+
+std::optional<std::reference_wrapper<AudioListenerComponent>>
+SceneDocument::audio_listener_mut(const SceneNodeId id) noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return audio_listeners_.get_mut(id);
+}
+
+bool SceneDocument::set_reverb_zone(
+    const SceneNodeId id,
+    const AudioReverbZoneComponent& zone_value) {
+    if (!valid(id) || !valid_audio_reverb_zone_component(zone_value)) {
+        return false;
+    }
+    if (const auto existing = reverb_zones_.get(id);
+        existing && existing->get() == zone_value) {
+        return true;
+    }
+    if (!reverb_zones_.upsert(id, zone_value)) {
+        return false;
+    }
+    ++content_revision_;
+    return true;
+}
+
+bool SceneDocument::remove_reverb_zone(const SceneNodeId id) noexcept {
+    if (!valid(id) || !reverb_zones_.remove(id)) {
+        return false;
+    }
+    ++content_revision_;
+    return true;
+}
+
+bool SceneDocument::has_reverb_zone(const SceneNodeId id) const noexcept {
+    return valid(id) && reverb_zones_.contains(id);
+}
+
+std::optional<std::reference_wrapper<const AudioReverbZoneComponent>>
+SceneDocument::reverb_zone(const SceneNodeId id) const noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return reverb_zones_.get(id);
+}
+
+std::optional<std::reference_wrapper<AudioReverbZoneComponent>>
+SceneDocument::reverb_zone_mut(const SceneNodeId id) noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return reverb_zones_.get_mut(id);
+}
+
 void SceneDocument::mark_content_changed() noexcept {
     ++content_revision_;
 }
@@ -645,6 +783,18 @@ void SceneDocument::build_node_records(
         if (const auto attached_pf = prefab_instances_.get(current_id)) {
             node_prefab = attached_pf->get();
         }
+        std::optional<AudioSourceComponent> node_audio_src{};
+        if (const auto attached_as = audio_sources_.get(current_id)) {
+            node_audio_src = attached_as->get();
+        }
+        std::optional<AudioListenerComponent> node_audio_lst{};
+        if (const auto attached_al = audio_listeners_.get(current_id)) {
+            node_audio_lst = attached_al->get();
+        }
+        std::optional<AudioReverbZoneComponent> node_reverb{};
+        if (const auto attached_rz = reverb_zones_.get(current_id)) {
+            node_reverb = attached_rz->get();
+        }
         output.push_back(SceneNodeRecord{
             .id = current_id,
             .uuid = slots_[index].uuid,
@@ -652,6 +802,9 @@ void SceneDocument::build_node_records(
             .collider = node_collider,
             .rigid_body = node_rigid_body,
             .prefab_instance = node_prefab,
+            .audio_source = node_audio_src,
+            .audio_listener = node_audio_lst,
+            .reverb_zone = node_reverb,
             .parent_record_index = parent_record,
         });
         if (ancestor_records.size() <= depth) {

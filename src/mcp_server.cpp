@@ -74,7 +74,7 @@ constexpr std::array<std::string_view, 31> runtime_tool_names{
     "engine.quit",
 };
 
-constexpr std::array<std::string_view, 35> editor_tool_names{
+constexpr std::array<std::string_view, 43> editor_tool_names{
     "render.set_exposure",
     "render.set_color_grading",
     "render.set_subsurface",
@@ -95,6 +95,14 @@ constexpr std::array<std::string_view, 35> editor_tool_names{
     "editor.scene.remove_collider",
     "editor.scene.set_rigid_body",
     "editor.scene.remove_rigid_body",
+    "editor.scene.set_audio_source",
+    "editor.scene.remove_audio_source",
+    "editor.scene.set_audio_listener",
+    "editor.scene.remove_audio_listener",
+    "editor.scene.set_reverb_zone",
+    "editor.scene.remove_reverb_zone",
+    "editor.audio.set_bus",
+    "editor.audio.preview",
     "editor.prefab.save",
     "editor.prefab.instantiate",
     "editor.prefab.unpack",
@@ -878,6 +886,84 @@ private:
         "Detach the authored RigidBodyComponent from a scene node.",
         object_schema(Json{{"id", handle_schema}}, Json::array({"id"})),
         false, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.set_audio_source", "Set scene node audio source",
+        "Attach or replace an AudioSourceComponent (2D/3D spatial emitter, bus routing, attenuation, cones, Doppler, occlusion, or Sound Cue reference) on a scene node.",
+        object_schema(Json{
+            {"id", handle_schema},
+            {"asset_path", Json{{"type", "string"}, {"maxLength", max_audio_asset_path_bytes}}},
+            {"bus", Json{{"type", "string"}, {"enum", Json::array({"master", "music", "sfx", "voice", "ui"})}}},
+            {"attenuation", Json{{"type", "string"}, {"enum", Json::array({"inverse_clamped", "linear", "exponential"})}}},
+            {"enabled", Json{{"type", "boolean"}}},
+            {"spatial", Json{{"type", "boolean"}}},
+            {"loop", Json{{"type", "boolean"}}},
+            {"play_on_start", Json{{"type", "boolean"}}},
+            {"streaming", Json{{"type", "boolean"}}},
+            {"occlusion", Json{{"type", "boolean"}}},
+            {"volume", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", maximum_audio_volume}}},
+            {"pitch", Json{{"type", "number"}, {"minimum", minimum_audio_pitch}, {"maximum", maximum_audio_pitch}}},
+            {"pitch_variance", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 1.0}}},
+            {"volume_variance", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 1.0}}},
+            {"min_distance", Json{{"type", "number"}, {"minimum", minimum_audio_distance}, {"maximum", 10'000.0}}},
+            {"max_distance", Json{{"type", "number"}, {"minimum", minimum_audio_distance}, {"maximum", maximum_audio_distance}}},
+            {"rolloff", Json{{"type", "number"}, {"minimum", minimum_audio_rolloff}, {"maximum", maximum_audio_rolloff}}},
+            {"doppler_factor", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", maximum_audio_doppler_scale}}},
+            {"inner_cone_degrees", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 360.0}}},
+            {"outer_cone_degrees", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 360.0}}},
+            {"outer_cone_gain", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 1.0}}},
+        }, Json::array({"id"})), false, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.remove_audio_source", "Remove scene node audio source",
+        "Detach the authored AudioSourceComponent from a scene node.",
+        object_schema(Json{{"id", handle_schema}}, Json::array({"id"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.set_audio_listener", "Set scene node audio listener",
+        "Attach or replace an AudioListenerComponent on a scene node.",
+        object_schema(Json{
+            {"id", handle_schema},
+            {"enabled", Json{{"type", "boolean"}}},
+            {"volume_scale", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", maximum_audio_volume}}},
+            {"doppler_scale", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", maximum_audio_doppler_scale}}},
+        }, Json::array({"id"})), false, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.remove_audio_listener", "Remove scene node audio listener",
+        "Detach the authored AudioListenerComponent from a scene node.",
+        object_schema(Json{{"id", handle_schema}}, Json::array({"id"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.set_reverb_zone", "Set scene node reverb zone",
+        "Attach or replace an AudioReverbZoneComponent spherical acoustic zone on a scene node.",
+        object_schema(Json{
+            {"id", handle_schema},
+            {"enabled", Json{{"type", "boolean"}}},
+            {"inner_radius", Json{{"type", "number"}, {"minimum", minimum_audio_distance}, {"maximum", maximum_audio_distance}}},
+            {"outer_radius", Json{{"type", "number"}, {"minimum", minimum_audio_distance}, {"maximum", maximum_audio_distance}}},
+            {"wet_level", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 1.0}}},
+            {"decay_seconds", Json{{"type", "number"}, {"minimum", minimum_reverb_decay_seconds}, {"maximum", maximum_reverb_decay_seconds}}},
+            {"damping", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 1.0}}},
+        }, Json::array({"id"})), false, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.remove_reverb_zone", "Remove scene node reverb zone",
+        "Detach the authored AudioReverbZoneComponent from a scene node.",
+        object_schema(Json{{"id", handle_schema}}, Json::array({"id"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "editor.audio.set_bus", "Configure audio mixer bus",
+        "Set volume and/or mute state on one of the 5 audio buses (master, music, sfx, voice, ui).",
+        object_schema(Json{
+            {"bus", Json{{"type", "string"}, {"enum", Json::array({"master", "music", "sfx", "voice", "ui"})}}},
+            {"volume", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", maximum_audio_volume}}},
+            {"muted", Json{{"type", "boolean"}}},
+        }, Json::array({"bus"})), false, false, true));
+    tools.push_back(tool_definition(
+        "editor.audio.preview", "Preview or stop audio asset",
+        "Preview a sandboxed audio asset or Sound Cue on the UI bus, or stop active preview playback.",
+        object_schema(Json{
+            {"path", Json{{"type", "string"}, {"maxLength", max_audio_asset_path_bytes}}},
+            {"stop", Json{{"type", "boolean"}}},
+            {"volume", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", maximum_audio_volume}}},
+        }), false, false, false));
     tools.push_back(tool_definition(
         "editor.prefab.save", "Save scene subtree as prefab",
         "Atomically save a scene node and its descendants to a sandboxed .vcrprefab.json asset.",
@@ -1770,6 +1856,218 @@ private:
     return true;
 }
 
+[[nodiscard]] bool parse_audio_source_fields(
+    const Json& object,
+    const bool allow_id,
+    AudioSourceComponent& source,
+    std::string& error) {
+    if (!object.is_object()) {
+        error = "audio_source must be a JSON object";
+        return false;
+    }
+    const bool keys_ok = allow_id
+        ? only_keys(object, {
+              "id", "asset_path", "bus", "attenuation", "enabled", "spatial",
+              "loop", "play_on_start", "streaming", "occlusion", "volume",
+              "pitch", "pitch_variance", "volume_variance", "min_distance",
+              "max_distance", "rolloff", "doppler_factor", "inner_cone_degrees",
+              "outer_cone_degrees", "outer_cone_gain"})
+        : only_keys(object, {
+              "asset_path", "bus", "attenuation", "enabled", "spatial",
+              "loop", "play_on_start", "streaming", "occlusion", "volume",
+              "pitch", "pitch_variance", "volume_variance", "min_distance",
+              "max_distance", "rolloff", "doppler_factor", "inner_cone_degrees",
+              "outer_cone_degrees", "outer_cone_gain"});
+    if (!keys_ok) {
+        error = "audio_source contains unknown fields";
+        return false;
+    }
+    if (object.contains("asset_path")) {
+        const auto p = get_string(object, "asset_path");
+        if (!p || !source.set_path(*p)) {
+            error = "asset_path must be empty or a valid relative audio/cue asset path";
+            return false;
+        }
+    }
+    if (object.contains("bus")) {
+        const auto b = get_string(object, "bus");
+        const auto parsed = b ? parse_audio_bus_id(*b) : std::nullopt;
+        if (!parsed) {
+            error = "bus must be master, music, sfx, voice, or ui";
+            return false;
+        }
+        source.bus = *parsed;
+    }
+    if (object.contains("attenuation")) {
+        const auto a = get_string(object, "attenuation");
+        const auto parsed = a ? parse_audio_attenuation_model(*a) : std::nullopt;
+        if (!parsed) {
+            error = "attenuation must be inverse_clamped, linear, or exponential";
+            return false;
+        }
+        source.attenuation = *parsed;
+    }
+    const auto parse_flag = [&](const std::string_view key, bool& out) {
+        if (!object.contains(key)) {
+            return true;
+        }
+        const auto v = get_bool(object, key);
+        if (!v) {
+            error = std::string(key) + " must be a boolean";
+            return false;
+        }
+        out = *v;
+        return true;
+    };
+    if (!parse_flag("enabled", source.enabled) ||
+        !parse_flag("spatial", source.spatial) ||
+        !parse_flag("loop", source.loop) ||
+        !parse_flag("play_on_start", source.play_on_start) ||
+        !parse_flag("streaming", source.streaming) ||
+        !parse_flag("occlusion", source.occlusion)) {
+        return false;
+    }
+    const auto parse_float_field = [&](const std::string_view key,
+                                       float& out,
+                                       const float lo,
+                                       const float hi) {
+        if (!object.contains(key)) {
+            return true;
+        }
+        const auto v = get_finite_float(object, key, lo, hi);
+        if (!v) {
+            error = std::string(key) + " is outside the valid audio_source range";
+            return false;
+        }
+        out = *v;
+        return true;
+    };
+    if (!parse_float_field("volume", source.volume, 0.0F, maximum_audio_volume) ||
+        !parse_float_field("pitch", source.pitch, minimum_audio_pitch, maximum_audio_pitch) ||
+        !parse_float_field("pitch_variance", source.pitch_variance, 0.0F, 1.0F) ||
+        !parse_float_field("volume_variance", source.volume_variance, 0.0F, 1.0F) ||
+        !parse_float_field("min_distance", source.min_distance, minimum_audio_distance, 10'000.0F) ||
+        !parse_float_field("max_distance", source.max_distance, minimum_audio_distance, maximum_audio_distance) ||
+        !parse_float_field("rolloff", source.rolloff, minimum_audio_rolloff, maximum_audio_rolloff) ||
+        !parse_float_field("doppler_factor", source.doppler_factor, 0.0F, maximum_audio_doppler_scale) ||
+        !parse_float_field("inner_cone_degrees", source.inner_cone_degrees, 0.0F, 360.0F) ||
+        !parse_float_field("outer_cone_degrees", source.outer_cone_degrees, 0.0F, 360.0F) ||
+        !parse_float_field("outer_cone_gain", source.outer_cone_gain, 0.0F, 1.0F)) {
+        return false;
+    }
+    if (!valid_audio_source_component(source)) {
+        error = "audio_source distances or cone angles violate ordering invariants";
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] bool parse_audio_listener_fields(
+    const Json& object,
+    const bool allow_id,
+    AudioListenerComponent& listener,
+    std::string& error) {
+    if (!object.is_object()) {
+        error = "audio_listener must be a JSON object";
+        return false;
+    }
+    const bool keys_ok = allow_id
+        ? only_keys(object, {"id", "enabled", "volume_scale", "doppler_scale"})
+        : only_keys(object, {"enabled", "volume_scale", "doppler_scale"});
+    if (!keys_ok) {
+        error = "audio_listener contains unknown fields";
+        return false;
+    }
+    if (object.contains("enabled")) {
+        const auto v = get_bool(object, "enabled");
+        if (!v) {
+            error = "enabled must be a boolean";
+            return false;
+        }
+        listener.enabled = *v;
+    }
+    if (object.contains("volume_scale")) {
+        const auto v = get_finite_float(
+            object, "volume_scale", 0.0F, maximum_audio_volume);
+        if (!v) {
+            error = "volume_scale is outside the valid audio_listener range";
+            return false;
+        }
+        listener.volume_scale = *v;
+    }
+    if (object.contains("doppler_scale")) {
+        const auto v = get_finite_float(
+            object, "doppler_scale", 0.0F, maximum_audio_doppler_scale);
+        if (!v) {
+            error = "doppler_scale is outside the valid audio_listener range";
+            return false;
+        }
+        listener.doppler_scale = *v;
+    }
+    if (!valid_audio_listener_component(listener)) {
+        error = "audio_listener fields are outside engine bounds";
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] bool parse_reverb_zone_fields(
+    const Json& object,
+    const bool allow_id,
+    AudioReverbZoneComponent& zone,
+    std::string& error) {
+    if (!object.is_object()) {
+        error = "reverb_zone must be a JSON object";
+        return false;
+    }
+    const bool keys_ok = allow_id
+        ? only_keys(object, {
+              "id", "enabled", "inner_radius", "outer_radius",
+              "wet_level", "decay_seconds", "damping"})
+        : only_keys(object, {
+              "enabled", "inner_radius", "outer_radius",
+              "wet_level", "decay_seconds", "damping"});
+    if (!keys_ok) {
+        error = "reverb_zone contains unknown fields";
+        return false;
+    }
+    if (object.contains("enabled")) {
+        const auto v = get_bool(object, "enabled");
+        if (!v) {
+            error = "enabled must be a boolean";
+            return false;
+        }
+        zone.enabled = *v;
+    }
+    const auto parse_float_field = [&](const std::string_view key,
+                                       float& out,
+                                       const float lo,
+                                       const float hi) {
+        if (!object.contains(key)) {
+            return true;
+        }
+        const auto v = get_finite_float(object, key, lo, hi);
+        if (!v) {
+            error = std::string(key) + " is outside the valid reverb_zone range";
+            return false;
+        }
+        out = *v;
+        return true;
+    };
+    if (!parse_float_field("inner_radius", zone.inner_radius, 0.1F, 10'000.0F) ||
+        !parse_float_field("outer_radius", zone.outer_radius, 0.1F, maximum_audio_distance) ||
+        !parse_float_field("wet_level", zone.wet_level, 0.0F, 1.0F) ||
+        !parse_float_field("decay_seconds", zone.decay_seconds, minimum_reverb_decay_seconds, maximum_reverb_decay_seconds) ||
+        !parse_float_field("damping", zone.damping, 0.0F, 1.0F)) {
+        return false;
+    }
+    if (!valid_audio_reverb_zone_component(zone)) {
+        error = "reverb_zone outer_radius must be >= inner_radius";
+        return false;
+    }
+    return true;
+}
+
 [[nodiscard]] bool validate_prefab_overrides(
     const Json& overrides_json,
     std::string& error) {
@@ -1783,7 +2081,8 @@ private:
                 "source_node_uuid", "node_index", "name", "visible",
                 "translation", "rotation_degrees", "scale",
                 "base_color", "metallic", "roughness", "ambient_occlusion",
-                "collider", "rigid_body"})) {
+                "collider", "rigid_body",
+                "audio_source", "audio_listener", "reverb_zone"})) {
             error = "each prefab override must be an object with known fields";
             return false;
         }
@@ -1863,6 +2162,25 @@ private:
         if (entry.contains("rigid_body")) {
             RigidBodyComponent rb{};
             if (!parse_rigid_body_fields(entry["rigid_body"], false, rb, error)) {
+                return false;
+            }
+        }
+        if (entry.contains("audio_source")) {
+            AudioSourceComponent src{};
+            if (!parse_audio_source_fields(entry["audio_source"], false, src, error)) {
+                return false;
+            }
+        }
+        if (entry.contains("audio_listener")) {
+            AudioListenerComponent listener{};
+            if (!parse_audio_listener_fields(
+                    entry["audio_listener"], false, listener, error)) {
+                return false;
+            }
+        }
+        if (entry.contains("reverb_zone")) {
+            AudioReverbZoneComponent zone{};
+            if (!parse_reverb_zone_fields(entry["reverb_zone"], false, zone, error)) {
                 return false;
             }
         }
@@ -2125,6 +2443,174 @@ private:
         }
         command.type = McpCommandType::editor_set_rigid_body;
         command.rigid_body = body;
+        return true;
+    }
+    if (name == "editor.scene.remove_audio_source") {
+        if (arguments.size() != 1U || !arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "id must be the only argument and contain index/generation";
+            return false;
+        }
+        command.type = McpCommandType::editor_remove_audio_source;
+        return true;
+    }
+    if (name == "editor.scene.set_audio_source") {
+        if (!arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "set_audio_source requires a valid id";
+            return false;
+        }
+        AudioSourceComponent source{};
+        if (!parse_audio_source_fields(arguments, true, source, error) ||
+            !copy_command_text(
+                source.path_view(), command.text, error, "asset_path")) {
+            return false;
+        }
+        command.type = McpCommandType::editor_set_audio_source;
+        command.audio_source = McpAudioSourcePayload{
+            .bus = source.bus,
+            .attenuation = source.attenuation,
+            .enabled = source.enabled,
+            .spatial = source.spatial,
+            .loop = source.loop,
+            .play_on_start = source.play_on_start,
+            .streaming = source.streaming,
+            .occlusion = source.occlusion,
+            .volume = source.volume,
+            .pitch = source.pitch,
+            .pitch_variance = source.pitch_variance,
+            .volume_variance = source.volume_variance,
+            .min_distance = source.min_distance,
+            .max_distance = source.max_distance,
+            .rolloff = source.rolloff,
+            .doppler_factor = source.doppler_factor,
+            .inner_cone_degrees = source.inner_cone_degrees,
+            .outer_cone_degrees = source.outer_cone_degrees,
+            .outer_cone_gain = source.outer_cone_gain,
+        };
+        return true;
+    }
+    if (name == "editor.scene.remove_audio_listener") {
+        if (arguments.size() != 1U || !arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "id must be the only argument and contain index/generation";
+            return false;
+        }
+        command.type = McpCommandType::editor_remove_audio_listener;
+        return true;
+    }
+    if (name == "editor.scene.set_audio_listener") {
+        if (!arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "set_audio_listener requires a valid id";
+            return false;
+        }
+        AudioListenerComponent listener{};
+        if (!parse_audio_listener_fields(arguments, true, listener, error)) {
+            return false;
+        }
+        command.type = McpCommandType::editor_set_audio_listener;
+        command.audio_listener = listener;
+        return true;
+    }
+    if (name == "editor.scene.remove_reverb_zone") {
+        if (arguments.size() != 1U || !arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "id must be the only argument and contain index/generation";
+            return false;
+        }
+        command.type = McpCommandType::editor_remove_reverb_zone;
+        return true;
+    }
+    if (name == "editor.scene.set_reverb_zone") {
+        if (!arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "set_reverb_zone requires a valid id";
+            return false;
+        }
+        AudioReverbZoneComponent zone{};
+        if (!parse_reverb_zone_fields(arguments, true, zone, error)) {
+            return false;
+        }
+        command.type = McpCommandType::editor_set_reverb_zone;
+        command.reverb_zone = zone;
+        return true;
+    }
+    if (name == "editor.audio.set_bus") {
+        if (!only_keys(arguments, {"bus", "volume", "muted"}) ||
+            !arguments.contains("bus")) {
+            error = "audio.set_bus requires bus and optional volume/muted";
+            return false;
+        }
+        const auto bus_str = get_string(arguments, "bus");
+        const auto bus = bus_str ? parse_audio_bus_id(*bus_str) : std::nullopt;
+        if (!bus) {
+            error = "bus must be master, music, sfx, voice, or ui";
+            return false;
+        }
+        command.audio_source.bus = *bus;
+        if (arguments.contains("volume")) {
+            const auto v = get_finite_float(
+                arguments, "volume", 0.0F, maximum_audio_volume);
+            if (!v) {
+                error = "volume must be between 0 and 4";
+                return false;
+            }
+            command.audio_source.volume = *v;
+            command.audio_bus_volume_supplied = true;
+        }
+        if (arguments.contains("muted")) {
+            const auto m = get_bool(arguments, "muted");
+            if (!m) {
+                error = "muted must be a boolean";
+                return false;
+            }
+            command.enabled = *m;
+            command.audio_bus_muted_supplied = true;
+        }
+        if (!command.audio_bus_volume_supplied && !command.audio_bus_muted_supplied) {
+            error = "at least one of volume or muted must be supplied";
+            return false;
+        }
+        command.type = McpCommandType::editor_audio_set_bus;
+        return true;
+    }
+    if (name == "editor.audio.preview") {
+        if (!only_keys(arguments, {"path", "stop", "volume"})) {
+            error = "audio.preview accepts only path, stop, and volume";
+            return false;
+        }
+        bool stop_preview = false;
+        if (arguments.contains("stop")) {
+            const auto s = get_bool(arguments, "stop");
+            if (!s) {
+                error = "stop must be a boolean";
+                return false;
+            }
+            stop_preview = *s;
+        }
+        command.enabled = stop_preview;
+        command.audio_source.volume = 1.0F;
+        if (arguments.contains("volume")) {
+            const auto v = get_finite_float(
+                arguments, "volume", 0.0F, maximum_audio_volume);
+            if (!v) {
+                error = "volume must be between 0 and 4";
+                return false;
+            }
+            command.audio_source.volume = *v;
+        }
+        if (!stop_preview) {
+            const auto path = get_string(arguments, "path");
+            if (!path || path->empty() || !valid_audio_asset_reference(*path) ||
+                !copy_command_text(*path, command.text, error, "path")) {
+                if (error.empty()) {
+                    error = "audio.preview requires a valid relative audio/cue path unless stop=true";
+                }
+                return false;
+            }
+        }
+        command.type = McpCommandType::editor_audio_preview;
         return true;
     }
     if (name == "editor.prefab.save") {

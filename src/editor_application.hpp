@@ -1,9 +1,11 @@
 #pragma once
 
+#include "audio_engine.hpp"
 #include "cli_options.hpp"
 #include "editor_ui.hpp"
 #include "fly_camera.hpp"
 #include "gameplay_session.hpp"
+#include "input_actions.hpp"
 #include "mcp_server.hpp"
 #include "renderer.hpp"
 #include "scene_document.hpp"
@@ -57,6 +59,8 @@ private:
     std::unique_ptr<SDL_Window, EditorWindowDeleter> window_{};
     VulkanContext context_{};
     Renderer renderer_{};
+    AudioEngine audio_engine_{};
+    InputActionSystem input_actions_{};
     EditorUi ui_{};
     SceneDocument scene_{};
     FlyCamera camera_{};

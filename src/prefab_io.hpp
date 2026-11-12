@@ -35,6 +35,9 @@ struct PrefabNodeOverride {
     std::optional<PbrMaterial> material{};
     std::optional<ColliderComponent> collider{};
     std::optional<RigidBodyComponent> rigid_body{};
+    std::optional<AudioSourceComponent> audio_source{};
+    std::optional<AudioListenerComponent> audio_listener{};
+    std::optional<AudioReverbZoneComponent> reverb_zone{};
 };
 
 struct PrefabInstantiateOptions {

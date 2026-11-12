@@ -168,10 +168,89 @@ using Json = nlohmann::json;
     } else {
         result["prefab_instance"] = nullptr;
     }
+    if (const auto audio_src = scene.audio_source(id)) {
+        const AudioSourceComponent& s = audio_src->get();
+        result["audio_source"] = Json{
+            {"enabled", s.enabled},
+            {"asset_path", std::string(s.path_view())},
+            {"bus", to_token(s.bus)},
+            {"volume", s.volume},
+            {"pitch", s.pitch},
+            {"volume_variance", s.volume_variance},
+            {"pitch_variance", s.pitch_variance},
+            {"spatial", s.spatial},
+            {"loop", s.loop},
+            {"play_on_start", s.play_on_start},
+            {"streaming", s.streaming},
+            {"occlusion", s.occlusion},
+            {"attenuation", to_token(s.attenuation)},
+            {"min_distance", s.min_distance},
+            {"max_distance", s.max_distance},
+            {"rolloff", s.rolloff},
+            {"doppler_factor", s.doppler_factor},
+            {"inner_cone_degrees", s.inner_cone_degrees},
+            {"outer_cone_degrees", s.outer_cone_degrees},
+            {"outer_cone_gain", s.outer_cone_gain},
+        };
+    } else {
+        result["audio_source"] = nullptr;
+    }
+    if (const auto listener = scene.audio_listener(id)) {
+        const AudioListenerComponent& l = listener->get();
+        result["audio_listener"] = Json{
+            {"enabled", l.enabled},
+            {"volume_scale", l.volume_scale},
+            {"doppler_scale", l.doppler_scale},
+        };
+    } else {
+        result["audio_listener"] = nullptr;
+    }
+    if (const auto zone = scene.reverb_zone(id)) {
+        const AudioReverbZoneComponent& z = zone->get();
+        result["reverb_zone"] = Json{
+            {"enabled", z.enabled},
+            {"inner_radius", z.inner_radius},
+            {"outer_radius", z.outer_radius},
+            {"wet_level", z.wet_level},
+            {"decay_seconds", z.decay_seconds},
+            {"damping", z.damping},
+        };
+    } else {
+        result["reverb_zone"] = nullptr;
+    }
     if (depth) {
         result["depth"] = *depth;
     }
     return result;
+}
+
+[[nodiscard]] Json audio_engine_state_json(const AudioEngine& audio) {
+    const AudioEngineTelemetry telem = audio.telemetry();
+    Json buses = Json::object();
+    for (std::size_t idx = 0U; idx < audio_bus_count; ++idx) {
+        const auto bus_id = static_cast<AudioBusId>(idx);
+        const AudioBusSnapshot& snap = telem.buses[idx];
+        buses[std::string(to_token(bus_id))] = Json{
+            {"volume", snap.volume},
+            {"muted", snap.muted},
+            {"peak_left", snap.peak_left},
+            {"peak_right", snap.peak_right},
+            {"active_voices", snap.active_voices},
+        };
+    }
+    return Json{
+        {"initialized", audio.initialized()},
+        {"hardware_output_active", telem.hardware_output_active},
+        {"gameplay_paused", telem.gameplay_paused},
+        {"active_voices", telem.active_voice_count},
+        {"active_streams", telem.active_stream_count},
+        {"resident_clip_count", telem.resident_clip_count},
+        {"resident_pcm_bytes", telem.resident_pcm_bytes},
+        {"master_limiter_gain", telem.master_limiter_gain},
+        {"preview_playing", audio.is_preview_playing()},
+        {"preview_asset", std::string(audio.preview_asset_path())},
+        {"buses", std::move(buses)},
+    };
 }
 
 [[nodiscard]] Json material_snapshot_json(
@@ -370,6 +449,91 @@ void apply_light_patch(
             if (r.contains("restitution")) rb.restitution = r["restitution"].get<float>();
             ov.rigid_body = rb;
         }
+        if (entry.contains("audio_source")) {
+            const auto& s = entry["audio_source"];
+            AudioSourceComponent src{};
+            if (s.contains("asset_path")) {
+                static_cast<void>(
+                    src.set_path(s["asset_path"].get<std::string_view>()));
+            }
+            if (s.contains("bus")) {
+                if (const auto b =
+                        parse_audio_bus_id(s["bus"].get<std::string_view>())) {
+                    src.bus = *b;
+                }
+            }
+            if (s.contains("attenuation")) {
+                if (const auto a = parse_audio_attenuation_model(
+                        s["attenuation"].get<std::string_view>())) {
+                    src.attenuation = *a;
+                }
+            }
+            if (s.contains("enabled")) src.enabled = s["enabled"].get<bool>();
+            if (s.contains("spatial")) src.spatial = s["spatial"].get<bool>();
+            if (s.contains("loop")) src.loop = s["loop"].get<bool>();
+            if (s.contains("play_on_start")) {
+                src.play_on_start = s["play_on_start"].get<bool>();
+            }
+            if (s.contains("streaming")) src.streaming = s["streaming"].get<bool>();
+            if (s.contains("occlusion")) src.occlusion = s["occlusion"].get<bool>();
+            if (s.contains("volume")) src.volume = s["volume"].get<float>();
+            if (s.contains("pitch")) src.pitch = s["pitch"].get<float>();
+            if (s.contains("volume_variance")) {
+                src.volume_variance = s["volume_variance"].get<float>();
+            }
+            if (s.contains("pitch_variance")) {
+                src.pitch_variance = s["pitch_variance"].get<float>();
+            }
+            if (s.contains("min_distance")) {
+                src.min_distance = s["min_distance"].get<float>();
+            }
+            if (s.contains("max_distance")) {
+                src.max_distance = s["max_distance"].get<float>();
+            }
+            if (s.contains("rolloff")) src.rolloff = s["rolloff"].get<float>();
+            if (s.contains("doppler_factor")) {
+                src.doppler_factor = s["doppler_factor"].get<float>();
+            }
+            if (s.contains("inner_cone_degrees")) {
+                src.inner_cone_degrees = s["inner_cone_degrees"].get<float>();
+            }
+            if (s.contains("outer_cone_degrees")) {
+                src.outer_cone_degrees = s["outer_cone_degrees"].get<float>();
+            }
+            if (s.contains("outer_cone_gain")) {
+                src.outer_cone_gain = s["outer_cone_gain"].get<float>();
+            }
+            ov.audio_source = src;
+        }
+        if (entry.contains("audio_listener")) {
+            const auto& l = entry["audio_listener"];
+            AudioListenerComponent listener{};
+            if (l.contains("enabled")) listener.enabled = l["enabled"].get<bool>();
+            if (l.contains("volume_scale")) {
+                listener.volume_scale = l["volume_scale"].get<float>();
+            }
+            if (l.contains("doppler_scale")) {
+                listener.doppler_scale = l["doppler_scale"].get<float>();
+            }
+            ov.audio_listener = listener;
+        }
+        if (entry.contains("reverb_zone")) {
+            const auto& z = entry["reverb_zone"];
+            AudioReverbZoneComponent zone{};
+            if (z.contains("enabled")) zone.enabled = z["enabled"].get<bool>();
+            if (z.contains("inner_radius")) {
+                zone.inner_radius = z["inner_radius"].get<float>();
+            }
+            if (z.contains("outer_radius")) {
+                zone.outer_radius = z["outer_radius"].get<float>();
+            }
+            if (z.contains("wet_level")) zone.wet_level = z["wet_level"].get<float>();
+            if (z.contains("decay_seconds")) {
+                zone.decay_seconds = z["decay_seconds"].get<float>();
+            }
+            if (z.contains("damping")) zone.damping = z["damping"].get<float>();
+            ov.reverb_zone = zone;
+        }
         overrides.push_back(std::move(ov));
     }
     return true;
@@ -498,7 +662,48 @@ void EditorApplication::initialize(const CliOptions& options) {
     renderer_.set_visibility_settings(visibility);
     scene_instances_.reserve(max_scene_nodes);
     scene_models_.reserve(max_scene_nodes);
-    ui_.initialize(context_, window_.get(), renderer_);
+
+    input_actions_.set_hardware_polling_enabled(true);
+    {
+        std::error_code fs_ec;
+        const std::filesystem::path bindings_path =
+            asset_root->path / "config" / "input_bindings.json";
+        if (std::filesystem::is_regular_file(bindings_path, fs_ec) && !fs_ec) {
+            std::string bindings_error;
+            if (!load_input_bindings_file(
+                    bindings_path, input_actions_, bindings_error)) {
+                std::cerr << "warning: failed to load input bindings '"
+                          << bindings_path.string() << "': "
+                          << bindings_error << "\n";
+            }
+        }
+    }
+    {
+        std::string audio_error;
+        if (!audio_engine_.initialize(
+                AudioEngineOptions{
+                    .asset_root = asset_root->path,
+                    .enable_hardware_output = true,
+                },
+                audio_error)) {
+            std::cerr << "warning: hardware audio output unavailable ("
+                      << audio_error
+                      << "); falling back to headless mixer.\n";
+            audio_error.clear();
+            if (!audio_engine_.initialize(
+                    AudioEngineOptions{
+                        .asset_root = asset_root->path,
+                        .enable_hardware_output = false,
+                    },
+                    audio_error)) {
+                std::cerr << "warning: headless audio initialization failed: "
+                          << audio_error << "\n";
+            }
+        }
+    }
+
+    ui_.initialize(
+        context_, window_.get(), renderer_, &audio_engine_, &input_actions_);
     camera_ = scene_startup_camera(scene_, options.camera_z_explicit
         ? std::optional<double>(options.camera_z) : std::nullopt);
     edit_camera_before_play_ = camera_;
@@ -602,12 +807,23 @@ void EditorApplication::main_loop() {
         synchronize_gameplay_state();
         renderer_.set_lighting_paused(
             ui_.play_state() == EditorPlayState::paused);
+        audio_engine_.set_gameplay_paused(
+            ui_.play_state() == EditorPlayState::paused);
         update_scene_snapshot();
         if (ui_.play_state() == EditorPlayState::playing) {
             update_gameplay(delta_seconds);
-        } else if (ui_.play_state() == EditorPlayState::edit) {
-            camera_.update(
-                ui_.camera_input(), delta_seconds);
+        } else {
+            input_actions_.begin_frame(delta_seconds);
+            if (ui_.play_state() == EditorPlayState::edit) {
+                camera_.update(
+                    ui_.camera_input(), delta_seconds);
+                audio_engine_.set_listener(AudioListenerState{
+                    .position = camera_.position(),
+                    .forward = camera_.forward(),
+                    .up = glm::vec3(0.0F, 1.0F, 0.0F),
+                });
+            }
+            audio_engine_.update(delta_seconds);
         }
         ImDrawData* const draw_data = ui_.end_frame();
 
@@ -657,7 +873,13 @@ void EditorApplication::synchronize_gameplay_state() {
                 : std::nullopt);
         std::string error;
         if (!gameplay_.start(
-                scene_, initial_view, startup_camera, camera_, error, &renderer_)) {
+                scene_,
+                initial_view,
+                startup_camera,
+                camera_,
+                error,
+                &renderer_,
+                audio_engine_.initialized() ? &audio_engine_ : nullptr)) {
             ui_.report_asset_error(std::move(error));
             ui_.stop_play(scene_);
             camera_ = edit_camera_before_play_;
@@ -668,7 +890,7 @@ void EditorApplication::synchronize_gameplay_state() {
         }
         submitted_scene_revision_ = 0U;
     } else if (requested_state == EditorPlayState::edit) {
-        gameplay_.stop();
+        gameplay_.stop(audio_engine_.initialized() ? &audio_engine_ : nullptr);
         camera_ = edit_camera_before_play_;
     }
 
@@ -677,24 +899,24 @@ void EditorApplication::synchronize_gameplay_state() {
 
 void EditorApplication::update_gameplay(
     const float delta_seconds) {
-    const FlyCameraInput input = ui_.camera_input();
+    const GameplayFrameInput frame_input = ui_.gameplay_input(delta_seconds);
+    if (ui_.play_state() != EditorPlayState::playing) {
+        observed_play_state_ = ui_.play_state();
+        renderer_.set_lighting_paused(
+            observed_play_state_ == EditorPlayState::paused);
+        audio_engine_.set_gameplay_paused(
+            observed_play_state_ == EditorPlayState::paused);
+        audio_engine_.update(delta_seconds);
+        return;
+    }
     if (!gameplay_.update(
-            GameplayFrameInput{
-                .character = CharacterInput{
-                    .forward = input.forward,
-                    .backward = input.backward,
-                    .left = input.left,
-                    .right = input.right,
-                    .jump = input.up,
-                    .run = input.boost,
-                },
-                .mouse_delta_x = input.mouse_delta_x,
-                .mouse_delta_y = input.mouse_delta_y,
-            },
+            frame_input,
             delta_seconds,
             scene_,
             renderer_,
-            camera_)) {
+            camera_,
+            audio_engine_.initialized() ? &audio_engine_ : nullptr,
+            &input_actions_)) {
         fatal("Gameplay runtime lost its player scene node.");
     }
 }
@@ -779,7 +1001,11 @@ void EditorApplication::execute_mcp_command(
                 {"node_count", scene_.size()},
                 {"collider_count", scene_.colliders().size()},
                 {"rigid_body_count", scene_.rigid_bodies().size()},
+                {"audio_source_count", scene_.audio_sources().size()},
+                {"audio_listener_count", scene_.audio_listeners().size()},
+                {"reverb_zone_count", scene_.reverb_zones().size()},
                 {"prefab_instance_count", scene_.prefab_instances().size()},
+                {"audio", audio_engine_state_json(audio_engine_)},
                 {"local_light_count", scene_.local_light_count()},
                 {"local_light_backend_requested",
                  to_token(renderer_.local_light_backend())},
@@ -1092,6 +1318,242 @@ void EditorApplication::execute_mcp_command(
             Json{{"node", scene_node_json(scene_, command.node_id)},
                  {"changed", true}});
         return;
+    case McpCommandType::editor_set_audio_source: {
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        AudioSourceComponent src{};
+        if (!src.set_path(command.text.data())) {
+            fail("audio_source asset_path is invalid");
+            return;
+        }
+        src.bus = command.audio_source.bus;
+        src.attenuation = command.audio_source.attenuation;
+        src.enabled = command.audio_source.enabled;
+        src.spatial = command.audio_source.spatial;
+        src.loop = command.audio_source.loop;
+        src.play_on_start = command.audio_source.play_on_start;
+        src.streaming = command.audio_source.streaming;
+        src.occlusion = command.audio_source.occlusion;
+        src.volume = command.audio_source.volume;
+        src.pitch = command.audio_source.pitch;
+        src.pitch_variance = command.audio_source.pitch_variance;
+        src.volume_variance = command.audio_source.volume_variance;
+        src.min_distance = command.audio_source.min_distance;
+        src.max_distance = command.audio_source.max_distance;
+        src.rolloff = command.audio_source.rolloff;
+        src.doppler_factor = command.audio_source.doppler_factor;
+        src.inner_cone_degrees = command.audio_source.inner_cone_degrees;
+        src.outer_cone_degrees = command.audio_source.outer_cone_degrees;
+        src.outer_cone_gain = command.audio_source.outer_cone_gain;
+        if (!valid_audio_source_component(src)) {
+            fail("audio_source component values are outside engine bounds");
+            return;
+        }
+        if (const auto existing = scene_.audio_source(command.node_id);
+            existing && existing->get() == src) {
+            succeed(
+                "audio_source component already matches",
+                Json{{"node", scene_node_json(scene_, command.node_id)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        if (!scene_.set_audio_source(command.node_id, src)) {
+            fail("unable to attach audio_source component");
+            return;
+        }
+        succeed(
+            "audio_source component updated",
+            Json{{"node", scene_node_json(scene_, command.node_id)},
+                 {"changed", true}});
+        return;
+    }
+    case McpCommandType::editor_remove_audio_source:
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!scene_.has_audio_source(command.node_id)) {
+            succeed(
+                "node has no audio_source component",
+                Json{{"node", scene_node_json(scene_, command.node_id)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        static_cast<void>(scene_.remove_audio_source(command.node_id));
+        succeed(
+            "audio_source component removed",
+            Json{{"node", scene_node_json(scene_, command.node_id)},
+                 {"changed", true}});
+        return;
+    case McpCommandType::editor_set_audio_listener: {
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!valid_audio_listener_component(command.audio_listener)) {
+            fail("audio_listener component values are outside engine bounds");
+            return;
+        }
+        if (const auto existing = scene_.audio_listener(command.node_id);
+            existing && existing->get() == command.audio_listener) {
+            succeed(
+                "audio_listener component already matches",
+                Json{{"node", scene_node_json(scene_, command.node_id)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        if (!scene_.set_audio_listener(command.node_id, command.audio_listener)) {
+            fail("unable to attach audio_listener component");
+            return;
+        }
+        succeed(
+            "audio_listener component updated",
+            Json{{"node", scene_node_json(scene_, command.node_id)},
+                 {"changed", true}});
+        return;
+    }
+    case McpCommandType::editor_remove_audio_listener:
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!scene_.has_audio_listener(command.node_id)) {
+            succeed(
+                "node has no audio_listener component",
+                Json{{"node", scene_node_json(scene_, command.node_id)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        static_cast<void>(scene_.remove_audio_listener(command.node_id));
+        succeed(
+            "audio_listener component removed",
+            Json{{"node", scene_node_json(scene_, command.node_id)},
+                 {"changed", true}});
+        return;
+    case McpCommandType::editor_set_reverb_zone: {
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!valid_audio_reverb_zone_component(command.reverb_zone)) {
+            fail("reverb_zone component values are outside engine bounds");
+            return;
+        }
+        if (const auto existing = scene_.reverb_zone(command.node_id);
+            existing && existing->get() == command.reverb_zone) {
+            succeed(
+                "reverb_zone component already matches",
+                Json{{"node", scene_node_json(scene_, command.node_id)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        if (!scene_.set_reverb_zone(command.node_id, command.reverb_zone)) {
+            fail("unable to attach reverb_zone component");
+            return;
+        }
+        succeed(
+            "reverb_zone component updated",
+            Json{{"node", scene_node_json(scene_, command.node_id)},
+                 {"changed", true}});
+        return;
+    }
+    case McpCommandType::editor_remove_reverb_zone:
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!scene_.has_reverb_zone(command.node_id)) {
+            succeed(
+                "node has no reverb_zone component",
+                Json{{"node", scene_node_json(scene_, command.node_id)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        static_cast<void>(scene_.remove_reverb_zone(command.node_id));
+        succeed(
+            "reverb_zone component removed",
+            Json{{"node", scene_node_json(scene_, command.node_id)},
+                 {"changed", true}});
+        return;
+    case McpCommandType::editor_audio_set_bus: {
+        if (!audio_engine_.initialized()) {
+            fail("audio engine is unavailable");
+            return;
+        }
+        const AudioBusId bus = command.audio_source.bus;
+        if (command.audio_bus_volume_supplied) {
+            audio_engine_.set_bus_volume(bus, command.audio_source.volume);
+        }
+        if (command.audio_bus_muted_supplied) {
+            audio_engine_.set_bus_muted(bus, command.enabled);
+        }
+        succeed(
+            "audio bus updated",
+            Json{
+                {"bus", to_token(bus)},
+                {"volume", audio_engine_.bus_volume(bus)},
+                {"muted", audio_engine_.bus_muted(bus)},
+                {"audio", audio_engine_state_json(audio_engine_)},
+            });
+        return;
+    }
+    case McpCommandType::editor_audio_preview: {
+        if (!audio_engine_.initialized()) {
+            fail("audio engine is unavailable");
+            return;
+        }
+        if (command.enabled) {
+            audio_engine_.stop_preview();
+            succeed(
+                "audio preview stopped",
+                Json{{"audio", audio_engine_state_json(audio_engine_)}});
+            return;
+        }
+        std::string error;
+        if (!audio_engine_.play_preview(command.text.data(), error)) {
+            fail(std::move(error));
+            return;
+        }
+        succeed(
+            "audio preview started",
+            Json{
+                {"path", std::string(command.text.data())},
+                {"audio", audio_engine_state_json(audio_engine_)},
+            });
+        return;
+    }
     case McpCommandType::editor_prefab_save: {
         if (ui_.play_state() != EditorPlayState::edit) {
             fail("scene editing is locked during Play");
@@ -2001,8 +2463,10 @@ void EditorApplication::shutdown() noexcept {
     running_ = false;
     mcp_server_.stop();
     pending_screenshot_token_ = 0U;
-    gameplay_.stop();
+    gameplay_.stop(audio_engine_.initialized() ? &audio_engine_ : nullptr);
     ui_.shutdown();
+    audio_engine_.shutdown();
+    input_actions_.set_hardware_polling_enabled(false);
     renderer_.shutdown();
     context_.shutdown();
     window_.reset();

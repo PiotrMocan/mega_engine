@@ -269,6 +269,24 @@ SceneNodeId duplicate_scene_subtree(
             static_cast<void>(scene.destroy_subtree(duplicate_root));
             return {};
         }
+        if (record.audio_source &&
+            !scene.set_audio_source(copy, *record.audio_source)) {
+            error = "Unable to copy audio source component to duplicated node.";
+            static_cast<void>(scene.destroy_subtree(duplicate_root));
+            return {};
+        }
+        if (record.audio_listener &&
+            !scene.set_audio_listener(copy, *record.audio_listener)) {
+            error = "Unable to copy audio listener component to duplicated node.";
+            static_cast<void>(scene.destroy_subtree(duplicate_root));
+            return {};
+        }
+        if (record.reverb_zone &&
+            !scene.set_reverb_zone(copy, *record.reverb_zone)) {
+            error = "Unable to copy reverb zone component to duplicated node.";
+            static_cast<void>(scene.destroy_subtree(duplicate_root));
+            return {};
+        }
         const bool copy_prefab_link =
             record.prefab_instance.has_value() &&
             (record_index != begin ||

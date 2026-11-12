@@ -659,6 +659,48 @@ int main() {
             "CharacterController lands and stands grounded on top of a kinematic rigid body");
     }
 
+    // Analog move_axis scaling, just_jumped(), and landing_impact_speed()
+    {
+        vcr::CharacterController analog_half;
+        vcr::CharacterController analog_full;
+        analog_half.reset({0.0F, 0.0F, 0.0F}, 0.0F);
+        analog_full.reset({0.0F, 0.0F, 0.0F}, 0.0F);
+        const float dt = 1.0F / 60.0F;
+        analog_half.update(
+            vcr::CharacterInput{.move_axis = {0.0F, 0.5F}}, camera_forward, dt);
+        analog_full.update(
+            vcr::CharacterInput{.move_axis = {0.0F, 1.0F}}, camera_forward, dt);
+        expect(
+            close_to(
+                analog_half.position().z,
+                analog_full.position().z * 0.5F,
+                1.0e-3F),
+            "partial analog move_axis scales horizontal character velocity proportionally");
+
+        vcr::CharacterController jumper;
+        jumper.reset({0.0F, 0.0F, 0.0F}, 0.0F);
+        jumper.update(vcr::CharacterInput{.jump = true}, camera_forward, dt);
+        expect(
+            jumper.just_jumped() && !jumper.grounded(),
+            "just_jumped() pulses true on takeoff frame");
+        jumper.update(vcr::CharacterInput{.jump = true}, camera_forward, dt);
+        expect(
+            !jumper.just_jumped(),
+            "just_jumped() clears on subsequent airborne frame");
+        float max_landing_speed = 0.0F;
+        for (int frame = 0; frame < 90; ++frame) {
+            jumper.update({}, camera_forward, dt);
+            max_landing_speed =
+                std::max(max_landing_speed, jumper.landing_impact_speed());
+            if (jumper.grounded()) {
+                break;
+            }
+        }
+        expect(
+            jumper.grounded() && max_landing_speed > 4.0F,
+            "landing_impact_speed() reports downward impact speed on touchdown");
+    }
+
     if (failures != 0) {
         std::cerr << failures << " gameplay test(s) failed\n";
         return 1;

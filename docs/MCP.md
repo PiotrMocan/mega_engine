@@ -13,7 +13,8 @@ build\windows-debug\bin\vulkan_editor.exe --mcp-stdio --no-validation
 | --- | --- |
 | `editor` | `get_state` |
 | `editor.selection` | `set` |
-| `editor.scene` | `list_nodes`, `get_node`, `find_by_uuid`, `create_node`, `update_node`, `delete_node`, `reparent_node`, `duplicate_node`, `set_collider`, `remove_collider`, `set_rigid_body`, `remove_rigid_body`, `save` |
+| `editor.scene` | `list_nodes`, `get_node`, `find_by_uuid`, `create_node`, `update_node`, `delete_node`, `reparent_node`, `duplicate_node`, `set_collider`, `remove_collider`, `set_rigid_body`, `remove_rigid_body`, `set_audio_source`, `remove_audio_source`, `set_audio_listener`, `remove_audio_listener`, `set_reverb_zone`, `remove_reverb_zone`, `save` |
+| `editor.audio` | `set_bus`, `preview` |
 | `editor.prefab` | `save`, `instantiate`, `unpack` |
 | `editor.camera` | `focus_selection` |
 | `editor.history` | `undo`, `redo` |
@@ -38,6 +39,11 @@ handle нужно считать недействительным и снова 
 `camera.focus_selection` кадрирует текущий выбор без изменения scene document.
 Точный эквивалент ручного gizmo для AI — `editor.scene.update_node` с
 `translation`, `rotation_degrees` и/или `scale`.
+Звуковые компоненты управляются через `editor.scene.set_audio_source` /
+`remove_audio_source`, `set_audio_listener` / `remove_audio_listener` и
+`set_reverb_zone` / `remove_reverb_zone`, а живой микшер и предпрослушивание —
+через `editor.audio.set_bus` и `editor.audio.preview`; их счётчики и телеметрия
+5 шин (`master`, `music`, `sfx`, `voice`, `ui`) публикуются в `editor.get_state`.
 
 Нативный smoke editor-profile:
 
@@ -159,7 +165,7 @@ Active blur поддерживает AA Off/SMAA1 и FSR Native. Для SMAA о�
 edge detection, для FSR Native — после upscale. MSAA, SMAA T2x и scaled FSR
 возвращают ошибку совместимости. HUD/editor компонуются после blur. Пауза больше
 250 ms, camera cut или смена настроек сбрасывают temporal state. Runtime/editor
-smoke inventories содержат 30/34 tools.
+smoke inventories содержат 31/43 tools.
 
 ### Screenshot
 

@@ -1068,6 +1068,90 @@ int main() {
             "FBX model and embedded material become separate assets");
     }
 
+    // Audio (.wav) asset import and corrupt audio preflight rejection
+    {
+        std::vector<std::byte> wav_bytes;
+        const auto push_u16 = [&](const std::uint16_t v) {
+            wav_bytes.push_back(static_cast<std::byte>(v & 0xFFU));
+            wav_bytes.push_back(static_cast<std::byte>((v >> 8U) & 0xFFU));
+        };
+        const auto push_u32 = [&](const std::uint32_t v) {
+            for (unsigned shift = 0U; shift < 32U; shift += 8U) {
+                wav_bytes.push_back(
+                    static_cast<std::byte>((v >> shift) & 0xFFU));
+            }
+        };
+        const auto push_tag = [&](const char (&tag)[5]) {
+            for (int i = 0; i < 4; ++i) {
+                wav_bytes.push_back(
+                    static_cast<std::byte>(static_cast<unsigned char>(tag[i])));
+            }
+        };
+        constexpr std::uint32_t frames = 4'800U;
+        constexpr std::uint32_t data_len = frames * 2U;
+        push_tag("RIFF");
+        push_u32(36U + data_len);
+        push_tag("WAVE");
+        push_tag("fmt ");
+        push_u32(16U);
+        push_u16(1U);
+        push_u16(1U);
+        push_u32(48'000U);
+        push_u32(96'000U);
+        push_u16(2U);
+        push_u16(16U);
+        push_tag("data");
+        push_u32(data_len);
+        for (std::uint32_t i = 0U; i < frames; ++i) {
+            push_u16(static_cast<std::uint16_t>(
+                static_cast<std::int16_t>((i % 64U < 32U) ? 8000 : -8000)));
+        }
+
+        const auto wav_source = source_root / "UI ClickBeep.wav";
+        expect(
+            write_binary(wav_source, wav_bytes),
+            "valid PCM WAV source fixture written");
+        expect(
+            vcr::asset_source_is_supported(wav_source) &&
+                vcr::classify_asset_source(wav_source) ==
+                    vcr::AssetSourceKind::audio_wav,
+            "classify_asset_source recognizes .wav as AssetSourceKind::audio_wav");
+        const auto wav_import = vcr::import_asset(wav_source, options);
+        expect(
+            static_cast<bool>(wav_import) &&
+                wav_import->source_kind == vcr::AssetSourceKind::audio_wav &&
+                result_has_kind(*wav_import, vcr::ImportedAssetKind::audio) &&
+                result_has_kind(
+                    *wav_import, vcr::ImportedAssetKind::source),
+            "importing .wav produces .vcraudio.json manifest and copied source file");
+        if (wav_import) {
+            for (const auto& f : wav_import->files) {
+                if (f.kind != vcr::ImportedAssetKind::audio) {
+                    continue;
+                }
+                const auto meta = read_json(asset_root / f.relative_path);
+                expect(
+                    meta.value("version", 0U) == 1U &&
+                        meta.value("sample_rate", 0U) == 48'000U &&
+                        meta.value("channels", 0U) == 1U &&
+                        meta.value("frame_count", 0ULL) == frames,
+                    "cooked .vcraudio.json stores inspected sample_rate, channels, and frame_count");
+            }
+        }
+
+        const auto bad_wav = source_root / "corrupt_tone.wav";
+        expect(
+            write_text(bad_wav, "NOT_A_WAV_HEADER"),
+            "corrupt WAV fixture written");
+        const auto bad_wav_import = vcr::import_asset(bad_wav, options);
+        expect(
+            !bad_wav_import &&
+                bad_wav_import.error().code ==
+                    vcr::AssetImportErrorCode::invalid_asset_data &&
+                !has_staging_directory(import_root),
+            "corrupt audio file is rejected transactionally without staging residue");
+    }
+
     if (failures != 0) {
         std::cerr << failures << " asset import test(s) failed\n";
         return 1;

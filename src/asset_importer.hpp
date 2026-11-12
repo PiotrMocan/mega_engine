@@ -21,12 +21,16 @@ enum class AssetSourceKind : std::uint8_t {
     model_stl,
     model_3ds,
     image,
+    audio_wav,
+    audio_ogg,
+    audio_flac,
 };
 
 enum class ImportedAssetKind : std::uint8_t {
     model,
     material,
     texture,
+    audio,
     mesh_binary,
     source,
 };

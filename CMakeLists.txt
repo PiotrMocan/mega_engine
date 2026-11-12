@@ -139,6 +139,12 @@ FetchContent_Declare(meshoptimizer
     GIT_REPOSITORY https://github.com/zeux/meshoptimizer.git
     GIT_TAG 6daea4695c48338363b08022d2fb15deaef6ac09
 )
+FetchContent_Declare(
+    miniaudio
+    GIT_REPOSITORY https://github.com/mackron/miniaudio.git
+    GIT_TAG 0.11.25
+    GIT_SHALLOW TRUE
+)
 if(WIN32 AND MSVC)
     FetchContent_Declare(
         FidelityFXSDK
@@ -165,6 +171,10 @@ endif()
 FetchContent_GetProperties(ImGuizmo)
 if(NOT imguizmo_POPULATED)
     FetchContent_Populate(ImGuizmo)
+endif()
+FetchContent_GetProperties(miniaudio)
+if(NOT miniaudio_POPULATED)
+    FetchContent_Populate(miniaudio)
 endif()
 
 # v1.92.8 stores the first secondary viewport's VkFormat address in the
@@ -347,6 +357,55 @@ target_link_libraries(vcr_imgui PUBLIC
     volk::volk
 )
 
+add_library(vcr_miniaudio STATIC
+    src/miniaudio_impl.c
+)
+set_target_properties(vcr_miniaudio PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED ON
+    C_EXTENSIONS OFF
+)
+target_include_directories(vcr_miniaudio SYSTEM PUBLIC
+    "${miniaudio_SOURCE_DIR}"
+)
+if(MSVC)
+    target_compile_options(vcr_miniaudio PRIVATE /W0)
+else()
+    target_compile_options(vcr_miniaudio PRIVATE -w)
+endif()
+if(UNIX AND NOT APPLE)
+    target_link_libraries(vcr_miniaudio PUBLIC m pthread dl)
+endif()
+
+add_library(vcr_cooked_audio_asset STATIC
+    src/cooked_audio_asset.cpp
+)
+target_include_directories(vcr_cooked_audio_asset PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_link_libraries(vcr_cooked_audio_asset
+    PUBLIC
+        glm::glm
+        vcr_miniaudio
+    PRIVATE
+        nlohmann_json::nlohmann_json
+)
+if(MSVC)
+    target_compile_options(vcr_cooked_audio_asset PRIVATE
+        /W4 /permissive- /Zc:preprocessor /GR- /EHsc
+    )
+    if(VCR_WARNINGS_AS_ERRORS)
+        target_compile_options(vcr_cooked_audio_asset PRIVATE /WX)
+    endif()
+else()
+    target_compile_options(vcr_cooked_audio_asset PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion -Wshadow -fno-rtti
+    )
+    if(VCR_WARNINGS_AS_ERRORS)
+        target_compile_options(vcr_cooked_audio_asset PRIVATE -Werror)
+    endif()
+endif()
+
 add_library(vcr_asset_import STATIC
     src/asset_importer.cpp
 )
@@ -356,10 +415,13 @@ target_include_directories(vcr_asset_import PUBLIC
 target_compile_definitions(vcr_asset_import PRIVATE
     VCR_HAS_ASSIMP=1
 )
-target_link_libraries(vcr_asset_import PRIVATE
-    assimp::assimp
-    glm::glm
-    nlohmann_json::nlohmann_json
+target_link_libraries(vcr_asset_import
+    PUBLIC
+        vcr_cooked_audio_asset
+    PRIVATE
+        assimp::assimp
+        glm::glm
+        nlohmann_json::nlohmann_json
 )
 if(MSVC)
     target_compile_options(vcr_asset_import PRIVATE
@@ -447,13 +509,16 @@ else()
 endif()
 
 set(VCR_RENDERER_SOURCES
+    src/audio_engine.cpp
     src/cli_options.cpp
     src/collision.cpp
     src/fly_camera.cpp
     src/gameplay.cpp
     src/gameplay_session.cpp
+    src/input_actions.cpp
     src/physics_world.cpp
     src/scene_uuid.cpp
+    src/sound_cue_io.cpp
     src/fsr3_upscaler.cpp
     src/gpu_buffer.cpp
     src/gpu_texture.cpp
@@ -615,6 +680,7 @@ endif()
 target_link_libraries(vulkan_cube PRIVATE vcr_imgui)
 target_link_libraries(
     vulkan_cube PRIVATE
+    vcr_cooked_audio_asset
     vcr_cooked_model_asset
     vcr_cooked_texture_asset
 )
@@ -622,6 +688,7 @@ target_link_libraries(vulkan_editor PRIVATE vcr_imgui)
 target_link_libraries(
     vulkan_editor PRIVATE
     vcr_asset_import
+    vcr_cooked_audio_asset
     vcr_cooked_model_asset
     vcr_cooked_texture_asset
 )
@@ -687,6 +754,48 @@ if(BUILD_TESTING)
         )
     endif()
     add_test(NAME vcr_gameplay_tests COMMAND vcr_gameplay_tests)
+
+    add_executable(vcr_audio_input_tests
+        tests/audio_input_tests.cpp
+        src/audio_engine.cpp
+        src/collision.cpp
+        src/input_actions.cpp
+        src/prefab_io.cpp
+        src/punctual_light.cpp
+        src/scene_document.cpp
+        src/scene_io.cpp
+        src/scene_uuid.cpp
+        src/sound_cue_io.cpp
+    )
+    target_include_directories(vcr_audio_input_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+    target_compile_definitions(vcr_audio_input_tests PRIVATE
+        GLM_FORCE_DEPTH_ZERO_TO_ONE
+        GLM_FORCE_RADIANS
+    )
+    target_link_libraries(vcr_audio_input_tests PRIVATE
+        vcr_cooked_audio_asset
+        glm::glm
+        nlohmann_json::nlohmann_json
+        Threads::Threads
+    )
+    if(MSVC)
+        target_compile_options(vcr_audio_input_tests PRIVATE
+            /W4 /permissive- /Zc:preprocessor /GR- /EHsc
+        )
+        if(VCR_WARNINGS_AS_ERRORS)
+            target_compile_options(vcr_audio_input_tests PRIVATE /WX)
+        endif()
+    else()
+        target_compile_options(vcr_audio_input_tests PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -fno-rtti
+        )
+        if(VCR_WARNINGS_AS_ERRORS)
+            target_compile_options(vcr_audio_input_tests PRIVATE -Werror)
+        endif()
+    endif()
+    add_test(NAME vcr_audio_input_tests COMMAND vcr_audio_input_tests)
 
     add_executable(vcr_fog_tests tests/fog_tests.cpp)
     target_include_directories(vcr_fog_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")

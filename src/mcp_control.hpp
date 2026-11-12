@@ -55,6 +55,14 @@ enum class McpCommandType : std::uint8_t {
     editor_remove_collider,
     editor_set_rigid_body,
     editor_remove_rigid_body,
+    editor_set_audio_source,
+    editor_remove_audio_source,
+    editor_set_audio_listener,
+    editor_remove_audio_listener,
+    editor_set_reverb_zone,
+    editor_remove_reverb_zone,
+    editor_audio_set_bus,
+    editor_audio_preview,
     editor_prefab_save,
     editor_prefab_instantiate,
     editor_prefab_unpack,
@@ -112,6 +120,30 @@ enum class McpMouseButton : std::uint8_t {
     left,
 };
 
+struct McpAudioSourcePayload {
+    AudioBusId bus = AudioBusId::sfx;
+    AudioAttenuationModel attenuation = AudioAttenuationModel::inverse_clamped;
+    bool enabled = true;
+    bool spatial = true;
+    bool loop = false;
+    bool play_on_start = true;
+    bool streaming = false;
+    bool occlusion = true;
+    float volume = 1.0F;
+    float pitch = 1.0F;
+    float pitch_variance = 0.0F;
+    float volume_variance = 0.0F;
+    float min_distance = 1.5F;
+    float max_distance = 35.0F;
+    float rolloff = 1.0F;
+    float doppler_factor = 1.0F;
+    float inner_cone_degrees = 360.0F;
+    float outer_cone_degrees = 360.0F;
+    float outer_cone_gain = 0.25F;
+};
+
+static_assert(std::is_trivially_copyable_v<McpAudioSourcePayload>);
+
 struct McpCommand {
     static constexpr std::size_t text_capacity =
         max_scene_asset_path_bytes + 1U;
@@ -165,6 +197,11 @@ struct McpCommand {
     SceneUuid node_uuid{};
     ColliderComponent collider{};
     RigidBodyComponent rigid_body{};
+    McpAudioSourcePayload audio_source{};
+    AudioListenerComponent audio_listener{};
+    AudioReverbZoneComponent reverb_zone{};
+    bool audio_bus_volume_supplied = false;
+    bool audio_bus_muted_supplied = false;
     bool prefab_attach_instance = true;
     SceneNodeKind node_kind = SceneNodeKind::folder;
     SceneTransform transform{};

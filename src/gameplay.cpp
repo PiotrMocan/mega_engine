@@ -47,12 +47,18 @@ constexpr float direction_epsilon = 1.0e-8F;
         0.0F,
         camera_forward.x,
     };
+    const float analog_right =
+        std::isfinite(input.move_axis.x) ? input.move_axis.x : 0.0F;
+    const float analog_forward =
+        std::isfinite(input.move_axis.y) ? input.move_axis.y : 0.0F;
     const float forward_axis =
-        static_cast<float>(input.forward) -
-        static_cast<float>(input.backward);
+        (static_cast<float>(input.forward) -
+         static_cast<float>(input.backward)) +
+        analog_forward;
     const float right_axis =
-        static_cast<float>(input.right) -
-        static_cast<float>(input.left);
+        (static_cast<float>(input.right) -
+         static_cast<float>(input.left)) +
+        analog_right;
     const glm::vec3 raw =
         camera_forward * forward_axis +
         camera_right * right_axis;
@@ -60,7 +66,9 @@ constexpr float direction_epsilon = 1.0e-8F;
     if (len_sq <= direction_epsilon) {
         return glm::vec3(0.0F);
     }
-    return raw * (1.0F / std::sqrt(len_sq));
+    const float len = std::sqrt(len_sq);
+    const float clamped_mag = std::min(len, 1.0F);
+    return raw * (clamped_mag / len);
 }
 
 [[nodiscard]] std::optional<float> sample_walkable_ledge(
@@ -145,20 +153,25 @@ void CharacterController::reset(
         ? std::remainder(facing_yaw_radians, two_pi)
         : pi;
     vertical_velocity_ = 0.0F;
+    landing_impact_speed_ = 0.0F;
     grounded_ = position_.y <= config_.ground_height + 1.0e-3F;
     jump_was_down_ = false;
+    just_jumped_ = false;
 }
 
 void CharacterController::update(
     const CharacterInput& input,
     const glm::vec3 camera_forward,
     const float delta_seconds) noexcept {
+    just_jumped_ = false;
+    landing_impact_speed_ = 0.0F;
     const bool jump_started = input.jump && !jump_was_down_;
     jump_was_down_ = input.jump;
     if (!std::isfinite(delta_seconds) || delta_seconds <= 0.0F) {
         return;
     }
     const float delta = std::min(delta_seconds, config_.maximum_delta_seconds);
+    const bool was_grounded = grounded_;
 
     const glm::vec3 movement =
         compute_planar_movement(input, camera_forward, facing_yaw_radians_);
@@ -179,12 +192,17 @@ void CharacterController::update(
     if (grounded_ && jump_started) {
         vertical_velocity_ = config_.jump_speed;
         grounded_ = false;
+        just_jumped_ = true;
     }
     vertical_velocity_ -= config_.gravity * delta;
+    const float impact_speed = std::max(0.0F, -vertical_velocity_);
     position_.y += vertical_velocity_ * delta;
     if (position_.y <= config_.ground_height) {
         position_.y = config_.ground_height;
         vertical_velocity_ = 0.0F;
+        if (!was_grounded) {
+            landing_impact_speed_ = impact_speed;
+        }
         grounded_ = true;
     }
 }
@@ -200,6 +218,8 @@ void CharacterController::update(
         return;
     }
 
+    just_jumped_ = false;
+    landing_impact_speed_ = 0.0F;
     const bool jump_started = input.jump && !jump_was_down_;
     jump_was_down_ = input.jump;
     if (!std::isfinite(delta_seconds) || delta_seconds <= 0.0F) {
@@ -211,10 +231,12 @@ void CharacterController::update(
 
     const glm::vec3 movement =
         compute_planar_movement(input, camera_forward, facing_yaw_radians_);
+    const float move_len_sq = glm::dot(movement, movement);
     const float speed = input.run ? config_.run_speed : config_.walk_speed;
 
-    if (glm::dot(movement, movement) > direction_epsilon) {
-        const float desired_yaw = std::atan2(movement.x, movement.z);
+    if (move_len_sq > direction_epsilon) {
+        const glm::vec3 move_dir = movement * (1.0F / std::sqrt(move_len_sq));
+        const float desired_yaw = std::atan2(move_dir.x, move_dir.z);
         const float yaw_delta = std::remainder(
             desired_yaw - facing_yaw_radians_, two_pi);
         const float maximum_turn = config_.turn_speed_radians * delta;
@@ -276,7 +298,7 @@ void CharacterController::update(
                             if (const auto y = sample_walkable_ledge(
                                     world,
                                     probe_center,
-                                    glm::vec2(movement.x * r, movement.z * r),
+                                    glm::vec2(move_dir.x * r, move_dir.z * r),
                                     config_.step_height + 0.05F,
                                     walkable_cos,
                                     layer_mask)) {
@@ -305,13 +327,13 @@ void CharacterController::update(
                                     direct.resolved_feet.x - start_pos.x,
                                     0.0F,
                                     direct.resolved_feet.z - start_pos.z),
-                                movement);
+                                move_dir);
                             const float step_progress = glm::dot(
                                 glm::vec3(
                                     settled.resolved_feet.x - start_pos.x,
                                     0.0F,
                                     settled.resolved_feet.z - start_pos.z),
-                                movement);
+                                move_dir);
                             if (!settled.hit_wall &&
                                 !settled.hit_ceiling &&
                                 settled.resolved_feet.y <=
@@ -341,10 +363,12 @@ void CharacterController::update(
     if (grounded_ && jump_started) {
         vertical_velocity_ = config_.jump_speed;
         grounded_ = false;
+        just_jumped_ = true;
     }
 
     const glm::vec3 pre_gravity_pos = position_;
     vertical_velocity_ -= config_.gravity * delta;
+    const float pre_contact_fall_speed = std::max(0.0F, -vertical_velocity_);
     const float total_dy = vertical_velocity_ * delta;
     const float max_v_step = std::max(config_.capsule_radius * 0.75F, 0.05F);
     const int v_substeps = std::clamp(
@@ -365,6 +389,10 @@ void CharacterController::update(
             vertical_velocity_ = 0.0F;
         }
         if (v_contact.grounded && vertical_velocity_ <= 0.0F) {
+            if (!was_grounded) {
+                landing_impact_speed_ =
+                    std::max(landing_impact_speed_, pre_contact_fall_speed);
+            }
             vertical_velocity_ = 0.0F;
             landed = true;
             break;
@@ -474,6 +502,10 @@ void CharacterController::apply_external_resolution(
         vertical_velocity_ = 0.0F;
     }
     if (grounded_on_body && vertical_velocity_ <= 0.0F) {
+        if (!grounded_) {
+            landing_impact_speed_ =
+                std::max(landing_impact_speed_, -vertical_velocity_);
+        }
         vertical_velocity_ = 0.0F;
         grounded_ = true;
     }

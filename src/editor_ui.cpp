@@ -1,10 +1,13 @@
 #include "editor_ui.hpp"
 
 #include "asset_importer.hpp"
+#include "cooked_audio_asset.hpp"
 #include "editor_scene_tools.hpp"
 #include "renderer.hpp"
 #include "runtime_assets.hpp"
 #include "scene_io.hpp"
+#include "sdl_input_bridge.hpp"
+#include "sound_cue_io.hpp"
 #include "vulkan_common.hpp"
 
 #include <imgui_impl_sdl3.h>
@@ -93,6 +96,22 @@ struct MaterialEditorUiState {
     bool loaded = false;
     bool dirty = false;
     bool close_confirmation_requested = false;
+};
+
+struct AudioInputUiState {
+    enum class CaptureMode : std::uint8_t {
+        none,
+        primary_key,
+        secondary_key,
+        gamepad_button,
+    };
+
+    std::optional<InputAction> capturing_action{};
+    CaptureMode capture_mode = CaptureMode::none;
+    GamepadState last_gamepad_for_capture{};
+    std::string status{};
+    std::string error{};
+    bool open = true;
 };
 
 class AssetImportWorker final {
@@ -426,6 +445,8 @@ struct EditorViewportRay {
     case AssetEntryKind::shader: return EditorIcon::renderer;
     case AssetEntryKind::scene: return EditorIcon::cube;
     case AssetEntryKind::prefab: return EditorIcon::model;
+    case AssetEntryKind::audio: return EditorIcon::play;
+    case AssetEntryKind::sound_cue: return EditorIcon::play;
     case AssetEntryKind::binary: return EditorIcon::import_asset;
     case AssetEntryKind::other: return EditorIcon::import_asset;
     }
@@ -442,6 +463,7 @@ inline constexpr std::uintmax_t maximum_material_file_bytes =
     case ImportedAssetKind::material: return "Material";
     case ImportedAssetKind::texture: return "Texture";
     case ImportedAssetKind::mesh_binary: return "Mesh data";
+    case ImportedAssetKind::audio: return "Audio";
     case ImportedAssetKind::source: return "Source";
     }
     return "Asset";
@@ -1234,17 +1256,23 @@ EditorUi::~EditorUi() noexcept {
 void EditorUi::initialize(
     VulkanContext& context,
     SDL_Window* const main_window,
-    Renderer& renderer) {
+    Renderer& renderer,
+    AudioEngine* const audio_engine,
+    InputActionSystem* const input_actions) {
     if (context_ != nullptr || main_window == nullptr) {
         fatal("Editor UI was initialized with invalid state.");
     }
     context_ = &context;
     main_window_ = main_window;
+    audio_engine_ = audio_engine;
+    input_actions_ = input_actions;
     import_worker_ = std::make_unique<AssetImportWorker>();
     import_ui_ = std::make_unique<AssetImportUiState>();
     external_drop_ = std::make_unique<ExternalAssetDropState>();
     material_editor_ =
         std::make_unique<MaterialEditorUiState>();
+    audio_input_ui_ =
+        std::make_unique<AudioInputUiState>();
     constexpr std::string_view default_scatter_name{"Plant"};
     std::memcpy(
         scatter_name_prefix_.data(),
@@ -1337,6 +1365,8 @@ void EditorUi::shutdown() noexcept {
     }
     context_ = nullptr;
     main_window_ = nullptr;
+    audio_engine_ = nullptr;
+    input_actions_ = nullptr;
     imgui_color_format_ = VK_FORMAT_UNDEFINED;
     imgui_rendering_info_.pColorAttachmentFormats = nullptr;
     known_viewport_generation_ = 0U;
@@ -1359,6 +1389,7 @@ void EditorUi::shutdown() noexcept {
     saved_content_revision_ = 0U;
     saved_structure_revision_ = 0U;
     selected_asset_.reset();
+    audio_input_ui_.reset();
     material_editor_.reset();
     external_drop_.reset();
     import_ui_.reset();
@@ -1381,6 +1412,91 @@ void EditorUi::shutdown() noexcept {
 
 void EditorUi::process_event(const SDL_Event& event) {
     if (context_ != nullptr) {
+        if (audio_input_ui_ != nullptr &&
+            audio_input_ui_->open &&
+            audio_input_ui_->capturing_action.has_value() &&
+            input_actions_ != nullptr) {
+            const InputAction action = *audio_input_ui_->capturing_action;
+            ActionBinding edited = input_actions_->binding(action);
+            if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
+                if (event.key.key == SDLK_ESCAPE) {
+                    audio_input_ui_->capturing_action.reset();
+                    audio_input_ui_->capture_mode =
+                        AudioInputUiState::CaptureMode::none;
+                    audio_input_ui_->status = "Cancelled rebind.";
+                    return;
+                }
+                if (event.key.key == SDLK_BACKSPACE ||
+                    event.key.key == SDLK_DELETE) {
+                    if (audio_input_ui_->capture_mode ==
+                        AudioInputUiState::CaptureMode::primary_key) {
+                        edited.primary_key = InputKey::none;
+                    } else if (audio_input_ui_->capture_mode ==
+                               AudioInputUiState::CaptureMode::secondary_key) {
+                        edited.secondary_key = InputKey::none;
+                    } else if (audio_input_ui_->capture_mode ==
+                               AudioInputUiState::CaptureMode::gamepad_button) {
+                        edited.gamepad_button = GamepadButton::none;
+                    }
+                    input_actions_->set_binding(action, edited);
+                    audio_input_ui_->capturing_action.reset();
+                    audio_input_ui_->capture_mode =
+                        AudioInputUiState::CaptureMode::none;
+                    audio_input_ui_->status =
+                        "Cleared binding for " +
+                        std::string(input_action_display_name(action)) + ".";
+                    return;
+                }
+                if (audio_input_ui_->capture_mode ==
+                        AudioInputUiState::CaptureMode::primary_key ||
+                    audio_input_ui_->capture_mode ==
+                        AudioInputUiState::CaptureMode::secondary_key) {
+                    const InputKey mapped =
+                        input_key_from_sdl_keycode(event.key.key);
+                    if (mapped != InputKey::none) {
+                        if (audio_input_ui_->capture_mode ==
+                            AudioInputUiState::CaptureMode::primary_key) {
+                            edited.primary_key = mapped;
+                        } else {
+                            edited.secondary_key = mapped;
+                        }
+                        input_actions_->set_binding(action, edited);
+                        audio_input_ui_->capturing_action.reset();
+                        audio_input_ui_->capture_mode =
+                            AudioInputUiState::CaptureMode::none;
+                        audio_input_ui_->status =
+                            "Bound " +
+                            std::string(input_action_display_name(action)) +
+                            " to " + std::string(to_token(mapped)) + ".";
+                        return;
+                    }
+                }
+            } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
+                       (audio_input_ui_->capture_mode ==
+                            AudioInputUiState::CaptureMode::primary_key ||
+                        audio_input_ui_->capture_mode ==
+                            AudioInputUiState::CaptureMode::secondary_key)) {
+                const InputKey mapped =
+                    input_key_from_sdl_mouse_button(event.button.button);
+                if (mapped != InputKey::none) {
+                    if (audio_input_ui_->capture_mode ==
+                        AudioInputUiState::CaptureMode::primary_key) {
+                        edited.primary_key = mapped;
+                    } else {
+                        edited.secondary_key = mapped;
+                    }
+                    input_actions_->set_binding(action, edited);
+                    audio_input_ui_->capturing_action.reset();
+                    audio_input_ui_->capture_mode =
+                        AudioInputUiState::CaptureMode::none;
+                    audio_input_ui_->status =
+                        "Bound " +
+                        std::string(input_action_display_name(action)) +
+                        " to " + std::string(to_token(mapped)) + ".";
+                    return;
+                }
+            }
+        }
         if (game_mouse_window_id_ != 0U) {
             if ((event.type == SDL_EVENT_WINDOW_FOCUS_LOST ||
                  event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) &&
@@ -1394,6 +1510,33 @@ void EditorUi::process_event(const SDL_Event& event) {
                        event.motion.windowID == game_mouse_window_id_) {
                 pending_game_mouse_delta_x_ += event.motion.xrel;
                 pending_game_mouse_delta_y_ += event.motion.yrel;
+                if (play_state_ == EditorPlayState::playing &&
+                    input_actions_ != nullptr) {
+                    input_actions_->add_mouse_delta(
+                        event.motion.xrel, event.motion.yrel);
+                }
+            }
+            if (play_state_ == EditorPlayState::playing &&
+                input_actions_ != nullptr) {
+                if ((event.type == SDL_EVENT_KEY_DOWN ||
+                     event.type == SDL_EVENT_KEY_UP) &&
+                    !event.key.repeat) {
+                    const InputKey mapped =
+                        input_key_from_sdl_keycode(event.key.key);
+                    if (mapped != InputKey::none) {
+                        input_actions_->set_key_down(
+                            mapped, event.type == SDL_EVENT_KEY_DOWN);
+                    }
+                } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+                           event.type == SDL_EVENT_MOUSE_BUTTON_UP) {
+                    const InputKey mapped =
+                        input_key_from_sdl_mouse_button(event.button.button);
+                    if (mapped != InputKey::none) {
+                        input_actions_->set_key_down(
+                            mapped,
+                            event.type == SDL_EVENT_MOUSE_BUTTON_DOWN);
+                    }
+                }
             }
         }
         static_cast<void>(ImGui_ImplSDL3_ProcessEvent(&event));
@@ -1721,6 +1864,7 @@ void EditorUi::begin_frame(
             ImGui::DockBuilderDockWindow("Material Editor", right);
             ImGui::DockBuilderDockWindow("Renderer", right);
             ImGui::DockBuilderDockWindow("Landscape", right);
+            ImGui::DockBuilderDockWindow("Audio & Input", right);
             ImGui::DockBuilderDockWindow("Assets", bottom);
             ImGui::DockBuilderDockWindow("Scene View", center);
             ImGui::DockBuilderFinish(dockspace_id);
@@ -1742,6 +1886,7 @@ void EditorUi::begin_frame(
     build_import_window();
     build_import_results();
     build_material_editor(renderer);
+    build_audio_input_panel();
     build_performance(scene, renderer, performance);
     build_external_game_window(now);
     process_file_commands(scene);
@@ -1983,6 +2128,61 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
             }
             selected_node_ = light;
         }
+        ImGui::Separator();
+        if (ImGui::MenuItem(
+                "Add audio source",
+                nullptr,
+                false,
+                play_state_ == EditorPlayState::edit)) {
+            checkpoint_scene(scene);
+            const SceneNodeId emitter = scene.create_node(
+                "Audio Emitter", SceneNodeKind::folder, parent);
+            if (emitter) {
+                if (auto node = scene.node(emitter)) {
+                    node->get().transform.translation =
+                        glm::vec3(0.0F, 1.5F, -4.0F);
+                }
+                AudioSourceComponent source{};
+                if (selected_asset_ &&
+                    (selected_asset_->kind == AssetEntryKind::audio ||
+                     selected_asset_->kind == AssetEntryKind::sound_cue) &&
+                    valid_audio_asset_reference(
+                        selected_asset_->relative_display)) {
+                    static_cast<void>(
+                        source.set_path(selected_asset_->relative_display));
+                }
+                static_cast<void>(scene.set_audio_source(emitter, source));
+                selected_node_ = emitter;
+            }
+        }
+        if (ImGui::MenuItem(
+                "Add audio listener",
+                nullptr,
+                false,
+                play_state_ == EditorPlayState::edit)) {
+            checkpoint_scene(scene);
+            const SceneNodeId listener = scene.create_node(
+                "Audio Listener", SceneNodeKind::folder, parent);
+            if (listener) {
+                static_cast<void>(scene.set_audio_listener(
+                    listener, AudioListenerComponent{}));
+                selected_node_ = listener;
+            }
+        }
+        if (ImGui::MenuItem(
+                "Add reverb zone",
+                nullptr,
+                false,
+                play_state_ == EditorPlayState::edit)) {
+            checkpoint_scene(scene);
+            const SceneNodeId zone = scene.create_node(
+                "Reverb Zone", SceneNodeKind::folder, parent);
+            if (zone) {
+                static_cast<void>(scene.set_reverb_zone(
+                    zone, AudioReverbZoneComponent{}));
+                selected_node_ = zone;
+            }
+        }
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Assets")) {
@@ -2018,6 +2218,15 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
                     material_editor_->open = false;
                 }
             }
+        }
+        const bool audio_input_open =
+            audio_input_ui_ != nullptr && audio_input_ui_->open;
+        if (ImGui::MenuItem(
+                "Audio & Input",
+                nullptr,
+                audio_input_open) &&
+            audio_input_ui_ != nullptr) {
+            audio_input_ui_->open = !audio_input_open;
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Reset editor layout")) {
@@ -2892,6 +3101,449 @@ void EditorUi::build_inspector(SceneDocument& scene) {
         }
     }
     {
+        ui_kit_.section_header(EditorIcon::play, "Audio Source");
+        if (const auto attached_src = scene.audio_source(selected_node_)) {
+            AudioSourceComponent edited_src = attached_src->get();
+            bool src_changed = false;
+            bool remove_src_requested = false;
+            if (ui_kit_.begin_property_grid("AudioSourceProperties")) {
+                ui_kit_.property_row("Enabled");
+                src_changed |= ImGui::Checkbox(
+                    "##AudioSrcEnabled", &edited_src.enabled);
+                ui_kit_.property_row("Asset / Cue");
+                std::array<char, max_audio_path_bytes + 1U> path_buf{};
+                std::memcpy(
+                    path_buf.data(),
+                    edited_src.asset_path.data(),
+                    edited_src.asset_path.size());
+                if (ImGui::InputTextWithHint(
+                        "##AudioSrcAsset",
+                        "audio/clip.vcraudio.json or .vcrcue.json",
+                        path_buf.data(),
+                        path_buf.size())) {
+                    const std::string_view candidate(path_buf.data());
+                    if (edited_src.set_path(candidate)) {
+                        src_changed = true;
+                    }
+                }
+                if (ImGui::BeginDragDropTarget()) {
+                    if (const ImGuiPayload* payload =
+                            ImGui::AcceptDragDropPayload("VCR_ASSET_PATH");
+                        payload != nullptr &&
+                        payload->Data != nullptr &&
+                        payload->DataSize > 1) {
+                        const auto* bytes =
+                            static_cast<const char*>(payload->Data);
+                        const std::size_t sz =
+                            static_cast<std::size_t>(payload->DataSize);
+                        if (bytes[sz - 1U] == '\0') {
+                            const std::string_view dropped{bytes, sz - 1U};
+                            if (edited_src.set_path(dropped)) {
+                                src_changed = true;
+                            }
+                        }
+                    }
+                    ImGui::EndDragDropTarget();
+                }
+                if (selected_asset_ &&
+                    (selected_asset_->kind == AssetEntryKind::audio ||
+                     selected_asset_->kind == AssetEntryKind::sound_cue) &&
+                    valid_audio_asset_reference(
+                        selected_asset_->relative_display)) {
+                    ui_kit_.property_row("Assign");
+                    if (ImGui::SmallButton("Use selected asset")) {
+                        if (edited_src.set_path(
+                                selected_asset_->relative_display)) {
+                            src_changed = true;
+                        }
+                    }
+                }
+                if (audio_engine_ != nullptr &&
+                    !edited_src.path_view().empty()) {
+                    ui_kit_.property_row("Preview");
+                    ImGui::EndDisabled();
+                    if (ImGui::SmallButton("Play")) {
+                        std::string preview_err;
+                        if (!audio_engine_->play_preview(
+                                edited_src.path_view(),
+                                preview_err)) {
+                            asset_error_ = std::move(preview_err);
+                        }
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Stop")) {
+                        audio_engine_->stop_preview();
+                    }
+                    ImGui::BeginDisabled(!editable);
+                }
+                ui_kit_.property_row("Bus");
+                if (ImGui::BeginCombo(
+                        "##AudioSrcBus", to_token(edited_src.bus).data())) {
+                    for (const auto candidate_bus : {
+                             AudioBusId::master,
+                             AudioBusId::music,
+                             AudioBusId::sfx,
+                             AudioBusId::voice,
+                             AudioBusId::ui}) {
+                        if (ImGui::Selectable(
+                                to_token(candidate_bus).data(),
+                                edited_src.bus == candidate_bus)) {
+                            src_changed |= edited_src.bus != candidate_bus;
+                            edited_src.bus = candidate_bus;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                ui_kit_.property_row("Spatial 3D");
+                src_changed |= ImGui::Checkbox(
+                    "##AudioSrcSpatial", &edited_src.spatial);
+                ui_kit_.property_row("Loop");
+                src_changed |= ImGui::Checkbox(
+                    "##AudioSrcLoop", &edited_src.loop);
+                ui_kit_.property_row("Play on start");
+                src_changed |= ImGui::Checkbox(
+                    "##AudioSrcPlayOnStart", &edited_src.play_on_start);
+                ui_kit_.property_row("Streaming");
+                src_changed |= ImGui::Checkbox(
+                    "##AudioSrcStreaming", &edited_src.streaming);
+                ui_kit_.property_row("Volume");
+                src_changed |= ImGui::SliderFloat(
+                    "##AudioSrcVolume",
+                    &edited_src.volume,
+                    0.0F,
+                    2.0F,
+                    "%.2f",
+                    ImGuiSliderFlags_AlwaysClamp);
+                ui_kit_.property_row("Pitch");
+                src_changed |= ImGui::SliderFloat(
+                    "##AudioSrcPitch",
+                    &edited_src.pitch,
+                    0.25F,
+                    4.0F,
+                    "%.2f",
+                    ImGuiSliderFlags_AlwaysClamp);
+                ui_kit_.property_row("Volume variance");
+                src_changed |= ImGui::SliderFloat(
+                    "##AudioSrcVolVar",
+                    &edited_src.volume_variance,
+                    0.0F,
+                    1.0F,
+                    "%.2f",
+                    ImGuiSliderFlags_AlwaysClamp);
+                ui_kit_.property_row("Pitch variance");
+                src_changed |= ImGui::SliderFloat(
+                    "##AudioSrcPitchVar",
+                    &edited_src.pitch_variance,
+                    0.0F,
+                    1.0F,
+                    "%.2f",
+                    ImGuiSliderFlags_AlwaysClamp);
+                if (edited_src.spatial) {
+                    ui_kit_.property_row("Attenuation");
+                    if (ImGui::BeginCombo(
+                            "##AudioSrcAtten",
+                            to_token(edited_src.attenuation).data())) {
+                        for (const auto candidate_model : {
+                                 AudioAttenuationModel::inverse_clamped,
+                                 AudioAttenuationModel::linear,
+                                 AudioAttenuationModel::exponential}) {
+                            if (ImGui::Selectable(
+                                    to_token(candidate_model).data(),
+                                    edited_src.attenuation ==
+                                        candidate_model)) {
+                                src_changed |=
+                                    edited_src.attenuation != candidate_model;
+                                edited_src.attenuation = candidate_model;
+                            }
+                        }
+                        ImGui::EndCombo();
+                    }
+                    ui_kit_.property_row("Min distance (m)");
+                    src_changed |= ImGui::DragFloat(
+                        "##AudioSrcMinDist",
+                        &edited_src.min_distance,
+                        0.1F,
+                        0.05F,
+                        10'000.0F,
+                        "%.2f",
+                        ImGuiSliderFlags_AlwaysClamp);
+                    ui_kit_.property_row("Max distance (m)");
+                    src_changed |= ImGui::DragFloat(
+                        "##AudioSrcMaxDist",
+                        &edited_src.max_distance,
+                        0.25F,
+                        edited_src.min_distance,
+                        100'000.0F,
+                        "%.2f",
+                        ImGuiSliderFlags_AlwaysClamp);
+                    ui_kit_.property_row("Rolloff");
+                    src_changed |= ImGui::DragFloat(
+                        "##AudioSrcRolloff",
+                        &edited_src.rolloff,
+                        0.05F,
+                        0.01F,
+                        16.0F,
+                        "%.2f",
+                        ImGuiSliderFlags_AlwaysClamp);
+                    ui_kit_.property_row("Doppler factor");
+                    src_changed |= ImGui::SliderFloat(
+                        "##AudioSrcDoppler",
+                        &edited_src.doppler_factor,
+                        0.0F,
+                        5.0F,
+                        "%.2f",
+                        ImGuiSliderFlags_AlwaysClamp);
+                    ui_kit_.property_row("Occlusion");
+                    src_changed |= ImGui::Checkbox(
+                        "##AudioSrcOcclusion", &edited_src.occlusion);
+                    ui_kit_.property_row("Inner cone");
+                    src_changed |= ImGui::SliderFloat(
+                        "##AudioSrcConeIn",
+                        &edited_src.inner_cone_degrees,
+                        0.0F,
+                        360.0F,
+                        "%.0f deg",
+                        ImGuiSliderFlags_AlwaysClamp);
+                    ui_kit_.property_row("Outer cone");
+                    src_changed |= ImGui::SliderFloat(
+                        "##AudioSrcConeOut",
+                        &edited_src.outer_cone_degrees,
+                        edited_src.inner_cone_degrees,
+                        360.0F,
+                        "%.0f deg",
+                        ImGuiSliderFlags_AlwaysClamp);
+                    if (edited_src.outer_cone_degrees < 359.9F) {
+                        ui_kit_.property_row("Outer gain");
+                        src_changed |= ImGui::SliderFloat(
+                            "##AudioSrcConeGain",
+                            &edited_src.outer_cone_gain,
+                            0.0F,
+                            1.0F,
+                            "%.2f",
+                            ImGuiSliderFlags_AlwaysClamp);
+                    }
+                }
+                ui_kit_.property_row("Component");
+                if (ImGui::SmallButton("Remove audio source")) {
+                    remove_src_requested = true;
+                }
+                ui_kit_.end_property_grid();
+            }
+            if (remove_src_requested) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                static_cast<void>(scene.remove_audio_source(selected_node_));
+            } else if (src_changed) {
+                edited_src = sanitize_audio_source_component(edited_src);
+                if (!inspector_edit_snapshot_) {
+                    inspector_edit_snapshot_ = scene;
+                    if (auto previous =
+                            inspector_edit_snapshot_->node(selected_node_)) {
+                        previous->get() = node_before_edit;
+                    }
+                }
+                static_cast<void>(
+                    scene.set_audio_source(selected_node_, edited_src));
+            }
+        } else {
+            ui_kit_.status_text(
+                "No audio emitter attached.",
+                EditorTone::neutral);
+            if (ui_kit_.action_button(
+                    "AddAudioSourceButton",
+                    EditorIcon::add,
+                    "Add Audio Source",
+                    EditorButtonStyle::secondary,
+                    editable)) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                AudioSourceComponent initial{};
+                if (selected_asset_ &&
+                    (selected_asset_->kind == AssetEntryKind::audio ||
+                     selected_asset_->kind == AssetEntryKind::sound_cue) &&
+                    valid_audio_asset_reference(
+                        selected_asset_->relative_display)) {
+                    static_cast<void>(
+                        initial.set_path(selected_asset_->relative_display));
+                }
+                static_cast<void>(
+                    scene.set_audio_source(selected_node_, initial));
+            }
+        }
+    }
+    {
+        ui_kit_.section_header(EditorIcon::camera, "Audio Listener");
+        if (const auto attached_listener =
+                scene.audio_listener(selected_node_)) {
+            AudioListenerComponent edited_listener = attached_listener->get();
+            bool listener_changed = false;
+            bool remove_listener_requested = false;
+            if (ui_kit_.begin_property_grid("AudioListenerProperties")) {
+                ui_kit_.property_row("Enabled");
+                listener_changed |= ImGui::Checkbox(
+                    "##AudioListenerEnabled", &edited_listener.enabled);
+                ui_kit_.property_row("Volume scale");
+                listener_changed |= ImGui::SliderFloat(
+                    "##AudioListenerVol",
+                    &edited_listener.volume_scale,
+                    0.0F,
+                    2.0F,
+                    "%.2f",
+                    ImGuiSliderFlags_AlwaysClamp);
+                ui_kit_.property_row("Doppler scale");
+                listener_changed |= ImGui::SliderFloat(
+                    "##AudioListenerDoppler",
+                    &edited_listener.doppler_scale,
+                    0.0F,
+                    5.0F,
+                    "%.2f",
+                    ImGuiSliderFlags_AlwaysClamp);
+                ui_kit_.property_row("Component");
+                if (ImGui::SmallButton("Remove audio listener")) {
+                    remove_listener_requested = true;
+                }
+                ui_kit_.end_property_grid();
+            }
+            if (remove_listener_requested) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                static_cast<void>(
+                    scene.remove_audio_listener(selected_node_));
+            } else if (listener_changed) {
+                edited_listener =
+                    sanitize_audio_listener_component(edited_listener);
+                if (!inspector_edit_snapshot_) {
+                    inspector_edit_snapshot_ = scene;
+                    if (auto previous =
+                            inspector_edit_snapshot_->node(selected_node_)) {
+                        previous->get() = node_before_edit;
+                    }
+                }
+                static_cast<void>(scene.set_audio_listener(
+                    selected_node_, edited_listener));
+            }
+        } else {
+            if (ui_kit_.action_button(
+                    "AddAudioListenerButton",
+                    EditorIcon::add,
+                    "Add Audio Listener",
+                    EditorButtonStyle::secondary,
+                    editable)) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                static_cast<void>(scene.set_audio_listener(
+                    selected_node_, AudioListenerComponent{}));
+            }
+        }
+    }
+    {
+        ui_kit_.section_header(EditorIcon::environment, "Reverb Zone");
+        if (const auto attached_zone = scene.reverb_zone(selected_node_)) {
+            AudioReverbZoneComponent edited_zone = attached_zone->get();
+            bool zone_changed = false;
+            bool remove_zone_requested = false;
+            if (ui_kit_.begin_property_grid("ReverbZoneProperties")) {
+                ui_kit_.property_row("Enabled");
+                zone_changed |= ImGui::Checkbox(
+                    "##ReverbZoneEnabled", &edited_zone.enabled);
+                ui_kit_.property_row("Inner radius (m)");
+                zone_changed |= ImGui::DragFloat(
+                    "##ReverbInner",
+                    &edited_zone.inner_radius,
+                    0.2F,
+                    0.1F,
+                    10'000.0F,
+                    "%.2f",
+                    ImGuiSliderFlags_AlwaysClamp);
+                ui_kit_.property_row("Outer radius (m)");
+                zone_changed |= ImGui::DragFloat(
+                    "##ReverbOuter",
+                    &edited_zone.outer_radius,
+                    0.2F,
+                    edited_zone.inner_radius,
+                    100'000.0F,
+                    "%.2f",
+                    ImGuiSliderFlags_AlwaysClamp);
+                ui_kit_.property_row("Wet level");
+                zone_changed |= ImGui::SliderFloat(
+                    "##ReverbWet",
+                    &edited_zone.wet_level,
+                    0.0F,
+                    1.0F,
+                    "%.2f",
+                    ImGuiSliderFlags_AlwaysClamp);
+                ui_kit_.property_row("Decay (s)");
+                zone_changed |= ImGui::SliderFloat(
+                    "##ReverbDecay",
+                    &edited_zone.decay_seconds,
+                    0.1F,
+                    20.0F,
+                    "%.2f s",
+                    ImGuiSliderFlags_AlwaysClamp);
+                ui_kit_.property_row("HF damping");
+                zone_changed |= ImGui::SliderFloat(
+                    "##ReverbDamping",
+                    &edited_zone.damping,
+                    0.0F,
+                    1.0F,
+                    "%.2f",
+                    ImGuiSliderFlags_AlwaysClamp);
+                ui_kit_.property_row("Component");
+                if (ImGui::SmallButton("Remove reverb zone")) {
+                    remove_zone_requested = true;
+                }
+                ui_kit_.end_property_grid();
+            }
+            if (remove_zone_requested) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                static_cast<void>(scene.remove_reverb_zone(selected_node_));
+            } else if (zone_changed) {
+                edited_zone =
+                    sanitize_audio_reverb_zone_component(edited_zone);
+                if (!inspector_edit_snapshot_) {
+                    inspector_edit_snapshot_ = scene;
+                    if (auto previous =
+                            inspector_edit_snapshot_->node(selected_node_)) {
+                        previous->get() = node_before_edit;
+                    }
+                }
+                static_cast<void>(
+                    scene.set_reverb_zone(selected_node_, edited_zone));
+            }
+        } else {
+            if (ui_kit_.action_button(
+                    "AddReverbZoneButton",
+                    EditorIcon::add,
+                    "Add Reverb Zone",
+                    EditorButtonStyle::secondary,
+                    editable)) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                static_cast<void>(scene.set_reverb_zone(
+                    selected_node_, AudioReverbZoneComponent{}));
+            }
+        }
+    }
+    {
         ui_kit_.section_header(EditorIcon::model, "Prefab");
         const SceneNodeId enclosing_root =
             scene.enclosing_prefab_root(selected_node_);
@@ -3254,6 +3906,114 @@ void draw_collider_wireframe(
     draw_obb(center, ax0, ax1, ax2, local_ext * sx_sy_sz);
 }
 
+void draw_audio_wireframe(
+    ImDrawList* const draw_list,
+    const SceneDocument& scene,
+    const SceneNodeId node_id,
+    const glm::mat4& view_projection,
+    const ImVec2 image_minimum,
+    const float image_width,
+    const float image_height) noexcept {
+    if (draw_list == nullptr || !scene.valid(node_id)) {
+        return;
+    }
+    const auto world_opt = scene_world_matrix(scene, node_id);
+    if (!world_opt) {
+        return;
+    }
+    const glm::mat4& world = *world_opt;
+    const glm::vec3 center = glm::vec3(world[3]);
+
+    const auto project_point = [&](const glm::vec3 world_pt,
+                                   ImVec2& out) noexcept -> bool {
+        const glm::vec4 clip = view_projection * glm::vec4(world_pt, 1.0F);
+        if (!std::isfinite(clip.w) || clip.w <= 0.01F) {
+            return false;
+        }
+        const glm::vec3 ndc = glm::vec3(clip) / clip.w;
+        out = ImVec2{
+            image_minimum.x + (ndc.x * 0.5F + 0.5F) * image_width,
+            image_minimum.y + (0.5F - ndc.y * 0.5F) * image_height,
+        };
+        return true;
+    };
+
+    const auto draw_segment = [&](const glm::vec3 a,
+                                  const glm::vec3 b,
+                                  const ImU32 color) noexcept {
+        ImVec2 sa{};
+        ImVec2 sb{};
+        if (project_point(a, sa) && project_point(b, sb)) {
+            draw_list->AddLine(sa, sb, color, 1.5F);
+        }
+    };
+
+    constexpr int ring_segments = 24;
+    constexpr float two_pi = 6.28318530718F;
+    const auto draw_sphere = [&](const float r, const ImU32 color) noexcept {
+        if (r <= 1.0e-3F) {
+            return;
+        }
+        const auto draw_circle = [&](const glm::vec3 u,
+                                     const glm::vec3 v) noexcept {
+            for (int s = 0; s < ring_segments; ++s) {
+                const float a0 = two_pi * static_cast<float>(s) /
+                    static_cast<float>(ring_segments);
+                const float a1 = two_pi * static_cast<float>(s + 1) /
+                    static_cast<float>(ring_segments);
+                draw_segment(
+                    center + (u * std::cos(a0) + v * std::sin(a0)) * r,
+                    center + (u * std::cos(a1) + v * std::sin(a1)) * r,
+                    color);
+            }
+        };
+        draw_circle(glm::vec3(1.0F, 0.0F, 0.0F), glm::vec3(0.0F, 1.0F, 0.0F));
+        draw_circle(glm::vec3(1.0F, 0.0F, 0.0F), glm::vec3(0.0F, 0.0F, 1.0F));
+        draw_circle(glm::vec3(0.0F, 1.0F, 0.0F), glm::vec3(0.0F, 0.0F, 1.0F));
+    };
+
+    if (const auto src_opt = scene.audio_source(node_id);
+        src_opt && src_opt->get().enabled && src_opt->get().spatial) {
+        const AudioSourceComponent& src = src_opt->get();
+        draw_sphere(src.min_distance, IM_COL32(72, 212, 255, 225));
+        draw_sphere(src.max_distance, IM_COL32(52, 148, 224, 150));
+        if (src.outer_cone_degrees < 359.9F) {
+            glm::vec3 fwd = -glm::vec3(world[2]);
+            const float len_sq = glm::dot(fwd, fwd);
+            fwd = len_sq > 1.0e-6F
+                ? (fwd / std::sqrt(len_sq))
+                : glm::vec3(0.0F, 0.0F, -1.0F);
+            const glm::vec3 ref = std::abs(fwd.y) < 0.95F
+                ? glm::vec3(0.0F, 1.0F, 0.0F)
+                : glm::vec3(1.0F, 0.0F, 0.0F);
+            const glm::vec3 right = glm::normalize(glm::cross(fwd, ref));
+            const glm::vec3 up = glm::normalize(glm::cross(right, fwd));
+            const auto draw_cone = [&](const float deg, const ImU32 col) {
+                const float half_rad = glm::radians(deg * 0.5F);
+                const float cos_h = std::cos(half_rad);
+                const float sin_h = std::sin(half_rad);
+                const float cone_len = std::min(src.max_distance, 12.0F);
+                for (int i = 0; i < 4; ++i) {
+                    const float ang = two_pi * 0.25F * static_cast<float>(i);
+                    const glm::vec3 radial =
+                        right * std::cos(ang) + up * std::sin(ang);
+                    const glm::vec3 ray_dir = fwd * cos_h + radial * sin_h;
+                    draw_segment(center, center + ray_dir * cone_len, col);
+                }
+            };
+            draw_cone(src.inner_cone_degrees, IM_COL32(120, 240, 255, 210));
+            draw_cone(src.outer_cone_degrees, IM_COL32(72, 164, 240, 150));
+        }
+    }
+
+    if (const auto zone_opt = scene.reverb_zone(node_id);
+        zone_opt && zone_opt->get().enabled) {
+        const AudioReverbZoneComponent& zone = zone_opt->get();
+        draw_sphere(zone.inner_radius, IM_COL32(198, 118, 255, 220));
+        draw_sphere(zone.outer_radius, IM_COL32(150, 84, 224, 150));
+    }
+}
+
 } // namespace
 
 void EditorUi::build_viewport(
@@ -3499,6 +4259,14 @@ void EditorUi::build_viewport(
         image_minimum,
         image_width,
         image_height);
+    draw_audio_wireframe(
+        ImGui::GetWindowDrawList(),
+        scene,
+        selected_node_,
+        projection * view,
+        image_minimum,
+        image_width,
+        image_height);
 
     bool gizmo_over = false;
     bool gizmo_using = false;
@@ -3729,7 +4497,9 @@ void EditorUi::build_assets(
         play_state_ == EditorPlayState::edit &&
         selected_asset_.has_value() &&
         (selected_asset_->kind == AssetEntryKind::model ||
-         selected_asset_->kind == AssetEntryKind::prefab);
+         selected_asset_->kind == AssetEntryKind::prefab ||
+         selected_asset_->kind == AssetEntryKind::audio ||
+         selected_asset_->kind == AssetEntryKind::sound_cue);
     if (ui_kit_.action_button(
             "AddSelectedAsset",
             EditorIcon::add,
@@ -3746,7 +4516,80 @@ void EditorUi::build_assets(
         ImGui::IsItemHovered(
             ImGuiHoveredFlags_AllowWhenDisabled)) {
         ImGui::SetTooltip(
-            "Select an imported .vcrasset.json model or .vcrprefab.json prefab.");
+            "Select a .vcrasset.json model, .vcrprefab.json prefab, audio clip, or .vcrcue.json Sound Cue.");
+    }
+    if (audio_engine_ != nullptr) {
+        const bool selected_audio =
+            selected_asset_.has_value() &&
+            (selected_asset_->kind == AssetEntryKind::audio ||
+             selected_asset_->kind == AssetEntryKind::sound_cue);
+        const bool preview_active = audio_engine_->is_preview_playing();
+        if (selected_audio || preview_active) {
+            ImGui::SameLine();
+            if (preview_active) {
+                if (ui_kit_.action_button(
+                        "StopAssetPreview",
+                        EditorIcon::stop,
+                        "Stop Preview",
+                        EditorButtonStyle::secondary,
+                        true)) {
+                    audio_engine_->stop_preview();
+                }
+            } else if (ui_kit_.action_button(
+                           "PlayAssetPreview",
+                           EditorIcon::play,
+                           "Preview",
+                           EditorButtonStyle::secondary,
+                           selected_audio)) {
+                std::string preview_err;
+                if (!audio_engine_->play_preview(
+                        selected_asset_->relative_display, preview_err)) {
+                    asset_error_ = std::move(preview_err);
+                } else {
+                    asset_error_.clear();
+                }
+            }
+        }
+    }
+    if (asset_import_enabled_ && play_state_ == EditorPlayState::edit) {
+        ImGui::SameLine();
+        if (ui_kit_.action_button(
+                "CreateSoundCueAsset",
+                EditorIcon::add,
+                "Sound Cue",
+                EditorButtonStyle::secondary,
+                selected_asset_.has_value() &&
+                    selected_asset_->kind == AssetEntryKind::audio)) {
+            SoundCueAsset cue{};
+            cue.name = selected_asset_->display_name;
+            cue.bus = AudioBusId::sfx;
+            cue.avoid_repeat = true;
+            cue.volume_min = 0.92F;
+            cue.volume_max = 1.0F;
+            cue.pitch_min = 0.95F;
+            cue.pitch_max = 1.05F;
+            cue.entries.push_back(SoundCueClipEntry{
+                .asset_path = selected_asset_->relative_display,
+                .weight = 1.0F,
+                .volume_scale = 1.0F,
+                .pitch_scale = 1.0F,
+            });
+            const std::string cue_rel_path =
+                make_default_sound_cue_relative_path(cue.name);
+            std::string cue_err;
+            if (save_sound_cue_file(
+                    cue, asset_browser_.root(), cue_rel_path, cue_err)) {
+                refresh_asset_browser();
+                asset_error_.clear();
+                scene_file_status_ = "Created Sound Cue: " + cue_rel_path;
+            } else {
+                asset_error_ = std::move(cue_err);
+            }
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(
+                "Select an audio clip to create a randomized .vcrcue.json Sound Cue.");
+        }
     }
     ImGui::SameLine();
     ui_kit_.badge(
@@ -3826,6 +4669,17 @@ void EditorUi::build_assets(
                         renderer,
                         entry.relative_display,
                         entry.display_name));
+                } else if (row_result.double_clicked &&
+                           (entry.kind == AssetEntryKind::audio ||
+                            entry.kind == AssetEntryKind::sound_cue) &&
+                           audio_engine_ != nullptr) {
+                    std::string preview_err;
+                    if (!audio_engine_->play_preview(
+                            entry.relative_display, preview_err)) {
+                        asset_error_ = std::move(preview_err);
+                    } else {
+                        asset_error_.clear();
+                    }
                 }
             }
             if (ImGui::BeginDragDropSource()) {
@@ -3842,8 +4696,22 @@ void EditorUi::build_assets(
                     ImGui::MenuItem("Open in Material Editor")) {
                     open_material_editor(entry.relative_path);
                 }
+                if ((entry.kind == AssetEntryKind::audio ||
+                     entry.kind == AssetEntryKind::sound_cue) &&
+                    audio_engine_ != nullptr &&
+                    ImGui::MenuItem("Preview Audio")) {
+                    std::string preview_err;
+                    if (!audio_engine_->play_preview(
+                            entry.relative_display, preview_err)) {
+                        asset_error_ = std::move(preview_err);
+                    } else {
+                        asset_error_.clear();
+                    }
+                }
                 if ((entry.kind == AssetEntryKind::model ||
-                     entry.kind == AssetEntryKind::prefab) &&
+                     entry.kind == AssetEntryKind::prefab ||
+                     entry.kind == AssetEntryKind::audio ||
+                     entry.kind == AssetEntryKind::sound_cue) &&
                     ImGui::MenuItem("Add to Scene")) {
                     static_cast<void>(add_model_asset_to_scene(
                         scene,
@@ -4325,6 +5193,77 @@ bool EditorUi::add_model_asset_to_scene(
         }
         return true;
     }
+    if (!relative_path.empty() &&
+        valid_audio_asset_reference(relative_path)) {
+        if (relative_path.ends_with(".vcrcue.json")) {
+            SoundCueAsset validated_cue{};
+            if (!load_sound_cue_file(
+                    asset_browser_.root(),
+                    relative_path,
+                    validated_cue,
+                    asset_error_)) {
+                return false;
+            }
+        } else {
+            std::filesystem::path resolved_audio{};
+            std::filesystem::path source_rel{};
+            std::string resolved_name{};
+            bool stream_recommended = false;
+            if (!resolve_sandboxed_audio_file(
+                    asset_browser_.root(),
+                    relative_path,
+                    resolved_audio,
+                    source_rel,
+                    resolved_name,
+                    stream_recommended,
+                    asset_error_)) {
+                return false;
+            }
+        }
+        std::string_view emitter_name = display_name;
+        if (emitter_name.empty()) {
+            const std::size_t sep = relative_path.find_last_of('/');
+            emitter_name = relative_path.substr(
+                sep == std::string_view::npos ? 0U : sep + 1U);
+        }
+        for (const std::string_view suffix : {
+                 std::string_view{".vcraudio.json"},
+                 std::string_view{".vcrcue.json"},
+                 std::string_view{".wav"},
+                 std::string_view{".ogg"},
+                 std::string_view{".flac"}}) {
+            if (emitter_name.ends_with(suffix)) {
+                emitter_name.remove_suffix(suffix.size());
+                break;
+            }
+        }
+        if (emitter_name.empty() ||
+            emitter_name.size() > max_scene_node_name_bytes) {
+            emitter_name = "Audio Emitter";
+        }
+        SceneNodeId parent{};
+        if (const auto selected = scene.node(selected_node_);
+            selected && selected->get().kind == SceneNodeKind::folder) {
+            parent = selected_node_;
+        }
+        checkpoint_scene(scene);
+        const SceneNodeId emitter = scene.create_node(
+            std::string(emitter_name), SceneNodeKind::folder, parent);
+        if (!emitter) {
+            asset_error_ =
+                "Unable to create the audio emitter node; scene capacity may be exhausted.";
+            return false;
+        }
+        AudioSourceComponent src{};
+        static_cast<void>(src.set_path(relative_path));
+        static_cast<void>(scene.set_audio_source(emitter, src));
+        selected_node_ = emitter;
+        name_buffer_node_ = {};
+        asset_error_.clear();
+        scene_file_status_ =
+            "Added audio source to scene: " + std::string(relative_path);
+        return true;
+    }
     if (!valid_scene_asset_path(relative_path)) {
         asset_error_ =
             "Only an imported .vcrasset.json model can be added "
@@ -4553,7 +5492,7 @@ void EditorUi::build_import_window() {
     ui_kit_.panel_header(
         EditorIcon::import_asset,
         "IMPORT ASSETS",
-        "FBX, OBJ, glTF/GLB, DAE, PLY, STL, 3DS and images");
+        "FBX, OBJ, glTF/GLB, DAE, PLY, STL, 3DS, images and audio (.wav/.ogg/.flac)");
     ui_kit_.badge(
         path_to_utf8(
             import_ui_->destination_directory).c_str(),
@@ -5295,6 +6234,381 @@ void EditorUi::build_material_editor(Renderer& renderer) {
         }
         ImGui::EndPopup();
     }
+}
+
+void EditorUi::build_audio_input_panel() {
+    if (audio_input_ui_ == nullptr || !audio_input_ui_->open) {
+        return;
+    }
+    ImGui::SetNextWindowSize(
+        ImVec2(420.0F, 560.0F), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Audio & Input", &audio_input_ui_->open)) {
+        ImGui::End();
+        return;
+    }
+    ui_kit_.panel_header(
+        EditorIcon::play,
+        "AUDIO & INPUT",
+        "5-bus mixer, brickwall limiter, and rebindable input actions");
+
+    ui_kit_.section_header(EditorIcon::play, "Audio Mixer");
+    if (audio_engine_ != nullptr && audio_engine_->initialized()) {
+        const AudioEngineTelemetry telem = audio_engine_->telemetry();
+        ui_kit_.badge(
+            telem.hardware_output_active ? "WASAPI 48 kHz" : "HEADLESS MIXER",
+            telem.hardware_output_active
+                ? EditorTone::success
+                : EditorTone::warning);
+        ImGui::SameLine();
+        char voice_badge[64]{};
+        std::snprintf(
+            voice_badge,
+            sizeof(voice_badge),
+            "VOICES %u/%zu  STREAMS %u/%zu",
+            telem.active_voice_count,
+            AudioEngine::max_voices,
+            telem.active_stream_count,
+            AudioEngine::max_stream_slots);
+        ui_kit_.badge(voice_badge, EditorTone::info);
+        ImGui::SameLine();
+        char limiter_badge[48]{};
+        if (telem.master_limiter_gain < 0.995F) {
+            const float gr_db =
+                20.0F * std::log10(std::max(telem.master_limiter_gain, 1.0e-4F));
+            std::snprintf(
+                limiter_badge,
+                sizeof(limiter_badge),
+                "LIMITER %.1f dB",
+                gr_db);
+            ui_kit_.badge(limiter_badge, EditorTone::warning);
+        } else {
+            ui_kit_.badge("LIMITER IDLE", EditorTone::neutral);
+        }
+
+        const double resident_mb =
+            static_cast<double>(telem.resident_pcm_bytes) /
+            (1024.0 * 1024.0);
+        const double peak_mb =
+            static_cast<double>(telem.resident_pcm_high_water_bytes) /
+            (1024.0 * 1024.0);
+        ImGui::TextDisabled(
+            "Clip cache: %zu clips (%.2f MB / %.2f MB high-water)",
+            telem.resident_clip_count,
+            resident_mb,
+            peak_mb);
+
+        if (audio_engine_->is_preview_playing()) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Stop Preview")) {
+                audio_engine_->stop_preview();
+            }
+        }
+
+        constexpr std::array<std::pair<AudioBusId, const char*>, audio_bus_count>
+            bus_labels{{
+                {AudioBusId::master, "Master"},
+                {AudioBusId::music, "Music"},
+                {AudioBusId::sfx, "SFX"},
+                {AudioBusId::voice, "Voice"},
+                {AudioBusId::ui, "UI"},
+            }};
+        if (ImGui::BeginTable(
+                "AudioBusMixerTable",
+                4,
+                ImGuiTableFlags_BordersInnerH |
+                    ImGuiTableFlags_RowBg |
+                    ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn(
+                "Bus", ImGuiTableColumnFlags_WidthFixed, 64.0F);
+            ImGui::TableSetupColumn(
+                "Mute", ImGuiTableColumnFlags_WidthFixed, 42.0F);
+            ImGui::TableSetupColumn(
+                "Gain", ImGuiTableColumnFlags_WidthStretch, 1.2F);
+            ImGui::TableSetupColumn(
+                "Peak L/R", ImGuiTableColumnFlags_WidthStretch, 0.9F);
+            ImGui::TableHeadersRow();
+
+            for (std::size_t idx = 0U; idx < bus_labels.size(); ++idx) {
+                const auto [bus_id, label] = bus_labels[idx];
+                const AudioBusSnapshot& snap = telem.buses[idx];
+                ImGui::PushID(static_cast<int>(idx));
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted(label);
+
+                ImGui::TableSetColumnIndex(1);
+                bool muted = snap.muted;
+                if (ImGui::Checkbox("##Mute", &muted)) {
+                    audio_engine_->set_bus_muted(bus_id, muted);
+                }
+
+                ImGui::TableSetColumnIndex(2);
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                float volume = snap.volume;
+                if (ImGui::SliderFloat(
+                        "##Gain",
+                        &volume,
+                        0.0F,
+                        2.0F,
+                        "%.2f",
+                        ImGuiSliderFlags_AlwaysClamp)) {
+                    audio_engine_->set_bus_volume(bus_id, volume);
+                }
+
+                ImGui::TableSetColumnIndex(3);
+                const float peak =
+                    std::clamp(std::max(snap.peak_left, snap.peak_right), 0.0F, 1.0F);
+                char peak_label[32]{};
+                std::snprintf(
+                    peak_label,
+                    sizeof(peak_label),
+                    "%.2f (%u)",
+                    std::max(snap.peak_left, snap.peak_right),
+                    snap.active_voices);
+                ImGui::ProgressBar(peak, ImVec2(-FLT_MIN, 0.0F), peak_label);
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+    } else {
+        ui_kit_.status_text(
+            "Audio engine is unavailable in this session.",
+            EditorTone::warning);
+    }
+
+    ImGui::Spacing();
+    ui_kit_.section_header(EditorIcon::camera, "Input Actions & Gamepad");
+    if (input_actions_ != nullptr) {
+        if (audio_input_ui_->capturing_action.has_value() &&
+            audio_input_ui_->capture_mode ==
+                AudioInputUiState::CaptureMode::gamepad_button) {
+            const GamepadButton pressed_button =
+                input_actions_->consume_last_pressed_gamepad_button();
+            if (pressed_button != GamepadButton::none) {
+                const InputAction action = *audio_input_ui_->capturing_action;
+                ActionBinding edited = input_actions_->binding(action);
+                edited.gamepad_button = pressed_button;
+                input_actions_->set_binding(action, edited);
+                audio_input_ui_->capturing_action.reset();
+                audio_input_ui_->capture_mode =
+                    AudioInputUiState::CaptureMode::none;
+                audio_input_ui_->status =
+                    "Bound " + std::string(input_action_display_name(action)) +
+                    " to gamepad " + std::string(to_token(pressed_button)) + ".";
+            }
+        } else {
+            static_cast<void>(
+                input_actions_->consume_last_pressed_gamepad_button());
+        }
+
+        const GamepadState& gp = input_actions_->gamepad_state();
+        ui_kit_.badge(
+            gp.connected ? "GAMEPAD CONNECTED" : "NO CONTROLLER",
+            gp.connected ? EditorTone::success : EditorTone::neutral);
+        ImGui::SameLine();
+        ImGui::TextDisabled(
+            "LS (%.2f, %.2f)  RS (%.2f, %.2f)",
+            gp.left_stick.x,
+            gp.left_stick.y,
+            gp.right_stick.x,
+            gp.right_stick.y);
+
+        if (ui_kit_.begin_property_grid("InputGamepadProperties")) {
+            ui_kit_.property_row("Context");
+            const InputContext current_ctx = input_actions_->context();
+            if (ImGui::BeginCombo(
+                    "##InputContextCombo", to_token(current_ctx).data())) {
+                for (const InputContext candidate : {
+                         InputContext::gameplay,
+                         InputContext::ui,
+                         InputContext::cutscene}) {
+                    if (ImGui::Selectable(
+                            to_token(candidate).data(),
+                            current_ctx == candidate)) {
+                        input_actions_->set_context(candidate);
+                    }
+                }
+                ImGui::EndCombo();
+            }
+
+            GamepadConfig gp_cfg = input_actions_->gamepad_config();
+            bool cfg_changed = false;
+            ui_kit_.property_row("Deadzone inner");
+            cfg_changed |= ImGui::SliderFloat(
+                "##GpInnerDz",
+                &gp_cfg.stick_inner_deadzone,
+                0.0F,
+                0.6F,
+                "%.2f",
+                ImGuiSliderFlags_AlwaysClamp);
+            ui_kit_.property_row("Deadzone outer");
+            cfg_changed |= ImGui::SliderFloat(
+                "##GpOuterDz",
+                &gp_cfg.stick_outer_deadzone,
+                std::max(0.65F, gp_cfg.stick_inner_deadzone + 0.05F),
+                1.0F,
+                "%.2f",
+                ImGuiSliderFlags_AlwaysClamp);
+            ui_kit_.property_row("Look speed");
+            cfg_changed |= ImGui::SliderFloat(
+                "##GpLookSpeed",
+                &gp_cfg.look_speed_pixels_per_sec,
+                120.0F,
+                2400.0F,
+                "%.0f px/s",
+                ImGuiSliderFlags_AlwaysClamp);
+            ui_kit_.property_row("Invert look Y");
+            cfg_changed |= ImGui::Checkbox(
+                "##GpInvertY", &gp_cfg.invert_look_y);
+            ui_kit_.property_row("Vibration");
+            cfg_changed |= ImGui::Checkbox(
+                "##GpVibration", &gp_cfg.vibration_enabled);
+            if (cfg_changed) {
+                input_actions_->set_gamepad_config(gp_cfg);
+            }
+            ui_kit_.property_row("Rumble test");
+            if (ImGui::SmallButton("Pulse Rumble")) {
+                input_actions_->trigger_rumble(0.65F, 0.85F, 0.35F);
+            }
+            ui_kit_.end_property_grid();
+        }
+
+        if (audio_input_ui_->capturing_action.has_value()) {
+            const std::string prompt =
+                "Listening for " +
+                std::string(input_action_display_name(
+                    *audio_input_ui_->capturing_action)) +
+                " (Esc to cancel, Backspace/Del to clear)...";
+            ui_kit_.status_text(prompt.c_str(), EditorTone::info);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Cancel")) {
+                audio_input_ui_->capturing_action.reset();
+                audio_input_ui_->capture_mode =
+                    AudioInputUiState::CaptureMode::none;
+            }
+        }
+
+        std::array<BindingConflict, 16U> conflicts{};
+        const std::size_t conflict_count =
+            input_actions_->detect_conflicts(conflicts);
+        if (conflict_count > 0U) {
+            const BindingConflict& first = conflicts[0];
+            const std::string shared_label =
+                first.shared_key != InputKey::none
+                    ? std::string(to_token(first.shared_key))
+                    : std::string(to_token(first.shared_gamepad));
+            const std::string warning_msg =
+                "Binding conflict (" + std::to_string(conflict_count) + "): " +
+                std::string(input_action_display_name(first.first)) + " & " +
+                std::string(input_action_display_name(first.second)) +
+                " share '" + shared_label + "' in " +
+                std::string(to_token(first.shared_context)) + ".";
+            ui_kit_.status_text(warning_msg.c_str(), EditorTone::warning);
+        }
+
+        if (!audio_input_ui_->error.empty()) {
+            ui_kit_.status_text(
+                audio_input_ui_->error.c_str(), EditorTone::danger);
+        } else if (!audio_input_ui_->status.empty()) {
+            ui_kit_.status_text(
+                audio_input_ui_->status.c_str(), EditorTone::neutral);
+        }
+
+        if (ImGui::Button("Save Bindings")) {
+            std::string save_err;
+            const std::filesystem::path bindings_path =
+                asset_browser_.root() / "config" / "input_bindings.json";
+            if (save_input_bindings_file(
+                    bindings_path, *input_actions_, save_err)) {
+                audio_input_ui_->error.clear();
+                audio_input_ui_->status =
+                    "Saved config/input_bindings.json.";
+            } else {
+                audio_input_ui_->error = std::move(save_err);
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset Defaults")) {
+            input_actions_->reset_bindings_to_default();
+            audio_input_ui_->capturing_action.reset();
+            audio_input_ui_->capture_mode =
+                AudioInputUiState::CaptureMode::none;
+            audio_input_ui_->error.clear();
+            audio_input_ui_->status = "Restored default bindings.";
+        }
+
+        if (ImGui::BeginTable(
+                "InputBindingsTable",
+                4,
+                ImGuiTableFlags_BordersInnerH |
+                    ImGuiTableFlags_RowBg |
+                    ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch, 1.2F);
+            ImGui::TableSetupColumn("Primary", ImGuiTableColumnFlags_WidthStretch, 0.9F);
+            ImGui::TableSetupColumn("Secondary", ImGuiTableColumnFlags_WidthStretch, 0.9F);
+            ImGui::TableSetupColumn("Gamepad", ImGuiTableColumnFlags_WidthStretch, 0.95F);
+            ImGui::TableHeadersRow();
+
+            for (std::size_t idx = 0U; idx < input_action_count; ++idx) {
+                const auto action = static_cast<InputAction>(idx);
+                const ActionBinding bind = input_actions_->binding(action);
+                ImGui::PushID(static_cast<int>(idx));
+                ImGui::TableNextRow();
+
+                ImGui::TableSetColumnIndex(0);
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted(input_action_display_name(action).data());
+
+                const auto rebind_button =
+                    [&](const char* const id_suffix,
+                        const std::string_view token,
+                        const AudioInputUiState::CaptureMode mode,
+                        const char* const listening_text) {
+                        const bool is_listening =
+                            audio_input_ui_->capturing_action == action &&
+                            audio_input_ui_->capture_mode == mode;
+                        std::string btn_label = is_listening
+                            ? std::string(listening_text)
+                            : std::string(token);
+                        btn_label += id_suffix;
+                        if (ImGui::Button(
+                                btn_label.c_str(), ImVec2(-FLT_MIN, 0.0F))) {
+                            audio_input_ui_->capturing_action = action;
+                            audio_input_ui_->capture_mode = mode;
+                            static_cast<void>(
+                                input_actions_
+                                    ->consume_last_pressed_gamepad_button());
+                        }
+                    };
+
+                ImGui::TableSetColumnIndex(1);
+                rebind_button(
+                    "##PrimaryBind",
+                    to_token(bind.primary_key),
+                    AudioInputUiState::CaptureMode::primary_key,
+                    "[Key...]");
+
+                ImGui::TableSetColumnIndex(2);
+                rebind_button(
+                    "##SecondaryBind",
+                    to_token(bind.secondary_key),
+                    AudioInputUiState::CaptureMode::secondary_key,
+                    "[Key...]");
+
+                ImGui::TableSetColumnIndex(3);
+                rebind_button(
+                    "##GamepadBind",
+                    to_token(bind.gamepad_button),
+                    AudioInputUiState::CaptureMode::gamepad_button,
+                    "[Pad...]");
+
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+    }
+    ImGui::End();
 }
 
 void EditorUi::build_performance(
@@ -6180,6 +7494,9 @@ void EditorUi::set_game_mouse_capture(SDL_Window* const window) noexcept {
     pending_game_mouse_delta_x_ = 0.0F;
     pending_game_mouse_delta_y_ = 0.0F;
     if (window == nullptr) {
+        if (input_actions_ != nullptr) {
+            input_actions_->release_all();
+        }
         return;
     }
     if (!SDL_SetWindowRelativeMouseMode(window, true)) {
@@ -6215,6 +7532,54 @@ void EditorUi::update_game_mouse_capture(const bool viewport_clicked) {
     set_game_mouse_capture(window);
 }
 
+GameplayFrameInput EditorUi::gameplay_input(
+    const float delta_seconds) noexcept {
+    if (play_state_ != EditorPlayState::playing) {
+        return {};
+    }
+    if (input_actions_ != nullptr) {
+        input_actions_->set_context(InputContext::gameplay);
+        input_actions_->begin_frame(delta_seconds);
+        if (input_actions_->action_pressed(InputAction::pause)) {
+            set_game_mouse_capture(nullptr);
+            play_state_ = EditorPlayState::paused;
+            return {};
+        }
+        if (game_mouse_window_id_ == 0U &&
+            !input_actions_->gamepad_state().connected) {
+            return {};
+        }
+        const glm::vec2 move = input_actions_->move_axis();
+        const glm::vec2 look = input_actions_->look_delta();
+        return GameplayFrameInput{
+            .character = CharacterInput{
+                .move_axis = move,
+                .forward = move.y > 0.1F,
+                .backward = move.y < -0.1F,
+                .left = move.x < -0.1F,
+                .right = move.x > 0.1F,
+                .jump = input_actions_->action_down(InputAction::jump),
+                .run = input_actions_->action_down(InputAction::run),
+                .interact = input_actions_->action_pressed(InputAction::interact),
+            },
+            .mouse_delta_x = look.x,
+            .mouse_delta_y = look.y,
+        };
+    }
+    return GameplayFrameInput{
+        .character = CharacterInput{
+            .forward = camera_input_.forward,
+            .backward = camera_input_.backward,
+            .left = camera_input_.left,
+            .right = camera_input_.right,
+            .jump = camera_input_.up,
+            .run = camera_input_.boost,
+        },
+        .mouse_delta_x = camera_input_.mouse_delta_x,
+        .mouse_delta_y = camera_input_.mouse_delta_y,
+    };
+}
+
 void EditorUi::start_play(SceneDocument& scene) {
     if (play_state_ != EditorPlayState::edit) {
         return;
@@ -6223,6 +7588,10 @@ void EditorUi::start_play(SceneDocument& scene) {
         asset_error_ =
             "Close or finish asset import before entering Play.";
         return;
+    }
+    if (input_actions_ != nullptr) {
+        input_actions_->release_all();
+        input_actions_->set_context(InputContext::gameplay);
     }
     edit_scene_snapshot_ = scene;
     play_state_ = EditorPlayState::playing;
@@ -6234,6 +7603,13 @@ void EditorUi::stop_play(SceneDocument& scene) {
         return;
     }
     set_game_mouse_capture(nullptr);
+    if (audio_engine_ != nullptr) {
+        audio_engine_->stop_gameplay_audio();
+    }
+    if (input_actions_ != nullptr) {
+        input_actions_->stop_rumble();
+        input_actions_->release_all();
+    }
     if (edit_scene_snapshot_) {
         scene = std::move(*edit_scene_snapshot_);
         edit_scene_snapshot_.reset();

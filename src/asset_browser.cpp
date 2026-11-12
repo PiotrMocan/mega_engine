@@ -296,6 +296,14 @@ AssetEntryKind AssetBrowser::classify(
     if (filename.ends_with(".vcrprefab.json")) {
         return AssetEntryKind::prefab;
     }
+    if (filename.ends_with(".vcrcue.json")) {
+        return AssetEntryKind::sound_cue;
+    }
+    if (filename.ends_with(".vcraudio.json") ||
+        extension == ".wav" || extension == ".ogg" ||
+        extension == ".flac") {
+        return AssetEntryKind::audio;
+    }
     if (filename.ends_with(".vcrasset.json") ||
         extension == ".fbx" || extension == ".obj" ||
         extension == ".glb" || extension == ".gltf" ||
@@ -331,6 +339,8 @@ const char* asset_kind_name(const AssetEntryKind kind) noexcept {
     case AssetEntryKind::model: return "Model";
     case AssetEntryKind::material: return "Material";
     case AssetEntryKind::prefab: return "Prefab";
+    case AssetEntryKind::audio: return "Audio";
+    case AssetEntryKind::sound_cue: return "Sound Cue";
     case AssetEntryKind::image: return "Image";
     case AssetEntryKind::shader: return "Shader";
     case AssetEntryKind::scene: return "Scene";

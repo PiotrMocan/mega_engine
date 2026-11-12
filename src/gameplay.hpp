@@ -1,5 +1,6 @@
 #pragma once
 
+#include <glm/vec2.hpp>
 #include <glm/vec3.hpp>
 
 #include <cstdint>
@@ -11,12 +12,14 @@ class CollisionWorld;
 class PhysicsWorld;
 
 struct CharacterInput {
+    glm::vec2 move_axis{0.0F, 0.0F}; // x = right [-1, 1], y = forward [-1, 1]
     bool forward = false;
     bool backward = false;
     bool left = false;
     bool right = false;
     bool jump = false;
     bool run = false;
+    bool interact = false;
 };
 
 static_assert(std::is_trivially_copyable_v<CharacterInput>);
@@ -60,14 +63,20 @@ public:
     [[nodiscard]] float facing_yaw() const noexcept { return facing_yaw_radians_; }
     [[nodiscard]] float vertical_velocity() const noexcept { return vertical_velocity_; }
     [[nodiscard]] bool grounded() const noexcept { return grounded_; }
+    [[nodiscard]] bool just_jumped() const noexcept { return just_jumped_; }
+    [[nodiscard]] float landing_impact_speed() const noexcept {
+        return landing_impact_speed_;
+    }
 
 private:
     CharacterConfig config_{};
     glm::vec3 position_{};
     float facing_yaw_radians_ = 3.14159265359F;
     float vertical_velocity_ = 0.0F;
+    float landing_impact_speed_ = 0.0F;
     bool grounded_ = true;
     bool jump_was_down_ = false;
+    bool just_jumped_ = false;
 };
 
 struct ThirdPersonCameraConfig {

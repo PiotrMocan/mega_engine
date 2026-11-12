@@ -1,8 +1,10 @@
 #pragma once
 
+#include "audio_engine.hpp"
 #include "cli_options.hpp"
 #include "fly_camera.hpp"
 #include "gameplay_session.hpp"
+#include "input_actions.hpp"
 #include "mcp_server.hpp"
 #include "renderer.hpp"
 #include "scene_document.hpp"
@@ -75,6 +77,8 @@ private:
     double camera_animation_time_ = 0;
     FlyCamera camera_{};
     GameplaySession gameplay_{};
+    InputActionSystem input_actions_{};
+    AudioEngine audio_engine_{};
     CliOptions options_{};
     BenchmarkController benchmark_{};
     BenchmarkFrameSamples benchmark_samples_{};

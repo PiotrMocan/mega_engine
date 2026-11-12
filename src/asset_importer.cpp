@@ -1,5 +1,6 @@
 #include "asset_importer.hpp"
 
+#include "cooked_audio_asset.hpp"
 #include "pbr_material.hpp"
 
 #include <nlohmann/json.hpp>
@@ -731,6 +732,62 @@ import_image(
         return make_unexpected_asset_import_error(written.error());
     }
     record_file(context, ImportedAssetKind::texture, metadata_relative);
+    context.result.primary_asset =
+        context.result_prefix / metadata_relative;
+    return commit_import(context);
+}
+
+[[nodiscard]] AssetImportOutcome<AssetImportResult>
+import_audio(
+    const std::filesystem::path& source,
+    ImportContext context) {
+    const std::filesystem::path source_relative =
+        std::filesystem::path("source") /
+        safe_source_filename(source);
+    const std::filesystem::path staged_source =
+        context.staging_directory / source_relative;
+    const auto copied = copy_source_file(
+        context,
+        source,
+        staged_source);
+    if (!copied) {
+        return make_unexpected_asset_import_error(copied.error());
+    }
+    record_file(context, ImportedAssetKind::source, source_relative);
+
+    AudioSourceFormatInfo info{};
+    std::string inspect_error;
+    if (!inspect_audio_source_file(staged_source, info, inspect_error)) {
+        return make_unexpected_asset_import_error(make_error(
+            AssetImportErrorCode::invalid_asset_data,
+            inspect_error.empty()
+                ? "Audio source file could not be decoded."
+                : std::move(inspect_error),
+            source));
+    }
+
+    const std::filesystem::path metadata_relative =
+        context.asset_slug + ".vcraudio.json";
+    const Json metadata{
+        {"schema", asset_schema},
+        {"version", asset_schema_version},
+        {"kind", "audio"},
+        {"name", context.asset_slug},
+        {"source", source_relative.generic_string()},
+        {"source_format", lowercase_extension(source).substr(1U)},
+        {"origin", "imported"},
+        {"sample_rate", info.sample_rate},
+        {"channels", info.channels},
+        {"frame_count", info.total_pcm_frames},
+        {"duration_seconds", info.duration_seconds},
+        {"stream_recommended", info.stream_recommended},
+    };
+    const auto written = write_json_file(
+        context.staging_directory / metadata_relative, metadata);
+    if (!written) {
+        return make_unexpected_asset_import_error(written.error());
+    }
+    record_file(context, ImportedAssetKind::audio, metadata_relative);
     context.result.primary_asset =
         context.result_prefix / metadata_relative;
     return commit_import(context);
@@ -2253,6 +2310,15 @@ AssetSourceKind classify_asset_source(
         extension == ".dds" || extension == ".exr") {
         return AssetSourceKind::image;
     }
+    if (extension == ".wav") {
+        return AssetSourceKind::audio_wav;
+    }
+    if (extension == ".ogg") {
+        return AssetSourceKind::audio_ogg;
+    }
+    if (extension == ".flac") {
+        return AssetSourceKind::audio_flac;
+    }
     return AssetSourceKind::unsupported;
 }
 
@@ -2272,7 +2338,7 @@ import_asset(
         return make_unexpected_asset_import_error(make_error(
             AssetImportErrorCode::unsupported_format,
             "Supported import formats are FBX, OBJ, glTF, GLB, DAE, PLY, "
-            "STL, 3DS, PNG, JPEG, TGA, HDR, BMP, DDS, and EXR.",
+            "STL, 3DS, PNG, JPEG, TGA, HDR, BMP, DDS, EXR, WAV, OGG, and FLAC.",
             source));
     }
     auto context = prepare_import(source, options, source_kind);
@@ -2281,6 +2347,11 @@ import_asset(
     }
     if (source_kind == AssetSourceKind::image) {
         return import_image(source, std::move(*context));
+    }
+    if (source_kind == AssetSourceKind::audio_wav ||
+        source_kind == AssetSourceKind::audio_ogg ||
+        source_kind == AssetSourceKind::audio_flac) {
+        return import_audio(source, std::move(*context));
     }
     return import_model(source, std::move(*context));
 }

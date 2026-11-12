@@ -371,6 +371,368 @@ static_assert(std::is_trivially_copyable_v<PrefabInstanceComponent>);
     return collider;
 }
 
+enum class AudioBusId : std::uint8_t {
+    master = 0U,
+    music = 1U,
+    sfx = 2U,
+    voice = 3U,
+    ui = 4U,
+    count = 5U,
+};
+
+inline constexpr std::size_t audio_bus_count =
+    static_cast<std::size_t>(AudioBusId::count);
+
+[[nodiscard]] constexpr std::string_view to_token(
+    const AudioBusId bus) noexcept {
+    switch (bus) {
+    case AudioBusId::master: return "master";
+    case AudioBusId::music: return "music";
+    case AudioBusId::sfx: return "sfx";
+    case AudioBusId::voice: return "voice";
+    case AudioBusId::ui: return "ui";
+    case AudioBusId::count: break;
+    }
+    return "unknown";
+}
+
+[[nodiscard]] constexpr std::optional<AudioBusId> parse_audio_bus_id(
+    const std::string_view token) noexcept {
+    if (token == "master") return AudioBusId::master;
+    if (token == "music") return AudioBusId::music;
+    if (token == "sfx") return AudioBusId::sfx;
+    if (token == "voice") return AudioBusId::voice;
+    if (token == "ui") return AudioBusId::ui;
+    return std::nullopt;
+}
+
+enum class AudioAttenuationModel : std::uint8_t {
+    inverse_clamped = 0U,
+    linear = 1U,
+    exponential = 2U,
+};
+
+[[nodiscard]] constexpr std::string_view to_token(
+    const AudioAttenuationModel model) noexcept {
+    switch (model) {
+    case AudioAttenuationModel::inverse_clamped: return "inverse_clamped";
+    case AudioAttenuationModel::linear: return "linear";
+    case AudioAttenuationModel::exponential: return "exponential";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] constexpr std::optional<AudioAttenuationModel>
+parse_audio_attenuation_model(const std::string_view token) noexcept {
+    if (token == "inverse_clamped") {
+        return AudioAttenuationModel::inverse_clamped;
+    }
+    if (token == "linear") return AudioAttenuationModel::linear;
+    if (token == "exponential") return AudioAttenuationModel::exponential;
+    return std::nullopt;
+}
+
+inline constexpr std::size_t max_audio_path_bytes = 255U;
+inline constexpr std::size_t max_audio_asset_path_bytes = max_audio_path_bytes;
+inline constexpr float maximum_audio_volume = 4.0F;
+inline constexpr float minimum_audio_pitch = 0.25F;
+inline constexpr float maximum_audio_pitch = 4.0F;
+inline constexpr float minimum_audio_distance = 0.05F;
+inline constexpr float maximum_audio_distance = 100'000.0F;
+inline constexpr float minimum_audio_rolloff = 0.01F;
+inline constexpr float maximum_audio_rolloff = 16.0F;
+inline constexpr float maximum_audio_doppler_scale = 5.0F;
+inline constexpr float minimum_reverb_decay_seconds = 0.1F;
+inline constexpr float maximum_reverb_decay_seconds = 20.0F;
+
+namespace component_detail {
+
+[[nodiscard]] constexpr char ascii_lower(const char ch) noexcept {
+    return (ch >= 'A' && ch <= 'Z')
+        ? static_cast<char>(ch - 'A' + 'a')
+        : ch;
+}
+
+[[nodiscard]] constexpr bool ends_with_ascii_icase(
+    const std::string_view text,
+    const std::string_view suffix) noexcept {
+    if (text.size() < suffix.size()) {
+        return false;
+    }
+    const std::size_t start = text.size() - suffix.size();
+    for (std::size_t i = 0U; i < suffix.size(); ++i) {
+        if (ascii_lower(text[start + i]) != ascii_lower(suffix[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace component_detail
+
+[[nodiscard]] inline bool valid_audio_asset_reference(
+    const std::string_view path) noexcept {
+    if (path.empty()) {
+        return true;
+    }
+    if (path.size() > max_audio_path_bytes ||
+        !component_detail::valid_utf8_text(path) ||
+        path.front() == '/' ||
+        path.front() == '\\') {
+        return false;
+    }
+    const bool known_ext =
+        path.ends_with(".vcraudio.json") ||
+        path.ends_with(".vcrcue.json") ||
+        component_detail::ends_with_ascii_icase(path, ".wav") ||
+        component_detail::ends_with_ascii_icase(path, ".ogg") ||
+        component_detail::ends_with_ascii_icase(path, ".flac");
+    if (!known_ext) {
+        return false;
+    }
+    std::size_t segment_begin = 0U;
+    for (std::size_t index = 0U; index <= path.size(); ++index) {
+        const bool at_end = index == path.size();
+        if (!at_end) {
+            const auto value = static_cast<unsigned char>(path[index]);
+            if (value == 0U || value < 0x20U ||
+                path[index] == '\\' || path[index] == ':') {
+                return false;
+            }
+        }
+        if (!at_end && path[index] != '/') {
+            continue;
+        }
+        const std::string_view segment =
+            path.substr(segment_begin, index - segment_begin);
+        if (segment.empty() || segment == "." || segment == "..") {
+            return false;
+        }
+        segment_begin = index + 1U;
+    }
+    return true;
+}
+
+struct AudioSourceComponent {
+    std::array<char, max_audio_path_bytes + 1U> asset_path{};
+    float volume = 1.0F;
+    float pitch = 1.0F;
+    float volume_variance = 0.0F;
+    float pitch_variance = 0.0F;
+    float min_distance = 1.5F;
+    float max_distance = 35.0F;
+    float rolloff = 1.0F;
+    float doppler_factor = 1.0F;
+    float inner_cone_degrees = 360.0F;
+    float outer_cone_degrees = 360.0F;
+    float outer_cone_gain = 0.25F;
+    AudioBusId bus = AudioBusId::sfx;
+    AudioAttenuationModel attenuation =
+        AudioAttenuationModel::inverse_clamped;
+    bool enabled = true;
+    bool spatial = true;
+    bool loop = false;
+    bool play_on_start = true;
+    bool streaming = false;
+    bool occlusion = true;
+
+    [[nodiscard]] std::string_view path_view() const noexcept {
+        std::size_t length = 0U;
+        while (length < max_audio_path_bytes && asset_path[length] != '\0') {
+            ++length;
+        }
+        return std::string_view(asset_path.data(), length);
+    }
+
+    [[nodiscard]] bool set_path(const std::string_view path) noexcept {
+        if (!valid_audio_asset_reference(path)) {
+            return false;
+        }
+        asset_path.fill('\0');
+        if (!path.empty()) {
+            std::memcpy(asset_path.data(), path.data(), path.size());
+        }
+        return true;
+    }
+
+    friend bool operator==(
+        const AudioSourceComponent&,
+        const AudioSourceComponent&) = default;
+};
+
+static_assert(std::is_trivially_copyable_v<AudioSourceComponent>);
+
+[[nodiscard]] inline bool valid_audio_source_component(
+    const AudioSourceComponent& src) noexcept {
+    if (to_token(src.bus) == "unknown" ||
+        to_token(src.attenuation) == "unknown") {
+        return false;
+    }
+    const std::string_view path = src.path_view();
+    if (!valid_audio_asset_reference(path)) {
+        return false;
+    }
+    for (std::size_t idx = path.size(); idx < src.asset_path.size(); ++idx) {
+        if (src.asset_path[idx] != '\0') {
+            return false;
+        }
+    }
+    return std::isfinite(src.volume) && src.volume >= 0.0F && src.volume <= 4.0F &&
+           std::isfinite(src.pitch) && src.pitch >= 0.25F && src.pitch <= 4.0F &&
+           std::isfinite(src.volume_variance) &&
+           src.volume_variance >= 0.0F && src.volume_variance <= 1.0F &&
+           std::isfinite(src.pitch_variance) &&
+           src.pitch_variance >= 0.0F && src.pitch_variance <= 1.0F &&
+           std::isfinite(src.min_distance) &&
+           src.min_distance >= 0.05F && src.min_distance <= 10'000.0F &&
+           std::isfinite(src.max_distance) &&
+           src.max_distance >= src.min_distance &&
+           src.max_distance <= 100'000.0F &&
+           std::isfinite(src.rolloff) &&
+           src.rolloff >= 0.01F && src.rolloff <= 16.0F &&
+           std::isfinite(src.doppler_factor) &&
+           src.doppler_factor >= 0.0F && src.doppler_factor <= 5.0F &&
+           std::isfinite(src.inner_cone_degrees) &&
+           src.inner_cone_degrees >= 0.0F &&
+           src.inner_cone_degrees <= 360.0F &&
+           std::isfinite(src.outer_cone_degrees) &&
+           src.outer_cone_degrees >= src.inner_cone_degrees &&
+           src.outer_cone_degrees <= 360.0F &&
+           std::isfinite(src.outer_cone_gain) &&
+           src.outer_cone_gain >= 0.0F && src.outer_cone_gain <= 1.0F;
+}
+
+[[nodiscard]] inline AudioSourceComponent sanitize_audio_source_component(
+    AudioSourceComponent src) noexcept {
+    if (to_token(src.bus) == "unknown") {
+        src.bus = AudioBusId::sfx;
+    }
+    if (to_token(src.attenuation) == "unknown") {
+        src.attenuation = AudioAttenuationModel::inverse_clamped;
+    }
+    const std::string_view p = src.path_view();
+    if (!valid_audio_asset_reference(p)) {
+        src.asset_path.fill('\0');
+    } else {
+        for (std::size_t idx = p.size(); idx < src.asset_path.size(); ++idx) {
+            src.asset_path[idx] = '\0';
+        }
+    }
+    const auto clamp_or = [](const float v,
+                             const float lo,
+                             const float hi,
+                             const float fallback) noexcept {
+        if (!std::isfinite(v)) return fallback;
+        return std::clamp(v, lo, hi);
+    };
+    src.volume = clamp_or(src.volume, 0.0F, 4.0F, 1.0F);
+    src.pitch = clamp_or(src.pitch, 0.25F, 4.0F, 1.0F);
+    src.volume_variance = clamp_or(src.volume_variance, 0.0F, 1.0F, 0.0F);
+    src.pitch_variance = clamp_or(src.pitch_variance, 0.0F, 1.0F, 0.0F);
+    src.min_distance = clamp_or(src.min_distance, 0.05F, 10'000.0F, 1.5F);
+    src.max_distance = clamp_or(
+        src.max_distance, src.min_distance, 100'000.0F,
+        std::max(35.0F, src.min_distance));
+    src.rolloff = clamp_or(src.rolloff, 0.01F, 16.0F, 1.0F);
+    src.doppler_factor = clamp_or(src.doppler_factor, 0.0F, 5.0F, 1.0F);
+    src.inner_cone_degrees =
+        clamp_or(src.inner_cone_degrees, 0.0F, 360.0F, 360.0F);
+    src.outer_cone_degrees = clamp_or(
+        src.outer_cone_degrees, src.inner_cone_degrees, 360.0F, 360.0F);
+    src.outer_cone_gain = clamp_or(src.outer_cone_gain, 0.0F, 1.0F, 0.25F);
+    return src;
+}
+
+struct AudioListenerComponent {
+    float volume_scale = 1.0F;
+    float doppler_scale = 1.0F;
+    bool enabled = true;
+
+    friend bool operator==(
+        const AudioListenerComponent&,
+        const AudioListenerComponent&) = default;
+};
+
+static_assert(std::is_trivially_copyable_v<AudioListenerComponent>);
+
+[[nodiscard]] inline bool valid_audio_listener_component(
+    const AudioListenerComponent& listener) noexcept {
+    return std::isfinite(listener.volume_scale) &&
+           listener.volume_scale >= 0.0F &&
+           listener.volume_scale <= 4.0F &&
+           std::isfinite(listener.doppler_scale) &&
+           listener.doppler_scale >= 0.0F &&
+           listener.doppler_scale <= 5.0F;
+}
+
+[[nodiscard]] inline AudioListenerComponent sanitize_audio_listener_component(
+    AudioListenerComponent listener) noexcept {
+    if (!std::isfinite(listener.volume_scale)) {
+        listener.volume_scale = 1.0F;
+    }
+    listener.volume_scale = std::clamp(listener.volume_scale, 0.0F, 4.0F);
+    if (!std::isfinite(listener.doppler_scale)) {
+        listener.doppler_scale = 1.0F;
+    }
+    listener.doppler_scale = std::clamp(listener.doppler_scale, 0.0F, 5.0F);
+    return listener;
+}
+
+struct AudioReverbZoneComponent {
+    float inner_radius = 4.0F;
+    float outer_radius = 12.0F;
+    float wet_level = 0.35F;
+    float decay_seconds = 1.8F;
+    float damping = 0.45F;
+    bool enabled = true;
+
+    friend bool operator==(
+        const AudioReverbZoneComponent&,
+        const AudioReverbZoneComponent&) = default;
+};
+
+static_assert(std::is_trivially_copyable_v<AudioReverbZoneComponent>);
+
+[[nodiscard]] inline bool valid_audio_reverb_zone_component(
+    const AudioReverbZoneComponent& zone) noexcept {
+    return std::isfinite(zone.inner_radius) &&
+           zone.inner_radius >= 0.1F &&
+           zone.inner_radius <= 10'000.0F &&
+           std::isfinite(zone.outer_radius) &&
+           zone.outer_radius >= zone.inner_radius &&
+           zone.outer_radius <= 100'000.0F &&
+           std::isfinite(zone.wet_level) &&
+           zone.wet_level >= 0.0F &&
+           zone.wet_level <= 1.0F &&
+           std::isfinite(zone.decay_seconds) &&
+           zone.decay_seconds >= 0.1F &&
+           zone.decay_seconds <= 20.0F &&
+           std::isfinite(zone.damping) &&
+           zone.damping >= 0.0F &&
+           zone.damping <= 1.0F;
+}
+
+[[nodiscard]] inline AudioReverbZoneComponent sanitize_audio_reverb_zone_component(
+    AudioReverbZoneComponent zone) noexcept {
+    const auto clamp_or = [](const float v,
+                             const float lo,
+                             const float hi,
+                             const float fallback) noexcept {
+        if (!std::isfinite(v)) return fallback;
+        return std::clamp(v, lo, hi);
+    };
+    zone.inner_radius = clamp_or(zone.inner_radius, 0.1F, 10'000.0F, 4.0F);
+    zone.outer_radius = clamp_or(
+        zone.outer_radius,
+        zone.inner_radius,
+        100'000.0F,
+        std::max(12.0F, zone.inner_radius));
+    zone.wet_level = clamp_or(zone.wet_level, 0.0F, 1.0F, 0.35F);
+    zone.decay_seconds = clamp_or(zone.decay_seconds, 0.1F, 20.0F, 1.8F);
+    zone.damping = clamp_or(zone.damping, 0.0F, 1.0F, 0.45F);
+    return zone;
+}
+
 // Value-semantic sparse-set component storage keyed by generational SceneNodeId.
 // Empty pools allocate zero heap memory until the first component is attached,
 // and copying a SceneDocument duplicates all pools with value semantics.

@@ -338,6 +338,228 @@ template <std::size_t Size>
     return valid_rigid_body_component(body);
 }
 
+[[nodiscard]] Json audio_source_json(const AudioSourceComponent& src) {
+    return Json{
+        {"enabled", src.enabled},
+        {"asset_path", std::string(src.path_view())},
+        {"bus", to_token(src.bus)},
+        {"volume", src.volume},
+        {"pitch", src.pitch},
+        {"volume_variance", src.volume_variance},
+        {"pitch_variance", src.pitch_variance},
+        {"spatial", src.spatial},
+        {"loop", src.loop},
+        {"play_on_start", src.play_on_start},
+        {"streaming", src.streaming},
+        {"occlusion", src.occlusion},
+        {"attenuation", to_token(src.attenuation)},
+        {"min_distance", src.min_distance},
+        {"max_distance", src.max_distance},
+        {"rolloff", src.rolloff},
+        {"doppler_factor", src.doppler_factor},
+        {"inner_cone_degrees", src.inner_cone_degrees},
+        {"outer_cone_degrees", src.outer_cone_degrees},
+        {"outer_cone_gain", src.outer_cone_gain},
+    };
+}
+
+[[nodiscard]] bool read_audio_source(
+    const Json& source,
+    AudioSourceComponent& out_src) {
+    if (!source.is_object()) return false;
+    for (const auto& [key, _] : source.items()) {
+        if (key != "enabled" &&
+            key != "asset_path" &&
+            key != "bus" &&
+            key != "volume" &&
+            key != "pitch" &&
+            key != "volume_variance" &&
+            key != "pitch_variance" &&
+            key != "spatial" &&
+            key != "loop" &&
+            key != "play_on_start" &&
+            key != "streaming" &&
+            key != "occlusion" &&
+            key != "attenuation" &&
+            key != "min_distance" &&
+            key != "max_distance" &&
+            key != "rolloff" &&
+            key != "doppler_factor" &&
+            key != "inner_cone_degrees" &&
+            key != "outer_cone_degrees" &&
+            key != "outer_cone_gain") {
+            return false;
+        }
+    }
+    AudioSourceComponent parsed{};
+    if (source.contains("enabled")) {
+        if (!source["enabled"].is_boolean()) return false;
+        parsed.enabled = source["enabled"].get<bool>();
+    }
+    if (source.contains("asset_path")) {
+        if (!source["asset_path"].is_string() ||
+            !parsed.set_path(source["asset_path"].get_ref<const std::string&>())) {
+            return false;
+        }
+    }
+    if (source.contains("bus")) {
+        if (!source["bus"].is_string()) return false;
+        const auto bus = parse_audio_bus_id(
+            source["bus"].get_ref<const std::string&>());
+        if (!bus) return false;
+        parsed.bus = *bus;
+    }
+    if (source.contains("attenuation")) {
+        if (!source["attenuation"].is_string()) return false;
+        const auto att = parse_audio_attenuation_model(
+            source["attenuation"].get_ref<const std::string&>());
+        if (!att) return false;
+        parsed.attenuation = *att;
+    }
+    const auto read_bool = [&](const char* k, bool& dst) {
+        if (!source.contains(k)) return true;
+        if (!source[k].is_boolean()) return false;
+        dst = source[k].get<bool>();
+        return true;
+    };
+    if (!read_bool("spatial", parsed.spatial) ||
+        !read_bool("loop", parsed.loop) ||
+        !read_bool("play_on_start", parsed.play_on_start) ||
+        !read_bool("streaming", parsed.streaming) ||
+        !read_bool("occlusion", parsed.occlusion)) {
+        return false;
+    }
+    if ((source.contains("volume") &&
+         !read_bounded_float(source["volume"], 0.0F, 4.0F, parsed.volume)) ||
+        (source.contains("pitch") &&
+         !read_bounded_float(source["pitch"], 0.25F, 4.0F, parsed.pitch)) ||
+        (source.contains("volume_variance") &&
+         !read_bounded_float(
+             source["volume_variance"], 0.0F, 1.0F, parsed.volume_variance)) ||
+        (source.contains("pitch_variance") &&
+         !read_bounded_float(
+             source["pitch_variance"], 0.0F, 1.0F, parsed.pitch_variance)) ||
+        (source.contains("min_distance") &&
+         !read_bounded_float(
+             source["min_distance"], 0.05F, 10'000.0F, parsed.min_distance)) ||
+        (source.contains("max_distance") &&
+         !read_bounded_float(
+             source["max_distance"], 0.05F, 100'000.0F, parsed.max_distance)) ||
+        (source.contains("rolloff") &&
+         !read_bounded_float(source["rolloff"], 0.01F, 16.0F, parsed.rolloff)) ||
+        (source.contains("doppler_factor") &&
+         !read_bounded_float(
+             source["doppler_factor"], 0.0F, 5.0F, parsed.doppler_factor)) ||
+        (source.contains("inner_cone_degrees") &&
+         !read_bounded_float(
+             source["inner_cone_degrees"],
+             0.0F,
+             360.0F,
+             parsed.inner_cone_degrees)) ||
+        (source.contains("outer_cone_degrees") &&
+         !read_bounded_float(
+             source["outer_cone_degrees"],
+             0.0F,
+             360.0F,
+             parsed.outer_cone_degrees)) ||
+        (source.contains("outer_cone_gain") &&
+         !read_bounded_float(
+             source["outer_cone_gain"], 0.0F, 1.0F, parsed.outer_cone_gain)) ||
+        !valid_audio_source_component(parsed)) {
+        return false;
+    }
+    out_src = parsed;
+    return true;
+}
+
+[[nodiscard]] Json audio_listener_json(const AudioListenerComponent& listener) {
+    return Json{
+        {"enabled", listener.enabled},
+        {"volume_scale", listener.volume_scale},
+        {"doppler_scale", listener.doppler_scale},
+    };
+}
+
+[[nodiscard]] bool read_audio_listener(
+    const Json& source,
+    AudioListenerComponent& out_listener) {
+    if (!source.is_object()) return false;
+    for (const auto& [key, _] : source.items()) {
+        if (key != "enabled" &&
+            key != "volume_scale" &&
+            key != "doppler_scale") {
+            return false;
+        }
+    }
+    AudioListenerComponent parsed{};
+    if (source.contains("enabled")) {
+        if (!source["enabled"].is_boolean()) return false;
+        parsed.enabled = source["enabled"].get<bool>();
+    }
+    if ((source.contains("volume_scale") &&
+         !read_bounded_float(
+             source["volume_scale"], 0.0F, 4.0F, parsed.volume_scale)) ||
+        (source.contains("doppler_scale") &&
+         !read_bounded_float(
+             source["doppler_scale"], 0.0F, 5.0F, parsed.doppler_scale)) ||
+        !valid_audio_listener_component(parsed)) {
+        return false;
+    }
+    out_listener = parsed;
+    return true;
+}
+
+[[nodiscard]] Json reverb_zone_json(const AudioReverbZoneComponent& zone) {
+    return Json{
+        {"enabled", zone.enabled},
+        {"inner_radius", zone.inner_radius},
+        {"outer_radius", zone.outer_radius},
+        {"wet_level", zone.wet_level},
+        {"decay_seconds", zone.decay_seconds},
+        {"damping", zone.damping},
+    };
+}
+
+[[nodiscard]] bool read_reverb_zone(
+    const Json& source,
+    AudioReverbZoneComponent& out_zone) {
+    if (!source.is_object()) return false;
+    for (const auto& [key, _] : source.items()) {
+        if (key != "enabled" &&
+            key != "inner_radius" &&
+            key != "outer_radius" &&
+            key != "wet_level" &&
+            key != "decay_seconds" &&
+            key != "damping") {
+            return false;
+        }
+    }
+    AudioReverbZoneComponent parsed{};
+    if (source.contains("enabled")) {
+        if (!source["enabled"].is_boolean()) return false;
+        parsed.enabled = source["enabled"].get<bool>();
+    }
+    if ((source.contains("inner_radius") &&
+         !read_bounded_float(
+             source["inner_radius"], 0.1F, 10'000.0F, parsed.inner_radius)) ||
+        (source.contains("outer_radius") &&
+         !read_bounded_float(
+             source["outer_radius"], 0.1F, 100'000.0F, parsed.outer_radius)) ||
+        (source.contains("wet_level") &&
+         !read_bounded_float(
+             source["wet_level"], 0.0F, 1.0F, parsed.wet_level)) ||
+        (source.contains("decay_seconds") &&
+         !read_bounded_float(
+             source["decay_seconds"], 0.1F, 20.0F, parsed.decay_seconds)) ||
+        (source.contains("damping") &&
+         !read_bounded_float(source["damping"], 0.0F, 1.0F, parsed.damping)) ||
+        !valid_audio_reverb_zone_component(parsed)) {
+        return false;
+    }
+    out_zone = parsed;
+    return true;
+}
+
 [[nodiscard]] bool path_escapes_root(const std::filesystem::path& relative) {
     if (relative.is_absolute()) {
         return true;
@@ -453,6 +675,9 @@ struct ParsedPrefabNode {
     SceneNode value{};
     std::optional<ColliderComponent> collider{};
     std::optional<RigidBodyComponent> rigid_body{};
+    std::optional<AudioSourceComponent> audio_source{};
+    std::optional<AudioListenerComponent> audio_listener{};
+    std::optional<AudioReverbZoneComponent> reverb_zone{};
     std::uint32_t parent_index = invalid_scene_node_index;
 };
 
@@ -667,7 +892,8 @@ bool save_prefab_file(
                         node.light.outer_cone_degrees;
                 }
             }
-            if (record.collider || record.rigid_body) {
+            if (record.collider || record.rigid_body || record.audio_source ||
+                record.audio_listener || record.reverb_zone) {
                 Json components = Json::object();
                 if (record.collider) {
                     components["collider"] = collider_json(*record.collider);
@@ -675,6 +901,18 @@ bool save_prefab_file(
                 if (record.rigid_body) {
                     components["rigid_body"] =
                         rigid_body_json(*record.rigid_body);
+                }
+                if (record.audio_source) {
+                    components["audio_source"] =
+                        audio_source_json(*record.audio_source);
+                }
+                if (record.audio_listener) {
+                    components["audio_listener"] =
+                        audio_listener_json(*record.audio_listener);
+                }
+                if (record.reverb_zone) {
+                    components["reverb_zone"] =
+                        reverb_zone_json(*record.reverb_zone);
                 }
                 encoded["components"] = std::move(components);
             }
@@ -1031,6 +1269,9 @@ bool instantiate_prefab_file(
 
             std::optional<ColliderComponent> collider{};
             std::optional<RigidBodyComponent> rigid_body{};
+            std::optional<AudioSourceComponent> audio_source{};
+            std::optional<AudioListenerComponent> audio_listener{};
+            std::optional<AudioReverbZoneComponent> reverb_zone{};
             if (encoded.contains("components")) {
                 const Json& comps = encoded["components"];
                 if (!comps.is_object()) {
@@ -1038,7 +1279,9 @@ bool instantiate_prefab_file(
                     return false;
                 }
                 for (const auto& [ckey, _] : comps.items()) {
-                    if (ckey != "collider" && ckey != "rigid_body") {
+                    if (ckey != "collider" && ckey != "rigid_body" &&
+                        ckey != "audio_source" && ckey != "audio_listener" &&
+                        ckey != "reverb_zone") {
                         error = "Prefab node contains an unknown component.";
                         return false;
                     }
@@ -1058,6 +1301,30 @@ bool instantiate_prefab_file(
                         return false;
                     }
                     rigid_body = rb;
+                }
+                if (comps.contains("audio_source")) {
+                    AudioSourceComponent as{};
+                    if (!read_audio_source(comps["audio_source"], as)) {
+                        error = "Prefab audio_source component is invalid.";
+                        return false;
+                    }
+                    audio_source = as;
+                }
+                if (comps.contains("audio_listener")) {
+                    AudioListenerComponent al{};
+                    if (!read_audio_listener(comps["audio_listener"], al)) {
+                        error = "Prefab audio_listener component is invalid.";
+                        return false;
+                    }
+                    audio_listener = al;
+                }
+                if (comps.contains("reverb_zone")) {
+                    AudioReverbZoneComponent rz{};
+                    if (!read_reverb_zone(comps["reverb_zone"], rz)) {
+                        error = "Prefab reverb_zone component is invalid.";
+                        return false;
+                    }
+                    reverb_zone = rz;
                 }
             }
 
@@ -1082,6 +1349,9 @@ bool instantiate_prefab_file(
                 },
                 .collider = collider,
                 .rigid_body = rigid_body,
+                .audio_source = audio_source,
+                .audio_listener = audio_listener,
+                .reverb_zone = reverb_zone,
                 .parent_index = parent_index,
             });
         }
@@ -1179,6 +1449,27 @@ bool instantiate_prefab_file(
             }
             target.rigid_body = *ov.rigid_body;
         }
+        if (ov.audio_source) {
+            if (!valid_audio_source_component(*ov.audio_source)) {
+                error = "Prefab override audio_source component is invalid.";
+                return false;
+            }
+            target.audio_source = *ov.audio_source;
+        }
+        if (ov.audio_listener) {
+            if (!valid_audio_listener_component(*ov.audio_listener)) {
+                error = "Prefab override audio_listener component is invalid.";
+                return false;
+            }
+            target.audio_listener = *ov.audio_listener;
+        }
+        if (ov.reverb_zone) {
+            if (!valid_audio_reverb_zone_component(*ov.reverb_zone)) {
+                error = "Prefab override reverb_zone component is invalid.";
+                return false;
+            }
+            target.reverb_zone = *ov.reverb_zone;
+        }
     }
 
     std::vector<SceneNodeId> created(parsed_nodes.size());
@@ -1229,6 +1520,24 @@ bool instantiate_prefab_file(
         if (spec.rigid_body && !scene.set_rigid_body(id, *spec.rigid_body)) {
             static_cast<void>(scene.destroy_subtree(root_created));
             error = "Unable to attach prefab rigid_body component.";
+            return false;
+        }
+        if (spec.audio_source &&
+            !scene.set_audio_source(id, *spec.audio_source)) {
+            static_cast<void>(scene.destroy_subtree(root_created));
+            error = "Unable to attach prefab audio_source component.";
+            return false;
+        }
+        if (spec.audio_listener &&
+            !scene.set_audio_listener(id, *spec.audio_listener)) {
+            static_cast<void>(scene.destroy_subtree(root_created));
+            error = "Unable to attach prefab audio_listener component.";
+            return false;
+        }
+        if (spec.reverb_zone &&
+            !scene.set_reverb_zone(id, *spec.reverb_zone)) {
+            static_cast<void>(scene.destroy_subtree(root_created));
+            error = "Unable to attach prefab reverb_zone component.";
             return false;
         }
     }

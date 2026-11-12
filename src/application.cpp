@@ -3,6 +3,7 @@
 #include "runtime_assets.hpp"
 #include "render_fixture_scene.hpp"
 #include "scene_io.hpp"
+#include "sdl_input_bridge.hpp"
 #include "vulkan_common.hpp"
 
 #include <nlohmann/json.hpp>
@@ -201,6 +202,31 @@ void Application::initialize(const CliOptions& options) {
     }
     if (!renderer_.set_lod_fade(options.lod_fade, options.lod_fade_seconds)) {
         fatal("Invalid model LOD fade settings");
+    }
+    if (!options.benchmark) {
+        input_actions_.set_hardware_polling_enabled(true);
+        if (const auto root = find_runtime_asset_root()) {
+            const std::filesystem::path bindings_path =
+                root->path / "config" / "input_bindings.json";
+            std::error_code fs_err;
+            if (std::filesystem::is_regular_file(bindings_path, fs_err) && !fs_err) {
+                std::string bind_err;
+                if (!load_input_bindings_file(bindings_path, input_actions_, bind_err)) {
+                    std::cerr << "Warning: failed to load input bindings: "
+                              << bind_err << '\n';
+                }
+            }
+            std::string audio_err;
+            if (!audio_engine_.initialize(
+                    AudioEngineOptions{
+                        .asset_root = root->path,
+                        .enable_hardware_output = true,
+                    },
+                    audio_err)) {
+                std::cerr << "Warning: failed to initialize audio engine: "
+                          << audio_err << '\n';
+            }
+        }
     }
     load_canonical_scene();
     if (!gameplay_.active()) {
@@ -428,7 +454,13 @@ void Application::initialize_gameplay(const SceneRenderView& initial_view) {
             : std::nullopt);
     std::string error;
     if (!gameplay_.start(
-            scene_, initial_view, startup_camera, camera_, error, &renderer_)) {
+            scene_,
+            initial_view,
+            startup_camera,
+            camera_,
+            error,
+            &renderer_,
+            audio_engine_.initialized() ? &audio_engine_ : nullptr)) {
         fatal(error);
     }
 }
@@ -623,6 +655,7 @@ void Application::process_event(const SDL_Event& event) {
         return;
     }
     if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
+        input_actions_.release_all();
         set_mouse_capture(false);
         return;
     }
@@ -633,16 +666,40 @@ void Application::process_event(const SDL_Event& event) {
         }
         return;
     }
-    if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
-        if (!options_.benchmark &&
-            event.button.button == SDL_BUTTON_LEFT &&
-            !mouse_captured_) {
-            set_mouse_capture(true);
+    if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+        event.type == SDL_EVENT_MOUSE_BUTTON_UP) {
+        if (!options_.benchmark) {
+            const InputKey btn =
+                input_key_from_sdl_mouse_button(event.button.button);
+            if (btn != InputKey::none) {
+                input_actions_.set_key_down(
+                    btn, event.type == SDL_EVENT_MOUSE_BUTTON_DOWN);
+            }
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
+                event.button.button == SDL_BUTTON_LEFT &&
+                !mouse_captured_) {
+                set_mouse_capture(true);
+            }
+        }
+        return;
+    }
+    if (event.type == SDL_EVENT_KEY_UP) {
+        if (!options_.benchmark) {
+            const InputKey mapped = input_key_from_sdl_keycode(event.key.key);
+            if (mapped != InputKey::none) {
+                input_actions_.set_key_down(mapped, false);
+            }
         }
         return;
     }
     if (event.type != SDL_EVENT_KEY_DOWN || event.key.repeat) {
         return;
+    }
+    if (!options_.benchmark) {
+        const InputKey mapped = input_key_from_sdl_keycode(event.key.key);
+        if (mapped != InputKey::none) {
+            input_actions_.set_key_down(mapped, true);
+        }
     }
     const auto key = input_key_from_sdl(event.key.key);
     if (key) {
@@ -752,42 +809,68 @@ void Application::set_mouse_capture(const bool enabled) noexcept {
 
 void Application::update_camera(const float delta_seconds) {
     FlyCameraInput input{};
+    glm::vec2 action_move_axis{0.0F, 0.0F};
     bool character_jump = false;
-    if (mouse_captured_ && !options_.benchmark) {
-        input.mouse_delta_x = pending_mouse_delta_x_;
-        input.mouse_delta_y = pending_mouse_delta_y_;
+    bool character_run = false;
+    bool character_interact = false;
+    if (!options_.benchmark) {
+        if (mouse_captured_) {
+            input_actions_.add_mouse_delta(
+                pending_mouse_delta_x_, pending_mouse_delta_y_);
+        }
+        input_actions_.begin_frame(delta_seconds);
+        const glm::vec2 look = input_actions_.look_delta();
+        if (mouse_captured_ || input_actions_.gamepad_state().connected) {
+            input.mouse_delta_x = look.x;
+            input.mouse_delta_y = look.y;
+        }
+        if (mouse_captured_ || input_actions_.gamepad_state().connected) {
+            action_move_axis = input_actions_.move_axis();
+            character_jump = input_actions_.action_down(InputAction::jump);
+            character_run = input_actions_.action_down(InputAction::run);
+            character_interact =
+                input_actions_.action_pressed(InputAction::interact);
+        }
 
-        int key_count = 0;
-        const bool* const keys = SDL_GetKeyboardState(&key_count);
-        const auto key_down = [keys, key_count](const SDL_Scancode scancode) {
-            const int index = static_cast<int>(scancode);
-            return keys != nullptr && index >= 0 && index < key_count &&
-                   keys[index];
-        };
-        input.forward = key_down(SDL_SCANCODE_W);
-        input.backward = key_down(SDL_SCANCODE_S);
-        input.left = key_down(SDL_SCANCODE_A);
-        input.right = key_down(SDL_SCANCODE_D);
-        input.up =
-            key_down(SDL_SCANCODE_SPACE) || key_down(SDL_SCANCODE_E);
-        character_jump = key_down(SDL_SCANCODE_SPACE);
-        input.down =
-            key_down(SDL_SCANCODE_LCTRL) ||
-            key_down(SDL_SCANCODE_RCTRL) ||
-            key_down(SDL_SCANCODE_Q);
-        input.boost =
-            key_down(SDL_SCANCODE_LSHIFT) ||
-            key_down(SDL_SCANCODE_RSHIFT);
+        if (mouse_captured_) {
+            int key_count = 0;
+            const bool* const keys = SDL_GetKeyboardState(&key_count);
+            const auto key_down = [keys, key_count](const SDL_Scancode scancode) {
+                const int index = static_cast<int>(scancode);
+                return keys != nullptr && index >= 0 && index < key_count &&
+                       keys[index];
+            };
+            input.forward = action_move_axis.y > 0.25F || key_down(SDL_SCANCODE_W);
+            input.backward = action_move_axis.y < -0.25F || key_down(SDL_SCANCODE_S);
+            input.left = action_move_axis.x < -0.25F || key_down(SDL_SCANCODE_A);
+            input.right = action_move_axis.x > 0.25F || key_down(SDL_SCANCODE_D);
+            input.up =
+                character_jump ||
+                key_down(SDL_SCANCODE_SPACE) ||
+                key_down(SDL_SCANCODE_E);
+            input.down =
+                key_down(SDL_SCANCODE_LCTRL) ||
+                key_down(SDL_SCANCODE_RCTRL) ||
+                key_down(SDL_SCANCODE_Q);
+            input.boost =
+                character_run ||
+                key_down(SDL_SCANCODE_LSHIFT) ||
+                key_down(SDL_SCANCODE_RSHIFT);
+        }
     }
     const auto mcp_key_active = [this](const McpInputKey key) {
         const std::size_t index = key_index(key);
         return mcp_keys_down_.test(index) ||
                mcp_keys_pressed_.test(index);
     };
-    input.forward = input.forward || mcp_key_active(McpInputKey::w);
-    input.backward = input.backward || mcp_key_active(McpInputKey::s);
-    input.left = input.left || mcp_key_active(McpInputKey::a);
-    input.right = input.right || mcp_key_active(McpInputKey::d);
+    const bool mcp_w = mcp_key_active(McpInputKey::w);
+    const bool mcp_s = mcp_key_active(McpInputKey::s);
+    const bool mcp_a = mcp_key_active(McpInputKey::a);
+    const bool mcp_d = mcp_key_active(McpInputKey::d);
+    input.forward = input.forward || mcp_w;
+    input.backward = input.backward || mcp_s;
+    input.left = input.left || mcp_a;
+    input.right = input.right || mcp_d;
     input.up = input.up ||
         mcp_key_active(McpInputKey::space) ||
         mcp_key_active(McpInputKey::e);
@@ -798,6 +881,9 @@ void Application::update_camera(const float delta_seconds) {
         input.boost || mcp_key_active(McpInputKey::shift);
     character_jump =
         character_jump || mcp_key_active(McpInputKey::space);
+    character_run = character_run || mcp_key_active(McpInputKey::shift);
+    character_interact =
+        character_interact || mcp_key_active(McpInputKey::e);
     input.mouse_delta_x += pending_mcp_mouse_delta_x_;
     input.mouse_delta_y += pending_mcp_mouse_delta_y_;
     pending_mouse_delta_x_ = 0.0F;
@@ -807,18 +893,28 @@ void Application::update_camera(const float delta_seconds) {
     mcp_keys_pressed_.reset();
     if (!gameplay_.active()) {
         camera_.update(input, delta_seconds);
+        if (!options_.benchmark && audio_engine_.initialized()) {
+            audio_engine_.set_listener(AudioListenerState{
+                .position = camera_.position(),
+                .forward = camera_.forward(),
+                .up = {0.0F, 1.0F, 0.0F},
+            });
+            audio_engine_.update(delta_seconds);
+        }
         return;
     }
 
     if (!gameplay_.update(
         GameplayFrameInput{
             .character = CharacterInput{
-                .forward = input.forward,
-                .backward = input.backward,
-                .left = input.left,
-                .right = input.right,
+                .move_axis = action_move_axis,
+                .forward = mcp_w,
+                .backward = mcp_s,
+                .left = mcp_a,
+                .right = mcp_d,
                 .jump = character_jump,
-                .run = input.boost,
+                .run = character_run,
+                .interact = character_interact,
             },
             .mouse_delta_x = input.mouse_delta_x,
             .mouse_delta_y = input.mouse_delta_y,
@@ -826,7 +922,9 @@ void Application::update_camera(const float delta_seconds) {
         delta_seconds,
         scene_,
         renderer_,
-        camera_)) {
+        camera_,
+        audio_engine_.initialized() ? &audio_engine_ : nullptr,
+        &input_actions_)) {
         fatal("Gameplay runtime lost its player scene node.");
     }
 }
@@ -1625,6 +1723,14 @@ void Application::execute_mcp_command(const McpCommand& command) {
     case McpCommandType::editor_remove_collider:
     case McpCommandType::editor_set_rigid_body:
     case McpCommandType::editor_remove_rigid_body:
+    case McpCommandType::editor_set_audio_source:
+    case McpCommandType::editor_remove_audio_source:
+    case McpCommandType::editor_set_audio_listener:
+    case McpCommandType::editor_remove_audio_listener:
+    case McpCommandType::editor_set_reverb_zone:
+    case McpCommandType::editor_remove_reverb_zone:
+    case McpCommandType::editor_audio_set_bus:
+    case McpCommandType::editor_audio_preview:
     case McpCommandType::editor_prefab_save:
     case McpCommandType::editor_prefab_instantiate:
     case McpCommandType::editor_prefab_unpack:
@@ -1871,6 +1977,10 @@ void Application::shutdown() noexcept {
     mcp_keys_down_.reset();
     mcp_keys_pressed_.reset();
     set_mouse_capture(false);
+    gameplay_.stop(&audio_engine_);
+    input_actions_.stop_rumble();
+    input_actions_.set_hardware_polling_enabled(false);
+    audio_engine_.shutdown();
     renderer_.shutdown();
     context_.shutdown();
     window_.reset();

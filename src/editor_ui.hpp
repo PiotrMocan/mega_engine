@@ -1,11 +1,14 @@
 #pragma once
 
 #include "asset_browser.hpp"
+#include "audio_engine.hpp"
 #include "cooked_model_asset.hpp"
-#include "prefab_io.hpp"
 #include "editor_ui_kit.hpp"
 #include "fly_camera.hpp"
+#include "gameplay_session.hpp"
+#include "input_actions.hpp"
 #include "performance_metrics.hpp"
+#include "prefab_io.hpp"
 #include "scene_document.hpp"
 #include "vulkan_context.hpp"
 
@@ -31,6 +34,7 @@ class AssetImportWorker;
 struct AssetImportUiState;
 struct ExternalAssetDropState;
 struct MaterialEditorUiState;
+struct AudioInputUiState;
 
 enum class EditorPlayState : std::uint8_t {
     edit,
@@ -74,7 +78,9 @@ public:
     void initialize(
         VulkanContext& context,
         SDL_Window* main_window,
-        Renderer& renderer);
+        Renderer& renderer,
+        AudioEngine* audio_engine = nullptr,
+        InputActionSystem* input_actions = nullptr);
     void shutdown() noexcept;
     void process_event(const SDL_Event& event);
     void synchronize_renderer(Renderer& renderer);
@@ -97,6 +103,8 @@ public:
     [[nodiscard]] FlyCameraInput camera_input() const noexcept {
         return camera_input_;
     }
+    [[nodiscard]] GameplayFrameInput gameplay_input(
+        float delta_seconds) noexcept;
     [[nodiscard]] bool wants_quit() const noexcept {
         return wants_quit_;
     }
@@ -225,6 +233,7 @@ private:
     void build_import_window();
     void build_import_results();
     void build_material_editor(Renderer& renderer);
+    void build_audio_input_panel();
     void build_performance(
         SceneDocument& scene,
         Renderer& renderer,
@@ -257,6 +266,8 @@ private:
     // EditorUi down before either lifetime ends.
     VulkanContext* context_ = nullptr;
     SDL_Window* main_window_ = nullptr;
+    AudioEngine* audio_engine_ = nullptr;
+    InputActionSystem* input_actions_ = nullptr;
     VkDescriptorSet scene_texture_ = VK_NULL_HANDLE;
     VkFormat imgui_color_format_ = VK_FORMAT_UNDEFINED;
     VkPipelineRenderingCreateInfo imgui_rendering_info_{
@@ -342,6 +353,7 @@ private:
     std::unique_ptr<AssetImportUiState> import_ui_;
     std::unique_ptr<ExternalAssetDropState> external_drop_;
     std::unique_ptr<MaterialEditorUiState> material_editor_;
+    std::unique_ptr<AudioInputUiState> audio_input_ui_;
     std::string asset_error_{};
     std::string pending_model_path_{}, pending_model_name_{};
     SceneNodeId pending_model_parent_{};

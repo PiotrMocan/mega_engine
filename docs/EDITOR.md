@@ -110,12 +110,13 @@ performance benchmark используется изолированный `vulka
 - `Scene Hierarchy`: иерархический forest с generational handles,
   работающими chevrons, `Expand all`/`Collapse all`, drag-and-drop reparenting,
   защитой от циклов, фильтром и clipped-отрисовкой.
-- `Inspector`: имя, персистентный `UUID` (с кнопкой копирования), visibility и position/rotation/scale для всех nodes; секция `Prefab` (сохранение выбранного поддерева в `*.vcrprefab.json`, индикация инстанса префаба и распаковка через `Unpack Prefab`); компонент `Collision` (`Auto Bounds`/`Box`/`Sphere`/`Capsule`/`Convex Hull`/`Triangle Mesh`, `Trigger`, offset, размеры, слои) с 3D wireframe-отображением (включая cooked hull/mesh/compound boxes) в `Scene View`; компонент `Rigid Body` (`Dynamic`/`Kinematic`, масса, линейное/угловое затухание, трение, упругость, гравитация, фиксация вращения, старт во сне);
+- `Inspector`: имя, персистентный `UUID` (с кнопкой копирования), visibility и position/rotation/scale для всех nodes; секция `Prefab` (сохранение выбранного поддерева в `*.vcrprefab.json`, индикация инстанса префаба и распаковка через `Unpack Prefab`); компонент `Collision` (`Auto Bounds`/`Box`/`Sphere`/`Capsule`/`Convex Hull`/`Triangle Mesh`, `Trigger`, offset, размеры, слои) с 3D wireframe-отображением (включая cooked hull/mesh/compound boxes) в `Scene View`; компонент `Rigid Body` (`Dynamic`/`Kinematic`, масса, линейное/угловое затухание, трение, упругость, гравитация, фиксация вращения, старт во сне); компоненты звука `Audio Source` (2D/3D источник или `Sound Cue`, маршрутизация в шины, аттенюация, конус направленности, Доплер, окклюзия, стриминг), `Audio Listener` и `Reverb Zone` (с 3D wireframe-сферами и конусами в `Scene View`);
   asset path для model
   nodes; PBR base color, metallic, roughness и ambient occlusion для
   cubes/ground. Terrain, sky и sun visibility уже
   управляет renderer, а неподключённые component controls намеренно не
   показываются как работающие.
+- `Audio & Input`: отдельная dockable панель с 5-шинным микшером (`Master`, `Music`, `SFX`, `Voice`, `UI`), пиковыми индикаторами L/R и brickwall-лимитером на `Master`, конструктором пулов вариаций `Sound Cue` (`*.vcrcue.json`), настройкой мёртвых зон/вибрации геймпада (`XInput`) и интерактивным переназначением клавиш/кнопок по контекстам (`Gameplay`, `UI`, `Cutscene`) с детекцией конфликтов и сохранением в `config/input_bindings.json`.
 - `Scene View`: offscreen Vulkan target, изменяемый размер, ray/AABB picking,
   selection bounds и transform gizmo. `W/E/R` выбирают move/rotate/scale,
   доступны World/Local space, постоянный snap и временный snap через `Ctrl`.
@@ -141,12 +142,12 @@ performance benchmark используется изолированный `vulka
   backend; resize окна меняет реальное scene resolution, а gameplay input
   принимается и в detached viewport.
 - `Assets`: sandboxed browser исходного project `assets` (с fallback на
-  packaged copy), сортировка, типы, drag payload, ручной refresh, явное
+  packaged copy), сортировка, типы, drag payload, предпрослушивание звуковых ассетов (`*.vcraudio.json`, `.wav`, `.ogg`, `.flac`, `*.vcrcue.json`) одной кнопкой через шину `UI`, ручной refresh, явное
   сообщение о truncation и запрет выхода через `..`/symbolic links.
-- `Asset Import`: FBX, OBJ, glTF/GLB, DAE, PLY, STL, 3DS и изображения
+- `Asset Import`: FBX, OBJ, glTF/GLB, DAE, PLY, STL, 3DS, изображения и аудиофайлы (`.wav`, `.ogg`, `.flac`)
   импортируются через отдельное окно или
   внешний drag-and-drop в `Assets`. Model cook создаёт versioned mesh,
-  model manifest, отдельные material/texture assets и сохраняет source.
+  model manifest, отдельные material/texture assets и сохраняет source; audio cook проверяет заголовок и длительность и создаёт `*.vcraudio.json` манифест с флагом рекомендации потокового стриминга для крупных треков.
   Публикация транзакционная и не заменяет существующий asset.
 - `Add to Scene`: model manifest (`*.vcrasset.json`) и префабы (`*.vcrprefab.json`) добавляются кнопкой, двойным кликом,
   context menu или drag-and-drop на `Scene View`. Renderer безопасно проверяет

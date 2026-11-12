@@ -96,6 +96,9 @@ struct SceneNodeRecord {
     std::optional<ColliderComponent> collider{};
     std::optional<RigidBodyComponent> rigid_body{};
     std::optional<PrefabInstanceComponent> prefab_instance{};
+    std::optional<AudioSourceComponent> audio_source{};
+    std::optional<AudioListenerComponent> audio_listener{};
+    std::optional<AudioReverbZoneComponent> reverb_zone{};
     std::uint32_t parent_record_index =
         invalid_scene_node_index;
 };
@@ -254,6 +257,60 @@ public:
         return prefab_instances_;
     }
 
+    [[nodiscard]] bool set_audio_source(
+        SceneNodeId id,
+        const AudioSourceComponent& audio_source);
+    [[nodiscard]] bool remove_audio_source(SceneNodeId id) noexcept;
+    [[nodiscard]] bool has_audio_source(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<
+        std::reference_wrapper<const AudioSourceComponent>>
+        audio_source(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<
+        std::reference_wrapper<AudioSourceComponent>>
+        audio_source_mut(SceneNodeId id) noexcept;
+    [[nodiscard]] const SparseComponentPool<
+        SceneNodeId,
+        AudioSourceComponent,
+        max_scene_nodes>& audio_sources() const noexcept {
+        return audio_sources_;
+    }
+
+    [[nodiscard]] bool set_audio_listener(
+        SceneNodeId id,
+        const AudioListenerComponent& audio_listener);
+    [[nodiscard]] bool remove_audio_listener(SceneNodeId id) noexcept;
+    [[nodiscard]] bool has_audio_listener(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<
+        std::reference_wrapper<const AudioListenerComponent>>
+        audio_listener(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<
+        std::reference_wrapper<AudioListenerComponent>>
+        audio_listener_mut(SceneNodeId id) noexcept;
+    [[nodiscard]] const SparseComponentPool<
+        SceneNodeId,
+        AudioListenerComponent,
+        max_scene_nodes>& audio_listeners() const noexcept {
+        return audio_listeners_;
+    }
+
+    [[nodiscard]] bool set_reverb_zone(
+        SceneNodeId id,
+        const AudioReverbZoneComponent& reverb_zone);
+    [[nodiscard]] bool remove_reverb_zone(SceneNodeId id) noexcept;
+    [[nodiscard]] bool has_reverb_zone(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<
+        std::reference_wrapper<const AudioReverbZoneComponent>>
+        reverb_zone(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<
+        std::reference_wrapper<AudioReverbZoneComponent>>
+        reverb_zone_mut(SceneNodeId id) noexcept;
+    [[nodiscard]] const SparseComponentPool<
+        SceneNodeId,
+        AudioReverbZoneComponent,
+        max_scene_nodes>& reverb_zones() const noexcept {
+        return reverb_zones_;
+    }
+
     void mark_content_changed() noexcept;
     [[nodiscard]] std::uint32_t last_transform_updates() const noexcept {
         return last_transform_updates_;
@@ -351,6 +408,18 @@ private:
         SceneNodeId,
         PrefabInstanceComponent,
         max_scene_nodes> prefab_instances_{};
+    SparseComponentPool<
+        SceneNodeId,
+        AudioSourceComponent,
+        max_scene_nodes> audio_sources_{};
+    SparseComponentPool<
+        SceneNodeId,
+        AudioListenerComponent,
+        max_scene_nodes> audio_listeners_{};
+    SparseComponentPool<
+        SceneNodeId,
+        AudioReverbZoneComponent,
+        max_scene_nodes> reverb_zones_{};
     std::uint32_t first_root_ = invalid_scene_node_index;
     std::uint32_t last_root_ = invalid_scene_node_index;
     std::uint32_t live_count_ = 0U;

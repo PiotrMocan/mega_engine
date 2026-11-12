@@ -85,6 +85,14 @@ try {
         "editor.scene.remove_collider",
         "editor.scene.set_rigid_body",
         "editor.scene.remove_rigid_body",
+        "editor.scene.set_audio_source",
+        "editor.scene.remove_audio_source",
+        "editor.scene.set_audio_listener",
+        "editor.scene.remove_audio_listener",
+        "editor.scene.set_reverb_zone",
+        "editor.scene.remove_reverb_zone",
+        "editor.audio.set_bus",
+        "editor.audio.preview",
         "editor.prefab.save",
         "editor.prefab.instantiate",
         "editor.prefab.unpack",
@@ -511,6 +519,143 @@ try {
         -not $removeRb.structuredContent.changed -or
         $null -ne $removeRb.structuredContent.node.rigid_body) {
         throw "editor.scene.remove_rigid_body failed to detach rigid body"
+    }
+
+    $setAudioSrc = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 811; method = "tools/call"
+        params = @{
+            name = "editor.scene.set_audio_source"
+            arguments = @{
+                id = $dupId
+                asset_path = "audio/campfire.vcraudio.json"
+                bus = "sfx"
+                volume = 0.85
+                pitch = 1.1
+                spatial = $true
+                min_distance = 2.0
+                max_distance = 32.0
+                occlusion = $true
+            }
+        }
+    } 811
+    if ($setAudioSrc.isError -or
+        -not $setAudioSrc.structuredContent.changed -or
+        $setAudioSrc.structuredContent.node.audio_source.asset_path -cne "audio/campfire.vcraudio.json" -or
+        $setAudioSrc.structuredContent.node.audio_source.bus -cne "sfx" -or
+        -not $setAudioSrc.structuredContent.node.audio_source.occlusion) {
+        throw "editor.scene.set_audio_source failed to attach spatial audio emitter"
+    }
+
+    $setAudioListener = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 812; method = "tools/call"
+        params = @{
+            name = "editor.scene.set_audio_listener"
+            arguments = @{
+                id = $folderId
+                enabled = $true
+                volume_scale = 0.95
+                doppler_scale = 1.25
+            }
+        }
+    } 812
+    if ($setAudioListener.isError -or
+        -not $setAudioListener.structuredContent.changed -or
+        [double]$setAudioListener.structuredContent.node.audio_listener.doppler_scale -ne 1.25) {
+        throw "editor.scene.set_audio_listener failed to attach listener component"
+    }
+
+    $setReverbZone = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 813; method = "tools/call"
+        params = @{
+            name = "editor.scene.set_reverb_zone"
+            arguments = @{
+                id = $groundId
+                inner_radius = 4.0
+                outer_radius = 16.0
+                wet_level = 0.35
+                decay_seconds = 2.5
+                damping = 0.4
+            }
+        }
+    } 813
+    if ($setReverbZone.isError -or
+        -not $setReverbZone.structuredContent.changed -or
+        [double]$setReverbZone.structuredContent.node.reverb_zone.decay_seconds -ne 2.5) {
+        throw "editor.scene.set_reverb_zone failed to attach reverb zone component"
+    }
+
+    $setSfxBus = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 814; method = "tools/call"
+        params = @{
+            name = "editor.audio.set_bus"
+            arguments = @{
+                bus = "sfx"
+                volume = 0.6
+                muted = $true
+            }
+        }
+    } 814
+    if ($setSfxBus.isError -or
+        $setSfxBus.structuredContent.bus -cne "sfx" -or
+        -not $setSfxBus.structuredContent.muted) {
+        throw "editor.audio.set_bus failed to update SFX bus"
+    }
+
+    $audioState = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 815; method = "tools/call"
+        params = @{ name = "editor.get_state"; arguments = @{} }
+    } 815
+    if ($audioState.isError -or
+        -not $audioState.structuredContent.audio.initialized -or
+        $audioState.structuredContent.audio_source_count -ne ($before.structuredContent.audio_source_count + 1) -or
+        $audioState.structuredContent.audio_listener_count -ne ($before.structuredContent.audio_listener_count + 1) -or
+        $audioState.structuredContent.reverb_zone_count -ne ($before.structuredContent.reverb_zone_count + 1) -or
+        -not $audioState.structuredContent.audio.buses.sfx.muted) {
+        throw "editor.get_state did not report live audio components and mixer bus state"
+    }
+
+    $stopPreview = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 816; method = "tools/call"
+        params = @{
+            name = "editor.audio.preview"
+            arguments = @{ stop = $true }
+        }
+    } 816
+    if ($stopPreview.isError -or $stopPreview.structuredContent.audio.preview_playing) {
+        throw "editor.audio.preview(stop=true) failed"
+    }
+
+    $restoreSfxBus = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 817; method = "tools/call"
+        params = @{
+            name = "editor.audio.set_bus"
+            arguments = @{
+                bus = "sfx"
+                volume = 1.0
+                muted = $false
+            }
+        }
+    } 817
+    if ($restoreSfxBus.isError -or $restoreSfxBus.structuredContent.muted) {
+        throw "editor.audio.set_bus failed to restore SFX bus"
+    }
+
+    $removeAudioSrc = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 818; method = "tools/call"
+        params = @{ name = "editor.scene.remove_audio_source"; arguments = @{ id = $dupId } }
+    } 818
+    $removeAudioListener = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 819; method = "tools/call"
+        params = @{ name = "editor.scene.remove_audio_listener"; arguments = @{ id = $folderId } }
+    } 819
+    $removeReverbZone = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 820; method = "tools/call"
+        params = @{ name = "editor.scene.remove_reverb_zone"; arguments = @{ id = $groundId } }
+    } 820
+    if ($removeAudioSrc.isError -or $null -ne $removeAudioSrc.structuredContent.node.audio_source -or
+        $removeAudioListener.isError -or $null -ne $removeAudioListener.structuredContent.node.audio_listener -or
+        $removeReverbZone.isError -or $null -ne $removeReverbZone.structuredContent.node.reverb_zone) {
+        throw "editor.scene.remove_audio_* failed to detach audio components"
     }
 
     $reselectDup = Send-McpMessage @{
