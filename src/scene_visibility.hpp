@@ -21,6 +21,11 @@ struct LodProjection {
 [[nodiscard]] Bounds transform_bounds(const Bounds &bounds, const glm::vec4 &row0,
                                       const glm::vec4 &row1, const glm::vec4 &row2) noexcept;
 
+// Upper bound on the maximum stretch of the linear transform. Tight for TRS
+// (including reflections), conservative for hierarchy-induced shear.
+[[nodiscard]] float lod_transform_scale(const glm::vec4 &row0, const glm::vec4 &row1,
+                                        const glm::vec4 &row2) noexcept;
+
 // Returns the nearest non-negative distance along a normalized ray.
 [[nodiscard]] std::optional<float> ray_bounds_intersection(
     glm::vec3 origin,

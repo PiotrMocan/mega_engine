@@ -220,6 +220,27 @@ LodProjection lod_projection(const Bounds &bounds, const glm::mat4 &vp,
     // Bound lateral and depth displacement, including off-axis perspective.
     return {near_depth, focal + std::max(max_x, max_y) / near_depth};
 }
+float lod_transform_scale(const glm::vec4 &row0, const glm::vec4 &row1,
+                          const glm::vec4 &row2) noexcept {
+    const glm::vec3 x(row0.x, row1.x, row2.x);
+    const glm::vec3 y(row0.y, row1.y, row2.y);
+    const glm::vec3 z(row0.z, row1.z, row2.z);
+    const glm::vec3 diagonal(glm::dot(x, x), glm::dot(y, y), glm::dot(z, z));
+    if (!std::isfinite(diagonal.x) || !std::isfinite(diagonal.y) || !std::isfinite(diagonal.z))
+        return std::numeric_limits<float>::infinity();
+    const float xy = std::abs(glm::dot(x, y));
+    const float xz = std::abs(glm::dot(x, z));
+    const float yz = std::abs(glm::dot(y, z));
+    // sigma_max(A)^2 = lambda_max(A^T A) <= ||A^T A||_infinity.
+    // Both this and trace(A^T A) are bounds; choose the tighter one. Orthogonal
+    // columns give max(scale), avoiding Frobenius' sqrt(3) inflation for a
+    // uniform scale. Keep operation order/padding in sync with lod_scale.glsl.
+    const float gram_bound = std::max({diagonal.x + xy + xz, diagonal.y + xy + yz,
+                                       diagonal.z + xz + yz});
+    const float frobenius_squared = diagonal.x + diagonal.y + diagonal.z;
+    return std::sqrt(std::min(gram_bound, frobenius_squared)) * 1.000002F;
+}
+
 unsigned select_lod(std::span<const float> errors, float scale, float distance, float pixels,
                     unsigned previous, float budget) noexcept {
     if (distance <= 0.0F || errors.empty()) {

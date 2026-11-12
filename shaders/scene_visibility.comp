@@ -1,6 +1,7 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 #include "lod_fade.glsl"
+#include "lod_scale.glsl"
 layout(local_size_x=128) in;
 layout(set=0,binding=0,std140) uniform VisibilityUniforms {
     mat4 viewProjection;
@@ -133,7 +134,7 @@ uint classify(uint id,out uint groupIndex,out uint lod) {
     uint pattern = (config.flags.w >> 1u) & 3u;
     uvec4 history = pattern == 0u ? uvec4(lodHistory[id*4u]) : loadHistory(id);
     if ((config.flags.w & 1u)!=0u && group.range.w==0u && distance>0) {
-        float scale=sqrt(dot(instance.row0.xyz,instance.row0.xyz)+dot(instance.row1.xyz,instance.row1.xyz)+dot(instance.row2.xyz,instance.row2.xyz));
+        float scale=lodTransformScale(instance.row0.xyz,instance.row1.xyz,instance.row2.xyz);
         vec2 maximumClip=vec2(abs(dot(rowX,vec4(center,1)))+dot(abs(rowX.xyz),extent),
             abs(dot(rowY,vec4(center,1)))+dot(abs(rowY.xyz),extent));
         vec2 maximumPixels=maximumClip/(config.guardError.xy*(1-config.guardError.xy));

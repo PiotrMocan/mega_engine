@@ -239,12 +239,8 @@ void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExt
         const auto &submesh = asset.submeshes[draw.submesh_index];
         for (auto i = draw.first_instance; i < draw.first_instance + draw.instance_count; ++i) {
             const auto &instance = editor_scene_instances_[i];
-            // Frobenius norm is an upper bound on the largest singular value,
-            // including shear. A conservative scale avoids excessive LOD error.
-            const float scale = std::sqrt(
-                glm::dot(glm::vec3(instance.model_row_0), glm::vec3(instance.model_row_0)) +
-                glm::dot(glm::vec3(instance.model_row_1), glm::vec3(instance.model_row_1)) +
-                glm::dot(glm::vec3(instance.model_row_2), glm::vec3(instance.model_row_2)));
+            const float scale = lod_transform_scale(instance.model_row_0,
+                instance.model_row_1, instance.model_row_2);
             const auto &b = world_bounds_[i];
             const auto lod_view = lod_projection(b, vp, {extent.width, extent.height});
             const unsigned lod =

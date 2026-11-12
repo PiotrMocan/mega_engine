@@ -1,4 +1,6 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "lod_scale.glsl"
 
 layout(local_size_x = 128) in;
 
@@ -74,10 +76,7 @@ void main() {
             dot(abs(instance.row0.xyz), source.extent.xyz),
             dot(abs(instance.row1.xyz), source.extent.xyz),
             dot(abs(instance.row2.xyz), source.extent.xyz));
-        const float scale = sqrt(
-            dot(instance.row0.xyz, instance.row0.xyz) +
-            dot(instance.row1.xyz, instance.row1.xyz) +
-            dot(instance.row2.xyz, instance.row2.xyz));
+        const float scale = lodTransformScale(instance.row0.xyz, instance.row1.xyz, instance.row2.xyz);
 
         groupIndex = uint(source.center.w);
         group = groups[groupIndex];

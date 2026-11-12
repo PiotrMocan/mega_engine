@@ -113,6 +113,108 @@ scripts/benchmark_vegetation_windows.ps1 -OutputName vegetation-local-moving -Ex
 Keep resolution, saved scene, AA, visibility, lighting and LOD settings equal
 between runs. Benchmark JSON records the actual backend and relevant options.
 
+## Tighter transform bounds for LOD, second pass (2026-11-12)
+
+Camera and shadow LOD selection previously scaled local geometric error by the
+Frobenius norm of the instance transform. A uniformly scaled object therefore
+paid an unnecessary `sqrt(3)` multiplier. CPU visibility and both GPU visibility
+shaders now use the smaller of two conservative bounds on maximum stretch:
+the square root of the absolute row-sum norm of `transpose(A) * A`, and the
+Frobenius norm. For orthogonal transform columns this approaches the largest
+axis scale; shear remains bounded. A small float-rounding margin is included.
+The GPU camera/shadow paths share `lod_scale.glsl`; CPU code uses the same math.
+
+This selects existing simpler LODs sooner without raising the configured pixel
+error or altering authored errors, mesh files, textures or scene placement.
+Unlike the first optimization pass, **the submitted triangle count changes**.
+The geometric error budget does not guarantee identical alpha coverage or
+lighting when an authored LOD changes.
+
+Fresh native Windows Release comparison on the same RX 6800 / Ryzen 7 9700X,
+driver 32.0.21045.16010, 1920 x 1080, IMMEDIATE, AA off, validation disabled,
+saved 11,533-node scene, 5 s warmup + 15 s measurement, three runs per variant:
+
+| Stationary metric | Before | After |
+|---|---:|---:|
+| Median FPS | 148.42 | 168.30 (+13.4%) |
+| FPS range | 148.18..148.43 | 167.13..169.25 |
+| Median GPU frame | 6.527 ms | 5.729 ms |
+| Median GPU geometry | 6.415 ms | 5.610 ms |
+| Median CPU frame | 6.738 ms | 5.942 ms |
+| Median 1% low | 140.65 FPS | 142.58 FPS |
+| Submitted triangles | 43,760,825 | 37,027,377 (-15.4%) |
+| LOD0 / LOD1 / LOD2 / LOD3 instances | 27 / 85 / 454 / 6806 | 10 / 25 / 257 / 7080 |
+
+The post-change 1% low range was 136.81..149.06 FPS, so its improvement is much
+less stable than average FPS. Shadows were cached in this stationary case.
+Clocks remain driver-managed under the Windows Balanced plan; no other renderer,
+editor, build or analyzer was running during the final measurement series.
+
+With `--animate-camera`, the same three-run comparison also exercises shadow
+refreshes along the camera path:
+
+| Moving-camera metric | Before | After |
+|---|---:|---:|
+| Median FPS | 131.78 | 170.93 (+29.7%) |
+| FPS range | 129.90..132.46 | 170.57..171.35 |
+| Median GPU frame | 7.404 ms | 5.677 ms |
+| Median GPU geometry | 6.453 ms | 5.042 ms |
+| Median GPU shadow time per frame | 0.798 ms | 0.487 ms |
+| Median CPU frame | 7.588 ms | 5.850 ms |
+| Median 1% low | 78.45 FPS | 96.40 FPS |
+
+These are fresh comparisons against the pre-change executable and the current
+saved scene, not a continuation of the earlier moving-camera result above.
+Shadow timing is averaged over all frames, including frames with cached tiles.
+The stationary median command-record time rose from 0.0735 to 0.0791 ms;
+the moving case fell from 0.1182 to 0.1094 ms. The 0.0056 ms stationary cost is
+accepted against the 0.798 ms reduction in total GPU time and improved total
+frame time. The change adds scalar math to visibility selection, with no new
+draw-recording or synchronization operations; the timing delta's hardware cause
+has not been isolated. Remaining CPU stage timings are recorded alongside the
+raw results in `build/windows-release/vegetation-lod-stage-comparison.json`.
+
+The settled image comparison changes 43,362 of 2,073,600 pixels (2.09%). Mean
+absolute RGB differences are 0.2429, 0.1825, 0.1743 on a 0..255 scale, with maxima
+148, 124, 126. Inspection shows small foliage/shadow detail changes; this is
+not pixel-exact rendering or an exhaustive quality test of authored LODs.
+
+An independent overdraw-ordering probe fell to 140.82 FPS from the 148.42 FPS
+baseline and was reverted. No overdraw reordering is part of this change.
+
+Verification: Release, Debug and MSVC ASan each passed 13/13 CTest executables.
+New tests cover rotated/nonuniform/reflected/singular transforms, overflow,
+and 32,768 displacement directions across 256 arbitrary sheared matrices.
+All shaders were compiled and passed `spirv-val` for Vulkan 1.3 / SPIR-V 1.5.
+Debug captures covered the full forest through CPU and GPU visibility, plus
+animated GPU grass with FSR and Bayer LOD transitions. ASan ran two animated
+startup/shutdown cycles with resize, present/mode switches and AA off/SMAA/MSAA/
+FSR. These runtime checks reported no Vulkan errors, ASan errors or live GPU
+allocations. Existing unused vertex-output warnings remain.
+
+MSVC `/analyze` + Core Check and clang-tidy ran on `scene_visibility.cpp` and
+`renderer_scene.cpp`. No diagnostic points to the new norm calculation. Existing
+generic bounds/style and vendor diagnostics remain; the reported hull index is
+bounded by 8 lower-chain plus 7 upper-chain insertions into 16 slots. Alpha-word
+indices in the unchanged opacity helper are bounded by its fixed map resolution.
+No suppression was added. Manual review found no new allocation/resource,
+thread-ownership or synchronization changes. Hardware-counter interpretation
+was not completed: the Windows UI helper failed to launch its app server with
+OS error 3, including after retry/reset. GPU timing results are measurements;
+a particular hardware stall cause is not established.
+
+Evidence:
+
+- `build/windows-release/vegetation-second-before-20261112/`
+- `build/windows-release/vegetation-lod-final-20261112/`
+- `build/windows-release/vegetation-lod-moving-{before,after}-20261112/`
+- `build/windows-release/vegetation-second-images/`
+- `build/windows-release/vegetation-overdraw-probe-20261112/`
+- `build/windows-debug/vegetation-lod-{cpu,gpu,grass}/`
+- `build/windows-asan/render-validation/animated-gpu-lod-scale/`
+- `build/windows-{release,debug,asan}/vegetation-lod-build.log`
+- `build/windows-release/vegetation-lod-{shaders,msvc,tidy}.log`
+
 ## Research and next bottlenecks
 
 Guerrilla's [GPU procedural placement](https://www.guerrilla-games.com/read/gpu-based-procedural-placement-in-horizon-zero-dawn)

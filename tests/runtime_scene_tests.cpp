@@ -24,6 +24,56 @@ void expect(bool result, const char *message) {
     }
 }
 
+void lod_transform_scale_tests() {
+    const auto bound = [](const glm::mat4 &matrix) {
+        return vcr::lod_transform_scale(
+            {matrix[0][0], matrix[1][0], matrix[2][0], matrix[3][0]},
+            {matrix[0][1], matrix[1][1], matrix[2][1], matrix[3][1]},
+            {matrix[0][2], matrix[1][2], matrix[2][2], matrix[3][2]});
+    };
+    expect(bound(glm::mat4(0)) == 0, "collapsed transform has zero geometric error");
+    const auto rotation = glm::rotate(glm::mat4(1), .73F, glm::normalize(glm::vec3(1, 2, 3)));
+    for (const auto scale : {glm::vec3(1), glm::vec3(3), glm::vec3(-2, .5F, 4),
+                             glm::vec3(0, 1, 2), glm::vec3(1.0e-8F), glm::vec3(1.0e8F)}) {
+        auto matrix = glm::scale(rotation, scale);
+        matrix[3] = glm::vec4(200, -5, 43, 1); // Translation cannot affect stretch.
+        const double maximum = std::max({std::abs(double(scale.x)), std::abs(double(scale.y)),
+                                          std::abs(double(scale.z))});
+        const double result = bound(matrix);
+        expect(result >= maximum && result <= maximum * 1.00001,
+            "rotated and reflected TRS uses the largest axis scale without sqrt(3) inflation");
+    }
+    // Deterministic arbitrary matrices cover shear from composed parent TRS,
+    // near singular transforms and reflections. Check actual transformed unit
+    // directions in double precision, independently of the norm formula.
+    std::uint32_t seed = 0x7931abcU;
+    const auto random = [&seed]() {
+        seed = seed * 1664525U + 1013904223U;
+        return float(seed >> 8U) / float(0x00ffffffU) * 2.0F - 1.0F;
+    };
+    for (unsigned test = 0; test < 256; ++test) {
+        glm::mat4 matrix(1);
+        double frobenius_squared = 0;
+        for (unsigned c = 0; c < 3; ++c) {
+            for (unsigned r = 0; r < 3; ++r) {
+                matrix[c][r] = random() * 10.0F;
+                frobenius_squared += double(matrix[c][r]) * matrix[c][r];
+            }
+        }
+        const double result = bound(matrix);
+        expect(result <= std::sqrt(frobenius_squared) * 1.00001,
+            "shear bound is no looser than padded Frobenius");
+        for (unsigned direction = 0; direction < 128; ++direction) {
+            const glm::dvec3 vector = glm::normalize(glm::dvec3(random(), random(), random()));
+            expect(glm::length(glm::dmat3(matrix) * vector) <= result,
+                "LOD error scale conservatively bounds sheared displacement");
+        }
+    }
+    auto overflow = glm::mat4(1);
+    overflow[0][0] = std::numeric_limits<float>::max();
+    expect(std::isinf(bound(overflow)), "unrepresentable stretch retains full detail");
+}
+
 void bounds_hierarchy_tests() {
     constexpr std::size_t capacity = 4096;
     vcr::BoundsHierarchy hierarchy;
@@ -339,6 +389,7 @@ void geometry_optimization_tests() {
 }
 
 int main() {
+    lod_transform_scale_tests();
     {
         vcr::CookedModelAsset grass;
         grass.materials.emplace_back().factors.model = vcr::MaterialModel::gpu_grass;
