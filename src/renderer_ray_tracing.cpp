@@ -1092,7 +1092,7 @@ void Renderer::build_model_blas_on_upload(EditorModelAsset& asset) {
         return;
     }
     const std::uint32_t vertex_count = static_cast<std::uint32_t>(
-        asset.vertex_buffer.size() / sizeof(CookedModelVertex));
+        asset.vertex_buffer.size() / model_vertex_stride_);
     if (vertex_count == 0U) {
         return;
     }
@@ -1129,7 +1129,7 @@ void Renderer::build_model_blas_on_upload(EditorModelAsset& asset) {
                         VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR,
                     .vertexFormat = VK_FORMAT_R32G32B32_SFLOAT,
                     .vertexData = {.deviceAddress = vertex_address},
-                    .vertexStride = sizeof(CookedModelVertex),
+                    .vertexStride = model_vertex_stride_,
                     .maxVertex = max_vertex,
                     .indexType = VK_INDEX_TYPE_UINT32,
                     .indexData = {.deviceAddress = index_address},

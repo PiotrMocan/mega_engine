@@ -1,4 +1,7 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+#include "grass_vertex.glsl"
+
 layout(set = 0, binding = 0, std140) uniform FrameUniforms
 {
     mat4 viewProjection;
@@ -32,9 +35,20 @@ void main()
     const uint sourceIndex = frame.globalRotation.y > 0.5
         ? visibleIndices[gl_InstanceIndex] : uint(gl_InstanceIndex);
     const Instance instance = instances[sourceIndex];
-    const vec4 p = vec4(inPosition, 1);
+    vec3 localPosition = inPosition;
+    vec2 surfaceUv = vec2(inUv.x, 1.0 - inUv.y);
+    if (VCR_ENABLE_GPU_GRASS) {
+        const GrassVertexResult grass = evaluateProceduralGrassVertex(
+            inUv,
+            frame.globalRotation.z,
+            instance.row0,
+            instance.row2);
+        localPosition = frame.globalRotation.z == 0.0 ? inPosition : grass.localPosition;
+        surfaceUv = grass.surfaceUv;
+    }
+    const vec4 p = vec4(localPosition, 1);
     gl_Position = shadowPush.light * vec4(dot(instance.row0, p), dot(instance.row1, p), dot(instance.row2, p), 1);
-    outUv = vec2(inUv.x, 1.0 - inUv.y);
+    outUv = surfaceUv;
     outBaseColor = instance.baseColor;
     outLodToken = 0u;
 }

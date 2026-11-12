@@ -452,7 +452,8 @@ void EditorApplication::initialize(const CliOptions& options) {
     context_.initialize(window_.get(), options.validation);
     renderer_.initialize(context_, window_.get(), preferred_present_mode(options.present),
                          RunMode::scene, 1U, options.gpu_workload_iterations, options.anti_aliasing,
-                         options.mcp_stdio, true, true, lighting);
+                         options.mcp_stdio, true, true, lighting, RenderFixture::none,
+                         options.model_vertex_format);
     if (!renderer_.set_local_light_backend(options.local_light_backend)) {
         fatal("Invalid local-lighting backend");
     }

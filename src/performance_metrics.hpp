@@ -208,6 +208,10 @@ struct BenchmarkResult {
     std::string shadow_depth_actual = "unavailable";
     std::string depth_prepass_requested = "off";
     std::string depth_prepass_actual = "off";
+    std::string model_vertex_format_requested = "auto";
+    std::string model_vertex_format_actual = "float";
+    std::uint32_t gpu_grass_instances = 0;
+    float gpu_grass_wind_seconds = 0.0F;
     std::string lod_fade_requested = "off";
     std::string lod_fade_actual = "off";
     float lod_fade_seconds_requested = 0.25F;

@@ -8,6 +8,7 @@
 #include "lighting.hpp"
 #include "lod_transition.hpp"
 #include "motion_blur.hpp"
+#include "model_vertex_format.hpp"
 #include "render_fixture.hpp"
 #include "subsurface.hpp"
 #include "tone_mapping.hpp"
@@ -98,6 +99,7 @@ struct CliOptions {
     SubsurfaceMode subsurface = SubsurfaceMode::off;
     bool subsurface_override = false;
     DepthPrepass depth_prepass = DepthPrepass::off;
+    ModelVertexFormat model_vertex_format = ModelVertexFormat::automatic;
     LodFadePattern lod_fade = LodFadePattern::off;
     MotionBlurSettings motion_blur{};
     LocalLightBackend local_light_backend = LocalLightBackend::automatic;

@@ -2,6 +2,7 @@
 #include "bounds_hierarchy.hpp"
 #include "camera_projection.hpp"
 #include "model_lod.hpp"
+#include "gpu_grass.hpp"
 #include "asset_preparation.hpp"
 #include <filesystem>
 #include <fstream>
@@ -291,7 +292,76 @@ void authored_lod_tests() {
     expect(rejects(base, levels, 4096), "decreasing authored error is rejected");
 }
 } // namespace
+void geometry_optimization_tests() {
+    vcr::CookedModelAsset mesh;
+    // Two triangles share positions but one has an authored UV seam. Include
+    // exact duplicates and an unused vertex to exercise lossless remapping.
+    for (unsigned i = 0; i < 7; ++i) {
+        vcr::CookedModelVertex v{};
+        v.position = {float(i % 3), float(i % 2), 0.0F};
+        v.normal = {0, 0, 1};
+        v.tangent = {1, 0, 0, 1};
+        mesh.vertices.push_back(v);
+    }
+    mesh.vertices[3] = mesh.vertices[0];
+    mesh.vertices[4] = mesh.vertices[1];
+    mesh.vertices[5] = mesh.vertices[2];
+    mesh.vertices[5].texcoord = {0.5F, 0.75F};
+    mesh.indices = {0, 1, 2, 3, 4, 5, 3, 4, 5};
+    vcr::CookedModelSubmesh part{};
+    part.index_count = 6;
+    part.lod_first = {0, 6, 6, 6};
+    part.lod_count = {6, 3, 3, 3};
+    part.lod_error = {0, 0.1F, 0.2F, 0.3F};
+    mesh.submeshes.push_back(part);
+    const auto original = mesh;
+    vcr::optimize_model_geometry(mesh);
+    expect(mesh.vertices.size() == 4, "geometry optimization shares only identical attribute tuples");
+    expect(mesh.indices.size() == original.indices.size() && mesh.submeshes[0].lod_error == part.lod_error &&
+        mesh.submeshes[0].lod_count == part.lod_count && mesh.submeshes[0].lod_first == part.lod_first,
+        "geometry optimization preserves all LOD errors and draw ranges");
+    for (std::size_t i = 0; i < mesh.indices.size(); ++i) {
+        // This tiny fixture retains triangle order; the comparison checks every
+        // attribute, including winding, rather than just bounding boxes.
+        const auto &before = original.vertices[original.indices[i]];
+        const auto &after = mesh.vertices[mesh.indices[i]];
+        expect(before.position == after.position && before.normal == after.normal &&
+            before.texcoord == after.texcoord && before.tangent == after.tangent,
+            "geometry optimization preserves indexed surface attributes");
+    }
+    expect(mesh.indices[6] == 0 && mesh.indices[7] == 1 && mesh.indices[8] == 2,
+        "coarsest LOD vertices occupy the first contiguous fetch range");
+    auto invalid = original;
+    invalid.indices[0] = 100;
+    bool rejected = false;
+    try { vcr::optimize_model_geometry(invalid); } catch (const std::invalid_argument &) { rejected = true; }
+    expect(rejected, "geometry optimization rejects out-of-bounds vertices");
+}
+
 int main() {
+    {
+        vcr::CookedModelAsset grass;
+        grass.materials.emplace_back().factors.model = vcr::MaterialModel::gpu_grass;
+        for (unsigned blade = 0; blade < 32; ++blade) {
+            for (unsigned corner = 0; corner < 3; ++corner) {
+                const float height = corner == 1 ? 1.0F : 0.0F;
+                const auto sample = vcr::evaluate_gpu_grass_blade(blade, float(corner) * .5F, height);
+                vcr::CookedModelVertex vertex{};
+                vertex.position = {sample.position.x, sample.position.y, sample.position.z};
+                vertex.texcoord = vcr::encode_gpu_grass_uv(blade, static_cast<vcr::GpuGrassCorner>(corner), height);
+                grass.indices.push_back(static_cast<unsigned>(grass.vertices.size()));
+                grass.vertices.push_back(vertex);
+            }
+        }
+        grass.submeshes.push_back({.index_count = 96});
+        vcr::prepare_model_lods(grass);
+        vcr::optimize_model_geometry(grass);
+        std::string error;
+        expect(grass.submeshes[0].lod_count == std::array<std::uint32_t, 4>{96,96,96,96} &&
+            vcr::validate_gpu_grass_submesh(grass.vertices, grass.indices, grass.submeshes[0], error),
+            "generic LOD preparation preserves procedural grass encoding across remapping");
+    }
+    geometry_optimization_tests();
     bounds_hierarchy_tests();
     authored_lod_tests();
     auto vp = vcr::camera_projection(16.0F / 9.0F, 0.1F, 100.0F);

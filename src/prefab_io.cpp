@@ -931,7 +931,7 @@ bool instantiate_prefab_file(
                     if (!pbr["model"].is_string()) return false;
                     const auto m = parse_material_model(
                         pbr["model"].get_ref<const std::string&>());
-                    if (!m) {
+                    if (!m || *m == MaterialModel::gpu_grass) {
                         error = "Prefab PBR model is invalid.";
                         return false;
                     }

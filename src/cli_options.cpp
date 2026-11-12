@@ -329,6 +329,16 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
             continue;
         }
         std::string_view value;
+        if (argument.name == "--model-vertices") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            const auto format = parse_model_vertex_format(value);
+            if (!format) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.model_vertex_format = *format;
+            continue;
+        }
         if (argument.name == "--cpu-culling") {
             if (!take_value(argument, index, argc, argv, value, result.error)) return result;
             if (value != "linear" && value != "hierarchy") {
@@ -1127,6 +1137,7 @@ std::string cli_usage(std::string_view executable_name) {
                   "  --motion-blur-camera-fade-end M    optional camera fade end\n"
                   "  --depth-prepass MODE    off, partial, full (default: off)\n"
                   "                          partial: terrain/primitives; full: all opaque\n"
+                  "  --model-vertices MODE   auto, float, packed (model directions; default: auto)\n"
                   "  --local-lighting MODE   off, forward, clustered, auto (default: auto)\n"
                   "  --subsurface off|full   Full-resolution masked separable SSS (default: off)\n"
                   "  --exposure fixed|auto   Scene exposure mode (default: fixed)\n"

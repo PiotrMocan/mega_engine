@@ -1063,7 +1063,7 @@ bool load_scene_file(
                         return false;
                     }
                     const auto model = parse_material_model(pbr["model"].get_ref<const std::string&>());
-                    if (!model) {
+                    if (!model || *model == MaterialModel::gpu_grass) {
                         error = "Scene PBR model must be standard, unlit, or subsurface.";
                         return false;
                     }

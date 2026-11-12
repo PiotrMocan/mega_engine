@@ -1087,7 +1087,7 @@ write_exclusive_material_file(
             {"subsurface_profile", to_token(material.subsurface_profile)},
             {"subsurface_strength", material.subsurface_strength},
         };
-        if (state.has_displacement_texture) {
+        if (state.has_displacement_texture && material.model != MaterialModel::gpu_grass) {
             state.document["tessellation"] = {
                 {"enabled", state.tessellation.enabled_flag != 0U},
                 {"displacement_scale", readable_float(
@@ -4979,6 +4979,7 @@ void EditorUi::build_material_editor(Renderer& renderer) {
                     1.0F, std::numeric_limits<float>::max(), "%.6g",
                     ImGuiSliderFlags_AlwaysClamp | ImGuiSliderFlags_NoRoundToFormat);
                 ui_kit_.property_row("Shading model");
+                ImGui::BeginDisabled(material_editor_->material.model == MaterialModel::gpu_grass);
                 if (ImGui::BeginCombo(
                         "##MaterialModel", to_token(material_editor_->material.model).data())) {
                     for (const auto model : {
@@ -5011,6 +5012,7 @@ void EditorUi::build_material_editor(Renderer& renderer) {
                     }
                     ImGui::EndCombo();
                 }
+                ImGui::EndDisabled();
                 if (material_editor_->material.model == MaterialModel::subsurface) {
                     ui_kit_.property_row("SSS profile");
                     if (ImGui::BeginCombo(
@@ -5054,7 +5056,8 @@ void EditorUi::build_material_editor(Renderer& renderer) {
                 ui_kit_.badge("NO HEIGHT MAP", EditorTone::warning);
             }
             ImGui::BeginDisabled(
-                !material_editor_->has_displacement_texture);
+                !material_editor_->has_displacement_texture ||
+                material_editor_->material.model == MaterialModel::gpu_grass);
             if (ui_kit_.begin_property_grid(
                     "MaterialTessellationProperties")) {
                 bool enabled =

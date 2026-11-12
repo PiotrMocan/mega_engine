@@ -9,6 +9,62 @@
 #include <unordered_set>
 
 namespace vcr {
+void optimize_model_geometry(CookedModelAsset &model) {
+    if (model.vertices.empty() || model.indices.empty()) return;
+    if (model.vertices.size() > std::numeric_limits<std::uint32_t>::max() ||
+        std::ranges::any_of(model.indices, [&](auto index) { return index >= model.vertices.size(); })) {
+        throw std::invalid_argument("Invalid vertex range for geometry optimization");
+    }
+    // Deduplicate complete tuples, never positions alone: UV/normal/tangent
+    // seams and alpha coverage remain identical. All allocation is cold-path.
+    std::vector<unsigned> remap(model.vertices.size());
+    const auto shared_count = meshopt_generateVertexRemap(remap.data(), model.indices.data(),
+        model.indices.size(), model.vertices.data(), model.vertices.size(), sizeof(CookedModelVertex));
+    std::vector<CookedModelVertex> vertices(shared_count);
+    meshopt_remapVertexBuffer(vertices.data(), model.vertices.data(), model.vertices.size(),
+        sizeof(CookedModelVertex), remap.data());
+    meshopt_remapIndexBuffer(model.indices.data(), model.indices.data(), model.indices.size(), remap.data());
+
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> ranges;
+    ranges.reserve(model.submeshes.size() * model_lod_count);
+    for (const auto &part : model.submeshes) {
+        for (std::size_t level = 0; level < model_lod_count; ++level) {
+            const auto first = part.lod_first[level], count = part.lod_count[level];
+            if (first > model.indices.size() || count > model.indices.size() - first || count % 3U != 0U)
+                throw std::invalid_argument("Invalid LOD range for geometry optimization");
+            if (count != 0U) ranges.emplace_back(first, count);
+        }
+    }
+    std::ranges::sort(ranges);
+    ranges.erase(std::unique(ranges.begin(), ranges.end()), ranges.end());
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        const auto [first, count] = ranges[i];
+        if (i != 0 && std::uint64_t(ranges[i - 1].first) + ranges[i - 1].second > first)
+            throw std::invalid_argument("Partially overlapping LOD ranges");
+        meshopt_optimizeVertexCache(model.indices.data() + first, model.indices.data() + first,
+            count, shared_count);
+    }
+    // A shared buffer ordered by LOD0 scatters distant LOD fetches throughout
+    // the entire source mesh. Start with LOD3 and append the additional detail.
+    remap.assign(shared_count, UINT32_MAX);
+    std::uint32_t next = 0;
+    const auto visit = [&](std::uint32_t index) {
+        if (remap[index] == UINT32_MAX) remap[index] = next++;
+    };
+    for (std::size_t level = model_lod_count; level-- > 0;) {
+        for (const auto &part : model.submeshes) {
+            for (std::uint32_t i = 0; i < part.lod_count[level]; ++i)
+                visit(model.indices[static_cast<std::size_t>(part.lod_first[level]) + i]);
+        }
+    }
+    for (const auto index : model.indices) visit(index);
+    std::vector<CookedModelVertex> ordered_vertices(shared_count);
+    meshopt_remapVertexBuffer(ordered_vertices.data(), vertices.data(), shared_count,
+        sizeof(CookedModelVertex), remap.data());
+    meshopt_remapIndexBuffer(model.indices.data(), model.indices.data(), model.indices.size(), remap.data());
+    model.vertices = std::move(ordered_vertices);
+}
+
 void prepare_authored_model_lods(CookedModelAsset &model,
                                 std::span<const CookedModelAsset> levels,
                                 const std::size_t maximum_geometry_bytes) {
@@ -208,7 +264,9 @@ void prepare_model_lods(CookedModelAsset &model) {
         const auto first = static_cast<std::uint32_t>(mesh.first_index);
         const auto count = static_cast<std::uint32_t>(mesh.index_count);
         const float epsilon = 1.0e-6F * std::max(scale, 1.0F);
-        if (count < 96) {
+        // Generic triangle simplification cannot preserve procedural blade encoding.
+        if (count < 96 || (mesh.material_index < model.materials.size() &&
+            model.materials[mesh.material_index].factors.model == MaterialModel::gpu_grass)) {
             mesh.lod_count.fill(count);
             mesh.lod_error = {0, epsilon, 2 * epsilon, 3 * epsilon};
             continue;

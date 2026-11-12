@@ -520,6 +520,18 @@ std::string benchmark_result_to_json(const BenchmarkResult& result) {
     append_key(output, "depth_prepass_actual");
     append_json_string(output, result.depth_prepass_actual);
     output.append(",\n");
+    append_key(output, "model_vertex_format_requested");
+    append_json_string(output, result.model_vertex_format_requested);
+    output.append(",\n");
+    append_key(output, "model_vertex_format_actual");
+    append_json_string(output, result.model_vertex_format_actual);
+    output.append(",\n");
+    append_key(output, "gpu_grass_instances");
+    append_json_u64(output, result.gpu_grass_instances);
+    output.append(",\n");
+    append_key(output, "gpu_grass_wind_seconds");
+    append_json_number(output, result.gpu_grass_wind_seconds);
+    output.append(",\n");
     append_key(output, "lod_fade_requested");
     append_json_string(output, result.lod_fade_requested);
     output.append(",\n");

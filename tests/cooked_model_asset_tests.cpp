@@ -461,6 +461,23 @@ int main() {
                "cooked shading model accepts only exact standard/unlit/subsurface string tokens");
     }
     Fixture packed = create_fixture(asset_root, "packed");
+    auto grass = create_fixture(asset_root, "invalid_grass_geometry");
+    grass.material["pbr"]["model"] = "gpu_grass";
+    expect(write_json(grass.material_absolute, grass.material) &&
+        has_error(vcr::load_cooked_model_asset(asset_root, grass.metadata_relative),
+                  CookedModelLoadErrorCode::invalid_mesh),
+        "ordinary geometry cannot be reclassified as procedural GPU grass");
+    grass.material["alpha_mode"] = "mask";
+    expect(write_json(grass.material_absolute, grass.material) &&
+        has_error(vcr::load_cooked_model_asset(asset_root, grass.metadata_relative),
+                  CookedModelLoadErrorCode::invalid_material),
+        "GPU grass rejects unsupported alpha-masked geometry");
+    grass.material["alpha_mode"] = "opaque";
+    grass.material["tessellation"] = Json::object();
+    expect(write_json(grass.material_absolute, grass.material) &&
+        has_error(vcr::load_cooked_model_asset(asset_root, grass.metadata_relative),
+                  CookedModelLoadErrorCode::invalid_material),
+        "GPU grass rejects tessellation settings");
     packed.material["textures"]["metallic_roughness"] = "packed.vcrtexture.json";
     expect(write_json(asset_root / "packed/packed.vcrtexture.json", Json::object()) &&
                write_json(packed.material_absolute, packed.material),

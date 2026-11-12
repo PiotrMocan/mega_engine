@@ -1,5 +1,6 @@
 #include "asset_preparation.hpp"
 #include "model_lod.hpp"
+#include "gpu_grass.hpp"
 #include "opacity_micromap.hpp"
 #include <algorithm>
 #include <cassert>
@@ -54,6 +55,13 @@ PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,
                 levels[i] = std::move(lod).value();
             }
             prepare_authored_model_lods(model, levels, geometry_budget);
+        }
+        optimize_model_geometry(model);
+        for (const auto& submesh : model.submeshes) {
+            if (model.materials[submesh.material_index].factors.model == MaterialModel::gpu_grass &&
+                !validate_gpu_grass_submesh(model.vertices, model.indices, submesh, result.error)) {
+                return result;
+            }
         }
         result.upload_bytes = model.vertices.size() * sizeof(CookedModelVertex) +
                               model.indices.size() * sizeof(std::uint32_t) + 512;

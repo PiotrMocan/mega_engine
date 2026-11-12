@@ -15,12 +15,18 @@ namespace vcr {
 
 inline constexpr float minimum_pbr_roughness = 0.045F;
 
-enum class MaterialModel : std::uint32_t { standard = 0, unlit = 1, subsurface = 2 };
+enum class MaterialModel : std::uint32_t {
+    standard = 0,
+    unlit = 1,
+    subsurface = 2,
+    gpu_grass = 3,
+};
 [[nodiscard]] constexpr std::string_view to_token(MaterialModel model) noexcept {
     switch (model) {
     case MaterialModel::standard: return "standard";
     case MaterialModel::unlit: return "unlit";
     case MaterialModel::subsurface: return "subsurface";
+    case MaterialModel::gpu_grass: return "gpu_grass";
     }
     return "standard";
 }
@@ -28,6 +34,7 @@ enum class MaterialModel : std::uint32_t { standard = 0, unlit = 1, subsurface =
     if (token == "standard") return MaterialModel::standard;
     if (token == "unlit") return MaterialModel::unlit;
     if (token == "subsurface") return MaterialModel::subsurface;
+    if (token == "gpu_grass") return MaterialModel::gpu_grass;
     return std::nullopt;
 }
 [[nodiscard]] inline float dielectric_f0(float ior) noexcept {
@@ -86,7 +93,8 @@ static_assert(offsetof(PbrMaterial, subsurface_strength) == 44U);
     material.reserved = 0.0F;
     material.ior = std::isfinite(material.ior) && material.ior >= 1.0F ? material.ior : 1.5F;
     if (material.model != MaterialModel::standard && material.model != MaterialModel::unlit &&
-        material.model != MaterialModel::subsurface) {
+        material.model != MaterialModel::subsurface &&
+        material.model != MaterialModel::gpu_grass) {
         material.model = MaterialModel::standard;
     }
     if (static_cast<std::uint32_t>(material.subsurface_profile) >

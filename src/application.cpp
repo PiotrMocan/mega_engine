@@ -173,7 +173,7 @@ void Application::initialize(const CliOptions& options) {
                          options.mcp_stdio, false,
                          options.render_fixture != RenderFixture::material_spheres &&
                              options.render_fixture != RenderFixture::subsurface_profiles,
-                         lighting, options.render_fixture);
+                         lighting, options.render_fixture, options.model_vertex_format);
     if (!renderer_.set_local_light_backend(options.local_light_backend)) {
         fatal("Invalid local-lighting backend");
     }
@@ -1094,6 +1094,8 @@ void Application::execute_mcp_command(const McpCommand& command) {
                             renderer_.lighting_statistics().opacity_micromap_bytes}}},
                      {"assets_pending", renderer_.assets_pending()},
                      {"visibility_backend", renderer_.visibility_backend()},
+                     {"gpu_grass_instances", renderer_.gpu_grass_instances()},
+                     {"gpu_grass_wind_seconds", renderer_.gpu_grass_wind_seconds()},
                      {"upload_high_water_bytes", renderer_.upload_high_water()},
                      {"visibility",
                       Json{
@@ -1764,6 +1766,10 @@ void Application::finish_benchmark() {
     result.animated = options_.animate_scene;
     result.animated_camera = options_.animate_camera;
     result.visibility_backend = renderer_.visibility_backend();
+    result.model_vertex_format_requested = to_token(options_.model_vertex_format);
+    result.model_vertex_format_actual = to_token(renderer_.model_vertex_format_actual());
+    result.gpu_grass_instances = renderer_.gpu_grass_instances();
+    result.gpu_grass_wind_seconds = renderer_.gpu_grass_wind_seconds();
     result.lighting = renderer_.lighting_settings();
     result.ray_tracing_supported = renderer_.ray_tracing_supported();
     result.ray_tracing_provisioned = renderer_.ray_tracing_provisioned();

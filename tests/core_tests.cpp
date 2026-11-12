@@ -134,6 +134,17 @@ int main() {
                "material sphere fixture is exposed through the strict renderer CLI");
     }
     {
+        const char* packed[]{"vcr", "--model-vertices=packed"};
+        const char* floats[]{"vcr", "--model-vertices", "float"};
+        const char* invalid[]{"vcr", "--model-vertices", "half"};
+        const char* missing_format[]{"vcr", "--model-vertices"};
+        const auto packed_options = vcr::parse_cli_options(2, packed);
+        const auto float_options = vcr::parse_cli_options(3, floats);
+        expect(packed_options && float_options &&
+               packed_options.options.model_vertex_format == vcr::ModelVertexFormat::packed &&
+               float_options.options.model_vertex_format == vcr::ModelVertexFormat::float32 &&
+               !vcr::parse_cli_options(3, invalid) && !vcr::parse_cli_options(2, missing_format),
+               "model vertex CLI selects explicit formats and rejects missing/unknown values");
         expect(!vcr::CliOptions{}.cpu_hierarchy, "linear CPU culling remains the default");
         const char* hierarchy[]{"vcr", "--cpu-culling=hierarchy"};
         const char* linear[]{"vcr", "--cpu-culling", "linear"};

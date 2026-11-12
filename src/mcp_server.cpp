@@ -1501,7 +1501,7 @@ private:
     if (arguments.contains("model")) {
         const auto token = get_string(arguments, "model");
         const auto model = token ? parse_material_model(*token) : std::nullopt;
-        if (!model) {
+        if (!model || *model == MaterialModel::gpu_grass) {
             error = "model must be standard, unlit or subsurface";
             return false;
         }

@@ -1,9 +1,11 @@
 #include "renderer.hpp"
+#include "gpu_grass.hpp"
 #include "camera_projection.hpp"
 #include "image_barrier.hpp"
 
 #include "pbr_material.hpp"
 #include "model_lod.hpp"
+#include "packed_model_vertex.hpp"
 #include "terrain_height.hpp"
 #include "vulkan_common.hpp"
 
@@ -694,6 +696,19 @@ Renderer::~Renderer() {
     shutdown();
 }
 
+#if VCR_EDITOR_ENABLED
+VkPipeline Renderer::model_geometry_pipeline(
+    const VkPipeline ordinary, const EditorModelDraw &draw) const {
+    const auto &submesh = editor_model_assets_[draw.asset_index].submeshes[draw.submesh_index];
+    if (submesh.material.model != MaterialModel::gpu_grass) return ordinary;
+    for (std::size_t i = 0; i < grass_pipeline_variant_count_; ++i) {
+        if (grass_pipeline_variants_[i].ordinary == ordinary)
+            return grass_pipeline_variants_[i].grass.get();
+    }
+    fatal("GPU grass render pass has no prewarmed geometry pipeline.");
+}
+#endif
+
 void Renderer::initialize(VulkanContext &context, SDL_Window *window,
                           const VkPresentModeKHR preferred_present_mode, const RunMode initial_mode,
                           const std::uint32_t initial_instances,
@@ -701,7 +716,7 @@ void Renderer::initialize(VulkanContext &context, SDL_Window *window,
                           const AntiAliasingSettings initial_anti_aliasing,
                           const bool enable_screenshot_capture, const bool enable_editor_output,
                           const bool enable_authored_scene, const LightingSettings lighting,
-                          const RenderFixture fixture) {
+                          const RenderFixture fixture, const ModelVertexFormat model_vertices) {
     context_ = &context;
     window_ = window;
     lighting_settings_ = lighting;
@@ -716,6 +731,17 @@ void Renderer::initialize(VulkanContext &context, SDL_Window *window,
     editor_output_enabled_ = enable_editor_output;
     authored_scene_enabled_ =
         enable_authored_scene || enable_editor_output;
+    VkFormatProperties packed_properties{};
+    vkGetPhysicalDeviceFormatProperties(context.physical_device(),
+        VK_FORMAT_A2B10G10R10_SNORM_PACK32, &packed_properties);
+    const bool supports_packed =
+        (packed_properties.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0U;
+    if (model_vertices == ModelVertexFormat::packed && !supports_packed)
+        fatal("Packed model vertices require A2B10G10R10_SNORM vertex-buffer support.");
+    model_vertex_format_actual_ = supports_packed && model_vertices != ModelVertexFormat::float32
+        ? ModelVertexFormat::packed : ModelVertexFormat::float32;
+    model_vertex_stride_ = model_vertex_format_actual_ == ModelVertexFormat::packed
+        ? sizeof(PackedModelVertex) : sizeof(CookedModelVertex);
     model_tessellation_enabled_ =
         authored_scene_enabled_ && context.tessellation_shader_enabled();
     editor_scene_instances_.reserve(
@@ -742,6 +768,7 @@ void Renderer::initialize(VulkanContext &context, SDL_Window *window,
 #else
     static_cast<void>(enable_editor_output);
     static_cast<void>(enable_authored_scene);
+    static_cast<void>(model_vertices);
 #endif
     const std::uint64_t range_capacity =
         context.properties().limits.maxStorageBufferRange /
@@ -785,6 +812,9 @@ void Renderer::initialize(VulkanContext &context, SDL_Window *window,
     }
     last_frame_time_ = std::chrono::steady_clock::now();
     ocean_time_seconds_ = 0.0;
+    gpu_grass_elapsed_seconds_ = 0.0;
+    gpu_grass_wind_seconds_ = previous_gpu_grass_wind_seconds_ = 0.0F;
+    gpu_grass_instances_ = 0;
 }
 
 void Renderer::shutdown() noexcept {
@@ -1427,7 +1457,7 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
     }
     const std::uint64_t vertex_bytes =
         static_cast<std::uint64_t>(model.vertices.size()) *
-        sizeof(CookedModelVertex);
+        model_vertex_stride_;
     const std::uint64_t index_bytes =
         static_cast<std::uint64_t>(model.indices.size()) *
         sizeof(std::uint32_t);
@@ -1754,6 +1784,11 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
         }
     }
     gpu_asset.bounds.extent += glm::vec3(maximum_displacement);
+    if (std::ranges::any_of(gpu_asset.submeshes, [](const auto& mesh) {
+            return mesh.material.model == MaterialModel::gpu_grass;
+        })) {
+        gpu_asset.bounds = enlarge_gpu_grass_local_bounds(gpu_asset.bounds);
+    }
 
     const VkBufferUsageFlags rt_geometry_usage = context_->ray_query_supported()
         ? (VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
@@ -1777,9 +1812,14 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
         "editor imported model index buffer");
-    upload_to_device_buffer(
-        gpu_asset.vertex_buffer,
-        std::as_bytes(std::span{model.vertices}));
+    if (model_vertex_format_actual_ == ModelVertexFormat::packed) {
+        std::vector<PackedModelVertex> packed;
+        packed.reserve(model.vertices.size());
+        for (const auto &vertex : model.vertices) packed.push_back(pack_model_vertex(vertex));
+        upload_to_device_buffer(gpu_asset.vertex_buffer, std::as_bytes(std::span{packed}));
+    } else {
+        upload_to_device_buffer(gpu_asset.vertex_buffer, std::as_bytes(std::span{model.vertices}));
+    }
     upload_to_device_buffer(
         gpu_asset.index_buffer,
         std::as_bytes(std::span{model.indices}));
@@ -1911,6 +1951,7 @@ bool Renderer::update_editor_scene(
     }
     editor_scene_instances_.clear();
     editor_model_draws_.clear();
+    gpu_grass_instances_ = 0;
     scene_metadata_.clear();
     local_lights_.clear();
     for (const ScenePunctualLight& light : view.local_lights) {
@@ -1995,6 +2036,8 @@ bool Renderer::update_editor_scene(
         }
 
         for (const EditorModelSubmesh& submesh : asset.submeshes) {
+            if (submesh.material.model == MaterialModel::gpu_grass)
+                gpu_grass_instances_ += static_cast<std::uint32_t>(instance_count);
             const std::uint32_t first_instance =
                 static_cast<std::uint32_t>(
                     editor_scene_instances_.size());
@@ -2101,6 +2144,17 @@ bool Renderer::apply_editor_material(
         return false;
     }
     material = sanitize_pbr_material(material);
+    // Changing geometry families requires revalidating/reloading the cooked mesh.
+    // Reject before editing anything, including assets sharing this material.
+    for (const auto& asset : editor_model_assets_) {
+        for (const auto& submesh : asset.submeshes) {
+            if (submesh.material_relative_path == material_relative_path &&
+                ((submesh.material.model == MaterialModel::gpu_grass) !=
+                     (material.model == MaterialModel::gpu_grass) ||
+                 (material.model == MaterialModel::gpu_grass && tessellation.enabled_flag != 0U)))
+                return false;
+        }
+    }
     bool updated = false;
     for (EditorModelAsset& asset : editor_model_assets_) {
         float maximum_growth = 0.0F;
@@ -4235,9 +4289,9 @@ void Renderer::record_shadow_map(VkCommandBuffer command_buffer, FrameContext &f
                 const bool tessellated_draw =
                     model_tessellation_enabled_ &&
                     draw.tessellation.enabled();
-                const VkPipeline desired_pipeline = tessellated_draw
+                const VkPipeline desired_pipeline = model_geometry_pipeline(tessellated_draw
                     ? tessellated_model_shadow_pipeline_.get()
-                    : model_shadow_pipeline_.get();
+                    : model_shadow_pipeline_.get(), draw);
                 if (desired_pipeline != bound_model_shadow_pipeline) {
                     vkCmdBindPipeline(
                         command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -5048,6 +5102,19 @@ void Renderer::update_frame_uniform(
                              extent);
     }
 #endif
+    const bool grass_frozen = gpu_grass_instances_ == 0 ||
+        !authored_scene_enabled_ || mode_ == RunMode::instancing ||
+        ray_tracing_mode_actual() != RayTracingMode::off ||
+        (lighting_settings_.dynamic && gi_provisioned_ && lighting_settings_.voxel_gi);
+    const float wind = wrap_gpu_grass_wind_seconds(gpu_grass_elapsed_seconds_, grass_frozen);
+    if (wind != gpu_grass_wind_seconds_) {
+        shadow_dirty_ = true;
+        // RT/GI use the uploaded reference geometry. A mode switch must not
+        // produce temporal motion between a live blade and its static BLAS.
+        if ((wind == 0.0F) != (gpu_grass_wind_seconds_ == 0.0F))
+            invalidate_temporal_history();
+    }
+    gpu_grass_wind_seconds_ = wind;
     prepare_lighting(frame, view_matrix, extent);
     glm::mat4 projection = unjittered_projection;
     if ((anti_aliasing_.method == AntiAliasingMethod::fsr3 &&
@@ -5078,6 +5145,11 @@ void Renderer::update_frame_uniform(
     frame.shadow_gpu_visibility = shadow_gpu_visibility_active();
 #endif
     uniforms.global_rotation.y = frame.shadow_gpu_visibility ? 1.0F : 0.0F;
+    if (authored_scene_enabled_ && mode_ != RunMode::instancing) {
+        uniforms.global_rotation.z = gpu_grass_wind_seconds_;
+        uniforms.global_rotation.w = temporal_history_valid_
+            ? previous_gpu_grass_wind_seconds_ : gpu_grass_wind_seconds_;
+    }
     frame.rendered_view_projection = view_projection;
     uniforms.unjittered_view_projection =
         unjittered_view_projection;
@@ -5119,6 +5191,7 @@ void Renderer::update_frame_uniform(
     previous_unjittered_view_projection_ =
         unjittered_view_projection;
     temporal_history_valid_ = true;
+    previous_gpu_grass_wind_seconds_ = gpu_grass_wind_seconds_;
 }
 
 ShaderModule Renderer::load_shader(const std::filesystem::path& path) const {
@@ -5584,6 +5657,54 @@ void Renderer::create_pipeline() {
         return shader_cache.back().second.get();
     };
 
+    std::array<VkShaderModule, 4> grass_capable_modules{};
+#if VCR_EDITOR_ENABLED
+    if (authored_scene_enabled_) {
+        grass_capable_modules = {cached_shader("editor_model.vert.spv"),
+            cached_shader("editor_model_aa.vert.spv"),
+            cached_shader("editor_model_depth.vert.spv"),
+            cached_shader("editor_model_shadow.vert.spv")};
+    }
+#endif
+    // Prewarm one fixed grass geometry family for every relevant render pass.
+    // Specialization removes all grass work/register pressure from ordinary
+    // models. A dynamic vertex branch regressed the pine benchmark by 10%.
+    const auto create_graphics_pipelines = [this, &grass_capable_modules](
+        VkDevice device, VkPipelineCache cache, std::uint32_t count,
+        const VkGraphicsPipelineCreateInfo *infos, const VkAllocationCallbacks *allocator,
+        VkPipeline *pipelines) -> VkResult {
+        const auto result = vkCreateGraphicsPipelines(device, cache, count, infos, allocator, pipelines);
+        if (result != VK_SUCCESS) return result;
+#if VCR_EDITOR_ENABLED
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const auto &source = infos[i];
+            if (source.stageCount == 0 || source.stageCount > 2 ||
+                std::ranges::find(grass_capable_modules, source.pStages[0].module) ==
+                    grass_capable_modules.end()) continue;
+            if (grass_pipeline_variant_count_ == grass_pipeline_variants_.size())
+                return VK_ERROR_TOO_MANY_OBJECTS;
+            // None of the model vertex stages has another specialization.
+            assert(source.pStages[0].pSpecializationInfo == nullptr);
+            const VkBool32 enabled = VK_TRUE;
+            const VkSpecializationMapEntry entry{7U, 0U, sizeof(enabled)};
+            const VkSpecializationInfo specialization{1U, &entry, sizeof(enabled), &enabled};
+            std::array<VkPipelineShaderStageCreateInfo, 2> stages{};
+            std::copy_n(source.pStages, source.stageCount, stages.begin());
+            stages[0].pSpecializationInfo = &specialization;
+            auto info = source;
+            info.pStages = stages.data();
+            auto &variant = grass_pipeline_variants_[grass_pipeline_variant_count_++];
+            variant.ordinary = pipelines[i];
+            const auto grass_result = vkCreateGraphicsPipelines(device, cache, 1U, &info, allocator,
+                variant.grass.put(device, vkDestroyPipeline));
+            if (grass_result != VK_SUCCESS) return grass_result;
+            context_->set_debug_name(VK_OBJECT_TYPE_PIPELINE, handle_value(variant.grass.get()),
+                "prewarmed GPU grass geometry pipeline");
+        }
+#endif
+        return result;
+    };
+
     const VkShaderModule vertex_module =
         cached_shader("cube.vert.spv");
     const VkShaderModule fragment_module =
@@ -5633,10 +5754,10 @@ void Renderer::create_pipeline() {
 #if VCR_EDITOR_ENABLED
     const VkVertexInputBindingDescription editor_model_vertex_binding{
         .binding = 0U,
-        .stride = sizeof(CookedModelVertex),
+        .stride = model_vertex_stride_,
         .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
     };
-    const std::array editor_model_vertex_attributes{
+    std::array editor_model_vertex_attributes{
         VkVertexInputAttributeDescription{
             .location = 0U,
             .binding = 0U,
@@ -5662,6 +5783,13 @@ void Renderer::create_pipeline() {
             .offset = offsetof(CookedModelVertex, tangent),
         },
     };
+    if (model_vertex_format_actual_ == ModelVertexFormat::packed) {
+        editor_model_vertex_attributes[1].format = VK_FORMAT_A2B10G10R10_SNORM_PACK32;
+        editor_model_vertex_attributes[1].offset = offsetof(PackedModelVertex, normal);
+        editor_model_vertex_attributes[2].offset = offsetof(PackedModelVertex, texcoord);
+        editor_model_vertex_attributes[3].format = VK_FORMAT_A2B10G10R10_SNORM_PACK32;
+        editor_model_vertex_attributes[3].offset = offsetof(PackedModelVertex, tangent);
+    }
     const VkPipelineVertexInputStateCreateInfo
         editor_model_vertex_input{
             .sType =
@@ -5794,7 +5922,7 @@ void Renderer::create_pipeline() {
         .layout = pipeline_layout_,
     };
     const auto create_prepass_variants =
-        [this, &depth_stencil, &cached_shader, &model_dynamic_state](
+        [this, &depth_stencil, &cached_shader, &model_dynamic_state, &create_graphics_pipelines](
             const VkGraphicsPipelineCreateInfo &source,
             DeviceObject<VkPipeline> &equal,
             DeviceObject<VkPipeline> &depth,
@@ -5804,7 +5932,7 @@ void Renderer::create_pipeline() {
             equal_state.depthWriteEnable = VK_FALSE;
             VkGraphicsPipelineCreateInfo info = source;
             info.pDepthStencilState = &equal_state;
-            VK_CHECK(vkCreateGraphicsPipelines(context_->device(), pipeline_cache_, 1, &info,
+            VK_CHECK(create_graphics_pipelines(context_->device(), pipeline_cache_, 1, &info,
                                                nullptr, equal.put(context_->device(), vkDestroyPipeline)));
             context_->set_debug_name(VK_OBJECT_TYPE_PIPELINE, handle_value(equal.get()),
                                      "prepassed opaque EQUAL color pipeline");
@@ -5835,12 +5963,12 @@ void Renderer::create_pipeline() {
                 info.pStages = stages.data();
                 info.pDepthStencilState = &depth_stencil;
                 info.pColorBlendState = &no_color;
-                VK_CHECK(vkCreateGraphicsPipelines(context_->device(), pipeline_cache_, 1, &info,
+                VK_CHECK(create_graphics_pipelines(context_->device(), pipeline_cache_, 1, &info,
                     nullptr, depth.put(context_->device(), vkDestroyPipeline)));
                 context_->set_debug_name(VK_OBJECT_TYPE_PIPELINE, handle_value(depth.get()),
                                         "model alpha and LOD depth coverage pipeline");
                 if (fade_depth != nullptr) {
-                    VK_CHECK(vkCreateGraphicsPipelines(context_->device(), pipeline_cache_, 1, &info,
+                    VK_CHECK(create_graphics_pipelines(context_->device(), pipeline_cache_, 1, &info,
                         nullptr, fade_depth->put(context_->device(), vkDestroyPipeline)));
                     context_->set_debug_name(VK_OBJECT_TYPE_PIPELINE, handle_value(fade_depth->get()),
                                             "model LOD and alpha depth coverage pipeline");
@@ -5864,7 +5992,7 @@ void Renderer::create_pipeline() {
             }
             info.pDepthStencilState = &depth_stencil;
             info.pColorBlendState = &no_color;
-            VK_CHECK(vkCreateGraphicsPipelines(context_->device(), pipeline_cache_, 1, &info,
+            VK_CHECK(create_graphics_pipelines(context_->device(), pipeline_cache_, 1, &info,
                                                nullptr, depth.put(context_->device(), vkDestroyPipeline)));
             context_->set_debug_name(VK_OBJECT_TYPE_PIPELINE, handle_value(depth.get()),
                                      "opaque depth-only prepass pipeline");
@@ -5890,14 +6018,14 @@ void Renderer::create_pipeline() {
                     .module = coverage, .pName = "main"};
                 info.stageCount = coverage_stage_count;
                 info.pStages = coverage_stages.data();
-                VK_CHECK(vkCreateGraphicsPipelines(context_->device(), pipeline_cache_, 1, &info,
+                VK_CHECK(create_graphics_pipelines(context_->device(), pipeline_cache_, 1, &info,
                     nullptr, fade_depth->put(context_->device(), vkDestroyPipeline)));
                 context_->set_debug_name(VK_OBJECT_TYPE_PIPELINE, handle_value(fade_depth->get()),
                                          "complementary LOD depth coverage pipeline");
             }
         };
     create_prepass_variants(pipeline_info, equal_direct_.cubes, depth_geometry_.cubes);
-    VK_CHECK(vkCreateGraphicsPipelines(
+    VK_CHECK(create_graphics_pipelines(
         context_->device(),
         pipeline_cache_,
         1,
@@ -5953,7 +6081,7 @@ void Renderer::create_pipeline() {
         static_cast<std::uint32_t>(scene_stages.size());
     scene_pipeline_info.pStages = scene_stages.data();
     create_prepass_variants(scene_pipeline_info, equal_direct_.scene, depth_geometry_.scene);
-    VK_CHECK(vkCreateGraphicsPipelines(
+    VK_CHECK(create_graphics_pipelines(
         context_->device(),
         pipeline_cache_,
         1,
@@ -5996,7 +6124,7 @@ void Renderer::create_pipeline() {
         editor_model_pipeline_info.pDynamicState = &model_dynamic_state;
         create_prepass_variants(editor_model_pipeline_info, equal_direct_.models,
                                 depth_geometry_.models, &lod_depth_model_);
-        VK_CHECK(vkCreateGraphicsPipelines(
+        VK_CHECK(create_graphics_pipelines(
             context_->device(),
             pipeline_cache_,
             1U,
@@ -6053,7 +6181,7 @@ void Renderer::create_pipeline() {
                 tessellated_info, equal_direct_.tessellated_models,
                 depth_geometry_.tessellated_models,
                 &lod_depth_tessellated_model_);
-            VK_CHECK(vkCreateGraphicsPipelines(
+            VK_CHECK(create_graphics_pipelines(
                 context_->device(), pipeline_cache_, 1U, &tessellated_info,
                 nullptr, &tessellated_editor_model_pipeline_));
             context_->set_debug_name(
@@ -6075,7 +6203,7 @@ void Renderer::create_pipeline() {
     terrain_pipeline_info.pVertexInputState = &terrain_vertex_input;
     terrain_pipeline_info.pInputAssemblyState = &terrain_input_assembly;
     create_prepass_variants(terrain_pipeline_info, equal_direct_.terrain, depth_geometry_.terrain);
-    VK_CHECK(vkCreateGraphicsPipelines(
+    VK_CHECK(create_graphics_pipelines(
         context_->device(),
         pipeline_cache_,
         1,
@@ -6116,7 +6244,8 @@ void Renderer::create_pipeline() {
     const auto create_aa_geometry_pipeline =
         [this, &gi_specialization, &pipeline_info, &aa_rendering_info, &aa_color_blend,
          &spatial_rendering_info, &color_blend, &create_prepass_variants,
-         &patch_input_assembly, &tessellation_state, &cached_shader, &model_dynamic_state](
+         &patch_input_assembly, &tessellation_state, &cached_shader, &model_dynamic_state,
+         &create_graphics_pipelines](
             const std::filesystem::path &vertex_path, const std::filesystem::path &fragment_path,
             const VkPipelineVertexInputStateCreateInfo &vertex_input_state,
             const VkPipelineInputAssemblyStateCreateInfo &input_assembly_state,
@@ -6193,7 +6322,7 @@ void Renderer::create_pipeline() {
             info.pColorBlendState = temporal ? &aa_color_blend : &color_blend;
             create_prepass_variants(info, equal, depth, fade_depth);
             DeviceObject<VkPipeline> result;
-            VK_CHECK(vkCreateGraphicsPipelines(
+            VK_CHECK(create_graphics_pipelines(
                 context_->device(),
                 pipeline_cache_,
                 1,
@@ -6359,7 +6488,7 @@ void Renderer::create_pipeline() {
         .depthAttachmentFormat = swapchain_.depth_format(),
     };
     const auto create_subsurface_geometry_pipeline =
-        [this, &gi_specialization, &pipeline_info, &create_prepass_variants,
+        [this, &gi_specialization, &pipeline_info, &create_prepass_variants, &create_graphics_pipelines,
          &sss_spatial_rendering, &sss_temporal_rendering,
          &sss_spatial_blend, &sss_temporal_blend,
          &patch_input_assembly, &tessellation_state, &cached_shader, &model_dynamic_state](
@@ -6433,7 +6562,7 @@ void Renderer::create_pipeline() {
             info.pColorBlendState = temporal ? &sss_temporal_blend : &sss_spatial_blend;
             create_prepass_variants(info, equal, existing_depth);
             DeviceObject<VkPipeline> result;
-            VK_CHECK(vkCreateGraphicsPipelines(
+            VK_CHECK(create_graphics_pipelines(
                 context_->device(), pipeline_cache_, 1U, &info, nullptr,
                 result.put(context_->device(), vkDestroyPipeline)));
             context_->set_debug_name(
@@ -6787,11 +6916,11 @@ void Renderer::create_pipeline() {
         authored_shadow_pipeline_.put(context_->device(), vkDestroyPipeline)));
     auto model_shadow_input = editor_model_vertex_input;
     model_shadow_input.vertexAttributeDescriptionCount = 3U;
-    const auto model_shadow_shader = load_shader("editor_model_shadow.vert.spv");
+    const auto model_shadow_shader = cached_shader("editor_model_shadow.vert.spv");
     const auto model_shadow_fragment = load_shader("editor_model_depth.frag.spv");
     const std::array model_shadow_stages{
         VkPipelineShaderStageCreateInfo{.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = model_shadow_shader.get(), .pName = "main"},
+            .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = model_shadow_shader, .pName = "main"},
         VkPipelineShaderStageCreateInfo{.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = model_shadow_fragment.get(), .pName = "main"},
     };
@@ -6800,7 +6929,7 @@ void Renderer::create_pipeline() {
     model_shadow_info.stageCount = static_cast<std::uint32_t>(model_shadow_stages.size());
     model_shadow_info.pStages = model_shadow_stages.data();
     model_shadow_info.pDynamicState = &model_dynamic_state;
-    VK_CHECK(vkCreateGraphicsPipelines(
+    VK_CHECK(create_graphics_pipelines(
         context_->device(), pipeline_cache_, 1, &model_shadow_info, nullptr,
         model_shadow_pipeline_.put(context_->device(), vkDestroyPipeline)));
     if (model_tessellation_enabled_) {
@@ -7198,6 +7327,10 @@ void Renderer::create_pipeline() {
 }
 
 void Renderer::destroy_pipeline() noexcept {
+#if VCR_EDITOR_ENABLED
+    grass_pipeline_variants_ = {};
+    grass_pipeline_variant_count_ = 0;
+#endif
     fog_pipeline_.reset();
     for (std::size_t index = 0U; index < msaa_geometry_.size(); ++index) {
         msaa_geometry_[index] = {};
@@ -7436,6 +7569,8 @@ bool Renderer::draw_frame(
                 frame_now - last_frame_time_).count());
     }
     last_frame_time_ = frame_now;
+    if (gpu_grass_instances_ != 0 && std::isfinite(fsr_frame_time_ms_))
+        gpu_grass_elapsed_seconds_ += std::clamp(static_cast<double>(fsr_frame_time_ms_) * 0.001, 0.0, 0.25);
     // Double accumulation avoids frame-rate-dependent loss of small deltas.
 #if VCR_EDITOR_ENABLED
     ocean_time_seconds_ += static_cast<double>(fsr_frame_time_ms_) * 0.001 *
@@ -8235,9 +8370,9 @@ void Renderer::record_commands(
                         const bool tessellated_draw =
                             model_tessellation_enabled_ &&
                             draw.tessellation.enabled();
-                        const VkPipeline desired_pipeline = tessellated_draw
+                        const VkPipeline desired_pipeline = model_geometry_pipeline(tessellated_draw
                             ? tessellated_editor_model_pipeline
-                            : editor_model_pipeline;
+                            : editor_model_pipeline, draw);
                         if (desired_pipeline != bound_model_pipeline) {
                             vkCmdBindPipeline(
                                 command_buffer,
@@ -9997,9 +10132,10 @@ std::uint32_t Renderer::subsurface_active_material_count() const noexcept {
     std::uint32_t count = 0U;
 #if VCR_EDITOR_ENABLED
     for (const auto& instance : editor_scene_instances_) {
-        count += instance.material.model == MaterialModel::subsurface &&
+        count += (instance.material.model == MaterialModel::gpu_grass ||
+                 (instance.material.model == MaterialModel::subsurface &&
                  instance.material.subsurface_profile != SubsurfaceProfile::none &&
-                 instance.material.subsurface_strength > 0.0F ? 1U : 0U;
+                 instance.material.subsurface_strength > 0.0F)) ? 1U : 0U;
     }
 #endif
     return count;

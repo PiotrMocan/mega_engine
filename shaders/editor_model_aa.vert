@@ -2,6 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 #include "pbr_material.glsl"
 #include "lod_fade.glsl"
+#include "grass_vertex.glsl"
 
 layout(set = 0, binding = 0, std140) uniform FrameUniforms
 {
@@ -86,7 +87,42 @@ void main()
     const uint sourceIndex = lodSource(token);
     outLodToken = token;
     const EditorInstanceData instance = instances[sourceIndex];
-    const vec4 localPosition = vec4(inPosition, 1.0);
+    const bool isGpuGrass = VCR_ENABLE_GPU_GRASS;
+    vec3 sourcePosition = inPosition;
+    vec3 previousSourcePosition = inPosition;
+    vec3 sourceNormal = inNormal;
+    vec4 sourceTangent = inTangent;
+    vec2 surfaceUv = vec2(inUv.x, 1.0 - inUv.y);
+    vec4 materialParameters = instance.materialParameters;
+    uint shadingModel = instance.shadingModel;
+    uint subsurfaceProfile = instance.subsurfaceProfile;
+    float subsurfaceStrength = instance.subsurfaceStrength;
+    if (isGpuGrass)
+    {
+        const GrassVertexResult grass = evaluateProceduralGrassVertex(
+            inUv,
+            frame.globalRotation.z,
+            instance.modelRow0,
+            instance.modelRow2);
+        const GrassVertexResult previousGrass = evaluateProceduralGrassVertex(
+            inUv,
+            frame.globalRotation.w,
+            instance.previousRow0,
+            instance.previousRow2);
+        sourcePosition = frame.globalRotation.z == 0.0 ? inPosition : grass.localPosition;
+        previousSourcePosition = frame.globalRotation.w == 0.0 ? inPosition : previousGrass.localPosition;
+        sourceNormal = grass.localNormal;
+        sourceTangent = vec4(grass.localTangent, 1.0);
+        surfaceUv = grass.surfaceUv;
+        materialParameters.z *= grass.ambientOcclusionScale;
+        shadingModel = VCR_MATERIAL_MODEL_SUBSURFACE;
+        subsurfaceProfile = VCR_SUBSURFACE_PROFILE_FOLIAGE;
+        subsurfaceStrength = subsurfaceStrength > 0.0
+            ? subsurfaceStrength
+            : VCR_GRASS_DEFAULT_SSS_STRENGTH;
+    }
+    const vec4 localPosition = vec4(sourcePosition, 1.0);
+    const vec4 previousLocalPosition = vec4(previousSourcePosition, 1.0);
     const vec3 worldPosition = vec3(
         dot(instance.modelRow0, localPosition),
         dot(instance.modelRow1, localPosition),
@@ -107,9 +143,9 @@ void main()
         instance.modelRow2.z);
 
     const vec3 cofactorNormal =
-        cross(column1, column2) * inNormal.x
-        + cross(column2, column0) * inNormal.y
-        + cross(column0, column1) * inNormal.z;
+        cross(column1, column2) * sourceNormal.x
+        + cross(column2, column0) * sourceNormal.y
+        + cross(column0, column1) * sourceNormal.z;
     const float determinantValue =
         dot(column0, cross(column1, column2));
     const float orientation =
@@ -117,18 +153,18 @@ void main()
     const vec3 transformedNormal =
         cofactorNormal * orientation;
     const vec3 linearNormal =
-        column0 * inNormal.x
-        + column1 * inNormal.y
-        + column2 * inNormal.z;
+        column0 * sourceNormal.x
+        + column1 * sourceNormal.y
+        + column2 * sourceNormal.z;
     const vec3 worldNormal =
         safeNormalize(
             transformedNormal,
             safeNormalize(linearNormal, vec3(0.0, 1.0, 0.0)));
 
     vec3 worldTangent =
-        column0 * inTangent.x
-        + column1 * inTangent.y
-        + column2 * inTangent.z;
+        column0 * sourceTangent.x
+        + column1 * sourceTangent.y
+        + column2 * sourceTangent.z;
     worldTangent -=
         worldNormal * dot(worldNormal, worldTangent);
     const vec3 tangentFallbackAxis =
@@ -141,7 +177,7 @@ void main()
             cross(tangentFallbackAxis, worldNormal),
             vec3(1.0, 0.0, 0.0)));
     const float tangentHandedness =
-        (inTangent.w < 0.0 ? -1.0 : 1.0) * orientation;
+        (sourceTangent.w < 0.0 ? -1.0 : 1.0) * orientation;
     const vec3 worldBitangent =
         safeNormalize(
             cross(worldNormal, worldTangent),
@@ -155,20 +191,20 @@ void main()
     outCurrentClip = frame.unjitteredViewProjection * world;
     outPreviousClip =
         frame.previousUnjitteredViewProjection * vec4(
-            dot(instance.previousRow0, localPosition),
-            dot(instance.previousRow1, localPosition),
-            dot(instance.previousRow2, localPosition), 1.0);
+            dot(instance.previousRow0, previousLocalPosition),
+            dot(instance.previousRow1, previousLocalPosition),
+            dot(instance.previousRow2, previousLocalPosition), 1.0);
     outWorldPosition = worldPosition;
-    outMaterialParameters = instance.materialParameters;
+    outMaterialParameters = materialParameters;
     outDielectricF0 = materialDielectricF0(instance.indexOfRefraction);
-    outMaterialModel = instance.shadingModel;
-    outSubsurfaceProfile = instance.subsurfaceProfile;
-    outSubsurfaceStrength = instance.subsurfaceStrength;
+    outMaterialModel = shadingModel;
+    outSubsurfaceProfile = subsurfaceProfile;
+    outSubsurfaceStrength = subsurfaceStrength;
     // Match the direct editor path: cooked FBX/OBJ UVs are authoring-space
     // bottom-left coordinates, while decoded texture rows are top-to-bottom.
     // Do not alter the tangent basis; OpenGL-style normal maps remain authored
     // against the original model UV directions.
-    outUv = vec2(inUv.x, 1.0 - inUv.y);
+    outUv = surfaceUv;
     outWorldTangent = worldTangent;
     outWorldBitangent = worldBitangent;
     gl_Position = frame.viewProjection * world;

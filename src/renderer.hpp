@@ -67,7 +67,11 @@ public:
                     std::uint32_t initial_instances, std::uint32_t initial_gpu_workload,
                     AntiAliasingSettings initial_anti_aliasing, bool enable_screenshot_capture,
                     bool enable_editor_output = false, bool enable_authored_scene = false,
-                    LightingSettings lighting = {}, RenderFixture fixture = RenderFixture::none);
+                    LightingSettings lighting = {}, RenderFixture fixture = RenderFixture::none,
+                    ModelVertexFormat model_vertices = ModelVertexFormat::automatic);
+    [[nodiscard]] ModelVertexFormat model_vertex_format_actual() const noexcept {
+        return model_vertex_format_actual_;
+    }
     [[nodiscard]] bool draw_frame(
         FrameTimings& timings,
         const glm::mat4& view_matrix
@@ -115,6 +119,8 @@ public:
         return local_light_statistics_;
     }
     [[nodiscard]] bool gi_provisioned() const noexcept { return gi_provisioned_; }
+    [[nodiscard]] std::uint32_t gpu_grass_instances() const noexcept { return gpu_grass_instances_; }
+    [[nodiscard]] float gpu_grass_wind_seconds() const noexcept { return gpu_grass_wind_seconds_; }
     [[nodiscard]] bool ray_tracing_supported() const noexcept {
         return context_ != nullptr && context_->ray_query_supported();
     }
@@ -520,6 +526,17 @@ private:
         std::uint32_t instance_count = 0U;
         std::uint32_t submesh_index = 0U;
     };
+    [[nodiscard]] VkPipeline model_geometry_pipeline(
+        VkPipeline ordinary, const EditorModelDraw &draw) const;
+
+    struct GrassPipelineVariant {
+        // Observer: the ordinary pipeline is owned by this Renderer. Variants
+        // retire before those owners when swapchain pipelines are rebuilt.
+        VkPipeline ordinary = VK_NULL_HANDLE;
+        DeviceObject<VkPipeline> grass{};
+    };
+    std::array<GrassPipelineVariant, 64> grass_pipeline_variants_{};
+    std::size_t grass_pipeline_variant_count_ = 0;
 
     struct EditorTextureAsset {
         glm::vec3 average_linear{1};
@@ -859,6 +876,8 @@ private:
     VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
     VkDescriptorPool anti_aliasing_descriptor_pool_ = VK_NULL_HANDLE;
     VkDescriptorPool subsurface_descriptor_pool_ = VK_NULL_HANDLE;
+    ModelVertexFormat model_vertex_format_actual_ = ModelVertexFormat::float32;
+    std::uint32_t model_vertex_stride_ = 0;
     GpuBuffer vertex_buffer_{};
     GpuBuffer index_buffer_{};
     GpuBuffer instance_buffer_{};
@@ -905,6 +924,10 @@ private:
     float fsr_frame_time_ms_ = 16.6667F;
     std::chrono::steady_clock::time_point last_frame_time_{};
     double ocean_time_seconds_ = 0.0;
+    double gpu_grass_elapsed_seconds_ = 0.0;
+    float gpu_grass_wind_seconds_ = 0.0F;
+    float previous_gpu_grass_wind_seconds_ = 0.0F;
+    std::uint32_t gpu_grass_instances_ = 0;
     std::optional<ScreenshotCapture> completed_screenshot_{};
 #if VCR_EDITOR_ENABLED
     EditorViewportResources editor_viewport_{};

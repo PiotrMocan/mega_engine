@@ -1,4 +1,5 @@
 #include "cooked_model_asset.hpp"
+#include "gpu_grass.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -613,7 +614,7 @@ parse_material(
         if (!model) {
             return CookedModelLoadError{
                 .code = CookedModelLoadErrorCode::invalid_material,
-                .message = "Material model must be standard, unlit, or subsurface.",
+                .message = "Material model must be standard, unlit, subsurface or gpu_grass.",
                 .path = file.absolute,
             };
         }
@@ -885,6 +886,12 @@ parse_material(
             return CookedModelLoadError{.code = CookedModelLoadErrorCode::invalid_material,
                 .message = "Alpha-masked tessellation is not supported.", .path = file.absolute};
         }
+    }
+    if (factors.model == MaterialModel::gpu_grass &&
+        ((coverage & 1U) != 0U || has_tessellation)) {
+        return CookedModelLoadError{.code = CookedModelLoadErrorCode::invalid_material,
+            .message = "GPU grass requires opaque coverage and no tessellation settings.",
+            .path = file.absolute};
     }
     output = CookedModelMaterial{
         .relative_path = file.relative,
@@ -1647,6 +1654,14 @@ CookedModelLoadResult load_cooked_model_asset(
             CookedModelLoadErrorCode::invalid_mesh,
             "Submeshes do not cover the complete index buffer.",
             model_file.absolute);
+    }
+    for (const auto& submesh : asset.submeshes) {
+        if (asset.materials[submesh.material_index].factors.model == MaterialModel::gpu_grass) {
+            std::string error;
+            if (!validate_gpu_grass_submesh(asset.vertices, asset.indices, submesh, error)) {
+                return fail(CookedModelLoadErrorCode::invalid_mesh, std::move(error), model_file.absolute);
+            }
+        }
     }
     if (auto collision_error = parse_collision_metadata(
             metadata, model_file.absolute, asset)) {
