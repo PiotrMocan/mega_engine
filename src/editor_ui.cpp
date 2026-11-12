@@ -3,6 +3,7 @@
 #include "asset_importer.hpp"
 #include "cooked_audio_asset.hpp"
 #include "editor_scene_tools.hpp"
+#include "project_system.hpp"
 #include "renderer.hpp"
 #include "runtime_assets.hpp"
 #include "scene_io.hpp"
@@ -1258,7 +1259,8 @@ void EditorUi::initialize(
     SDL_Window* const main_window,
     Renderer& renderer,
     AudioEngine* const audio_engine,
-    InputActionSystem* const input_actions) {
+    InputActionSystem* const input_actions,
+    const std::string_view explicit_project_path) {
     if (context_ != nullptr || main_window == nullptr) {
         fatal("Editor UI was initialized with invalid state.");
     }
@@ -1317,18 +1319,22 @@ void EditorUi::initialize(
     register_scene_texture(renderer);
 
     hierarchy_rows_.reserve(max_scene_nodes);
-    if (const auto asset_root = find_runtime_asset_root()) {
+    if (const auto asset_root =
+            find_runtime_asset_root(explicit_project_path)) {
+        project_root_ = asset_root->project_root;
+        project_name_ = asset_root->project_name;
         if (asset_browser_.initialize(
                 asset_root->path, asset_error_)) {
             asset_import_enabled_ =
                 asset_root->project_owned;
             scene_path_ =
                 asset_browser_.root() /
-                canonical_scene_relative_path;
+                asset_root->startup_scene_relative_path;
             scene_file_name_ =
                 scene_path_.filename().string();
             scene_file_status_ =
-                "Game scene; Save updates assets/scenes/editor_scene.json";
+                "Game scene; Save updates assets/" +
+                asset_root->startup_scene_relative_path;
             if (!asset_import_enabled_) {
                 asset_error_ =
                     "Packaged assets are browse-only. Open the editor "
@@ -1408,6 +1414,9 @@ void EditorUi::shutdown() noexcept {
     gizmo_edit_snapshot_.reset();
     focus_selection_requested_ = false;
     scatter_created_.clear();
+    project_root_.clear();
+    project_name_.clear();
+    pending_open_scene_path_.clear();
 }
 
 void EditorUi::process_event(const SDL_Event& event) {
@@ -2008,7 +2017,43 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
                 "Ctrl+O",
                 false,
                 editable)) {
+            pending_open_scene_path_.clear();
             open_requested_ = true;
+        }
+        if (ImGui::BeginMenu("Project scenes", editable)) {
+            const std::filesystem::path scenes_dir =
+                asset_browser_.root() / "scenes";
+            std::error_code fs_ec;
+            bool any_scene = false;
+            if (!asset_browser_.root().empty() &&
+                std::filesystem::is_directory(scenes_dir, fs_ec) && !fs_ec) {
+                std::vector<std::filesystem::path> scene_files;
+                for (const auto& entry :
+                     std::filesystem::directory_iterator(scenes_dir, fs_ec)) {
+                    if (fs_ec) {
+                        break;
+                    }
+                    std::error_code item_ec;
+                    if (entry.is_regular_file(item_ec) && !item_ec &&
+                        entry.path().extension() == ".json") {
+                        scene_files.push_back(entry.path());
+                    }
+                }
+                std::sort(scene_files.begin(), scene_files.end());
+                for (const std::filesystem::path& candidate : scene_files) {
+                    any_scene = true;
+                    const std::string label = candidate.filename().string();
+                    const bool is_current = candidate == scene_path_;
+                    if (ImGui::MenuItem(label.c_str(), nullptr, is_current)) {
+                        pending_open_scene_path_ = candidate;
+                        open_requested_ = true;
+                    }
+                }
+            }
+            if (!any_scene) {
+                ImGui::TextDisabled("No saved scenes in assets/scenes/");
+            }
+            ImGui::EndMenu();
         }
         if (ImGui::MenuItem(
                 "Import assets...",
@@ -2019,6 +2064,25 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
                     import_worker_ != nullptr &&
                     !import_worker_->failed())) {
             import_dialog_requested_ = true;
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Project Manager...")) {
+#if defined(_WIN32)
+            constexpr std::string_view pm_exe_name{"vulkan_project_manager.exe"};
+#else
+            constexpr std::string_view pm_exe_name{"vulkan_project_manager"};
+#endif
+            if (const auto pm_exe = find_sibling_executable(pm_exe_name)) {
+                std::string launch_error;
+                if (!launch_detached_executable(
+                        *pm_exe, {}, pm_exe->parent_path(), launch_error)) {
+                    scene_file_status_ =
+                        "Project Manager launch failed: " + launch_error;
+                }
+            } else {
+                scene_file_status_ =
+                    "Project Manager executable was not found next to editor.";
+            }
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Exit")) {
@@ -2250,6 +2314,10 @@ void EditorUi::build_toolbar(SceneDocument& scene) {
     }
 
     ui_kit_.brand_lockup();
+    if (!project_name_.empty()) {
+        ImGui::SameLine(0.0F, 10.0F);
+        ui_kit_.badge(project_name_.c_str(), EditorTone::primary);
+    }
     ImGui::SameLine(0.0F, 15.0F);
     ImGui::AlignTextToFramePadding();
 
@@ -7103,8 +7171,14 @@ void EditorUi::process_file_commands(SceneDocument& scene) {
             if (scene_is_dirty(scene)) {
                 open_confirmation_requested_ = true;
             } else {
+                if (!pending_open_scene_path_.empty()) {
+                    scene_path_ = std::exchange(pending_open_scene_path_, {});
+                    scene_file_name_ = scene_path_.filename().string();
+                }
                 open_scene(scene);
             }
+        } else {
+            pending_open_scene_path_.clear();
         }
     }
     if (quit_requested_) {
@@ -7130,19 +7204,28 @@ void EditorUi::process_file_commands(SceneDocument& scene) {
             "Open saved scene?",
             nullptr,
             ImGuiWindowFlags_AlwaysAutoResize)) {
+        const std::filesystem::path& target_scene_path =
+            pending_open_scene_path_.empty()
+                ? scene_path_
+                : pending_open_scene_path_;
         ImGui::TextUnformatted(
             "Discard the current unsaved changes and open:");
         ImGui::TextWrapped(
             "%s",
-            scene_path_.empty()
+            target_scene_path.empty()
                 ? "(scene path unavailable)"
-                : scene_path_.string().c_str());
+                : target_scene_path.string().c_str());
         if (ImGui::Button("Discard and open")) {
+            if (!pending_open_scene_path_.empty()) {
+                scene_path_ = std::exchange(pending_open_scene_path_, {});
+                scene_file_name_ = scene_path_.filename().string();
+            }
             open_scene(scene);
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancel")) {
+            pending_open_scene_path_.clear();
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();

@@ -41,7 +41,11 @@ if ($variant.levels.Count -ne 3 -or ($variant.levels.triangles -join ',') -cne '
     throw 'Validator requires the documented three-level fixture and error bounds.'
 }
 $canonicalPath = Join-Path $root 'assets/scenes/editor_scene.json'
-$canonicalBefore = (Get-FileHash -LiteralPath $canonicalPath -Algorithm SHA256).Hash
+$canonicalBefore = if (Test-Path -LiteralPath $canonicalPath) {
+    (Get-FileHash -LiteralPath $canonicalPath -Algorithm SHA256).Hash
+} else {
+    '<absent>'
+}
 $outputDirectory = Join-Path $tree "render-validation/lod-fade-$Fixture/$VisibilityBackend"
 if ($RunTag) { $outputDirectory += "-$RunTag" }
 New-Item -ItemType Directory -Force -Path $outputDirectory | Out-Null
@@ -383,11 +387,16 @@ for ($startup=1; $startup -le $Startups; ++$startup) {
     finally {
         DisposeRenderer $logPath
         $script:lodTrace | ConvertTo-Json -Depth 16 | Set-Content (Join-Path $outputDirectory "$startup-mcp-trace.json")
+        $canonicalAfter = if (Test-Path -LiteralPath $canonicalPath) {
+            (Get-FileHash -LiteralPath $canonicalPath -Algorithm SHA256).Hash
+        } else {
+            '<absent>'
+        }
         $summary=[pscustomobject]@{
             passed=$passed;failure=$failure;startup=$startup;cycles=$Cycles;fixture=$Fixture;visibility_backend=$VisibilityBackend
             captures=$script:lodCaptures;invalid_requests_rejected=$script:lodInvalidRequests
             comparisons=@($script:lodEvidence.ToArray());asset_root=$assetRoot
-            canonical_unchanged=((Get-FileHash -LiteralPath $canonicalPath -Algorithm SHA256).Hash -ceq $canonicalBefore)
+            canonical_unchanged=($canonicalAfter -ceq $canonicalBefore)
             limits='Reversal continuity and third-target timing are covered by math tests; this script currently gates coarsening captures, settled reference, resize and mode restoration.'
         }
         $summary | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $outputDirectory "$startup-summary.json")
@@ -415,5 +424,10 @@ if ($CheckAssetRootGuards) {
         } finally { DisposeRenderer $logPath }
     }
     $guards | ConvertTo-Json | Set-Content (Join-Path $outputDirectory 'asset-root-guards.json')
-    if ((Get-FileHash -LiteralPath $canonicalPath -Algorithm SHA256).Hash -cne $canonicalBefore) { throw 'Asset-root guards changed the canonical scene.' }
+    $canonicalAfterGuards = if (Test-Path -LiteralPath $canonicalPath) {
+        (Get-FileHash -LiteralPath $canonicalPath -Algorithm SHA256).Hash
+    } else {
+        '<absent>'
+    }
+    if ($canonicalAfterGuards -cne $canonicalBefore) { throw 'Asset-root guards changed the canonical scene.' }
 }

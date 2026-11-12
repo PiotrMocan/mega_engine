@@ -80,6 +80,7 @@ private:
     InputActionSystem input_actions_{};
     AudioEngine audio_engine_{};
     CliOptions options_{};
+    std::string project_name_{};
     BenchmarkController benchmark_{};
     BenchmarkFrameSamples benchmark_samples_{};
     std::chrono::steady_clock::time_point benchmark_measurement_begin_{};

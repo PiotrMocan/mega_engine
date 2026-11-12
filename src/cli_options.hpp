@@ -116,6 +116,7 @@ struct CliOptions {
     bool cpu_hierarchy = false;
     bool animate_scene = false;
     std::uint32_t scene_count = 0;
+    std::string project_path{};
     std::string scene_asset{};
     std::string stream_asset{};
     bool animate_camera = false;

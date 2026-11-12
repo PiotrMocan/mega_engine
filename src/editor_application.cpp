@@ -607,10 +607,18 @@ void EditorApplication::initialize(const CliOptions& options) {
         fatal(SDL_GetError());
     }
 
-    const auto asset_root = find_runtime_asset_root();
-    if (!asset_root) fatal("Unable to locate the runtime assets directory.");
+    const auto asset_root = find_runtime_asset_root(options.project_path);
+    if (!asset_root) {
+        fatal(options.project_path.empty()
+                  ? "Unable to locate the runtime assets directory."
+                  : ("Unable to open project directory: " + options.project_path));
+    }
+    project_name_ = asset_root->project_name;
     std::string scene_error;
-    if (!load_startup_scene(asset_root->path / canonical_scene_relative_path, scene_, scene_error))
+    if (!load_startup_scene(
+            asset_root->path / asset_root->startup_scene_relative_path,
+            scene_,
+            scene_error))
         fatal(scene_error);
     const auto lighting = resolve_scene_lighting(options, scene_.lighting);
     context_.initialize(window_.get(), options.validation);
@@ -703,7 +711,12 @@ void EditorApplication::initialize(const CliOptions& options) {
     }
 
     ui_.initialize(
-        context_, window_.get(), renderer_, &audio_engine_, &input_actions_);
+        context_,
+        window_.get(),
+        renderer_,
+        &audio_engine_,
+        &input_actions_,
+        options.project_path);
     camera_ = scene_startup_camera(scene_, options.camera_z_explicit
         ? std::optional<double>(options.camera_z) : std::nullopt);
     edit_camera_before_play_ = camera_;
@@ -2442,12 +2455,15 @@ void EditorApplication::update_window_title() {
         play_state = "PAUSE";
         break;
     }
-    char title[192]{};
+    char title[256]{};
+    const char* const app_prefix =
+        project_name_.empty() ? "Vulkan Cube Editor" : project_name_.c_str();
     std::snprintf(
         title,
         sizeof(title),
-        "Vulkan Cube Editor | %s%s | %.0f FPS | CPU %.3f ms | "
+        "%s | %s%s | %.0f FPS | CPU %.3f ms | "
         "GPU %.3f ms | %u nodes | Scene %ux%u",
+        app_prefix,
         play_state,
         ui_.external_game_window_open() ? " / WINDOW" : "",
         stats.one_second_average_fps,

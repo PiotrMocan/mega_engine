@@ -21,6 +21,7 @@ compile_commands.json
 !/assets/sky_clouds.png
 !/assets/smaa/
 !/assets/validation/
+/projects/
 /art/
 /scripts/blender/*freight*.py
 /scripts/import_freight_yard.ps1

@@ -80,7 +80,8 @@ public:
         SDL_Window* main_window,
         Renderer& renderer,
         AudioEngine* audio_engine = nullptr,
-        InputActionSystem* input_actions = nullptr);
+        InputActionSystem* input_actions = nullptr,
+        std::string_view explicit_project_path = {});
     void shutdown() noexcept;
     void process_event(const SDL_Event& event);
     void synchronize_renderer(Renderer& renderer);
@@ -369,7 +370,10 @@ private:
     float scatter_scale_[2]{0.8F, 1.2F};
     float flat_ground_size_[2]{64.0F, 64.0F};
     float flat_ground_height_ = 0.0F;
+    std::filesystem::path project_root_{};
+    std::string project_name_{};
     std::filesystem::path scene_path_{};
+    std::filesystem::path pending_open_scene_path_{};
     std::string scene_file_name_{"editor_scene.json"};
     std::string scene_file_status_{};
     std::uint64_t saved_content_revision_ = 0U;

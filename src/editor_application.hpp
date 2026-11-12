@@ -70,6 +70,7 @@ private:
     std::vector<SceneModelInstance> scene_models_{};
     std::vector<ScenePunctualLight> scene_lights_{};
     CliOptions options_{};
+    std::string project_name_{};
     McpControlPlane mcp_control_{};
     McpServer mcp_server_{mcp_control_, McpServerProfile::editor};
     std::uint64_t submitted_scene_revision_ = 0U;

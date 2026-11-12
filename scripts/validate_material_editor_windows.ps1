@@ -18,7 +18,11 @@ $outputDirectory = Join-Path $tree 'render-validation/material-editor'
 if ($RunTag) { $outputDirectory += "-$RunTag" }
 New-Item -ItemType Directory -Force -Path $outputDirectory | Out-Null
 $scenePath = Join-Path $root 'assets/scenes/editor_scene.json'
-$sceneHashBefore = (Get-FileHash -LiteralPath $scenePath -Algorithm SHA256).Hash
+$sceneHashBefore = if (Test-Path -LiteralPath $scenePath) {
+    (Get-FileHash -LiteralPath $scenePath -Algorithm SHA256).Hash
+} else {
+    '<absent>'
+}
 $logPath = Join-Path $outputDirectory 'editor.log'
 $tracePath = Join-Path $outputDirectory 'mcp-checks.json'
 Add-Type -AssemblyName System.Drawing
@@ -331,7 +335,11 @@ try {
     [IO.File]::WriteAllText($logPath,$stderr)
     $process.Dispose()
     try {
-        $sceneHashAfter = (Get-FileHash -LiteralPath $scenePath -Algorithm SHA256).Hash
+        $sceneHashAfter = if (Test-Path -LiteralPath $scenePath) {
+            (Get-FileHash -LiteralPath $scenePath -Algorithm SHA256).Hash
+        } else {
+            '<absent>'
+        }
         if ($sceneHashAfter -cne $sceneHashBefore) { $failures.Add('Canonical editor_scene.json changed.') }
     } catch { $sceneHashAfter=$null; $failures.Add("Scene hash check failed: $($_.Exception.Message)") }
 }

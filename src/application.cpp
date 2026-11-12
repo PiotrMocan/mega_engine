@@ -161,11 +161,22 @@ void Application::initialize(const CliOptions& options) {
         preferred_present = VK_PRESENT_MODE_FIFO_KHR;
         break;
     }
+    if (!options.project_path.empty()) {
+        const auto explicit_root = find_runtime_asset_root(options.project_path);
+        if (!explicit_root) {
+            fatal("Unable to open project directory: " + options.project_path);
+        }
+        project_name_ = explicit_root->project_name;
+    }
     if (!options.lighting_room && options.scene_count == 0 && options.render_fixture == RenderFixture::none) {
-        const auto asset_root = find_runtime_asset_root();
+        const auto asset_root = find_runtime_asset_root(options.project_path);
         if (!asset_root) fatal("Unable to locate the runtime assets directory.");
+        project_name_ = asset_root->project_name;
         std::string error;
-        if (!load_startup_scene(asset_root->path / canonical_scene_relative_path, scene_, error))
+        if (!load_startup_scene(
+                asset_root->path / asset_root->startup_scene_relative_path,
+                scene_,
+                error))
             fatal(error);
     }
     const auto lighting = resolve_scene_lighting(options, scene_.lighting);
@@ -205,7 +216,7 @@ void Application::initialize(const CliOptions& options) {
     }
     if (!options.benchmark) {
         input_actions_.set_hardware_polling_enabled(true);
-        if (const auto root = find_runtime_asset_root()) {
+        if (const auto root = find_runtime_asset_root(options.project_path)) {
             const std::filesystem::path bindings_path =
                 root->path / "config" / "input_bindings.json";
             std::error_code fs_err;
@@ -250,7 +261,10 @@ void Application::initialize(const CliOptions& options) {
     renderer_.set_visibility_settings(visibility);
     renderer_.enable_async_assets();
     if (!options.stream_asset.empty()) {
-        const auto root = find_runtime_asset_root();
+        const auto root = find_runtime_asset_root(options.project_path);
+        if (!root) {
+            fatal("Unable to locate the runtime assets directory.");
+        }
         SceneTransform ignored;
         std::string error;
         static_cast<void>(
@@ -291,12 +305,12 @@ void Application::initialize(const CliOptions& options) {
 void Application::load_canonical_scene() {
     if (options_.render_fixture == RenderFixture::material_spheres ||
         options_.render_fixture == RenderFixture::subsurface_profiles) return;
-    const auto asset_root = find_runtime_asset_root();
+    const auto asset_root = find_runtime_asset_root(options_.project_path);
     if (!asset_root) {
         fatal("Unable to locate the runtime assets directory.");
     }
     const std::filesystem::path scene_path =
-        asset_root->path / canonical_scene_relative_path;
+        asset_root->path / asset_root->startup_scene_relative_path;
     std::string error;
     if (options_.render_fixture != RenderFixture::none) {
         const auto layers = options_.render_fixture == RenderFixture::overdraw_16 ? 16U
@@ -479,7 +493,7 @@ void Application::set_lighting_room_roof(bool enabled) {
         lighting_room_roof_ = {};
     }
     scene_.mark_content_changed();
-    const auto root = find_runtime_asset_root();
+    const auto root = find_runtime_asset_root(options_.project_path);
     if (!root)
         fatal("Unable to locate runtime assets while updating the lighting test room");
     std::string error;
@@ -493,7 +507,7 @@ void Application::service_assets() {
     if (options_.stream_asset.empty() || stream_asset_placed_ || renderer_.assets_pending()) {
         return;
     }
-    const auto root = find_runtime_asset_root();
+    const auto root = find_runtime_asset_root(options_.project_path);
     if (!root) {
         fatal("Runtime assets root disappeared");
     }
@@ -1792,13 +1806,16 @@ void Application::update_window_title() {
     last_title_update_ = now;
     const auto stats = renderer_.metrics_snapshot(false);
     const glm::vec3 camera_position = camera_.position();
+    const char* const app_label =
+        project_name_.empty() ? "Vulkan Scene" : project_name_.c_str();
     char title[512]{};
     std::snprintf(
         title,
         sizeof(title),
-        "Vulkan Scene | %.0f FPS | avg %.3f ms | CPU %.3f ms | "
+        "%s | %.0f FPS | avg %.3f ms | CPU %.3f ms | "
         "GPU %.3f ms | cam %.1f %.1f %.1f | %u inst | "
         "%llu tris | %s/%u | AA %s/%s | %s",
+        app_label,
         stats.one_second_average_fps,
         stats.average.cpu_frame_ms,
         stats.latest.cpu_frame_ms,

@@ -2,22 +2,37 @@
 
 #include <filesystem>
 #include <optional>
+#include <string>
+#include <string_view>
 
 namespace vcr {
-
-struct RuntimeAssetRoot {
-    std::filesystem::path path{};
-    bool project_owned = false;
-};
 
 inline constexpr const char* canonical_scene_relative_path =
     "scenes/editor_scene.json";
 
-// Cold lookup. An explicitly set VCR_ASSET_ROOT selects that assets directory
-// before project/package discovery; invalid/empty overrides fail without a
-// fallback. Set the process environment before SDL starts caching it. No local
-// mutable cache is kept. Override roots are never marked project-owned.
-[[nodiscard]] std::optional<RuntimeAssetRoot>
-find_runtime_asset_root();
+struct RuntimeAssetRoot {
+    std::filesystem::path path{};
+    std::filesystem::path project_root{};
+    std::string project_name{};
+    std::string startup_scene_relative_path{canonical_scene_relative_path};
+    bool project_owned = false;
+};
+
+// Cold lookup. Precedence:
+// 1. Non-empty explicit_project_path (--project CLI flag) -> validates project
+//    manifest + assets/, fails without fallback if invalid.
+// 2. VCR_PROJECT_ROOT environment variable -> validates project manifest +
+//    assets/, fails without fallback if invalid.
+// 3. VCR_ASSET_ROOT environment variable -> selects that assets directory
+//    directly (non-project-owned), failing without fallback if invalid.
+// 4. Current working directory inside a valid project (project.vcrproject.json).
+// 5. Engine checkout (CMakeLists.txt + assets/) or packaged <exe>/assets.
+[[nodiscard]] std::optional<RuntimeAssetRoot> find_runtime_asset_root(
+    std::string_view explicit_project_path = {});
+
+// Discovers the engine repository root (or executable parent directory when
+// running from a standalone build) so tools can locate sibling executables
+// and the default projects/ directory.
+[[nodiscard]] std::optional<std::filesystem::path> find_engine_workspace_root();
 
 } // namespace vcr

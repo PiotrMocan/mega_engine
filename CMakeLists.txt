@@ -538,6 +538,7 @@ set(VCR_RENDERER_SOURCES
     src/renderer_assets.cpp
     src/scene_visibility.cpp
     src/bounds_hierarchy.cpp
+    src/project_system.cpp
     src/runtime_assets.cpp
     src/swapchain.cpp
     src/vma.cpp
@@ -569,6 +570,24 @@ add_executable(vulkan_editor
     ${VCR_RENDERER_SOURCES}
 )
 
+add_executable(vulkan_project_manager
+    src/project_manager_main.cpp
+    src/project_manager_application.cpp
+    src/project_system.cpp
+    src/runtime_assets.cpp
+    src/editor_ui_kit.cpp
+    src/vulkan_context.cpp
+    src/swapchain.cpp
+    src/vma.cpp
+    src/scene_document.cpp
+    src/scene_io.cpp
+    src/prefab_io.cpp
+    src/scene_uuid.cpp
+    src/collision.cpp
+    src/punctual_light.cpp
+    src/png_encoder.cpp
+)
+
 find_package(Threads REQUIRED)
 
 function(vcr_configure_executable target editor_enabled)
@@ -591,6 +610,9 @@ function(vcr_configure_executable target editor_enabled)
         Threads::Threads
         meshoptimizer
     )
+    if(WIN32)
+        target_link_libraries(${target} PRIVATE shell32)
+    endif()
     target_compile_definitions(${target} PRIVATE
         VK_NO_PROTOTYPES
         VMA_STATIC_VULKAN_FUNCTIONS=0
@@ -632,6 +654,7 @@ endfunction()
 
 vcr_configure_executable(vulkan_cube 1)
 vcr_configure_executable(vulkan_editor 1)
+vcr_configure_executable(vulkan_project_manager 1)
 
 # Explicit GPU numerical gate; ordinary CPU CTest does not silently require a GPU.
 add_executable(vcr_tone_mapping_gpu_tests EXCLUDE_FROM_ALL
@@ -692,6 +715,11 @@ target_link_libraries(
     vcr_cooked_model_asset
     vcr_cooked_texture_asset
 )
+target_link_libraries(
+    vulkan_project_manager PRIVATE
+    vcr_imgui
+    vcr_cooked_model_asset
+)
 
 # Both executables share one output directory. A single dependency target
 # prevents parallel post-build copy_directory commands from racing over the
@@ -726,6 +754,7 @@ if(VCR_HAS_FSR3)
 endif()
 add_dependencies(vulkan_cube vcr_runtime_assets)
 add_dependencies(vulkan_editor vcr_runtime_assets)
+add_dependencies(vulkan_project_manager vcr_runtime_assets)
 
 include(CTest)
 if(BUILD_TESTING)
@@ -992,4 +1021,55 @@ if(BUILD_TESTING)
             ENVIRONMENT "TMPDIR=/tmp;TMP=/tmp;TEMP=/tmp"
         )
     endif()
+
+    add_executable(vcr_project_tests
+        tests/project_tests.cpp
+        src/project_system.cpp
+        src/runtime_assets.cpp
+        src/asset_browser.cpp
+        src/cli_options.cpp
+        src/png_encoder.cpp
+        src/scene_document.cpp
+        src/scene_io.cpp
+        src/prefab_io.cpp
+        src/scene_uuid.cpp
+        src/punctual_light.cpp
+        src/collision.cpp
+    )
+    target_include_directories(vcr_project_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+    target_compile_definitions(vcr_project_tests PRIVATE
+        GLM_FORCE_DEPTH_ZERO_TO_ONE
+        GLM_FORCE_RADIANS
+        VCR_VALIDATION_DEFAULT=0
+    )
+    target_link_libraries(
+        vcr_project_tests PRIVATE
+        vcr_cooked_model_asset
+        vcr_cooked_texture_asset
+        SDL3::SDL3-static
+        glm::glm
+        nlohmann_json::nlohmann_json
+        Threads::Threads
+    )
+    if(WIN32)
+        target_link_libraries(vcr_project_tests PRIVATE shell32)
+    endif()
+    if(MSVC)
+        target_compile_options(vcr_project_tests PRIVATE
+            /W4 /permissive- /Zc:preprocessor /GR- /EHsc
+        )
+        if(VCR_WARNINGS_AS_ERRORS)
+            target_compile_options(vcr_project_tests PRIVATE /WX)
+        endif()
+    else()
+        target_compile_options(vcr_project_tests PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -fno-rtti
+        )
+        if(VCR_WARNINGS_AS_ERRORS)
+            target_compile_options(vcr_project_tests PRIVATE -Werror)
+        endif()
+    endif()
+    add_test(NAME vcr_project_tests COMMAND vcr_project_tests)
 endif()

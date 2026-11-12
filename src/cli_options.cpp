@@ -702,6 +702,17 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
             }
             continue;
         }
+        if (argument.name == "--project") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) {
+                return result;
+            }
+            if (value.empty() || value.size() > 4096) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.project_path = value;
+            continue;
+        }
         if (argument.name == "--culling" || argument.name == "--lod" ||
             argument.name == "--dynamic-shadows" || argument.name == "--scene-count" ||
             argument.name == "--scene-asset" || argument.name == "--stream-asset" ||
@@ -1098,6 +1109,7 @@ std::string cli_usage(std::string_view executable_name) {
         executable_name.empty() ? std::string_view{"vulkan_cube"}
                                 : executable_name);
     result.append(" [options]\n"
+                  "  --project PATH          Open project directory or project.vcrproject.json\n"
                   "  --benchmark             Run timed benchmark and write benchmark.json\n"
                   "  --mcp-stdio             Expose AI toolsets over MCP stdio\n"
                   "  --width N               Initial drawable width (default: 1920)\n"
