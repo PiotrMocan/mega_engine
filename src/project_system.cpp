@@ -1,6 +1,7 @@
 #include "project_system.hpp"
 
 #include "cooked_model_asset.hpp"
+#include "icon_system.hpp"
 #include "lighting_settings.hpp"
 #include "pbr_material.hpp"
 #include "png_encoder.hpp"
@@ -863,6 +864,82 @@ bool valid_project_scene_relative_path(const std::string_view path) noexcept {
     return true;
 }
 
+namespace {
+
+[[nodiscard]] bool ascii_ends_with_icase(
+    const std::string_view value,
+    const std::string_view suffix) noexcept {
+    if (value.size() < suffix.size()) {
+        return false;
+    }
+    const std::size_t offset = value.size() - suffix.size();
+    for (std::size_t i = 0U; i < suffix.size(); ++i) {
+        auto lower = [](const char c) noexcept {
+            return (c >= 'A' && c <= 'Z')
+                ? static_cast<char>(c - 'A' + 'a')
+                : c;
+        };
+        if (lower(value[offset + i]) != lower(suffix[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+std::string default_project_executable_filename(const std::string_view slug_or_name) {
+    return make_project_folder_slug(slug_or_name) + ".exe";
+}
+
+bool valid_project_executable_filename(const std::string_view filename) noexcept {
+    if (filename.empty() || filename.size() > 128U ||
+        filename == "." || filename == ".." ||
+        !valid_utf8_text(filename) ||
+        !ascii_ends_with_icase(filename, ".exe") ||
+        filename.size() <= 4U) {
+        return false;
+    }
+    for (const char raw : filename) {
+        const auto ch = static_cast<unsigned char>(raw);
+        if (ch < 0x20U || raw == '/' || raw == '\\' || raw == ':' ||
+            raw == '*' || raw == '?' || raw == '"' || raw == '<' ||
+            raw == '>' || raw == '|') {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool valid_project_icon_relative_path(const std::string_view path) noexcept {
+    if (path.empty() || path.size() > 256U ||
+        !ascii_ends_with_icase(path, ".ico") ||
+        path.size() <= 4U ||
+        !valid_utf8_text(path) || path.front() == '/' || path.front() == '\\') {
+        return false;
+    }
+    std::size_t segment_begin = 0U;
+    for (std::size_t index = 0U; index <= path.size(); ++index) {
+        const bool at_end = index == path.size();
+        if (!at_end) {
+            const auto ch = static_cast<unsigned char>(path[index]);
+            if (ch < 0x20U || path[index] == '\\' || path[index] == ':') {
+                return false;
+            }
+        }
+        if (!at_end && path[index] != '/') {
+            continue;
+        }
+        const std::string_view segment =
+            path.substr(segment_begin, index - segment_begin);
+        if (segment.empty() || segment == "." || segment == "..") {
+            return false;
+        }
+        segment_begin = index + 1U;
+    }
+    return true;
+}
+
 bool save_project_manifest(
     const ProjectManifest& manifest,
     const std::filesystem::path& manifest_file,
@@ -888,6 +965,22 @@ bool save_project_manifest(
         error = "Project startup_scene must be a safe relative .json path under assets/.";
         return false;
     }
+    const std::string resolved_executable = manifest.executable.empty()
+        ? default_project_executable_filename(
+              manifest_file.parent_path().filename().empty()
+                  ? std::string_view(manifest.name)
+                  : std::string_view(path_to_utf8(manifest_file.parent_path().filename())))
+        : manifest.executable;
+    if (!valid_project_executable_filename(resolved_executable)) {
+        error = "Project executable must be a valid .exe filename without directory separators.";
+        return false;
+    }
+    const std::string resolved_icon =
+        manifest.icon_path.empty() ? std::string("icon.ico") : manifest.icon_path;
+    if (!valid_project_icon_relative_path(resolved_icon)) {
+        error = "Project icon must be a safe relative .ico path inside the project folder.";
+        return false;
+    }
     const Json encoded{
         {"format", std::string(project_manifest_format)},
         {"version", project_manifest_version},
@@ -895,6 +988,8 @@ bool save_project_manifest(
         {"description", manifest.description},
         {"template", manifest.template_id},
         {"startup_scene", manifest.startup_scene},
+        {"executable", resolved_executable},
+        {"icon", resolved_icon},
         {"created_utc",
          manifest.created_utc.empty() ? current_utc_iso8601() : manifest.created_utc},
     };
@@ -978,6 +1073,28 @@ bool load_project_manifest(
         error = "Project manifest startup_scene is invalid.";
         return false;
     }
+    if (root.contains("executable")) {
+        if (!root["executable"].is_string()) {
+            error = "Project manifest executable must be a string.";
+            return false;
+        }
+        parsed.executable = root["executable"].get<std::string>();
+        if (!valid_project_executable_filename(parsed.executable)) {
+            error = "Project manifest executable filename is invalid.";
+            return false;
+        }
+    }
+    if (root.contains("icon")) {
+        if (!root["icon"].is_string()) {
+            error = "Project manifest icon must be a string.";
+            return false;
+        }
+        parsed.icon_path = root["icon"].get<std::string>();
+        if (!valid_project_icon_relative_path(parsed.icon_path)) {
+            error = "Project manifest icon path is invalid.";
+            return false;
+        }
+    }
     if (root.contains("created_utc") && root["created_utc"].is_string()) {
         parsed.created_utc = root["created_utc"].get<std::string>();
     }
@@ -1022,6 +1139,35 @@ ProjectInspection inspect_project_directory(
         result.state = ProjectDiskState::invalid_manifest;
         return result;
     }
+
+    if (result.manifest.executable.empty()) {
+        result.manifest.executable = default_project_executable_filename(
+            path_to_utf8(result.project_directory.filename()));
+    }
+    if (result.manifest.icon_path.empty()) {
+        result.manifest.icon_path = "icon.ico";
+    }
+    result.executable_path =
+        result.project_directory / path_from_utf8(result.manifest.executable);
+    result.icon_file_path =
+        result.project_directory / path_from_utf8(result.manifest.icon_path);
+
+    ec.clear();
+    result.icon_exists =
+        std::filesystem::is_regular_file(result.icon_file_path, ec) && !ec;
+    ec.clear();
+    const bool has_exe =
+        std::filesystem::is_regular_file(result.executable_path, ec) && !ec;
+    ec.clear();
+    const bool has_shaders =
+        std::filesystem::is_directory(
+            result.project_directory / "engine" / "shaders", ec) && !ec;
+    ec.clear();
+    const bool has_sky =
+        std::filesystem::is_regular_file(
+            result.project_directory / "engine" / "assets" / "sky_clouds.png",
+            ec) && !ec;
+    result.runtime_bundled = has_exe && has_shaders && has_sky;
 
     result.assets_directory = result.project_directory / "assets";
     const auto assets_status =
@@ -1152,6 +1298,8 @@ bool create_project_on_disk(
         .description = options.description,
         .template_id = std::string(to_token(options.template_kind)),
         .startup_scene = "scenes/editor_scene.json",
+        .executable = default_project_executable_filename(folder),
+        .icon_path = "icon.ico",
         .created_utc = current_utc_iso8601(),
     };
     if (!save_project_manifest(
@@ -1161,8 +1309,33 @@ bool create_project_on_disk(
         return false;
     }
 
+    // Always materialize the default project icon in <project>/icon.ico.
+    std::string icon_err;
+    if (!write_builtin_ico_file(
+            BuiltinIconKind::project_default,
+            project_dir / "icon.ico",
+            icon_err)) {
+        std::error_code cleanup_ec;
+        std::filesystem::remove_all(project_dir, cleanup_ec);
+        error = "Failed to write default project icon: " + icon_err;
+        return false;
+    }
+
     output.project_directory = normalize_project_path(project_dir);
     output.manifest = std::move(manifest);
+    output.runtime_bundled = false;
+    output.bundle_warning.clear();
+
+    if (options.bundle_runtime) {
+        BundleProjectRuntimeResult bundle_res{};
+        std::string bundle_err;
+        if (bundle_project_runtime(
+                output.project_directory, bundle_res, bundle_err)) {
+            output.runtime_bundled = true;
+        } else {
+            output.bundle_warning = std::move(bundle_err);
+        }
+    }
     return true;
 }
 
@@ -1665,9 +1838,21 @@ bool initialize_manifest_for_existing_directory(
         .description = "Imported existing project directory.",
         .template_id = "imported",
         .startup_scene = std::move(startup_scene),
+        .executable = default_project_executable_filename(
+            path_to_utf8(normalized.filename())),
+        .icon_path = "icon.ico",
         .created_utc = current_utc_iso8601(),
     };
-    return save_project_manifest(manifest, manifest_path, error);
+    if (!save_project_manifest(manifest, manifest_path, error)) {
+        return false;
+    }
+    const std::filesystem::path icon_file = normalized / "icon.ico";
+    if (!std::filesystem::exists(icon_file, ec) || ec) {
+        std::string icon_err;
+        static_cast<void>(write_builtin_ico_file(
+            BuiltinIconKind::project_default, icon_file, icon_err));
+    }
+    return true;
 }
 
 std::filesystem::path default_projects_root_directory() {
@@ -1822,6 +2007,453 @@ bool open_directory_in_file_explorer(
     error = "Opening Explorer is only supported on Windows.";
     return false;
 #endif
+}
+
+namespace {
+
+[[nodiscard]] bool copy_file_atomically(
+    const std::filesystem::path& source,
+    const std::filesystem::path& destination,
+    std::string& error) {
+    std::error_code ec;
+    const std::filesystem::path parent = destination.parent_path();
+    if (!parent.empty()) {
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            error = "Unable to create directory '" + path_to_utf8(parent) +
+                    "': " + ec.message();
+            return false;
+        }
+    }
+    std::filesystem::path temp_path = destination;
+    temp_path += ".tmp";
+    std::filesystem::remove(temp_path, ec);
+    ec.clear();
+    if (!std::filesystem::copy_file(
+            source,
+            temp_path,
+            std::filesystem::copy_options::overwrite_existing,
+            ec) ||
+        ec) {
+        error = "Unable to copy '" + path_to_utf8(source) + "' -> '" +
+                path_to_utf8(destination) + "': " + ec.message();
+        return false;
+    }
+#if defined(_WIN32)
+    if (MoveFileExW(
+            temp_path.c_str(),
+            destination.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == FALSE) {
+        const DWORD last_err = GetLastError();
+        std::filesystem::remove(temp_path, ec);
+        if (last_err == ERROR_ACCESS_DENIED ||
+            last_err == ERROR_SHARING_VIOLATION) {
+            error = "Cannot overwrite '" + path_to_utf8(destination) +
+                    "' because it is currently running or locked.";
+        } else {
+            error = "Unable to publish '" + path_to_utf8(destination) +
+                    "' (Win32 error " + std::to_string(last_err) + ").";
+        }
+        return false;
+    }
+#else
+    std::filesystem::rename(temp_path, destination, ec);
+    if (ec) {
+        std::error_code rm_ec;
+        std::filesystem::remove(temp_path, rm_ec);
+        error = "Unable to publish '" + path_to_utf8(destination) +
+                "': " + ec.message();
+        return false;
+    }
+#endif
+    return true;
+}
+
+[[nodiscard]] bool read_binary_file(
+    const std::filesystem::path& path,
+    std::vector<std::uint8_t>& out_bytes,
+    std::string& error) {
+    out_bytes.clear();
+    std::error_code ec;
+    const auto status = std::filesystem::symlink_status(path, ec);
+    if (ec || !std::filesystem::is_regular_file(status) ||
+        std::filesystem::is_symlink(status)) {
+        error = "File does not exist or is a symbolic link: " + path_to_utf8(path);
+        return false;
+    }
+    const std::uintmax_t sz = std::filesystem::file_size(path, ec);
+    if (ec || sz == 0U || sz > 64ULL * 1024ULL * 1024ULL) {
+        error = "File is empty or exceeds size limit: " + path_to_utf8(path);
+        return false;
+    }
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        error = "Unable to open file: " + path_to_utf8(path);
+        return false;
+    }
+    out_bytes.resize(static_cast<std::size_t>(sz));
+    in.read(
+        reinterpret_cast<char*>(out_bytes.data()),
+        static_cast<std::streamsize>(sz));
+    if (!in) {
+        out_bytes.clear();
+        error = "Unable to read file: " + path_to_utf8(path);
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] std::optional<std::filesystem::path> locate_spv_shaders_dir(
+    const std::filesystem::path& exe_dir,
+    const std::optional<std::filesystem::path>& workspace) {
+    std::error_code ec;
+    const std::filesystem::path bin_shaders = exe_dir / "shaders";
+    if (std::filesystem::is_directory(bin_shaders, ec) && !ec) {
+        return bin_shaders;
+    }
+    if (workspace) {
+        ec.clear();
+        const std::filesystem::path src_spv = *workspace / "shaders" / "spv";
+        if (std::filesystem::is_directory(src_spv, ec) && !ec) {
+            return src_spv;
+        }
+    }
+    return std::nullopt;
+}
+
+[[nodiscard]] std::optional<std::filesystem::path> locate_core_assets_dir(
+    const std::filesystem::path& exe_dir,
+    const std::optional<std::filesystem::path>& workspace) {
+    std::error_code ec;
+    const std::filesystem::path bin_assets = exe_dir / "assets";
+    if (std::filesystem::is_regular_file(bin_assets / "sky_clouds.png", ec) &&
+        !ec) {
+        return bin_assets;
+    }
+    if (workspace) {
+        ec.clear();
+        const std::filesystem::path src_assets = *workspace / "assets";
+        if (std::filesystem::is_regular_file(
+                src_assets / "sky_clouds.png", ec) &&
+            !ec) {
+            return src_assets;
+        }
+    }
+    return std::nullopt;
+}
+
+} // namespace
+
+std::optional<std::filesystem::path> find_packable_engine_runtime_binary() {
+#if defined(_WIN32)
+    constexpr std::string_view runtime_filename{"vulkan_cube.exe"};
+#else
+    constexpr std::string_view runtime_filename{"vulkan_cube"};
+#endif
+    std::error_code ec;
+    if (const auto workspace = discover_workspace_root()) {
+        static constexpr std::array<std::string_view, 3U> build_trees{
+            "windows-release",
+            "windows-debug",
+            "windows-asan",
+        };
+        for (const std::string_view tree : build_trees) {
+            ec.clear();
+            const std::filesystem::path candidate =
+                *workspace / "build" / tree / "bin" / runtime_filename;
+            if (std::filesystem::is_regular_file(candidate, ec) && !ec) {
+                return normalize_project_path(candidate);
+            }
+        }
+    }
+    if (const auto exe_dir = executable_parent_directory()) {
+        ec.clear();
+        const std::filesystem::path direct = *exe_dir / runtime_filename;
+        if (std::filesystem::is_regular_file(direct, ec) && !ec) {
+            return normalize_project_path(direct);
+        }
+    }
+    return std::nullopt;
+}
+
+bool bundle_project_runtime(
+    const std::filesystem::path& project_directory,
+    BundleProjectRuntimeResult& output,
+    std::string& error,
+    const std::filesystem::path& explicit_engine_exe) {
+    output = BundleProjectRuntimeResult{};
+    error.clear();
+
+    const ProjectInspection inspection =
+        inspect_project_directory(project_directory);
+    if (inspection.state != ProjectDiskState::ready) {
+        error = inspection.diagnostic.empty()
+            ? std::string("Project directory is not ready.")
+            : inspection.diagnostic;
+        return false;
+    }
+
+    std::filesystem::path engine_exe = explicit_engine_exe;
+    if (engine_exe.empty()) {
+        const auto found = find_packable_engine_runtime_binary();
+        if (!found) {
+            error = "Unable to locate compiled engine binary (vulkan_cube.exe). "
+                    "Build Windows Release first.";
+            return false;
+        }
+        engine_exe = *found;
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(engine_exe, ec) || ec) {
+        error = "Engine runtime binary does not exist: " +
+                path_to_utf8(engine_exe);
+        return false;
+    }
+
+    const std::filesystem::path exe_dir = engine_exe.parent_path();
+    const auto workspace = discover_workspace_root();
+
+    const auto shaders_src = locate_spv_shaders_dir(exe_dir, workspace);
+    if (!shaders_src) {
+        error = "Unable to locate compiled SPIR-V shaders directory.";
+        return false;
+    }
+    const auto core_assets_src = locate_core_assets_dir(exe_dir, workspace);
+    if (!core_assets_src) {
+        error = "Unable to locate core engine assets (sky_clouds.png, smaa/).";
+        return false;
+    }
+
+    ProjectManifest manifest = inspection.manifest;
+    bool manifest_needs_save = false;
+    if (manifest.executable.empty()) {
+        manifest.executable = default_project_executable_filename(
+            path_to_utf8(inspection.project_directory.filename()));
+        manifest_needs_save = true;
+    }
+    if (manifest.icon_path.empty()) {
+        manifest.icon_path = "icon.ico";
+        manifest_needs_save = true;
+    }
+    const std::filesystem::path manifest_file =
+        inspection.project_directory / project_manifest_filename;
+    if (manifest_needs_save) {
+        if (!save_project_manifest(manifest, manifest_file, error)) {
+            return false;
+        }
+    }
+
+    const std::filesystem::path target_exe =
+        inspection.project_directory / path_from_utf8(manifest.executable);
+    const std::filesystem::path target_icon =
+        inspection.project_directory / path_from_utf8(manifest.icon_path);
+
+    // 1. Copy the engine runtime executable as <project>/<executable>.
+    if (!copy_file_atomically(engine_exe, target_exe, error)) {
+        return false;
+    }
+
+    // 2. Copy FidelityFX FSR 3 runtime DLL beside the executable if present.
+    bool copied_fsr3 = false;
+    const std::filesystem::path fsr3_src = exe_dir / "amd_fidelityfx_vk.dll";
+    ec.clear();
+    if (std::filesystem::is_regular_file(fsr3_src, ec) && !ec) {
+        if (!copy_file_atomically(
+                fsr3_src,
+                inspection.project_directory / "amd_fidelityfx_vk.dll",
+                error)) {
+            return false;
+        }
+        copied_fsr3 = true;
+    }
+
+    // 3. Populate <project>/engine/shaders/*.spv.
+    const std::filesystem::path target_shaders =
+        inspection.project_directory / "engine" / "shaders";
+    std::filesystem::create_directories(target_shaders, ec);
+    if (ec) {
+        error = "Unable to create engine/shaders directory: " + ec.message();
+        return false;
+    }
+    std::size_t copied_shaders = 0U;
+    for (const auto& entry :
+         std::filesystem::recursive_directory_iterator(*shaders_src, ec)) {
+        if (ec) {
+            error = "Failed iterating SPIR-V shaders: " + ec.message();
+            return false;
+        }
+        std::error_code item_ec;
+        if (!entry.is_regular_file(item_ec) || item_ec) {
+            continue;
+        }
+        if (entry.path().extension() != ".spv") {
+            continue;
+        }
+        const std::filesystem::path rel =
+            std::filesystem::relative(entry.path(), *shaders_src, item_ec);
+        if (item_ec || rel.empty()) {
+            continue;
+        }
+        if (!copy_file_atomically(entry.path(), target_shaders / rel, error)) {
+            return false;
+        }
+        ++copied_shaders;
+    }
+    if (copied_shaders == 0U) {
+        error = "No SPIR-V shader binaries found in " + path_to_utf8(*shaders_src);
+        return false;
+    }
+
+    // 4. Populate <project>/engine/assets/ (sky_clouds.png + SMAA lookup tables).
+    const std::filesystem::path target_core_assets =
+        inspection.project_directory / "engine" / "assets";
+    if (!copy_file_atomically(
+            *core_assets_src / "sky_clouds.png",
+            target_core_assets / "sky_clouds.png",
+            error)) {
+        return false;
+    }
+    for (const char* smaa_file : {"smaa/AreaTexRG8.dds", "smaa/SearchTexR8.dds"}) {
+        const std::filesystem::path src_smaa = *core_assets_src / smaa_file;
+        ec.clear();
+        if (!std::filesystem::is_regular_file(src_smaa, ec) || ec) {
+            error = "Missing core SMAA lookup asset: " + path_to_utf8(src_smaa);
+            return false;
+        }
+        if (!copy_file_atomically(
+                src_smaa, target_core_assets / smaa_file, error)) {
+            return false;
+        }
+    }
+
+    // 5. Copy LICENSES if available.
+    std::filesystem::path licenses_src = exe_dir / "LICENSES";
+    ec.clear();
+    if (!std::filesystem::is_directory(licenses_src, ec) || ec) {
+        if (workspace) {
+            licenses_src = *workspace / "LICENSES";
+        }
+    }
+    ec.clear();
+    if (std::filesystem::is_directory(licenses_src, ec) && !ec) {
+        const std::filesystem::path target_licenses =
+            inspection.project_directory / "engine" / "LICENSES";
+        for (const auto& entry :
+             std::filesystem::recursive_directory_iterator(licenses_src, ec)) {
+            if (ec) {
+                break;
+            }
+            std::error_code item_ec;
+            if (!entry.is_regular_file(item_ec) || item_ec) {
+                continue;
+            }
+            const std::filesystem::path rel =
+                std::filesystem::relative(entry.path(), licenses_src, item_ec);
+            if (!item_ec && !rel.empty()) {
+                static_cast<void>(copy_file_atomically(
+                    entry.path(), target_licenses / rel, error));
+            }
+        }
+    }
+
+    // 6. Ensure icon.ico exists and embed it into <project>/<executable>.
+    ec.clear();
+    if (!std::filesystem::is_regular_file(target_icon, ec) || ec) {
+        if (!write_builtin_ico_file(
+                BuiltinIconKind::project_default, target_icon, error)) {
+            return false;
+        }
+    }
+
+    std::vector<std::uint8_t> ico_bytes;
+    if (!read_binary_file(target_icon, ico_bytes, error)) {
+        return false;
+    }
+    if (!apply_ico_to_pe_executable(target_exe, ico_bytes, error)) {
+        return false;
+    }
+
+    output.project_directory = inspection.project_directory;
+    output.executable_path = target_exe;
+    output.icon_path = target_icon;
+    output.copied_shaders = copied_shaders;
+    output.copied_fsr3_dll = copied_fsr3;
+    output.icon_embedded = true;
+    return true;
+}
+
+bool set_project_icon(
+    const std::filesystem::path& project_directory,
+    const std::filesystem::path& source_image_or_ico,
+    std::string& error) {
+    error.clear();
+    const ProjectInspection inspection =
+        inspect_project_directory(project_directory);
+    if (inspection.state != ProjectDiskState::ready) {
+        error = inspection.diagnostic.empty()
+            ? std::string("Project directory is not ready.")
+            : inspection.diagnostic;
+        return false;
+    }
+
+    std::vector<std::uint8_t> ico_bytes;
+    IconRgbaImage preview;
+    if (!load_or_convert_to_ico_bytes(
+            source_image_or_ico, ico_bytes, preview, error)) {
+        return false;
+    }
+
+    const std::filesystem::path icon_dest = inspection.icon_file_path;
+    if (!atomic_write_bytes(icon_dest, ico_bytes, error)) {
+        return false;
+    }
+
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(inspection.executable_path, ec) &&
+        !ec) {
+        return apply_ico_to_pe_executable(
+            inspection.executable_path, ico_bytes, error);
+    }
+
+    // If the standalone executable hasn't been bundled yet and the engine binary
+    // is available, bundle it automatically so the user gets an icon-stamped .exe.
+    if (find_packable_engine_runtime_binary().has_value()) {
+        BundleProjectRuntimeResult bundled{};
+        return bundle_project_runtime(
+            inspection.project_directory, bundled, error);
+    }
+    return true;
+}
+
+bool reset_project_icon_to_default(
+    const std::filesystem::path& project_directory,
+    std::string& error) {
+    error.clear();
+    const ProjectInspection inspection =
+        inspect_project_directory(project_directory);
+    if (inspection.state != ProjectDiskState::ready) {
+        error = inspection.diagnostic.empty()
+            ? std::string("Project directory is not ready.")
+            : inspection.diagnostic;
+        return false;
+    }
+
+    std::vector<std::uint8_t> ico_bytes;
+    if (!encode_builtin_ico(
+            BuiltinIconKind::project_default, ico_bytes, error)) {
+        return false;
+    }
+    if (!atomic_write_bytes(inspection.icon_file_path, ico_bytes, error)) {
+        return false;
+    }
+
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(inspection.executable_path, ec) &&
+        !ec) {
+        return apply_ico_to_pe_executable(
+            inspection.executable_path, ico_bytes, error);
+    }
+    return true;
 }
 
 } // namespace vcr

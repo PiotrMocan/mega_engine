@@ -2,20 +2,32 @@
 #include "cli_options.hpp"
 #include "cooked_model_asset.hpp"
 #include "cooked_texture_asset.hpp"
+#include "icon_system.hpp"
+#include "png_encoder.hpp"
 #include "prefab_io.hpp"
 #include "project_system.hpp"
 #include "runtime_assets.hpp"
 #include "scene_document.hpp"
 #include "scene_io.hpp"
 
+#include <array>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <span>
 #include <string>
 #include <system_error>
 #include <vector>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -76,6 +88,14 @@ void test_slug_and_scene_path_validation() {
     REQUIRE(!vcr::valid_project_scene_relative_path("scenes/../secret.json"));
     REQUIRE(!vcr::valid_project_scene_relative_path("scenes\\editor_scene.json"));
     REQUIRE(!vcr::valid_project_scene_relative_path("/scenes/editor_scene.json"));
+
+    REQUIRE(vcr::default_project_executable_filename("Neon City") == "neon_city.exe");
+    REQUIRE(vcr::valid_project_executable_filename("neon_city.exe"));
+    REQUIRE(!vcr::valid_project_executable_filename("dir/neon_city.exe"));
+    REQUIRE(!vcr::valid_project_executable_filename("neon_city.txt"));
+    REQUIRE(vcr::valid_project_icon_relative_path("icon.ico"));
+    REQUIRE(!vcr::valid_project_icon_relative_path("../icon.ico"));
+    REQUIRE(!vcr::valid_project_icon_relative_path("icon.png"));
 }
 
 void test_standard_template_creation_and_assets() {
@@ -90,6 +110,7 @@ void test_standard_template_creation_and_assets() {
                 .parent_directory = temp.path(),
                 .folder_name = {},
                 .template_kind = vcr::ProjectTemplateKind::standard,
+                .bundle_runtime = false,
             },
             created,
             error),
@@ -98,6 +119,8 @@ void test_standard_template_creation_and_assets() {
     REQUIRE(created.manifest.name == "Standard Template Check");
     REQUIRE(created.manifest.template_id == "standard");
     REQUIRE(created.manifest.startup_scene == "scenes/editor_scene.json");
+    REQUIRE(created.manifest.executable == "standard_template_check.exe");
+    REQUIRE(created.manifest.icon_path == "icon.ico");
 
     const vcr::ProjectInspection inspection =
         vcr::inspect_project_directory(created.project_directory);
@@ -105,6 +128,7 @@ void test_standard_template_creation_and_assets() {
         inspection.state == vcr::ProjectDiskState::ready,
         inspection.diagnostic);
     REQUIRE(inspection.startup_scene_exists);
+    REQUIRE(inspection.icon_exists);
     REQUIRE(inspection.scene_relative_paths.size() == 1U);
     REQUIRE(inspection.scene_relative_paths[0] == "scenes/editor_scene.json");
 
@@ -193,6 +217,7 @@ void test_empty_template_and_registry_lifecycle() {
                 .description = "Minimal plane only",
                 .parent_directory = projects_dir,
                 .template_kind = vcr::ProjectTemplateKind::empty,
+                .bundle_runtime = false,
             },
             minimal,
             error),
@@ -278,6 +303,245 @@ void test_cli_project_option() {
     }
 }
 
+void write_bytes_file(
+    const std::filesystem::path& path,
+    const std::span<const std::uint8_t> bytes) {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    REQUIRE(static_cast<bool>(out));
+    if (!bytes.empty()) {
+        out.write(
+            reinterpret_cast<const char*>(bytes.data()),
+            static_cast<std::streamsize>(bytes.size()));
+    }
+    out.flush();
+    REQUIRE(static_cast<bool>(out));
+}
+
+void write_text_file(
+    const std::filesystem::path& path,
+    const std::string_view text) {
+    write_bytes_file(
+        path,
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(text.data()),
+            text.size()));
+}
+
+[[nodiscard]] std::vector<std::uint8_t> read_binary_file(
+    const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    REQUIRE(static_cast<bool>(in));
+    const std::streamoff size = in.tellg();
+    REQUIRE(size >= 0);
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+    in.seekg(0, std::ios::beg);
+    if (!bytes.empty()) {
+        in.read(
+            reinterpret_cast<char*>(bytes.data()),
+            static_cast<std::streamsize>(bytes.size()));
+    }
+    REQUIRE(static_cast<bool>(in));
+    return bytes;
+}
+
+void test_icon_generation_conversion_and_pe_patching() {
+    std::string error;
+    constexpr std::array<vcr::BuiltinIconKind, 5U> kinds{{
+        vcr::BuiltinIconKind::engine,
+        vcr::BuiltinIconKind::editor,
+        vcr::BuiltinIconKind::project_default,
+        vcr::BuiltinIconKind::project_manager,
+        vcr::BuiltinIconKind::icon_tool,
+    }};
+    for (const vcr::BuiltinIconKind kind : kinds) {
+        const vcr::IconRgbaImage img =
+            vcr::generate_builtin_icon_rgba(kind, 256U);
+        REQUIRE(img.valid());
+        REQUIRE(img.width == 256U);
+        REQUIRE(img.height == 256U);
+
+        std::uint64_t opaque_count = 0U;
+        for (std::size_t i = 3U; i < img.pixels.size(); i += 4U) {
+            if (img.pixels[i] > 200U) {
+                ++opaque_count;
+            }
+        }
+        REQUIRE(opaque_count > 10000U);
+
+        std::vector<std::uint8_t> ico_bytes;
+        REQUIRE_MSG(vcr::encode_builtin_ico(kind, ico_bytes, error), error);
+        REQUIRE(ico_bytes.size() > 1000U);
+        const std::uint16_t entry_count = static_cast<std::uint16_t>(
+            ico_bytes[4] | (static_cast<std::uint16_t>(ico_bytes[5]) << 8U));
+        REQUIRE(entry_count == 6U);
+    }
+
+    // Create a custom non-square PNG and verify conversion to multi-size .ico.
+    const std::uint32_t w = 64U;
+    const std::uint32_t h = 48U;
+    std::vector<std::uint8_t> custom_rgba(static_cast<std::size_t>(w) * h * 4U);
+    for (std::uint32_t y = 0U; y < h; ++y) {
+        for (std::uint32_t x = 0U; x < w; ++x) {
+            const std::size_t idx =
+                (static_cast<std::size_t>(y) * w + x) * 4U;
+            custom_rgba[idx + 0U] = static_cast<std::uint8_t>((x * 255U) / w);
+            custom_rgba[idx + 1U] = static_cast<std::uint8_t>((y * 255U) / h);
+            custom_rgba[idx + 2U] = 220U;
+            custom_rgba[idx + 3U] = 255U;
+        }
+    }
+    const vcr::PngEncodeResult png = vcr::encode_png_rgba(custom_rgba, w, h);
+    REQUIRE_MSG(static_cast<bool>(png), png.error);
+
+    const ScopedTempDir temp;
+    const std::filesystem::path custom_png_path = temp.path() / "custom.png";
+    write_bytes_file(custom_png_path, png.bytes);
+
+    std::vector<std::uint8_t> custom_ico_bytes;
+    vcr::IconRgbaImage preview{};
+    REQUIRE_MSG(
+        vcr::load_or_convert_to_ico_bytes(
+            custom_png_path, custom_ico_bytes, preview, error),
+        error);
+    REQUIRE(preview.valid());
+    const std::uint16_t custom_entries = static_cast<std::uint16_t>(
+        custom_ico_bytes[4] |
+        (static_cast<std::uint16_t>(custom_ico_bytes[5]) << 8U));
+    REQUIRE(custom_entries == 6U);
+
+#if defined(_WIN32)
+    std::array<wchar_t, 4096U> self_buf{};
+    const DWORD len = GetModuleFileNameW(
+        nullptr, self_buf.data(), static_cast<DWORD>(self_buf.size()));
+    REQUIRE(len > 0U && len < self_buf.size());
+    const std::filesystem::path self_exe(self_buf.data());
+    const std::filesystem::path dummy_exe = temp.path() / "dummy_game.exe";
+    std::filesystem::copy_file(
+        self_exe, dummy_exe, std::filesystem::copy_options::overwrite_existing);
+
+    REQUIRE_MSG(
+        vcr::apply_ico_to_pe_executable(dummy_exe, custom_ico_bytes, error),
+        error);
+    std::uint32_t frame_count = 0U;
+    REQUIRE_MSG(
+        vcr::read_pe_executable_icon_frame_count(dummy_exe, frame_count, error),
+        error);
+    REQUIRE(frame_count == 6U);
+#endif
+}
+
+void test_project_bundle_and_icon_workflow() {
+    const ScopedTempDir temp;
+    const std::filesystem::path projects_dir = temp.path() / "projects";
+    vcr::CreateProjectResult created{};
+    std::string error;
+    REQUIRE_MSG(
+        vcr::create_project_on_disk(
+            vcr::CreateProjectOptions{
+                .name = "Portable Test Game",
+                .description = "Standalone bundle check",
+                .parent_directory = projects_dir,
+                .template_kind = vcr::ProjectTemplateKind::standard,
+                .bundle_runtime = false,
+            },
+            created,
+            error),
+        error);
+
+#if defined(_WIN32)
+    std::array<wchar_t, 4096U> self_buf{};
+    const DWORD len = GetModuleFileNameW(
+        nullptr, self_buf.data(), static_cast<DWORD>(self_buf.size()));
+    REQUIRE(len > 0U && len < self_buf.size());
+    const std::filesystem::path fake_bin = temp.path() / "fake_bin";
+    std::filesystem::create_directories(fake_bin);
+    const std::filesystem::path fake_engine_exe = fake_bin / "vulkan_cube.exe";
+    std::filesystem::copy_file(
+        std::filesystem::path(self_buf.data()),
+        fake_engine_exe,
+        std::filesystem::copy_options::overwrite_existing);
+    write_text_file(fake_bin / "amd_fidelityfx_vk.dll", "FAKE_FFX_DLL");
+    write_text_file(fake_bin / "shaders/cube.vert.spv", "FAKE_SPV");
+    write_text_file(fake_bin / "assets/sky_clouds.png", "FAKE_SKY");
+    write_text_file(fake_bin / "assets/smaa/AreaTexRG8.dds", "FAKE_AREA");
+    write_text_file(fake_bin / "assets/smaa/SearchTexR8.dds", "FAKE_SEARCH");
+    write_text_file(fake_bin / "LICENSES/LICENSE.txt", "MIT");
+
+    vcr::BundleProjectRuntimeResult bundle_res{};
+    REQUIRE_MSG(
+        vcr::bundle_project_runtime(
+            created.project_directory, bundle_res, error, fake_engine_exe),
+        error);
+    REQUIRE(bundle_res.copied_fsr3_dll);
+    REQUIRE(bundle_res.copied_shaders >= 1U);
+    REQUIRE(bundle_res.icon_embedded);
+    REQUIRE(std::filesystem::is_regular_file(
+        created.project_directory / "portable_test_game.exe"));
+    REQUIRE(std::filesystem::is_regular_file(
+        created.project_directory / "amd_fidelityfx_vk.dll"));
+    REQUIRE(std::filesystem::is_regular_file(
+        created.project_directory / "icon.ico"));
+    REQUIRE(std::filesystem::is_regular_file(
+        created.project_directory / "engine/shaders/cube.vert.spv"));
+    REQUIRE(std::filesystem::is_regular_file(
+        created.project_directory / "engine/assets/sky_clouds.png"));
+    REQUIRE(std::filesystem::is_regular_file(
+        created.project_directory / "engine/assets/smaa/AreaTexRG8.dds"));
+    REQUIRE(std::filesystem::is_regular_file(
+        created.project_directory / "engine/LICENSES/LICENSE.txt"));
+
+    const vcr::ProjectInspection after_bundle =
+        vcr::inspect_project_directory(created.project_directory);
+    REQUIRE(after_bundle.runtime_bundled);
+    REQUIRE(after_bundle.icon_exists);
+
+    vcr::AssetBrowser browser;
+    REQUIRE_MSG(browser.initialize(after_bundle.assets_directory, error), error);
+
+    std::uint32_t frame_count = 0U;
+    REQUIRE_MSG(
+        vcr::read_pe_executable_icon_frame_count(
+            after_bundle.executable_path, frame_count, error),
+        error);
+    REQUIRE(frame_count == 6U);
+
+    // Apply a custom PNG icon and confirm project icon.ico + PE icon update cleanly.
+    const std::vector<std::uint8_t> default_ico_bytes =
+        read_binary_file(after_bundle.icon_file_path);
+    std::vector<std::uint8_t> red_rgba(32U * 32U * 4U, 255U);
+    for (std::size_t i = 0U; i < red_rgba.size(); i += 4U) {
+        red_rgba[i + 0U] = 240U;
+        red_rgba[i + 1U] = 40U;
+        red_rgba[i + 2U] = 50U;
+        red_rgba[i + 3U] = 255U;
+    }
+    const vcr::PngEncodeResult red_png = vcr::encode_png_rgba(red_rgba, 32U, 32U);
+    REQUIRE_MSG(static_cast<bool>(red_png), red_png.error);
+    const std::filesystem::path red_png_path = temp.path() / "red_icon.png";
+    write_bytes_file(red_png_path, red_png.bytes);
+
+    REQUIRE_MSG(
+        vcr::set_project_icon(created.project_directory, red_png_path, error),
+        error);
+    const std::vector<std::uint8_t> custom_ico_bytes =
+        read_binary_file(after_bundle.icon_file_path);
+    REQUIRE(custom_ico_bytes != default_ico_bytes);
+    REQUIRE_MSG(
+        vcr::read_pe_executable_icon_frame_count(
+            after_bundle.executable_path, frame_count, error),
+        error);
+    REQUIRE(frame_count == 6U);
+
+    REQUIRE_MSG(
+        vcr::reset_project_icon_to_default(created.project_directory, error),
+        error);
+    const std::vector<std::uint8_t> restored_ico_bytes =
+        read_binary_file(after_bundle.icon_file_path);
+    REQUIRE(restored_ico_bytes == default_ico_bytes);
+#endif
+}
+
 } // namespace
 
 int main() {
@@ -285,6 +549,8 @@ int main() {
     test_standard_template_creation_and_assets();
     test_empty_template_and_registry_lifecycle();
     test_cli_project_option();
+    test_icon_generation_conversion_and_pe_patching();
+    test_project_bundle_and_icon_workflow();
     std::cout << "All project system tests passed.\n";
     return 0;
 }

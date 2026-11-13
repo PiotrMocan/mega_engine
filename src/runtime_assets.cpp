@@ -40,6 +40,7 @@ namespace {
         return RuntimeAssetRoot{
             .path = std::move(canonical_assets),
             .project_root = inspection.project_directory,
+            .project_icon_path = inspection.icon_file_path,
             .project_name = inspection.manifest.name,
             .startup_scene_relative_path = inspection.manifest.startup_scene,
             .project_owned = true,
@@ -67,6 +68,7 @@ namespace {
                     return RuntimeAssetRoot{
                         .path = std::move(canonical_assets),
                         .project_root = inspection.project_directory,
+                        .project_icon_path = inspection.icon_file_path,
                         .project_name = inspection.manifest.name,
                         .startup_scene_relative_path =
                             inspection.manifest.startup_scene,
@@ -166,6 +168,14 @@ std::optional<RuntimeAssetRoot> find_runtime_asset_root(
         }
     }
 
+    const char* const base_path = SDL_GetBasePath();
+    if (base_path != nullptr) {
+        if (auto bundled_project =
+                find_ancestor_user_project(std::filesystem::path(base_path))) {
+            return bundled_project;
+        }
+    }
+
     const std::filesystem::path working_directory =
         std::filesystem::current_path(filesystem_error);
     if (!filesystem_error) {
@@ -177,7 +187,6 @@ std::optional<RuntimeAssetRoot> find_runtime_asset_root(
         }
     }
 
-    const char* const base_path = SDL_GetBasePath();
     if (base_path == nullptr) {
         return std::nullopt;
     }

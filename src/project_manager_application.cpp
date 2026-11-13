@@ -125,7 +125,18 @@ void print_pm_usage() {
         << "    --init-manifest       Create project.vcrproject.json if missing\n"
         << "  --remove DIR            Remove a project from registry (keeps files)\n"
         << "  --scan DIR              Scan immediate subfolders for projects\n"
+        << "  --build-game DIR        Bundle standalone game .exe and runtime in DIR\n"
+        << "  --build-all-games       Bundle standalone game .exe for all ready projects\n"
+        << "  --set-icon DIR          Apply --icon image/.ico to project DIR\n"
+        << "    --icon FILE           Source .png/.ico/.jpg/.bmp/.tga for --set-icon\n"
         << "  -h, --help              Show this help text\n";
+}
+
+[[nodiscard]] bool is_supported_pm_icon_extension(
+    const std::filesystem::path& path) {
+    const std::string ext = ascii_lowercase(path_to_utf8_str(path.extension()));
+    return ext == ".png" || ext == ".ico" || ext == ".jpg" ||
+           ext == ".jpeg" || ext == ".bmp" || ext == ".tga";
 }
 
 #if defined(_WIN32)
@@ -135,12 +146,18 @@ void print_pm_usage() {
 [[nodiscard]] std::string executable_name_runtime() noexcept {
     return "vulkan_cube.exe";
 }
+[[nodiscard]] std::string executable_name_icon_tool() noexcept {
+    return "vulkan_icon_tool.exe";
+}
 #else
 [[nodiscard]] std::string executable_name_editor() noexcept {
     return "vulkan_editor";
 }
 [[nodiscard]] std::string executable_name_runtime() noexcept {
     return "vulkan_cube";
+}
+[[nodiscard]] std::string executable_name_icon_tool() noexcept {
+    return "vulkan_icon_tool";
 }
 #endif
 
@@ -277,6 +294,36 @@ bool ProjectManagerApplication::parse_cli(
             out.target_directory = std::string(val);
             continue;
         }
+        if (arg == "--build-game") {
+            std::string_view val;
+            if (!require_value(val)) {
+                return false;
+            }
+            out.cli_build_game = true;
+            out.target_directory = std::string(val);
+            continue;
+        }
+        if (arg == "--build-all-games") {
+            out.cli_build_all_games = true;
+            continue;
+        }
+        if (arg == "--set-icon") {
+            std::string_view val;
+            if (!require_value(val)) {
+                return false;
+            }
+            out.cli_set_icon = true;
+            out.target_directory = std::string(val);
+            continue;
+        }
+        if (arg == "--icon") {
+            std::string_view val;
+            if (!require_value(val)) {
+                return false;
+            }
+            out.icon_source_path = std::string(val);
+            continue;
+        }
         if (arg == "--width") {
             std::string_view val;
             if (!require_value(val)) {
@@ -343,9 +390,20 @@ bool ProjectManagerApplication::parse_cli(
         (out.cli_create ? 1 : 0) +
         (out.cli_register ? 1 : 0) +
         (out.cli_remove ? 1 : 0) +
-        (out.cli_scan ? 1 : 0);
+        (out.cli_scan ? 1 : 0) +
+        (out.cli_build_game ? 1 : 0) +
+        (out.cli_build_all_games ? 1 : 0) +
+        (out.cli_set_icon ? 1 : 0);
     if (action_count > 1) {
-        error = "Specify only one CLI action (--list, --create, --register, --remove, or --scan).";
+        error = "Specify only one CLI action (--list, --create, --register, --remove, --scan, --build-game, --build-all-games, or --set-icon).";
+        return false;
+    }
+    if (out.cli_set_icon && out.icon_source_path.empty()) {
+        error = "--set-icon requires --icon <image_or_ico>.";
+        return false;
+    }
+    if (!out.icon_source_path.empty() && !out.cli_set_icon) {
+        error = "--icon can only be used together with --set-icon <DIR>.";
         return false;
     }
     return true;
@@ -366,7 +424,9 @@ int ProjectManagerApplication::run(const int argc, char** const argv) {
     registry_file_path_ = default_project_registry_path(options_.registry_path);
 
     if (options_.cli_list || options_.cli_create ||
-        options_.cli_register || options_.cli_remove || options_.cli_scan) {
+        options_.cli_register || options_.cli_remove || options_.cli_scan ||
+        options_.cli_build_game || options_.cli_build_all_games ||
+        options_.cli_set_icon) {
         return run_cli_action(options_);
     }
 
@@ -424,6 +484,16 @@ int ProjectManagerApplication::run_cli_action(
             item["scenes"] = insp.scene_relative_paths;
             item["status"] = project_disk_state_label(insp.state);
             item["ready"] = insp.state == ProjectDiskState::ready;
+            item["executable"] =
+                insp.state == ProjectDiskState::ready
+                    ? insp.manifest.executable
+                    : std::string{};
+            item["runtime_bundled"] = insp.runtime_bundled;
+            item["icon"] =
+                insp.state == ProjectDiskState::ready
+                    ? insp.manifest.icon_path
+                    : std::string{};
+            item["icon_exists"] = insp.icon_exists;
             item["pinned"] = entry.pinned;
             item["last_opened_utc"] = entry.last_opened_utc;
             list.push_back(std::move(item));
@@ -464,6 +534,11 @@ int ProjectManagerApplication::run_cli_action(
         out["project_directory"] = path_to_utf8_str(created.project_directory);
         out["template"] = created.manifest.template_id;
         out["startup_scene"] = created.manifest.startup_scene;
+        out["executable"] = created.manifest.executable;
+        out["runtime_bundled"] = created.runtime_bundled;
+        if (!created.bundle_warning.empty()) {
+            out["bundle_warning"] = created.bundle_warning;
+        }
         std::cout << out.dump(2) << '\n';
         return 0;
     }
@@ -522,6 +597,81 @@ int ProjectManagerApplication::run_cli_action(
         return 0;
     }
 
+    if (options.cli_build_game) {
+        const std::filesystem::path dir =
+            path_from_utf8_str(options.target_directory);
+        BundleProjectRuntimeResult res{};
+        if (!bundle_project_runtime(dir, res, error)) {
+            std::cerr << "Build game failed: " << error << '\n';
+            return 1;
+        }
+        Json out = Json::object();
+        out["project_directory"] = path_to_utf8_str(res.project_directory);
+        out["executable_path"] = path_to_utf8_str(res.executable_path);
+        out["icon_path"] = path_to_utf8_str(res.icon_path);
+        out["copied_shaders"] = res.copied_shaders;
+        out["copied_fsr3_dll"] = res.copied_fsr3_dll;
+        out["icon_embedded"] = res.icon_embedded;
+        std::cout << out.dump(2) << '\n';
+        return 0;
+    }
+
+    if (options.cli_build_all_games) {
+        Json built = Json::array();
+        Json failed = Json::array();
+        std::size_t ready_count = 0U;
+        for (const ProjectRegistryEntry& entry : registry_.entries()) {
+            const ProjectInspection insp =
+                inspect_project_directory(entry.project_directory);
+            if (insp.state != ProjectDiskState::ready) {
+                continue;
+            }
+            ++ready_count;
+            BundleProjectRuntimeResult res{};
+            std::string build_err;
+            if (bundle_project_runtime(entry.project_directory, res, build_err)) {
+                Json row = Json::object();
+                row["name"] = insp.manifest.name;
+                row["executable_path"] = path_to_utf8_str(res.executable_path);
+                row["icon_embedded"] = res.icon_embedded;
+                row["copied_shaders"] = res.copied_shaders;
+                built.push_back(std::move(row));
+            } else {
+                Json row = Json::object();
+                row["name"] = insp.manifest.name;
+                row["project_directory"] =
+                    path_to_utf8_str(entry.project_directory);
+                row["error"] = build_err;
+                failed.push_back(std::move(row));
+            }
+        }
+        Json out = Json::object();
+        out["ready_projects"] = ready_count;
+        out["built"] = built;
+        out["failed"] = failed;
+        std::cout << out.dump(2) << '\n';
+        return (ready_count > 0U && failed.empty()) ? 0 : 1;
+    }
+
+    if (options.cli_set_icon) {
+        const std::filesystem::path dir =
+            path_from_utf8_str(options.target_directory);
+        const std::filesystem::path src =
+            path_from_utf8_str(options.icon_source_path);
+        if (!set_project_icon(dir, src, error)) {
+            std::cerr << "Set project icon failed: " << error << '\n';
+            return 1;
+        }
+        const ProjectInspection insp = inspect_project_directory(dir);
+        Json out = Json::object();
+        out["project_directory"] = path_to_utf8_str(insp.project_directory);
+        out["icon_path"] = path_to_utf8_str(insp.icon_file_path);
+        out["runtime_bundled"] = insp.runtime_bundled;
+        out["executable_path"] = path_to_utf8_str(insp.executable_path);
+        std::cout << out.dump(2) << '\n';
+        return 0;
+    }
+
     return 0;
 }
 
@@ -543,6 +693,8 @@ void ProjectManagerApplication::initialize_gui(
         fatal(SDL_GetError());
     }
     SDL_SetWindowMinimumSize(window_.get(), 920, 560);
+    apply_window_builtin_icon(
+        window_.get(), BuiltinIconKind::project_manager);
 
     context_.initialize(window_.get(), options.validation);
     swapchain_.initialize(
@@ -580,6 +732,17 @@ void ProjectManagerApplication::initialize_gui(
 
 void ProjectManagerApplication::initialize_frame_resources() {
     const VkDevice device = context_.device();
+    const VkCommandPoolCreateInfo upload_pool_info{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+        .queueFamilyIndex = context_.queue_families().graphics,
+    };
+    VK_CHECK(vkCreateCommandPool(
+        device,
+        &upload_pool_info,
+        nullptr,
+        upload_command_pool_.put(device, vkDestroyCommandPool)));
+
     for (std::size_t i = 0U; i < frames_in_flight; ++i) {
         FrameSlot& slot = frames_[i];
         const VkCommandPoolCreateInfo pool_info{
@@ -651,7 +814,7 @@ void ProjectManagerApplication::initialize_imgui_backend() {
     init_info.Device = context_.device();
     init_info.QueueFamily = context_.queue_families().graphics;
     init_info.Queue = context_.graphics_queue();
-    init_info.DescriptorPoolSize = 128U;
+    init_info.DescriptorPoolSize = 512U;
     init_info.MinImageCount = 2U;
     init_info.ImageCount =
         static_cast<std::uint32_t>(swapchain_.images().size());
@@ -692,12 +855,18 @@ void ProjectManagerApplication::handle_swapchain_resize() {
     resize_requested_ = false;
     rebuild_present_semaphores();
 
-    if (swapchain_.color_format() != prev_format) {
+    if (swapchain_.color_format() != prev_format ||
+        swapchain_.images().size() != prev_count) {
+        for (UiTexturePreview& old : retired_icon_previews_) {
+            old.destroy(imgui_vulkan_initialized_);
+        }
+        retired_icon_previews_.clear();
+        for (CachedProjectItem& item : items_) {
+            item.icon_preview.destroy(imgui_vulkan_initialized_);
+        }
         shutdown_imgui_backend();
         initialize_imgui_backend();
-    } else if (swapchain_.images().size() != prev_count) {
-        ImGui_ImplVulkan_SetMinImageCount(
-            static_cast<std::uint32_t>(swapchain_.images().size()));
+        icon_previews_dirty_ = true;
     }
 }
 
@@ -736,6 +905,53 @@ void ProjectManagerApplication::process_event(const SDL_Event& event) {
     case SDL_EVENT_WINDOW_RESIZED:
         resize_requested_ = true;
         break;
+    case SDL_EVENT_DROP_FILE:
+        if (event.drop.data != nullptr) {
+            const std::filesystem::path dropped =
+                path_from_utf8_str(event.drop.data);
+            std::error_code ec;
+            if (std::filesystem::is_directory(dropped, ec) && !ec) {
+                const ProjectInspection insp =
+                    inspect_project_directory(dropped);
+                if (insp.state == ProjectDiskState::ready) {
+                    std::string err;
+                    if (registry_.register_project_directory(
+                            dropped, err, false)) {
+                        save_registry();
+                        refresh_cached_inspections();
+                        for (std::size_t i = 0U; i < items_.size(); ++i) {
+                            std::error_code eq_ec;
+                            if (items_[i].entry.project_directory == dropped ||
+                                std::filesystem::equivalent(
+                                    items_[i].entry.project_directory,
+                                    dropped,
+                                    eq_ec)) {
+                                selected_index_ = i;
+                                sync_inspector_from_selection();
+                                break;
+                            }
+                        }
+                        status_message_ =
+                            "Registered and selected dropped project.";
+                        status_tone_ = EditorTone::success;
+                    } else {
+                        status_message_ = "Drop register failed: " + err;
+                        status_tone_ = EditorTone::danger;
+                    }
+                } else {
+                    status_message_ =
+                        "Dropped directory is not a ready project.";
+                    status_tone_ = EditorTone::warning;
+                }
+            } else if (is_supported_pm_icon_extension(dropped)) {
+                apply_icon_to_selected_project(dropped);
+            } else {
+                status_message_ =
+                    "Drop a .png/.ico/.jpg/.bmp/.tga icon onto a selected project, or a project folder.";
+                status_tone_ = EditorTone::warning;
+            }
+        }
+        break;
     default:
         break;
     }
@@ -747,6 +963,8 @@ void ProjectManagerApplication::draw_frame() {
 
     const VkFence fence = frame.in_flight.get();
     VK_CHECK(vkWaitForFences(device, 1U, &fence, VK_TRUE, UINT64_MAX));
+
+    sync_gpu_icon_previews();
 
     std::uint32_t image_index = 0U;
     const VkResult acquire = vkAcquireNextImageKHR(
@@ -902,6 +1120,13 @@ void ProjectManagerApplication::shutdown() noexcept {
                       << static_cast<int>(idle) << '\n';
         }
     }
+    for (UiTexturePreview& old : retired_icon_previews_) {
+        old.destroy(imgui_vulkan_initialized_);
+    }
+    retired_icon_previews_.clear();
+    for (CachedProjectItem& item : items_) {
+        item.icon_preview.destroy(imgui_vulkan_initialized_);
+    }
     shutdown_imgui_backend();
     ui_kit_.shutdown();
     if (ImGui::GetCurrentContext() != nullptr) {
@@ -910,6 +1135,7 @@ void ProjectManagerApplication::shutdown() noexcept {
         }
         ImGui::DestroyContext();
     }
+    upload_command_pool_.reset();
     for (FrameSlot& slot : frames_) {
         slot.in_flight.reset();
         slot.image_available.reset();
@@ -961,6 +1187,11 @@ void ProjectManagerApplication::refresh_cached_inspections() {
         prev_selected_dir = items_[*selected_index_].entry.project_directory;
     }
 
+    for (CachedProjectItem& old_item : items_) {
+        if (old_item.icon_preview.valid()) {
+            retired_icon_previews_.push_back(std::move(old_item.icon_preview));
+        }
+    }
     items_.clear();
     const auto entries = registry_.entries();
     items_.reserve(entries.size());
@@ -1008,7 +1239,60 @@ void ProjectManagerApplication::refresh_cached_inspections() {
     if (!selected_index_ && !items_.empty()) {
         selected_index_ = 0U;
     }
+    if (context_.device() != VK_NULL_HANDLE &&
+        upload_command_pool_.get() != VK_NULL_HANDLE) {
+        icon_previews_dirty_ = true;
+    }
     sync_inspector_from_selection();
+}
+
+void ProjectManagerApplication::sync_gpu_icon_previews() {
+    if (retired_icon_previews_.empty() && !icon_previews_dirty_) {
+        return;
+    }
+    if (context_.device() == VK_NULL_HANDLE ||
+        upload_command_pool_.get() == VK_NULL_HANDLE) {
+        return;
+    }
+
+    VK_CHECK(vkDeviceWaitIdle(context_.device()));
+    for (UiTexturePreview& old : retired_icon_previews_) {
+        old.destroy(imgui_vulkan_initialized_);
+    }
+    retired_icon_previews_.clear();
+
+    if (icon_previews_dirty_) {
+        const IconRgbaImage fallback_icon =
+            generate_builtin_icon_rgba(BuiltinIconKind::project_default, 64U);
+        for (CachedProjectItem& item : items_) {
+            if (item.icon_preview.valid()) {
+                continue;
+            }
+            IconRgbaImage preview_rgba{};
+            std::string load_err;
+            if (item.inspection.icon_exists &&
+                load_icon_source_image(
+                    item.inspection.icon_file_path, preview_rgba, load_err)) {
+                if (preview_rgba.width > 128U ||
+                    preview_rgba.height > 128U ||
+                    preview_rgba.width != preview_rgba.height) {
+                    preview_rgba =
+                        resize_rgba_square_icon(preview_rgba, 64U);
+                }
+            } else {
+                preview_rgba = fallback_icon;
+            }
+            std::string upload_err;
+            static_cast<void>(item.icon_preview.upload(
+                context_,
+                upload_command_pool_.get(),
+                preview_rgba,
+                "ProjectManagerCardIcon",
+                upload_err,
+                imgui_vulkan_initialized_));
+        }
+        icon_previews_dirty_ = false;
+    }
 }
 
 void ProjectManagerApplication::save_registry() {
@@ -1098,6 +1382,7 @@ void ProjectManagerApplication::build_ui() {
     build_add_existing_modal();
     build_remove_confirm_modal();
     build_folder_picker_modal();
+    build_icon_file_picker_modal();
 }
 
 void ProjectManagerApplication::build_header_bar() {
@@ -1271,13 +1556,25 @@ void ProjectManagerApplication::build_project_list_panel() {
 
         if (ImGui::BeginChild(
                 "##ProjectCard",
-                ImVec2(0.0F, 92.0F),
+                ImVec2(0.0F, 98.0F),
                 ImGuiChildFlags_Borders)) {
             const ImVec2 card_min = ImGui::GetWindowPos();
             const ImVec2 card_size = ImGui::GetWindowSize();
             const ImVec2 card_max(
                 card_min.x + card_size.x,
                 card_min.y + card_size.y);
+
+            if (item.icon_preview.valid()) {
+                ImGui::Image(
+                    item.icon_preview.imgui_id(),
+                    ImVec2(36.0F, 36.0F),
+                    ImVec2(0.0F, 0.0F),
+                    ImVec2(1.0F, 1.0F));
+            } else {
+                ImGui::Dummy(ImVec2(36.0F, 36.0F));
+            }
+            ImGui::SameLine(0.0F, 10.0F);
+            ImGui::Indent(46.0F);
 
             ImGui::TextUnformatted(item.entry.name.c_str());
             ImGui::SameLine(0.0F, 8.0F);
@@ -1287,6 +1584,15 @@ void ProjectManagerApplication::build_project_list_panel() {
 
             ImGui::SameLine(0.0F, 6.0F);
             ui_kit_.badge(item.entry.template_id.c_str(), EditorTone::info);
+
+            if (is_ready) {
+                ImGui::SameLine(0.0F, 6.0F);
+                ui_kit_.badge(
+                    item.inspection.runtime_bundled ? "GAME .EXE" : "NO .EXE",
+                    item.inspection.runtime_bundled
+                        ? EditorTone::success
+                        : EditorTone::warning);
+            }
 
             if (item.entry.pinned) {
                 ImGui::SameLine(0.0F, 6.0F);
@@ -1369,6 +1675,7 @@ void ProjectManagerApplication::build_project_list_panel() {
             }
 
             ImGui::TextDisabled("%s", item.directory_utf8.c_str());
+            ImGui::Unindent(46.0F);
 
             const bool hovered_card =
                 ImGui::IsMouseHoveringRect(card_min, card_max) &&
@@ -1600,6 +1907,72 @@ void ProjectManagerApplication::build_inspector_panel() {
                 ImGui::PopID();
             }
         }
+
+        ImGui::Spacing();
+        ui_kit_.section_header(EditorIcon::cube, "Standalone Game & Icon");
+        if (selected.icon_preview.valid()) {
+            ImGui::Image(
+                selected.icon_preview.imgui_id(),
+                ImVec2(64.0F, 64.0F),
+                ImVec2(0.0F, 0.0F),
+                ImVec2(1.0F, 1.0F));
+            ImGui::SameLine(0.0F, 12.0F);
+        }
+        ImGui::BeginGroup();
+        ImGui::Text(
+            "Executable: %s",
+            selected.inspection.manifest.executable.c_str());
+        ui_kit_.badge(
+            selected.inspection.runtime_bundled ? "GAME .EXE READY" : "NO .EXE",
+            selected.inspection.runtime_bundled
+                ? EditorTone::success
+                : EditorTone::warning);
+        ImGui::SameLine(0.0F, 6.0F);
+        ImGui::TextDisabled(
+            "Icon: %s (%s)",
+            selected.inspection.manifest.icon_path.c_str(),
+            selected.inspection.icon_exists ? "ok" : "missing");
+        ImGui::EndGroup();
+
+        ImGui::Spacing();
+        if (ui_kit_.action_button(
+                "InspectorBundleGame",
+                EditorIcon::cube,
+                selected.inspection.runtime_bundled
+                    ? "Update Game (.exe)"
+                    : "Build Game (.exe)",
+                EditorButtonStyle::secondary,
+                true,
+                false,
+                ImVec2(-1.0F, 0.0F))) {
+            bundle_selected_project_runtime();
+            return;
+        }
+        ImGui::Spacing();
+        if (ui_kit_.action_button(
+                "InspectorChangeIcon",
+                EditorIcon::save,
+                "Change Icon...",
+                EditorButtonStyle::secondary)) {
+            open_icon_file_picker(selected.entry.project_directory);
+        }
+        ImGui::SameLine(0.0F, 6.0F);
+        if (ui_kit_.action_button(
+                "InspectorResetIcon",
+                EditorIcon::revert,
+                "Reset Default",
+                EditorButtonStyle::quiet)) {
+            reset_selected_project_icon();
+            return;
+        }
+        ImGui::SameLine(0.0F, 6.0F);
+        if (ui_kit_.action_button(
+                "InspectorIconUtility",
+                EditorIcon::external_window,
+                "Icon Utility...",
+                EditorButtonStyle::quiet)) {
+            launch_icon_tool_for_selected_project();
+        }
     }
 
     ImGui::Spacing();
@@ -1807,6 +2180,10 @@ void ProjectManagerApplication::build_create_project_modal() {
         path_to_utf8_str(preview_target).c_str());
 
     ImGui::Checkbox(
+        "Bundle standalone game executable (.exe)",
+        &create_bundle_runtime_);
+
+    ImGui::Checkbox(
         "Open in Editor immediately after creation",
         &create_open_in_editor_);
 
@@ -1834,6 +2211,7 @@ void ProjectManagerApplication::build_create_project_modal() {
                         path_from_utf8_str(create_location_buffer_.data()),
                     .folder_name = create_folder_buffer_.data(),
                     .template_kind = create_template_,
+                    .bundle_runtime = create_bundle_runtime_,
                 },
                 created,
                 err)) {
@@ -1855,9 +2233,16 @@ void ProjectManagerApplication::build_create_project_modal() {
                     break;
                 }
             }
-            status_message_ =
-                "Created project '" + created.manifest.name + "'.";
-            status_tone_ = EditorTone::success;
+            if (!created.bundle_warning.empty()) {
+                status_message_ =
+                    "Created '" + created.manifest.name +
+                    "' (bundle warning: " + created.bundle_warning + ")";
+                status_tone_ = EditorTone::warning;
+            } else {
+                status_message_ =
+                    "Created project '" + created.manifest.name + "'.";
+                status_tone_ = EditorTone::success;
+            }
             ImGui::CloseCurrentPopup();
         }
     }
@@ -2305,24 +2690,45 @@ void ProjectManagerApplication::launch_project_in_runtime(
     if (item_index >= items_.size()) {
         return;
     }
-    const CachedProjectItem& item = items_[item_index];
-    if (item.inspection.state != ProjectDiskState::ready) {
+    const std::filesystem::path project_dir =
+        items_[item_index].entry.project_directory;
+    const std::string project_name = items_[item_index].entry.name;
+    const std::string dir_utf8 = items_[item_index].directory_utf8;
+    if (items_[item_index].inspection.state != ProjectDiskState::ready) {
         status_message_ = "Project is not ready on disk.";
         status_tone_ = EditorTone::danger;
         return;
     }
-    const auto runtime_exe = find_sibling_executable(executable_name_runtime());
-    if (!runtime_exe) {
-        status_message_ =
-            "Could not find " + executable_name_runtime() +
-            " next to Project Manager.";
-        status_tone_ = EditorTone::danger;
-        return;
+
+    ProjectInspection current_insp = items_[item_index].inspection;
+    if (!current_insp.runtime_bundled) {
+        BundleProjectRuntimeResult bundle_res{};
+        std::string bundle_err;
+        if (bundle_project_runtime(project_dir, bundle_res, bundle_err)) {
+            refresh_cached_inspections();
+            current_insp = inspect_project_directory(project_dir);
+        }
     }
 
+    std::filesystem::path launch_exe{};
     std::vector<std::string> args;
-    args.emplace_back("--project");
-    args.push_back(item.directory_utf8);
+    if (current_insp.runtime_bundled) {
+        launch_exe = current_insp.executable_path;
+    } else {
+        const auto runtime_exe =
+            find_sibling_executable(executable_name_runtime());
+        if (!runtime_exe) {
+            status_message_ =
+                "Could not find " + executable_name_runtime() +
+                " next to Project Manager.";
+            status_tone_ = EditorTone::danger;
+            return;
+        }
+        launch_exe = *runtime_exe;
+        args.emplace_back("--project");
+        args.push_back(dir_utf8);
+    }
+
     if (launch_resolution_preset_ == 1) {
         args.emplace_back("--width");
         args.emplace_back("1600");
@@ -2347,21 +2753,271 @@ void ProjectManagerApplication::launch_project_in_runtime(
 
     std::string launch_err;
     if (!launch_detached_executable(
-            *runtime_exe,
+            launch_exe,
             args,
-            item.entry.project_directory,
+            project_dir,
             launch_err)) {
         status_message_ = "Runtime launch failed: " + launch_err;
         status_tone_ = EditorTone::danger;
         return;
     }
-    if (registry_.touch_last_opened(item.entry.project_directory)) {
+    if (registry_.touch_last_opened(project_dir)) {
         save_registry();
         refresh_cached_inspections();
     }
     status_message_ =
-        "Launched '" + item.entry.name + "' in Vulkan Cube Runtime.";
+        "Launched '" + project_name + "' (" +
+        path_to_utf8_str(launch_exe.filename()) + ").";
     status_tone_ = EditorTone::success;
+}
+
+void ProjectManagerApplication::apply_icon_to_selected_project(
+    const std::filesystem::path& source_file) {
+    if (!selected_index_ || *selected_index_ >= items_.size()) {
+        status_message_ = "Select a project first to change its icon.";
+        status_tone_ = EditorTone::warning;
+        return;
+    }
+    const CachedProjectItem& selected = items_[*selected_index_];
+    if (selected.inspection.state != ProjectDiskState::ready) {
+        status_message_ = "Selected project is not ready on disk.";
+        status_tone_ = EditorTone::danger;
+        return;
+    }
+    std::string err;
+    if (!set_project_icon(selected.entry.project_directory, source_file, err)) {
+        status_message_ = "Change icon failed: " + err;
+        status_tone_ = EditorTone::danger;
+        return;
+    }
+    refresh_cached_inspections();
+    status_message_ =
+        "Updated icon for '" + selected.entry.name + "'.";
+    status_tone_ = EditorTone::success;
+}
+
+void ProjectManagerApplication::bundle_selected_project_runtime() {
+    if (!selected_index_ || *selected_index_ >= items_.size()) {
+        return;
+    }
+    const CachedProjectItem& selected = items_[*selected_index_];
+    if (selected.inspection.state != ProjectDiskState::ready) {
+        status_message_ = "Selected project is not ready on disk.";
+        status_tone_ = EditorTone::danger;
+        return;
+    }
+    BundleProjectRuntimeResult res{};
+    std::string err;
+    if (!bundle_project_runtime(selected.entry.project_directory, res, err)) {
+        status_message_ = "Game build failed: " + err;
+        status_tone_ = EditorTone::danger;
+        return;
+    }
+    refresh_cached_inspections();
+    status_message_ =
+        "Bundled standalone game '" +
+        path_to_utf8_str(res.executable_path.filename()) + "'.";
+    status_tone_ = EditorTone::success;
+}
+
+void ProjectManagerApplication::reset_selected_project_icon() {
+    if (!selected_index_ || *selected_index_ >= items_.size()) {
+        return;
+    }
+    const CachedProjectItem& selected = items_[*selected_index_];
+    if (selected.inspection.state != ProjectDiskState::ready) {
+        return;
+    }
+    std::string err;
+    if (!reset_project_icon_to_default(selected.entry.project_directory, err)) {
+        status_message_ = "Reset default icon failed: " + err;
+        status_tone_ = EditorTone::danger;
+        return;
+    }
+    refresh_cached_inspections();
+    status_message_ =
+        "Restored default icon for '" + selected.entry.name + "'.";
+    status_tone_ = EditorTone::success;
+}
+
+void ProjectManagerApplication::launch_icon_tool_for_selected_project() {
+    if (!selected_index_ || *selected_index_ >= items_.size()) {
+        return;
+    }
+    const CachedProjectItem& selected = items_[*selected_index_];
+    const auto tool_exe = find_sibling_executable(executable_name_icon_tool());
+    if (!tool_exe) {
+        status_message_ =
+            "Could not find " + executable_name_icon_tool() +
+            " next to Project Manager.";
+        status_tone_ = EditorTone::danger;
+        return;
+    }
+    const std::vector<std::string> args{
+        "--project",
+        selected.directory_utf8,
+    };
+    std::string launch_err;
+    if (!launch_detached_executable(
+            *tool_exe, args, selected.entry.project_directory, launch_err)) {
+        status_message_ = "Icon Utility launch failed: " + launch_err;
+        status_tone_ = EditorTone::danger;
+        return;
+    }
+    status_message_ =
+        "Opened Icon Utility for '" + selected.entry.name + "'.";
+    status_tone_ = EditorTone::info;
+}
+
+void ProjectManagerApplication::open_icon_file_picker(
+    const std::filesystem::path& initial_dir) {
+    icon_picker_error_.clear();
+    icon_picker_drives_.clear();
+
+#if defined(_WIN32)
+    const DWORD mask = GetLogicalDrives();
+    for (int i = 0; i < 26; ++i) {
+        if ((mask & (1U << i)) != 0U) {
+            const char drive_letter = static_cast<char>('A' + i);
+            const std::string root = std::string(1U, drive_letter) + ":\\";
+            icon_picker_drives_.push_back(path_from_utf8_str(root));
+        }
+    }
+#endif
+
+    std::error_code ec;
+    std::filesystem::path start = initial_dir;
+    if (start.empty() || !std::filesystem::is_directory(start, ec) || ec) {
+        ec.clear();
+        start = std::filesystem::current_path(ec);
+    }
+    navigate_icon_file_picker(start);
+    open_icon_file_picker_requested_ = true;
+}
+
+void ProjectManagerApplication::navigate_icon_file_picker(
+    const std::filesystem::path& directory) {
+    icon_picker_error_.clear();
+    std::error_code ec;
+    if (!std::filesystem::is_directory(directory, ec) || ec) {
+        icon_picker_error_ = "Directory is not accessible.";
+        return;
+    }
+    const auto canonical_or_abs =
+        std::filesystem::weakly_canonical(directory, ec);
+    icon_picker_current_ =
+        (!ec && !canonical_or_abs.empty()) ? canonical_or_abs : directory;
+    icon_picker_current_utf8_ = path_to_utf8_str(icon_picker_current_);
+
+    icon_picker_subdirs_.clear();
+    icon_picker_files_.clear();
+    ec.clear();
+    for (const auto& entry :
+         std::filesystem::directory_iterator(icon_picker_current_, ec)) {
+        if (ec) {
+            break;
+        }
+        std::error_code item_ec;
+        if (entry.is_directory(item_ec) && !item_ec) {
+            icon_picker_subdirs_.push_back(entry.path());
+        } else {
+            item_ec.clear();
+            if (entry.is_regular_file(item_ec) && !item_ec &&
+                is_supported_pm_icon_extension(entry.path())) {
+                icon_picker_files_.push_back(entry.path());
+            }
+        }
+    }
+    std::sort(icon_picker_subdirs_.begin(), icon_picker_subdirs_.end());
+    std::sort(icon_picker_files_.begin(), icon_picker_files_.end());
+}
+
+void ProjectManagerApplication::build_icon_file_picker_modal() {
+    if (open_icon_file_picker_requested_) {
+        ImGui::OpenPopup("Choose Project Icon");
+        open_icon_file_picker_requested_ = false;
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(580.0F, 450.0F), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("Choose Project Icon", nullptr)) {
+        return;
+    }
+
+    if (!icon_picker_drives_.empty()) {
+        for (std::size_t d = 0U; d < icon_picker_drives_.size(); ++d) {
+            if (d > 0U) {
+                ImGui::SameLine(0.0F, 4.0F);
+            }
+            const std::string drive_label =
+                path_to_utf8_str(icon_picker_drives_[d]);
+            if (ImGui::SmallButton(drive_label.c_str())) {
+                navigate_icon_file_picker(icon_picker_drives_[d]);
+            }
+        }
+    }
+
+    const std::filesystem::path parent = icon_picker_current_.parent_path();
+    const bool can_go_up =
+        !parent.empty() && parent != icon_picker_current_;
+    if (!can_go_up) {
+        ImGui::BeginDisabled();
+    }
+    if (ImGui::Button("Up")) {
+        navigate_icon_file_picker(parent);
+    }
+    if (!can_go_up) {
+        ImGui::EndDisabled();
+    }
+    ImGui::SameLine(0.0F, 8.0F);
+    ImGui::TextWrapped("%s", icon_picker_current_utf8_.c_str());
+
+    ImGui::Separator();
+
+    const float list_height = ImGui::GetContentRegionAvail().y - 54.0F;
+    if (ImGui::BeginChild(
+            "##IconPickerEntries",
+            ImVec2(0.0F, (std::max)(100.0F, list_height)),
+            ImGuiChildFlags_Borders)) {
+        std::optional<std::filesystem::path> next_dir;
+        for (std::size_t i = 0U; i < icon_picker_subdirs_.size(); ++i) {
+            const std::string label =
+                "[DIR] " + path_to_utf8_str(icon_picker_subdirs_[i].filename());
+            ImGui::PushID(static_cast<int>(i));
+            if (ImGui::Selectable(label.c_str(), false)) {
+                next_dir = icon_picker_subdirs_[i];
+            }
+            ImGui::PopID();
+        }
+        std::optional<std::filesystem::path> picked_file;
+        for (std::size_t i = 0U; i < icon_picker_files_.size(); ++i) {
+            const std::string label =
+                path_to_utf8_str(icon_picker_files_[i].filename());
+            ImGui::PushID(static_cast<int>(100000U + i));
+            if (ImGui::Selectable(label.c_str(), false)) {
+                picked_file = icon_picker_files_[i];
+            }
+            ImGui::PopID();
+        }
+        if (icon_picker_subdirs_.empty() && icon_picker_files_.empty()) {
+            ImGui::TextDisabled(
+                "(No subdirectories or .png/.ico/.jpg/.bmp/.tga files)");
+        }
+        if (next_dir) {
+            navigate_icon_file_picker(*next_dir);
+        } else if (picked_file) {
+            apply_icon_to_selected_project(*picked_file);
+            ImGui::CloseCurrentPopup();
+        }
+    }
+    ImGui::EndChild();
+
+    if (!icon_picker_error_.empty()) {
+        ui_kit_.status_text(icon_picker_error_.c_str(), EditorTone::danger);
+    }
+    if (ImGui::Button("Cancel", ImVec2(100.0F, 0.0F))) {
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
 }
 
 } // namespace vcr

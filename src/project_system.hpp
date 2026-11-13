@@ -49,6 +49,8 @@ struct ProjectManifest {
     std::string description{};
     std::string template_id{"standard"};
     std::string startup_scene{"scenes/editor_scene.json"};
+    std::string executable{};
+    std::string icon_path{"icon.ico"};
     std::string created_utc{};
 };
 
@@ -68,8 +70,12 @@ struct ProjectInspection {
     ProjectManifest manifest{};
     std::filesystem::path project_directory{};
     std::filesystem::path assets_directory{};
+    std::filesystem::path executable_path{};
+    std::filesystem::path icon_file_path{};
     std::vector<std::string> scene_relative_paths{};
     bool startup_scene_exists = false;
+    bool runtime_bundled = false;
+    bool icon_exists = false;
     std::string diagnostic{};
 };
 
@@ -89,11 +95,23 @@ struct CreateProjectOptions {
     std::filesystem::path parent_directory{};
     std::string folder_name{};
     ProjectTemplateKind template_kind = ProjectTemplateKind::standard;
+    bool bundle_runtime = true;
 };
 
 struct CreateProjectResult {
     std::filesystem::path project_directory{};
     ProjectManifest manifest{};
+    bool runtime_bundled = false;
+    std::string bundle_warning{};
+};
+
+struct BundleProjectRuntimeResult {
+    std::filesystem::path project_directory{};
+    std::filesystem::path executable_path{};
+    std::filesystem::path icon_path{};
+    std::size_t copied_shaders = 0U;
+    bool copied_fsr3_dll = false;
+    bool icon_embedded = false;
 };
 
 class ProjectRegistry final {
@@ -148,6 +166,47 @@ private:
 // Validates a relative scene path under <project>/assets (e.g. "scenes/foo.json").
 [[nodiscard]] bool valid_project_scene_relative_path(
     std::string_view path) noexcept;
+
+// Returns a default Windows executable filename derived from a project slug/name
+// (e.g. "neon_night_city" -> "neon_night_city.exe").
+[[nodiscard]] std::string default_project_executable_filename(
+    std::string_view slug_or_name);
+
+// Validates a project executable filename (single .exe filename, no directories).
+[[nodiscard]] bool valid_project_executable_filename(
+    std::string_view filename) noexcept;
+
+// Validates a relative .ico path inside <project>/ (e.g. "icon.ico").
+[[nodiscard]] bool valid_project_icon_relative_path(
+    std::string_view path) noexcept;
+
+// Finds vulkan_cube.exe suitable for packaging into a standalone project,
+// preferring an uninstrumented Release build when available.
+[[nodiscard]] std::optional<std::filesystem::path>
+find_packable_engine_runtime_binary();
+
+// Copies the engine runtime executable, FSR3 DLL (if built), SPIR-V shaders,
+// core renderer assets (sky + SMAA), and licenses into <project>/, ensures
+// icon.ico exists, and embeds the project's icon into its PE executable.
+[[nodiscard]] bool bundle_project_runtime(
+    const std::filesystem::path& project_directory,
+    BundleProjectRuntimeResult& output,
+    std::string& error,
+    const std::filesystem::path& explicit_engine_exe = {});
+
+// Converts/validates source_image_or_ico into multi-resolution .ico bytes,
+// writes <project>/<manifest.icon_path>, bundles runtime if missing & packable
+// binary is found, and updates the project executable's embedded PE icon.
+[[nodiscard]] bool set_project_icon(
+    const std::filesystem::path& project_directory,
+    const std::filesystem::path& source_image_or_ico,
+    std::string& error);
+
+// Restores <project>/<manifest.icon_path> to the built-in Default Project Icon
+// and re-embeds it into the project executable if present.
+[[nodiscard]] bool reset_project_icon_to_default(
+    const std::filesystem::path& project_directory,
+    std::string& error);
 
 [[nodiscard]] bool save_project_manifest(
     const ProjectManifest& manifest,

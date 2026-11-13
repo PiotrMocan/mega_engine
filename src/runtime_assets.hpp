@@ -13,6 +13,7 @@ inline constexpr const char* canonical_scene_relative_path =
 struct RuntimeAssetRoot {
     std::filesystem::path path{};
     std::filesystem::path project_root{};
+    std::filesystem::path project_icon_path{};
     std::string project_name{};
     std::string startup_scene_relative_path{canonical_scene_relative_path};
     bool project_owned = false;
@@ -25,8 +26,10 @@ struct RuntimeAssetRoot {
 //    assets/, fails without fallback if invalid.
 // 3. VCR_ASSET_ROOT environment variable -> selects that assets directory
 //    directly (non-project-owned), failing without fallback if invalid.
-// 4. Current working directory inside a valid project (project.vcrproject.json).
-// 5. Engine checkout (CMakeLists.txt + assets/) or packaged <exe>/assets.
+// 4. Executable directory (<exe>/project.vcrproject.json) so bundled standalone
+//    project executables work from any working directory.
+// 5. Current working directory inside a valid project (project.vcrproject.json).
+// 6. Engine checkout (CMakeLists.txt + assets/) or packaged <exe>/assets.
 [[nodiscard]] std::optional<RuntimeAssetRoot> find_runtime_asset_root(
     std::string_view explicit_project_path = {});
 

@@ -2,8 +2,10 @@
 
 #include "device_object.hpp"
 #include "editor_ui_kit.hpp"
+#include "icon_system.hpp"
 #include "project_system.hpp"
 #include "swapchain.hpp"
+#include "ui_texture_preview.hpp"
 #include "vulkan_context.hpp"
 
 #include <SDL3/SDL.h>
@@ -29,6 +31,9 @@ struct ProjectManagerCliOptions {
     bool cli_remove = false;
     bool cli_scan = false;
     bool cli_init_manifest = false;
+    bool cli_build_game = false;
+    bool cli_build_all_games = false;
+    bool cli_set_icon = false;
 
     std::string registry_path{};
     std::string create_name{};
@@ -37,6 +42,7 @@ struct ProjectManagerCliOptions {
     std::string create_description{};
     ProjectTemplateKind create_template = ProjectTemplateKind::standard;
     std::string target_directory{};
+    std::string icon_source_path{};
 
     std::uint32_t width = 1380U;
     std::uint32_t height = 840U;
@@ -88,6 +94,7 @@ private:
         ProjectInspection inspection{};
         std::string directory_utf8{};
         std::string search_haystack_lower{};
+        UiTexturePreview icon_preview{};
     };
 
     [[nodiscard]] bool parse_cli(
@@ -110,8 +117,14 @@ private:
 
     void reload_registry_and_cache(bool auto_scan_first_time);
     void refresh_cached_inspections();
+    void sync_gpu_icon_previews();
     void save_registry();
     void sync_inspector_from_selection();
+
+    void apply_icon_to_selected_project(const std::filesystem::path& source_file);
+    void bundle_selected_project_runtime();
+    void reset_selected_project_icon();
+    void launch_icon_tool_for_selected_project();
 
     void build_ui();
     void build_header_bar();
@@ -121,11 +134,14 @@ private:
     void build_add_existing_modal();
     void build_remove_confirm_modal();
     void build_folder_picker_modal();
+    void build_icon_file_picker_modal();
 
     void open_folder_picker(
         FolderPickerTarget target,
         const std::filesystem::path& initial_dir);
     void navigate_folder_picker(const std::filesystem::path& directory);
+    void open_icon_file_picker(const std::filesystem::path& initial_dir);
+    void navigate_icon_file_picker(const std::filesystem::path& directory);
 
     void launch_project_in_editor(std::size_t item_index);
     void launch_project_in_runtime(std::size_t item_index);
@@ -140,7 +156,10 @@ private:
     VulkanContext context_{};
     Swapchain swapchain_{};
     std::array<FrameSlot, frames_in_flight> frames_{};
+    DeviceObject<VkCommandPool> upload_command_pool_{};
     std::vector<DeviceObject<VkSemaphore>> present_semaphores_{};
+    std::vector<UiTexturePreview> retired_icon_previews_{};
+    bool icon_previews_dirty_ = false;
     std::size_t frame_index_ = 0U;
     std::uint32_t rendered_frames_ = 0U;
     bool resize_requested_ = false;
@@ -181,6 +200,7 @@ private:
     ProjectTemplateKind create_template_ = ProjectTemplateKind::standard;
     bool create_folder_manually_edited_ = false;
     bool create_open_in_editor_ = true;
+    bool create_bundle_runtime_ = true;
     std::string create_modal_error_{};
 
     // Add existing project modal state.
@@ -204,6 +224,15 @@ private:
     std::vector<std::filesystem::path> folder_picker_subdirs_{};
     std::array<char, 129U> folder_picker_new_dir_buffer_{};
     std::string folder_picker_error_{};
+
+    // Built-in icon file picker modal state.
+    bool open_icon_file_picker_requested_ = false;
+    std::filesystem::path icon_picker_current_{};
+    std::string icon_picker_current_utf8_{};
+    std::vector<std::filesystem::path> icon_picker_drives_{};
+    std::vector<std::filesystem::path> icon_picker_subdirs_{};
+    std::vector<std::filesystem::path> icon_picker_files_{};
+    std::string icon_picker_error_{};
 };
 
 } // namespace vcr

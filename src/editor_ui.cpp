@@ -2066,6 +2066,55 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
             import_dialog_requested_ = true;
         }
         ImGui::Separator();
+        if (!project_root_.empty()) {
+            if (ImGui::MenuItem("Build / Update Game Executable")) {
+                BundleProjectRuntimeResult bundle_res{};
+                std::string bundle_err;
+                if (bundle_project_runtime(
+                        project_root_, bundle_res, bundle_err)) {
+                    scene_file_status_ =
+                        "Built standalone game: " +
+                        bundle_res.executable_path.filename().string();
+                } else {
+                    scene_file_status_ = "Game build failed: " + bundle_err;
+                }
+            }
+            if (ImGui::MenuItem("Project Icon Utility...")) {
+#if defined(_WIN32)
+                constexpr std::string_view icon_tool_exe_name{
+                    "vulkan_icon_tool.exe"};
+#else
+                constexpr std::string_view icon_tool_exe_name{
+                    "vulkan_icon_tool"};
+#endif
+                if (const auto tool_exe =
+                        find_sibling_executable(icon_tool_exe_name)) {
+                    const std::u8string u8_proj = project_root_.u8string();
+                    std::string proj_utf8(u8_proj.size(), '\0');
+                    std::transform(
+                        u8_proj.begin(),
+                        u8_proj.end(),
+                        proj_utf8.begin(),
+                        [](const char8_t ch) {
+                            return static_cast<char>(ch);
+                        });
+                    const std::vector<std::string> args{
+                        "--project",
+                        std::move(proj_utf8),
+                    };
+                    std::string launch_error;
+                    if (!launch_detached_executable(
+                            *tool_exe, args, project_root_, launch_error)) {
+                        scene_file_status_ =
+                            "Icon Utility launch failed: " + launch_error;
+                    }
+                } else {
+                    scene_file_status_ =
+                        "Icon Utility executable was not found next to editor.";
+                }
+            }
+            ImGui::Separator();
+        }
         if (ImGui::MenuItem("Project Manager...")) {
 #if defined(_WIN32)
             constexpr std::string_view pm_exe_name{"vulkan_project_manager.exe"};

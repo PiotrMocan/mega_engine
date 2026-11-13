@@ -508,6 +508,37 @@ else()
     endif()
 endif()
 
+add_library(vcr_icon_system STATIC
+    src/icon_system.cpp
+)
+target_include_directories(vcr_icon_system PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_include_directories(vcr_icon_system SYSTEM PRIVATE
+    "${assimp_SOURCE_DIR}/contrib/stb"
+)
+target_link_libraries(vcr_icon_system
+    PUBLIC SDL3::SDL3-static
+)
+if(WIN32)
+    target_link_libraries(vcr_icon_system PRIVATE shell32)
+endif()
+if(MSVC)
+    target_compile_options(vcr_icon_system PRIVATE
+        /W4 /permissive- /Zc:preprocessor /GR- /EHsc
+    )
+    if(VCR_WARNINGS_AS_ERRORS)
+        target_compile_options(vcr_icon_system PRIVATE /WX)
+    endif()
+else()
+    target_compile_options(vcr_icon_system PRIVATE
+        -Wall -Wextra -Wpedantic -Wconversion -Wshadow -fno-rtti
+    )
+    if(VCR_WARNINGS_AS_ERRORS)
+        target_compile_options(vcr_icon_system PRIVATE -Werror)
+    endif()
+endif()
+
 set(VCR_RENDERER_SOURCES
     src/audio_engine.cpp
     src/cli_options.cpp
@@ -579,6 +610,30 @@ add_executable(vulkan_project_manager
     src/vulkan_context.cpp
     src/swapchain.cpp
     src/vma.cpp
+    src/gpu_buffer.cpp
+    src/gpu_texture.cpp
+    src/ui_texture_preview.cpp
+    src/scene_document.cpp
+    src/scene_io.cpp
+    src/prefab_io.cpp
+    src/scene_uuid.cpp
+    src/collision.cpp
+    src/punctual_light.cpp
+    src/png_encoder.cpp
+)
+
+add_executable(vulkan_icon_tool
+    src/icon_tool_main.cpp
+    src/icon_tool_application.cpp
+    src/project_system.cpp
+    src/runtime_assets.cpp
+    src/editor_ui_kit.cpp
+    src/vulkan_context.cpp
+    src/swapchain.cpp
+    src/vma.cpp
+    src/gpu_buffer.cpp
+    src/gpu_texture.cpp
+    src/ui_texture_preview.cpp
     src/scene_document.cpp
     src/scene_io.cpp
     src/prefab_io.cpp
@@ -655,6 +710,13 @@ endfunction()
 vcr_configure_executable(vulkan_cube 1)
 vcr_configure_executable(vulkan_editor 1)
 vcr_configure_executable(vulkan_project_manager 1)
+vcr_configure_executable(vulkan_icon_tool 1)
+if(WIN32)
+    target_sources(vulkan_cube PRIVATE resources/vulkan_cube.rc)
+    target_sources(vulkan_editor PRIVATE resources/vulkan_editor.rc)
+    target_sources(vulkan_project_manager PRIVATE resources/vulkan_project_manager.rc)
+    target_sources(vulkan_icon_tool PRIVATE resources/vulkan_icon_tool.rc)
+endif()
 
 # Explicit GPU numerical gate; ordinary CPU CTest does not silently require a GPU.
 add_executable(vcr_tone_mapping_gpu_tests EXCLUDE_FROM_ALL
@@ -706,6 +768,7 @@ target_link_libraries(
     vcr_cooked_audio_asset
     vcr_cooked_model_asset
     vcr_cooked_texture_asset
+    vcr_icon_system
 )
 target_link_libraries(vulkan_editor PRIVATE vcr_imgui)
 target_link_libraries(
@@ -714,11 +777,19 @@ target_link_libraries(
     vcr_cooked_audio_asset
     vcr_cooked_model_asset
     vcr_cooked_texture_asset
+    vcr_icon_system
 )
 target_link_libraries(
     vulkan_project_manager PRIVATE
     vcr_imgui
     vcr_cooked_model_asset
+    vcr_icon_system
+)
+target_link_libraries(
+    vulkan_icon_tool PRIVATE
+    vcr_imgui
+    vcr_cooked_model_asset
+    vcr_icon_system
 )
 
 # Both executables share one output directory. A single dependency target
@@ -755,6 +826,7 @@ endif()
 add_dependencies(vulkan_cube vcr_runtime_assets)
 add_dependencies(vulkan_editor vcr_runtime_assets)
 add_dependencies(vulkan_project_manager vcr_runtime_assets)
+add_dependencies(vulkan_icon_tool vcr_runtime_assets)
 
 include(CTest)
 if(BUILD_TESTING)
@@ -1048,6 +1120,7 @@ if(BUILD_TESTING)
         vcr_project_tests PRIVATE
         vcr_cooked_model_asset
         vcr_cooked_texture_asset
+        vcr_icon_system
         SDL3::SDL3-static
         glm::glm
         nlohmann_json::nlohmann_json

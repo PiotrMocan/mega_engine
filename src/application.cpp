@@ -1,5 +1,6 @@
 #include "application.hpp"
 
+#include "icon_system.hpp"
 #include "runtime_assets.hpp"
 #include "render_fixture_scene.hpp"
 #include "scene_io.hpp"
@@ -161,23 +162,47 @@ void Application::initialize(const CliOptions& options) {
         preferred_present = VK_PRESENT_MODE_FIFO_KHR;
         break;
     }
+    std::filesystem::path resolved_project_root{};
+    std::filesystem::path resolved_project_icon{};
     if (!options.project_path.empty()) {
         const auto explicit_root = find_runtime_asset_root(options.project_path);
         if (!explicit_root) {
             fatal("Unable to open project directory: " + options.project_path);
         }
         project_name_ = explicit_root->project_name;
+        resolved_project_root = explicit_root->project_root;
+        resolved_project_icon = explicit_root->project_icon_path;
     }
     if (!options.lighting_room && options.scene_count == 0 && options.render_fixture == RenderFixture::none) {
         const auto asset_root = find_runtime_asset_root(options.project_path);
         if (!asset_root) fatal("Unable to locate the runtime assets directory.");
         project_name_ = asset_root->project_name;
+        resolved_project_root = asset_root->project_root;
+        resolved_project_icon = asset_root->project_icon_path;
         std::string error;
         if (!load_startup_scene(
                 asset_root->path / asset_root->startup_scene_relative_path,
                 scene_,
                 error))
             fatal(error);
+    } else if (resolved_project_root.empty()) {
+        if (const auto asset_root = find_runtime_asset_root(options.project_path)) {
+            resolved_project_root = asset_root->project_root;
+            resolved_project_icon = asset_root->project_icon_path;
+            if (project_name_.empty()) {
+                project_name_ = asset_root->project_name;
+            }
+        }
+    }
+    if (!resolved_project_root.empty()) {
+        apply_window_icon_from_file_or_builtin(
+            window_.get(),
+            resolved_project_icon.empty()
+                ? (resolved_project_root / "icon.ico")
+                : resolved_project_icon,
+            BuiltinIconKind::project_default);
+    } else {
+        apply_window_builtin_icon(window_.get(), BuiltinIconKind::engine);
     }
     const auto lighting = resolve_scene_lighting(options, scene_.lighting);
     renderer_.initialize(context_, window_.get(), preferred_present, options.initial_mode,

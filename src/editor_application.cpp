@@ -2,6 +2,7 @@
 
 #include "asset_browser.hpp"
 #include "editor_scene_tools.hpp"
+#include "icon_system.hpp"
 #include "prefab_io.hpp"
 #include "runtime_assets.hpp"
 #include "scene_io.hpp"
@@ -602,6 +603,7 @@ void EditorApplication::initialize(const CliOptions& options) {
     if (!window_) {
         fatal(SDL_GetError());
     }
+    apply_window_builtin_icon(window_.get(), BuiltinIconKind::editor);
     main_window_id_ = SDL_GetWindowID(window_.get());
     if (main_window_id_ == 0U) {
         fatal(SDL_GetError());

@@ -49,6 +49,40 @@ struct Vertex {
     float normal[3];
 };
 
+[[nodiscard]] std::filesystem::path resolve_engine_shader_path(
+    const std::filesystem::path& base_dir,
+    const std::filesystem::path& relative_path) {
+    std::error_code ec;
+    const std::filesystem::path direct = base_dir / "shaders" / relative_path;
+    if (std::filesystem::is_regular_file(direct, ec) && !ec) {
+        return direct;
+    }
+    ec.clear();
+    const std::filesystem::path bundled =
+        base_dir / "engine" / "shaders" / relative_path;
+    if (std::filesystem::is_regular_file(bundled, ec) && !ec) {
+        return bundled;
+    }
+    return direct;
+}
+
+[[nodiscard]] std::filesystem::path resolve_engine_core_asset_path(
+    const std::filesystem::path& base_dir,
+    const std::filesystem::path& relative_path) {
+    std::error_code ec;
+    const std::filesystem::path direct = base_dir / "assets" / relative_path;
+    if (std::filesystem::exists(direct, ec) && !ec) {
+        return direct;
+    }
+    ec.clear();
+    const std::filesystem::path bundled =
+        base_dir / "engine" / "assets" / relative_path;
+    if (std::filesystem::exists(bundled, ec) && !ec) {
+        return bundled;
+    }
+    return direct;
+}
+
 #if VCR_EDITOR_ENABLED
 inline constexpr std::uint32_t maximum_editor_model_assets = 1'024U;
 inline constexpr std::uint32_t maximum_editor_texture_assets = 4'096U;
@@ -2801,8 +2835,8 @@ void Renderer::create_sky_texture() {
     if (base_path == nullptr) {
         fatal(SDL_GetError());
     }
-    const std::filesystem::path texture_path =
-        std::filesystem::path(base_path) / "assets" / "sky_clouds.png";
+    const std::filesystem::path texture_path = resolve_engine_core_asset_path(
+        std::filesystem::path(base_path), "sky_clouds.png");
     const std::string texture_path_string = texture_path.string();
     SdlSurface source(SDL_LoadPNG(texture_path_string.c_str()));
     if (!source) {
@@ -3063,7 +3097,8 @@ void Renderer::create_anti_aliasing_resources() {
             fatal(SDL_GetError());
         }
         const std::filesystem::path smaa_asset_path =
-            std::filesystem::path(base_path) / "assets" / "smaa";
+            resolve_engine_core_asset_path(
+                std::filesystem::path(base_path), "smaa");
         constexpr std::uint32_t area_width = 160U;
         constexpr std::uint32_t area_height = 560U;
         constexpr std::uint32_t search_width = 66U;
@@ -5220,7 +5255,8 @@ ShaderModule Renderer::load_shader(const std::filesystem::path& path) const {
     if (base_path == nullptr) {
         fatal(SDL_GetError());
     }
-    const auto full_path = std::filesystem::path(base_path) / "shaders" / path;
+    const auto full_path = resolve_engine_shader_path(
+        std::filesystem::path(base_path), path);
 
     std::ifstream input(full_path, std::ios::binary | std::ios::ate);
     if (!input) {
