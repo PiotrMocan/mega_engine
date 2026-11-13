@@ -365,6 +365,7 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
                 return result;
             }
             result.options.depth_prepass = *prepass;
+            result.options.depth_prepass_override = true;
             continue;
         }
         if (argument.name == "--lod-fade") {

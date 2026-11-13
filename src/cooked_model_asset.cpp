@@ -1642,11 +1642,23 @@ CookedModelLoadResult load_cooked_model_asset(
                 "Submesh metadata and binary ranges are inconsistent.",
                 model_file.absolute);
         }
+        std::optional<float> authored_geometric_error;
+        if (authored.contains("geometric_error")) {
+            float parsed_error = 0.0F;
+            if (!json_float_in_range(authored, "geometric_error", 0.0F,
+                                     std::numeric_limits<float>::max(), parsed_error)) {
+                return fail(CookedModelLoadErrorCode::invalid_json,
+                            "Submesh geometric_error must be a finite non-negative number.",
+                            model_file.absolute);
+            }
+            authored_geometric_error = parsed_error;
+        }
         asset.submeshes.push_back(CookedModelSubmesh{
             .first_index = binary.first_index,
             .index_count = binary.index_count,
             .material_index = binary.material_index,
             .name = std::move(name),
+            .authored_geometric_error = authored_geometric_error,
         });
     }
     if (expected_first_index != asset.indices.size()) {

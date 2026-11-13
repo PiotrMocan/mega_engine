@@ -63,7 +63,9 @@ void cook(const std::filesystem::path &root, const std::filesystem::path &path) 
         std::vector<vcr::CookedModelVertex> vertices;
         std::vector<std::uint32_t> indices, remap(model.vertices.size(),missing);
         Json sections = Json::array();
-        float error = 0;
+        float max_error = 0.0F;
+        double weighted_error = 0.0;
+        std::uint64_t total_base_indices = 0U;
         for (const auto &part : model.submeshes) {
             const auto first = indices.size();
             for (std::uint32_t i = 0; i < part.lod_count[level]; ++i) {
@@ -75,11 +77,18 @@ void cook(const std::filesystem::path &root, const std::filesystem::path &path) 
                 indices.push_back(remap[old]);
             }
             if (indices.size() == first) throw std::runtime_error("LOD lost a material section");
-            error = std::max(error,part.lod_error[level]);
+            max_error = std::max(max_error, part.lod_error[level]);
+            weighted_error += static_cast<double>(part.lod_error[level]) *
+                static_cast<double>(part.index_count);
+            total_base_indices += part.index_count;
             sections.push_back({{"name",part.name},{"first_index",first},
                 {"index_count",indices.size()-first},{"material_index",part.material_index},
-                {"material",metadata["materials"][part.material_index]}});
+                {"material",metadata["materials"][part.material_index]},
+                {"geometric_error",part.lod_error[level]}});
         }
+        float error = total_base_indices > 0U
+            ? static_cast<float>(weighted_error / static_cast<double>(total_base_indices))
+            : max_error;
         const auto lod_name = name+"_LOD"+std::to_string(level);
         const auto mesh_relative = std::filesystem::path("meshes")/(lod_name+".vcrmesh");
         const auto destination = root/path.parent_path()/mesh_relative;

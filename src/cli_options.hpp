@@ -99,6 +99,7 @@ struct CliOptions {
     SubsurfaceMode subsurface = SubsurfaceMode::off;
     bool subsurface_override = false;
     DepthPrepass depth_prepass = DepthPrepass::off;
+    bool depth_prepass_override = false;
     ModelVertexFormat model_vertex_format = ModelVertexFormat::automatic;
     LodFadePattern lod_fade = LodFadePattern::off;
     MotionBlurSettings motion_blur{};

@@ -103,7 +103,15 @@ bool occludedHiz(Instance instance,vec3 center,vec3 extent) {
     }
     return true;
 }
-uint classify(uint id,out uint groupIndex,out uint lod) {
+#include "visibility_bins_common.glsl"
+
+uint depthBinForDistance(float distance) {
+    if (distance <= 1.0) return 0u;
+    // 16 logarithmic shells from 1 m to 512 m+ (~1.47x distance ratio per bin).
+    return min(uint(floor(log2(distance) * (16.0 / 9.0))), kDepthBins - 1u);
+}
+
+uint classify(uint id,out uint groupIndex,out uint lod,out uint depthBin) {
     Instance instance=instances[id];
     Source source=sources[id];
     vec4 local=vec4(source.center.xyz,1);
@@ -114,14 +122,16 @@ uint classify(uint id,out uint groupIndex,out uint lod) {
         for (uint i=0;i<6;++i) {
             vec4 plane=config.planes[i];
             if (dot(plane.xyz,center)+plane.w+dot(abs(plane.xyz),extent)<-1e-4) {
-                if ((config.flags.w >> 1u) != 0u) clearHistory(id);
+                if (((config.flags.w >> 1u) & 3u) != 0u) clearHistory(id);
+                depthBin=0u;
                 return 1;
             }
         }
     }
     if (((config.flags.z & 1u)!=0u && occludedGrid(center,extent)) ||
         ((config.flags.z & 2u)!=0u && occludedHiz(instance,center,extent))) {
-        if ((config.flags.w >> 1u) != 0u) clearHistory(id);
+        if (((config.flags.w >> 1u) & 3u) != 0u) clearHistory(id);
+        depthBin=0u;
         return 2;
     }
     groupIndex=uint(source.center.w);
@@ -131,6 +141,7 @@ uint classify(uint id,out uint groupIndex,out uint lod) {
     vec4 rowY=vec4(config.viewProjection[0].y,config.viewProjection[1].y,config.viewProjection[2].y,config.viewProjection[3].y);
     vec4 rowW=vec4(config.viewProjection[0].w,config.viewProjection[1].w,config.viewProjection[2].w,config.viewProjection[3].w);
     float distance=dot(rowW,vec4(center,1))-dot(abs(rowW.xyz),extent);
+    depthBin=depthBinForDistance(distance);
     uint pattern = (config.flags.w >> 1u) & 3u;
     uvec4 history = pattern == 0u ? uvec4(lodHistory[id*4u]) : loadHistory(id);
     if ((config.flags.w & 1u)!=0u && group.range.w==0u && distance>0) {
@@ -175,12 +186,19 @@ uint classify(uint id,out uint groupIndex,out uint lod) {
 }
 shared uint localCounts[8];
 shared uint reservations[4];
+#ifdef VCR_VISIBILITY_BINNED
+shared uint localBinCounts[64];
+shared uint binReservations[64];
+#endif
 void main() {
     uint lane=gl_LocalInvocationID.x,id=gl_GlobalInvocationID.x;
     if (lane<8) localCounts[lane]=0;
+#ifdef VCR_VISIBILITY_BINNED
+    if (lane<64u) localBinCounts[lane]=0u;
+#endif
     barrier();
-    uint groupIndex=0,lod=0,offset=0,oldOffset=0;
-    uint result=id<config.flags.x ? classify(id,groupIndex,lod) : 3;
+    uint groupIndex=0,lod=0,depthBin=0,offset=0,oldOffset=0;
+    uint result=id<config.flags.x ? classify(id,groupIndex,lod,depthBin) : 3;
     uvec4 history = uvec4(0u);
     bool fading = false;
     if (result==0) {
@@ -189,10 +207,20 @@ void main() {
             history = loadHistory(id);
             fading = history.x != history.y && uintBitsToFloat(history.z) < 1.0;
         }
-        offset=atomicAdd(localCounts[lod],1);
+#ifdef VCR_VISIBILITY_BINNED
+        offset=atomicAdd(localBinCounts[lod*kDepthBins+depthBin],1u);
+        atomicAdd(localCounts[lod],1u);
+#else
+        offset=atomicAdd(localCounts[lod],1u);
+#endif
         uint triangles=groups[groupIndex].counts[lod]/3u;
         if (fading) {
-            oldOffset=atomicAdd(localCounts[history.x],1);
+#ifdef VCR_VISIBILITY_BINNED
+            oldOffset=atomicAdd(localBinCounts[history.x*kDepthBins+depthBin],1u);
+            atomicAdd(localCounts[history.x],1u);
+#else
+            oldOffset=atomicAdd(localCounts[history.x],1u);
+#endif
             triangles+=groups[groupIndex].counts[history.x]/3u;
         }
         atomicAdd(localCounts[6],1); // Unique sources, independent of dual draws.
@@ -202,13 +230,23 @@ void main() {
     else if (result==2) atomicAdd(localCounts[5],1);
     barrier();
     // Sources are contiguous and sorted by draw group. Usually a whole
-    // workgroup shares one draw; reserve once per LOD instead of serializing
+    // workgroup shares one draw; reserve once per LOD/bin instead of serializing
     // tens of thousands of global atomics on one indirect instanceCount.
     uint first=gl_WorkGroupID.x*128;
     uint commonGroup=uint(sources[first].center.w);
     bool homogeneous=commonGroup==uint(sources[min(first+127,config.flags.x-1)].center.w);
-    if (homogeneous && lane<4 && localCounts[lane]>0)
+#ifdef VCR_VISIBILITY_BINNED
+    if (homogeneous && lane<64u && localBinCounts[lane]>0u) {
+        uint bLod=lane/kDepthBins;
+        uint bBin=lane-bLod*kDepthBins;
+        uint cmd=commonGroup*4u+bLod;
+        binReservations[lane]=atomicAdd(indices[kBinCountsBase+cmd*kDepthBins+bBin],localBinCounts[lane]);
+    }
+#else
+    if (homogeneous && lane<4 && localCounts[lane]>0) {
         reservations[lane]=atomicAdd(draws[commonGroup*4+lane].instanceCount,localCounts[lane]);
+    }
+#endif
     if (lane==0) {
         atomicAdd(counters[0],localCounts[6]);
         atomicAdd(counters[1],localCounts[4]); atomicAdd(counters[2],localCounts[5]);
@@ -217,6 +255,35 @@ void main() {
         atomicAdd(counters[6],localCounts[7]);
     }
     barrier();
+#ifdef VCR_VISIBILITY_BINNED
+    if (id < config.flags.x) {
+        uint scratchOffset = kScratchBase + id * 4u;
+        if (result == 0u) {
+            uint commandIndex = groupIndex * 4u + lod;
+            uint binOffset = homogeneous
+                ? binReservations[lod * kDepthBins + depthBin] + offset
+                : atomicAdd(indices[kBinCountsBase + commandIndex * kDepthBins + depthBin], 1u);
+            uint pattern = (config.flags.w >> 1u) & 3u;
+            uint token = fading
+                ? lodToken(id, uintBitsToFloat(history.z), false, pattern) : id;
+            uint header = 1u | (depthBin << 1u) | (commandIndex << 5u)
+                | (fading ? (1u << 21u) : 0u) | ((history.x & 3u) << 22u);
+            uint oldBinOffset = 0u;
+            if (fading) {
+                uint oldCommand = groupIndex * 4u + history.x;
+                oldBinOffset = homogeneous
+                    ? binReservations[history.x * kDepthBins + depthBin] + oldOffset
+                    : atomicAdd(indices[kBinCountsBase + oldCommand * kDepthBins + depthBin], 1u);
+            }
+            indices[scratchOffset + 0u] = header;
+            indices[scratchOffset + 1u] = binOffset;
+            indices[scratchOffset + 2u] = token;
+            indices[scratchOffset + 3u] = oldBinOffset;
+        } else {
+            indices[scratchOffset + 0u] = 0u;
+        }
+    }
+#else
     if (result==0) {
         uint commandIndex=groupIndex*4+lod;
         offset=homogeneous ? reservations[lod]+offset : atomicAdd(draws[commandIndex].instanceCount,1);
@@ -229,4 +296,5 @@ void main() {
             indices[draws[oldCommand].firstInstance+oldOffset]=lodToken(id,uintBitsToFloat(history.z),true,pattern);
         }
     }
+#endif
 }

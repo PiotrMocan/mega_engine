@@ -86,6 +86,8 @@ foreach ($shader in $regularShaders) {
     Compile-Shader -Source $shader.Name -Output ($shader.Name + '.spv') -ExtraArguments $extraArguments
 }
 Compile-Shader -Source 'editor_model_depth.frag' -Output 'editor_model_depth_temporal.frag.spv' -ExtraArguments @('-DVCR_TEMPORAL_COVERAGE=1')
+Compile-Shader -Source 'editor_model_depth.vert' -Output 'editor_model_depth_coverage.vert.spv' -ExtraArguments @('-DVCR_DEPTH_MATERIAL_COVERAGE=1')
+Compile-Shader -Source 'scene_visibility.comp' -Output 'scene_visibility_binned.comp.spv' -ExtraArguments @('-DVCR_VISIBILITY_BINNED=1')
 $subsurfaceGeometryShaders = @(
     'ocean.frag',
     'cube.frag',
@@ -124,6 +126,48 @@ foreach ($shader in $rayQueryFragmentShaders) {
         -Source $shader `
         -Output ($stem + '_sss_rt.frag.spv') `
         -ExtraArguments @('-DVCR_SSS_OUTPUT=1', '-DVCR_RAY_QUERY=1')
+}
+$opaqueModelFragmentShaders = @(
+    'editor_model.frag',
+    'editor_model_aa.frag'
+)
+foreach ($shader in $opaqueModelFragmentShaders) {
+    $stem = [System.IO.Path]::GetFileNameWithoutExtension($shader)
+    Compile-Shader `
+        -Source $shader `
+        -Output ($stem + '_opaque.frag.spv') `
+        -ExtraArguments @('-DVCR_OPAQUE_EARLY_Z=1')
+    Compile-Shader `
+        -Source $shader `
+        -Output ($stem + '_opaque_sss.frag.spv') `
+        -ExtraArguments @('-DVCR_OPAQUE_EARLY_Z=1', '-DVCR_SSS_OUTPUT=1')
+    Compile-Shader `
+        -Source $shader `
+        -Output ($stem + '_opaque_rt.frag.spv') `
+        -ExtraArguments @('-DVCR_OPAQUE_EARLY_Z=1', '-DVCR_RAY_QUERY=1')
+    Compile-Shader `
+        -Source $shader `
+        -Output ($stem + '_opaque_sss_rt.frag.spv') `
+        -ExtraArguments @('-DVCR_OPAQUE_EARLY_Z=1', '-DVCR_SSS_OUTPUT=1', '-DVCR_RAY_QUERY=1')
+}
+foreach ($shader in $opaqueModelFragmentShaders) {
+    $stem = [System.IO.Path]::GetFileNameWithoutExtension($shader)
+    Compile-Shader `
+        -Source $shader `
+        -Output ($stem + '_equal.frag.spv') `
+        -ExtraArguments @('-DVCR_EQUAL_EARLY_Z=1')
+    Compile-Shader `
+        -Source $shader `
+        -Output ($stem + '_equal_sss.frag.spv') `
+        -ExtraArguments @('-DVCR_EQUAL_EARLY_Z=1', '-DVCR_SSS_OUTPUT=1')
+    Compile-Shader `
+        -Source $shader `
+        -Output ($stem + '_equal_rt.frag.spv') `
+        -ExtraArguments @('-DVCR_EQUAL_EARLY_Z=1', '-DVCR_RAY_QUERY=1')
+    Compile-Shader `
+        -Source $shader `
+        -Output ($stem + '_equal_sss_rt.frag.spv') `
+        -ExtraArguments @('-DVCR_EQUAL_EARLY_Z=1', '-DVCR_SSS_OUTPUT=1', '-DVCR_RAY_QUERY=1')
 }
 Compile-Shader `
     -Source 'voxel_light.comp' `

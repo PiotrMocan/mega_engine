@@ -106,8 +106,16 @@ float sunSubsurfaceTransmittanceAt(
                 worldPos, sunFacingNormal, lightDirection);
         }
 #endif
-        const float rawTrans = sunVisibilityAt(
-            worldPos + lightDirection * 0.04, sunFacingNormal, lightDirection);
+        if (directVis >= 0.999)
+        {
+            return 1.0;
+        }
+        // Beyond the nearest cascade, a 4 cm leaf thickness offset is smaller
+        // than a single shadow texel; avoid a redundant second PCF tap there.
+        const float viewDepth = -(lighting.cameraView * vec4(worldPos, 1.0)).z;
+        const float rawTrans = (lighting.options.x <= 0.5 || viewDepth < lighting.shadowSplits.x)
+            ? sunVisibilityAt(worldPos + lightDirection * 0.04, sunFacingNormal, lightDirection)
+            : directVis;
         return pow(max(rawTrans, 0.0), 0.70);
     }
     if (dot(geomNormal, lightDirection) < 0.0 && dot(shadingNormal, lightDirection) > -0.55)
@@ -161,11 +169,15 @@ PbrLightingComponents evaluateLitSurfaceComponents(
         normalize(frame.cameraPosition.xyz - worldPosition);
     const vec3 lightDirection =
         normalize(frame.sunDirectionIntensity.xyz);
-    const float rawVisibility =
-        sunVisibilityAt(worldPosition, geomNormal, lightDirection);
-    const float transmissionVisibility = sunSubsurfaceTransmittanceAt(
-        worldPosition, geomNormal, normal, lightDirection, rawVisibility,
-        materialModel, subsurfaceProfile, subsurfaceStrength);
+    float rawVisibility = 0.0;
+    float transmissionVisibility = 0.0;
+    if (frame.sunDirectionIntensity.w > 0.0)
+    {
+        rawVisibility = sunVisibilityAt(worldPosition, geomNormal, lightDirection);
+        transmissionVisibility = sunSubsurfaceTransmittanceAt(
+            worldPosition, geomNormal, normal, lightDirection, rawVisibility,
+            materialModel, subsurfaceProfile, subsurfaceStrength);
+    }
     const float visibility = (materialModel == 2u && subsurfaceProfile == 4u)
         ? mix(rawVisibility, transmissionVisibility, 0.28 * clamp(subsurfaceStrength, 0.0, 1.0))
         : rawVisibility;
@@ -173,7 +185,9 @@ PbrLightingComponents evaluateLitSurfaceComponents(
     vec3 backDiffuseAmbient = diffuseAmbient;
     if (lighting.options.x > 0.5) {
         diffuseAmbient = dynamicSkyHemisphereAmbient(normal);
-        backDiffuseAmbient = dynamicSkyHemisphereAmbient(-normal);
+        backDiffuseAmbient = (materialModel == 2u && subsurfaceProfile != 0u && subsurfaceStrength > 0.0)
+            ? dynamicSkyHemisphereAmbient(-normal)
+            : diffuseAmbient;
     }
     if (voxelGiCompiled && lighting.options.y > 0.5) {
 #ifdef VCR_SURFACE_SHADOW_EXPLICIT_LOD

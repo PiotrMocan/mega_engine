@@ -1,0 +1,33 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x=64) in;
+layout(set=0,binding=0,std140) uniform VisibilityUniforms {
+    mat4 viewProjection;
+    mat4 hizViewProjection;
+    vec4 planes[6];
+    vec4 cameraPixels;
+    vec4 guardError;
+    vec4 hizParams;
+    uvec4 flags;
+    vec4 grid[144];
+} config;
+struct Draw { uint indexCount,instanceCount,firstIndex; int vertexOffset; uint firstInstance; };
+layout(set=0,binding=4,std430) buffer Visible { uint counters[8]; uint indices[]; };
+layout(set=0,binding=5,std430) buffer Commands { Draw draws[]; };
+
+#include "visibility_bins_common.glsl"
+
+void main() {
+    uint cmd = gl_GlobalInvocationID.x;
+    uint commandCount = config.flags.w >> 4u;
+    if (cmd >= commandCount) return;
+    uint firstInstance = draws[cmd].firstInstance;
+    uint base = kBinCountsBase + cmd * kDepthBins;
+    uint running = 0u;
+    for (uint bin = 0u; bin < kDepthBins; ++bin) {
+        uint count = indices[base + bin];
+        indices[base + bin] = firstInstance + running;
+        running += count;
+    }
+    draws[cmd].instanceCount = running;
+}

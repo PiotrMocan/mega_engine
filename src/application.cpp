@@ -208,7 +208,7 @@ void Application::initialize(const CliOptions& options) {
     if (!renderer_.set_motion_blur_settings(options.motion_blur)) {
         fatal("Invalid motion blur settings for the selected AA mode");
     }
-    if (!renderer_.set_depth_prepass(options.depth_prepass)) {
+    if (!renderer_.set_depth_prepass(options.depth_prepass, options.depth_prepass_override)) {
         fatal("Invalid depth prepass mode");
     }
     if (!renderer_.set_lod_fade(options.lod_fade, options.lod_fade_seconds)) {

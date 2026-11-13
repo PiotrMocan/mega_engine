@@ -22,6 +22,8 @@ layout(set = 0, binding = 3) uniform sampler2D skyTexture;
 const float pi = 3.14159265358979323846;
 const float inverseTwoPi = 0.15915494309189533577;
 
+layout(early_fragment_tests) in;
+
 void main()
 {
     const vec4 worldAtFarPlane =

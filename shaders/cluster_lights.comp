@@ -25,11 +25,18 @@ layout(set = 0, binding = 8, std430) buffer LocalLightClusterBuffer
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 shared uint lightActive;
+shared vec3 viewPositionShared;
+shared float radiusShared;
+shared uint isSpotShared;
+shared vec3 spotAxisShared;
+shared float outerCosShared;
+shared float outerSinShared;
 shared uvec2 minimumTileShared;
 shared uvec2 maximumTileShared;
 shared uint minimumSliceShared;
 shared uint maximumSliceShared;
 shared uint maximumListLengthShared;
+shared uint appendedCountShared;
 
 uint depthSlice(float depth)
 {
@@ -40,6 +47,41 @@ uint depthSlice(float depth)
         / log2(farPlane / nearPlane);
     return min(uint(max(floor(normalized * slices), 0.0)),
                lighting.clusterDimensions.z - 1u);
+}
+
+float sliceDepth(uint slice)
+{
+    const float nearPlane = lighting.clusterProjection.z;
+    const float farPlane = lighting.clusterProjection.w;
+    const float slices = float(lighting.clusterDimensions.z);
+    return nearPlane * exp2(log2(farPlane / nearPlane) * (float(slice) / slices));
+}
+
+bool sphereIntersectsAabb(vec3 center, float radius, vec3 aabbMin, vec3 aabbMax)
+{
+    const vec3 closest = clamp(center, aabbMin, aabbMax);
+    const vec3 delta = closest - center;
+    return dot(delta, delta) <= radius * radius;
+}
+
+bool spotConeIntersectsSphere(
+    vec3 apex,
+    vec3 axis,
+    float range,
+    float outerCos,
+    float outerSin,
+    vec3 sphereCenter,
+    float sphereRadius)
+{
+    const vec3 toSphere = sphereCenter - apex;
+    const float distSq = dot(toSphere, toSphere);
+    const float axial = dot(toSphere, axis);
+    const float radialSq = max(distSq - axial * axial, 0.0);
+    const float closestConeDist = outerCos * sqrt(radialSq) - axial * outerSin;
+    if (closestConeDist > sphereRadius) return false;
+    if (axial > range + sphereRadius) return false;
+    if (axial < -sphereRadius) return false;
+    return true;
 }
 
 uint appendLight(uint cluster, uint lightIndex)
@@ -71,50 +113,110 @@ void main()
     {
         lightActive = 0u;
         maximumListLengthShared = 0u;
+        appendedCountShared = 0u;
         if (lightIndex < lighting.localLightCounts.x)
         {
             const GpuPunctualLight light = localLights[lightIndex];
-            const vec3 viewPosition =
-                (lighting.cameraView * vec4(light.positionRange.xyz, 1.0)).xyz;
-            const float centreDepth = -viewPosition.z;
             const float radius = light.positionRange.w;
-            const float nearPlane = lighting.clusterProjection.z;
-            const float farPlane = lighting.clusterProjection.w;
-            const float nearDepth = max(centreDepth - radius, nearPlane);
-            const float farDepth = min(centreDepth + radius, farPlane);
-            if (farDepth >= nearPlane && nearDepth <= farPlane && nearDepth <= farDepth)
+            if (light.colorIntensity.w > 0.0 && radius > 0.0)
             {
-                const float denominator = max(centreDepth - radius, nearPlane);
-                const float centreDenominator = max(centreDepth, nearPlane);
-                const vec2 ndcCentre = viewPosition.xy * lighting.clusterProjection.xy
-                    / centreDenominator;
-                // Include the projected centre displacement as depth varies
-                // across the sphere, plus one pixel of numeric guard.
-                const vec2 ndcRadius = abs(lighting.clusterProjection.xy) * radius
-                    / denominator
-                    * (vec2(1.0) + abs(viewPosition.xy) / centreDenominator);
-                const vec2 uvGuard = lighting.clusterViewport.zw;
-                const vec2 uvMinimum =
-                    (ndcCentre - ndcRadius) * 0.5 + 0.5 - uvGuard;
-                const vec2 uvMaximum =
-                    (ndcCentre + ndcRadius) * 0.5 + 0.5 + uvGuard;
-                if (!any(lessThan(uvMaximum, vec2(0.0))) &&
-                    !any(greaterThan(uvMinimum, vec2(1.0))))
+                const vec3 viewPosition =
+                    (lighting.cameraView * vec4(light.positionRange.xyz, 1.0)).xyz;
+                viewPositionShared = viewPosition;
+                radiusShared = radius;
+                isSpotShared = light.directionType.w > 0.5 ? 1u : 0u;
+
+                vec3 boundCenter = viewPosition;
+                float boundRadius = radius;
+                if (isSpotShared != 0u)
                 {
+                    const vec3 rawAxis =
+                        (lighting.cameraView * vec4(light.directionType.xyz, 0.0)).xyz;
+                    const float axisLenSq = dot(rawAxis, rawAxis);
+                    spotAxisShared = axisLenSq > 1.0e-12
+                        ? rawAxis * inversesqrt(axisLenSq)
+                        : vec3(0.0, 0.0, -1.0);
+                    const float scale = max(light.spotScaleOffset.x, 1.0e-5);
+                    const float outerCos =
+                        clamp(-light.spotScaleOffset.y / scale, 0.0, 1.0);
+                    outerCosShared = outerCos;
+                    outerSinShared = sqrt(max(1.0 - outerCos * outerCos, 0.0));
+                    // Tightest sphere enclosing a right circular cone (<= 90 deg).
+                    if (outerCos > 0.70710678)
+                    {
+                        boundRadius = radius / (2.0 * outerCos);
+                        boundCenter = viewPosition + spotAxisShared * boundRadius;
+                    }
+                    else
+                    {
+                        boundRadius = radius * outerSinShared;
+                        boundCenter = viewPosition + spotAxisShared * (radius * outerCos);
+                    }
+                }
+                else
+                {
+                    spotAxisShared = vec3(0.0, 0.0, -1.0);
+                    outerCosShared = 0.0;
+                    outerSinShared = 1.0;
+                }
+
+                const float nearPlane = lighting.clusterProjection.z;
+                const float farPlane = lighting.clusterProjection.w;
+                const float sphereNear = max(-viewPosition.z - radius, nearPlane);
+                const float sphereFar = min(-viewPosition.z + radius, farPlane);
+                const float boundNear = max(-boundCenter.z - boundRadius, sphereNear);
+                const float boundFar = min(-boundCenter.z + boundRadius, sphereFar);
+                if (boundFar >= nearPlane && boundNear <= farPlane && boundNear <= boundFar)
+                {
+                    const float centreDepth = -boundCenter.z;
                     const uvec2 dimensions = lighting.clusterDimensions.xy;
-                    minimumTileShared = min(
-                        uvec2(floor(clamp(uvMinimum, vec2(0.0), vec2(1.0))
-                            * vec2(dimensions))),
-                        dimensions - 1u);
-                    maximumTileShared = min(
-                        uvec2(floor(clamp(uvMaximum, vec2(0.0), vec2(1.0))
-                            * vec2(dimensions))),
-                        dimensions - 1u);
-                    minimumSliceShared = depthSlice(
-                        max(nearDepth * (1.0 - 1.0e-5), nearPlane));
-                    maximumSliceShared = depthSlice(
-                        min(farDepth * (1.0 + 1.0e-5), farPlane));
-                    lightActive = 1u;
+                    bool visible2d = true;
+                    // Only use Perspective AABB tightening when the bounding sphere is
+                    // strictly in front of the near plane; near-crossing spheres fall
+                    // back to full screen XY and let exact 3D per-cluster culling prune.
+                    if (centreDepth - boundRadius > nearPlane)
+                    {
+                        const float denominator = centreDepth - boundRadius;
+                        const vec2 ndcCentre =
+                            boundCenter.xy * lighting.clusterProjection.xy / centreDepth;
+                        const vec2 ndcRadius =
+                            abs(lighting.clusterProjection.xy) * boundRadius / denominator
+                            * (vec2(1.0) + abs(boundCenter.xy) / centreDepth);
+                        const vec2 uvGuard = lighting.clusterViewport.zw;
+                        const vec2 uvMinimum =
+                            (ndcCentre - ndcRadius) * 0.5 + 0.5 - uvGuard;
+                        const vec2 uvMaximum =
+                            (ndcCentre + ndcRadius) * 0.5 + 0.5 + uvGuard;
+                        if (any(lessThan(uvMaximum, vec2(0.0))) ||
+                            any(greaterThan(uvMinimum, vec2(1.0))))
+                        {
+                            visible2d = false;
+                        }
+                        else
+                        {
+                            minimumTileShared = min(
+                                uvec2(floor(clamp(uvMinimum, vec2(0.0), vec2(1.0))
+                                    * vec2(dimensions))),
+                                dimensions - 1u);
+                            maximumTileShared = min(
+                                uvec2(floor(clamp(uvMaximum, vec2(0.0), vec2(1.0))
+                                    * vec2(dimensions))),
+                                dimensions - 1u);
+                        }
+                    }
+                    else
+                    {
+                        minimumTileShared = uvec2(0u);
+                        maximumTileShared = dimensions - 1u;
+                    }
+                    if (visible2d)
+                    {
+                        minimumSliceShared = depthSlice(
+                            max(boundNear * (1.0 - 1.0e-5), nearPlane));
+                        maximumSliceShared = depthSlice(
+                            min(boundFar * (1.0 + 1.0e-5), farPlane));
+                        lightActive = 1u;
+                    }
                 }
             }
         }
@@ -123,12 +225,15 @@ void main()
     if (lightActive == 0u) return;
 
     const uvec2 dimensions = lighting.clusterDimensions.xy;
+    const vec2 invDimensions = 1.0 / vec2(dimensions);
+    const vec2 uvGuard = lighting.clusterViewport.zw;
     const uint tileWidth = maximumTileShared.x - minimumTileShared.x + 1u;
     const uint tileHeight = maximumTileShared.y - minimumTileShared.y + 1u;
     const uint sliceCount = maximumSliceShared - minimumSliceShared + 1u;
     const uint tilesPerSlice = tileWidth * tileHeight;
     const uint assignmentCount = tilesPerSlice * sliceCount;
     uint localMaximum = 0u;
+    uint localAppended = 0u;
     for (uint assignment = localIndex; assignment < assignmentCount;
          assignment += gl_WorkGroupSize.x)
     {
@@ -136,20 +241,66 @@ void main()
         const uint tileOffset = assignment - sliceOffset * tilesPerSlice;
         const uint yOffset = tileOffset / tileWidth;
         const uint xOffset = tileOffset - yOffset * tileWidth;
-        const uint cluster = minimumTileShared.x + xOffset + dimensions.x *
-            (minimumTileShared.y + yOffset + dimensions.y *
-                (minimumSliceShared + sliceOffset));
-        localMaximum = max(localMaximum,
-                           appendLight(cluster, lightIndex));
+        const uint tileX = minimumTileShared.x + xOffset;
+        const uint tileY = minimumTileShared.y + yOffset;
+        const uint sliceZ = minimumSliceShared + sliceOffset;
+
+        const vec2 uvMin = max(vec2(tileX, tileY) * invDimensions - uvGuard, vec2(0.0));
+        const vec2 uvMax = min(vec2(tileX + 1u, tileY + 1u) * invDimensions + uvGuard, vec2(1.0));
+        const vec2 rayA = (uvMin * 2.0 - 1.0) / lighting.clusterProjection.xy;
+        const vec2 rayB = (uvMax * 2.0 - 1.0) / lighting.clusterProjection.xy;
+        const vec2 rayMin = min(rayA, rayB);
+        const vec2 rayMax = max(rayA, rayB);
+
+        const float zNearSlice = sliceZ == 0u
+            ? 0.0
+            : sliceDepth(sliceZ) * (1.0 - 1.0e-5);
+        // Fragments beyond farPlane clamp to the last depth slice in shading.
+        const float zFarSlice = (sliceZ + 1u >= lighting.clusterDimensions.z)
+            ? max(sliceDepth(sliceZ + 1u), -viewPositionShared.z + radiusShared)
+            : sliceDepth(sliceZ + 1u) * (1.0 + 1.0e-5);
+
+        const float clampedNear = max(zNearSlice, max(0.0, -viewPositionShared.z - radiusShared));
+        const float clampedFar = min(zFarSlice, -viewPositionShared.z + radiusShared);
+        if (clampedNear > clampedFar) continue;
+
+        const vec3 aabbMin = vec3(
+            min(rayMin.x * clampedNear, rayMin.x * clampedFar),
+            min(rayMin.y * clampedNear, rayMin.y * clampedFar),
+            -clampedFar);
+        const vec3 aabbMax = vec3(
+            max(rayMax.x * clampedNear, rayMax.x * clampedFar),
+            max(rayMax.y * clampedNear, rayMax.y * clampedFar),
+            -clampedNear);
+
+        if (!sphereIntersectsAabb(viewPositionShared, radiusShared, aabbMin, aabbMax))
+            continue;
+
+        if (isSpotShared != 0u)
+        {
+            const vec3 clusterCenter = 0.5 * (aabbMin + aabbMax);
+            const float clusterRadius = length(0.5 * (aabbMax - aabbMin)) + 1.0e-4;
+            if (!spotConeIntersectsSphere(
+                    viewPositionShared, spotAxisShared, radiusShared,
+                    outerCosShared, outerSinShared, clusterCenter, clusterRadius))
+            {
+                continue;
+            }
+        }
+
+        const uint cluster = tileX + dimensions.x * (tileY + dimensions.y * sliceZ);
+        localMaximum = max(localMaximum, appendLight(cluster, lightIndex));
+        ++localAppended;
     }
-    atomicMax(maximumListLengthShared, localMaximum);
+    if (localMaximum > 0u) atomicMax(maximumListLengthShared, localMaximum);
+    if (localAppended > 0u) atomicAdd(appendedCountShared, localAppended);
     barrier();
-    if (localIndex == 0u)
+    if (localIndex == 0u && appendedCountShared > 0u)
     {
         const uint capacity = lighting.clusterDimensions.w;
         const uint clusterCount = dimensions.x * dimensions.y * lighting.clusterDimensions.z;
         const uint statisticsBase = clusterCount * (2u + capacity);
-        atomicAdd(clusterData[statisticsBase], assignmentCount);
+        atomicAdd(clusterData[statisticsBase], appendedCountShared);
         atomicMax(clusterData[statisticsBase + 2u], maximumListLengthShared);
     }
 }

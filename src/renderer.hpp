@@ -143,9 +143,26 @@ public:
         if (depth_prepass_ != DepthPrepass::off) {
             return depth_prepass_;
         }
-        return ray_tracing_mode_actual() != RayTracingMode::off
-            ? DepthPrepass::full
-            : DepthPrepass::off;
+        if (ray_tracing_mode_actual() != RayTracingMode::off) {
+            return DepthPrepass::full;
+        }
+        if (depth_prepass_override_) {
+            return DepthPrepass::off;
+        }
+        if (mode_ != RunMode::instancing && mode_ != RunMode::gpu_saturation) {
+            if (local_light_backend_actual() == LocalLightBackend::clustered
+#if VCR_EDITOR_ENABLED
+                && (!authored_scene_enabled_ ||
+                    (visibility_statistics_.submitted > 0U &&
+                     visibility_statistics_.triangles <= 2'000'000ULL &&
+                     static_cast<std::uint64_t>(alpha_masked_model_instances_) * 2ULL <=
+                         total_model_instances_))
+#endif
+            ) {
+                return DepthPrepass::full;
+            }
+        }
+        return DepthPrepass::off;
     }
     [[nodiscard]] LodFadePattern lod_fade_pattern() const noexcept { return lod_fade_pattern_; }
     [[nodiscard]] float lod_fade_seconds() const noexcept { return lod_fade_seconds_; }
@@ -158,10 +175,12 @@ public:
 #endif
     }
     [[nodiscard]] bool set_lod_fade(LodFadePattern pattern, float seconds) noexcept;
-    [[nodiscard]] bool set_depth_prepass(DepthPrepass mode) noexcept {
+    [[nodiscard]] bool set_depth_prepass(
+        DepthPrepass mode, bool explicit_override = true) noexcept {
         if (mode != DepthPrepass::off && mode != DepthPrepass::partial &&
             mode != DepthPrepass::full) return false;
         depth_prepass_ = mode;
+        depth_prepass_override_ = explicit_override;
         return true;
     }
     // Display mapping runs after temporal reconstruction, so switching it does
@@ -398,7 +417,10 @@ public:
     }
     [[nodiscard]] bool coarse_depth_order_active() const noexcept {
         return visibility_settings_.coarse_front_to_back && mode_ != RunMode::instancing &&
-            !gpu_visibility_active_ && !scene_metadata_.empty();
+            (!gpu_visibility_active_ ||
+             (!gpu_visibility_bypassed_ && !visibility_commands_.empty() &&
+              visibility_groups_.size() <= max_shadow_draw_groups)) &&
+            !scene_metadata_.empty();
     }
     [[nodiscard]] unsigned terrain_lod() const noexcept {
         return terrain_lod_;
@@ -535,8 +557,17 @@ private:
         VkPipeline ordinary = VK_NULL_HANDLE;
         DeviceObject<VkPipeline> grass{};
     };
-    std::array<GrassPipelineVariant, 64> grass_pipeline_variants_{};
+    std::array<GrassPipelineVariant, 96> grass_pipeline_variants_{};
     std::size_t grass_pipeline_variant_count_ = 0;
+
+    struct OpaquePipelineVariant {
+        // Observer: the ordinary pipeline is owned by this Renderer. Variants
+        // retire before those owners when swapchain pipelines are rebuilt.
+        VkPipeline ordinary = VK_NULL_HANDLE;
+        DeviceObject<VkPipeline> opaque{};
+    };
+    std::array<OpaquePipelineVariant, 128> opaque_pipeline_variants_{};
+    std::size_t opaque_pipeline_variant_count_ = 0;
 
     struct EditorTextureAsset {
         glm::vec3 average_linear{1};
@@ -724,6 +755,7 @@ private:
     SubsurfaceMode subsurface_mode_ = SubsurfaceMode::off;
     MotionBlurSettings motion_blur_settings_{};
     DepthPrepass depth_prepass_ = DepthPrepass::off;
+    bool depth_prepass_override_ = false;
     LodFadePattern lod_fade_pattern_ = LodFadePattern::off;
     float lod_fade_seconds_ = 0.25F;
     bool lighting_paused_ = false;
@@ -972,6 +1004,9 @@ private:
     DeviceObject<VkPipelineLayout> visibility_pipeline_layout_;
     DeviceObject<VkDescriptorPool> visibility_pool_;
     DeviceObject<VkPipeline> visibility_pipeline_;
+    DeviceObject<VkPipeline> visibility_binned_pipeline_;
+    DeviceObject<VkPipeline> visibility_prefix_pipeline_;
+    DeviceObject<VkPipeline> visibility_scatter_pipeline_;
     GpuBuffer visibility_lod_history_;
     std::vector<VisibilitySource> visibility_sources_;
     std::vector<VisibilityGroup> visibility_groups_;
@@ -1037,6 +1072,8 @@ private:
     std::uint32_t editor_cube_count_ = 0U;
     std::uint32_t authored_scene_object_count_ = 0U;
     std::uint64_t authored_scene_triangle_count_ = 0U;
+    std::uint32_t total_model_instances_ = 0U;
+    std::uint32_t alpha_masked_model_instances_ = 0U;
     std::uint64_t editor_scene_revision_ = 1U;
     std::uint64_t editor_viewport_generation_ = 0U;
     std::uint64_t swapchain_generation_ = 1U;

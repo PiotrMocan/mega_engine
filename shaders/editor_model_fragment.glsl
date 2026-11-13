@@ -5,8 +5,16 @@
 #define VCR_SURFACE_SHADOW_EXPLICIT_LOD 1
 #endif
 #include "surface_lighting_common.glsl"
+#ifndef VCR_OPAQUE_EARLY_Z
 #include "lod_fade.glsl"
 #include "material_coverage.glsl"
+#ifdef VCR_EQUAL_EARLY_Z
+layout(early_fragment_tests) in;
+#endif
+#else
+#include "material_coverage.glsl"
+layout(early_fragment_tests) in;
+#endif
 
 // Locations 0..5 (non-temporal) and 0..7 (temporal) intentionally match
 // scene.frag / scene_aa.frag's vertex interface.
@@ -96,11 +104,15 @@ void main()
     // Derivatives after nonuniform discard are undefined. All material maps
     // share authored UVs, so compute their gradients before applying coverage.
     const vec2 uvDx = dFdx(inUv), uvDy = dFdy(inUv);
+#ifndef VCR_OPAQUE_EARLY_Z
     if (!lodKeep(inLodToken, uvec2(gl_FragCoord.xy))) discard;
+#endif
     const vec4 sampledBaseColor =
         textureGrad(materialBaseColorTexture, inUv, uvDx, uvDy);
     const vec4 baseColor = sampledBaseColor * inBaseColor;
+#ifndef VCR_OPAQUE_EARLY_Z
     if (!materialKeepsAlpha(pushConstants.padding, baseColor.a)) discard;
+#endif
 
     const vec3 clampedBaseColor = clamp(baseColor.rgb, vec3(0.0), vec3(1.0));
     vec3 shadedColor = clampedBaseColor;

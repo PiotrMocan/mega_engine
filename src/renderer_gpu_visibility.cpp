@@ -16,8 +16,23 @@ constexpr VkDeviceSize command_capacity =
     group_capacity * model_lod_count * sizeof(VkDrawIndexedIndirectCommand);
 constexpr VkDeviceSize shadow_command_capacity =
     VkDeviceSize{max_shadow_draw_groups} * 16ULL * sizeof(VkDrawIndexedIndirectCommand);
+constexpr std::size_t visibility_depth_bins = 16ULL;
+constexpr std::size_t max_binned_commands =
+    std::size_t{max_shadow_draw_groups} * model_lod_count;
+constexpr std::size_t bin_counts_uint_offset = 20ULL * source_capacity;
+constexpr std::size_t scratch_uint_offset =
+    bin_counts_uint_offset + max_binned_commands * visibility_depth_bins;
 constexpr VkDeviceSize visible_capacity =
-    32ULL + source_capacity * 20ULL * sizeof(std::uint32_t);
+    32ULL +
+    (20ULL * source_capacity + max_binned_commands * visibility_depth_bins +
+     4ULL * source_capacity) *
+        sizeof(std::uint32_t);
+static_assert(source_capacity == 100'001ULL,
+              "Update kMaxSceneSources in shaders/visibility_bins_common.glsl");
+static_assert(max_binned_commands == 4096ULL * 4ULL,
+              "Update kMaxBinnedCommands in shaders/visibility_bins_common.glsl");
+static_assert(visibility_depth_bins == 16ULL,
+              "Update kDepthBins in shaders/visibility_bins_common.glsl");
 
 void barrier(VkCommandBuffer command, VkBuffer buffer, VkPipelineStageFlags2 src,
              VkAccessFlags2 src_access, VkPipelineStageFlags2 dst, VkAccessFlags2 dst_access,
@@ -144,6 +159,9 @@ void Renderer::create_gpu_visibility() {
         context_->device(), &pipeline_layout, nullptr,
         visibility_pipeline_layout_.put(context_->device(), vkDestroyPipelineLayout)));
     const auto shader = load_shader("scene_visibility.comp.spv");
+    const auto binned_shader = load_shader("scene_visibility_binned.comp.spv");
+    const auto prefix_shader = load_shader("scene_visibility_prefix.comp.spv");
+    const auto scatter_shader = load_shader("scene_visibility_scatter.comp.spv");
     const VkComputePipelineCreateInfo pipeline{
         .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -151,9 +169,39 @@ void Renderer::create_gpu_visibility() {
                   .module = shader.get(),
                   .pName = "main"},
         .layout = visibility_pipeline_layout_.get()};
+    const VkComputePipelineCreateInfo binned_pipeline{
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                  .module = binned_shader.get(),
+                  .pName = "main"},
+        .layout = visibility_pipeline_layout_.get()};
+    const VkComputePipelineCreateInfo prefix_pipeline{
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                  .module = prefix_shader.get(),
+                  .pName = "main"},
+        .layout = visibility_pipeline_layout_.get()};
+    const VkComputePipelineCreateInfo scatter_pipeline{
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                  .module = scatter_shader.get(),
+                  .pName = "main"},
+        .layout = visibility_pipeline_layout_.get()};
     VK_CHECK(
         vkCreateComputePipelines(context_->device(), pipeline_cache_, 1, &pipeline, nullptr,
                                  visibility_pipeline_.put(context_->device(), vkDestroyPipeline)));
+    VK_CHECK(vkCreateComputePipelines(
+        context_->device(), pipeline_cache_, 1, &binned_pipeline, nullptr,
+        visibility_binned_pipeline_.put(context_->device(), vkDestroyPipeline)));
+    VK_CHECK(vkCreateComputePipelines(
+        context_->device(), pipeline_cache_, 1, &prefix_pipeline, nullptr,
+        visibility_prefix_pipeline_.put(context_->device(), vkDestroyPipeline)));
+    VK_CHECK(vkCreateComputePipelines(
+        context_->device(), pipeline_cache_, 1, &scatter_pipeline, nullptr,
+        visibility_scatter_pipeline_.put(context_->device(), vkDestroyPipeline)));
 
     std::array<VkDescriptorSetLayoutBinding, 6> shadow_bindings{};
     for (unsigned i = 0; i < shadow_bindings.size(); ++i) {
@@ -407,6 +455,9 @@ void Renderer::destroy_gpu_visibility() noexcept {
     shadow_visibility_pipeline_layout_.reset();
     shadow_visibility_layout_.reset();
 
+    visibility_scatter_pipeline_.reset();
+    visibility_prefix_pipeline_.reset();
+    visibility_binned_pipeline_.reset();
     visibility_pipeline_.reset();
     visibility_pipeline_layout_.reset();
     visibility_pool_.reset();
@@ -1022,6 +1073,11 @@ void Renderer::prepare_gpu_scene_packet(const glm::mat4 &vp, glm::vec3 camera, V
     }
     const std::uint32_t occlusion_flags =
         (grid_occlusion_enabled ? 1U : 0U) | (use_hiz ? 2U : 0U);
+    const bool binned =
+        visibility_settings_.coarse_front_to_back &&
+        !scene_metadata_.empty() && !visibility_commands_.empty() &&
+        visibility_groups_.size() <= max_shadow_draw_groups;
+    const auto command_count = static_cast<unsigned>(visibility_commands_.size());
     const VisibilityUniforms uniform{
         padded,
         use_hiz ? hiz_view_projection_ : glm::mat4{1.0F},
@@ -1035,7 +1091,8 @@ void Renderer::prepare_gpu_scene_packet(const glm::mat4 &vp, glm::vec3 camera, V
         {static_cast<unsigned>(scene_metadata_.size()), visibility_settings_.frustum ? 1U : 0U,
          occlusion_flags,
          unsigned(visibility_settings_.lod) |
-             (fade_enabled ? (unsigned(lod_fade_pattern_) << 1U) : 0U)},
+             (fade_enabled ? (unsigned(lod_fade_pattern_) << 1U) : 0U) |
+             (binned ? (8U | (command_count << 4U)) : 0U)},
         grid.depths()};
     if (!gpu_visibility_bypassed_) {
         frames_[frame_index_].visibility.uniform.write(std::as_bytes(std::span{&uniform, 1}));
@@ -1140,19 +1197,48 @@ void Renderer::record_gpu_visibility(VkCommandBuffer command, FrameContext &fram
     const auto commands_bytes = visibility_commands_.size() * sizeof(VkDrawIndexedIndirectCommand);
     const VkDeviceSize main_visible_bytes =
         32ULL + 4ULL * VkDeviceSize{scene_metadata_.size()} * sizeof(std::uint32_t);
+    const bool binned =
+        visibility_settings_.coarse_front_to_back &&
+        !scene_metadata_.empty() && !visibility_commands_.empty() &&
+        visibility_groups_.size() <= max_shadow_draw_groups;
+    const VkDeviceSize bin_counts_byte_offset =
+        32ULL + bin_counts_uint_offset * sizeof(std::uint32_t);
+    const VkDeviceSize bin_counts_bytes =
+        VkDeviceSize{visibility_commands_.size()} * visibility_depth_bins * sizeof(std::uint32_t);
+    const VkDeviceSize scratch_byte_offset =
+        32ULL + scratch_uint_offset * sizeof(std::uint32_t);
+    const VkDeviceSize scratch_bytes =
+        4ULL * VkDeviceSize{scene_metadata_.size()} * sizeof(std::uint32_t);
     const VkBufferCopy commands{commands_offset, 0, commands_bytes};
     vkCmdCopyBuffer(command, f.staging.handle(), f.indirect.handle(), 1, &commands);
     vkCmdFillBuffer(command, f.visible.handle(), 0, 32, 0);
+    if (binned) {
+        vkCmdFillBuffer(command, f.visible.handle(), bin_counts_byte_offset, bin_counts_bytes, 0);
+    }
     barrier(command, f.indirect.handle(), VK_PIPELINE_STAGE_2_TRANSFER_BIT,
             VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, 0U,
             commands_bytes);
     barrier(command, f.visible.handle(),
             VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
-            VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT |
+                VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, 0U,
             main_visible_bytes);
+    if (binned) {
+        barrier(command, f.visible.handle(),
+                VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                    VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                bin_counts_byte_offset, bin_counts_bytes);
+        barrier(command, f.visible.handle(), VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                scratch_byte_offset, scratch_bytes);
+    }
     barrier(command, visibility_lod_history_.handle(), VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             reset_lod_history_ ? VK_PIPELINE_STAGE_2_TRANSFER_BIT
@@ -1167,10 +1253,34 @@ void Renderer::record_gpu_visibility(VkCommandBuffer command, FrameContext &fram
                 VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         reset_lod_history_ = false;
     }
-    vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, visibility_pipeline_.get());
+    vkCmdBindPipeline(
+        command, VK_PIPELINE_BIND_POINT_COMPUTE,
+        binned ? visibility_binned_pipeline_.get() : visibility_pipeline_.get());
     vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE,
                             visibility_pipeline_layout_.get(), 0, 1, &f.descriptor, 0, nullptr);
     vkCmdDispatch(command, (static_cast<unsigned>(scene_metadata_.size()) + 127) / 128, 1, 1);
+    if (binned) {
+        barrier(command, f.visible.handle(), VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                bin_counts_byte_offset, bin_counts_bytes);
+        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          visibility_prefix_pipeline_.get());
+        vkCmdDispatch(command,
+                      (static_cast<unsigned>(visibility_commands_.size()) + 63U) / 64U, 1, 1);
+        barrier(command, f.visible.handle(), VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                bin_counts_byte_offset, bin_counts_bytes);
+        barrier(command, f.visible.handle(), VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_READ_BIT, scratch_byte_offset, scratch_bytes);
+        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          visibility_scatter_pipeline_.get());
+        vkCmdDispatch(command, (static_cast<unsigned>(scene_metadata_.size()) + 127U) / 128U, 1, 1);
+    }
     barrier(command, f.visible.handle(), VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,

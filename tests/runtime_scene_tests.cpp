@@ -616,6 +616,157 @@ int main() {
             expect(std::isfinite(cards.lod_error[level]) && cards.lod_error[level] > cards.lod_error[level - 1],
                    "foliage geometric errors remain finite and strictly increasing");
         }
+        expect(cards.lod_error[3] < 0.03F,
+               "foliage silhouette error stays decoupled from UV-attribute simplification weights");
+
+        vcr::CookedModelAsset tall_tree;
+        tall_tree.materials.push_back({.name = "Bark", .coverage = 0U});
+        tall_tree.materials.push_back({.name = "Needles", .coverage = 1U});
+        // Opaque cylindrical trunk with a 0..1 UV seam spanning 20 m height.
+        constexpr unsigned rings = 10U;
+        constexpr unsigned sectors = 12U;
+        for (unsigned r = 0; r <= rings; ++r) {
+            const float y = static_cast<float>(r) * 2.0F;
+            const float radius = 0.35F * (1.0F - 0.6F * static_cast<float>(r) / static_cast<float>(rings));
+            for (unsigned s = 0; s <= sectors; ++s) {
+                const float u = static_cast<float>(s) / static_cast<float>(sectors);
+                const float angle = u * 6.2831853F;
+                vcr::CookedModelVertex v{};
+                v.position = {std::cos(angle) * radius, y, std::sin(angle) * radius};
+                v.normal = {std::cos(angle), 0.0F, std::sin(angle)};
+                v.texcoord = {u, y * 0.25F};
+                tall_tree.vertices.push_back(v);
+            }
+        }
+        for (unsigned r = 0; r < rings; ++r) {
+            for (unsigned s = 0; s < sectors; ++s) {
+                const auto i0 = r * (sectors + 1U) + s;
+                const auto i1 = i0 + 1U;
+                const auto i2 = i0 + (sectors + 1U);
+                const auto i3 = i2 + 1U;
+                for (const auto idx : {i0, i2, i1, i1, i2, i3}) {
+                    tall_tree.indices.push_back(idx);
+                }
+            }
+        }
+        const auto trunk_index_count = tall_tree.indices.size();
+        for (unsigned card = 0; card < 32U; ++card) {
+            const float y = 6.0F + static_cast<float>(card) * 0.4F;
+            const auto base_v = static_cast<std::uint32_t>(tall_tree.vertices.size());
+            for (unsigned corner = 0; corner < 4U; ++corner) {
+                const float u = static_cast<float>(corner & 1U);
+                const float t = static_cast<float>((corner >> 1U) & 1U);
+                vcr::CookedModelVertex v{};
+                v.position = {(u - 0.5F) * 2.4F, y + t * 0.8F, (t - 0.5F) * 2.4F};
+                v.normal = {0.0F, 1.0F, 0.0F};
+                v.texcoord = {u, t};
+                tall_tree.vertices.push_back(v);
+            }
+            for (const auto idx : {base_v, base_v + 1U, base_v + 2U, base_v + 2U, base_v + 1U, base_v + 3U}) {
+                tall_tree.indices.push_back(idx);
+            }
+        }
+        tall_tree.submeshes.push_back({.first_index = 0U, .index_count = trunk_index_count, .material_index = 0U, .name = "Bark"});
+        tall_tree.submeshes.push_back({.first_index = trunk_index_count, .index_count = tall_tree.indices.size() - trunk_index_count, .material_index = 1U, .name = "Needles"});
+        auto authored_base = tall_tree;
+        vcr::prepare_model_lods(tall_tree);
+        expect(tall_tree.submeshes[0].lod_error[3] < 0.30F &&
+                   tall_tree.submeshes[1].lod_error[3] < 0.10F,
+               "tall UV-seamed trunk and foliage cards keep bounded meter-scale LOD errors");
+
+        // Authored LODs preserve independent per-submesh geometric errors when present.
+        authored_base.lods = {{"lod1.vcrasset.json", 0.02F}, {"lod2.vcrasset.json", 0.05F}, {"lod3.vcrasset.json", 0.09F}};
+        std::vector<vcr::CookedModelAsset> authored_levels(3, authored_base);
+        for (std::size_t lvl = 0; lvl < 3U; ++lvl) {
+            authored_levels[lvl].lods.clear();
+            authored_levels[lvl].submeshes[0].authored_geometric_error = 0.04F * static_cast<float>(lvl + 1U);
+            authored_levels[lvl].submeshes[1].authored_geometric_error = 0.015F * static_cast<float>(lvl + 1U);
+        }
+        vcr::prepare_authored_model_lods(authored_base, authored_levels, 16ULL * 1024ULL * 1024ULL);
+        expect(std::abs(authored_base.submeshes[0].lod_error[3] - 0.12F) < 1.0e-5F &&
+                   std::abs(authored_base.submeshes[1].lod_error[3] - 0.045F) < 1.0e-5F,
+               "authored LOD preparation preserves per-submesh geometric error");
+
+        // Dense micro-card foliage crowns (>= 512 disconnected cards) decimate cleanly
+        // across LOD1..LOD3 while keeping LOD0 bit-exact and staying within LOD0 AABB.
+        vcr::CookedModelAsset micro_crown;
+        micro_crown.materials.push_back({.name = "PineNeedles", .coverage = 1U});
+        for (unsigned card = 0U; card < 600U; ++card) {
+            const float cx = static_cast<float>(card % 10U) * 0.8F - 3.6F;
+            const float cy = 2.0F + static_cast<float>(card / 30U) * 0.9F;
+            const float cz = static_cast<float>((card / 10U) % 3U) * 1.4F - 1.4F;
+            const auto base_v = static_cast<std::uint32_t>(micro_crown.vertices.size());
+            for (unsigned corner = 0U; corner < 4U; ++corner) {
+                const float u = static_cast<float>(corner & 1U);
+                const float t = static_cast<float>((corner >> 1U) & 1U);
+                vcr::CookedModelVertex v{};
+                v.position = {cx + (u - 0.5F) * 0.3F, cy + (t - 0.5F) * 0.3F, cz};
+                v.normal = {0.0F, 0.0F, 1.0F};
+                v.texcoord = {u, t};
+                micro_crown.vertices.push_back(v);
+            }
+            for (const auto idx :
+                 {base_v, base_v + 1U, base_v + 2U, base_v + 2U, base_v + 1U, base_v + 3U}) {
+                micro_crown.indices.push_back(idx);
+            }
+        }
+        micro_crown.submeshes.push_back({
+            .first_index = 0U,
+            .index_count = micro_crown.indices.size(),
+            .material_index = 0U,
+            .name = "PineNeedles",
+        });
+        const auto micro_lod0_indices = micro_crown.indices;
+        const auto micro_lod0_vertices = micro_crown.vertices;
+        std::array<float, 3U> crown_min{
+            std::numeric_limits<float>::max(),
+            std::numeric_limits<float>::max(),
+            std::numeric_limits<float>::max(),
+        };
+        std::array<float, 3U> crown_max{
+            std::numeric_limits<float>::lowest(),
+            std::numeric_limits<float>::lowest(),
+            std::numeric_limits<float>::lowest(),
+        };
+        for (const auto& v : micro_lod0_vertices) {
+            for (std::size_t axis = 0U; axis < 3U; ++axis) {
+                crown_min[axis] = std::min(crown_min[axis], v.position[axis]);
+                crown_max[axis] = std::max(crown_max[axis], v.position[axis]);
+            }
+        }
+        vcr::prepare_model_lods(micro_crown);
+        const auto& crown_mesh = micro_crown.submeshes.front();
+        expect(std::equal(
+                   micro_lod0_indices.begin(), micro_lod0_indices.end(),
+                   micro_crown.indices.begin()) &&
+                   std::equal(
+                       micro_lod0_vertices.begin(), micro_lod0_vertices.end(),
+                       micro_crown.vertices.begin(),
+                       [](const vcr::CookedModelVertex& a, const vcr::CookedModelVertex& b) {
+                           return a.position == b.position && a.texcoord == b.texcoord;
+                       }),
+               "micro-card foliage LOD0 keeps original vertices and indices bit-exact");
+        expect(crown_mesh.lod_count[0] > crown_mesh.lod_count[1] &&
+                   crown_mesh.lod_count[1] > crown_mesh.lod_count[2] &&
+                   crown_mesh.lod_count[2] > crown_mesh.lod_count[3] &&
+                   crown_mesh.lod_count[3] > 0U &&
+                   crown_mesh.lod_count[1] <= static_cast<std::uint32_t>(micro_lod0_indices.size() * 0.40) &&
+                   crown_mesh.lod_count[2] <= static_cast<std::uint32_t>(micro_lod0_indices.size() * 0.16) &&
+                   crown_mesh.lod_count[3] <= static_cast<std::uint32_t>(micro_lod0_indices.size() * 0.08),
+               "micro-card foliage achieves progressive multi-level triangle reduction");
+        expect(std::isfinite(crown_mesh.lod_error[3]) &&
+                   crown_mesh.lod_error[1] > 0.0F &&
+                   crown_mesh.lod_error[2] > crown_mesh.lod_error[1] &&
+                   crown_mesh.lod_error[3] > crown_mesh.lod_error[2] &&
+                   crown_mesh.lod_error[3] < 0.08F,
+               "micro-card foliage LOD errors stay finite, increasing, and meter-bounded");
+        for (const auto& v : micro_crown.vertices) {
+            for (std::size_t axis = 0U; axis < 3U; ++axis) {
+                expect(v.position[axis] >= crown_min[axis] - 1.0e-5F &&
+                           v.position[axis] <= crown_max[axis] + 1.0e-5F,
+                       "micro-card LOD scaling stays strictly inside LOD0 bounds");
+            }
+        }
     }
     {
         std::array<vcr::CookedModelVertex, 3> tri_vertices{};

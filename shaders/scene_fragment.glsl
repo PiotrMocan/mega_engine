@@ -3,6 +3,8 @@
 
 #include "surface_lighting_common.glsl"
 
+layout(early_fragment_tests) in;
+
 layout(location = 0) in vec3 inWorldNormal;
 layout(location = 1) in vec4 inBaseColor;
 layout(location = 2) flat in uint inInstanceIndex;

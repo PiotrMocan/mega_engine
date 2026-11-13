@@ -1,0 +1,39 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x=128) in;
+layout(set=0,binding=0,std140) uniform VisibilityUniforms {
+    mat4 viewProjection;
+    mat4 hizViewProjection;
+    vec4 planes[6];
+    vec4 cameraPixels;
+    vec4 guardError;
+    vec4 hizParams;
+    uvec4 flags;
+    vec4 grid[144];
+} config;
+layout(set=0,binding=4,std430) buffer Visible { uint counters[8]; uint indices[]; };
+
+#include "visibility_bins_common.glsl"
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= config.flags.x) return;
+    uint scratchOffset = kScratchBase + id * 4u;
+    uint header = indices[scratchOffset + 0u];
+    if ((header & 1u) == 0u) return;
+
+    uint depthBin = (header >> 1u) & 15u;
+    uint commandIndex = (header >> 5u) & 0xffffu;
+    uint binOffset = indices[scratchOffset + 1u];
+    uint token = indices[scratchOffset + 2u];
+    uint dst = indices[kBinCountsBase + commandIndex * kDepthBins + depthBin] + binOffset;
+    indices[dst] = token;
+
+    if ((header & (1u << 21u)) != 0u) {
+        uint oldLod = (header >> 22u) & 3u;
+        uint oldCommand = (commandIndex & ~3u) | oldLod;
+        uint oldBinOffset = indices[scratchOffset + 3u];
+        uint oldDst = indices[kBinCountsBase + oldCommand * kDepthBins + depthBin] + oldBinOffset;
+        indices[oldDst] = token | (1u << 29u);
+    }
+}
