@@ -291,6 +291,14 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
             result.options.mcp_stdio = true;
             continue;
         }
+        if (argument.name == "--main-menu") {
+            if (argument.has_inline_value) {
+                result.error = invalid_value(argument.name, argument.inline_value);
+                return result;
+            }
+            result.options.start_in_main_menu = true;
+            continue;
+        }
         if (argument.name == "--validation") {
             if (argument.has_inline_value) {
                 result.error = invalid_value(argument.name, argument.inline_value);
@@ -714,6 +722,17 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
             result.options.project_path = value;
             continue;
         }
+        if (argument.name == "--locale") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) {
+                return result;
+            }
+            if (value.empty() || value.size() > 32) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.locale = value;
+            continue;
+        }
         if (argument.name == "--culling" || argument.name == "--lod" ||
             argument.name == "--dynamic-shadows" || argument.name == "--scene-count" ||
             argument.name == "--scene-asset" || argument.name == "--stream-asset" ||
@@ -1111,6 +1130,8 @@ std::string cli_usage(std::string_view executable_name) {
                                 : executable_name);
     result.append(" [options]\n"
                   "  --project PATH          Open project directory or project.vcrproject.json\n"
+                  "  --main-menu             Open standalone runtime in main menu screen\n"
+                  "  --locale CODE           Select initial localization code (e.g. en, ru)\n"
                   "  --benchmark             Run timed benchmark and write benchmark.json\n"
                   "  --mcp-stdio             Expose AI toolsets over MCP stdio\n"
                   "  --width N               Initial drawable width (default: 1920)\n"

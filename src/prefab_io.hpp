@@ -40,6 +40,7 @@ struct PrefabNodeOverride {
     std::optional<AudioReverbZoneComponent> reverb_zone{};
     std::optional<AnimatorComponent> animator{};
     std::optional<GameplayComponent> gameplay{};
+    std::optional<UiMarkerComponent> ui_marker{};
 };
 
 struct PrefabInstantiateOptions {

@@ -299,6 +299,12 @@ SceneNodeId duplicate_scene_subtree(
             static_cast<void>(scene.destroy_subtree(duplicate_root));
             return {};
         }
+        if (record.ui_marker &&
+            !scene.set_ui_marker(copy, *record.ui_marker)) {
+            error = "Unable to copy ui_marker component to duplicated node.";
+            static_cast<void>(scene.destroy_subtree(duplicate_root));
+            return {};
+        }
         const bool copy_prefab_link =
             record.prefab_instance.has_value() &&
             (record_index != begin ||

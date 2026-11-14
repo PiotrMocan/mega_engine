@@ -55,6 +55,7 @@ private:
         std::string message,
         std::string structured_json = "{}");
     void synchronize_gameplay_state();
+    void bind_game_ui_callbacks() noexcept;
     void update_gameplay(float delta_seconds);
     void update_scene_snapshot();
     void update_window_title();
@@ -97,6 +98,10 @@ private:
     EditorPlayState observed_play_state_ = EditorPlayState::edit;
     std::uint32_t main_window_id_ = 0U;
     bool running_ = false;
+    bool ui_bloom_enabled_ = true;
+    bool pending_gameplay_restart_ = false;
+    bool pending_gameplay_stop_to_edit_ = false;
+    std::vector<SceneHierarchyRow> ui_sky_rows_scratch_{};
     std::uint64_t pending_screenshot_token_ = 0U;
     std::optional<std::reference_wrapper<std::streambuf>>
         original_stdout_buffer_{};

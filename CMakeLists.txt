@@ -413,6 +413,8 @@ set(VCR_ENGINE_CORE_SOURCES
     src/gameplay_framework.cpp
     src/gameplay_session.cpp
     src/game_overlay.cpp
+    src/game_ui_runtime.cpp
+    src/localization.cpp
     src/game_module_loader.cpp
     src/cli_options.cpp
     src/performance_metrics.cpp
@@ -1054,4 +1056,29 @@ if(BUILD_TESTING)
     )
     add_dependencies(vcr_renderer_skinning_tests vcr_runtime_assets)
     add_test(NAME vcr_renderer_skinning_tests COMMAND vcr_renderer_skinning_tests)
+
+    add_executable(vcr_game_ui_localization_tests
+        tests/game_ui_localization_tests.cpp
+    )
+    target_compile_definitions(vcr_game_ui_localization_tests PRIVATE
+        VCR_VALIDATION_DEFAULT=0
+    )
+    target_link_libraries(
+        vcr_game_ui_localization_tests PRIVATE
+        vcr_engine
+        vcr_window_icon
+        SDL3::SDL3-static
+        glm::glm
+        nlohmann_json::nlohmann_json
+        Threads::Threads
+    )
+    set_target_properties(vcr_game_ui_localization_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+    if(WIN32)
+        target_link_libraries(vcr_game_ui_localization_tests PRIVATE shell32)
+    endif()
+    add_dependencies(vcr_game_ui_localization_tests vulkan_cube vcr_runtime_assets)
+    vcr_apply_cxx_warning_flags(vcr_game_ui_localization_tests)
+    add_test(NAME vcr_game_ui_localization_tests COMMAND vcr_game_ui_localization_tests)
 endif()

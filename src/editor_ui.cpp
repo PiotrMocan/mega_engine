@@ -1425,6 +1425,8 @@ void EditorUi::initialize(
     edit_animator_preview_ = edit_animator_preview;
     show_skeleton_wireframe_ = true;
     animation_gameplay_panel_open_ = true;
+    ui_localization_panel_open_ = true;
+    ui_loc_status_.clear();
     save_slot_path_buf_.fill('\0');
     constexpr std::string_view default_save_slot =
         "saves/quicksave.vcrsave.json";
@@ -1682,6 +1684,14 @@ void EditorUi::process_event(const SDL_Event& event) {
                 }
             }
         }
+        const bool ui_wants_cursor =
+            gameplay_session_ != nullptr &&
+            gameplay_session_->active() &&
+            gameplay_session_->game_ui().wants_mouse_cursor();
+        const bool ui_handles_esc =
+            gameplay_session_ != nullptr &&
+            gameplay_session_->active() &&
+            gameplay_session_->game_ui().handles_escape_key();
         if (game_mouse_window_id_ != 0U) {
             if ((event.type == SDL_EVENT_WINDOW_FOCUS_LOST ||
                  event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) &&
@@ -1690,6 +1700,11 @@ void EditorUi::process_event(const SDL_Event& event) {
             } else if (event.type == SDL_EVENT_KEY_DOWN &&
                        event.key.key == SDLK_ESCAPE) {
                 set_game_mouse_capture(nullptr);
+                if (ui_handles_esc &&
+                    play_state_ == EditorPlayState::playing &&
+                    input_actions_ != nullptr) {
+                    input_actions_->set_key_down(InputKey::escape, true);
+                }
                 return;
             } else if (event.type == SDL_EVENT_MOUSE_MOTION &&
                        event.motion.windowID == game_mouse_window_id_) {
@@ -1701,26 +1716,31 @@ void EditorUi::process_event(const SDL_Event& event) {
                         event.motion.xrel, event.motion.yrel);
                 }
             }
-            if (play_state_ == EditorPlayState::playing &&
-                input_actions_ != nullptr) {
-                if ((event.type == SDL_EVENT_KEY_DOWN ||
-                     event.type == SDL_EVENT_KEY_UP) &&
-                    !event.key.repeat) {
-                    const InputKey mapped =
-                        input_key_from_sdl_keycode(event.key.key);
-                    if (mapped != InputKey::none) {
-                        input_actions_->set_key_down(
-                            mapped, event.type == SDL_EVENT_KEY_DOWN);
-                    }
-                } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
-                           event.type == SDL_EVENT_MOUSE_BUTTON_UP) {
-                    const InputKey mapped =
-                        input_key_from_sdl_mouse_button(event.button.button);
-                    if (mapped != InputKey::none) {
-                        input_actions_->set_key_down(
-                            mapped,
-                            event.type == SDL_EVENT_MOUSE_BUTTON_DOWN);
-                    }
+        }
+        const bool allow_unfocused_ui_input =
+            ui_wants_cursor &&
+            (ImGui::GetCurrentContext() == nullptr ||
+             !ImGui::GetIO().WantTextInput);
+        if ((game_mouse_window_id_ != 0U || allow_unfocused_ui_input) &&
+            play_state_ == EditorPlayState::playing &&
+            input_actions_ != nullptr) {
+            if ((event.type == SDL_EVENT_KEY_DOWN ||
+                 event.type == SDL_EVENT_KEY_UP) &&
+                !event.key.repeat) {
+                const InputKey mapped =
+                    input_key_from_sdl_keycode(event.key.key);
+                if (mapped != InputKey::none) {
+                    input_actions_->set_key_down(
+                        mapped, event.type == SDL_EVENT_KEY_DOWN);
+                }
+            } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+                       event.type == SDL_EVENT_MOUSE_BUTTON_UP) {
+                const InputKey mapped =
+                    input_key_from_sdl_mouse_button(event.button.button);
+                if (mapped != InputKey::none) {
+                    input_actions_->set_key_down(
+                        mapped,
+                        event.type == SDL_EVENT_MOUSE_BUTTON_DOWN);
                 }
             }
         }
@@ -1919,6 +1939,7 @@ void EditorUi::begin_frame(
     FlyCamera& camera,
     const PerformanceSnapshot& performance,
     const std::chrono::steady_clock::time_point now) {
+    play_display_fps_ = static_cast<float>(performance.average_fps);
     if (game_mouse_window_id_ != 0U) {
         const SDL_Window* const captured =
             SDL_GetWindowFromID(game_mouse_window_id_);
@@ -2053,6 +2074,7 @@ void EditorUi::begin_frame(
             ImGui::DockBuilderDockWindow("Landscape", right);
             ImGui::DockBuilderDockWindow("Audio & Input", right);
             ImGui::DockBuilderDockWindow("Animation & Gameplay", right);
+            ImGui::DockBuilderDockWindow("UI & Localization", right);
             ImGui::DockBuilderDockWindow("Assets", bottom);
             ImGui::DockBuilderDockWindow("Scene View", center);
             ImGui::DockBuilderFinish(dockspace_id);
@@ -2076,6 +2098,7 @@ void EditorUi::begin_frame(
     build_material_editor(renderer);
     build_audio_input_panel();
     build_animation_gameplay_panel(scene, renderer);
+    build_ui_localization_panel(scene, renderer);
     build_performance(scene, renderer, performance);
     build_external_game_window(now);
     process_file_commands(scene);
@@ -2526,6 +2549,12 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
                 nullptr,
                 animation_gameplay_panel_open_)) {
             animation_gameplay_panel_open_ = !animation_gameplay_panel_open_;
+        }
+        if (ImGui::MenuItem(
+                "UI & Localization",
+                nullptr,
+                ui_localization_panel_open_)) {
+            ui_localization_panel_open_ = !ui_localization_panel_open_;
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Reset editor layout")) {
@@ -4210,12 +4239,13 @@ void EditorUi::build_inspector(
                     &edited_gp.persist_save_state);
 
                 ui_kit_.property_row("Behavior");
-                constexpr std::array<const char*, 7U> kBehaviors{
+                constexpr std::array<const char*, 8U> kBehaviors{
                     "patrol",
                     "collectible",
                     "health_pack",
                     "door",
                     "interactable",
+                    "dialogue",
                     "trigger_zone",
                     "destructible",
                 };
@@ -4378,6 +4408,137 @@ void EditorUi::build_inspector(
                 initial.patrol_point_b =
                     node.transform.translation + glm::vec3(0.0F, 0.0F, 4.0F);
                 static_cast<void>(scene.set_gameplay(selected_node_, initial));
+            }
+        }
+    }
+    {
+        ui_kit_.section_header(EditorIcon::eye, "UI Marker");
+        if (const auto existing_um = scene.ui_marker(selected_node_)) {
+            UiMarkerComponent edited_um = existing_um->get();
+            bool um_changed = false;
+            bool remove_um_requested = false;
+            if (ui_kit_.begin_property_grid("UiMarkerGrid")) {
+                ui_kit_.property_row("Enabled");
+                um_changed |= ImGui::Checkbox("##UiMarkerEnabled", &edited_um.enabled);
+
+                ui_kit_.property_row("Kind");
+                constexpr std::array<UiMarkerKind, 6U> kMarkerKinds{
+                    UiMarkerKind::objective,
+                    UiMarkerKind::waypoint,
+                    UiMarkerKind::interact,
+                    UiMarkerKind::speaker,
+                    UiMarkerKind::hazard,
+                    UiMarkerKind::info,
+                };
+                if (ImGui::BeginCombo("##UiMarkerKind", to_string(edited_um.kind).data())) {
+                    for (const UiMarkerKind kind : kMarkerKinds) {
+                        const bool is_sel = edited_um.kind == kind;
+                        if (ImGui::Selectable(to_string(kind).data(), is_sel)) {
+                            edited_um.kind = kind;
+                            um_changed = true;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+
+                ui_kit_.property_row("Label");
+                um_changed |= ImGui::InputText(
+                    "##UiMarkerLabel",
+                    edited_um.label.data(),
+                    edited_um.label.size());
+
+                ui_kit_.property_row("Subtitle text");
+                um_changed |= ImGui::InputText(
+                    "##UiMarkerSubtitle",
+                    edited_um.subtitle_text.data(),
+                    edited_um.subtitle_text.size());
+
+                ui_kit_.property_row("Dialogue ID");
+                um_changed |= ImGui::InputText(
+                    "##UiMarkerDialogueId",
+                    edited_um.dialogue_id.data(),
+                    edited_um.dialogue_id.size());
+
+                um_changed |= ui_kit_.drag_vec3(
+                    "##UiMarkerOffset",
+                    "World offset",
+                    &edited_um.world_offset.x,
+                    0.05F,
+                    0.0F);
+
+                ui_kit_.property_row("Max / Fade m");
+                float distances[2]{edited_um.max_distance, edited_um.fade_start_distance};
+                if (ImGui::DragFloat2("##UiMarkerDist", distances, 0.5F, 0.0F, 5000.0F, "%.1f m")) {
+                    edited_um.max_distance = distances[0];
+                    edited_um.fade_start_distance = distances[1];
+                    um_changed = true;
+                }
+
+                ui_kit_.property_row("Clamp to edge");
+                um_changed |= ImGui::Checkbox("##UiMarkerClamp", &edited_um.clamp_to_screen);
+
+                ui_kit_.property_row("Show distance");
+                um_changed |= ImGui::Checkbox("##UiMarkerShowDist", &edited_um.show_distance);
+
+                ui_kit_.property_row("Show health");
+                um_changed |= ImGui::Checkbox("##UiMarkerShowHp", &edited_um.show_health_bar);
+
+                ui_kit_.property_row("Color");
+                float rgba[4]{
+                    static_cast<float>(edited_um.color_rgba8 & 0xFFU) / 255.0F,
+                    static_cast<float>((edited_um.color_rgba8 >> 8U) & 0xFFU) / 255.0F,
+                    static_cast<float>((edited_um.color_rgba8 >> 16U) & 0xFFU) / 255.0F,
+                    static_cast<float>((edited_um.color_rgba8 >> 24U) & 0xFFU) / 255.0F,
+                };
+                if (ImGui::ColorEdit4("##UiMarkerColor", rgba)) {
+                    const auto to_u8 = [](const float v) noexcept -> std::uint8_t {
+                        return static_cast<std::uint8_t>(std::clamp(std::lround(v * 255.0F), 0L, 255L));
+                    };
+                    edited_um.color_rgba8 = pack_rgba8(
+                        to_u8(rgba[0]), to_u8(rgba[1]), to_u8(rgba[2]), to_u8(rgba[3]));
+                    um_changed = true;
+                }
+
+                ui_kit_.property_row("Component");
+                if (ImGui::SmallButton("Remove UI marker")) {
+                    remove_um_requested = true;
+                }
+                ui_kit_.end_property_grid();
+            }
+
+            if (remove_um_requested) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                static_cast<void>(scene.remove_ui_marker(selected_node_));
+            } else if (um_changed) {
+                edited_um = sanitize_ui_marker_component(edited_um);
+                if (!inspector_edit_snapshot_) {
+                    inspector_edit_snapshot_ = scene;
+                    if (auto previous =
+                            inspector_edit_snapshot_->node(selected_node_)) {
+                        previous->get() = node_before_edit;
+                    }
+                }
+                static_cast<void>(scene.set_ui_marker(selected_node_, edited_um));
+            }
+        } else {
+            if (ui_kit_.action_button(
+                    "AddUiMarkerButton",
+                    EditorIcon::add,
+                    "Add UI Marker",
+                    EditorButtonStyle::secondary,
+                    editable)) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                UiMarkerComponent initial{};
+                static_cast<void>(initial.set_label(node.name));
+                static_cast<void>(scene.set_ui_marker(selected_node_, initial));
             }
         }
     }
@@ -5055,6 +5216,14 @@ void EditorUi::build_viewport(
         ImVec2(1.0F, 1.0F));
     const bool viewport_clicked =
         ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    const bool viewport_hovered_now = ImGui::IsItemHovered();
+    if (!external_game_window_open_) {
+        update_play_viewport_mouse(
+            ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax(),
+            viewport_clicked,
+            viewport_hovered_now);
+    }
     if (!external_game_window_open_ || viewport_clicked) {
         update_game_mouse_capture(viewport_clicked);
     }
@@ -5346,12 +5515,18 @@ void EditorUi::build_external_game_window(
             available,
             ImVec2(0.0F, 0.0F),
             ImVec2(1.0F, 1.0F));
-        update_game_mouse_capture(
-            ImGui::IsItemClicked(ImGuiMouseButton_Left));
+        const bool ext_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+        const bool ext_hovered = ImGui::IsItemHovered();
+        update_play_viewport_mouse(
+            ImGui::GetItemRectMin(),
+            ImGui::GetItemRectMax(),
+            ext_clicked,
+            ext_hovered);
+        update_game_mouse_capture(ext_clicked);
         const bool external_viewport_activated =
-            ImGui::IsItemClicked(ImGuiMouseButton_Left) ||
+            ext_clicked ||
             ImGui::IsItemClicked(ImGuiMouseButton_Right);
-        external_viewport_hovered_ = ImGui::IsItemHovered();
+        external_viewport_hovered_ = ext_hovered;
         if (external_viewport_activated) {
             ImGui::SetWindowFocus();
         }
@@ -7728,6 +7903,216 @@ void EditorUi::build_animation_gameplay_panel(
     ImGui::End();
 }
 
+void EditorUi::build_ui_localization_panel(
+    SceneDocument& /*scene*/,
+    Renderer& /*renderer*/) {
+    if (!ui_localization_panel_open_) {
+        return;
+    }
+    ImGui::SetNextWindowSize(
+        ImVec2(420.0F, 520.0F), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("UI & Localization", &ui_localization_panel_open_)) {
+        ImGui::End();
+        return;
+    }
+    ui_kit_.panel_header(
+        EditorIcon::eye,
+        "UI & LOCALIZATION",
+        "HUD layout, resolution scaling, language switcher, and dialogues");
+
+    if (gameplay_session_ == nullptr) {
+        ui_kit_.status_text(
+            "Gameplay session host is unavailable.", EditorTone::warning);
+        ImGui::End();
+        return;
+    }
+
+    ui_kit_.section_header(EditorIcon::eye, "Game UI Config");
+    GameUiConfig cfg = gameplay_session_->game_ui().config();
+    bool cfg_changed = false;
+    if (ui_kit_.begin_property_grid("GameUiConfigGrid")) {
+        ui_kit_.property_row("Start main menu");
+        cfg_changed |= ImGui::Checkbox("##UiStartMainMenu", &cfg.start_in_main_menu);
+
+        ui_kit_.property_row("Auto pause (Esc)");
+        cfg_changed |= ImGui::Checkbox("##UiAutoPause", &cfg.auto_pause_enabled);
+
+        ui_kit_.property_row("Default HUD");
+        cfg_changed |= ImGui::Checkbox("##UiShowHud", &cfg.show_default_hud);
+
+        ui_kit_.property_row("Crosshair");
+        cfg_changed |= ImGui::Checkbox("##UiShowCrosshair", &cfg.show_crosshair);
+
+        ui_kit_.property_row("Show FPS");
+        cfg_changed |= ImGui::Checkbox("##UiShowFps", &cfg.show_fps);
+
+        ui_kit_.property_row("Subtitles");
+        cfg_changed |= ImGui::Checkbox("##UiShowSubtitles", &cfg.show_subtitles);
+
+        ui_kit_.property_row("World markers");
+        cfg_changed |= ImGui::Checkbox("##UiShowMarkers", &cfg.show_world_markers);
+
+        ui_kit_.property_row("Marker dialogue");
+        cfg_changed |= ImGui::Checkbox("##UiAutoDialogue", &cfg.auto_trigger_marker_dialogue);
+
+        ui_kit_.property_row("Scale mode");
+        constexpr std::array<const char*, 4U> kScaleLabels{
+            "Fit (Reference 1080p)",
+            "Match Height",
+            "Match Width",
+            "Fixed Pixels",
+        };
+        const std::size_t mode_idx =
+            std::min<std::size_t>(static_cast<std::size_t>(cfg.scale_config.mode), 3U);
+        if (ImGui::BeginCombo("##UiScaleMode", kScaleLabels[mode_idx])) {
+            for (std::size_t i = 0U; i < kScaleLabels.size(); ++i) {
+                if (ImGui::Selectable(kScaleLabels[i], mode_idx == i)) {
+                    cfg.scale_config.mode = static_cast<UiScaleMode>(i);
+                    cfg_changed = true;
+                }
+            }
+            ImGui::EndCombo();
+        }
+
+        ui_kit_.property_row("UI scale");
+        cfg_changed |= ImGui::DragFloat(
+            "##UiUserScale", &cfg.scale_config.user_scale, 0.02F, 0.50F, 2.50F, "%.2fx");
+
+        ui_kit_.property_row("Safe area %");
+        float safe_pct = cfg.scale_config.safe_area_fraction * 100.0F;
+        if (ImGui::DragFloat("##UiSafeArea", &safe_pct, 0.25F, 0.0F, 12.0F, "%.1f%%")) {
+            cfg.scale_config.safe_area_fraction = safe_pct * 0.01F;
+            cfg_changed = true;
+        }
+
+        auto edit_cfg_string = [](const char* const id, std::string& str) {
+            std::array<char, 128U> buf{};
+            const std::size_t n = std::min(str.size(), buf.size() - 1U);
+            if (n > 0U) {
+                std::memcpy(buf.data(), str.data(), n);
+            }
+            if (ImGui::InputText(id, buf.data(), buf.size())) {
+                str.assign(buf.data());
+                return true;
+            }
+            return false;
+        };
+        ui_kit_.property_row("Menu title");
+        cfg_changed |= edit_cfg_string("##UiTitleText", cfg.title_text);
+
+        ui_kit_.property_row("Menu subtitle");
+        cfg_changed |= edit_cfg_string("##UiSubtitleText", cfg.subtitle_text);
+
+        ui_kit_.end_property_grid();
+    }
+    if (cfg_changed) {
+        gameplay_session_->configure_game_ui(cfg);
+    }
+
+    ui_kit_.section_header(EditorIcon::refresh, "Localization & Dialogues");
+    LocalizationSystem& loc = gameplay_session_->localization();
+    const auto locales = loc.available_locales();
+    const std::string active_loc(loc.locale());
+    std::size_t active_entry_count = 0U;
+    if (ImGui::BeginCombo("Active locale", active_loc.c_str())) {
+        for (const auto& info : locales) {
+            const bool selected = (info.locale == active_loc);
+            if (selected) {
+                active_entry_count = info.entry_count;
+            }
+            std::string display = info.locale;
+            if (!info.display_name.empty()) {
+                display += " (";
+                display += info.display_name;
+                display += ")";
+            }
+            if (ImGui::Selectable(display.c_str(), selected)) {
+                static_cast<void>(loc.set_locale(info.locale));
+                ui_loc_status_ = "Switched locale to " + info.locale + ".";
+            }
+        }
+        ImGui::EndCombo();
+    } else {
+        for (const auto& info : locales) {
+            if (info.locale == active_loc) {
+                active_entry_count = info.entry_count;
+                break;
+            }
+        }
+    }
+    ImGui::Text(
+        "Entries in '%s': %zu",
+        active_loc.c_str(),
+        active_entry_count);
+
+    if (ImGui::Button("Reload localization & dialogues")) {
+        loc.reset_to_builtins();
+        std::string err;
+        const std::filesystem::path loc_dir = asset_root() / "localization";
+        const std::size_t loaded_loc =
+            std::filesystem::exists(loc_dir) ? loc.load_directory(loc_dir, &err) : 0U;
+        if (!active_loc.empty()) {
+            static_cast<void>(loc.set_locale(active_loc));
+        }
+        gameplay_session_->game_ui().clear_dialogues();
+        const std::filesystem::path dlg_dir = asset_root() / "dialogues";
+        const std::size_t loaded_dlg = std::filesystem::exists(dlg_dir)
+            ? gameplay_session_->game_ui().load_dialogue_directory(dlg_dir, &err)
+            : 0U;
+        ui_loc_status_ = "Loaded " + std::to_string(loaded_loc) +
+                         " locale files, " + std::to_string(loaded_dlg) + " dialogue files.";
+        if (!err.empty()) {
+            ui_loc_status_ += " Note: " + err;
+        }
+    }
+
+    ui_kit_.section_header(EditorIcon::play, "Play UI Test Actions");
+    const bool playing_now = gameplay_session_->active();
+    ImGui::BeginDisabled(!playing_now);
+    ImGui::InputText("Speaker", ui_test_speaker_buf_.data(), ui_test_speaker_buf_.size());
+    ImGui::InputText("Text / Key", ui_test_text_buf_.data(), ui_test_text_buf_.size());
+    ImGui::InputText("Dialogue ID", ui_test_dialogue_id_buf_.data(), ui_test_dialogue_id_buf_.size());
+    if (ImGui::Button("Push subtitle")) {
+        gameplay_session_->game_ui().push_subtitle(
+            ui_test_speaker_buf_.data(), ui_test_text_buf_.data(), 4.0F);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Show toast")) {
+        gameplay_session_->game_ui().show_toast(ui_test_text_buf_.data(), 3.0F);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Start dialogue")) {
+        if (ui_test_dialogue_id_buf_[0] != '\0') {
+            static_cast<void>(gameplay_session_->game_ui().start_dialogue(
+                ui_test_dialogue_id_buf_.data()));
+        } else {
+            static_cast<void>(gameplay_session_->game_ui().start_inline_dialogue(
+                ui_test_speaker_buf_.data(), ui_test_text_buf_.data()));
+        }
+    }
+    if (ImGui::Button("Screen: In-Game")) {
+        gameplay_session_->game_ui().open_screen(GameUiScreen::in_game);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Screen: Pause")) {
+        gameplay_session_->game_ui().open_screen(GameUiScreen::pause_menu);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Screen: Settings")) {
+        gameplay_session_->game_ui().open_screen(GameUiScreen::settings);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Screen: Main Menu")) {
+        gameplay_session_->game_ui().open_screen(GameUiScreen::main_menu);
+    }
+    ImGui::EndDisabled();
+
+    if (!ui_loc_status_.empty()) {
+        ui_kit_.status_text(ui_loc_status_.c_str(), EditorTone::neutral);
+    }
+    ImGui::End();
+}
+
 void EditorUi::build_performance(
     SceneDocument& scene,
     Renderer& renderer,
@@ -8636,7 +9021,58 @@ void EditorUi::set_game_mouse_capture(SDL_Window* const window) noexcept {
     ImGui::ClearActiveID();
 }
 
+void EditorUi::update_play_viewport_mouse(
+    const ImVec2 rect_min,
+    const ImVec2 rect_max,
+    const bool clicked_left,
+    const bool hovered) noexcept {
+    if (play_state_ != EditorPlayState::playing ||
+        gameplay_session_ == nullptr ||
+        !gameplay_session_->active()) {
+        play_mouse_pos_px_ = glm::vec2(-1.0F, -1.0F);
+        play_mouse_left_down_ = false;
+        play_mouse_left_pressed_ = false;
+        prev_ui_wants_cursor_ = false;
+        return;
+    }
+    const bool ui_wants_cursor =
+        gameplay_session_->game_ui().wants_mouse_cursor();
+    if (ui_wants_cursor && game_mouse_window_id_ != 0U) {
+        set_game_mouse_capture(nullptr);
+    }
+    prev_ui_wants_cursor_ = ui_wants_cursor;
+
+    const float rw = rect_max.x - rect_min.x;
+    const float rh = rect_max.y - rect_min.y;
+    if (ui_wants_cursor && rw > 1.0F && rh > 1.0F) {
+        const ImVec2 mp = ImGui::GetMousePos();
+        if (mp.x >= rect_min.x && mp.x <= rect_max.x &&
+            mp.y >= rect_min.y && mp.y <= rect_max.y) {
+            const float nx = (mp.x - rect_min.x) / rw;
+            const float ny = (mp.y - rect_min.y) / rh;
+            const float vp_w = static_cast<float>(std::max(1U, requested_viewport_extent_.width));
+            const float vp_h = static_cast<float>(std::max(1U, requested_viewport_extent_.height));
+            play_mouse_pos_px_ = glm::vec2(nx * vp_w, ny * vp_h);
+        } else {
+            play_mouse_pos_px_ = glm::vec2(-1.0F, -1.0F);
+        }
+        play_mouse_left_down_ = hovered && ImGui::IsMouseDown(ImGuiMouseButton_Left);
+        if (clicked_left || (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))) {
+            play_mouse_left_pressed_ = true;
+        }
+    } else {
+        play_mouse_pos_px_ = glm::vec2(-1.0F, -1.0F);
+        play_mouse_left_down_ = false;
+        play_mouse_left_pressed_ = false;
+    }
+}
+
 void EditorUi::update_game_mouse_capture(const bool viewport_clicked) {
+    if (gameplay_session_ != nullptr &&
+        gameplay_session_->active() &&
+        gameplay_session_->game_ui().wants_mouse_cursor()) {
+        return;
+    }
     if (play_state_ != EditorPlayState::playing ||
         game_mouse_window_id_ != 0U ||
         (!game_mouse_capture_requested_ && !viewport_clicked)) {
@@ -8661,19 +9097,42 @@ GameplayFrameInput EditorUi::gameplay_input(
     if (play_state_ != EditorPlayState::playing) {
         return {};
     }
+    const bool ui_wants_cursor =
+        gameplay_session_ != nullptr &&
+        gameplay_session_->active() &&
+        gameplay_session_->game_ui().wants_mouse_cursor();
+    const bool ui_handles_esc =
+        gameplay_session_ != nullptr &&
+        gameplay_session_->active() &&
+        gameplay_session_->game_ui().handles_escape_key();
+    const glm::vec2 mouse_px = play_mouse_pos_px_;
+    const bool left_down = play_mouse_left_down_;
+    const bool left_pressed = std::exchange(play_mouse_left_pressed_, false);
     if (input_actions_ != nullptr) {
-        if (input_actions_->context() == InputContext::ui) {
+        if (ui_wants_cursor && input_actions_->context() != InputContext::ui) {
+            input_actions_->set_context(InputContext::ui);
+        } else if (!ui_wants_cursor && input_actions_->context() == InputContext::ui) {
             input_actions_->set_context(InputContext::gameplay);
         }
         input_actions_->begin_frame(delta_seconds);
-        if (input_actions_->action_pressed(InputAction::pause)) {
+        if (!ui_handles_esc && input_actions_->action_pressed(InputAction::pause)) {
             set_game_mouse_capture(nullptr);
             play_state_ = EditorPlayState::paused;
             return {};
         }
+        if (ui_wants_cursor) {
+            return GameplayFrameInput{
+                .mouse_pos_px = mouse_px,
+                .mouse_left_down = left_down,
+                .mouse_left_pressed = left_pressed,
+                .display_fps = play_display_fps_,
+            };
+        }
         if (game_mouse_window_id_ == 0U &&
             !input_actions_->gamepad_state().connected) {
-            return {};
+            return GameplayFrameInput{
+                .display_fps = play_display_fps_,
+            };
         }
         const glm::vec2 move = input_actions_->move_axis();
         const glm::vec2 look = input_actions_->look_delta();
@@ -8690,6 +9149,10 @@ GameplayFrameInput EditorUi::gameplay_input(
             },
             .mouse_delta_x = look.x,
             .mouse_delta_y = look.y,
+            .mouse_pos_px = mouse_px,
+            .mouse_left_down = left_down,
+            .mouse_left_pressed = left_pressed,
+            .display_fps = play_display_fps_,
         };
     }
     return GameplayFrameInput{
@@ -8703,6 +9166,10 @@ GameplayFrameInput EditorUi::gameplay_input(
         },
         .mouse_delta_x = camera_input_.mouse_delta_x,
         .mouse_delta_y = camera_input_.mouse_delta_y,
+        .mouse_pos_px = mouse_px,
+        .mouse_left_down = left_down,
+        .mouse_left_pressed = left_pressed,
+        .display_fps = play_display_fps_,
     };
 }
 

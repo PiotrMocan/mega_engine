@@ -4,9 +4,11 @@
 #include "audio_engine.hpp"
 #include "collision.hpp"
 #include "game_overlay.hpp"
+#include "game_ui_runtime.hpp"
 #include "gameplay.hpp"
 #include "gameplay_framework.hpp"
 #include "input_actions.hpp"
+#include "localization.hpp"
 #include "physics_world.hpp"
 #include "runtime_transform_registry.hpp"
 #include "scene_document.hpp"
@@ -45,6 +47,10 @@ struct GameplayFrameInput {
     CharacterInput character{};
     float mouse_delta_x = 0.0F;
     float mouse_delta_y = 0.0F;
+    glm::vec2 mouse_pos_px{-1.0F, -1.0F};
+    bool mouse_left_down = false;
+    bool mouse_left_pressed = false;
+    float display_fps = 0.0F;
 };
 
 struct GameplayPlayerSetup {
@@ -229,6 +235,30 @@ public:
     [[nodiscard]] bool default_camera_look_enabled() const noexcept {
         return default_camera_look_enabled_;
     }
+
+    void set_content_asset_root(std::filesystem::path asset_root) {
+        content_asset_root_ = std::move(asset_root);
+    }
+    [[nodiscard]] const std::filesystem::path& content_asset_root() const noexcept {
+        return content_asset_root_;
+    }
+
+    void configure_game_ui(const GameUiConfig& config) {
+        game_ui_.configure(config);
+        game_ui_configured_ = true;
+    }
+    [[nodiscard]] GameUiRuntime& game_ui() noexcept {
+        return game_ui_;
+    }
+    [[nodiscard]] const GameUiRuntime& game_ui() const noexcept {
+        return game_ui_;
+    }
+    [[nodiscard]] LocalizationSystem& localization() noexcept {
+        return localization_;
+    }
+    [[nodiscard]] const LocalizationSystem& localization() const noexcept {
+        return localization_;
+    }
     [[nodiscard]] ThirdPersonCamera& third_person_camera() noexcept {
         return camera_;
     }
@@ -307,6 +337,11 @@ private:
     AnimatorRuntimeSystem animator_runtime_{};
     RuntimeTransformRegistry transform_registry_{};
     GameOverlayCanvas overlay_canvas_{};
+    LocalizationSystem localization_{};
+    GameUiRuntime game_ui_{};
+    std::filesystem::path content_asset_root_{};
+    bool game_ui_configured_ = false;
+    bool ui_audio_paused_ = false;
     AnimatorComponent player_anim_scratch_{};
 
     std::vector<SceneWorldNode> cached_world_nodes_{};

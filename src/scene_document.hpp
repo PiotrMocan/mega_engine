@@ -101,6 +101,7 @@ struct SceneNodeRecord {
     std::optional<AudioReverbZoneComponent> reverb_zone{};
     std::optional<AnimatorComponent> animator{};
     std::optional<GameplayComponent> gameplay{};
+    std::optional<UiMarkerComponent> ui_marker{};
     std::uint32_t parent_record_index =
         invalid_scene_node_index;
 };
@@ -349,6 +350,24 @@ public:
         return gameplays_;
     }
 
+    [[nodiscard]] bool set_ui_marker(
+        SceneNodeId id,
+        const UiMarkerComponent& ui_marker);
+    [[nodiscard]] bool remove_ui_marker(SceneNodeId id) noexcept;
+    [[nodiscard]] bool has_ui_marker(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<
+        std::reference_wrapper<const UiMarkerComponent>>
+        ui_marker(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<
+        std::reference_wrapper<UiMarkerComponent>>
+        ui_marker_mut(SceneNodeId id) noexcept;
+    [[nodiscard]] const SparseComponentPool<
+        SceneNodeId,
+        UiMarkerComponent,
+        max_scene_nodes>& ui_markers() const noexcept {
+        return ui_markers_;
+    }
+
     void mark_content_changed() noexcept;
     [[nodiscard]] std::uint32_t last_transform_updates() const noexcept {
         return last_transform_updates_;
@@ -466,6 +485,10 @@ private:
         SceneNodeId,
         GameplayComponent,
         max_scene_nodes> gameplays_{};
+    SparseComponentPool<
+        SceneNodeId,
+        UiMarkerComponent,
+        max_scene_nodes> ui_markers_{};
     std::uint32_t first_root_ = invalid_scene_node_index;
     std::uint32_t last_root_ = invalid_scene_node_index;
     std::uint32_t live_count_ = 0U;

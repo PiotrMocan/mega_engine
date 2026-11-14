@@ -385,6 +385,28 @@ bool GameplaySession::start(
         cached_structure_revision_ = scene.structure_revision();
     }
 
+    if (!content_asset_root_.empty()) {
+        const std::string saved_locale(localization_.locale());
+        localization_.reset_to_builtins();
+        localization_.load_directory(content_asset_root_ / "localization", nullptr);
+        if (!saved_locale.empty()) {
+            static_cast<void>(localization_.set_locale(saved_locale));
+        }
+        game_ui_.clear_dialogues();
+        game_ui_.load_dialogue_directory(content_asset_root_ / "dialogues", nullptr);
+    }
+
+    if (!game_ui_configured_ &&
+        (extensions_.on_input_ai != nullptr ||
+         extensions_.on_camera_audio_overlay != nullptr)) {
+        GameUiConfig custom_cfg = game_ui_.config();
+        custom_cfg.auto_pause_enabled = false;
+        custom_cfg.show_default_hud = false;
+        game_ui_.configure(custom_cfg);
+    }
+    game_ui_.reset_session_state();
+    ui_audio_paused_ = false;
+
     if (audio_engine != nullptr && audio_engine->initialized()) {
         audio_engine->set_gameplay_paused(false);
         sync_scene_audio(scene, output_camera, 0.0F, true, *audio_engine);
@@ -501,6 +523,53 @@ bool GameplaySession::update_internal(
         cached_structure_revision_ = scene.structure_revision();
     }
 
+    const std::uint32_t vp_w = std::max(1U, viewport_extent.x);
+    const std::uint32_t vp_h = std::max(1U, viewport_extent.y);
+    const glm::vec3 ui_player_pos = player_setup_.use_animated_character
+        ? animated_player_.world_position()
+        : character_.position();
+    const GameUiUpdateInput ui_in{
+        .delta_seconds = dt,
+        .viewport_extent = glm::uvec2(vp_w, vp_h),
+        .mouse_pos_px = input.mouse_pos_px,
+        .mouse_left_pressed = input.mouse_left_pressed,
+        .display_fps = input.display_fps,
+        .camera_pos = output_camera.position(),
+        .camera_forward = output_camera.forward(),
+        .camera_up = glm::vec3{0.0F, 1.0F, 0.0F},
+        .player_pos = ui_player_pos,
+        .player_health = gameplay_world_.player_health(),
+        .player_max_health = gameplay_world_.player_max_health(),
+        .scene = &scene,
+        .world_nodes = cached_world_nodes_,
+        .gameplay_world = &gameplay_world_,
+        .input_actions = input_actions,
+        .audio_engine = audio_engine,
+        .localization = &localization_,
+    };
+    game_ui_.update(ui_in);
+    if (game_ui_.blocks_gameplay_simulation()) {
+        if (audio_engine != nullptr && audio_engine->initialized()) {
+            if (!ui_audio_paused_) {
+                audio_engine->set_gameplay_paused(true);
+                ui_audio_paused_ = true;
+            }
+            audio_engine->update(dt);
+        }
+        overlay_canvas_.set_viewport(
+            static_cast<float>(vp_w),
+            static_cast<float>(vp_h));
+        overlay_canvas_.clear();
+        game_ui_.render(overlay_canvas_, ui_in);
+        return true;
+    }
+    if (ui_audio_paused_) {
+        if (audio_engine != nullptr && audio_engine->initialized()) {
+            audio_engine->set_gameplay_paused(false);
+        }
+        ui_audio_paused_ = false;
+    }
+
     GameplayUpdateContext ctx{
         .input = input,
         .scene = scene,
@@ -510,6 +579,14 @@ bool GameplaySession::update_internal(
         .input_actions = input_actions,
         .delta_seconds = dt,
     };
+    if (game_ui_.blocks_player_control()) {
+        ctx.input.character = CharacterInput{};
+        ctx.input.mouse_delta_x = 0.0F;
+        ctx.input.mouse_delta_y = 0.0F;
+        ctx.input.mouse_left_down = false;
+        ctx.input.mouse_left_pressed = false;
+        ctx.suppress_default_camera_look = true;
+    }
 
     // Stage 1: Input & AI.
     if (extensions_.on_input_ai != nullptr) {
@@ -737,8 +814,6 @@ bool GameplaySession::update_internal(
         cam_focus, collision_world_, physics_world_);
     output_camera = FlyCamera(on_foot_cam_pos, camera_.yaw(), camera_.pitch());
 
-    const std::uint32_t vp_w = std::max(1U, viewport_extent.x);
-    const std::uint32_t vp_h = std::max(1U, viewport_extent.y);
     overlay_canvas_.set_viewport(
         static_cast<float>(vp_w),
         static_cast<float>(vp_h));
@@ -753,6 +828,28 @@ bool GameplaySession::update_internal(
                 ctx.camera_override_pitch_radians);
         }
     }
+
+    const GameUiUpdateInput ui_final_input{
+        .delta_seconds = 0.0F,
+        .viewport_extent = glm::uvec2(vp_w, vp_h),
+        .mouse_pos_px = input.mouse_pos_px,
+        .mouse_left_pressed = input.mouse_left_pressed,
+        .display_fps = input.display_fps,
+        .camera_pos = output_camera.position(),
+        .camera_forward = output_camera.forward(),
+        .camera_up = glm::vec3{0.0F, 1.0F, 0.0F},
+        .player_pos = active_player_pos,
+        .player_health = gameplay_world_.player_health(),
+        .player_max_health = gameplay_world_.player_max_health(),
+        .scene = &scene,
+        .world_nodes = cached_world_nodes_,
+        .gameplay_world = &gameplay_world_,
+        .input_actions = input_actions,
+        .audio_engine = audio_engine,
+        .localization = &localization_,
+    };
+    game_ui_.refresh_markers(ui_final_input);
+    game_ui_.render(overlay_canvas_, ui_final_input);
 
     if (input_actions != nullptr) {
         if (player_setup_.use_animated_character) {
@@ -1124,8 +1221,13 @@ void GameplaySession::stop(
         extensions_.on_stop(extensions_.user_data, *this);
     }
     if (audio_engine != nullptr && audio_engine->initialized()) {
+        if (ui_audio_paused_) {
+            audio_engine->set_gameplay_paused(false);
+        }
         audio_engine->stop_gameplay_audio(0.03F);
     }
+    ui_audio_paused_ = false;
+    game_ui_.reset_session_state();
     const SkeletalAssetProvider skeletal_provider =
         renderer_bridge != nullptr
             ? renderer_bridge->skeletal_provider

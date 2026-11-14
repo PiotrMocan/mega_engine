@@ -3,6 +3,8 @@
 #include "cooked_audio_asset.hpp"
 #include "cooked_model_asset.hpp"
 #include "cooked_texture_asset.hpp"
+#include "game_overlay.hpp"
+#include "localization.hpp"
 #include "runtime_assets.hpp"
 #include "scene_io.hpp"
 
@@ -162,6 +164,8 @@ private:
     std::size_t file_count = 0U;
     std::vector<std::filesystem::path> models;
     std::vector<std::filesystem::path> scenes;
+    std::vector<std::filesystem::path> fonts;
+    std::vector<std::filesystem::path> localizations;
     for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
         if (++file_count > 1'000'000U) {
             error = "Project content exceeds the shipping file limit.";
@@ -180,7 +184,13 @@ private:
         const bool audio = name.ends_with(".vcraudio.json");
         const bool scene = *rel.begin() == "scenes" && ext == ".json";
         const bool config = *rel.begin() == "config" && ext == ".json";
+        const bool localization = name.ends_with(".vcrloc.json") ||
+            (*rel.begin() == "localization" && ext == ".json");
+        const bool dialogue = name.ends_with(".vcrdlg.json") ||
+            (*rel.begin() == "dialogues" && ext == ".json");
+        const bool font = name.ends_with(".vcrfont.json");
         const bool metadata = texture || model || audio || scene || config ||
+            localization || dialogue || font ||
             name.ends_with(".vcrmaterial.json") || name.ends_with(".vcrprefab.json") ||
             name.ends_with(".vcrcue.json");
         if (ext == ".wav" || ext == ".ogg" || ext == ".flac") {
@@ -226,6 +236,23 @@ private:
                 if (!resolve_sandboxed_audio_file(
                         root, name, resolved, relative, audio_name, streaming, error)) return false;
                 copy_runtime_file(resolved, target / relative);
+            } else if (localization) {
+                LocalizationSystem loc_check;
+                if (!loc_check.load_file(entry.path(), &error)) return false;
+                localizations.push_back(rel);
+            } else if (dialogue) {
+                // Keep localized dialogue graph JSON files intact.
+            } else if (font) {
+                if (!doc.contains("image") || !doc["image"].is_string() ||
+                    doc["image"].get_ref<const std::string&>().empty()) {
+                    error = "Shipping font asset missing valid 'image' reference: " + name;
+                    return false;
+                }
+                const std::filesystem::path img_rel =
+                    (rel.parent_path() / from_utf8(doc["image"].get<std::string>())).lexically_normal();
+                if (!regular_unlinked_file(root, img_rel, error)) return false;
+                copy_runtime_file(root / img_rel, target / img_rel);
+                fonts.push_back(rel);
             } else if (scene || config || name.ends_with(".vcrcue.json") ||
                        name.ends_with(".vcrprefab.json")) {
                 if (!copy_audio_references(doc, root, target, error)) return false;
@@ -255,6 +282,20 @@ private:
         for (const auto& node : nodes) {
             if (node.value.kind == SceneNodeKind::model &&
                 !regular_unlinked_file(target, from_utf8(node.value.asset_path), error)) return false;
+        }
+    }
+    for (const auto& loc_rel : localizations) {
+        LocalizationSystem loc_verify;
+        if (!loc_verify.load_file(target / loc_rel, &error)) {
+            error = "Shipping localization validation failed for '" + utf8(loc_rel) + "': " + error;
+            return false;
+        }
+    }
+    for (const auto& font_rel : fonts) {
+        GameUiFontAtlas font_verify;
+        if (!load_game_ui_font_atlas_file(target / font_rel, font_verify, &error)) {
+            error = "Shipping font validation failed for '" + utf8(font_rel) + "': " + error;
+            return false;
         }
     }
     return true;

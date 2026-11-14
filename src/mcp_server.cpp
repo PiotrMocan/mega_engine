@@ -74,7 +74,7 @@ constexpr std::array<std::string_view, 31> runtime_tool_names{
     "engine.quit",
 };
 
-constexpr std::array<std::string_view, 49> editor_tool_names{
+constexpr std::array<std::string_view, 52> editor_tool_names{
     "render.set_exposure",
     "render.set_color_grading",
     "render.set_subsurface",
@@ -109,6 +109,9 @@ constexpr std::array<std::string_view, 49> editor_tool_names{
     "editor.scene.set_gameplay",
     "editor.scene.remove_gameplay",
     "editor.gameplay.save_or_load",
+    "editor.scene.set_ui_marker",
+    "editor.scene.remove_ui_marker",
+    "editor.ui.configure",
     "editor.prefab.save",
     "editor.prefab.instantiate",
     "editor.prefab.unpack",
@@ -1283,6 +1286,53 @@ private:
             {"action", Json{{"type", "string"}, {"enum", Json::array({"save", "load", "start_play", "stop_play"})}}},
             {"path", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", 255}}},
         }, Json::array({"action"})), false, false, false));
+    tools.push_back(tool_definition(
+        "editor.scene.set_ui_marker", "Attach or configure UiMarkerComponent on a scene node",
+        "Set world-space HUD indicator marker properties (objective/waypoint/interact/speaker/hazard/info) on a scene node.",
+        object_schema(Json{
+            {"id", handle_schema},
+            {"kind", Json{{"type", "string"}, {"enum", Json::array({"objective", "waypoint", "interact", "speaker", "hazard", "info"})}}},
+            {"enabled", Json{{"type", "boolean"}}},
+            {"clamp_to_screen", Json{{"type", "boolean"}}},
+            {"show_distance", Json{{"type", "boolean"}}},
+            {"show_health_bar", Json{{"type", "boolean"}}},
+            {"world_offset", vec3_schema},
+            {"max_distance", Json{{"type", "number"}, {"minimum", 1.0}, {"maximum", 10000.0}}},
+            {"fade_start_distance", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 10000.0}}},
+            {"color_rgba8", Json{{"type", "integer"}, {"minimum", 0}, {"maximum", 4294967295}}},
+            {"label", Json{{"type", "string"}, {"maxLength", 127}}},
+            {"subtitle_text", Json{{"type", "string"}, {"maxLength", 127}}},
+            {"dialogue_id", Json{{"type", "string"}, {"maxLength", 63}}},
+        }, Json::array({"id"})), false, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.remove_ui_marker", "Remove scene node UiMarkerComponent",
+        "Detach the authored UiMarkerComponent from a scene node.",
+        object_schema(Json{{"id", handle_schema}}, Json::array({"id"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "editor.ui.configure", "Configure runtime game UI and localization",
+        "Update GameUiConfig scaling/HUD flags, switch locale, reload localization/dialogue files, or trigger Play-mode UI screens/subtitles/toasts/dialogues.",
+        object_schema(Json{
+            {"start_in_main_menu", Json{{"type", "boolean"}}},
+            {"auto_pause_enabled", Json{{"type", "boolean"}}},
+            {"show_default_hud", Json{{"type", "boolean"}}},
+            {"show_crosshair", Json{{"type", "boolean"}}},
+            {"show_fps", Json{{"type", "boolean"}}},
+            {"show_subtitles", Json{{"type", "boolean"}}},
+            {"show_world_markers", Json{{"type", "boolean"}}},
+            {"auto_trigger_marker_dialogue", Json{{"type", "boolean"}}},
+            {"scale_mode", Json{{"type", "string"}, {"enum", Json::array({"fit", "match_height", "match_width", "pixel_constant"})}}},
+            {"user_scale", Json{{"type", "number"}, {"minimum", 0.5}, {"maximum", 2.5}}},
+            {"safe_area_fraction", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 0.15}}},
+            {"locale", Json{{"type", "string"}, {"minLength", 2}, {"maxLength", 15}}},
+            {"reload_assets", Json{{"type", "boolean"}}},
+            {"screen", Json{{"type", "string"}, {"enum", Json::array({"in_game", "main_menu", "pause_menu", "settings", "dialogue"})}}},
+            {"subtitle_speaker", Json{{"type", "string"}, {"maxLength", 63}}},
+            {"subtitle_text", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", max_scene_asset_path_bytes}}},
+            {"toast_text", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", 1023}}},
+            {"dialogue_id", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", 63}}},
+            {"duration_seconds", Json{{"type", "number"}, {"minimum", 0.2}, {"maximum", 60.0}}},
+        }), false, false, false));
     tools.push_back(tool_definition(
         "capture.screenshot", "Capture editor window",
         "Capture the next completed editor swapchain image as PNG image content.",
@@ -2471,6 +2521,103 @@ private:
     return true;
 }
 
+[[nodiscard]] bool parse_ui_marker_fields(
+    const Json& object,
+    UiMarkerComponent& um,
+    std::string& error) {
+    if (!only_keys(object, {
+            "id", "kind", "enabled", "clamp_to_screen", "show_distance",
+            "show_health_bar", "world_offset", "max_distance",
+            "fade_start_distance", "color_rgba8", "label",
+            "subtitle_text", "dialogue_id"})) {
+        error = "ui_marker payload contains unknown field";
+        return false;
+    }
+    if (object.contains("kind")) {
+        const auto k = get_string(object, "kind");
+        const auto parsed = k ? parse_ui_marker_kind(*k) : std::nullopt;
+        if (!parsed) {
+            error = "kind must be objective, waypoint, interact, speaker, hazard, or info";
+            return false;
+        }
+        um.kind = *parsed;
+    }
+    const auto parse_flag = [&](const std::string_view key, bool& out) {
+        if (!object.contains(key)) {
+            return true;
+        }
+        const auto b = get_bool(object, key);
+        if (!b) {
+            error = std::string(key) + " must be a boolean";
+            return false;
+        }
+        out = *b;
+        return true;
+    };
+    if (!parse_flag("enabled", um.enabled) ||
+        !parse_flag("clamp_to_screen", um.clamp_to_screen) ||
+        !parse_flag("show_distance", um.show_distance) ||
+        !parse_flag("show_health_bar", um.show_health_bar)) {
+        return false;
+    }
+    if (object.contains("world_offset") &&
+        !parse_vec3(object, "world_offset", um.world_offset)) {
+        error = "world_offset must be a finite [x, y, z] array";
+        return false;
+    }
+    if (object.contains("max_distance")) {
+        const auto v = get_finite_float(object, "max_distance", 1.0F, 10'000.0F);
+        if (!v) {
+            error = "max_distance must be between 1 and 10000";
+            return false;
+        }
+        um.max_distance = *v;
+    }
+    if (object.contains("fade_start_distance")) {
+        const auto v = get_finite_float(object, "fade_start_distance", 0.0F, 10'000.0F);
+        if (!v) {
+            error = "fade_start_distance must be between 0 and 10000";
+            return false;
+        }
+        um.fade_start_distance = *v;
+    }
+    if (object.contains("color_rgba8")) {
+        const auto c = get_u32(
+            object, "color_rgba8", 0U, std::numeric_limits<std::uint32_t>::max());
+        if (!c) {
+            error = "color_rgba8 must be an unsigned 32-bit RGBA integer";
+            return false;
+        }
+        um.color_rgba8 = *c;
+    }
+    if (object.contains("label")) {
+        const auto s = get_string(object, "label");
+        if (!s || !um.set_label(*s)) {
+            error = "label must be a valid UTF-8 string within 127 bytes";
+            return false;
+        }
+    }
+    if (object.contains("subtitle_text")) {
+        const auto s = get_string(object, "subtitle_text");
+        if (!s || !um.set_subtitle_text(*s)) {
+            error = "subtitle_text must be a valid UTF-8 string within 127 bytes";
+            return false;
+        }
+    }
+    if (object.contains("dialogue_id")) {
+        const auto s = get_string(object, "dialogue_id");
+        if (!s || !um.set_dialogue_id(*s)) {
+            error = "dialogue_id must be a valid UTF-8 string within 63 bytes";
+            return false;
+        }
+    }
+    if (!valid_ui_marker_component(um)) {
+        error = "ui_marker fields are outside engine bounds";
+        return false;
+    }
+    return true;
+}
+
 [[nodiscard]] bool command_from_editor_tool(
     const std::string_view name,
     const Json& arguments,
@@ -2967,6 +3114,184 @@ private:
             return false;
         }
         command.type = McpCommandType::editor_gameplay_save_or_load;
+        return true;
+    }
+    if (name == "editor.scene.remove_ui_marker") {
+        if (arguments.size() != 1U || !arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "id must be the only argument and contain index/generation";
+            return false;
+        }
+        command.type = McpCommandType::editor_remove_ui_marker;
+        return true;
+    }
+    if (name == "editor.scene.set_ui_marker") {
+        if (!arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "set_ui_marker requires a valid id";
+            return false;
+        }
+        UiMarkerComponent um{};
+        if (!parse_ui_marker_fields(arguments, um, error)) {
+            return false;
+        }
+        command.type = McpCommandType::editor_set_ui_marker;
+        command.ui_marker = um;
+        return true;
+    }
+    if (name == "editor.ui.configure") {
+        if (!only_keys(arguments, {
+                "start_in_main_menu", "auto_pause_enabled", "show_default_hud",
+                "show_crosshair", "show_fps", "show_subtitles",
+                "show_world_markers", "auto_trigger_marker_dialogue",
+                "scale_mode", "user_scale", "safe_area_fraction", "locale",
+                "reload_assets", "screen", "subtitle_speaker",
+                "subtitle_text", "toast_text", "dialogue_id",
+                "duration_seconds"})) {
+            error = "ui.configure payload contains unknown field";
+            return false;
+        }
+        McpUiConfigPayload cfg{};
+        const auto opt_bool = [&](const std::string_view key,
+                                  const std::uint32_t flag,
+                                  bool& target) -> bool {
+            if (!arguments.contains(key)) {
+                return true;
+            }
+            const auto b = get_bool(arguments, key);
+            if (!b) {
+                error = std::string(key) + " must be a boolean";
+                return false;
+            }
+            target = *b;
+            cfg.mask |= flag;
+            return true;
+        };
+        if (!opt_bool("start_in_main_menu", McpUiConfigPayload::flag_start_in_main_menu, cfg.start_in_main_menu) ||
+            !opt_bool("auto_pause_enabled", McpUiConfigPayload::flag_auto_pause_enabled, cfg.auto_pause_enabled) ||
+            !opt_bool("show_default_hud", McpUiConfigPayload::flag_show_default_hud, cfg.show_default_hud) ||
+            !opt_bool("show_crosshair", McpUiConfigPayload::flag_show_crosshair, cfg.show_crosshair) ||
+            !opt_bool("show_fps", McpUiConfigPayload::flag_show_fps, cfg.show_fps) ||
+            !opt_bool("show_subtitles", McpUiConfigPayload::flag_show_subtitles, cfg.show_subtitles) ||
+            !opt_bool("show_world_markers", McpUiConfigPayload::flag_show_world_markers, cfg.show_world_markers) ||
+            !opt_bool("auto_trigger_marker_dialogue", McpUiConfigPayload::flag_auto_trigger_marker_dialogue, cfg.auto_trigger_marker_dialogue) ||
+            !opt_bool("reload_assets", McpUiConfigPayload::flag_reload_assets, cfg.reload_assets)) {
+            return false;
+        }
+        if (arguments.contains("scale_mode")) {
+            const auto sm = get_string(arguments, "scale_mode");
+            if (!sm) {
+                error = "scale_mode must be fit, match_height, match_width, or pixel_constant";
+                return false;
+            }
+            if (*sm == "fit") cfg.scale_mode = 0U;
+            else if (*sm == "match_height") cfg.scale_mode = 1U;
+            else if (*sm == "match_width") cfg.scale_mode = 2U;
+            else if (*sm == "pixel_constant") cfg.scale_mode = 3U;
+            else {
+                error = "scale_mode must be fit, match_height, match_width, or pixel_constant";
+                return false;
+            }
+            cfg.mask |= McpUiConfigPayload::flag_scale_mode;
+        }
+        if (arguments.contains("user_scale")) {
+            const auto v = get_finite_float(arguments, "user_scale", 0.5F, 2.5F);
+            if (!v) {
+                error = "user_scale must be between 0.5 and 2.5";
+                return false;
+            }
+            cfg.user_scale = *v;
+            cfg.mask |= McpUiConfigPayload::flag_user_scale;
+        }
+        if (arguments.contains("safe_area_fraction")) {
+            const auto v = get_finite_float(arguments, "safe_area_fraction", 0.0F, 0.15F);
+            if (!v) {
+                error = "safe_area_fraction must be between 0 and 0.15";
+                return false;
+            }
+            cfg.safe_area_fraction = *v;
+            cfg.mask |= McpUiConfigPayload::flag_safe_area_fraction;
+        }
+        if (arguments.contains("duration_seconds")) {
+            const auto v = get_finite_float(arguments, "duration_seconds", 0.2F, 60.0F);
+            if (!v) {
+                error = "duration_seconds must be between 0.2 and 60";
+                return false;
+            }
+            cfg.duration_seconds = *v;
+        }
+        if (arguments.contains("locale")) {
+            const auto s = get_string(arguments, "locale");
+            if (!s || s->size() < 2U ||
+                !copy_command_text(*s, cfg.locale, error, "locale")) {
+                if (error.empty()) {
+                    error = "locale must be a valid 2..15 char language code";
+                }
+                return false;
+            }
+            cfg.mask |= McpUiConfigPayload::flag_locale;
+        }
+        if (arguments.contains("screen")) {
+            const auto sc = get_string(arguments, "screen");
+            if (!sc) {
+                error = "screen must be in_game, main_menu, pause_menu, settings, or dialogue";
+                return false;
+            }
+            if (*sc == "in_game") cfg.screen = 0U;
+            else if (*sc == "main_menu") cfg.screen = 1U;
+            else if (*sc == "pause_menu") cfg.screen = 2U;
+            else if (*sc == "settings") cfg.screen = 3U;
+            else if (*sc == "dialogue") cfg.screen = 4U;
+            else {
+                error = "screen must be in_game, main_menu, pause_menu, settings, or dialogue";
+                return false;
+            }
+            cfg.mask |= McpUiConfigPayload::flag_screen;
+        }
+        if (arguments.contains("subtitle_speaker")) {
+            const auto s = get_string(arguments, "subtitle_speaker");
+            if (!s || !copy_command_text(*s, cfg.speaker, error, "subtitle_speaker")) {
+                if (error.empty()) {
+                    error = "subtitle_speaker must be a string within 63 bytes";
+                }
+                return false;
+            }
+        }
+        if (arguments.contains("subtitle_text")) {
+            const auto s = get_string(arguments, "subtitle_text");
+            if (!s || s->empty() ||
+                !copy_command_text(*s, command.text, error, "subtitle_text")) {
+                if (error.empty()) {
+                    error = "subtitle_text must be a non-empty bounded string";
+                }
+                return false;
+            }
+            cfg.mask |= McpUiConfigPayload::flag_subtitle;
+        }
+        if (arguments.contains("toast_text")) {
+            const auto s = get_string(arguments, "toast_text");
+            if (!s || s->empty() ||
+                !copy_command_text(*s, command.secondary_text, error, "toast_text")) {
+                if (error.empty()) {
+                    error = "toast_text must be a non-empty bounded string";
+                }
+                return false;
+            }
+            cfg.mask |= McpUiConfigPayload::flag_toast;
+        }
+        if (arguments.contains("dialogue_id")) {
+            const auto s = get_string(arguments, "dialogue_id");
+            if (!s || s->empty() ||
+                !copy_command_text(*s, cfg.dialogue_id, error, "dialogue_id")) {
+                if (error.empty()) {
+                    error = "dialogue_id must be a non-empty bounded string";
+                }
+                return false;
+            }
+            cfg.mask |= McpUiConfigPayload::flag_dialogue;
+        }
+        command.type = McpCommandType::editor_configure_ui;
+        command.ui_config = cfg;
         return true;
     }
     if (name == "editor.audio.set_bus") {

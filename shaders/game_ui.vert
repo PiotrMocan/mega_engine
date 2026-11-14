@@ -9,7 +9,8 @@ layout(location = 1) out vec4 outColor;
 
 layout(push_constant) uniform GameUiPushConstants {
     vec2 invViewport;
-    vec2 padding;
+    float sdfMode;
+    float sdfSoftness;
 } ui;
 
 vec3 srgb_to_linear(vec3 c)

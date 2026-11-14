@@ -323,4 +323,104 @@ using Json = nlohmann::json;
     return true;
 }
 
+[[nodiscard]] inline Json ui_marker_to_json(const UiMarkerComponent& marker) {
+    return Json{
+        {"kind", std::string(to_string(marker.kind))},
+        {"enabled", marker.enabled},
+        {"clamp_to_screen", marker.clamp_to_screen},
+        {"show_distance", marker.show_distance},
+        {"show_health_bar", marker.show_health_bar},
+        {"world_offset", Json::array({marker.world_offset.x, marker.world_offset.y, marker.world_offset.z})},
+        {"max_distance", marker.max_distance},
+        {"fade_start_distance", marker.fade_start_distance},
+        {"color_rgba8", marker.color_rgba8},
+        {"label", std::string(marker.label_view())},
+        {"subtitle_text", std::string(marker.subtitle_text_view())},
+        {"dialogue_id", std::string(marker.dialogue_id_view())},
+    };
+}
+
+[[nodiscard]] inline bool parse_ui_marker_json(
+    const Json& source,
+    UiMarkerComponent& out) {
+    if (!source.is_object()) {
+        return false;
+    }
+    for (const auto& [k, _] : source.items()) {
+        if (k != "kind" && k != "enabled" && k != "clamp_to_screen" &&
+            k != "show_distance" && k != "show_health_bar" &&
+            k != "world_offset" && k != "max_distance" &&
+            k != "fade_start_distance" && k != "color_rgba8" &&
+            k != "label" && k != "subtitle_text" && k != "dialogue_id") {
+            return false;
+        }
+    }
+    UiMarkerComponent parsed{};
+    if (source.contains("kind")) {
+        if (!source["kind"].is_string()) {
+            return false;
+        }
+        const auto kind_opt = parse_ui_marker_kind(source["kind"].get<std::string_view>());
+        if (!kind_opt.has_value()) {
+            return false;
+        }
+        parsed.kind = *kind_opt;
+    }
+    if ((source.contains("enabled") && !source["enabled"].is_boolean()) ||
+        (source.contains("clamp_to_screen") && !source["clamp_to_screen"].is_boolean()) ||
+        (source.contains("show_distance") && !source["show_distance"].is_boolean()) ||
+        (source.contains("show_health_bar") && !source["show_health_bar"].is_boolean())) {
+        return false;
+    }
+    parsed.enabled = source.value("enabled", parsed.enabled);
+    parsed.clamp_to_screen = source.value("clamp_to_screen", parsed.clamp_to_screen);
+    parsed.show_distance = source.value("show_distance", parsed.show_distance);
+    parsed.show_health_bar = source.value("show_health_bar", parsed.show_health_bar);
+    if (source.contains("world_offset") &&
+        !read_vec3(source["world_offset"], -1000.0F, 1000.0F, parsed.world_offset)) {
+        return false;
+    }
+    if (source.contains("max_distance") &&
+        !read_bounded_float(source["max_distance"], 1.0F, 10'000.0F, parsed.max_distance)) {
+        return false;
+    }
+    if (source.contains("fade_start_distance") &&
+        !read_bounded_float(source["fade_start_distance"], 0.0F, 10'000.0F, parsed.fade_start_distance)) {
+        return false;
+    }
+    if (source.contains("color_rgba8")) {
+        if (!source["color_rgba8"].is_number_integer()) {
+            return false;
+        }
+        const std::int64_t val = source["color_rgba8"].get<std::int64_t>();
+        if (val < 0 || val > static_cast<std::int64_t>(0xFFFFFFFFULL)) {
+            return false;
+        }
+        parsed.color_rgba8 = static_cast<std::uint32_t>(val);
+    }
+    if (source.contains("label")) {
+        if (!source["label"].is_string() ||
+            !parsed.set_label(source["label"].get<std::string_view>())) {
+            return false;
+        }
+    }
+    if (source.contains("subtitle_text")) {
+        if (!source["subtitle_text"].is_string() ||
+            !parsed.set_subtitle_text(source["subtitle_text"].get<std::string_view>())) {
+            return false;
+        }
+    }
+    if (source.contains("dialogue_id")) {
+        if (!source["dialogue_id"].is_string() ||
+            !parsed.set_dialogue_id(source["dialogue_id"].get<std::string_view>())) {
+            return false;
+        }
+    }
+    if (!valid_ui_marker_component(parsed)) {
+        return false;
+    }
+    out = parsed;
+    return true;
+}
+
 } // namespace vcr::component_json

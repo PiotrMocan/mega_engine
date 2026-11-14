@@ -62,6 +62,8 @@ private:
         McpInputKey key,
         McpInputAction action);
     void set_mouse_capture(bool enabled) noexcept;
+    void bind_game_ui_callbacks() noexcept;
+    void restart_gameplay_session();
     void update_camera(float delta_seconds);
     void update_window_title();
     void finish_benchmark();
@@ -103,6 +105,13 @@ private:
     bool running_ = false;
     bool fullscreen_ = false;
     bool mouse_captured_ = false;
+    bool mouse_left_down_ = false;
+    bool mouse_left_pressed_ = false;
+    bool ui_bloom_enabled_ = true;
+    bool pending_gameplay_restart_ = false;
+    glm::vec2 mouse_pos_px_{-1.0F, -1.0F};
+    SceneDocument initial_gameplay_scene_snapshot_{};
+    std::vector<SceneHierarchyRow> ui_sky_rows_scratch_{};
     float pending_mouse_delta_x_ = 0.0F;
     float pending_mouse_delta_y_ = 0.0F;
     float pending_mcp_mouse_delta_x_ = 0.0F;

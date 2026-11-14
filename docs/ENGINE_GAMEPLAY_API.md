@@ -79,8 +79,8 @@ Headers: [`src/physics_world.hpp`](../src/physics_world.hpp), [`src/input_action
 - **Glass Materials** ([`src/cooked_model_asset.hpp`](../src/cooked_model_asset.hpp)):
   - `material_coverage_glass_bit` marks architectural/prop dielectric glass for physical specular reflection/transmission rendering and non-opaque ray-tracing BLAS handling.
 - **UI Overlay Canvas** ([`src/game_overlay.hpp`](../src/game_overlay.hpp)):
-  - `GameOverlayCanvas`: zero steady-state allocation 2D HUD renderer with ASCII + Cyrillic bitmap atlas (`pack_rgba8`, `draw_rect`, `draw_rect_outline`, `draw_line`, `draw_progress_bar`, `draw_arc`, `draw_text`, `measure_text`, `project_world_to_screen`).
-  - Submitted automatically at the end of Stage 5 via `Renderer::set_game_overlay_vertices`.
+  - `GameOverlayCanvas`: zero steady-state allocation 2D HUD renderer with `512x512` R8 SDF font atlas (`GameUiFontAtlas`, ASCII + Cyrillic + UI glyphs, `.vcrfont.json` + PNG I/O), `draw_rect`, `draw_rect_outline`, `draw_rounded_panel`, `draw_line`, `draw_progress_bar`, `draw_arc`, `draw_crosshair`, `draw_text_px`, `draw_text_shadowed`, `draw_text_wrapped`, `measure_text_px`, `measure_text_wrapped`, and `project_world_indicator`.
+  - Submitted automatically at the end of Stage 5 via `Renderer::set_game_overlay_vertices` with `VK_FILTER_LINEAR` and `GameUiPushConstants` SDF antialiasing (`shaders/game_ui.vert`, `shaders/game_ui.frag`).
 
 ---
 
@@ -107,3 +107,20 @@ Headers/CMake: [`src/game_module_api.hpp`](../src/game_module_api.hpp), [`src/ga
 - **Cross-DLL Error Reporting**: `configure_session(id, host, error_buf, error_buf_size)` writes UTF-8 diagnostics into caller-owned storage instead of returning heap-allocated `std::string` across CRT heaps.
 - **Configuration-Matched SDK Linking**: `vcr_engine` uses `DEBUG_POSTFIX "d"` (`vcr_engined.dll` / `vcr_engined.lib` in Debug, `vcr_engine.dll` / `vcr_engine.lib` in Release/ASan), and `VcrEngineSdk.cmake` selects the configuration-matched binaries strictly while setting `DEBUG_POSTFIX ""` on game module targets.
 - **Shadow-Copy Hardening**: `LoadedGameModule::load` rejects non-regular files and symlinks on both the source DLL and temporary shadow-copy directories, and binds `bound_session_` cleanup to unload/failure paths before `FreeLibrary`.
+
+---
+
+## 9. Runtime Game UI, Localization & World Markers (Stage 5)
+
+Headers: [`src/game_overlay.hpp`](../src/game_overlay.hpp), [`src/localization.hpp`](../src/localization.hpp), [`src/game_ui_runtime.hpp`](../src/game_ui_runtime.hpp), [`src/scene_components.hpp`](../src/scene_components.hpp)
+
+- **Resolution Scaling & Anchors (`UiScaler`, `UiAnchorPreset`, `UiScaleMode`)**: Scales UI elements from a `1920x1080` reference across `720p–4K` and ultrawide viewports using `fit`, `match_height`, `match_width`, or `pixel_constant` modes with configurable `safe_area_fraction` and 10 anchor presets (`top_left`..`stretch_fill`).
+- **SDF Font Atlases (`.vcrfont.json` + PNG)**: `GameUiFontAtlas::build_default_sdf()` generates a `512x512` signed-distance atlas with ASCII, Cyrillic (`U+0400..U+045F`), and UI glyphs. `save_game_ui_font_atlas_file` / `load_game_ui_font_atlas_file` serialize metrics and companion `.png` textures; `Renderer::set_game_ui_font_atlas` uploads custom atlases.
+- **Localization (`LocalizationSystem`, `.vcrloc.json`)**: Provides built-in `en` and `ru` UI string tables, sorted binary-searched zero-allocation runtime lookups (`get`, `try_get`, `resolve`, `format_into` with `{arg}` placeholders), fallback locale chain, and directory loading from `assets/localization/*.vcrloc.json`.
+- **Runtime Menus, HUD & Dialogues (`GameUiRuntime`, `.vcrdlg.json`)**: Dear ImGui-free in-game UI integrated into `GameplaySession`, standalone `Application`, and `vulkan_editor` Play mode:
+  - Screens: `in_game` (HUD, crosshair, interaction prompt, toasts, subtitles, world markers), `main_menu`, `pause_menu`, `settings` (`graphics`, `audio`, `controls` with live keyboard & gamepad rebinding, `interface_loc`), and multi-choice `dialogue` graphs (`*.vcrdlg.json`) that can set `GameplayWorld` variables.
+  - CLI options: `--main-menu` starts the session on the main menu; `--locale <code>` selects the initial UI locale.
+  - Custom game module compatibility: when a module attaches `on_input_ai` or `on_camera_audio_overlay` without calling `GameplaySession::configure_game_ui`, default auto-pause and built-in HUD drawing stay disabled so custom HUD/pause logic keeps control.
+- **3D World Markers & Editor / MCP Integration**:
+  - `UiMarkerComponent` (`objective`, `waypoint`, `interact`, `speaker`, `hazard`, `info`) projects 3D entity positions via `project_world_indicator` with off-screen edge clamping, distance fading, optional health bars, subtitles, and `dialogue_id` triggers (`"dialogue"` default gameplay behavior).
+  - Editor tools: `Inspector -> UI Marker` section with undo support, docked `UI & Localization` panel, Play viewport hover/click cursor tracking, shipping validation (`ship_project` for `.vcrloc.json`, `.vcrdlg.json`, `.vcrfont.json` + `.png`), and MCP tools `editor_set_ui_marker`, `editor_remove_ui_marker`, and `editor_configure_ui`.

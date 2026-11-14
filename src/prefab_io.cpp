@@ -681,6 +681,7 @@ struct ParsedPrefabNode {
     std::optional<AudioReverbZoneComponent> reverb_zone{};
     std::optional<AnimatorComponent> animator{};
     std::optional<GameplayComponent> gameplay{};
+    std::optional<UiMarkerComponent> ui_marker{};
     std::uint32_t parent_index = invalid_scene_node_index;
 };
 
@@ -897,7 +898,7 @@ bool save_prefab_file(
             }
             if (record.collider || record.rigid_body || record.audio_source ||
                 record.audio_listener || record.reverb_zone ||
-                record.animator || record.gameplay) {
+                record.animator || record.gameplay || record.ui_marker) {
                 Json components = Json::object();
                 if (record.collider) {
                     components["collider"] = collider_json(*record.collider);
@@ -925,6 +926,10 @@ bool save_prefab_file(
                 if (record.gameplay) {
                     components["gameplay"] =
                         component_json::gameplay_to_json(*record.gameplay);
+                }
+                if (record.ui_marker) {
+                    components["ui_marker"] =
+                        component_json::ui_marker_to_json(*record.ui_marker);
                 }
                 encoded["components"] = std::move(components);
             }
@@ -1286,6 +1291,7 @@ bool instantiate_prefab_file(
             std::optional<AudioReverbZoneComponent> reverb_zone{};
             std::optional<AnimatorComponent> animator{};
             std::optional<GameplayComponent> gameplay{};
+            std::optional<UiMarkerComponent> ui_marker{};
             if (encoded.contains("components")) {
                 const Json& comps = encoded["components"];
                 if (!comps.is_object()) {
@@ -1296,7 +1302,7 @@ bool instantiate_prefab_file(
                     if (ckey != "collider" && ckey != "rigid_body" &&
                         ckey != "audio_source" && ckey != "audio_listener" &&
                         ckey != "reverb_zone" && ckey != "animator" &&
-                        ckey != "gameplay") {
+                        ckey != "gameplay" && ckey != "ui_marker") {
                         error = "Prefab node contains an unknown component.";
                         return false;
                     }
@@ -1359,6 +1365,15 @@ bool instantiate_prefab_file(
                     }
                     gameplay = gp;
                 }
+                if (comps.contains("ui_marker")) {
+                    UiMarkerComponent marker{};
+                    if (!component_json::parse_ui_marker_json(
+                            comps["ui_marker"], marker)) {
+                        error = "Prefab ui_marker component is invalid.";
+                        return false;
+                    }
+                    ui_marker = marker;
+                }
             }
 
             parsed_nodes.push_back(ParsedPrefabNode{
@@ -1387,6 +1402,7 @@ bool instantiate_prefab_file(
                 .reverb_zone = reverb_zone,
                 .animator = animator,
                 .gameplay = gameplay,
+                .ui_marker = ui_marker,
                 .parent_index = parent_index,
             });
         }
@@ -1519,6 +1535,13 @@ bool instantiate_prefab_file(
             }
             target.gameplay = *ov.gameplay;
         }
+        if (ov.ui_marker) {
+            if (!valid_ui_marker_component(*ov.ui_marker)) {
+                error = "Prefab override ui_marker component is invalid.";
+                return false;
+            }
+            target.ui_marker = *ov.ui_marker;
+        }
     }
 
     std::vector<SceneNodeId> created(parsed_nodes.size());
@@ -1599,6 +1622,12 @@ bool instantiate_prefab_file(
             !scene.set_gameplay(id, *spec.gameplay)) {
             static_cast<void>(scene.destroy_subtree(root_created));
             error = "Unable to attach prefab gameplay component.";
+            return false;
+        }
+        if (spec.ui_marker &&
+            !scene.set_ui_marker(id, *spec.ui_marker)) {
+            static_cast<void>(scene.destroy_subtree(root_created));
+            error = "Unable to attach prefab ui_marker component.";
             return false;
         }
     }

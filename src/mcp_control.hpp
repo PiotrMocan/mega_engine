@@ -87,6 +87,9 @@ enum class McpCommandType : std::uint8_t {
     editor_set_gameplay,
     editor_remove_gameplay,
     editor_gameplay_save_or_load,
+    editor_set_ui_marker,
+    editor_remove_ui_marker,
+    editor_configure_ui,
     engine_request_quit,
     engine_commit_quit,
 };
@@ -150,6 +153,47 @@ struct McpAudioSourcePayload {
 
 static_assert(std::is_trivially_copyable_v<McpAudioSourcePayload>);
 
+struct McpUiConfigPayload {
+    static constexpr std::uint32_t flag_start_in_main_menu = 1U << 0U;
+    static constexpr std::uint32_t flag_auto_pause_enabled = 1U << 1U;
+    static constexpr std::uint32_t flag_show_default_hud = 1U << 2U;
+    static constexpr std::uint32_t flag_show_crosshair = 1U << 3U;
+    static constexpr std::uint32_t flag_show_fps = 1U << 4U;
+    static constexpr std::uint32_t flag_show_subtitles = 1U << 5U;
+    static constexpr std::uint32_t flag_show_world_markers = 1U << 6U;
+    static constexpr std::uint32_t flag_auto_trigger_marker_dialogue = 1U << 7U;
+    static constexpr std::uint32_t flag_scale_mode = 1U << 8U;
+    static constexpr std::uint32_t flag_user_scale = 1U << 9U;
+    static constexpr std::uint32_t flag_safe_area_fraction = 1U << 10U;
+    static constexpr std::uint32_t flag_locale = 1U << 11U;
+    static constexpr std::uint32_t flag_screen = 1U << 12U;
+    static constexpr std::uint32_t flag_subtitle = 1U << 13U;
+    static constexpr std::uint32_t flag_toast = 1U << 14U;
+    static constexpr std::uint32_t flag_dialogue = 1U << 15U;
+    static constexpr std::uint32_t flag_reload_assets = 1U << 16U;
+
+    std::uint32_t mask = 0U;
+    bool start_in_main_menu = false;
+    bool auto_pause_enabled = true;
+    bool show_default_hud = true;
+    bool show_crosshair = true;
+    bool show_fps = false;
+    bool show_subtitles = true;
+    bool show_world_markers = true;
+    bool auto_trigger_marker_dialogue = true;
+    bool reload_assets = false;
+    std::uint8_t scale_mode = 0U;
+    std::uint8_t screen = 0U;
+    float user_scale = 1.0F;
+    float safe_area_fraction = 0.025F;
+    float duration_seconds = 3.5F;
+    std::array<char, 16U> locale{};
+    std::array<char, 64U> speaker{};
+    std::array<char, 64U> dialogue_id{};
+};
+
+static_assert(std::is_trivially_copyable_v<McpUiConfigPayload>);
+
 struct McpCommand {
     static constexpr std::size_t text_capacity =
         max_scene_asset_path_bytes + 1U;
@@ -211,6 +255,8 @@ struct McpCommand {
     bool prefab_attach_instance = true;
     AnimatorComponent animator{};
     GameplayComponent gameplay{};
+    UiMarkerComponent ui_marker{};
+    McpUiConfigPayload ui_config{};
     float preview_time_seconds = -1.0F;
     bool preview_stop = false;
     bool preview_params_supplied = false;

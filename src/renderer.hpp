@@ -342,6 +342,7 @@ public:
     }
 #if VCR_EDITOR_ENABLED
     void set_game_overlay_vertices(std::span<const GameUiVertex> vertices);
+    void set_game_ui_font_atlas(const GameUiFontAtlas& atlas);
 #endif
     [[nodiscard]] bool fsr3_available() const noexcept {
         return fsr3_upscaler_.available();
@@ -1231,6 +1232,7 @@ private:
     DeviceObject<VkPipeline> game_ui_direct_pipeline_{};
     DeviceObject<VkPipeline> game_ui_post_pipeline_{};
     std::vector<GameUiVertex> game_ui_pending_vertices_{};
+    bool game_ui_sdf_enabled_ = true;
 #endif
 };
 

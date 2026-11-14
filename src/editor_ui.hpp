@@ -257,6 +257,9 @@ private:
     void build_animation_gameplay_panel(
         SceneDocument& scene,
         Renderer& renderer);
+    void build_ui_localization_panel(
+        SceneDocument& scene,
+        Renderer& renderer);
     void build_performance(
         SceneDocument& scene,
         Renderer& renderer,
@@ -280,6 +283,11 @@ private:
     void update_camera_input();
     void set_game_mouse_capture(SDL_Window* window) noexcept;
     void update_game_mouse_capture(bool viewport_clicked);
+    void update_play_viewport_mouse(
+        ImVec2 rect_min,
+        ImVec2 rect_max,
+        bool clicked_left,
+        bool hovered) noexcept;
     void request_viewport_extent(
         VkExtent2D extent,
         std::chrono::steady_clock::time_point now) noexcept;
@@ -294,6 +302,16 @@ private:
     AnimatorRuntimeSystem* edit_animator_preview_ = nullptr;
     bool show_skeleton_wireframe_ = true;
     bool animation_gameplay_panel_open_ = true;
+    bool ui_localization_panel_open_ = true;
+    std::array<char, 64U> ui_test_speaker_buf_{"Narrator"};
+    std::array<char, 256U> ui_test_text_buf_{"ui.dialogue.greeting"};
+    std::array<char, 64U> ui_test_dialogue_id_buf_{};
+    std::string ui_loc_status_{};
+    glm::vec2 play_mouse_pos_px_{-1.0F, -1.0F};
+    bool play_mouse_left_down_ = false;
+    bool play_mouse_left_pressed_ = false;
+    float play_display_fps_ = 0.0F;
+    bool prev_ui_wants_cursor_ = false;
     std::array<char, 256U> save_slot_path_buf_{};
     std::optional<std::string> pending_quick_save_path_{};
     std::optional<std::string> pending_quick_load_path_{};

@@ -480,25 +480,183 @@ void Application::load_canonical_scene() {
         << " (" << scene_.size() << " nodes)\n";
 }
 
-void Application::initialize_gameplay(const SceneRenderView& initial_view) {
-    if (options_.benchmark || options_.animate_camera ||
-        options_.render_fixture != RenderFixture::none ||
-        options_.lighting_room || options_.scene_count != 0U) {
+void Application::bind_game_ui_callbacks() noexcept {
+    const GameUiHostCallbacks callbacks{
+        .user_data = this,
+        .query_host_state = [](void* const ud, GameUiHostState& out_state) noexcept {
+            auto* const self = static_cast<Application*>(ud);
+            out_state.set_present_mode_label(
+                Swapchain::present_mode_name(self->renderer_.swapchain().present_mode()));
+            out_state.fullscreen = self->fullscreen_;
+            out_state.set_anti_aliasing_label(
+                to_string(self->renderer_.anti_aliasing()));
+            out_state.dynamic_shadows = self->renderer_.lighting_settings().dynamic;
+            out_state.shadow_resolution = self->renderer_.shadow_resolution();
+            bool any_sky = false;
+            try {
+                self->scene_.build_hierarchy_rows(
+                    self->ui_sky_rows_scratch_, {}, SceneHierarchyScope::all);
+                for (const SceneHierarchyRow& row : self->ui_sky_rows_scratch_) {
+                    if (const auto node = self->scene_.node(row.id)) {
+                        if (node->get().kind == SceneNodeKind::environment &&
+                            node->get().visible) {
+                            any_sky = true;
+                            break;
+                        }
+                    }
+                }
+            } catch (...) {
+                any_sky = true;
+            }
+            out_state.sky_enabled = any_sky;
+            out_state.exposure_ev = self->renderer_.exposure_settings().compensation_ev;
+            out_state.bloom_enabled = self->ui_bloom_enabled_;
+        },
+        .cycle_present_mode = [](void* const ud, const int delta) noexcept {
+            auto* const self = static_cast<Application*>(ud);
+            const VkPresentModeKHR cur = self->renderer_.swapchain().present_mode();
+            int idx = cur == VK_PRESENT_MODE_IMMEDIATE_KHR ? 0
+                    : (cur == VK_PRESENT_MODE_MAILBOX_KHR ? 1 : 2);
+            idx = (idx + (delta >= 0 ? 1 : 2)) % 3;
+            constexpr std::array<PresentPreference, 3U> kPrefs{
+                PresentPreference::immediate,
+                PresentPreference::mailbox,
+                PresentPreference::fifo,
+            };
+            self->renderer_.set_present_mode(kPrefs[static_cast<std::size_t>(idx)]);
+            self->renderer_.reset_metrics();
+        },
+        .set_fullscreen = [](void* const ud, const bool enabled) noexcept {
+            auto* const self = static_cast<Application*>(ud);
+            if (!self->window_ || self->fullscreen_ == enabled) {
+                return;
+            }
+            if (SDL_SetWindowFullscreen(self->window_.get(), enabled)) {
+                self->fullscreen_ = enabled;
+            } else {
+                std::cerr << "Unable to toggle fullscreen: " << SDL_GetError() << '\n';
+            }
+        },
+        .cycle_anti_aliasing = [](void* const ud, const int /*delta*/) noexcept {
+            auto* const self = static_cast<Application*>(ud);
+            self->renderer_.cycle_anti_aliasing();
+            self->renderer_.reset_metrics();
+        },
+        .set_dynamic_shadows = [](void* const ud, const bool enabled) noexcept {
+            auto* const self = static_cast<Application*>(ud);
+            LightingSettings lighting = self->renderer_.lighting_settings();
+            lighting.dynamic = enabled;
+            if (self->renderer_.set_lighting_settings(lighting)) {
+                self->renderer_.reset_metrics();
+            }
+        },
+        .cycle_shadow_resolution = [](void* const ud, const int delta) noexcept {
+            auto* const self = static_cast<Application*>(ud);
+            LightingSettings lighting = self->renderer_.lighting_settings();
+            std::size_t current_idx = 0U;
+            for (std::size_t i = 0U; i < shadow_resolutions.size(); ++i) {
+                if (shadow_resolutions[i] == lighting.shadow_resolution) {
+                    current_idx = i;
+                    break;
+                }
+            }
+            for (std::size_t probe = 1U; probe <= shadow_resolutions.size(); ++probe) {
+                const std::size_t candidate_idx = delta >= 0
+                    ? (current_idx + probe) % shadow_resolutions.size()
+                    : (current_idx + shadow_resolutions.size() - (probe % shadow_resolutions.size())) %
+                          shadow_resolutions.size();
+                const std::uint32_t candidate = shadow_resolutions[candidate_idx];
+                if (self->renderer_.supports_shadow_resolution(candidate)) {
+                    lighting.shadow_resolution = candidate;
+                    static_cast<void>(self->renderer_.set_lighting_settings(lighting));
+                    self->renderer_.reset_metrics();
+                    break;
+                }
+            }
+        },
+        .set_sky_enabled = [](void* const ud, const bool enabled) noexcept {
+            auto* const self = static_cast<Application*>(ud);
+            try {
+                bool modified = false;
+                self->scene_.build_hierarchy_rows(
+                    self->ui_sky_rows_scratch_, {}, SceneHierarchyScope::all);
+                for (const SceneHierarchyRow& row : self->ui_sky_rows_scratch_) {
+                    if (auto node = self->scene_.node(row.id)) {
+                        if (node->get().kind == SceneNodeKind::environment &&
+                            node->get().visible != enabled) {
+                            node->get().visible = enabled;
+                            modified = true;
+                        }
+                    }
+                }
+                if (!modified) {
+                    return;
+                }
+                self->scene_.mark_content_changed();
+                const auto root = find_runtime_asset_root(self->options_.project_path);
+                if (root) {
+                    std::string err;
+                    const SceneRenderView view = self->scene_.build_render_view(
+                        self->scene_instances_, self->scene_models_, self->scene_lights_);
+                    static_cast<void>(self->renderer_.update_editor_scene(view, root->path, err));
+                }
+            } catch (...) {
+            }
+        },
+        .adjust_exposure_ev = [](void* const ud, const float delta_ev) noexcept {
+            auto* const self = static_cast<Application*>(ud);
+            ExposureSettings exp = self->renderer_.exposure_settings();
+            exp.compensation_ev = std::clamp(exp.compensation_ev + delta_ev, -6.0F, 6.0F);
+            static_cast<void>(self->renderer_.set_exposure_settings(exp));
+        },
+        .set_bloom_enabled = [](void* const ud, const bool enabled) noexcept {
+            auto* const self = static_cast<Application*>(ud);
+            self->ui_bloom_enabled_ = enabled;
+        },
+        .on_new_game = [](void* const ud) noexcept {
+            auto* const self = static_cast<Application*>(ud);
+            self->pending_gameplay_restart_ = true;
+        },
+        .on_restart_game = [](void* const ud) noexcept {
+            auto* const self = static_cast<Application*>(ud);
+            self->pending_gameplay_restart_ = true;
+        },
+        .on_quit_requested = [](void* const ud) noexcept {
+            auto* const self = static_cast<Application*>(ud);
+            self->running_ = false;
+        },
+    };
+    gameplay_.game_ui().set_host_callbacks(callbacks);
+}
+
+void Application::restart_gameplay_session() {
+    if (!gameplay_.active()) {
         return;
     }
+    GameUiConfig cfg = gameplay_.game_ui().config();
+    cfg.start_in_main_menu = false;
+    const std::string saved_locale(gameplay_.localization().locale());
 
-    const FlyCamera startup_camera = scene_startup_camera(
-        scene_,
-        options_.camera_z_explicit
-            ? std::optional<double>(options_.camera_z)
-            : std::nullopt);
-    gameplay_renderer_bridge_ = make_gameplay_renderer_bridge(renderer_);
+    gameplay_.stop(
+        audio_engine_.initialized() ? &audio_engine_ : nullptr,
+        &gameplay_renderer_bridge_);
     loaded_game_module_.unload(&gameplay_);
     loaded_module_project_root_.clear();
     loaded_module_asset_root_.clear();
+
+    scene_ = initial_gameplay_scene_snapshot_;
+    scene_.mark_content_changed();
+    SceneRenderView view = scene_.build_render_view(
+        scene_instances_, scene_models_, scene_lights_);
+    const auto root = find_runtime_asset_root(options_.project_path);
     std::string error;
-    if (const auto root = find_runtime_asset_root(options_.project_path);
-        root && !root->game_module_path.empty()) {
+    if (root && !renderer_.update_editor_scene(view, root->path, error)) {
+        fatal(error);
+    }
+
+    gameplay_.set_content_asset_root(root ? root->path : std::filesystem::path{});
+    gameplay_.configure_game_ui(cfg);
+    if (root && !root->game_module_path.empty()) {
         loaded_module_project_root_ = root->project_root;
         loaded_module_asset_root_ = root->path;
         const GameModuleHostContext host{
@@ -514,6 +672,79 @@ void Application::initialize_gameplay(const SceneRenderView& initial_view) {
             fatal(error);
         }
     }
+    bind_game_ui_callbacks();
+    const FlyCamera startup_camera = scene_startup_camera(
+        scene_,
+        options_.camera_z_explicit
+            ? std::optional<double>(options_.camera_z)
+            : std::nullopt);
+    if (!gameplay_.start(
+            scene_,
+            view,
+            startup_camera,
+            camera_,
+            error,
+            &gameplay_renderer_bridge_,
+            audio_engine_.initialized() ? &audio_engine_ : nullptr,
+            &input_actions_)) {
+        fatal(error);
+    }
+    if (!saved_locale.empty()) {
+        static_cast<void>(gameplay_.localization().set_locale(saved_locale));
+    }
+    view = scene_.build_render_view(
+        scene_instances_, scene_models_, scene_lights_);
+    if (root && !renderer_.update_editor_scene(view, root->path, error)) {
+        fatal(error);
+    }
+}
+
+void Application::initialize_gameplay(const SceneRenderView& initial_view) {
+    if (options_.benchmark || options_.animate_camera ||
+        options_.render_fixture != RenderFixture::none ||
+        options_.lighting_room || options_.scene_count != 0U) {
+        return;
+    }
+
+    initial_gameplay_scene_snapshot_ = scene_;
+    const FlyCamera startup_camera = scene_startup_camera(
+        scene_,
+        options_.camera_z_explicit
+            ? std::optional<double>(options_.camera_z)
+            : std::nullopt);
+    gameplay_renderer_bridge_ = make_gameplay_renderer_bridge(renderer_);
+    loaded_game_module_.unload(&gameplay_);
+    loaded_module_project_root_.clear();
+    loaded_module_asset_root_.clear();
+    std::string error;
+    const auto root = find_runtime_asset_root(options_.project_path);
+    gameplay_.set_content_asset_root(
+        root ? root->path : std::filesystem::path{});
+    if (!options_.locale.empty()) {
+        static_cast<void>(gameplay_.localization().set_locale(options_.locale));
+    }
+    if (root && !root->game_module_path.empty()) {
+        loaded_module_project_root_ = root->project_root;
+        loaded_module_asset_root_ = root->path;
+        const GameModuleHostContext host{
+            .project_root = &loaded_module_project_root_,
+            .asset_root = &loaded_module_asset_root_,
+            .scene = &scene_,
+            .session = &gameplay_,
+            .audio_engine = audio_engine_.initialized() ? &audio_engine_ : nullptr,
+            .input_actions = &input_actions_,
+        };
+        if (!loaded_game_module_.load(
+                root->game_module_path, host, false, error)) {
+            fatal(error);
+        }
+    }
+    if (options_.start_in_main_menu) {
+        GameUiConfig cfg = gameplay_.game_ui().config();
+        cfg.start_in_main_menu = true;
+        gameplay_.configure_game_ui(cfg);
+    }
+    bind_game_ui_callbacks();
     if (!gameplay_.start(
             scene_,
             initial_view,
@@ -524,6 +755,12 @@ void Application::initialize_gameplay(const SceneRenderView& initial_view) {
             audio_engine_.initialized() ? &audio_engine_ : nullptr,
             &input_actions_)) {
         fatal(error);
+    }
+    if (!options_.locale.empty()) {
+        static_cast<void>(gameplay_.localization().set_locale(options_.locale));
+    }
+    if (gameplay_.game_ui().wants_mouse_cursor()) {
+        set_mouse_capture(false);
     }
 }
 
@@ -725,21 +962,52 @@ void Application::process_event(const SDL_Event& event) {
         if (mouse_captured_ && !options_.benchmark) {
             pending_mouse_delta_x_ += event.motion.xrel;
             pending_mouse_delta_y_ += event.motion.yrel;
+        } else if (window_ && !options_.benchmark) {
+            int win_w = 0;
+            int win_h = 0;
+            SDL_GetWindowSize(window_.get(), &win_w, &win_h);
+            const VkExtent2D swap_ext = renderer_.swapchain().extent();
+            if (win_w > 0 && win_h > 0 && swap_ext.width > 0U && swap_ext.height > 0U) {
+                mouse_pos_px_ = glm::vec2(
+                    event.motion.x * (static_cast<float>(swap_ext.width) / static_cast<float>(win_w)),
+                    event.motion.y * (static_cast<float>(swap_ext.height) / static_cast<float>(win_h)));
+            }
         }
         return;
     }
     if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
         event.type == SDL_EVENT_MOUSE_BUTTON_UP) {
         if (!options_.benchmark) {
+            if (window_ && !mouse_captured_) {
+                int win_w = 0;
+                int win_h = 0;
+                SDL_GetWindowSize(window_.get(), &win_w, &win_h);
+                const VkExtent2D swap_ext = renderer_.swapchain().extent();
+                if (win_w > 0 && win_h > 0 && swap_ext.width > 0U && swap_ext.height > 0U) {
+                    mouse_pos_px_ = glm::vec2(
+                        event.button.x * (static_cast<float>(swap_ext.width) / static_cast<float>(win_w)),
+                        event.button.y * (static_cast<float>(swap_ext.height) / static_cast<float>(win_h)));
+                }
+            }
+            if (event.button.button == SDL_BUTTON_LEFT) {
+                const bool down = (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN);
+                if (down && !mouse_left_down_) {
+                    mouse_left_pressed_ = true;
+                }
+                mouse_left_down_ = down;
+            }
             const InputKey btn =
                 input_key_from_sdl_mouse_button(event.button.button);
             if (btn != InputKey::none) {
                 input_actions_.set_key_down(
                     btn, event.type == SDL_EVENT_MOUSE_BUTTON_DOWN);
             }
+            const bool ui_cursor =
+                gameplay_.active() && gameplay_.game_ui().wants_mouse_cursor();
             if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
                 event.button.button == SDL_BUTTON_LEFT &&
-                !mouse_captured_) {
+                !mouse_captured_ &&
+                !ui_cursor) {
                 set_mouse_capture(true);
             }
         }
@@ -785,6 +1053,12 @@ void Application::handle_key_action(
     const bool allow_quit) {
     switch (key) {
     case McpInputKey::escape:
+        if (gameplay_.active() && gameplay_.game_ui().handles_escape_key()) {
+            if (mouse_captured_ && !options_.benchmark) {
+                set_mouse_capture(false);
+            }
+            break;
+        }
         if (mouse_captured_ && !options_.benchmark) {
             set_mouse_capture(false);
         } else if (allow_quit) {
@@ -903,6 +1177,17 @@ void Application::update_camera(const float delta_seconds) {
     bool character_run = false;
     bool character_interact = false;
     if (!options_.benchmark) {
+        if (gameplay_.active()) {
+            const bool ui_wants_cursor = gameplay_.game_ui().wants_mouse_cursor();
+            if (ui_wants_cursor && input_actions_.context() != InputContext::ui) {
+                input_actions_.set_context(InputContext::ui);
+            } else if (!ui_wants_cursor && input_actions_.context() == InputContext::ui) {
+                input_actions_.set_context(InputContext::gameplay);
+            }
+            if (ui_wants_cursor && mouse_captured_) {
+                set_mouse_capture(false);
+            }
+        }
         if (mouse_captured_) {
             input_actions_.add_mouse_delta(
                 pending_mouse_delta_x_, pending_mouse_delta_y_);
@@ -993,6 +1278,14 @@ void Application::update_camera(const float delta_seconds) {
         return;
     }
 
+    if (pending_gameplay_restart_) {
+        pending_gameplay_restart_ = false;
+        restart_gameplay_session();
+    }
+    if (gameplay_.game_ui().wants_mouse_cursor() && mouse_captured_) {
+        set_mouse_capture(false);
+    }
+
     if (!gameplay_.update(
         GameplayFrameInput{
             .character = CharacterInput{
@@ -1007,6 +1300,11 @@ void Application::update_camera(const float delta_seconds) {
             },
             .mouse_delta_x = input.mouse_delta_x,
             .mouse_delta_y = input.mouse_delta_y,
+            .mouse_pos_px = mouse_pos_px_,
+            .mouse_left_down = mouse_left_down_,
+            .mouse_left_pressed = std::exchange(mouse_left_pressed_, false),
+            .display_fps = static_cast<float>(
+                renderer_.metrics_snapshot(false).one_second_average_fps),
         },
         delta_seconds,
         scene_,
@@ -1015,6 +1313,9 @@ void Application::update_camera(const float delta_seconds) {
         audio_engine_.initialized() ? &audio_engine_ : nullptr,
         &input_actions_)) {
         fatal("Gameplay runtime lost its player scene node.");
+    }
+    if (gameplay_.game_ui().wants_mouse_cursor() && mouse_captured_) {
+        set_mouse_capture(false);
     }
 }
 

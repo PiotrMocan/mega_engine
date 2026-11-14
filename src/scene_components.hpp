@@ -1161,4 +1161,119 @@ private:
     std::vector<Component> values_{};
 };
 
+enum class UiMarkerKind : std::uint8_t {
+    objective = 0U,
+    waypoint = 1U,
+    interact = 2U,
+    speaker = 3U,
+    hazard = 4U,
+    info = 5U,
+};
+
+[[nodiscard]] inline constexpr std::string_view to_string(
+    const UiMarkerKind kind) noexcept {
+    switch (kind) {
+    case UiMarkerKind::objective:
+        return "objective";
+    case UiMarkerKind::waypoint:
+        return "waypoint";
+    case UiMarkerKind::interact:
+        return "interact";
+    case UiMarkerKind::speaker:
+        return "speaker";
+    case UiMarkerKind::hazard:
+        return "hazard";
+    case UiMarkerKind::info:
+        return "info";
+    }
+    return "objective";
+}
+
+[[nodiscard]] inline std::optional<UiMarkerKind> parse_ui_marker_kind(
+    const std::string_view name) noexcept {
+    if (name == "objective") return UiMarkerKind::objective;
+    if (name == "waypoint") return UiMarkerKind::waypoint;
+    if (name == "interact") return UiMarkerKind::interact;
+    if (name == "speaker") return UiMarkerKind::speaker;
+    if (name == "hazard") return UiMarkerKind::hazard;
+    if (name == "info") return UiMarkerKind::info;
+    return std::nullopt;
+}
+
+struct UiMarkerComponent {
+    UiMarkerKind kind = UiMarkerKind::objective;
+    bool enabled = true;
+    bool clamp_to_screen = true;
+    bool show_distance = true;
+    bool show_health_bar = false;
+    glm::vec3 world_offset{0.0F, 1.8F, 0.0F};
+    float max_distance = 120.0F;
+    float fade_start_distance = 85.0F;
+    std::uint32_t color_rgba8 = 0xFFFFE15CU;
+    std::array<char, 128U> label{};
+    std::array<char, 128U> subtitle_text{};
+    std::array<char, 64U> dialogue_id{};
+
+    [[nodiscard]] std::string_view label_view() const noexcept {
+        return component_detail::fixed_cstr_view(label);
+    }
+    [[nodiscard]] bool set_label(const std::string_view v) noexcept {
+        return component_detail::set_fixed_cstr(label, v);
+    }
+    [[nodiscard]] std::string_view subtitle_text_view() const noexcept {
+        return component_detail::fixed_cstr_view(subtitle_text);
+    }
+    [[nodiscard]] bool set_subtitle_text(const std::string_view v) noexcept {
+        return component_detail::set_fixed_cstr(subtitle_text, v);
+    }
+    [[nodiscard]] std::string_view dialogue_id_view() const noexcept {
+        return component_detail::fixed_cstr_view(dialogue_id);
+    }
+    [[nodiscard]] bool set_dialogue_id(const std::string_view v) noexcept {
+        return component_detail::set_fixed_cstr(dialogue_id, v);
+    }
+
+    friend bool operator==(
+        const UiMarkerComponent&,
+        const UiMarkerComponent&) = default;
+};
+
+static_assert(std::is_trivially_copyable_v<UiMarkerComponent>);
+
+[[nodiscard]] inline bool valid_ui_marker_component(
+    const UiMarkerComponent& marker) noexcept {
+    return component_detail::valid_fixed_cstr(marker.label) &&
+           component_detail::valid_fixed_cstr(marker.subtitle_text) &&
+           component_detail::valid_fixed_cstr(marker.dialogue_id) &&
+           std::isfinite(marker.world_offset.x) &&
+           std::isfinite(marker.world_offset.y) &&
+           std::isfinite(marker.world_offset.z) &&
+           std::isfinite(marker.max_distance) &&
+           marker.max_distance >= 1.0F &&
+           marker.max_distance <= 10'000.0F &&
+           std::isfinite(marker.fade_start_distance) &&
+           marker.fade_start_distance >= 0.0F &&
+           marker.fade_start_distance <= marker.max_distance;
+}
+
+[[nodiscard]] inline UiMarkerComponent sanitize_ui_marker_component(
+    UiMarkerComponent marker) noexcept {
+    const auto finite_or = [](const float v, const float fallback) noexcept {
+        return std::isfinite(v) ? v : fallback;
+    };
+    const auto clamp_or = [](const float v, const float lo, const float hi, const float fallback) noexcept {
+        return std::isfinite(v) ? std::clamp(v, lo, hi) : fallback;
+    };
+    marker.world_offset.x = std::clamp(finite_or(marker.world_offset.x, 0.0F), -1000.0F, 1000.0F);
+    marker.world_offset.y = std::clamp(finite_or(marker.world_offset.y, 1.8F), -1000.0F, 1000.0F);
+    marker.world_offset.z = std::clamp(finite_or(marker.world_offset.z, 0.0F), -1000.0F, 1000.0F);
+    marker.max_distance = clamp_or(marker.max_distance, 1.0F, 10'000.0F, 120.0F);
+    marker.fade_start_distance = clamp_or(
+        marker.fade_start_distance, 0.0F, marker.max_distance, std::min(85.0F, marker.max_distance));
+    if (marker.color_rgba8 == 0U) {
+        marker.color_rgba8 = 0xFFFFE15CU;
+    }
+    return marker;
+}
+
 } // namespace vcr

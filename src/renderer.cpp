@@ -10664,8 +10664,8 @@ void Renderer::record_commands(
             const std::array<float, 4U> ui_push{
                 1.0F / static_cast<float>(std::max(display_extent.width, 1U)),
                 1.0F / static_cast<float>(std::max(display_extent.height, 1U)),
-                0.0F,
-                0.0F,
+                game_ui_sdf_enabled_ ? 1.0F : 0.0F,
+                1.15F,
             };
             vkCmdBindPipeline(
                 command_buffer,
@@ -10683,7 +10683,7 @@ void Renderer::record_commands(
             vkCmdPushConstants(
                 command_buffer,
                 game_ui_pipeline_layout_.get(),
-                VK_SHADER_STAGE_VERTEX_BIT,
+                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                 0U,
                 sizeof(ui_push),
                 ui_push.data());
@@ -12206,23 +12206,69 @@ void Renderer::set_game_overlay_vertices(const std::span<const GameUiVertex> ver
         vertices.begin() + static_cast<std::ptrdiff_t>(clamped_count));
 }
 
-void Renderer::create_game_ui_resources() {
-    if (context_ == nullptr || game_ui_atlas_) {
+void Renderer::set_game_ui_font_atlas(const GameUiFontAtlas& atlas) {
+    if (context_ == nullptr) {
         return;
     }
-    std::array<std::uint8_t, game_ui_atlas_size * game_ui_atlas_size> atlas_pixels{};
-    build_game_ui_font_atlas(atlas_pixels);
+    if (atlas.width == 0U || atlas.height == 0U ||
+        atlas.pixels_r8.size() != static_cast<std::size_t>(atlas.width) * static_cast<std::size_t>(atlas.height)) {
+        return;
+    }
+    if (!game_ui_atlas_) {
+        create_game_ui_resources();
+    }
+    VK_CHECK(vkDeviceWaitIdle(context_->device()));
+    game_ui_atlas_ = GpuTexture{};
     game_ui_atlas_.create_sampled(
         *context_,
-        game_ui_atlas_size,
-        game_ui_atlas_size,
+        atlas.width,
+        atlas.height,
         VK_FORMAT_R8_UNORM,
-        VK_FILTER_NEAREST,
+        atlas.sdf ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
         VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
         "game overlay font atlas");
     upload_to_device_texture(
         game_ui_atlas_,
-        std::as_bytes(std::span{atlas_pixels}),
+        std::as_bytes(std::span{atlas.pixels_r8.data(), atlas.pixels_r8.size()}),
+        1U,
+        "game overlay font atlas");
+    game_ui_sdf_enabled_ = atlas.sdf;
+
+    if (game_ui_set_ != VK_NULL_HANDLE) {
+        const VkDescriptorImageInfo image_info{
+            .sampler = game_ui_atlas_.sampler(),
+            .imageView = game_ui_atlas_.view(),
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        const VkWriteDescriptorSet write{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = game_ui_set_,
+            .dstBinding = 0U,
+            .descriptorCount = 1U,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &image_info,
+        };
+        vkUpdateDescriptorSets(context_->device(), 1U, &write, 0U, nullptr);
+    }
+}
+
+void Renderer::create_game_ui_resources() {
+    if (context_ == nullptr || game_ui_atlas_) {
+        return;
+    }
+    const GameUiFontAtlas& default_atlas = default_game_ui_font_atlas();
+    game_ui_sdf_enabled_ = default_atlas.sdf;
+    game_ui_atlas_.create_sampled(
+        *context_,
+        default_atlas.width,
+        default_atlas.height,
+        VK_FORMAT_R8_UNORM,
+        default_atlas.sdf ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        "game overlay font atlas");
+    upload_to_device_texture(
+        game_ui_atlas_,
+        std::as_bytes(std::span{default_atlas.pixels_r8.data(), default_atlas.pixels_r8.size()}),
         1U,
         "game overlay font atlas");
 
@@ -12284,7 +12330,7 @@ void Renderer::create_game_ui_resources() {
     vkUpdateDescriptorSets(context_->device(), 1U, &write, 0U, nullptr);
 
     const VkPushConstantRange push_range{
-        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
         .offset = 0U,
         .size = 16U,
     };

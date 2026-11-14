@@ -8,6 +8,7 @@
 #include "project_system.hpp"
 #include "renderer_gameplay_bridge.hpp"
 #include "runtime_assets.hpp"
+#include "scene_component_json.hpp"
 #include "scene_io.hpp"
 #include "vulkan_common.hpp"
 #include "window_icon_sdl.hpp"
@@ -273,6 +274,11 @@ using Json = nlohmann::json;
         };
     } else {
         result["gameplay"] = nullptr;
+    }
+    if (const auto um = scene.ui_marker(id)) {
+        result["ui_marker"] = component_json::ui_marker_to_json(um->get());
+    } else {
+        result["ui_marker"] = nullptr;
     }
     if (renderer != nullptr &&
         value.kind == SceneNodeKind::model &&
@@ -986,6 +992,138 @@ void EditorApplication::main_loop() {
     }
 }
 
+void EditorApplication::bind_game_ui_callbacks() noexcept {
+    const GameUiHostCallbacks callbacks{
+        .user_data = this,
+        .query_host_state = [](void* const ud, GameUiHostState& out_state) noexcept {
+            auto* const self = static_cast<EditorApplication*>(ud);
+            out_state.set_present_mode_label(
+                Swapchain::present_mode_name(self->renderer_.swapchain().present_mode()));
+            out_state.fullscreen = false;
+            out_state.set_anti_aliasing_label(
+                to_string(self->renderer_.anti_aliasing()));
+            out_state.dynamic_shadows = self->renderer_.lighting_settings().dynamic;
+            out_state.shadow_resolution = self->renderer_.shadow_resolution();
+            bool any_sky = false;
+            try {
+                self->scene_.build_hierarchy_rows(
+                    self->ui_sky_rows_scratch_, {}, SceneHierarchyScope::all);
+                for (const SceneHierarchyRow& row : self->ui_sky_rows_scratch_) {
+                    if (const auto node = self->scene_.node(row.id)) {
+                        if (node->get().kind == SceneNodeKind::environment &&
+                            node->get().visible) {
+                            any_sky = true;
+                            break;
+                        }
+                    }
+                }
+            } catch (...) {
+                any_sky = true;
+            }
+            out_state.sky_enabled = any_sky;
+            out_state.exposure_ev = self->renderer_.exposure_settings().compensation_ev;
+            out_state.bloom_enabled = self->ui_bloom_enabled_;
+        },
+        .cycle_present_mode = [](void* const ud, const int delta) noexcept {
+            auto* const self = static_cast<EditorApplication*>(ud);
+            const VkPresentModeKHR cur = self->renderer_.swapchain().present_mode();
+            int idx = cur == VK_PRESENT_MODE_IMMEDIATE_KHR ? 0
+                    : (cur == VK_PRESENT_MODE_MAILBOX_KHR ? 1 : 2);
+            idx = (idx + (delta >= 0 ? 1 : 2)) % 3;
+            constexpr std::array<PresentPreference, 3U> kPrefs{
+                PresentPreference::immediate,
+                PresentPreference::mailbox,
+                PresentPreference::fifo,
+            };
+            self->renderer_.set_present_mode(kPrefs[static_cast<std::size_t>(idx)]);
+            self->renderer_.reset_metrics();
+        },
+        .set_fullscreen = [](void* const /*ud*/, const bool /*enabled*/) noexcept {},
+        .cycle_anti_aliasing = [](void* const ud, const int /*delta*/) noexcept {
+            auto* const self = static_cast<EditorApplication*>(ud);
+            self->renderer_.cycle_anti_aliasing();
+            self->renderer_.reset_metrics();
+        },
+        .set_dynamic_shadows = [](void* const ud, const bool enabled) noexcept {
+            auto* const self = static_cast<EditorApplication*>(ud);
+            LightingSettings lighting = self->renderer_.lighting_settings();
+            lighting.dynamic = enabled;
+            if (self->renderer_.set_lighting_settings(lighting)) {
+                self->renderer_.reset_metrics();
+            }
+        },
+        .cycle_shadow_resolution = [](void* const ud, const int delta) noexcept {
+            auto* const self = static_cast<EditorApplication*>(ud);
+            LightingSettings lighting = self->renderer_.lighting_settings();
+            std::size_t current_idx = 0U;
+            for (std::size_t i = 0U; i < shadow_resolutions.size(); ++i) {
+                if (shadow_resolutions[i] == lighting.shadow_resolution) {
+                    current_idx = i;
+                    break;
+                }
+            }
+            for (std::size_t probe = 1U; probe <= shadow_resolutions.size(); ++probe) {
+                const std::size_t candidate_idx = delta >= 0
+                    ? (current_idx + probe) % shadow_resolutions.size()
+                    : (current_idx + shadow_resolutions.size() - (probe % shadow_resolutions.size())) %
+                          shadow_resolutions.size();
+                const std::uint32_t candidate = shadow_resolutions[candidate_idx];
+                if (self->renderer_.supports_shadow_resolution(candidate)) {
+                    lighting.shadow_resolution = candidate;
+                    static_cast<void>(self->renderer_.set_lighting_settings(lighting));
+                    self->renderer_.reset_metrics();
+                    break;
+                }
+            }
+        },
+        .set_sky_enabled = [](void* const ud, const bool enabled) noexcept {
+            auto* const self = static_cast<EditorApplication*>(ud);
+            try {
+                bool modified = false;
+                self->scene_.build_hierarchy_rows(
+                    self->ui_sky_rows_scratch_, {}, SceneHierarchyScope::all);
+                for (const SceneHierarchyRow& row : self->ui_sky_rows_scratch_) {
+                    if (auto node = self->scene_.node(row.id)) {
+                        if (node->get().kind == SceneNodeKind::environment &&
+                            node->get().visible != enabled) {
+                            node->get().visible = enabled;
+                            modified = true;
+                        }
+                    }
+                }
+                if (modified) {
+                    self->scene_.mark_content_changed();
+                    self->update_scene_snapshot();
+                }
+            } catch (...) {
+            }
+        },
+        .adjust_exposure_ev = [](void* const ud, const float delta_ev) noexcept {
+            auto* const self = static_cast<EditorApplication*>(ud);
+            ExposureSettings exp = self->renderer_.exposure_settings();
+            exp.compensation_ev = std::clamp(exp.compensation_ev + delta_ev, -6.0F, 6.0F);
+            static_cast<void>(self->renderer_.set_exposure_settings(exp));
+        },
+        .set_bloom_enabled = [](void* const ud, const bool enabled) noexcept {
+            auto* const self = static_cast<EditorApplication*>(ud);
+            self->ui_bloom_enabled_ = enabled;
+        },
+        .on_new_game = [](void* const ud) noexcept {
+            auto* const self = static_cast<EditorApplication*>(ud);
+            self->pending_gameplay_restart_ = true;
+        },
+        .on_restart_game = [](void* const ud) noexcept {
+            auto* const self = static_cast<EditorApplication*>(ud);
+            self->pending_gameplay_restart_ = true;
+        },
+        .on_quit_requested = [](void* const ud) noexcept {
+            auto* const self = static_cast<EditorApplication*>(ud);
+            self->pending_gameplay_stop_to_edit_ = true;
+        },
+    };
+    gameplay_.game_ui().set_host_callbacks(callbacks);
+}
+
 void EditorApplication::synchronize_gameplay_state() {
     const EditorPlayState requested_state = ui_.play_state();
     if (requested_state == observed_play_state_) {
@@ -1011,6 +1149,7 @@ void EditorApplication::synchronize_gameplay_state() {
         loaded_game_module_.unload(&gameplay_);
         loaded_module_project_root_.clear();
         loaded_module_asset_root_.clear();
+        gameplay_.set_content_asset_root(ui_.asset_root());
         std::string error;
         const std::filesystem::path project_dir = ui_.asset_root().parent_path();
         if (!project_dir.empty() &&
@@ -1042,6 +1181,7 @@ void EditorApplication::synchronize_gameplay_state() {
                 }
             }
         }
+        bind_game_ui_callbacks();
         if (!gameplay_.start(
                 scene_,
                 initial_view,
@@ -1066,6 +1206,8 @@ void EditorApplication::synchronize_gameplay_state() {
             nullptr, &gameplay_renderer_bridge_.transform_sink);
         renderer_.snap_runtime_transforms();
     } else if (requested_state == EditorPlayState::edit) {
+        pending_gameplay_restart_ = false;
+        pending_gameplay_stop_to_edit_ = false;
         gameplay_.stop(
             audio_engine_.initialized() ? &audio_engine_ : nullptr,
             gameplay_renderer_bridge_.context != nullptr
@@ -1082,6 +1224,21 @@ void EditorApplication::synchronize_gameplay_state() {
 
 void EditorApplication::update_gameplay(
     const float delta_seconds) {
+    if (pending_gameplay_restart_) {
+        pending_gameplay_restart_ = false;
+        GameUiConfig cfg = gameplay_.game_ui().config();
+        cfg.start_in_main_menu = false;
+        const std::string saved_locale(gameplay_.localization().locale());
+        ui_.stop_play(scene_);
+        synchronize_gameplay_state();
+        gameplay_.configure_game_ui(cfg);
+        ui_.start_play(scene_);
+        synchronize_gameplay_state();
+        if (!saved_locale.empty()) {
+            static_cast<void>(gameplay_.localization().set_locale(saved_locale));
+        }
+        return;
+    }
     const GameplayFrameInput frame_input = ui_.gameplay_input(delta_seconds);
     if (ui_.play_state() != EditorPlayState::playing) {
         observed_play_state_ = ui_.play_state();
@@ -1101,6 +1258,13 @@ void EditorApplication::update_gameplay(
             audio_engine_.initialized() ? &audio_engine_ : nullptr,
             &input_actions_)) {
         fatal("Gameplay runtime lost its player scene node.");
+    }
+    renderer_.set_lighting_paused(
+        gameplay_.game_ui().blocks_gameplay_simulation());
+    if (pending_gameplay_stop_to_edit_) {
+        pending_gameplay_stop_to_edit_ = false;
+        ui_.stop_play(scene_);
+        synchronize_gameplay_state();
     }
 }
 
@@ -2111,6 +2275,164 @@ void EditorApplication::execute_mcp_command(
                 {"path", resolved_rel},
                 {"entity_count", gameplay_.gameplay_world().entity_count()},
                 {"player_health", gameplay_.gameplay_world().player_health()},
+            });
+        return;
+    }
+    case McpCommandType::editor_set_ui_marker: {
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!valid_ui_marker_component(command.ui_marker)) {
+            fail("ui_marker component values are outside engine bounds");
+            return;
+        }
+        if (const auto existing = scene_.ui_marker(command.node_id);
+            existing && existing->get() == command.ui_marker) {
+            succeed(
+                "ui_marker component already matches",
+                Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        if (!scene_.set_ui_marker(command.node_id, command.ui_marker)) {
+            fail("unable to attach ui_marker component");
+            return;
+        }
+        succeed(
+            "ui_marker component updated",
+            Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                 {"changed", true}});
+        return;
+    }
+    case McpCommandType::editor_remove_ui_marker:
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!scene_.has_ui_marker(command.node_id)) {
+            succeed(
+                "node has no ui_marker component",
+                Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        static_cast<void>(scene_.remove_ui_marker(command.node_id));
+        succeed(
+            "ui_marker component removed",
+            Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                 {"changed", true}});
+        return;
+    case McpCommandType::editor_configure_ui: {
+        const McpUiConfigPayload& p = command.ui_config;
+        GameUiConfig cfg = gameplay_.game_ui().config();
+        if ((p.mask & McpUiConfigPayload::flag_start_in_main_menu) != 0U) {
+            cfg.start_in_main_menu = p.start_in_main_menu;
+        }
+        if ((p.mask & McpUiConfigPayload::flag_auto_pause_enabled) != 0U) {
+            cfg.auto_pause_enabled = p.auto_pause_enabled;
+        }
+        if ((p.mask & McpUiConfigPayload::flag_show_default_hud) != 0U) {
+            cfg.show_default_hud = p.show_default_hud;
+        }
+        if ((p.mask & McpUiConfigPayload::flag_show_crosshair) != 0U) {
+            cfg.show_crosshair = p.show_crosshair;
+        }
+        if ((p.mask & McpUiConfigPayload::flag_show_fps) != 0U) {
+            cfg.show_fps = p.show_fps;
+        }
+        if ((p.mask & McpUiConfigPayload::flag_show_subtitles) != 0U) {
+            cfg.show_subtitles = p.show_subtitles;
+        }
+        if ((p.mask & McpUiConfigPayload::flag_show_world_markers) != 0U) {
+            cfg.show_world_markers = p.show_world_markers;
+        }
+        if ((p.mask & McpUiConfigPayload::flag_auto_trigger_marker_dialogue) != 0U) {
+            cfg.auto_trigger_marker_dialogue = p.auto_trigger_marker_dialogue;
+        }
+        if ((p.mask & McpUiConfigPayload::flag_scale_mode) != 0U) {
+            cfg.scale_config.mode = static_cast<UiScaleMode>(p.scale_mode);
+        }
+        if ((p.mask & McpUiConfigPayload::flag_user_scale) != 0U) {
+            cfg.scale_config.user_scale = p.user_scale;
+        }
+        if ((p.mask & McpUiConfigPayload::flag_safe_area_fraction) != 0U) {
+            cfg.scale_config.safe_area_fraction = p.safe_area_fraction;
+        }
+        gameplay_.configure_game_ui(cfg);
+
+        if ((p.mask & McpUiConfigPayload::flag_reload_assets) != 0U && p.reload_assets) {
+            const std::string saved_locale(gameplay_.localization().locale());
+            gameplay_.localization().reset_to_builtins();
+            const std::filesystem::path loc_dir = ui_.asset_root() / "localization";
+            if (!ui_.asset_root().empty() && std::filesystem::exists(loc_dir)) {
+                static_cast<void>(gameplay_.localization().load_directory(loc_dir, nullptr));
+            }
+            if (!saved_locale.empty()) {
+                static_cast<void>(gameplay_.localization().set_locale(saved_locale));
+            }
+            gameplay_.game_ui().clear_dialogues();
+            const std::filesystem::path dlg_dir = ui_.asset_root() / "dialogues";
+            if (!ui_.asset_root().empty() && std::filesystem::exists(dlg_dir)) {
+                static_cast<void>(gameplay_.game_ui().load_dialogue_directory(dlg_dir, nullptr));
+            }
+        }
+        if ((p.mask & McpUiConfigPayload::flag_locale) != 0U) {
+            if (!gameplay_.localization().set_locale(p.locale.data())) {
+                fail(std::string("unknown locale: ") + p.locale.data());
+                return;
+            }
+        }
+        if ((p.mask & McpUiConfigPayload::flag_screen) != 0U) {
+            gameplay_.game_ui().open_screen(static_cast<GameUiScreen>(p.screen));
+        }
+        if ((p.mask & McpUiConfigPayload::flag_subtitle) != 0U) {
+            gameplay_.game_ui().push_subtitle(
+                p.speaker.data(), command.text.data(), p.duration_seconds);
+        }
+        if ((p.mask & McpUiConfigPayload::flag_toast) != 0U) {
+            gameplay_.game_ui().show_toast(command.secondary_text.data(), p.duration_seconds);
+        }
+        if ((p.mask & McpUiConfigPayload::flag_dialogue) != 0U) {
+            if (!gameplay_.game_ui().start_dialogue(p.dialogue_id.data())) {
+                fail(std::string("dialogue_id not found: ") + p.dialogue_id.data());
+                return;
+            }
+        }
+        std::size_t active_entry_count = 0U;
+        for (const auto& info : gameplay_.localization().available_locales()) {
+            if (info.locale == gameplay_.localization().locale()) {
+                active_entry_count = info.entry_count;
+                break;
+            }
+        }
+        const GameUiConfig& final_cfg = gameplay_.game_ui().config();
+        succeed(
+            "ui configuration applied",
+            Json{
+                {"locale", std::string(gameplay_.localization().locale())},
+                {"locale_entries", active_entry_count},
+                {"screen", static_cast<std::uint32_t>(gameplay_.game_ui().screen())},
+                {"active_subtitles", gameplay_.game_ui().active_subtitle_count()},
+                {"start_in_main_menu", final_cfg.start_in_main_menu},
+                {"auto_pause_enabled", final_cfg.auto_pause_enabled},
+                {"show_default_hud", final_cfg.show_default_hud},
+                {"show_crosshair", final_cfg.show_crosshair},
+                {"show_fps", final_cfg.show_fps},
+                {"show_subtitles", final_cfg.show_subtitles},
+                {"show_world_markers", final_cfg.show_world_markers},
+                {"user_scale", final_cfg.scale_config.user_scale},
+                {"safe_area_fraction", final_cfg.scale_config.safe_area_fraction},
             });
         return;
     }

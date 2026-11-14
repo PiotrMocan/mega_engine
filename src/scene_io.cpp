@@ -944,7 +944,8 @@ bool save_scene_file(
         }
         if (record.collider || record.rigid_body || record.prefab_instance ||
             record.audio_source || record.audio_listener ||
-            record.reverb_zone || record.animator || record.gameplay) {
+            record.reverb_zone || record.animator || record.gameplay ||
+            record.ui_marker) {
             Json components = Json::object();
             if (record.collider) {
                 components["collider"] = collider_json(*record.collider);
@@ -975,6 +976,10 @@ bool save_scene_file(
             if (record.gameplay) {
                 components["gameplay"] =
                     component_json::gameplay_to_json(*record.gameplay);
+            }
+            if (record.ui_marker) {
+                components["ui_marker"] =
+                    component_json::ui_marker_to_json(*record.ui_marker);
             }
             encoded["components"] = std::move(components);
         }
@@ -1365,6 +1370,7 @@ bool load_scene_file(
             std::optional<AudioReverbZoneComponent> parsed_reverb_zone{};
             std::optional<AnimatorComponent> parsed_animator{};
             std::optional<GameplayComponent> parsed_gameplay{};
+            std::optional<UiMarkerComponent> parsed_ui_marker{};
             if (encoded.contains("components")) {
                 const Json& components = encoded["components"];
                 if (!components.is_object()) {
@@ -1379,7 +1385,8 @@ bool load_scene_file(
                         component_key != "audio_listener" &&
                         component_key != "reverb_zone" &&
                         component_key != "animator" &&
-                        component_key != "gameplay") {
+                        component_key != "gameplay" &&
+                        component_key != "ui_marker") {
                         error = "Scene node contains an unknown component.";
                         return false;
                     }
@@ -1458,6 +1465,15 @@ bool load_scene_file(
                     }
                     parsed_gameplay = gp_value;
                 }
+                if (components.contains("ui_marker")) {
+                    UiMarkerComponent marker_value{};
+                    if (!component_json::parse_ui_marker_json(
+                            components["ui_marker"], marker_value)) {
+                        error = "Scene node ui_marker component is invalid.";
+                        return false;
+                    }
+                    parsed_ui_marker = marker_value;
+                }
             }
             const SceneNodeId id = parsed_uuid
                 ? loaded.create_node_with_uuid(name, *kind, *parsed_uuid, parent_id)
@@ -1504,6 +1520,11 @@ bool load_scene_file(
             if (parsed_gameplay &&
                 !loaded.set_gameplay(id, *parsed_gameplay)) {
                 error = "Unable to attach scene gameplay component.";
+                return false;
+            }
+            if (parsed_ui_marker &&
+                !loaded.set_ui_marker(id, *parsed_ui_marker)) {
+                error = "Unable to attach scene ui_marker component.";
                 return false;
             }
             auto node = loaded.node(id);

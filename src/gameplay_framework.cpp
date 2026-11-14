@@ -536,6 +536,27 @@ void behavior_door_fixed_update(GameplayBehaviorContext& ctx) {
     e.transform_dirty = true;
 }
 
+void behavior_dialogue_interact(GameplayBehaviorContext& ctx) {
+    GameplayEntityState& e = ctx.entity;
+    e.toggled = !e.toggled;
+    ctx.world.play_entity_cue(e, ctx.audio_engine);
+
+    const float prev_count = ctx.world.get_variable("dialogue.interactions");
+    ctx.world.set_variable("dialogue.interactions", prev_count + 1.0F);
+    ctx.world.set_variable("dialogue.requested", 1.0F);
+    ctx.world.set_variable(
+        "dialogue.last_node_index", static_cast<float>(e.node_id.index));
+
+    std::array<char, 160U> msg{};
+    std::snprintf(
+        msg.data(),
+        msg.size(),
+        "dialogue interact node#%u tag=%s",
+        e.node_id.index,
+        e.tag.empty() ? "-" : e.tag.c_str());
+    ctx.world.push_event_log(msg.data());
+}
+
 void behavior_trigger_zone_enter(GameplayBehaviorContext& ctx) {
     GameplayEntityState& e = ctx.entity;
     e.toggled = true;
@@ -1587,6 +1608,11 @@ void GameplayBehaviorRegistry::register_default_behaviors() {
     register_behavior(
         "destructible",
         GameplayBehaviorCallbacks{});
+    register_behavior(
+        "dialogue",
+        GameplayBehaviorCallbacks{
+            .on_interact = &behavior_dialogue_interact,
+        });
 }
 
 bool GameplayBehaviorRegistry::register_behavior(
