@@ -22,7 +22,10 @@ inline constexpr std::size_t model_lod_count = 4U;
 inline constexpr std::uint32_t material_coverage_alpha_mask_bit = 1U;
 inline constexpr std::uint32_t material_coverage_two_sided_bit = 2U;
 inline constexpr std::uint32_t material_coverage_packed_ao_bit = 4U;
-inline constexpr std::uint32_t material_coverage_glass_bit = 8U;
+inline constexpr std::uint32_t material_coverage_alpha_blend_bit = 8U;
+inline constexpr std::uint32_t material_coverage_glass_bit = 16U;
+inline constexpr std::uint32_t material_coverage_transparent_mask =
+    material_coverage_alpha_blend_bit | material_coverage_glass_bit;
 
 struct CookedModelVertex {
     std::array<float, 3U> position{};

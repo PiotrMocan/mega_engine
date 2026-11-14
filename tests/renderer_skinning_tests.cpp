@@ -787,6 +787,243 @@ void run() {
                 "editor Stop restores authored transform T0");
     }
 
+    // G. Forward transparent dielectric glass blending (no Bayer screen-door checkerboard).
+    {
+        const auto write_quad_model = [&](const std::string_view model_name,
+                                          const std::string_view material_name,
+                                          const float half_extent,
+                                          const std::array<float, 4U>& base_color,
+                                          const float roughness,
+                                          const std::string_view alpha_mode,
+                                          const bool is_glass,
+                                          const bool double_sided) {
+            const std::filesystem::path dir = temp_assets.path() / model_name;
+            std::filesystem::create_directories(dir / "mesh");
+            std::filesystem::create_directories(dir / "materials");
+
+            std::vector<TestVertex> vertices;
+            std::vector<std::uint32_t> indices;
+            std::vector<vcr::CookedSkinVertex> unused_skin;
+            add_quad_patch(vertices, indices, unused_skin, half_extent, 0.0F, 0U);
+            const std::array<TestSubmesh, 1U> submeshes{{
+                TestSubmesh{
+                    .first_index = 0U,
+                    .index_count = indices.size(),
+                    .material_index = 0U,
+                },
+            }};
+            require(
+                write_bytes(dir / "mesh" / "quad.vcrmesh", make_mesh_bytes(vertices, indices, submeshes)),
+                "write static quad vcrmesh");
+
+            const Json material{
+                {"schema", "vcr.asset"},
+                {"version", 1U},
+                {"kind", "material"},
+                {"name", material_name},
+                {"alpha_mode", alpha_mode},
+                {"glass", is_glass},
+                {"double_sided", double_sided},
+                {"pbr",
+                 {
+                     {"base_color", {base_color[0], base_color[1], base_color[2], base_color[3]}},
+                     {"metallic", 0.0F},
+                     {"roughness", roughness},
+                     {"ambient_occlusion", 1.0F},
+                 }},
+                {"textures", Json::object()},
+            };
+            require(
+                write_json(dir / "materials" / "0_surface.vcrmaterial.json", material),
+                "write static quad material");
+
+            const Json metadata{
+                {"schema", "vcr.asset"},
+                {"version", 1U},
+                {"kind", "model"},
+                {"name", model_name},
+                {"mesh", "mesh/quad.vcrmesh"},
+                {"generate_lods", false},
+                {"geometry",
+                 {
+                     {"vertex_count", vertices.size()},
+                     {"index_count", indices.size()},
+                     {"index_type", "uint32"},
+                     {"primitive", "triangles"},
+                     {"vertex_stride", vcr::cooked_mesh_vertex_stride},
+                 }},
+                {"materials", {"materials/0_surface.vcrmaterial.json"}},
+                {"submeshes",
+                 {
+                     {
+                         {"name", "quad_submesh"},
+                         {"first_index", 0U},
+                         {"index_count", indices.size()},
+                         {"material_index", 0U},
+                         {"material", "materials/0_surface.vcrmaterial.json"},
+                     },
+                 }},
+            };
+            require(
+                write_json(dir / (std::string(model_name) + ".vcrasset.json"), metadata),
+                "write static quad vcrasset.json");
+        };
+
+        write_quad_model(
+            "opaque_bg",
+            "OpaqueRed",
+            2.0F,
+            {1.0F, 0.05F, 0.03F, 1.0F},
+            0.8F,
+            "opaque",
+            false,
+            true);
+        write_quad_model(
+            "blue_glass",
+            "BlueGlass",
+            2.5F,
+            {0.08F, 0.55F, 0.95F, 0.35F},
+            0.06F,
+            "blend",
+            true,
+            true);
+
+        const auto build_glass_scene = [&](const bool include_glass) {
+            vcr::SceneDocument glass_doc;
+            static_cast<void>(glass_doc.create_node("Sky", vcr::SceneNodeKind::environment));
+            static_cast<void>(glass_doc.create_node("Sun", vcr::SceneNodeKind::directional_light));
+            const vcr::SceneNodeId light_id =
+                glass_doc.create_node("KeyLight", vcr::SceneNodeKind::point_light);
+            if (auto node = glass_doc.node(light_id)) {
+                node->get().transform.translation = glm::vec3(0.0F, 0.0F, -1.5F);
+                node->get().light = vcr::PunctualLight{
+                    .color = glm::vec3(1.0F, 1.0F, 1.0F),
+                    .intensity_candela = 900.0F,
+                    .range = 30.0F,
+                };
+            }
+            const vcr::SceneNodeId bg_id =
+                glass_doc.create_node("BgQuad", vcr::SceneNodeKind::model);
+            if (auto node = glass_doc.node(bg_id)) {
+                node->get().asset_path = "opaque_bg/opaque_bg.vcrasset.json";
+                node->get().transform.translation = glm::vec3(0.0F, 0.0F, -5.5F);
+            }
+            if (include_glass) {
+                const vcr::SceneNodeId glass_id =
+                    glass_doc.create_node("GlassQuad", vcr::SceneNodeKind::model);
+                if (auto node = glass_doc.node(glass_id)) {
+                    node->get().asset_path = "blue_glass/blue_glass.vcrasset.json";
+                    node->get().transform.translation = glm::vec3(0.0F, 0.0F, -4.0F);
+                }
+            }
+            return glass_doc;
+        };
+
+        struct PatchMetrics final {
+            double mean_r = 0.0;
+            double mean_g = 0.0;
+            double mean_b = 0.0;
+            double mean_neighbor_diff = 0.0;
+        };
+        const auto measure_center_patch = [](const vcr::ScreenshotCapture& shot) {
+            const std::uint32_t cx = shot.width / 2U;
+            const std::uint32_t cy = shot.height / 2U;
+            const std::uint32_t x0 = cx > 8U ? cx - 8U : 0U;
+            const std::uint32_t y0 = cy > 8U ? cy - 8U : 0U;
+            const std::uint32_t x1 = std::min(shot.width, x0 + 16U);
+            const std::uint32_t y1 = std::min(shot.height, y0 + 16U);
+            std::uint64_t sum_r = 0U;
+            std::uint64_t sum_g = 0U;
+            std::uint64_t sum_b = 0U;
+            std::uint64_t sample_count = 0U;
+            std::uint64_t diff_sum = 0U;
+            std::uint64_t diff_pairs = 0U;
+            const auto pixel_idx = [&](const std::uint32_t x, const std::uint32_t y) {
+                return (static_cast<std::size_t>(y) * shot.width + x) * 4U;
+            };
+            const auto abs_u8 = [](const std::uint8_t a, const std::uint8_t b) noexcept {
+                return static_cast<std::uint64_t>(a > b ? (a - b) : (b - a));
+            };
+            for (std::uint32_t y = y0; y < y1; ++y) {
+                for (std::uint32_t x = x0; x < x1; ++x) {
+                    const std::size_t idx = pixel_idx(x, y);
+                    sum_r += shot.rgba[idx + 0U];
+                    sum_g += shot.rgba[idx + 1U];
+                    sum_b += shot.rgba[idx + 2U];
+                    ++sample_count;
+                    if (x + 1U < x1) {
+                        const std::size_t right = pixel_idx(x + 1U, y);
+                        diff_sum += abs_u8(shot.rgba[idx + 0U], shot.rgba[right + 0U]);
+                        diff_sum += abs_u8(shot.rgba[idx + 1U], shot.rgba[right + 1U]);
+                        diff_sum += abs_u8(shot.rgba[idx + 2U], shot.rgba[right + 2U]);
+                        diff_pairs += 3U;
+                    }
+                    if (y + 1U < y1) {
+                        const std::size_t down = pixel_idx(x, y + 1U);
+                        diff_sum += abs_u8(shot.rgba[idx + 0U], shot.rgba[down + 0U]);
+                        diff_sum += abs_u8(shot.rgba[idx + 1U], shot.rgba[down + 1U]);
+                        diff_sum += abs_u8(shot.rgba[idx + 2U], shot.rgba[down + 2U]);
+                        diff_pairs += 3U;
+                    }
+                }
+            }
+            require(sample_count > 0U && diff_pairs > 0U, "center patch is non-empty");
+            return PatchMetrics{
+                .mean_r = static_cast<double>(sum_r) / static_cast<double>(sample_count),
+                .mean_g = static_cast<double>(sum_g) / static_cast<double>(sample_count),
+                .mean_b = static_cast<double>(sum_b) / static_cast<double>(sample_count),
+                .mean_neighbor_diff =
+                    static_cast<double>(diff_sum) / static_cast<double>(diff_pairs),
+            };
+        };
+
+        for (const vcr::VisibilitySettings::Backend backend : backends) {
+            const bool is_gpu = backend == vcr::VisibilitySettings::Backend::gpu;
+            renderer.invalidate_editor_scene();
+            vcr::VisibilitySettings vis{};
+            vis.frustum = true;
+            vis.occlusion = is_gpu;
+            vis.lod = true;
+            vis.dynamic_shadows = true;
+            vis.backend = backend;
+            vis.coarse_front_to_back = true;
+            renderer.set_visibility_settings(vis);
+
+            std::vector<vcr::SceneGpuInstance> cubes_bg;
+            std::vector<vcr::SceneModelInstance> models_bg;
+            std::vector<vcr::ScenePunctualLight> lights_bg;
+            vcr::SceneDocument doc_bg = build_glass_scene(false);
+            const vcr::SceneRenderView view_bg =
+                doc_bg.build_render_view(cubes_bg, models_bg, lights_bg);
+            std::string sync_err;
+            require(renderer.update_editor_scene(view_bg, temp_assets.path(), sync_err),
+                    "sync opaque background scene: " + sync_err);
+            render_frames(3U);
+            const vcr::ScreenshotCapture shot_bg = capture_frame();
+            const PatchMetrics m_bg = measure_center_patch(shot_bg);
+            require(m_bg.mean_r > 80.0 && m_bg.mean_r > m_bg.mean_b + 30.0,
+                    "opaque background quad renders bright red before glass overlay");
+
+            std::vector<vcr::SceneGpuInstance> cubes_glass;
+            std::vector<vcr::SceneModelInstance> models_glass;
+            std::vector<vcr::ScenePunctualLight> lights_glass;
+            vcr::SceneDocument doc_glass = build_glass_scene(true);
+            const vcr::SceneRenderView view_glass =
+                doc_glass.build_render_view(cubes_glass, models_glass, lights_glass);
+            require(renderer.update_editor_scene(view_glass, temp_assets.path(), sync_err),
+                    "sync transparent glass scene: " + sync_err);
+            render_frames(3U);
+            const vcr::ScreenshotCapture shot_glass = capture_frame();
+            const PatchMetrics m_glass = measure_center_patch(shot_glass);
+            require(m_glass.mean_r > 35.0 && m_glass.mean_r < m_bg.mean_r,
+                    "dielectric glass transmits attenuated red background behind it");
+            require(m_glass.mean_b > m_bg.mean_b + 12.0 && m_glass.mean_g > m_bg.mean_g + 8.0,
+                    "dielectric glass contributes cyan-blue tint/reflection over background");
+            require(m_glass.mean_neighbor_diff < 6.0,
+                    "transparent glass blends smoothly without Bayer screen-door checkerboard");
+        }
+    }
+
     std::cout << "vcr_renderer_skinning_tests passed all checks\n";
 }
 

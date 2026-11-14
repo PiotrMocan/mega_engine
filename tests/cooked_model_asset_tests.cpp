@@ -974,6 +974,68 @@ int main() {
         has_error(vcr::load_cooked_model_asset(asset_root, source_quality.metadata_relative),
                   CookedModelLoadErrorCode::invalid_json), "nonboolean source-quality flag is rejected");
 
+    expect(vcr::material_coverage_alpha_mask_bit == 1U &&
+               vcr::material_coverage_two_sided_bit == 2U &&
+               vcr::material_coverage_packed_ao_bit == 4U &&
+               vcr::material_coverage_alpha_blend_bit == 8U &&
+               vcr::material_coverage_glass_bit == 16U &&
+               vcr::material_coverage_transparent_mask == 24U,
+           "material coverage bit constants match shader contract");
+
+    auto blend_fixture = create_fixture(asset_root, "alpha_blend_default");
+    blend_fixture.material["alpha_mode"] = "blend";
+    expect(write_json(blend_fixture.material_absolute, blend_fixture.material),
+           "alpha_blend material written");
+    const auto blend_loaded =
+        vcr::load_cooked_model_asset(asset_root, blend_fixture.metadata_relative);
+    expect(blend_loaded && blend_loaded->materials.size() == 1U &&
+               blend_loaded->materials[0].coverage ==
+                   (vcr::material_coverage_alpha_blend_bit |
+                    vcr::material_coverage_two_sided_bit),
+           "alpha_mode blend defaults to two-sided alpha blend coverage (10)");
+
+    auto glass_fixture = create_fixture(asset_root, "glass_material");
+    glass_fixture.material["glass"] = true;
+    expect(write_json(glass_fixture.material_absolute, glass_fixture.material),
+           "glass material written");
+    const auto glass_loaded =
+        vcr::load_cooked_model_asset(asset_root, glass_fixture.metadata_relative);
+    expect(glass_loaded && glass_loaded->materials.size() == 1U &&
+               glass_loaded->materials[0].coverage ==
+                   (vcr::material_coverage_alpha_blend_bit |
+                    vcr::material_coverage_glass_bit |
+                    vcr::material_coverage_two_sided_bit),
+           "glass flag implies alpha_blend | glass | two_sided coverage (26)");
+
+    auto one_sided_blend = create_fixture(asset_root, "alpha_blend_single_sided");
+    one_sided_blend.material["alpha_mode"] = "blend";
+    one_sided_blend.material["double_sided"] = false;
+    expect(write_json(one_sided_blend.material_absolute, one_sided_blend.material),
+           "single-sided blend material written");
+    const auto one_sided_loaded =
+        vcr::load_cooked_model_asset(asset_root, one_sided_blend.metadata_relative);
+    expect(one_sided_loaded && one_sided_loaded->materials.size() == 1U &&
+               one_sided_loaded->materials[0].coverage ==
+                   vcr::material_coverage_alpha_blend_bit,
+           "explicit double_sided false clears two-sided bit on alpha_mode blend (8)");
+
+    auto bad_alpha_mode = create_fixture(asset_root, "bad_alpha_mode");
+    bad_alpha_mode.material["alpha_mode"] = "dither";
+    expect(write_json(bad_alpha_mode.material_absolute, bad_alpha_mode.material),
+           "invalid alpha_mode material written");
+    expect(has_error(vcr::load_cooked_model_asset(asset_root, bad_alpha_mode.metadata_relative),
+                     CookedModelLoadErrorCode::invalid_material),
+           "unsupported alpha_mode is rejected");
+
+    auto grass_blend = create_fixture(asset_root, "gpu_grass_blend");
+    grass_blend.material["pbr"]["model"] = "gpu_grass";
+    grass_blend.material["alpha_mode"] = "blend";
+    expect(write_json(grass_blend.material_absolute, grass_blend.material),
+           "gpu_grass blend material written");
+    expect(has_error(vcr::load_cooked_model_asset(asset_root, grass_blend.metadata_relative),
+                     CookedModelLoadErrorCode::invalid_material),
+           "gpu_grass rejects transparent blend coverage");
+
     if (failures != 0) {
         std::cerr << failures << " cooked model test(s) failed\n";
         return 1;

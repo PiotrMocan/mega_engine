@@ -439,7 +439,8 @@ public:
     [[nodiscard]] bool apply_editor_material(
         std::string_view material_relative_path,
         PbrMaterial material,
-        MaterialTessellation tessellation) noexcept;
+        MaterialTessellation tessellation,
+        std::optional<std::uint32_t> coverage = std::nullopt) noexcept;
     void invalidate_editor_scene() noexcept;
     [[nodiscard]] bool prepare_editor_viewport(VkExtent2D extent);
     [[nodiscard]] VkImageView editor_viewport_image_view() const noexcept {
@@ -964,6 +965,28 @@ private:
         lod_depth_msaa_tessellated_model_{};
     SpatialPipelines subsurface_spatial_{}, subsurface_temporal_{};
     SpatialPipelines equal_subsurface_spatial_{}, equal_subsurface_temporal_{};
+    struct TransparentModelPipelines {
+        DeviceObject<VkPipeline> models{};
+        DeviceObject<VkPipeline> tessellated_models{};
+
+        void reset() noexcept {
+            models.reset();
+            tessellated_models.reset();
+        }
+    };
+#if VCR_EDITOR_ENABLED
+    struct TransparentDrawOrderEntry {
+        std::uint32_t draw_index = 0U;
+        float distance_sq = 0.0F;
+    };
+    TransparentModelPipelines transparent_direct_{};
+    TransparentModelPipelines transparent_spatial_{};
+    TransparentModelPipelines transparent_temporal_{};
+    TransparentModelPipelines transparent_subsurface_spatial_{};
+    TransparentModelPipelines transparent_subsurface_temporal_{};
+    std::array<TransparentModelPipelines, 2U> transparent_msaa_{};
+    std::vector<TransparentDrawOrderEntry> transparent_draw_order_{};
+#endif
     VkDescriptorSetLayout anti_aliasing_descriptor_set_layout_ =
         VK_NULL_HANDLE;
     VkPipelineLayout post_process_pipeline_layout_ = VK_NULL_HANDLE;

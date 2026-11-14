@@ -1667,21 +1667,41 @@ import_materials(
         static_cast<void>(material_observer->Get(AI_MATKEY_GLTF_ALPHACUTOFF, alpha_cutoff));
         int double_sided = 0;
         static_cast<void>(material_observer->Get(AI_MATKEY_TWOSIDED, double_sided));
-        const Json metadata{
+        float transmission_factor = 0.0F;
+#ifdef AI_MATKEY_TRANSMISSION_FACTOR
+        if (material_observer->Get(
+                AI_MATKEY_TRANSMISSION_FACTOR,
+                transmission_factor) != AI_SUCCESS ||
+            !std::isfinite(transmission_factor)) {
+            transmission_factor = 0.0F;
+        }
+#endif
+        const std::string_view raw_alpha_mode(alpha_mode.C_Str());
+        const bool gltf_transmissive =
+            transmission_factor > 0.01F && raw_alpha_mode != "MASK";
+        const std::string_view resolved_alpha_mode =
+            raw_alpha_mode == "MASK"
+                ? "mask"
+                : ((raw_alpha_mode == "BLEND" || gltf_transmissive) ? "blend" : "opaque");
+        const float resolved_alpha =
+            (gltf_transmissive && pbr.base_color.w >= 0.999F)
+                ? std::clamp(1.0F - transmission_factor, 0.08F, 0.95F)
+                : pbr.base_color.w;
+        Json metadata{
             {"schema", asset_schema},
             {"version", asset_schema_version},
             {"kind", "material"},
             {"name", material_name},
-            {"alpha_mode", std::string_view(alpha_mode.C_Str()) == "MASK" ? "mask" : (std::string_view(alpha_mode.C_Str()) == "BLEND" ? "blend" : "opaque")},
+            {"alpha_mode", resolved_alpha_mode},
             {"alpha_cutoff", std::isfinite(alpha_cutoff) ? std::clamp(alpha_cutoff, 0.0F, 1.0F) : 0.5F},
-            {"double_sided", double_sided != 0 || std::string_view(alpha_mode.C_Str()) == "BLEND"},
+            {"double_sided", double_sided != 0 || resolved_alpha_mode == "blend"},
             {"pbr",
              {
                  {"base_color",
                   {pbr.base_color.x,
                    pbr.base_color.y,
                    pbr.base_color.z,
-                   pbr.base_color.w}},
+                   resolved_alpha}},
                  {"metallic", pbr.metallic},
                  {"roughness", pbr.roughness},
                  {"ambient_occlusion", pbr.ambient_occlusion},
@@ -1692,6 +1712,9 @@ import_materials(
              }},
             {"textures", std::move(texture_references)},
         };
+        if (gltf_transmissive) {
+            metadata["glass"] = true;
+        }
         std::error_code filesystem_error;
         std::filesystem::create_directories(
             (context.staging_directory / material_relative)

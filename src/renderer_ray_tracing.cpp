@@ -856,6 +856,9 @@ void Renderer::prepare_ray_tracing(FrameContext& frame) {
                 continue;
             }
             const auto& submesh = asset.submeshes[draw.submesh_index];
+            if ((submesh.coverage & material_coverage_transparent_mask) != 0U || !submesh.blas) {
+                continue;
+            }
             VkGeometryInstanceFlagsKHR flags =
                 VK_GEOMETRY_INSTANCE_TRIANGLE_FRONT_COUNTERCLOCKWISE_BIT_KHR;
             if ((submesh.coverage & 2U) != 0U) {
@@ -1118,11 +1121,12 @@ void Renderer::build_model_blas_on_upload(EditorModelAsset& asset) {
     VkDeviceSize total_scratch_bytes = 0ULL;
     for (auto& submesh : asset.submeshes) {
         const std::uint32_t triangle_count = submesh.index_count / 3U;
-        if (triangle_count == 0U) {
+        if (triangle_count == 0U ||
+            (submesh.coverage & material_coverage_transparent_mask) != 0U) {
             continue;
         }
         const VkGeometryFlagsKHR geom_flags =
-            (submesh.coverage & (1U | material_coverage_glass_bit)) == 0U ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0U;
+            (submesh.coverage & material_coverage_alpha_mask_bit) == 0U ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0U;
         geometries.push_back(VkAccelerationStructureGeometryKHR{
             .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
             .geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR,

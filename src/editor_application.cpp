@@ -895,7 +895,8 @@ void EditorApplication::main_loop() {
             if (renderer_.apply_editor_material(
                     material_update->relative_path,
                     material_update->material,
-                    material_update->tessellation)) {
+                    material_update->tessellation,
+                    material_update->coverage)) {
                 submitted_scene_revision_ = 0U;
                 renderer_.invalidate_editor_scene();
             }

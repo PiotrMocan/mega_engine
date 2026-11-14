@@ -854,11 +854,11 @@ parse_material(
     if (const auto mode = metadata.find("alpha_mode"); mode != metadata.end()) {
         if (!mode->is_string() || (*mode != "opaque" && *mode != "mask" && *mode != "blend")) {
             return CookedModelLoadError{.code = CookedModelLoadErrorCode::invalid_material,
-                .message = "Material alpha_mode must be opaque or mask.", .path = file.absolute};
+                .message = "Material alpha_mode must be opaque, mask, or blend.", .path = file.absolute};
         }
         coverage = *mode == "mask"
             ? material_coverage_alpha_mask_bit
-            : (*mode == "blend" ? (material_coverage_glass_bit | material_coverage_two_sided_bit) : 0U);
+            : (*mode == "blend" ? (material_coverage_alpha_blend_bit | material_coverage_two_sided_bit) : 0U);
     }
     if (const auto glass = metadata.find("glass"); glass != metadata.end()) {
         if (!glass->is_boolean()) {
@@ -866,7 +866,8 @@ parse_material(
                 .message = "Material glass must be boolean.", .path = file.absolute};
         }
         if (glass->get<bool>()) {
-            coverage |= material_coverage_glass_bit | material_coverage_two_sided_bit;
+            coverage |= material_coverage_alpha_blend_bit | material_coverage_glass_bit |
+                material_coverage_two_sided_bit;
         }
     }
     float alpha_cutoff = 0.5F;
@@ -880,7 +881,11 @@ parse_material(
             return CookedModelLoadError{.code = CookedModelLoadErrorCode::invalid_material,
                 .message = "Material double_sided must be boolean.", .path = file.absolute};
         }
-        if (two_sided->get<bool>()) coverage |= 2U;
+        if (two_sided->get<bool>()) {
+            coverage |= material_coverage_two_sided_bit;
+        } else {
+            coverage &= ~material_coverage_two_sided_bit;
+        }
     }
     if (const auto packed_ao = metadata.find("occlusion_in_metallic_roughness");
         packed_ao != metadata.end()) {
@@ -899,7 +904,7 @@ parse_material(
         }
     }
     if (factors.model == MaterialModel::gpu_grass &&
-        ((coverage & (material_coverage_alpha_mask_bit | material_coverage_glass_bit)) != 0U || has_tessellation)) {
+        ((coverage & (material_coverage_alpha_mask_bit | material_coverage_transparent_mask)) != 0U || has_tessellation)) {
         return CookedModelLoadError{.code = CookedModelLoadErrorCode::invalid_material,
             .message = "GPU grass requires opaque coverage and no tessellation settings.",
             .path = file.absolute};

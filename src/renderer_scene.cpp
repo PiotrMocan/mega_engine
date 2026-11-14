@@ -282,7 +282,24 @@ void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExt
                     ++visible.instance_count;
                 }
             }
-            sort_range(first);
+            if ((visible.coverage & material_coverage_transparent_mask) != 0U) {
+                if (visibility_scratch_.size() - first >= 2U) {
+                    std::sort(
+                        visibility_scratch_.begin() + static_cast<std::ptrdiff_t>(first),
+                        visibility_scratch_.end(),
+                        [this, camera](std::uint32_t left, std::uint32_t right) {
+                            left = lod_visibility_source(left);
+                            right = lod_visibility_source(right);
+                            const glm::vec3 d_left = world_bounds_[left].center - camera;
+                            const glm::vec3 d_right = world_bounds_[right].center - camera;
+                            const float l_sq = glm::dot(d_left, d_left);
+                            const float r_sq = glm::dot(d_right, d_right);
+                            return l_sq != r_sq ? l_sq > r_sq : left < right;
+                        });
+                }
+            } else {
+                sort_range(first);
+            }
             if (visible.instance_count) {
                 visible_model_draws_.push_back(visible);
                 visibility_statistics_.lod_instances[lod] += visible.instance_count;

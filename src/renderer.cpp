@@ -741,7 +741,7 @@ VkPipeline Renderer::model_geometry_pipeline(
         }
         fatal("GPU grass render pass has no prewarmed geometry pipeline.");
     }
-    if ((draw.coverage & (1U | material_coverage_glass_bit)) == 0U &&
+    if ((draw.coverage & (material_coverage_alpha_mask_bit | material_coverage_transparent_mask)) == 0U &&
         (ordinary == model_shadow_pipeline_.get() || lod_fade_actual() == LodFadePattern::off)) {
         for (std::size_t i = 0; i < opaque_pipeline_variant_count_; ++i) {
             if (opaque_pipeline_variants_[i].ordinary == ordinary)
@@ -795,6 +795,7 @@ void Renderer::initialize(VulkanContext &context, SDL_Window *window,
     editor_texture_assets_.reserve(128U);
     game_ui_pending_vertices_.reserve(game_ui_max_vertices);
     editor_model_draws_.reserve(max_scene_nodes);
+    transparent_draw_order_.reserve(max_scene_nodes);
     editor_model_sort_scratch_.reserve(max_scene_nodes);
     scene_metadata_.reserve(maximum_editor_scene_instances);
     scene_packet_.reserve(maximum_editor_scene_instances);
@@ -2517,7 +2518,7 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
             }
         }
         std::uint32_t gi_first = 0, gi_count = 0;
-        if (gi_provisioned_) {
+        if (gi_provisioned_ && (coverage & material_coverage_transparent_mask) == 0U) {
             std::vector<GiTriangle> triangles;
             triangles.reserve(static_cast<std::size_t>(source.index_count / 3));
             for (std::uint64_t i = source.first_index; i < source.first_index + source.index_count;
@@ -2916,17 +2917,22 @@ bool Renderer::update_editor_scene(
                 });
                 scene_metadata_.push_back({model.id, asset.bounds, false});
             }
-            if (asset.is_skinned()) {
+            const bool per_instance_transparent =
+                (submesh.coverage & material_coverage_transparent_mask) != 0U &&
+                editor_model_draws_.size() + instance_count + 2U <= max_shadow_draw_groups;
+            if (asset.is_skinned() || per_instance_transparent) {
                 for (std::size_t local_idx = 0U; local_idx < instance_count; ++local_idx) {
                     const SceneModelInstance& model =
                         view.models[editor_model_sort_scratch_[group_begin + local_idx]];
                     std::int32_t slot_vertex_offset = 0;
                     bool uses_skinned = false;
-                    for (const SkinnedNodeSlot& slot : skinned_node_slots_) {
-                        if (slot.node_id == model.id && slot.asset_index == *asset_index) {
-                            slot_vertex_offset = static_cast<std::int32_t>(slot.vertex_offset);
-                            uses_skinned = true;
-                            break;
+                    if (asset.is_skinned()) {
+                        for (const SkinnedNodeSlot& slot : skinned_node_slots_) {
+                            if (slot.node_id == model.id && slot.asset_index == *asset_index) {
+                                slot_vertex_offset = static_cast<std::int32_t>(slot.vertex_offset);
+                                uses_skinned = true;
+                                break;
+                            }
                         }
                     }
                     editor_model_draws_.push_back(EditorModelDraw{
@@ -2993,7 +2999,7 @@ bool Renderer::update_editor_scene(
             static_cast<std::uint64_t>(draw.index_count / 3U) *
             draw.instance_count;
         total_model_instances_ += draw.instance_count;
-        if ((draw.coverage & (1U | material_coverage_glass_bit)) != 0U) {
+        if ((draw.coverage & material_coverage_alpha_mask_bit) != 0U) {
             alpha_masked_model_instances_ += draw.instance_count;
         }
     }
@@ -3035,7 +3041,8 @@ bool Renderer::update_editor_scene(
 bool Renderer::apply_editor_material(
     const std::string_view material_relative_path,
     PbrMaterial material,
-    const MaterialTessellation tessellation) noexcept {
+    const MaterialTessellation tessellation,
+    const std::optional<std::uint32_t> coverage) noexcept {
     if (!authored_scene_enabled_ ||
         material_relative_path.empty()) {
         return false;
@@ -3048,7 +3055,11 @@ bool Renderer::apply_editor_material(
             if (submesh.material_relative_path == material_relative_path &&
                 ((submesh.material.model == MaterialModel::gpu_grass) !=
                      (material.model == MaterialModel::gpu_grass) ||
-                 (material.model == MaterialModel::gpu_grass && tessellation.enabled_flag != 0U)))
+                 (material.model == MaterialModel::gpu_grass &&
+                  (tessellation.enabled_flag != 0U ||
+                   (coverage.has_value() &&
+                    (*coverage & (material_coverage_alpha_mask_bit |
+                                  material_coverage_transparent_mask)) != 0U)))))
                 return false;
         }
     }
@@ -3084,6 +3095,16 @@ bool Renderer::apply_editor_material(
                         displacement_bound(submesh.tessellation));
                 submesh.material = material;
                 submesh.tessellation = tessellation;
+                if (coverage.has_value() && submesh.coverage != *coverage) {
+                    const bool transparency_changed =
+                        ((submesh.coverage ^ *coverage) &
+                         material_coverage_transparent_mask) != 0U;
+                    submesh.coverage = *coverage;
+                    shadow_dirty_ = true;
+                    if (transparency_changed && rt_provisioned_) {
+                        rt_tlas_build_due_ = true;
+                    }
+                }
                 updated = true;
             }
         }
@@ -5188,7 +5209,9 @@ void Renderer::record_shadow_map(VkCommandBuffer command_buffer, FrameContext &f
                 for (std::size_t draw_index = 0U; draw_index < editor_model_draws_.size();
                      ++draw_index) {
                     const auto &draw = editor_model_draws_[draw_index];
-                    const bool alpha_masked_draw = (draw.coverage & (1U | material_coverage_glass_bit)) != 0U;
+                    if ((draw.coverage & material_coverage_transparent_mask) != 0U) continue;
+                    const bool alpha_masked_draw =
+                        (draw.coverage & material_coverage_alpha_mask_bit) != 0U;
                     if (alpha_masked_draw != (coverage_pass == 1U)) continue;
                     const bool tessellated_draw =
                         model_tessellation_enabled_ &&
@@ -7897,6 +7920,190 @@ void Renderer::create_pipeline() {
                 info, "ocean.frag.spv", index == 0U
                     ? "MSAA 2x ocean pipeline" : "MSAA 4x ocean pipeline");
         }
+
+        const char* const transparent_frag_spv =
+            rt_provisioned_
+                ? "editor_model_transparent_rt.frag.spv"
+                : "editor_model_transparent.frag.spv";
+        const char* const transparent_aa_frag_spv =
+            rt_provisioned_
+                ? "editor_model_aa_transparent_rt.frag.spv"
+                : "editor_model_aa_transparent.frag.spv";
+        const char* const transparent_sss_frag_spv =
+            rt_provisioned_
+                ? "editor_model_transparent_sss_rt.frag.spv"
+                : "editor_model_transparent_sss.frag.spv";
+        const char* const transparent_aa_sss_frag_spv =
+            rt_provisioned_
+                ? "editor_model_aa_transparent_sss_rt.frag.spv"
+                : "editor_model_aa_transparent_sss.frag.spv";
+        std::array<VkVertexInputBindingDescription, 2U> transparent_aa_bindings{};
+        std::array<VkVertexInputAttributeDescription, 5U> transparent_aa_attributes{};
+        const VkPipelineVertexInputStateCreateInfo transparent_aa_vertex_input =
+            build_aa_editor_model_vertex_input(
+                editor_model_vertex_input,
+                transparent_aa_bindings,
+                transparent_aa_attributes);
+        const auto create_transparent =
+            [&](const VkGraphicsPipelineCreateInfo& base_info,
+                const char* const fragment_shader,
+                const char* const debug_name,
+                const bool temporal,
+                const bool subsurface,
+                const bool tessellated_model,
+                const VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT) {
+                const VkShaderModule vertex = cached_shader(
+                    tessellated_model
+                        ? "editor_model_tess.vert.spv"
+                        : (temporal ? "editor_model_aa.vert.spv" : "editor_model.vert.spv"));
+                const VkShaderModule fragment = cached_shader(fragment_shader);
+                std::array<VkPipelineShaderStageCreateInfo, 4U> stages{};
+                stages[0] = VkPipelineShaderStageCreateInfo{
+                    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    .stage = VK_SHADER_STAGE_VERTEX_BIT,
+                    .module = vertex,
+                    .pName = "main",
+                };
+                std::uint32_t stage_count = 1U;
+                if (tessellated_model) {
+                    stages[stage_count++] = VkPipelineShaderStageCreateInfo{
+                        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                        .stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+                        .module = cached_shader("editor_model_tess.tesc.spv"),
+                        .pName = "main",
+                    };
+                    stages[stage_count++] = VkPipelineShaderStageCreateInfo{
+                        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                        .stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
+                        .module = cached_shader(
+                            temporal
+                                ? "editor_model_tess_aa.tese.spv"
+                                : "editor_model_tess.tese.spv"),
+                        .pName = "main",
+                    };
+                }
+                stages[stage_count++] = VkPipelineShaderStageCreateInfo{
+                    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                    .module = fragment,
+                    .pName = "main",
+                    .pSpecializationInfo = &gi_specialization,
+                };
+                VkPipelineDepthStencilStateCreateInfo depth = depth_stencil;
+                depth.depthTestEnable = VK_TRUE;
+                depth.depthWriteEnable = VK_FALSE;
+                depth.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
+
+                VkPipelineMultisampleStateCreateInfo sample_state = multisampling;
+                sample_state.rasterizationSamples = samples;
+                sample_state.sampleShadingEnable = VK_FALSE;
+
+                auto blend = *base_info.pColorBlendState;
+                std::array<VkPipelineColorBlendAttachmentState, 4U> attachments{};
+                assert(blend.attachmentCount <= attachments.size());
+                std::copy_n(blend.pAttachments, blend.attachmentCount, attachments.begin());
+                const std::uint32_t active_color_attachments = subsurface ? 2U : 1U;
+                if (context_->independent_blend_enabled()) {
+                    for (std::uint32_t idx = 0U; idx < blend.attachmentCount; ++idx) {
+                        auto& attachment = attachments[idx];
+                        if (idx < active_color_attachments) {
+                            const bool sss_diffuse = subsurface && idx == 0U;
+                            attachment.blendEnable = VK_TRUE;
+                            attachment.srcColorBlendFactor =
+                                sss_diffuse ? VK_BLEND_FACTOR_ZERO : VK_BLEND_FACTOR_ONE;
+                            attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+                            attachment.colorBlendOp = VK_BLEND_OP_ADD;
+                            attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+                            attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+                            attachment.alphaBlendOp = VK_BLEND_OP_ADD;
+                            attachment.colorWriteMask = sss_diffuse
+                                ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                   VK_COLOR_COMPONENT_B_BIT)
+                                : (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                   VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT);
+                        } else {
+                            attachment.blendEnable = VK_FALSE;
+                            attachment.colorWriteMask = 0U;
+                        }
+                    }
+                } else {
+                    for (std::uint32_t idx = 0U; idx < blend.attachmentCount; ++idx) {
+                        auto& attachment = attachments[idx];
+                        attachment.blendEnable = VK_TRUE;
+                        attachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+                        attachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+                        attachment.colorBlendOp = VK_BLEND_OP_ADD;
+                        attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+                        attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+                        attachment.alphaBlendOp = VK_BLEND_OP_ADD;
+                    }
+                }
+                blend.pAttachments = attachments.data();
+
+                VkGraphicsPipelineCreateInfo info = base_info;
+                info.stageCount = stage_count;
+                info.pStages = stages.data();
+                info.pVertexInputState = (temporal && !tessellated_model)
+                    ? &transparent_aa_vertex_input
+                    : &editor_model_vertex_input;
+                info.pInputAssemblyState =
+                    tessellated_model ? &patch_input_assembly : &input_assembly;
+                info.pTessellationState = tessellated_model ? &tessellation_state : nullptr;
+                info.pRasterizationState = &rasterization;
+                info.pMultisampleState = &sample_state;
+                info.pDepthStencilState = &depth;
+                info.pColorBlendState = &blend;
+                info.pDynamicState = &model_dynamic_state;
+                DeviceObject<VkPipeline> result;
+                VK_CHECK(vkCreateGraphicsPipelines(
+                    context_->device(), pipeline_cache_, 1U, &info, nullptr,
+                    result.put(context_->device(), vkDestroyPipeline)));
+                context_->set_debug_name(
+                    VK_OBJECT_TYPE_PIPELINE, handle_value(result.get()), debug_name);
+                return result;
+            };
+        const auto create_transparent_pair =
+            [&](TransparentModelPipelines& target,
+                const VkGraphicsPipelineCreateInfo& base_info,
+                const char* const fragment_shader,
+                const char* const debug_prefix,
+                const bool temporal,
+                const bool subsurface,
+                const VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT) {
+                const std::string model_name =
+                    std::string(debug_prefix) + " transparent model pipeline";
+                target.models = create_transparent(
+                    base_info, fragment_shader, model_name.c_str(),
+                    temporal, subsurface, false, samples);
+                if (model_tessellation_enabled_) {
+                    const std::string tess_name =
+                        std::string(debug_prefix) + " transparent tessellated model pipeline";
+                    target.tessellated_models = create_transparent(
+                        base_info, fragment_shader, tess_name.c_str(),
+                        temporal, subsurface, true, samples);
+                }
+            };
+        create_transparent_pair(
+            transparent_direct_, sky_pipeline_info, transparent_frag_spv,
+            "Direct", false, false);
+        create_transparent_pair(
+            transparent_spatial_, spatial_sky_info, transparent_frag_spv,
+            "Spatial", false, false);
+        create_transparent_pair(
+            transparent_temporal_, aa_sky_pipeline_info, transparent_aa_frag_spv,
+            "Temporal", true, false);
+        create_transparent_pair(
+            transparent_subsurface_spatial_, sss_spatial_sky_info, transparent_sss_frag_spv,
+            "SSS spatial", false, true);
+        create_transparent_pair(
+            transparent_subsurface_temporal_, sss_temporal_sky_info, transparent_aa_sss_frag_spv,
+            "SSS temporal", true, true);
+        for (std::size_t index = 0U; index < msaa_samples.size(); ++index) {
+            if ((msaa_supported_sample_counts_ & msaa_samples[index]) == 0U) continue;
+            create_transparent_pair(
+                transparent_msaa_[index], spatial_sky_info, transparent_frag_spv,
+                index == 0U ? "MSAA 2x" : "MSAA 4x", false, false, msaa_samples[index]);
+        }
     }
 #endif
 
@@ -8641,6 +8848,14 @@ void Renderer::destroy_pipeline() noexcept {
 #if VCR_EDITOR_ENABLED
     aa_editor_model_pipeline_.reset();
     aa_tessellated_editor_model_pipeline_.reset();
+    transparent_direct_.reset();
+    transparent_spatial_.reset();
+    transparent_temporal_.reset();
+    transparent_subsurface_spatial_.reset();
+    transparent_subsurface_temporal_.reset();
+    for (auto& transparent : transparent_msaa_) {
+        transparent.reset();
+    }
 #endif
     aa_scene_pipeline_.reset();
     aa_terrain_pipeline_.reset();
@@ -9460,10 +9675,12 @@ void Renderer::record_commands(
             const VkPipeline terrain_pipeline,
             const VkPipeline sky_pipeline,
             const VkPipeline ocean_pipeline,
-            const bool depth_only = false) {
+            const bool depth_only = false,
+            const TransparentModelPipelines* const transparent_pipelines = nullptr) {
 #if !VCR_EDITOR_ENABLED
             static_cast<void>(editor_model_pipeline);
             static_cast<void>(tessellated_editor_model_pipeline);
+            static_cast<void>(transparent_pipelines);
 #endif
             set_viewport(extent);
             const VkDescriptorSet descriptor_set =
@@ -9493,6 +9710,171 @@ void Renderer::record_commands(
                 sizeof(push_constants),
                 &push_constants);
             const VkDeviceSize vertex_offset = 0;
+#if VCR_EDITOR_ENABLED
+            struct ModelDrawState {
+                VkPipeline pipeline = VK_NULL_HANDLE;
+                VkDescriptorSet material_set = VK_NULL_HANDLE;
+                std::size_t asset_bind_key = std::numeric_limits<std::size_t>::max();
+                std::size_t tessellation_asset = std::numeric_limits<std::size_t>::max();
+                std::uint32_t tessellation_submesh = std::numeric_limits<std::uint32_t>::max();
+            };
+            const auto record_model_draw =
+                [this, command_buffer, &frame, extent, vertex_offset](
+                    const EditorModelDraw& draw,
+                    const std::size_t draw_index,
+                    const VkPipeline desired_pipeline,
+                    const VkCullModeFlags cull_mode,
+                    const bool tessellated_draw,
+                    const bool interleave_masked_lods,
+                    const std::size_t lod_band,
+                    ModelDrawState& state) {
+                    const EditorModelAsset& asset =
+                        editor_model_assets_[draw.asset_index];
+                    const auto& submesh = asset.submeshes[draw.submesh_index];
+                    if (interleave_masked_lods) {
+                        if (tessellated_draw || draw.uses_skinned_pool) {
+                            if (lod_band > 0U) return;
+                        } else if (submesh.lod_count[lod_band] == 0U) {
+                            return;
+                        }
+                    }
+                    vkCmdSetCullMode(command_buffer, cull_mode);
+                    if (desired_pipeline != state.pipeline) {
+                        vkCmdBindPipeline(
+                            command_buffer,
+                            VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            desired_pipeline);
+                        state.pipeline = desired_pipeline;
+                    }
+                    vkCmdPushConstants(
+                        command_buffer, pipeline_layout_,
+                        VK_SHADER_STAGE_FRAGMENT_BIT, 12U,
+                        sizeof(draw.coverage), &draw.coverage);
+                    if (draw.material_descriptor_set != state.material_set) {
+                        vkCmdBindDescriptorSets(
+                            command_buffer,
+                            VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            pipeline_layout_,
+                            1U,
+                            1U,
+                            &draw.material_descriptor_set,
+                            0U,
+                            nullptr);
+                        state.material_set = draw.material_descriptor_set;
+                    }
+                    if (tessellated_draw &&
+                        (draw.asset_index != state.tessellation_asset ||
+                         draw.submesh_index != state.tessellation_submesh)) {
+                        const MaterialTessellation& settings = draw.tessellation;
+                        const std::array tessellation_push{
+                            settings.displacement_scale,
+                            settings.displacement_center,
+                            static_cast<float>(extent.height) /
+                                (2.0F * std::max(settings.target_edge_pixels, 1.0F)),
+                            settings.maximum_factor,
+                            settings.up_facing_only != 0U ? 1.0F : 0.0F,
+                            settings.normal_threshold,
+                            settings.uv_edge_fade,
+                            static_cast<float>(extent.width) /
+                                static_cast<float>(std::max(extent.height, 1U)),
+                            draw.tessellation_uv_bounds.x,
+                            draw.tessellation_uv_bounds.y,
+                            draw.tessellation_uv_bounds.z,
+                            draw.tessellation_uv_bounds.w,
+                        };
+                        vkCmdPushConstants(
+                            command_buffer, pipeline_layout_,
+                            VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+                                VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
+                            80U, sizeof(tessellation_push),
+                            tessellation_push.data());
+                        state.tessellation_asset = draw.asset_index;
+                        state.tessellation_submesh = draw.submesh_index;
+                    }
+                    const std::size_t draw_bind_key =
+                        (static_cast<std::size_t>(draw.asset_index) << 1U) |
+                        (draw.uses_skinned_pool ? 1U : 0U);
+                    if (draw_bind_key != state.asset_bind_key) {
+                        const VkBuffer curr_vb =
+                            draw.uses_skinned_pool &&
+                                    skinned_vertex_pool_[0].handle() != VK_NULL_HANDLE
+                                ? skinned_vertex_pool_[skinning_pool_parity_].handle()
+                                : asset.vertex_buffer.handle();
+                        const VkBuffer prev_vb =
+                            draw.uses_skinned_pool &&
+                                    skinned_vertex_pool_[0].handle() != VK_NULL_HANDLE
+                                ? skinned_vertex_pool_[1U - skinning_pool_parity_].handle()
+                                : curr_vb;
+                        const std::array<VkBuffer, 2U> model_vertex_buffers{
+                            curr_vb, prev_vb};
+                        const std::array<VkDeviceSize, 2U> model_vertex_offsets{
+                            vertex_offset, vertex_offset};
+                        vkCmdBindVertexBuffers(
+                            command_buffer,
+                            0U,
+                            2U,
+                            model_vertex_buffers.data(),
+                            model_vertex_offsets.data());
+                        vkCmdBindIndexBuffer(
+                            command_buffer,
+                            asset.index_buffer.handle(),
+                            0U,
+                            VK_INDEX_TYPE_UINT32);
+                        state.asset_bind_key = draw_bind_key;
+                    }
+                    if (gpu_visibility_active_) {
+                        const VkDeviceSize group_base =
+                            (draw_index + 2U) * model_lod_count *
+                            sizeof(VkDrawIndexedIndirectCommand);
+                        if (interleave_masked_lods) {
+                            const std::size_t active_lod =
+                                (tessellated_draw || draw.uses_skinned_pool) ? 0U : lod_band;
+                            vkCmdDrawIndexedIndirect(
+                                command_buffer, frame.visibility.indirect.handle(),
+                                group_base + active_lod * sizeof(VkDrawIndexedIndirectCommand),
+                                1U, sizeof(VkDrawIndexedIndirectCommand));
+                        } else if (tessellated_draw || draw.uses_skinned_pool) {
+                            vkCmdDrawIndexedIndirect(
+                                command_buffer, frame.visibility.indirect.handle(),
+                                group_base, 1U, sizeof(VkDrawIndexedIndirectCommand));
+                        } else {
+                            std::uint32_t contiguous_lods = 0U;
+                            bool sparse = false;
+                            for (std::size_t lod = 0U; lod < model_lod_count; ++lod) {
+                                if (submesh.lod_count[lod] > 0U) {
+                                    if (lod == contiguous_lods) {
+                                        ++contiguous_lods;
+                                    } else {
+                                        sparse = true;
+                                    }
+                                }
+                            }
+                            if (context_->multi_draw_indirect() && !sparse &&
+                                contiguous_lods > 0U) {
+                                vkCmdDrawIndexedIndirect(
+                                    command_buffer, frame.visibility.indirect.handle(),
+                                    group_base, contiguous_lods,
+                                    sizeof(VkDrawIndexedIndirectCommand));
+                            } else {
+                                for (std::size_t lod = 0U; lod < model_lod_count; ++lod) {
+                                    if (submesh.lod_count[lod] > 0U) {
+                                        vkCmdDrawIndexedIndirect(
+                                            command_buffer,
+                                            frame.visibility.indirect.handle(),
+                                            group_base +
+                                                lod * sizeof(VkDrawIndexedIndirectCommand),
+                                            1U, sizeof(VkDrawIndexedIndirectCommand));
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        vkCmdDrawIndexed(
+                            command_buffer, draw.index_count, draw.instance_count,
+                            draw.first_index, draw.vertex_offset, draw.first_instance);
+                    }
+                };
+#endif
             const VkBuffer vertex_buffer = vertex_buffer_.handle();
             vkCmdBindVertexBuffers(
                 command_buffer,
@@ -9582,11 +9964,7 @@ void Renderer::record_commands(
                         gpu_visibility_active_ ? editor_model_draws_ : visible_model_draws_;
                     const bool include_models =
                         !depth_only || active_depth_prepass == DepthPrepass::full;
-                    VkPipeline bound_model_pipeline = VK_NULL_HANDLE;
-                    VkDescriptorSet bound_material_set = VK_NULL_HANDLE;
-                    std::size_t bound_asset_index = std::numeric_limits<std::size_t>::max();
-                    std::uint32_t bound_tessellation_submesh = std::numeric_limits<std::uint32_t>::max();
-                    std::size_t bound_tessellation_asset = std::numeric_limits<std::size_t>::max();
+                    ModelDrawState opaque_draw_state{};
                     for (std::uint32_t coverage_pass = 0U; coverage_pass < 2U; ++coverage_pass) {
                         const bool interleave_masked_lods =
                             coverage_pass == 1U && gpu_visibility_active_ &&
@@ -9596,172 +9974,48 @@ void Renderer::record_commands(
                         const std::size_t lod_band_count =
                             interleave_masked_lods ? model_lod_count : 1U;
                         for (std::size_t lod_band = 0U; lod_band < lod_band_count; ++lod_band) {
-                        for (std::size_t draw_index = 0; include_models && draw_index < model_draws.size();
-                             ++draw_index) {
-                            const auto &draw = model_draws[draw_index];
-                            const bool alpha_masked = (draw.coverage & (1U | material_coverage_glass_bit)) != 0U;
-                            if (alpha_masked != (coverage_pass != 0U)) {
-                                continue;
-                            }
-                            const bool tessellated_draw =
-                                model_tessellation_enabled_ &&
-                                draw.tessellation.enabled();
-                            const EditorModelAsset& asset =
-                                editor_model_assets_[draw.asset_index];
-                            const auto &submesh = asset.submeshes[draw.submesh_index];
-                            if (interleave_masked_lods) {
-                                if (tessellated_draw || draw.uses_skinned_pool) {
-                                    if (lod_band > 0U) continue;
-                                } else if (submesh.lod_count[lod_band] == 0U) {
+                            for (std::size_t draw_index = 0;
+                                 include_models && draw_index < model_draws.size();
+                                 ++draw_index) {
+                                const auto &draw = model_draws[draw_index];
+                                if ((draw.coverage & material_coverage_transparent_mask) != 0U) {
                                     continue;
                                 }
-                            }
-                            vkCmdSetCullMode(command_buffer, (draw.coverage & 2U) != 0U
-                                ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT);
-                            const VkPipeline desired_pipeline = model_geometry_pipeline(tessellated_draw
-                                ? tessellated_editor_model_pipeline
-                                : editor_model_pipeline, draw);
-                            if (desired_pipeline != bound_model_pipeline) {
-                                vkCmdBindPipeline(
-                                    command_buffer,
-                                    VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                    desired_pipeline);
-                                bound_model_pipeline = desired_pipeline;
-                            }
-                            vkCmdPushConstants(command_buffer, pipeline_layout_,
-                                               VK_SHADER_STAGE_FRAGMENT_BIT, 12U,
-                                               sizeof(draw.coverage), &draw.coverage);
-                            if (draw.material_descriptor_set != bound_material_set) {
-                                vkCmdBindDescriptorSets(
-                                    command_buffer,
-                                    VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                    pipeline_layout_,
-                                    1U,
-                                    1U,
-                                    &draw.material_descriptor_set,
-                                    0U,
-                                    nullptr);
-                                bound_material_set = draw.material_descriptor_set;
-                            }
-                            if (tessellated_draw &&
-                                (draw.asset_index != bound_tessellation_asset ||
-                                 draw.submesh_index != bound_tessellation_submesh)) {
-                                const MaterialTessellation& settings =
-                                    draw.tessellation;
-                                const std::array tessellation_push{
-                                    settings.displacement_scale,
-                                    settings.displacement_center,
-                                    static_cast<float>(extent.height) /
-                                        (2.0F * std::max(
-                                            settings.target_edge_pixels, 1.0F)),
-                                    settings.maximum_factor,
-                                    settings.up_facing_only != 0U ? 1.0F : 0.0F,
-                                    settings.normal_threshold,
-                                    settings.uv_edge_fade,
-                                    static_cast<float>(extent.width) /
-                                        static_cast<float>(std::max(extent.height, 1U)),
-                                    draw.tessellation_uv_bounds.x,
-                                    draw.tessellation_uv_bounds.y,
-                                    draw.tessellation_uv_bounds.z,
-                                    draw.tessellation_uv_bounds.w,
-                                };
-                                vkCmdPushConstants(
-                                    command_buffer, pipeline_layout_,
-                                    VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
-                                        VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
-                                    80U, sizeof(tessellation_push),
-                                    tessellation_push.data());
-                                bound_tessellation_asset = draw.asset_index;
-                                bound_tessellation_submesh = draw.submesh_index;
-                            }
-                            const std::size_t draw_bind_key =
-                                (static_cast<std::size_t>(draw.asset_index) << 1U) |
-                                (draw.uses_skinned_pool ? 1U : 0U);
-                            if (draw_bind_key != bound_asset_index) {
-                                const VkBuffer curr_vb =
-                                    draw.uses_skinned_pool &&
-                                            skinned_vertex_pool_[0].handle() != VK_NULL_HANDLE
-                                        ? skinned_vertex_pool_[skinning_pool_parity_].handle()
-                                        : asset.vertex_buffer.handle();
-                                const VkBuffer prev_vb =
-                                    draw.uses_skinned_pool &&
-                                            skinned_vertex_pool_[0].handle() != VK_NULL_HANDLE
-                                        ? skinned_vertex_pool_[1U - skinning_pool_parity_].handle()
-                                        : curr_vb;
-                                const std::array<VkBuffer, 2U> model_vertex_buffers{
-                                    curr_vb, prev_vb};
-                                const std::array<VkDeviceSize, 2U> model_vertex_offsets{
-                                    vertex_offset, vertex_offset};
-                                vkCmdBindVertexBuffers(
-                                    command_buffer,
-                                    0U,
-                                    2U,
-                                    model_vertex_buffers.data(),
-                                    model_vertex_offsets.data());
-                                vkCmdBindIndexBuffer(
-                                    command_buffer,
-                                    asset.index_buffer.handle(),
-                                    0U,
-                                    VK_INDEX_TYPE_UINT32);
-                                bound_asset_index = draw_bind_key;
-                            }
-                            if (gpu_visibility_active_) {
-                                const VkDeviceSize group_base =
-                                    (draw_index + 2U) * model_lod_count *
-                                    sizeof(VkDrawIndexedIndirectCommand);
-                                if (interleave_masked_lods) {
-                                    const std::size_t active_lod = (tessellated_draw || draw.uses_skinned_pool) ? 0U : lod_band;
-                                    vkCmdDrawIndexedIndirect(
-                                        command_buffer, frame.visibility.indirect.handle(),
-                                        group_base + active_lod * sizeof(VkDrawIndexedIndirectCommand),
-                                        1U, sizeof(VkDrawIndexedIndirectCommand));
-                                } else if (tessellated_draw || draw.uses_skinned_pool) {
-                                    vkCmdDrawIndexedIndirect(
-                                        command_buffer, frame.visibility.indirect.handle(),
-                                        group_base, 1U, sizeof(VkDrawIndexedIndirectCommand));
-                                } else {
-                                    std::uint32_t contiguous_lods = 0U;
-                                    bool sparse = false;
-                                    for (std::size_t lod = 0U; lod < model_lod_count; ++lod) {
-                                        if (submesh.lod_count[lod] > 0U) {
-                                            if (lod == contiguous_lods) {
-                                                ++contiguous_lods;
-                                            } else {
-                                                sparse = true;
-                                            }
-                                        }
-                                    }
-                                    if (context_->multi_draw_indirect() && !sparse &&
-                                        contiguous_lods > 0U) {
-                                        vkCmdDrawIndexedIndirect(
-                                            command_buffer, frame.visibility.indirect.handle(),
-                                            group_base, contiguous_lods,
-                                            sizeof(VkDrawIndexedIndirectCommand));
-                                    } else {
-                                        for (std::size_t lod = 0U; lod < model_lod_count; ++lod) {
-                                            if (submesh.lod_count[lod] > 0U) {
-                                                vkCmdDrawIndexedIndirect(
-                                                    command_buffer,
-                                                    frame.visibility.indirect.handle(),
-                                                    group_base +
-                                                        lod * sizeof(VkDrawIndexedIndirectCommand),
-                                                    1U, sizeof(VkDrawIndexedIndirectCommand));
-                                            }
-                                        }
-                                    }
+                                const bool alpha_masked =
+                                    (draw.coverage & material_coverage_alpha_mask_bit) != 0U;
+                                if (alpha_masked != (coverage_pass != 0U)) {
+                                    continue;
                                 }
-                            } else {
-                                vkCmdDrawIndexed(command_buffer, draw.index_count, draw.instance_count,
-                                                 draw.first_index, draw.vertex_offset, draw.first_instance);
+                                const bool tessellated_draw =
+                                    model_tessellation_enabled_ &&
+                                    draw.tessellation.enabled();
+                                const VkPipeline desired_pipeline = model_geometry_pipeline(
+                                    tessellated_draw
+                                        ? tessellated_editor_model_pipeline
+                                        : editor_model_pipeline,
+                                    draw);
+                                const VkCullModeFlags cull_mode =
+                                    (draw.coverage & material_coverage_two_sided_bit) != 0U
+                                        ? VK_CULL_MODE_NONE
+                                        : VK_CULL_MODE_BACK_BIT;
+                                record_model_draw(
+                                    draw,
+                                    draw_index,
+                                    desired_pipeline,
+                                    cull_mode,
+                                    tessellated_draw,
+                                    interleave_masked_lods,
+                                    lod_band,
+                                    opaque_draw_state);
                             }
-                        }
                         }
                         if (coverage_pass == 0U && draw_terrain) {
                             emit_terrain();
                             draw_terrain = false;
-                            bound_model_pipeline = VK_NULL_HANDLE;
-                            bound_material_set = VK_NULL_HANDLE;
-                            bound_asset_index = std::numeric_limits<std::size_t>::max();
+                            opaque_draw_state.pipeline = VK_NULL_HANDLE;
+                            opaque_draw_state.material_set = VK_NULL_HANDLE;
+                            opaque_draw_state.asset_bind_key =
+                                std::numeric_limits<std::size_t>::max();
                         }
                     }
                 } else
@@ -9821,6 +10075,108 @@ void Renderer::record_commands(
                 vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                   ocean_pipeline);
                 vkCmdDraw(command_buffer, 3, 1, 0, 0);
+            }
+            if (!depth_only && mode_ != RunMode::instancing &&
+                authored_scene_enabled_ &&
+                transparent_pipelines != nullptr &&
+                transparent_pipelines->models.get() != VK_NULL_HANDLE) {
+                const auto& model_draws =
+                    gpu_visibility_active_ ? editor_model_draws_ : visible_model_draws_;
+                transparent_draw_order_.clear();
+                for (std::size_t draw_index = 0U; draw_index < model_draws.size();
+                     ++draw_index) {
+                    const auto& draw = model_draws[draw_index];
+                    if ((draw.coverage & material_coverage_transparent_mask) == 0U ||
+                        draw.instance_count == 0U) {
+                        continue;
+                    }
+                    const std::uint32_t src_instance = gpu_visibility_active_
+                        ? draw.first_instance
+                        : lod_visibility_source(visible_indices_[draw.first_instance]);
+                    glm::vec3 world_center = world_bounds_[src_instance].center;
+                    if (const auto id = scene_metadata_[src_instance].id;
+                        id && runtime_transforms_.contains(id)) {
+                        const auto t = runtime_transforms_.current(id);
+                        const glm::vec4 c(
+                            scene_metadata_[src_instance].local_bounds.center, 1.0F);
+                        world_center = {
+                            glm::dot(t.x, c), glm::dot(t.y, c), glm::dot(t.z, c)};
+                    }
+                    const glm::vec3 delta = world_center - lod_camera_position_;
+                    transparent_draw_order_.push_back(TransparentDrawOrderEntry{
+                        .draw_index = static_cast<std::uint32_t>(draw_index),
+                        .distance_sq = glm::dot(delta, delta),
+                    });
+                }
+                if (!transparent_draw_order_.empty()) {
+                    std::sort(
+                        transparent_draw_order_.begin(),
+                        transparent_draw_order_.end(),
+                        [](const TransparentDrawOrderEntry& left,
+                           const TransparentDrawOrderEntry& right) {
+                            if (left.distance_sq != right.distance_sq) {
+                                return left.distance_sq > right.distance_sq;
+                            }
+                            return left.draw_index < right.draw_index;
+                        });
+                    vkCmdBindDescriptorSets(
+                        command_buffer,
+                        VK_PIPELINE_BIND_POINT_GRAPHICS,
+                        pipeline_layout_,
+                        0U,
+                        1U,
+                        &descriptor_set,
+                        0U,
+                        nullptr);
+                    vkCmdPushConstants(
+                        command_buffer,
+                        pipeline_layout_,
+                        VK_SHADER_STAGE_FRAGMENT_BIT,
+                        0U,
+                        sizeof(push_constants),
+                        &push_constants);
+                    ModelDrawState transparent_state{};
+                    for (const TransparentDrawOrderEntry& entry : transparent_draw_order_) {
+                        const auto& draw = model_draws[entry.draw_index];
+                        const bool tessellated_draw =
+                            model_tessellation_enabled_ &&
+                            draw.tessellation.enabled() &&
+                            transparent_pipelines->tessellated_models.get() != VK_NULL_HANDLE;
+                        const VkPipeline desired_pipeline = tessellated_draw
+                            ? transparent_pipelines->tessellated_models.get()
+                            : transparent_pipelines->models.get();
+                        if ((draw.coverage & material_coverage_two_sided_bit) != 0U) {
+                            record_model_draw(
+                                draw,
+                                entry.draw_index,
+                                desired_pipeline,
+                                VK_CULL_MODE_FRONT_BIT,
+                                tessellated_draw,
+                                false,
+                                0U,
+                                transparent_state);
+                            record_model_draw(
+                                draw,
+                                entry.draw_index,
+                                desired_pipeline,
+                                VK_CULL_MODE_BACK_BIT,
+                                tessellated_draw,
+                                false,
+                                0U,
+                                transparent_state);
+                        } else {
+                            record_model_draw(
+                                draw,
+                                entry.draw_index,
+                                desired_pipeline,
+                                VK_CULL_MODE_BACK_BIT,
+                                tessellated_draw,
+                                false,
+                                0U,
+                                transparent_state);
+                        }
+                    }
+                }
             }
 #else
             static_cast<void>(ocean_pipeline);
@@ -10266,8 +10622,13 @@ void Renderer::record_commands(
             prepassed_pipeline(scene_pipeline_, equal_direct_.scene),
             prepassed_pipeline(scene_pipeline_, equal_direct_.scene),
 #endif
+#if VCR_EDITOR_ENABLED
             prepassed_pipeline(terrain_pipeline_, equal_direct_.terrain),
-            sky_pipeline_, ocean_pipeline_.get());
+            sky_pipeline_, ocean_pipeline_.get(), false, &transparent_direct_);
+#else
+            prepassed_pipeline(terrain_pipeline_, equal_direct_.terrain),
+            sky_pipeline_, ocean_pipeline_.get(), false, nullptr);
+#endif
         if (frame.timestamp_queries != VK_NULL_HANDLE) {
             vkCmdWriteTimestamp2(
                 command_buffer,
@@ -10527,8 +10888,14 @@ void Renderer::record_commands(
                 prepassed_pipeline(pipelines.scene.get(), equal.scene),
                 prepassed_pipeline(pipelines.scene.get(), equal.scene),
 #endif
+#if VCR_EDITOR_ENABLED
                 prepassed_pipeline(pipelines.terrain.get(), equal.terrain),
-                pipelines.sky.get(), pipelines.ocean.get());
+                pipelines.sky.get(), pipelines.ocean.get(), false,
+                &(temporal ? transparent_subsurface_temporal_ : transparent_subsurface_spatial_));
+#else
+                prepassed_pipeline(pipelines.terrain.get(), equal.terrain),
+                pipelines.sky.get(), pipelines.ocean.get(), false, nullptr);
+#endif
         } else {
             const auto& pipelines = multisampled
                 ? msaa_geometry_[sample_index] : smaa_geometry_;
@@ -10558,7 +10925,17 @@ void Renderer::record_commands(
 #endif
                 prepassed_pipeline((temporal ? aa_terrain_pipeline_ : pipelines.terrain).get(), equal.terrain),
                 (temporal ? aa_sky_pipeline_ : pipelines.sky).get(),
-                (temporal ? aa_ocean_pipeline_ : pipelines.ocean).get());
+#if VCR_EDITOR_ENABLED
+                (temporal ? aa_ocean_pipeline_ : pipelines.ocean).get(),
+                false,
+                &(multisampled
+                    ? transparent_msaa_[sample_index]
+                    : (temporal ? transparent_temporal_ : transparent_spatial_)));
+#else
+                (temporal ? aa_ocean_pipeline_ : pipelines.ocean).get(),
+                false,
+                nullptr);
+#endif
         }
         vkCmdEndRendering(command_buffer);
         if (frame.timestamp_queries != VK_NULL_HANDLE) {

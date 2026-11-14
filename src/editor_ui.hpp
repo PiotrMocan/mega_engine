@@ -57,6 +57,7 @@ struct SavedMaterialUpdate {
     std::string relative_path{};
     PbrMaterial material{};
     MaterialTessellation tessellation{};
+    std::optional<std::uint32_t> coverage{};
 };
 
 struct MaterialEditorSnapshot {
@@ -65,6 +66,7 @@ struct MaterialEditorSnapshot {
     std::string displacement_texture{};
     PbrMaterial material{};
     MaterialTessellation tessellation{};
+    std::optional<std::uint32_t> coverage{};
 };
 
 class EditorUi final {

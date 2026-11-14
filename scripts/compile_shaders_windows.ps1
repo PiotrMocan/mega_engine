@@ -96,6 +96,8 @@ $subsurfaceGeometryShaders = @(
     'scene_aa.frag',
     'editor_model.frag',
     'editor_model_aa.frag',
+    'editor_model_transparent.frag',
+    'editor_model_aa_transparent.frag',
     'sky.frag',
     'sky_aa.frag'
 )
@@ -114,7 +116,9 @@ $rayQueryFragmentShaders = @(
     'scene.frag',
     'scene_aa.frag',
     'editor_model.frag',
-    'editor_model_aa.frag'
+    'editor_model_aa.frag',
+    'editor_model_transparent.frag',
+    'editor_model_aa_transparent.frag'
 )
 foreach ($shader in $rayQueryFragmentShaders) {
     $stem = [System.IO.Path]::GetFileNameWithoutExtension($shader)

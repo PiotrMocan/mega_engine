@@ -2,6 +2,7 @@
 
 #include "asset_importer.hpp"
 #include "cooked_audio_asset.hpp"
+#include "cooked_model_asset.hpp"
 #include "editor_scene_tools.hpp"
 #include "gameplay_framework.hpp"
 #include "project_system.hpp"
@@ -85,6 +86,22 @@ struct ExternalAssetDropState {
     bool hover = false;
 };
 
+enum class MaterialAlphaMode : std::uint8_t {
+    opaque = 0U,
+    mask = 1U,
+    blend = 2U,
+};
+
+[[nodiscard]] constexpr std::string_view to_token(
+    const MaterialAlphaMode mode) noexcept {
+    switch (mode) {
+    case MaterialAlphaMode::opaque: return "opaque";
+    case MaterialAlphaMode::mask: return "mask";
+    case MaterialAlphaMode::blend: return "blend";
+    }
+    return "opaque";
+}
+
 struct MaterialEditorUiState {
     nlohmann::json document{};
     std::filesystem::path relative_path{};
@@ -92,6 +109,11 @@ struct MaterialEditorUiState {
     std::array<char, 256U> name{};
     PbrMaterial material{};
     MaterialTessellation tessellation{};
+    MaterialAlphaMode alpha_mode = MaterialAlphaMode::opaque;
+    float alpha_cutoff = 0.5F;
+    bool double_sided = false;
+    bool glass = false;
+    bool packed_ao = false;
     bool has_displacement_texture = false;
     std::string error{};
     std::string status{};
@@ -100,6 +122,54 @@ struct MaterialEditorUiState {
     bool dirty = false;
     bool close_confirmation_requested = false;
 };
+
+[[nodiscard]] std::uint32_t compute_material_coverage(
+    const MaterialEditorUiState& state) noexcept {
+    std::uint32_t coverage = 0U;
+    if (state.alpha_mode == MaterialAlphaMode::mask) {
+        coverage = material_coverage_alpha_mask_bit;
+    } else if (state.alpha_mode == MaterialAlphaMode::blend) {
+        coverage = material_coverage_alpha_blend_bit;
+    }
+    if (state.glass) {
+        coverage |= material_coverage_alpha_blend_bit | material_coverage_glass_bit;
+    }
+    if (state.double_sided) {
+        coverage |= material_coverage_two_sided_bit;
+    }
+    if (state.packed_ao) {
+        coverage |= material_coverage_packed_ao_bit;
+    }
+    if ((coverage & material_coverage_alpha_mask_bit) != 0U) {
+        coverage |= static_cast<std::uint32_t>(std::lround(
+            std::clamp(state.alpha_cutoff, 0.0F, 1.0F) * 65535.0F)) << 16U;
+    }
+    return coverage;
+}
+
+[[nodiscard]] SavedMaterialUpdate make_saved_material_update(
+    const MaterialEditorUiState& state) {
+    return SavedMaterialUpdate{
+        .relative_path = state.relative_path.generic_string(),
+        .material = state.material,
+        .tessellation = state.tessellation,
+        .coverage = compute_material_coverage(state),
+    };
+}
+
+[[nodiscard]] MaterialEditorSnapshot make_material_snapshot(
+    const MaterialEditorUiState& state) {
+    return MaterialEditorSnapshot{
+        .relative_path = state.relative_path.generic_string(),
+        .name = std::string(state.name.data()),
+        .displacement_texture = state.has_displacement_texture
+            ? state.document["textures"]["displacement"].get<std::string>()
+            : std::string{},
+        .material = state.material,
+        .tessellation = state.tessellation,
+        .coverage = compute_material_coverage(state),
+    };
+}
 
 struct AudioInputUiState {
     enum class CaptureMode : std::uint8_t {
@@ -823,6 +893,62 @@ inline constexpr std::uintmax_t maximum_material_file_bytes =
             }
         }
 
+        MaterialAlphaMode alpha_mode = MaterialAlphaMode::opaque;
+        float alpha_cutoff = 0.5F;
+        bool double_sided = false;
+        bool glass = false;
+        bool packed_ao = false;
+        if (document.contains("alpha_mode")) {
+            if (!document["alpha_mode"].is_string()) {
+                error = "Material alpha_mode must be opaque, mask, or blend.";
+                return false;
+            }
+            const std::string& mode_text =
+                document["alpha_mode"].get_ref<const std::string&>();
+            if (mode_text == "opaque") {
+                alpha_mode = MaterialAlphaMode::opaque;
+            } else if (mode_text == "mask") {
+                alpha_mode = MaterialAlphaMode::mask;
+            } else if (mode_text == "blend") {
+                alpha_mode = MaterialAlphaMode::blend;
+                double_sided = true;
+            } else {
+                error = "Material alpha_mode must be opaque, mask, or blend.";
+                return false;
+            }
+        }
+        if (document.contains("glass")) {
+            if (!document["glass"].is_boolean()) {
+                error = "Material glass must be boolean.";
+                return false;
+            }
+            glass = document["glass"].get<bool>();
+            if (glass) {
+                alpha_mode = MaterialAlphaMode::blend;
+                double_sided = true;
+            }
+        }
+        if (document.contains("alpha_cutoff") &&
+            !read_material_factor(
+                document["alpha_cutoff"], 0.0F, 1.0F, alpha_cutoff)) {
+            error = "Material alpha cutoff must be finite and from 0 through 1.";
+            return false;
+        }
+        if (document.contains("double_sided")) {
+            if (!document["double_sided"].is_boolean()) {
+                error = "Material double_sided must be boolean.";
+                return false;
+            }
+            double_sided = document["double_sided"].get<bool>();
+        }
+        if (document.contains("occlusion_in_metallic_roughness")) {
+            if (!document["occlusion_in_metallic_roughness"].is_boolean()) {
+                error = "Material occlusion_in_metallic_roughness must be boolean.";
+                return false;
+            }
+            packed_ao = document["occlusion_in_metallic_roughness"].get<bool>();
+        }
+
         state.name.fill('\0');
         std::memcpy(state.name.data(), name.data(), name.size());
         state.document = std::move(document);
@@ -830,6 +956,11 @@ inline constexpr std::uintmax_t maximum_material_file_bytes =
         state.absolute_path = std::move(absolute_path);
         state.material = sanitize_pbr_material(material);
         state.tessellation = tessellation;
+        state.alpha_mode = alpha_mode;
+        state.alpha_cutoff = alpha_cutoff;
+        state.double_sided = double_sided;
+        state.glass = glass;
+        state.packed_ao = packed_ao;
         state.has_displacement_texture = has_displacement_texture;
         state.loaded = true;
         state.dirty = false;
@@ -1102,6 +1233,20 @@ write_exclusive_material_file(
                 precision;
         };
         state.document["name"] = std::string(name);
+        state.document["alpha_mode"] = std::string(to_token(state.alpha_mode));
+        state.document["alpha_cutoff"] = readable_float(
+            std::clamp(state.alpha_cutoff, 0.0F, 1.0F));
+        state.document["double_sided"] = state.double_sided;
+        if (state.glass) {
+            state.document["glass"] = true;
+        } else {
+            state.document.erase("glass");
+        }
+        if (state.packed_ao) {
+            state.document["occlusion_in_metallic_roughness"] = true;
+        } else {
+            state.document.erase("occlusion_in_metallic_roughness");
+        }
         state.document["pbr"] = {
             {"base_color",
              {material.base_color.x,
@@ -6539,15 +6684,7 @@ bool EditorUi::inspect_material(
             asset_browser_.root(), relative_path, state, error)) {
         return false;
     }
-    snapshot = MaterialEditorSnapshot{
-        .relative_path = state.relative_path.generic_string(),
-        .name = std::string(state.name.data()),
-        .displacement_texture = state.has_displacement_texture
-            ? state.document["textures"]["displacement"].get<std::string>()
-            : std::string{},
-        .material = state.material,
-        .tessellation = state.tessellation,
-    };
+    snapshot = make_material_snapshot(state);
     return true;
 }
 
@@ -6603,25 +6740,14 @@ bool EditorUi::set_material_tessellation(
     if (!save_material_document(state, asset_browser_.root(), error)) {
         return false;
     }
-    snapshot = MaterialEditorSnapshot{
-        .relative_path = state.relative_path.generic_string(),
-        .name = std::string(state.name.data()),
-        .displacement_texture =
-            state.document["textures"]["displacement"].get<std::string>(),
-        .material = state.material,
-        .tessellation = state.tessellation,
-    };
+    snapshot = make_material_snapshot(state);
+    saved_material_update_ = make_saved_material_update(state);
     if (material_editor_ != nullptr && material_editor_->loaded &&
         material_editor_->relative_path == state.relative_path) {
         const bool was_open = material_editor_->open;
         *material_editor_ = std::move(state);
         material_editor_->open = was_open;
     }
-    saved_material_update_ = SavedMaterialUpdate{
-        .relative_path = snapshot.relative_path,
-        .material = snapshot.material,
-        .tessellation = snapshot.tessellation,
-    };
     return true;
 }
 
@@ -6763,6 +6889,61 @@ void EditorUi::build_material_editor(Renderer& renderer) {
                         1.0F,
                         "%.2f");
                 }
+                ui_kit_.property_row("Alpha mode");
+                const bool gpu_grass =
+                    material_editor_->material.model == MaterialModel::gpu_grass;
+                ImGui::BeginDisabled(gpu_grass);
+                if (ImGui::BeginCombo(
+                        "##MaterialAlphaMode",
+                        to_token(material_editor_->alpha_mode).data())) {
+                    for (const auto alpha_mode : {
+                             MaterialAlphaMode::opaque,
+                             MaterialAlphaMode::mask,
+                             MaterialAlphaMode::blend}) {
+                        if (ImGui::Selectable(
+                                to_token(alpha_mode).data(),
+                                material_editor_->alpha_mode == alpha_mode)) {
+                            if (material_editor_->alpha_mode != alpha_mode) {
+                                material_editor_->alpha_mode = alpha_mode;
+                                if (alpha_mode == MaterialAlphaMode::blend) {
+                                    material_editor_->double_sided = true;
+                                } else {
+                                    material_editor_->glass = false;
+                                }
+                                if (alpha_mode == MaterialAlphaMode::mask) {
+                                    material_editor_->tessellation.enabled_flag = 0U;
+                                }
+                                changed = true;
+                            }
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                if (material_editor_->alpha_mode == MaterialAlphaMode::mask) {
+                    ui_kit_.property_row("Alpha cutoff");
+                    changed |= ImGui::SliderFloat(
+                        "##MaterialAlphaCutoff",
+                        &material_editor_->alpha_cutoff,
+                        0.0F,
+                        1.0F,
+                        "%.2f");
+                }
+                ui_kit_.property_row("Glass dielectric");
+                if (ImGui::Checkbox(
+                        "##MaterialGlass", &material_editor_->glass)) {
+                    if (material_editor_->glass) {
+                        material_editor_->alpha_mode = MaterialAlphaMode::blend;
+                        material_editor_->double_sided = true;
+                    }
+                    changed = true;
+                }
+                ImGui::EndDisabled();
+                ui_kit_.property_row("Double sided");
+                changed |= ImGui::Checkbox(
+                    "##MaterialDoubleSided", &material_editor_->double_sided);
+                ui_kit_.property_row("AO in M/R texture");
+                changed |= ImGui::Checkbox(
+                    "##MaterialPackedAo", &material_editor_->packed_ao);
                 ui_kit_.end_property_grid();
             }
             ui_kit_.section_header(
@@ -6779,7 +6960,8 @@ void EditorUi::build_material_editor(Renderer& renderer) {
             }
             ImGui::BeginDisabled(
                 !material_editor_->has_displacement_texture ||
-                material_editor_->material.model == MaterialModel::gpu_grass);
+                material_editor_->material.model == MaterialModel::gpu_grass ||
+                material_editor_->alpha_mode == MaterialAlphaMode::mask);
             if (ui_kit_.begin_property_grid(
                     "MaterialTessellationProperties")) {
                 bool enabled =
@@ -6846,12 +7028,7 @@ void EditorUi::build_material_editor(Renderer& renderer) {
                 material_editor_->dirty = true;
                 material_editor_->status =
                     "Unsaved material changes.";
-                saved_material_update_ = SavedMaterialUpdate{
-                    .relative_path =
-                        material_editor_->relative_path.generic_string(),
-                    .material = material_editor_->material,
-                    .tessellation = material_editor_->tessellation,
-                };
+                saved_material_update_ = make_saved_material_update(*material_editor_);
             }
 
             if (ui_kit_.action_button(
@@ -6868,15 +7045,7 @@ void EditorUi::build_material_editor(Renderer& renderer) {
                         "Save failed: " + error;
                 } else {
                     saved_material_update_ =
-                        SavedMaterialUpdate{
-                            .relative_path =
-                                material_editor_->relative_path
-                                    .generic_string(),
-                            .material =
-                                material_editor_->material,
-                            .tessellation =
-                                material_editor_->tessellation,
-                        };
+                        make_saved_material_update(*material_editor_);
                 }
             }
             ImGui::SameLine();
@@ -6896,12 +7065,8 @@ void EditorUi::build_material_editor(Renderer& renderer) {
                     material_editor_->error =
                         "Revert failed: " + error;
                 } else {
-                    saved_material_update_ = SavedMaterialUpdate{
-                        .relative_path =
-                            material_editor_->relative_path.generic_string(),
-                        .material = material_editor_->material,
-                        .tessellation = material_editor_->tessellation,
-                    };
+                    saved_material_update_ =
+                        make_saved_material_update(*material_editor_);
                 }
             }
             ImGui::EndDisabled();
@@ -6976,15 +7141,7 @@ void EditorUi::build_material_editor(Renderer& renderer) {
                     asset_browser_.root(),
                     error)) {
                 saved_material_update_ =
-                    SavedMaterialUpdate{
-                        .relative_path =
-                            material_editor_->relative_path
-                                .generic_string(),
-                        .material =
-                            material_editor_->material,
-                        .tessellation =
-                            material_editor_->tessellation,
-                    };
+                    make_saved_material_update(*material_editor_);
                 material_editor_->open = false;
                 ImGui::CloseCurrentPopup();
             } else {
@@ -8150,15 +8307,7 @@ void EditorUi::process_file_commands(SceneDocument& scene) {
                     material_editor_->open = true;
                 } else {
                     saved_material_update_ =
-                        SavedMaterialUpdate{
-                            .relative_path =
-                                material_editor_->relative_path
-                                    .generic_string(),
-                            .material =
-                                material_editor_->material,
-                            .tessellation =
-                                material_editor_->tessellation,
-                        };
+                        make_saved_material_update(*material_editor_);
                 }
             }
             if (!scene_is_dirty(scene) && material_saved) {

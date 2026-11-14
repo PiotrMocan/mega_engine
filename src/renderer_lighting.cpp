@@ -485,6 +485,7 @@ void Renderer::snapshot_voxel_scene() {
     for (unsigned i = 0; i < editor_cube_count_; ++i)
         append(gi_cube_first_, 12, editor_ground_count_ + i);
     for (const auto &draw : editor_model_draws_) {
+        if ((draw.coverage & material_coverage_transparent_mask) != 0U) continue;
         const auto &submesh = editor_model_assets_[draw.asset_index].submeshes[draw.submesh_index];
         for (unsigned i = 0; i < draw.instance_count; ++i)
             append(submesh.gi_first, submesh.gi_count, draw.first_instance + i, submesh.gi_albedo);

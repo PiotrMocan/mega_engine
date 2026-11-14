@@ -5,7 +5,11 @@
 #define VCR_SURFACE_SHADOW_EXPLICIT_LOD 1
 #endif
 #include "surface_lighting_common.glsl"
-#ifndef VCR_OPAQUE_EARLY_Z
+#if defined(VCR_TRANSPARENT_PASS)
+#include "lod_fade.glsl"
+#include "material_coverage.glsl"
+layout(early_fragment_tests) in;
+#elif !defined(VCR_OPAQUE_EARLY_Z)
 #include "lod_fade.glsl"
 #include "material_coverage.glsl"
 #ifdef VCR_EQUAL_EARLY_Z
@@ -104,36 +108,39 @@ void main()
     // Derivatives after nonuniform discard are undefined. All material maps
     // share authored UVs, so compute their gradients before applying coverage.
     const vec2 uvDx = dFdx(inUv), uvDy = dFdy(inUv);
-#ifndef VCR_OPAQUE_EARLY_Z
+#if !defined(VCR_OPAQUE_EARLY_Z) && !defined(VCR_TRANSPARENT_PASS)
     if (!lodKeep(inLodToken, uvec2(gl_FragCoord.xy))) discard;
 #endif
     const vec4 sampledBaseColor =
         textureGrad(materialBaseColorTexture, inUv, uvDx, uvDy);
     const vec4 baseColor = sampledBaseColor * inBaseColor;
-#ifndef VCR_OPAQUE_EARLY_Z
+#if !defined(VCR_OPAQUE_EARLY_Z) && !defined(VCR_TRANSPARENT_PASS)
     if (!materialKeepsAlpha(pushConstants.padding, baseColor.a)) discard;
 #endif
 
     const vec3 clampedBaseColor = clamp(baseColor.rgb, vec3(0.0), vec3(1.0));
     vec3 shadedColor = clampedBaseColor;
+    vec3 surfaceNormal = materialFaceNormal(
+        pushConstants.padding, safeNormalize(inWorldNormal, vec3(0.0, 1.0, 0.0)));
+    vec3 surfaceMaterialParameters = inMaterialParameters.xyz;
     PbrLightingComponents lightingComponents;
     lightingComponents.diffuse = vec3(0.0);
     lightingComponents.specular = vec3(0.0);
     if (inMaterialModel != 1u) {
-        const vec3 normal = sampleWorldNormal(uvDx, uvDy);
+        surfaceNormal = sampleWorldNormal(uvDx, uvDy);
         const vec3 geomNormal = materialFaceNormal(
             pushConstants.padding, safeNormalize(inWorldNormal, vec3(0.0, 1.0, 0.0)));
         const vec4 sampledMetallicRoughness =
             textureGrad(materialMetallicRoughnessTexture, inUv, uvDx, uvDy);
-        const vec3 materialParameters = vec3(
+        surfaceMaterialParameters = vec3(
             inMaterialParameters.x * sampledMetallicRoughness.b,
             inMaterialParameters.y * sampledMetallicRoughness.g,
             inMaterialParameters.z * ((pushConstants.padding & 4u) != 0u
                 ? sampledMetallicRoughness.r : 1.0));
         lightingComponents = evaluateLitSurfaceComponents(
             clampedBaseColor,
-            materialParameters,
-            normal,
+            surfaceMaterialParameters,
+            surfaceNormal,
             geomNormal,
             inWorldPosition,
             inDielectricF0,
@@ -141,25 +148,57 @@ void main()
             inSubsurfaceProfile,
             inSubsurfaceStrength);
         shadedColor = lightingComponents.diffuse + lightingComponents.specular;
-        if (materialIsGlass(pushConstants.padding)) {
-            const vec3 viewDir = safeNormalize(
-                frame.cameraPosition.xyz - inWorldPosition,
-                vec3(0.0, 0.0, 1.0));
-            const float nDotV = max(dot(normalize(normal), viewDir), 0.0);
-            const float fresnel = pow(1.0 - nDotV, 5.0);
-            const vec3 skyReflect = mix(vec3(0.18, 0.24, 0.30), vec3(0.65, 0.80, 0.96), clamp(normal.y * 0.5 + 0.5, 0.0, 1.0));
-            lightingComponents.specular += skyReflect * (0.14 + 0.72 * fresnel);
-            shadedColor = lightingComponents.diffuse * 0.35 + lightingComponents.specular;
-        }
     }
 
     applySurfaceWorkloadModulation(
         inInstanceIndex, shadedColor, lightingComponents);
 
+#ifdef VCR_TRANSPARENT_PASS
+    const float lodPresence = lodKeep(inLodToken, uvec2(gl_FragCoord.xy)) ? 1.0 : 0.0;
+    const float rawOpacity = clamp(baseColor.a, 0.0, 1.0);
+    const bool backFaceTwoSided =
+        (pushConstants.padding & kMaterialTwoSidedBit) != 0u && !gl_FrontFacing;
+    float effectiveAlpha = 0.0;
+    vec3 premulRgb = vec3(0.0);
+    if (inMaterialModel == 1u) {
+        effectiveAlpha = rawOpacity * (backFaceTwoSided ? 0.5 : 1.0) * lodPresence;
+        premulRgb = min(clampedBaseColor * effectiveAlpha, vec3(65504.0));
+    } else {
+        const vec3 viewDir = safeNormalize(
+            frame.cameraPosition.xyz - inWorldPosition,
+            vec3(0.0, 0.0, 1.0));
+        const float nDotV = max(dot(surfaceNormal, viewDir), 1.0e-4);
+        const float metallic = clamp(surfaceMaterialParameters.x, 0.0, 1.0);
+        const float roughness = clamp(surfaceMaterialParameters.y, pbrMinimumRoughness, 1.0);
+        const vec3 reflectanceAtNormal = mix(vec3(inDielectricF0), clampedBaseColor, metallic);
+        const vec3 fresnel = fresnelSchlickRoughness(nDotV, reflectanceAtNormal, roughness);
+        const float fresnelStrength = clamp(max(fresnel.r, max(fresnel.g, fresnel.b)), 0.0, 1.0);
+        const float specWeight = backFaceTwoSided ? 0.35 : 1.0;
+        const float bodyOpacity = rawOpacity * (backFaceTwoSided ? 0.45 : 1.0);
+        const float dielectricGlassFactor =
+            (materialIsExplicitGlass(pushConstants.padding) || (metallic < 0.25 && roughness < 0.25))
+                ? fresnelStrength
+                : 0.0;
+        effectiveAlpha = clamp(
+            bodyOpacity + (1.0 - bodyOpacity) * max(fresnelStrength, dielectricGlassFactor) * specWeight,
+            0.0, 1.0) * lodPresence;
+        premulRgb = min(
+            (lightingComponents.diffuse * bodyOpacity + lightingComponents.specular * specWeight)
+                * lodPresence,
+            vec3(65504.0));
+    }
+#ifdef VCR_SSS_OUTPUT
+    outColor = vec4(0.0, 0.0, 0.0, effectiveAlpha);
+    outSubsurfaceBase = vec4(premulRgb, effectiveAlpha);
+#else
+    outColor = vec4(premulRgb, effectiveAlpha);
+#endif
+#else
     writeLitSurface(
         lightingComponents.diffuse, lightingComponents.specular, shadedColor,
         baseColor.a, inMaterialModel, inSubsurfaceProfile,
         inSubsurfaceStrength);
+#endif
 #ifdef VCR_SSS_TEMPORAL
     writeTemporalSurfaceOutputs(inCurrentClip, inPreviousClip);
 #else
