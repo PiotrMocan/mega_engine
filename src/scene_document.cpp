@@ -265,6 +265,8 @@ bool SceneDocument::destroy_subtree(const SceneNodeId id) {
         audio_sources_.remove_slot(*iterator);
         audio_listeners_.remove_slot(*iterator);
         reverb_zones_.remove_slot(*iterator);
+        animators_.remove_slot(*iterator);
+        gameplays_.remove_slot(*iterator);
         slot.uuid = {};
         slot.value = {};
         slot.world_matrix = glm::mat4(1.0F);
@@ -713,6 +715,96 @@ SceneDocument::reverb_zone_mut(const SceneNodeId id) noexcept {
     return reverb_zones_.get_mut(id);
 }
 
+bool SceneDocument::set_animator(
+    const SceneNodeId id,
+    const AnimatorComponent& animator_value) {
+    if (!valid(id) || !valid_animator_component(animator_value)) {
+        return false;
+    }
+    if (const auto existing = animators_.get(id);
+        existing && existing->get() == animator_value) {
+        return true;
+    }
+    if (!animators_.upsert(id, animator_value)) {
+        return false;
+    }
+    ++content_revision_;
+    return true;
+}
+
+bool SceneDocument::remove_animator(const SceneNodeId id) noexcept {
+    if (!valid(id) || !animators_.remove(id)) {
+        return false;
+    }
+    ++content_revision_;
+    return true;
+}
+
+bool SceneDocument::has_animator(const SceneNodeId id) const noexcept {
+    return valid(id) && animators_.contains(id);
+}
+
+std::optional<std::reference_wrapper<const AnimatorComponent>>
+SceneDocument::animator(const SceneNodeId id) const noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return animators_.get(id);
+}
+
+std::optional<std::reference_wrapper<AnimatorComponent>>
+SceneDocument::animator_mut(const SceneNodeId id) noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return animators_.get_mut(id);
+}
+
+bool SceneDocument::set_gameplay(
+    const SceneNodeId id,
+    const GameplayComponent& gameplay_value) {
+    if (!valid(id) || !valid_gameplay_component(gameplay_value)) {
+        return false;
+    }
+    if (const auto existing = gameplays_.get(id);
+        existing && existing->get() == gameplay_value) {
+        return true;
+    }
+    if (!gameplays_.upsert(id, gameplay_value)) {
+        return false;
+    }
+    ++content_revision_;
+    return true;
+}
+
+bool SceneDocument::remove_gameplay(const SceneNodeId id) noexcept {
+    if (!valid(id) || !gameplays_.remove(id)) {
+        return false;
+    }
+    ++content_revision_;
+    return true;
+}
+
+bool SceneDocument::has_gameplay(const SceneNodeId id) const noexcept {
+    return valid(id) && gameplays_.contains(id);
+}
+
+std::optional<std::reference_wrapper<const GameplayComponent>>
+SceneDocument::gameplay(const SceneNodeId id) const noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return gameplays_.get(id);
+}
+
+std::optional<std::reference_wrapper<GameplayComponent>>
+SceneDocument::gameplay_mut(const SceneNodeId id) noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return gameplays_.get_mut(id);
+}
+
 void SceneDocument::mark_content_changed() noexcept {
     ++content_revision_;
 }
@@ -795,6 +887,14 @@ void SceneDocument::build_node_records(
         if (const auto attached_rz = reverb_zones_.get(current_id)) {
             node_reverb = attached_rz->get();
         }
+        std::optional<AnimatorComponent> node_animator{};
+        if (const auto attached_an = animators_.get(current_id)) {
+            node_animator = attached_an->get();
+        }
+        std::optional<GameplayComponent> node_gameplay{};
+        if (const auto attached_gp = gameplays_.get(current_id)) {
+            node_gameplay = attached_gp->get();
+        }
         output.push_back(SceneNodeRecord{
             .id = current_id,
             .uuid = slots_[index].uuid,
@@ -805,6 +905,8 @@ void SceneDocument::build_node_records(
             .audio_source = node_audio_src,
             .audio_listener = node_audio_lst,
             .reverb_zone = node_reverb,
+            .animator = node_animator,
+            .gameplay = node_gameplay,
             .parent_record_index = parent_record,
         });
         if (ancestor_records.size() <= depth) {

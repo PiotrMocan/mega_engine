@@ -38,6 +38,7 @@
 #include "cooked_model_asset.hpp"
 #include "cooked_texture_asset.hpp"
 #include "scene_document.hpp"
+#include "skeletal_animation.hpp"
 struct ImDrawData;
 #endif
 
@@ -453,6 +454,22 @@ public:
         SceneNodeId id) const noexcept;
     [[nodiscard]] const CookedModelCollision* editor_model_collision(
         std::string_view relative_path) const noexcept;
+    [[nodiscard]] const CookedSkeletonAsset* find_model_skeleton(
+        std::string_view relative_path) const noexcept;
+    [[nodiscard]] const std::vector<AnimationClip>* find_model_animations(
+        std::string_view relative_path) const noexcept;
+    void set_skinned_model_pose(
+        SceneNodeId node_id,
+        std::string_view asset_relative_path,
+        std::span<const glm::mat4> skin_matrices);
+    void remove_skinned_model_pose(SceneNodeId node_id) noexcept;
+    void clear_skinned_model_poses() noexcept;
+    [[nodiscard]] std::uint32_t skinning_active_node_count() const noexcept {
+        return static_cast<std::uint32_t>(skinned_node_slots_.size());
+    }
+    [[nodiscard]] bool editor_scene_needs_sync() const noexcept {
+        return editor_scene_revision_ == 0U;
+    }
     [[nodiscard]] std::uint64_t swapchain_generation() const noexcept {
         return swapchain_generation_;
     }
@@ -528,12 +545,24 @@ private:
         std::string relative_path{};
         GpuBuffer vertex_buffer{};
         GpuBuffer index_buffer{};
+        GpuBuffer skin_vertex_buffer{};
+        VkDescriptorSet skin_asset_set = VK_NULL_HANDLE;
+        CookedSkeletonAsset skeleton{};
+        std::vector<CookedAnimationReference> animation_refs{};
+        std::vector<AnimationClip> animations{};
         std::vector<EditorModelSubmesh> submeshes{};
         SceneTransform recommended_transform{};
         CookedModelCollision collision{};
         VkDeviceSize gpu_bytes = 0U;
+        std::uint32_t vertex_count = 0U;
         Bounds bounds{};
         bool ready = true;
+
+        [[nodiscard]] bool is_skinned() const noexcept {
+            return !skeleton.empty() &&
+                   skin_vertex_buffer.handle() != VK_NULL_HANDLE &&
+                   vertex_count > 0U;
+        }
     };
 
     struct EditorModelDraw {
@@ -547,6 +576,9 @@ private:
         std::uint32_t first_instance = 0U;
         std::uint32_t instance_count = 0U;
         std::uint32_t submesh_index = 0U;
+        SceneNodeId node_id{};
+        std::int32_t vertex_offset = 0;
+        bool uses_skinned_pool = false;
     };
     [[nodiscard]] VkPipeline model_geometry_pipeline(
         VkPipeline ordinary, const EditorModelDraw &draw) const;
@@ -736,6 +768,16 @@ private:
     [[nodiscard]] std::vector<std::string> resident_editor_texture_paths() const;
     [[nodiscard]] std::optional<std::uint32_t> publish_editor_model(const PreparedModel &prepared,
                                                                     std::string &error);
+    [[nodiscard]] bool ensure_skinning_pipeline_and_pools(
+        std::uint32_t required_vertices,
+        std::uint32_t required_bones);
+    void destroy_skinning_resources() noexcept;
+    void record_model_skinning(
+        VkCommandBuffer command_buffer,
+        FrameContext& frame);
+    [[nodiscard]] bool update_skinning_asset_descriptor(
+        EditorModelAsset& asset) noexcept;
+    void compact_skinned_node_slots() noexcept;
 #endif
     [[nodiscard]] VkExtent2D scene_output_extent() const noexcept;
 
@@ -1057,6 +1099,27 @@ private:
     bool async_assets_ = false;
     std::vector<EditorModelAsset> editor_model_assets_{};
     std::vector<EditorModelDraw> editor_model_draws_{};
+    struct SkinnedNodeSlot {
+        SceneNodeId node_id{};
+        std::uint32_t asset_index = 0U;
+        std::uint32_t vertex_offset = 0U;
+        std::uint32_t vertex_count = 0U;
+        std::uint32_t bone_offset = 0U;
+        std::uint32_t bone_count = 0U;
+        bool initialized_prev_pool = false;
+    };
+    std::vector<SkinnedNodeSlot> skinned_node_slots_{};
+    std::vector<glm::mat4> skinned_bone_matrices_{};
+    DeviceObject<VkDescriptorSetLayout> skin_asset_set_layout_{};
+    DeviceObject<VkDescriptorSetLayout> skin_frame_set_layout_{};
+    DeviceObject<VkDescriptorPool> skin_descriptor_pool_{};
+    DeviceObject<VkPipelineLayout> skin_pipeline_layout_{};
+    DeviceObject<VkPipeline> skin_compute_pipeline_{};
+    std::array<GpuBuffer, 2U> skinned_vertex_pool_{};
+    std::uint32_t skinned_pool_vertex_capacity_ = 0U;
+    std::uint32_t skinned_pool_vertex_cursor_ = 0U;
+    std::uint32_t skinning_pool_parity_ = 0U;
+    bool skinning_resources_ready_ = false;
     std::vector<EditorTextureAsset> editor_texture_assets_{};
     std::vector<std::uint32_t> editor_model_sort_scratch_{};
     GpuTexture editor_default_base_color_texture_{};

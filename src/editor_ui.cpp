@@ -3,10 +3,12 @@
 #include "asset_importer.hpp"
 #include "cooked_audio_asset.hpp"
 #include "editor_scene_tools.hpp"
+#include "gameplay_framework.hpp"
 #include "project_system.hpp"
 #include "renderer.hpp"
 #include "runtime_assets.hpp"
 #include "scene_io.hpp"
+#include "scene_uuid.hpp"
 #include "sdl_input_bridge.hpp"
 #include "sound_cue_io.hpp"
 #include "vulkan_common.hpp"
@@ -448,6 +450,8 @@ struct EditorViewportRay {
     case AssetEntryKind::prefab: return EditorIcon::model;
     case AssetEntryKind::audio: return EditorIcon::play;
     case AssetEntryKind::sound_cue: return EditorIcon::play;
+    case AssetEntryKind::animation: return EditorIcon::play;
+    case AssetEntryKind::save_state: return EditorIcon::cube;
     case AssetEntryKind::binary: return EditorIcon::import_asset;
     case AssetEntryKind::other: return EditorIcon::import_asset;
     }
@@ -464,6 +468,8 @@ inline constexpr std::uintmax_t maximum_material_file_bytes =
     case ImportedAssetKind::material: return "Material";
     case ImportedAssetKind::texture: return "Texture";
     case ImportedAssetKind::mesh_binary: return "Mesh data";
+    case ImportedAssetKind::skeleton: return "Skeleton";
+    case ImportedAssetKind::animation: return "Animation";
     case ImportedAssetKind::audio: return "Audio";
     case ImportedAssetKind::source: return "Source";
     }
@@ -1260,7 +1266,9 @@ void EditorUi::initialize(
     Renderer& renderer,
     AudioEngine* const audio_engine,
     InputActionSystem* const input_actions,
-    const std::string_view explicit_project_path) {
+    const std::string_view explicit_project_path,
+    GameplaySession* const gameplay_session,
+    AnimatorRuntimeSystem* const edit_animator_preview) {
     if (context_ != nullptr || main_window == nullptr) {
         fatal("Editor UI was initialized with invalid state.");
     }
@@ -1268,6 +1276,22 @@ void EditorUi::initialize(
     main_window_ = main_window;
     audio_engine_ = audio_engine;
     input_actions_ = input_actions;
+    gameplay_session_ = gameplay_session;
+    edit_animator_preview_ = edit_animator_preview;
+    show_skeleton_wireframe_ = true;
+    animation_gameplay_panel_open_ = true;
+    save_slot_path_buf_.fill('\0');
+    constexpr std::string_view default_save_slot =
+        "saves/quicksave.vcrsave.json";
+    std::memcpy(
+        save_slot_path_buf_.data(),
+        default_save_slot.data(),
+        default_save_slot.size());
+    pending_quick_save_path_.reset();
+    pending_quick_load_path_.reset();
+    save_load_status_.clear();
+    save_load_error_.clear();
+    skeleton_wireframe_scratch_.clear();
     import_worker_ = std::make_unique<AssetImportWorker>();
     import_ui_ = std::make_unique<AssetImportUiState>();
     external_drop_ = std::make_unique<ExternalAssetDropState>();
@@ -1373,6 +1397,13 @@ void EditorUi::shutdown() noexcept {
     main_window_ = nullptr;
     audio_engine_ = nullptr;
     input_actions_ = nullptr;
+    gameplay_session_ = nullptr;
+    edit_animator_preview_ = nullptr;
+    pending_quick_save_path_.reset();
+    pending_quick_load_path_.reset();
+    save_load_status_.clear();
+    save_load_error_.clear();
+    skeleton_wireframe_scratch_.clear();
     imgui_color_format_ = VK_FORMAT_UNDEFINED;
     imgui_rendering_info_.pColorAttachmentFormats = nullptr;
     known_viewport_generation_ = 0U;
@@ -1551,7 +1582,9 @@ void EditorUi::process_event(const SDL_Event& event) {
         static_cast<void>(ImGui_ImplSDL3_ProcessEvent(&event));
         if (event.type == SDL_EVENT_KEY_DOWN &&
             !event.key.repeat) {
-            if (event.key.key == SDLK_F5) {
+            if (event.key.key == SDLK_F5 &&
+                (play_state_ == EditorPlayState::edit ||
+                 (event.key.mod & SDL_KMOD_SHIFT) != 0)) {
                 toggle_play_requested_ = true;
             } else if (event.key.key == SDLK_F6) {
                 toggle_external_window_requested_ = true;
@@ -1874,6 +1907,7 @@ void EditorUi::begin_frame(
             ImGui::DockBuilderDockWindow("Renderer", right);
             ImGui::DockBuilderDockWindow("Landscape", right);
             ImGui::DockBuilderDockWindow("Audio & Input", right);
+            ImGui::DockBuilderDockWindow("Animation & Gameplay", right);
             ImGui::DockBuilderDockWindow("Assets", bottom);
             ImGui::DockBuilderDockWindow("Scene View", center);
             ImGui::DockBuilderFinish(dockspace_id);
@@ -1884,7 +1918,7 @@ void EditorUi::begin_frame(
     build_main_menu(scene);
     build_toolbar(scene);
     build_hierarchy(scene);
-    build_inspector(scene);
+    build_inspector(scene, renderer);
     build_viewport(scene, renderer, camera, now);
     build_assets(scene, renderer);
     build_landscape(scene, renderer);
@@ -1896,6 +1930,7 @@ void EditorUi::begin_frame(
     build_import_results();
     build_material_editor(renderer);
     build_audio_input_panel();
+    build_animation_gameplay_panel(scene, renderer);
     build_performance(scene, renderer, performance);
     build_external_game_window(now);
     process_file_commands(scene);
@@ -2341,6 +2376,12 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
             audio_input_ui_ != nullptr) {
             audio_input_ui_->open = !audio_input_open;
         }
+        if (ImGui::MenuItem(
+                "Animation & Gameplay",
+                nullptr,
+                animation_gameplay_panel_open_)) {
+            animation_gameplay_panel_open_ = !animation_gameplay_panel_open_;
+        }
         ImGui::Separator();
         if (ImGui::MenuItem("Reset editor layout")) {
             reset_layout_requested_ = true;
@@ -2668,7 +2709,79 @@ void EditorUi::build_hierarchy(SceneDocument& scene) {
     ImGui::End();
 }
 
-void EditorUi::build_inspector(SceneDocument& scene) {
+namespace {
+
+[[nodiscard]] bool edit_clip_name_field(
+    const char* const combo_id,
+    const char* const input_id,
+    std::array<char, 128U>& buffer,
+    const std::vector<AnimationClip>* const clips) {
+    bool modified = false;
+    if (clips != nullptr && !clips->empty()) {
+        const char* preview =
+            buffer[0] != '\0' ? buffer.data() : "(select clip)";
+        if (ImGui::BeginCombo(combo_id, preview)) {
+            for (const AnimationClip& clip : *clips) {
+                const bool selected =
+                    std::string_view(buffer.data()) == clip.name;
+                if (ImGui::Selectable(clip.name.c_str(), selected)) {
+                    std::array<char, 128U> next{};
+                    const std::size_t n =
+                        std::min(clip.name.size(), next.size() - 1U);
+                    std::memcpy(next.data(), clip.name.data(), n);
+                    buffer = next;
+                    modified = true;
+                }
+            }
+            ImGui::EndCombo();
+        }
+    }
+    if (ImGui::InputText(input_id, buffer.data(), buffer.size())) {
+        modified = true;
+    }
+    return modified;
+}
+
+[[nodiscard]] bool edit_bone_name_field(
+    const char* const combo_id,
+    const char* const input_id,
+    std::array<char, 64U>& buffer,
+    const CookedSkeletonAsset* const skeleton) {
+    bool modified = false;
+    if (skeleton != nullptr && !skeleton->bones.empty()) {
+        const char* preview =
+            buffer[0] != '\0' ? buffer.data() : "(none)";
+        if (ImGui::BeginCombo(combo_id, preview)) {
+            if (ImGui::Selectable("(none)", buffer[0] == '\0')) {
+                buffer.fill('\0');
+                modified = true;
+            }
+            for (const SkeletonBone& bone : skeleton->bones) {
+                const bool selected =
+                    std::string_view(buffer.data()) == bone.name;
+                if (ImGui::Selectable(bone.name.c_str(), selected)) {
+                    std::array<char, 64U> next{};
+                    const std::size_t n =
+                        std::min(bone.name.size(), next.size() - 1U);
+                    std::memcpy(next.data(), bone.name.data(), n);
+                    buffer = next;
+                    modified = true;
+                }
+            }
+            ImGui::EndCombo();
+        }
+    }
+    if (ImGui::InputText(input_id, buffer.data(), buffer.size())) {
+        modified = true;
+    }
+    return modified;
+}
+
+} // namespace
+
+void EditorUi::build_inspector(
+    SceneDocument& scene,
+    Renderer& renderer) {
     ImGui::SetNextWindowSize(
         ImVec2(340.0F, 570.0F), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Inspector")) {
@@ -3660,6 +3773,469 @@ void EditorUi::build_inspector(SceneDocument& scene) {
             }
         }
     }
+    if (node.kind == SceneNodeKind::model ||
+        scene.has_animator(selected_node_)) {
+        ui_kit_.section_header(EditorIcon::play, "Animator");
+        const CookedSkeletonAsset* const skeleton = !node.asset_path.empty()
+            ? renderer.find_model_skeleton(node.asset_path)
+            : nullptr;
+        const std::vector<AnimationClip>* const clips = !node.asset_path.empty()
+            ? renderer.find_model_animations(node.asset_path)
+            : nullptr;
+        if (skeleton != nullptr) {
+            char skel_badge[64]{};
+            std::snprintf(
+                skel_badge,
+                sizeof(skel_badge),
+                "%zu BONES  %zu CLIPS",
+                skeleton->bones.size(),
+                clips != nullptr ? clips->size() : 0U);
+            ui_kit_.badge(skel_badge, EditorTone::info);
+        } else {
+            ui_kit_.status_text(
+                "No skeleton loaded on model; CPU/MCP values will be stored.",
+                EditorTone::neutral);
+        }
+
+        if (const auto attached_anim = scene.animator(selected_node_)) {
+            AnimatorComponent edited_anim = attached_anim->get();
+            bool anim_changed = false;
+            bool remove_anim_requested = false;
+            if (ui_kit_.begin_property_grid("AnimatorProperties")) {
+                ui_kit_.property_row("Blend mode");
+                constexpr std::array<AnimatorBlendMode, 4U> kModes{
+                    AnimatorBlendMode::single_clip,
+                    AnimatorBlendMode::blend_space_1d,
+                    AnimatorBlendMode::blend_space_2d,
+                    AnimatorBlendMode::state_machine,
+                };
+                const auto mode_label =
+                    [](const AnimatorBlendMode m) -> const char* {
+                    switch (m) {
+                    case AnimatorBlendMode::single_clip: return "Single Clip";
+                    case AnimatorBlendMode::blend_space_1d:
+                        return "Blend Space 1D";
+                    case AnimatorBlendMode::blend_space_2d:
+                        return "Blend Space 2D";
+                    case AnimatorBlendMode::state_machine:
+                        return "State Machine";
+                    }
+                    return "Single Clip";
+                };
+                if (ImGui::BeginCombo(
+                        "##AnimatorBlendMode", mode_label(edited_anim.mode))) {
+                    for (const AnimatorBlendMode m : kModes) {
+                        const bool is_sel = edited_anim.mode == m;
+                        if (ImGui::Selectable(mode_label(m), is_sel)) {
+                            edited_anim.mode = m;
+                            anim_changed = true;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+
+                ui_kit_.property_row("Primary clip");
+                anim_changed |= edit_clip_name_field(
+                    "##AnimatorClipCombo",
+                    "##AnimatorClipInput",
+                    edited_anim.clip_name,
+                    clips);
+
+                ui_kit_.property_row("Secondary clip");
+                anim_changed |= edit_clip_name_field(
+                    "##AnimatorSecondaryCombo",
+                    "##AnimatorSecondaryInput",
+                    edited_anim.secondary_clip_name,
+                    clips);
+
+                ui_kit_.property_row("Upper-body bone");
+                anim_changed |= edit_bone_name_field(
+                    "##AnimatorUpperBoneCombo",
+                    "##AnimatorUpperBoneInput",
+                    edited_anim.upper_body_root_bone,
+                    skeleton);
+
+                ui_kit_.property_row("Upper weight");
+                anim_changed |= ImGui::SliderFloat(
+                    "##AnimatorUpperWeight",
+                    &edited_anim.upper_body_weight,
+                    0.0F,
+                    1.0F,
+                    "%.2f",
+                    ImGuiSliderFlags_AlwaysClamp);
+
+                ui_kit_.property_row("Upper additive");
+                anim_changed |= ImGui::Checkbox(
+                    "##AnimatorUpperAdditive",
+                    &edited_anim.upper_body_additive);
+
+                ui_kit_.property_row("Playing / Loop");
+                anim_changed |= ImGui::Checkbox(
+                    "Playing##AnimatorPlaying", &edited_anim.playing);
+                ImGui::SameLine();
+                anim_changed |= ImGui::Checkbox(
+                    "Loop##AnimatorLooping", &edited_anim.looping);
+
+                ui_kit_.property_row("Playback speed");
+                anim_changed |= ImGui::DragFloat(
+                    "##AnimatorSpeed",
+                    &edited_anim.playback_speed,
+                    0.05F,
+                    -10.0F,
+                    10.0F,
+                    "%.2fx");
+
+                ui_kit_.property_row("Blend X / Y");
+                anim_changed |= ImGui::DragFloat2(
+                    "##AnimatorBlendParams",
+                    &edited_anim.param_x,
+                    0.05F,
+                    -100.0F,
+                    100.0F,
+                    "%.2f");
+
+                ui_kit_.property_row("Root motion");
+                anim_changed |= ImGui::Checkbox(
+                    "##AnimatorRootMotion",
+                    &edited_anim.root_motion_enabled);
+
+                ui_kit_.property_row("Foot IK");
+                anim_changed |= ImGui::Checkbox(
+                    "Enable##AnimatorFootIk", &edited_anim.foot_ik_enabled);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                anim_changed |= ImGui::SliderFloat(
+                    "##AnimatorFootIkWeight",
+                    &edited_anim.foot_ik_weight,
+                    0.0F,
+                    1.0F,
+                    "%.2f",
+                    ImGuiSliderFlags_AlwaysClamp);
+
+                ui_kit_.property_row("Look-At IK");
+                anim_changed |= ImGui::Checkbox(
+                    "Enable##AnimatorLookAtIk", &edited_anim.look_at_ik_enabled);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                anim_changed |= ImGui::SliderFloat(
+                    "##AnimatorLookAtWeight",
+                    &edited_anim.look_at_ik_weight,
+                    0.0F,
+                    1.0F,
+                    "%.2f",
+                    ImGuiSliderFlags_AlwaysClamp);
+
+                anim_changed |= ui_kit_.drag_vec3(
+                    "##AnimatorLookTarget",
+                    "Look target",
+                    &edited_anim.look_at_target_world.x,
+                    0.05F,
+                    0.0F);
+
+                ui_kit_.property_row("Component");
+                if (ImGui::SmallButton("Remove animator")) {
+                    remove_anim_requested = true;
+                }
+                ui_kit_.end_property_grid();
+            }
+
+            if (remove_anim_requested) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                static_cast<void>(scene.remove_animator(selected_node_));
+                if (edit_animator_preview_ != nullptr) {
+                    edit_animator_preview_->clear_preview(selected_node_);
+                }
+                renderer.remove_skinned_model_pose(selected_node_);
+            } else if (anim_changed) {
+                edited_anim = sanitize_animator_component(edited_anim);
+                if (!inspector_edit_snapshot_) {
+                    inspector_edit_snapshot_ = scene;
+                    if (auto previous =
+                            inspector_edit_snapshot_->node(selected_node_)) {
+                        previous->get() = node_before_edit;
+                    }
+                }
+                static_cast<void>(
+                    scene.set_animator(selected_node_, edited_anim));
+            }
+
+            if (editable &&
+                edit_animator_preview_ != nullptr &&
+                clips != nullptr &&
+                !clips->empty()) {
+                const AnimatorNodeRuntime* const preview_rt =
+                    edit_animator_preview_->node_runtime(selected_node_);
+                float clip_duration = 1.0F;
+                for (const AnimationClip& clip : *clips) {
+                    if (clip.name == edited_anim.clip_name_view() ||
+                        (edited_anim.clip_name_view().empty() &&
+                         &clip == &clips->front())) {
+                        clip_duration = std::max(clip.duration_seconds, 0.05F);
+                        break;
+                    }
+                }
+                float scrub_t = preview_rt != nullptr
+                    ? std::clamp(preview_rt->current_time, 0.0F, clip_duration)
+                    : std::clamp(
+                          edited_anim.start_time_seconds, 0.0F, clip_duration);
+                const std::string_view active_clip =
+                    !edited_anim.clip_name_view().empty()
+                        ? edited_anim.clip_name_view()
+                        : std::string_view(clips->front().name);
+
+                if (ui_kit_.action_button(
+                        "PreviewAnimPlayButton",
+                        EditorIcon::play,
+                        "Preview Play",
+                        EditorButtonStyle::secondary,
+                        editable)) {
+                    edit_animator_preview_->set_preview(
+                        selected_node_, active_clip, true, scrub_t);
+                }
+                ImGui::SameLine();
+                if (ui_kit_.action_button(
+                        "PreviewAnimPauseButton",
+                        EditorIcon::pause,
+                        "Pause",
+                        EditorButtonStyle::secondary,
+                        editable)) {
+                    edit_animator_preview_->set_preview(
+                        selected_node_, active_clip, false, scrub_t);
+                }
+                ImGui::SameLine();
+                if (ui_kit_.action_button(
+                        "PreviewAnimStopButton",
+                        EditorIcon::stop,
+                        "Stop",
+                        EditorButtonStyle::secondary,
+                        editable)) {
+                    edit_animator_preview_->clear_preview(selected_node_);
+                    renderer.remove_skinned_model_pose(selected_node_);
+                }
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::SliderFloat(
+                        "##PreviewScrub",
+                        &scrub_t,
+                        0.0F,
+                        clip_duration,
+                        "Time %.2fs",
+                        ImGuiSliderFlags_AlwaysClamp)) {
+                    edit_animator_preview_->set_preview(
+                        selected_node_, active_clip, false, scrub_t);
+                }
+            }
+        } else {
+            if (ui_kit_.action_button(
+                    "AddAnimatorButton",
+                    EditorIcon::add,
+                    "Add Animator",
+                    EditorButtonStyle::secondary,
+                    editable)) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                AnimatorComponent initial{};
+                if (clips != nullptr && !clips->empty()) {
+                    static_cast<void>(
+                        initial.set_clip_name(clips->front().name));
+                }
+                static_cast<void>(scene.set_animator(selected_node_, initial));
+            }
+        }
+    }
+    {
+        ui_kit_.section_header(EditorIcon::cube, "Gameplay");
+        if (const auto attached_gp = scene.gameplay(selected_node_)) {
+            GameplayComponent edited_gp = attached_gp->get();
+            bool gp_changed = false;
+            bool remove_gp_requested = false;
+            if (ui_kit_.begin_property_grid("GameplayProperties")) {
+                ui_kit_.property_row("Enabled");
+                gp_changed |= ImGui::Checkbox(
+                    "Active##GameplayEnabled", &edited_gp.enabled);
+                ImGui::SameLine();
+                gp_changed |= ImGui::Checkbox(
+                    "Save state##GameplayPersist",
+                    &edited_gp.persist_save_state);
+
+                ui_kit_.property_row("Behavior");
+                constexpr std::array<const char*, 7U> kBehaviors{
+                    "patrol",
+                    "collectible",
+                    "health_pack",
+                    "door",
+                    "interactable",
+                    "trigger_zone",
+                    "destructible",
+                };
+                if (ImGui::BeginCombo(
+                        "##GameplayBehaviorCombo",
+                        edited_gp.behavior[0] != '\0'
+                            ? edited_gp.behavior.data()
+                            : "interactable")) {
+                    for (const char* const b : kBehaviors) {
+                        const bool is_sel =
+                            std::string_view(edited_gp.behavior.data()) == b;
+                        if (ImGui::Selectable(b, is_sel)) {
+                            static_cast<void>(edited_gp.set_behavior(b));
+                            gp_changed = true;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                gp_changed |= ImGui::InputText(
+                    "##GameplayBehaviorInput",
+                    edited_gp.behavior.data(),
+                    edited_gp.behavior.size());
+
+                ui_kit_.property_row("Tag");
+                gp_changed |= ImGui::InputText(
+                    "##GameplayTagInput",
+                    edited_gp.tag.data(),
+                    edited_gp.tag.size());
+
+                ui_kit_.property_row("Sound cue");
+                gp_changed |= ImGui::InputText(
+                    "##GameplaySoundCue",
+                    edited_gp.on_trigger_sound_cue.data(),
+                    edited_gp.on_trigger_sound_cue.size());
+
+                ui_kit_.property_row("Health / Max");
+                gp_changed |= ImGui::DragFloat2(
+                    "##GameplayHealthPair",
+                    &edited_gp.health,
+                    1.0F,
+                    0.0F,
+                    1'000'000.0F,
+                    "%.1f");
+
+                ui_kit_.property_row("Move speed");
+                gp_changed |= ImGui::DragFloat(
+                    "##GameplayMoveSpeed",
+                    &edited_gp.move_speed,
+                    0.1F,
+                    0.0F,
+                    1'000.0F,
+                    "%.2f m/s");
+
+                ui_kit_.property_row("Interact radius");
+                gp_changed |= ImGui::DragFloat(
+                    "##GameplayInteractRadius",
+                    &edited_gp.interaction_radius,
+                    0.05F,
+                    0.05F,
+                    1'000.0F,
+                    "%.2f m");
+
+                gp_changed |= ui_kit_.drag_vec3(
+                    "##GameplayPatrolA",
+                    "Patrol A",
+                    &edited_gp.patrol_point_a.x,
+                    0.05F,
+                    0.0F);
+                gp_changed |= ui_kit_.drag_vec3(
+                    "##GameplayPatrolB",
+                    "Patrol B",
+                    &edited_gp.patrol_point_b.x,
+                    0.05F,
+                    0.0F);
+
+                ui_kit_.property_row("Target UUID");
+                std::array<char, 40U> target_uuid_buf{};
+                if (edited_gp.target_node_uuid) {
+                    const std::string formatted =
+                        format_scene_uuid(edited_gp.target_node_uuid);
+                    const std::size_t n = std::min(
+                        formatted.size(), target_uuid_buf.size() - 1U);
+                    std::memcpy(target_uuid_buf.data(), formatted.data(), n);
+                }
+                if (ImGui::InputText(
+                        "##GameplayTargetUuid",
+                        target_uuid_buf.data(),
+                        target_uuid_buf.size(),
+                        ImGuiInputTextFlags_EnterReturnsTrue)) {
+                    const std::string_view typed(target_uuid_buf.data());
+                    if (typed.empty()) {
+                        edited_gp.target_node_uuid = {};
+                        gp_changed = true;
+                    } else if (const auto parsed = parse_scene_uuid(typed)) {
+                        edited_gp.target_node_uuid = *parsed;
+                        gp_changed = true;
+                    }
+                }
+                if (edited_gp.target_node_uuid) {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Clear##ClearTargetUuid")) {
+                        edited_gp.target_node_uuid = {};
+                        gp_changed = true;
+                    }
+                }
+
+                ui_kit_.property_row("Params 0 / 1");
+                gp_changed |= ImGui::DragFloat2(
+                    "##GameplayCustomParams",
+                    &edited_gp.custom_param_0,
+                    0.1F,
+                    -100'000.0F,
+                    100'000.0F,
+                    "%.2f");
+
+                ui_kit_.property_row("Component");
+                if (ImGui::SmallButton("Remove gameplay")) {
+                    remove_gp_requested = true;
+                }
+                ui_kit_.end_property_grid();
+            }
+
+            if (remove_gp_requested) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                static_cast<void>(scene.remove_gameplay(selected_node_));
+            } else if (gp_changed) {
+                edited_gp = sanitize_gameplay_component(edited_gp);
+                if (!valid_gameplay_component(edited_gp)) {
+                    edited_gp.on_trigger_sound_cue.fill('\0');
+                }
+                if (!inspector_edit_snapshot_) {
+                    inspector_edit_snapshot_ = scene;
+                    if (auto previous =
+                            inspector_edit_snapshot_->node(selected_node_)) {
+                        previous->get() = node_before_edit;
+                    }
+                }
+                static_cast<void>(
+                    scene.set_gameplay(selected_node_, edited_gp));
+            }
+        } else {
+            if (ui_kit_.action_button(
+                    "AddGameplayButton",
+                    EditorIcon::add,
+                    "Add Gameplay",
+                    EditorButtonStyle::secondary,
+                    editable)) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                GameplayComponent initial{};
+                static_cast<void>(initial.set_behavior("interactable"));
+                initial.patrol_point_a = node.transform.translation;
+                initial.patrol_point_b =
+                    node.transform.translation + glm::vec3(0.0F, 0.0F, 4.0F);
+                static_cast<void>(scene.set_gameplay(selected_node_, initial));
+            }
+        }
+    }
     {
         ui_kit_.section_header(EditorIcon::model, "Prefab");
         const SceneNodeId enclosing_root =
@@ -4131,6 +4707,75 @@ void draw_audio_wireframe(
     }
 }
 
+void draw_skeleton_wireframe(
+    ImDrawList* const draw_list,
+    const SceneDocument& scene,
+    const Renderer& renderer,
+    const AnimatorRuntimeSystem* const runtime,
+    const SceneNodeId selected_node,
+    const glm::mat4& view_projection,
+    const ImVec2 image_minimum,
+    const float image_width,
+    const float image_height,
+    std::vector<SkeletonDebugSegment>& segments_scratch) noexcept {
+    if (draw_list == nullptr || !scene.valid(selected_node) ||
+        image_width <= 1.0F || image_height <= 1.0F ||
+        runtime == nullptr) {
+        return;
+    }
+    const auto node_opt = scene.node(selected_node);
+    if (!node_opt || node_opt->get().kind != SceneNodeKind::model ||
+        node_opt->get().asset_path.empty()) {
+        return;
+    }
+    const CookedSkeletonAsset* const skeleton =
+        renderer.find_model_skeleton(node_opt->get().asset_path);
+    const auto world_opt = scene_world_matrix(scene, selected_node);
+    if (skeleton == nullptr || skeleton->bones.empty() || !world_opt) {
+        return;
+    }
+    const auto anim_comp = scene.animator(selected_node);
+    segments_scratch.clear();
+    runtime->collect_debug_skeleton_segments(
+        selected_node,
+        *world_opt,
+        *skeleton,
+        segments_scratch,
+        anim_comp ? &anim_comp->get() : nullptr);
+
+    const auto project_point = [&](const glm::vec3 world_pt,
+                                   ImVec2& out_screen) noexcept {
+        const glm::vec4 clip = view_projection * glm::vec4(world_pt, 1.0F);
+        if (!std::isfinite(clip.w) || clip.w <= 0.01F) {
+            return false;
+        }
+        const glm::vec3 ndc = glm::vec3(clip) / clip.w;
+        out_screen = ImVec2(
+            image_minimum.x + (ndc.x * 0.5F + 0.5F) * image_width,
+            image_minimum.y + (0.5F - ndc.y * 0.5F) * image_height);
+        return std::isfinite(out_screen.x) && std::isfinite(out_screen.y);
+    };
+
+    constexpr ImU32 bone_color = IM_COL32(86, 224, 180, 230);
+    constexpr ImU32 joint_color = IM_COL32(220, 255, 240, 240);
+    constexpr ImU32 ik_color = IM_COL32(255, 204, 64, 240);
+    for (const SkeletonDebugSegment& seg : segments_scratch) {
+        ImVec2 sa{};
+        ImVec2 sb{};
+        if (!project_point(seg.world_a, sa) ||
+            !project_point(seg.world_b, sb)) {
+            continue;
+        }
+        if (seg.is_ik_marker) {
+            draw_list->AddLine(sa, sb, ik_color, 1.75F);
+            draw_list->AddCircle(sb, 4.0F, ik_color, 12, 1.5F);
+        } else {
+            draw_list->AddLine(sa, sb, bone_color, 2.0F);
+            draw_list->AddCircleFilled(sb, 2.5F, joint_color, 8);
+        }
+    }
+}
+
 } // namespace
 
 void EditorUi::build_viewport(
@@ -4243,6 +4888,8 @@ void EditorUi::build_viewport(
             "Snap step. Hold Ctrl for temporary snapping.");
     }
     ImGui::EndDisabled();
+    ImGui::SameLine(0.0F, 14.0F);
+    static_cast<void>(ImGui::Checkbox("Skeleton", &show_skeleton_wireframe_));
 
     const ImVec2 available = ImGui::GetContentRegionAvail();
     const float dpi = std::max(
@@ -4384,6 +5031,25 @@ void EditorUi::build_viewport(
         image_minimum,
         image_width,
         image_height);
+    if (show_skeleton_wireframe_) {
+        const AnimatorRuntimeSystem* const runtime =
+            play_state_ != EditorPlayState::edit
+                ? (gameplay_session_ != nullptr
+                       ? &gameplay_session_->animator_runtime()
+                       : nullptr)
+                : edit_animator_preview_;
+        draw_skeleton_wireframe(
+            ImGui::GetWindowDrawList(),
+            scene,
+            renderer,
+            runtime,
+            selected_node_,
+            projection * view,
+            image_minimum,
+            image_width,
+            image_height,
+            skeleton_wireframe_scratch_);
+    }
 
     bool gizmo_over = false;
     bool gizmo_using = false;
@@ -6725,6 +7391,182 @@ void EditorUi::build_audio_input_panel() {
             ImGui::EndTable();
         }
     }
+    ImGui::End();
+}
+
+void EditorUi::build_animation_gameplay_panel(
+    SceneDocument& scene,
+    Renderer& renderer) {
+    if (!animation_gameplay_panel_open_) {
+        return;
+    }
+    ImGui::SetNextWindowSize(
+        ImVec2(420.0F, 560.0F), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin(
+            "Animation & Gameplay", &animation_gameplay_panel_open_)) {
+        ImGui::End();
+        return;
+    }
+    ui_kit_.panel_header(
+        EditorIcon::play,
+        "ANIMATION & GAMEPLAY",
+        "Skeletal runtime, gameplay behaviors, variables, and save/load");
+
+    const bool play_active =
+        play_state_ != EditorPlayState::edit &&
+        gameplay_session_ != nullptr &&
+        gameplay_session_->active();
+    const AnimatorRuntimeSystem* const anim_rt = play_active
+        ? &gameplay_session_->animator_runtime()
+        : edit_animator_preview_;
+
+    char anim_count_str[24]{};
+    char gp_count_str[24]{};
+    char skinned_count_str[24]{};
+    char hp_str[32]{};
+    std::snprintf(
+        anim_count_str,
+        sizeof(anim_count_str),
+        "%u",
+        scene.animators().size());
+    std::snprintf(
+        gp_count_str,
+        sizeof(gp_count_str),
+        "%u",
+        scene.gameplays().size());
+    std::snprintf(
+        skinned_count_str,
+        sizeof(skinned_count_str),
+        "%u",
+        renderer.skinning_active_node_count());
+    if (play_active) {
+        const GameplayWorld& gw = gameplay_session_->gameplay_world();
+        std::snprintf(
+            hp_str,
+            sizeof(hp_str),
+            "%.0f / %.0f",
+            gw.player_health(),
+            gw.player_max_health());
+    } else {
+        std::snprintf(hp_str, sizeof(hp_str), "Edit");
+    }
+
+    if (ImGui::BeginTable(
+            "AnimGameplayMetrics",
+            4,
+            ImGuiTableFlags_SizingStretchSame)) {
+        ImGui::TableNextColumn();
+        ui_kit_.metric_card(
+            "AnimCountCard", "ANIMATORS", anim_count_str, EditorTone::info);
+        ImGui::TableNextColumn();
+        ui_kit_.metric_card(
+            "SkinnedCard",
+            "SKINNED",
+            skinned_count_str,
+            EditorTone::success);
+        ImGui::TableNextColumn();
+        ui_kit_.metric_card(
+            "GameplayCountCard", "GAMEPLAY", gp_count_str, EditorTone::primary);
+        ImGui::TableNextColumn();
+        ui_kit_.metric_card(
+            "PlayerHpCard", "PLAYER HP", hp_str, EditorTone::neutral);
+        ImGui::EndTable();
+    }
+
+    ui_kit_.section_header(EditorIcon::save, "Save / Load Game State");
+    ui_kit_.badge(
+        play_active ? "F5 QUICKSAVE / F9 QUICKLOAD" : "START PLAY FOR SAVE/LOAD",
+        play_active ? EditorTone::success : EditorTone::neutral);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    static_cast<void>(ImGui::InputText(
+        "##SaveSlotPathInput",
+        save_slot_path_buf_.data(),
+        save_slot_path_buf_.size()));
+
+    if (ui_kit_.action_button(
+            "SaveGameStateButton",
+            EditorIcon::save,
+            "Save Game",
+            EditorButtonStyle::secondary,
+            play_active)) {
+        pending_quick_save_path_ = std::string(save_slot_path_buf_.data());
+    }
+    ImGui::SameLine();
+    if (ui_kit_.action_button(
+            "LoadGameStateButton",
+            EditorIcon::folder,
+            "Load Game",
+            EditorButtonStyle::secondary,
+            play_active)) {
+        pending_quick_load_path_ = std::string(save_slot_path_buf_.data());
+    }
+    if (!save_load_error_.empty()) {
+        ui_kit_.status_text(save_load_error_.c_str(), EditorTone::danger);
+    } else if (!save_load_status_.empty()) {
+        ui_kit_.status_text(save_load_status_.c_str(), EditorTone::success);
+    }
+
+    ui_kit_.section_header(EditorIcon::cube, "Gameplay Runtime");
+    if (play_active) {
+        const GameplayWorld& gw = gameplay_session_->gameplay_world();
+        char entity_badge[48]{};
+        std::snprintf(
+            entity_badge,
+            sizeof(entity_badge),
+            "%zu ENTITIES",
+            gw.entity_count());
+        ui_kit_.badge(entity_badge, EditorTone::info);
+
+        const auto vars = gw.variables();
+        if (!vars.empty()) {
+            if (ImGui::BeginTable(
+                    "GameplayVariablesTable",
+                    2,
+                    ImGuiTableFlags_BordersInnerH |
+                        ImGuiTableFlags_SizingStretchProp)) {
+                ImGui::TableSetupColumn("Variable", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, 90.0F);
+                ImGui::TableHeadersRow();
+                for (const auto& [var_name, var_value] : vars) {
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::TextUnformatted(var_name.c_str());
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::Text("%.2f", var_value);
+                }
+                ImGui::EndTable();
+            }
+        } else {
+            ui_kit_.status_text(
+                "No gameplay variables recorded yet.", EditorTone::neutral);
+        }
+
+        if (gw.event_log_count() > 0U) {
+            ui_kit_.section_header(EditorIcon::play, "Gameplay Events");
+            for (std::size_t i = 0U; i < gw.event_log_count(); ++i) {
+                const std::string_view entry = gw.event_log_entry(i);
+                ui_kit_.status_text(
+                    std::string(entry).c_str(), EditorTone::neutral);
+            }
+        }
+    } else {
+        ui_kit_.status_text(
+            "Enter Play (F5) to simulate patrol, triggers, doors, pickups, and Save/Load.",
+            EditorTone::neutral);
+    }
+
+    ui_kit_.section_header(EditorIcon::play, "Animation Events");
+    if (anim_rt != nullptr && anim_rt->event_log_count() > 0U) {
+        for (std::size_t i = 0U; i < anim_rt->event_log_count(); ++i) {
+            const std::string_view entry = anim_rt->event_log_entry(i);
+            ui_kit_.status_text(
+                std::string(entry).c_str(), EditorTone::neutral);
+        }
+    } else {
+        ui_kit_.status_text(
+            "No recent animation events.", EditorTone::neutral);
+    }
+
     ImGui::End();
 }
 

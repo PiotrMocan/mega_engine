@@ -122,6 +122,9 @@ struct MicroCardComponent {
     const std::uint32_t first = static_cast<std::uint32_t>(mesh.first_index);
     const std::uint32_t count = static_cast<std::uint32_t>(mesh.index_count);
     const std::uint32_t tri_count = count / 3U;
+    if (!model.skin_vertices.empty()) {
+        return false;
+    }
     if (tri_count < 512U) {
         return false;
     }
@@ -358,12 +361,45 @@ void optimize_model_geometry(CookedModelAsset &model) {
     }
     // Deduplicate complete tuples, never positions alone: UV/normal/tangent
     // seams and alpha coverage remain identical. All allocation is cold-path.
+    const bool has_skin =
+        !model.skin_vertices.empty() &&
+        model.skin_vertices.size() == model.vertices.size();
     std::vector<unsigned> remap(model.vertices.size());
-    const auto shared_count = meshopt_generateVertexRemap(remap.data(), model.indices.data(),
-        model.indices.size(), model.vertices.data(), model.vertices.size(), sizeof(CookedModelVertex));
+    std::size_t shared_count = 0U;
+    if (has_skin) {
+        const std::array<meshopt_Stream, 2U> streams{
+            meshopt_Stream{model.vertices.data(), sizeof(CookedModelVertex), sizeof(CookedModelVertex)},
+            meshopt_Stream{model.skin_vertices.data(), sizeof(CookedSkinVertex), sizeof(CookedSkinVertex)},
+        };
+        shared_count = meshopt_generateVertexRemapMulti(
+            remap.data(),
+            model.indices.data(),
+            model.indices.size(),
+            model.vertices.size(),
+            streams.data(),
+            streams.size());
+    } else {
+        shared_count = meshopt_generateVertexRemap(
+            remap.data(),
+            model.indices.data(),
+            model.indices.size(),
+            model.vertices.data(),
+            model.vertices.size(),
+            sizeof(CookedModelVertex));
+    }
     std::vector<CookedModelVertex> vertices(shared_count);
     meshopt_remapVertexBuffer(vertices.data(), model.vertices.data(), model.vertices.size(),
         sizeof(CookedModelVertex), remap.data());
+    std::vector<CookedSkinVertex> skin_vertices{};
+    if (has_skin) {
+        skin_vertices.resize(shared_count);
+        meshopt_remapVertexBuffer(
+            skin_vertices.data(),
+            model.skin_vertices.data(),
+            model.skin_vertices.size(),
+            sizeof(CookedSkinVertex),
+            remap.data());
+    }
     meshopt_remapIndexBuffer(model.indices.data(), model.indices.data(), model.indices.size(), remap.data());
 
     std::vector<std::pair<std::uint32_t, std::uint32_t>> ranges;
@@ -402,6 +438,16 @@ void optimize_model_geometry(CookedModelAsset &model) {
     std::vector<CookedModelVertex> ordered_vertices(shared_count);
     meshopt_remapVertexBuffer(ordered_vertices.data(), vertices.data(), shared_count,
         sizeof(CookedModelVertex), remap.data());
+    if (has_skin) {
+        std::vector<CookedSkinVertex> ordered_skin_vertices(shared_count);
+        meshopt_remapVertexBuffer(
+            ordered_skin_vertices.data(),
+            skin_vertices.data(),
+            shared_count,
+            sizeof(CookedSkinVertex),
+            remap.data());
+        model.skin_vertices = std::move(ordered_skin_vertices);
+    }
     meshopt_remapIndexBuffer(model.indices.data(), model.indices.data(), model.indices.size(), remap.data());
     model.vertices = std::move(ordered_vertices);
 }
@@ -582,6 +628,9 @@ void prepare_authored_model_lods(CookedModelAsset &model,
     model.vertices = std::move(shared_vertices);
     model.indices = std::move(indices);
     model.submeshes = std::move(submeshes);
+    model.skin_vertices.clear();
+    model.skeleton.bones.clear();
+    model.skeleton_relative_path.clear();
 }
 
 void prepare_model_lods(CookedModelAsset &model) {

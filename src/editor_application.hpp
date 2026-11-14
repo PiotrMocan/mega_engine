@@ -15,11 +15,13 @@
 
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <iosfwd>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace vcr {
@@ -55,6 +57,17 @@ private:
     void update_scene_snapshot();
     void update_window_title();
     void shutdown() noexcept;
+    [[nodiscard]] std::filesystem::path resolve_save_file_path(
+        std::string_view relative_path,
+        std::string& error) const;
+    [[nodiscard]] bool quick_save_gameplay(
+        std::string& out_relative_path,
+        std::string& error,
+        std::string_view relative_path = "saves/quicksave.vcrsave.json");
+    [[nodiscard]] bool quick_load_gameplay(
+        std::string& out_relative_path,
+        std::string& error,
+        std::string_view relative_path = "saves/quicksave.vcrsave.json");
 
     std::unique_ptr<SDL_Window, EditorWindowDeleter> window_{};
     VulkanContext context_{};
@@ -66,6 +79,7 @@ private:
     FlyCamera camera_{};
     FlyCamera edit_camera_before_play_{};
     GameplaySession gameplay_{};
+    AnimatorRuntimeSystem edit_animator_preview_{};
     std::vector<SceneGpuInstance> scene_instances_{};
     std::vector<SceneModelInstance> scene_models_{};
     std::vector<ScenePunctualLight> scene_lights_{};

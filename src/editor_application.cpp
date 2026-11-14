@@ -85,7 +85,8 @@ using Json = nlohmann::json;
 [[nodiscard]] Json scene_node_json(
     const SceneDocument& scene,
     const SceneNodeId id,
-    const std::optional<std::uint32_t> depth = std::nullopt) {
+    const std::optional<std::uint32_t> depth = std::nullopt,
+    const Renderer* const renderer = nullptr) {
     const auto node = scene.node(id);
     if (!node) {
         return Json::object();
@@ -218,6 +219,80 @@ using Json = nlohmann::json;
         };
     } else {
         result["reverb_zone"] = nullptr;
+    }
+    if (const auto anim = scene.animator(id)) {
+        const AnimatorComponent& a = anim->get();
+        result["animator"] = Json{
+            {"mode", to_token(a.mode)},
+            {"clip_name", std::string(a.clip_name_view())},
+            {"secondary_clip_name", std::string(a.secondary_clip_view())},
+            {"upper_body_root_bone", std::string(a.upper_body_bone_view())},
+            {"upper_body_weight", a.upper_body_weight},
+            {"upper_body_additive", a.upper_body_additive},
+            {"playback_speed", a.playback_speed},
+            {"start_time_seconds", a.start_time_seconds},
+            {"looping", a.looping},
+            {"playing", a.playing},
+            {"root_motion_enabled", a.root_motion_enabled},
+            {"foot_ik_enabled", a.foot_ik_enabled},
+            {"foot_ik_weight", a.foot_ik_weight},
+            {"look_at_ik_enabled", a.look_at_ik_enabled},
+            {"look_at_ik_weight", a.look_at_ik_weight},
+            {"look_at_target_world", vec3_json(a.look_at_target_world)},
+            {"param_x", a.param_x},
+            {"param_y", a.param_y},
+        };
+    } else {
+        result["animator"] = nullptr;
+    }
+    if (const auto gp = scene.gameplay(id)) {
+        const GameplayComponent& g = gp->get();
+        result["gameplay"] = Json{
+            {"enabled", g.enabled},
+            {"persist_save_state", g.persist_save_state},
+            {"behavior", std::string(g.behavior_view())},
+            {"tag", std::string(g.tag_view())},
+            {"on_trigger_sound_cue",
+             std::string(g.on_trigger_sound_cue_view())},
+            {"health", g.health},
+            {"max_health", g.max_health},
+            {"move_speed", g.move_speed},
+            {"interaction_radius", g.interaction_radius},
+            {"patrol_point_a", vec3_json(g.patrol_point_a)},
+            {"patrol_point_b", vec3_json(g.patrol_point_b)},
+            {"target_node_uuid",
+             static_cast<bool>(g.target_node_uuid)
+                 ? Json(format_scene_uuid(g.target_node_uuid))
+                 : Json(nullptr)},
+            {"custom_param_0", g.custom_param_0},
+            {"custom_param_1", g.custom_param_1},
+        };
+    } else {
+        result["gameplay"] = nullptr;
+    }
+    if (renderer != nullptr &&
+        value.kind == SceneNodeKind::model &&
+        !value.asset_path.empty()) {
+        if (const CookedSkeletonAsset* const skel =
+                renderer->find_model_skeleton(value.asset_path)) {
+            const std::vector<AnimationClip>* const clips =
+                renderer->find_model_animations(value.asset_path);
+            Json clip_names = Json::array();
+            if (clips != nullptr) {
+                for (const AnimationClip& c : *clips) {
+                    clip_names.push_back(c.name);
+                }
+            }
+            result["skeleton"] = Json{
+                {"bone_count", skel->bones.size()},
+                {"clip_count", clips != nullptr ? clips->size() : 0U},
+                {"clips", std::move(clip_names)},
+            };
+        } else {
+            result["skeleton"] = nullptr;
+        }
+    } else {
+        result["skeleton"] = nullptr;
     }
     if (depth) {
         result["depth"] = *depth;
@@ -718,7 +793,9 @@ void EditorApplication::initialize(const CliOptions& options) {
         renderer_,
         &audio_engine_,
         &input_actions_,
-        options.project_path);
+        options.project_path,
+        &gameplay_,
+        &edit_animator_preview_);
     camera_ = scene_startup_camera(scene_, options.camera_z_explicit
         ? std::optional<double>(options.camera_z) : std::nullopt);
     edit_camera_before_play_ = camera_;
@@ -820,6 +897,26 @@ void EditorApplication::main_loop() {
             }
         }
         synchronize_gameplay_state();
+        if (auto save_rel = ui_.consume_quick_save_request()) {
+            std::string saved_path;
+            std::string save_err;
+            if (quick_save_gameplay(saved_path, save_err, *save_rel)) {
+                ui_.report_save_load_feedback(
+                    "Saved game state to " + saved_path, {});
+            } else {
+                ui_.report_save_load_feedback({}, std::move(save_err));
+            }
+        }
+        if (auto load_rel = ui_.consume_quick_load_request()) {
+            std::string loaded_path;
+            std::string load_err;
+            if (quick_load_gameplay(loaded_path, load_err, *load_rel)) {
+                ui_.report_save_load_feedback(
+                    "Loaded game state from " + loaded_path, {});
+            } else {
+                ui_.report_save_load_feedback({}, std::move(load_err));
+            }
+        }
         renderer_.set_lighting_paused(
             ui_.play_state() == EditorPlayState::paused);
         audio_engine_.set_gameplay_paused(
@@ -832,6 +929,17 @@ void EditorApplication::main_loop() {
             if (ui_.play_state() == EditorPlayState::edit) {
                 camera_.update(
                     ui_.camera_input(), delta_seconds);
+                const SkeletalAssetProvider skeletal_provider =
+                    make_renderer_skeletal_provider(&renderer_);
+                edit_animator_preview_.update(
+                    delta_seconds,
+                    scene_,
+                    nullptr,
+                    nullptr,
+                    skeletal_provider,
+                    audio_engine_.initialized() ? &audio_engine_ : nullptr,
+                    {},
+                    true);
                 audio_engine_.set_listener(AudioListenerState{
                     .position = camera_.position(),
                     .forward = camera_.forward(),
@@ -839,6 +947,9 @@ void EditorApplication::main_loop() {
                 });
             }
             audio_engine_.update(delta_seconds);
+        }
+        if (renderer_.editor_scene_needs_sync()) {
+            update_scene_snapshot();
         }
         ImDrawData* const draw_data = ui_.end_frame();
 
@@ -878,6 +989,10 @@ void EditorApplication::synchronize_gameplay_state() {
 
     if (observed_play_state_ == EditorPlayState::edit &&
         requested_state != EditorPlayState::edit) {
+        const SkeletalAssetProvider skeletal_provider =
+            make_renderer_skeletal_provider(&renderer_);
+        edit_animator_preview_.clear(&skeletal_provider);
+        renderer_.clear_skinned_model_poses();
         edit_camera_before_play_ = camera_;
         const SceneRenderView initial_view = scene_.build_render_view(
             scene_instances_, scene_models_, scene_lights_);
@@ -905,8 +1020,12 @@ void EditorApplication::synchronize_gameplay_state() {
         }
         submitted_scene_revision_ = 0U;
     } else if (requested_state == EditorPlayState::edit) {
-        gameplay_.stop(audio_engine_.initialized() ? &audio_engine_ : nullptr);
+        gameplay_.stop(
+            audio_engine_.initialized() ? &audio_engine_ : nullptr,
+            &renderer_);
         camera_ = edit_camera_before_play_;
+        submitted_scene_revision_ = 0U;
+        renderer_.invalidate_editor_scene();
     }
 
     observed_play_state_ = requested_state;
@@ -952,7 +1071,125 @@ void EditorApplication::process_event(
          event.type == SDL_EVENT_WINDOW_RESIZED) &&
         event.window.windowID == main_window_id_) {
         renderer_.request_resize();
+        return;
     }
+    if (event.type == SDL_EVENT_KEY_DOWN &&
+        !event.key.repeat &&
+        ui_.play_state() == EditorPlayState::playing &&
+        (ImGui::GetCurrentContext() == nullptr ||
+         !ImGui::GetIO().WantTextInput)) {
+        if (event.key.key == SDLK_F5 &&
+            (event.key.mod & SDL_KMOD_SHIFT) == 0) {
+            std::string saved_path;
+            std::string save_error;
+            if (quick_save_gameplay(saved_path, save_error)) {
+                ui_.report_save_load_feedback(
+                    "Saved game state to " + saved_path, {});
+            } else {
+                ui_.report_save_load_feedback({}, save_error);
+                ui_.report_asset_error(std::move(save_error));
+            }
+        } else if (event.key.key == SDLK_F9) {
+            std::string loaded_path;
+            std::string load_error;
+            if (quick_load_gameplay(loaded_path, load_error)) {
+                ui_.report_save_load_feedback(
+                    "Loaded game state from " + loaded_path, {});
+            } else {
+                ui_.report_save_load_feedback({}, load_error);
+                ui_.report_asset_error(std::move(load_error));
+            }
+        }
+    }
+}
+
+std::filesystem::path EditorApplication::resolve_save_file_path(
+    const std::string_view relative_path,
+    std::string& error) const {
+    error.clear();
+    if (ui_.asset_root().empty()) {
+        error = "Editor asset root is unavailable for save files.";
+        return {};
+    }
+    if (relative_path.empty() ||
+        relative_path.size() > 255U ||
+        !relative_path.ends_with(".vcrsave.json") ||
+        relative_path.front() == '/' ||
+        relative_path.front() == '\\' ||
+        relative_path.find('\\') != std::string_view::npos ||
+        relative_path.find(':') != std::string_view::npos) {
+        error =
+            "Save path must be a relative .vcrsave.json path with forward slashes.";
+        return {};
+    }
+    std::size_t seg_start = 0U;
+    for (std::size_t i = 0U; i <= relative_path.size(); ++i) {
+        if (i != relative_path.size() && relative_path[i] != '/') {
+            continue;
+        }
+        const std::string_view seg =
+            relative_path.substr(seg_start, i - seg_start);
+        if (seg.empty() || seg == "." || seg == "..") {
+            error = "Save path must not contain empty or parent segments.";
+            return {};
+        }
+        seg_start = i + 1U;
+    }
+    std::filesystem::path resolved = ui_.asset_root();
+    for (std::size_t pos = 0U; pos < relative_path.size();) {
+        const std::size_t slash = relative_path.find('/', pos);
+        const std::string_view seg = slash == std::string_view::npos
+            ? relative_path.substr(pos)
+            : relative_path.substr(pos, slash - pos);
+        resolved /= std::filesystem::path(seg);
+        if (slash == std::string_view::npos) {
+            break;
+        }
+        pos = slash + 1U;
+    }
+    return resolved;
+}
+
+bool EditorApplication::quick_save_gameplay(
+    std::string& out_relative_path,
+    std::string& error,
+    const std::string_view relative_path) {
+    out_relative_path.clear();
+    if (!gameplay_.active()) {
+        error = "Quick Save requires an active Play session.";
+        return false;
+    }
+    const std::filesystem::path full_path =
+        resolve_save_file_path(relative_path, error);
+    if (full_path.empty()) {
+        return false;
+    }
+    if (!gameplay_.save_game_state(full_path, error)) {
+        return false;
+    }
+    out_relative_path.assign(relative_path);
+    return true;
+}
+
+bool EditorApplication::quick_load_gameplay(
+    std::string& out_relative_path,
+    std::string& error,
+    const std::string_view relative_path) {
+    out_relative_path.clear();
+    if (!gameplay_.active()) {
+        error = "Quick Load requires an active Play session.";
+        return false;
+    }
+    const std::filesystem::path full_path =
+        resolve_save_file_path(relative_path, error);
+    if (full_path.empty()) {
+        return false;
+    }
+    if (!gameplay_.load_game_state(full_path, scene_, renderer_, camera_, error)) {
+        return false;
+    }
+    out_relative_path.assign(relative_path);
+    return true;
 }
 
 void EditorApplication::process_mcp_commands() {
@@ -1019,8 +1256,32 @@ void EditorApplication::execute_mcp_command(
                 {"audio_source_count", scene_.audio_sources().size()},
                 {"audio_listener_count", scene_.audio_listeners().size()},
                 {"reverb_zone_count", scene_.reverb_zones().size()},
+                {"animator_count", scene_.animators().size()},
+                {"gameplay_count", scene_.gameplays().size()},
+                {"skinned_active_nodes", renderer_.skinning_active_node_count()},
                 {"prefab_instance_count", scene_.prefab_instances().size()},
                 {"audio", audio_engine_state_json(audio_engine_)},
+                {"animation_gameplay", Json{
+                    {"animator_count", scene_.animators().size()},
+                    {"gameplay_count", scene_.gameplays().size()},
+                    {"skinned_active_nodes",
+                     renderer_.skinning_active_node_count()},
+                    {"gameplay_active", gameplay_.active()},
+                    {"entity_count",
+                     gameplay_.active()
+                         ? gameplay_.gameplay_world().entity_count()
+                         : 0U},
+                    {"player_health",
+                     gameplay_.active()
+                         ? gameplay_.gameplay_world().player_health()
+                         : 0.0F},
+                    {"player_max_health",
+                     gameplay_.active()
+                         ? gameplay_.gameplay_world().player_max_health()
+                         : 0.0F},
+                    {"edit_preview_nodes",
+                     edit_animator_preview_.active_node_count()},
+                }},
                 {"local_light_count", scene_.local_light_count()},
                 {"local_light_backend_requested",
                  to_token(renderer_.local_light_backend())},
@@ -1199,7 +1460,7 @@ void EditorApplication::execute_mcp_command(
         Json nodes = Json::array();
         for (std::size_t index = begin; index < end; ++index) {
             nodes.push_back(scene_node_json(
-                scene_, rows[index].id, rows[index].depth));
+                scene_, rows[index].id, rows[index].depth, &renderer_));
         }
         succeed(
             "scene node page",
@@ -1220,7 +1481,7 @@ void EditorApplication::execute_mcp_command(
         }
         succeed(
             "scene node found by UUID",
-            Json{{"node", scene_node_json(scene_, found)}});
+            Json{{"node", scene_node_json(scene_, found, std::nullopt, &renderer_)}});
         return;
     }
     case McpCommandType::editor_set_collider: {
@@ -1569,6 +1830,241 @@ void EditorApplication::execute_mcp_command(
             });
         return;
     }
+    case McpCommandType::editor_set_animator: {
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!valid_animator_component(command.animator)) {
+            fail("animator component values are outside engine bounds");
+            return;
+        }
+        if (const auto existing = scene_.animator(command.node_id);
+            existing && existing->get() == command.animator) {
+            succeed(
+                "animator component already matches",
+                Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        if (!scene_.set_animator(command.node_id, command.animator)) {
+            fail("unable to attach animator component");
+            return;
+        }
+        succeed(
+            "animator component updated",
+            Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                 {"changed", true}});
+        return;
+    }
+    case McpCommandType::editor_remove_animator:
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!scene_.has_animator(command.node_id)) {
+            succeed(
+                "node has no animator component",
+                Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        static_cast<void>(scene_.remove_animator(command.node_id));
+        edit_animator_preview_.clear_preview(command.node_id);
+        renderer_.remove_skinned_model_pose(command.node_id);
+        succeed(
+            "animator component removed",
+            Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                 {"changed", true}});
+        return;
+    case McpCommandType::editor_animation_preview: {
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("animation preview override is only active in Edit mode");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (command.preview_stop) {
+            edit_animator_preview_.clear_preview(command.node_id);
+            renderer_.remove_skinned_model_pose(command.node_id);
+            succeed(
+                "animation preview stopped",
+                Json{
+                    {"preview_active",
+                     edit_animator_preview_.has_active_preview(command.node_id)},
+                    {"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                });
+            return;
+        }
+        if (command.preview_params_supplied) {
+            edit_animator_preview_.set_param_override(
+                command.node_id,
+                command.animator.param_x,
+                command.animator.param_y);
+        }
+        edit_animator_preview_.set_preview(
+            command.node_id,
+            command.text.data(),
+            command.enabled,
+            command.preview_time_seconds);
+        const SkeletalAssetProvider provider =
+            make_renderer_skeletal_provider(&renderer_);
+        edit_animator_preview_.update(
+            0.0F, scene_, nullptr, nullptr, provider, nullptr, {}, true);
+        const AnimatorNodeRuntime* const rt =
+            edit_animator_preview_.node_runtime(command.node_id);
+        succeed(
+            "animation preview updated",
+            Json{
+                {"preview_active",
+                 edit_animator_preview_.has_active_preview(command.node_id)},
+                {"playing", command.enabled},
+                {"current_time", rt != nullptr ? rt->current_time : 0.0F},
+                {"normalized_phase", rt != nullptr ? rt->normalized_phase : 0.0F},
+                {"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+            });
+        return;
+    }
+    case McpCommandType::editor_set_gameplay: {
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!valid_gameplay_component(command.gameplay)) {
+            fail("gameplay component values are outside engine bounds");
+            return;
+        }
+        if (const auto existing = scene_.gameplay(command.node_id);
+            existing && existing->get() == command.gameplay) {
+            succeed(
+                "gameplay component already matches",
+                Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        if (!scene_.set_gameplay(command.node_id, command.gameplay)) {
+            fail("unable to attach gameplay component");
+            return;
+        }
+        succeed(
+            "gameplay component updated",
+            Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                 {"changed", true}});
+        return;
+    }
+    case McpCommandType::editor_remove_gameplay:
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!scene_.has_gameplay(command.node_id)) {
+            succeed(
+                "node has no gameplay component",
+                Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        static_cast<void>(scene_.remove_gameplay(command.node_id));
+        succeed(
+            "gameplay component removed",
+            Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                 {"changed", true}});
+        return;
+    case McpCommandType::editor_gameplay_save_or_load: {
+        if (command.gameplay_io_action == 2U) {
+            if (ui_.play_state() == EditorPlayState::edit) {
+                ui_.start_play(scene_);
+                synchronize_gameplay_state();
+            }
+            if (!gameplay_.active()) {
+                fail("unable to start Play session");
+                return;
+            }
+            succeed(
+                "play mode active",
+                Json{
+                    {"action", "start_play"},
+                    {"mode", "playing"},
+                    {"gameplay_active", true},
+                    {"entity_count", gameplay_.gameplay_world().entity_count()},
+                    {"player_health", gameplay_.gameplay_world().player_health()},
+                });
+            return;
+        }
+        if (command.gameplay_io_action == 3U) {
+            if (ui_.play_state() != EditorPlayState::edit) {
+                ui_.stop_play(scene_);
+                synchronize_gameplay_state();
+            }
+            succeed(
+                "play mode stopped",
+                Json{
+                    {"action", "stop_play"},
+                    {"mode", "edit"},
+                    {"gameplay_active", gameplay_.active()},
+                });
+            return;
+        }
+        std::string resolved_rel;
+        std::string io_error;
+        if (command.gameplay_io_action == 0U) {
+            if (!quick_save_gameplay(
+                    resolved_rel, io_error, command.text.data())) {
+                ui_.report_save_load_feedback({}, io_error);
+                fail(std::move(io_error));
+                return;
+            }
+            ui_.report_save_load_feedback(
+                "Saved game state to " + resolved_rel, {});
+            succeed(
+                "game state saved",
+                Json{
+                    {"action", "save"},
+                    {"path", resolved_rel},
+                    {"entity_count", gameplay_.gameplay_world().entity_count()},
+                    {"player_health", gameplay_.gameplay_world().player_health()},
+                });
+            return;
+        }
+        if (!quick_load_gameplay(resolved_rel, io_error, command.text.data())) {
+            ui_.report_save_load_feedback({}, io_error);
+            fail(std::move(io_error));
+            return;
+        }
+        ui_.report_save_load_feedback(
+            "Loaded game state from " + resolved_rel, {});
+        succeed(
+            "game state loaded",
+            Json{
+                {"action", "load"},
+                {"path", resolved_rel},
+                {"entity_count", gameplay_.gameplay_world().entity_count()},
+                {"player_health", gameplay_.gameplay_world().player_health()},
+            });
+        return;
+    }
     case McpCommandType::editor_prefab_save: {
         if (ui_.play_state() != EditorPlayState::edit) {
             fail("scene editing is locked during Play");
@@ -1690,7 +2186,7 @@ void EditorApplication::execute_mcp_command(
         }
         succeed(
             "scene node",
-            Json{{"node", scene_node_json(scene_, command.node_id)}});
+            Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)}});
         return;
     case McpCommandType::editor_create_node: {
         if (ui_.play_state() != EditorPlayState::edit) {
@@ -2420,7 +2916,8 @@ void EditorApplication::complete_mcp_screenshot() {
 
 void EditorApplication::update_scene_snapshot() {
     if (submitted_scene_revision_ ==
-        scene_.content_revision()) {
+            scene_.content_revision() &&
+        !renderer_.editor_scene_needs_sync()) {
         return;
     }
     const SceneRenderView view =
@@ -2481,7 +2978,10 @@ void EditorApplication::shutdown() noexcept {
     running_ = false;
     mcp_server_.stop();
     pending_screenshot_token_ = 0U;
-    gameplay_.stop(audio_engine_.initialized() ? &audio_engine_ : nullptr);
+    edit_animator_preview_.clear(nullptr);
+    gameplay_.stop(
+        audio_engine_.initialized() ? &audio_engine_ : nullptr,
+        &renderer_);
     ui_.shutdown();
     audio_engine_.shutdown();
     input_actions_.set_hardware_polling_enabled(false);

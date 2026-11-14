@@ -96,6 +96,7 @@ public:
 
     void reset(float yaw_radians) noexcept;
     void rotate(float mouse_delta_x, float mouse_delta_y) noexcept;
+    void set_angles(float yaw_radians, float pitch_radians) noexcept;
 
     [[nodiscard]] glm::vec3 forward() const noexcept;
     [[nodiscard]] glm::vec3 planar_forward() const noexcept;

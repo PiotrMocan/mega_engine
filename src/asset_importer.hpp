@@ -32,6 +32,8 @@ enum class ImportedAssetKind : std::uint8_t {
     texture,
     audio,
     mesh_binary,
+    skeleton,
+    animation,
     source,
 };
 

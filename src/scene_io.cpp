@@ -1,4 +1,5 @@
 #include "scene_io.hpp"
+#include "scene_component_json.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -943,7 +944,7 @@ bool save_scene_file(
         }
         if (record.collider || record.rigid_body || record.prefab_instance ||
             record.audio_source || record.audio_listener ||
-            record.reverb_zone) {
+            record.reverb_zone || record.animator || record.gameplay) {
             Json components = Json::object();
             if (record.collider) {
                 components["collider"] = collider_json(*record.collider);
@@ -966,6 +967,14 @@ bool save_scene_file(
             if (record.reverb_zone) {
                 components["reverb_zone"] =
                     reverb_zone_json(*record.reverb_zone);
+            }
+            if (record.animator) {
+                components["animator"] =
+                    component_json::animator_to_json(*record.animator);
+            }
+            if (record.gameplay) {
+                components["gameplay"] =
+                    component_json::gameplay_to_json(*record.gameplay);
             }
             encoded["components"] = std::move(components);
         }
@@ -1354,6 +1363,8 @@ bool load_scene_file(
             std::optional<AudioSourceComponent> parsed_audio_source{};
             std::optional<AudioListenerComponent> parsed_audio_listener{};
             std::optional<AudioReverbZoneComponent> parsed_reverb_zone{};
+            std::optional<AnimatorComponent> parsed_animator{};
+            std::optional<GameplayComponent> parsed_gameplay{};
             if (encoded.contains("components")) {
                 const Json& components = encoded["components"];
                 if (!components.is_object()) {
@@ -1366,7 +1377,9 @@ bool load_scene_file(
                         component_key != "prefab_instance" &&
                         component_key != "audio_source" &&
                         component_key != "audio_listener" &&
-                        component_key != "reverb_zone") {
+                        component_key != "reverb_zone" &&
+                        component_key != "animator" &&
+                        component_key != "gameplay") {
                         error = "Scene node contains an unknown component.";
                         return false;
                     }
@@ -1427,6 +1440,24 @@ bool load_scene_file(
                     }
                     parsed_reverb_zone = rz_value;
                 }
+                if (components.contains("animator")) {
+                    AnimatorComponent anim_value{};
+                    if (!component_json::read_animator_json(
+                            components["animator"], anim_value)) {
+                        error = "Scene node animator component is invalid.";
+                        return false;
+                    }
+                    parsed_animator = anim_value;
+                }
+                if (components.contains("gameplay")) {
+                    GameplayComponent gp_value{};
+                    if (!component_json::read_gameplay_json(
+                            components["gameplay"], gp_value)) {
+                        error = "Scene node gameplay component is invalid.";
+                        return false;
+                    }
+                    parsed_gameplay = gp_value;
+                }
             }
             const SceneNodeId id = parsed_uuid
                 ? loaded.create_node_with_uuid(name, *kind, *parsed_uuid, parent_id)
@@ -1463,6 +1494,16 @@ bool load_scene_file(
             if (parsed_reverb_zone &&
                 !loaded.set_reverb_zone(id, *parsed_reverb_zone)) {
                 error = "Unable to attach scene reverb_zone component.";
+                return false;
+            }
+            if (parsed_animator &&
+                !loaded.set_animator(id, *parsed_animator)) {
+                error = "Unable to attach scene animator component.";
+                return false;
+            }
+            if (parsed_gameplay &&
+                !loaded.set_gameplay(id, *parsed_gameplay)) {
+                error = "Unable to attach scene gameplay component.";
                 return false;
             }
             auto node = loaded.node(id);

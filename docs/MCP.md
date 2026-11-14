@@ -13,8 +13,10 @@ build\windows-debug\bin\vulkan_editor.exe --mcp-stdio --no-validation
 | --- | --- |
 | `editor` | `get_state` |
 | `editor.selection` | `set` |
-| `editor.scene` | `list_nodes`, `get_node`, `find_by_uuid`, `create_node`, `update_node`, `delete_node`, `reparent_node`, `duplicate_node`, `set_collider`, `remove_collider`, `set_rigid_body`, `remove_rigid_body`, `set_audio_source`, `remove_audio_source`, `set_audio_listener`, `remove_audio_listener`, `set_reverb_zone`, `remove_reverb_zone`, `save` |
+| `editor.scene` | `list_nodes`, `get_node`, `find_by_uuid`, `create_node`, `update_node`, `delete_node`, `reparent_node`, `duplicate_node`, `set_collider`, `remove_collider`, `set_rigid_body`, `remove_rigid_body`, `set_audio_source`, `remove_audio_source`, `set_audio_listener`, `remove_audio_listener`, `set_reverb_zone`, `remove_reverb_zone`, `set_animator`, `remove_animator`, `set_gameplay`, `remove_gameplay`, `save` |
 | `editor.audio` | `set_bus`, `preview` |
+| `editor.animation` | `preview` |
+| `editor.gameplay` | `save_or_load` |
 | `editor.prefab` | `save`, `instantiate`, `unpack` |
 | `editor.camera` | `focus_selection` |
 | `editor.history` | `undo`, `redo` |
@@ -44,6 +46,13 @@ handle нужно считать недействительным и снова 
 `set_reverb_zone` / `remove_reverb_zone`, а живой микшер и предпрослушивание —
 через `editor.audio.set_bus` и `editor.audio.preview`; их счётчики и телеметрия
 5 шин (`master`, `music`, `sfx`, `voice`, `ui`) публикуются в `editor.get_state`.
+Скелетная анимация и геймплей управляются через `editor.scene.set_animator` /
+`remove_animator`, `editor.animation.preview` (play/pause/scrub/stop в Edit mode),
+`editor.scene.set_gameplay` / `remove_gameplay` и `editor.gameplay.save_or_load`
+(`start_play`, `stop_play`, `save` / `load` sandboxed `*.vcrsave.json`); ответы
+`get_node`/`list_nodes` содержат `animator`, `gameplay` и метаданные `skeleton`
+(кости/клипы/ skinned флаг), а `editor.get_state` публикует `animator_count`,
+`gameplay_count`, `skinned_active_nodes` и блок `animation_gameplay`.
 
 Нативный smoke editor-profile:
 
@@ -165,7 +174,7 @@ Active blur поддерживает AA Off/SMAA1 и FSR Native. Для SMAA о�
 edge detection, для FSR Native — после upscale. MSAA, SMAA T2x и scaled FSR
 возвращают ошибку совместимости. HUD/editor компонуются после blur. Пауза больше
 250 ms, camera cut или смена настроек сбрасывают temporal state. Runtime/editor
-smoke inventories содержат 31/43 tools.
+smoke inventories содержат 31/49 tools.
 
 ### Screenshot
 

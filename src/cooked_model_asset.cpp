@@ -1679,6 +1679,145 @@ CookedModelLoadResult load_cooked_model_asset(
             metadata, model_file.absolute, asset)) {
         return CookedModelLoadResult(std::move(*collision_error));
     }
+    if (const auto skel_it = metadata.find("skeleton"); skel_it != metadata.end()) {
+        if (!skel_it->is_string()) {
+            return fail(
+                CookedModelLoadErrorCode::invalid_json,
+                "Model skeleton reference must be a string.",
+                model_file.absolute);
+        }
+        const std::string skel_ref = skel_it->get<std::string>();
+        if (skel_ref.empty() || skel_ref.size() > options.maximum_reference_bytes) {
+            return fail(
+                CookedModelLoadErrorCode::invalid_path,
+                "Model skeleton reference length is invalid.",
+                model_file.absolute);
+        }
+        const std::filesystem::path authored_skel_ref(skel_ref);
+        if (path_escapes_root(authored_skel_ref)) {
+            return fail(
+                CookedModelLoadErrorCode::invalid_path,
+                "Model skeleton reference contains traversal or is absolute.",
+                authored_skel_ref);
+        }
+        const std::filesystem::path skel_relative =
+            (asset_directory / authored_skel_ref).lexically_normal();
+        ResolvedAssetFile skel_file;
+        if (auto error = resolve_asset_file(canonical_root, skel_relative, skel_file)) {
+            return CookedModelLoadResult(std::move(*error));
+        }
+        if (!has_suffix(skel_file.relative, ".vcrskin")) {
+            return fail(
+                CookedModelLoadErrorCode::invalid_path,
+                "Model skeleton must use .vcrskin.",
+                skel_file.relative);
+        }
+        std::string skin_error;
+        if (!load_cooked_skin_file(
+                skel_file.absolute,
+                asset.skeleton,
+                asset.skin_vertices,
+                skin_error,
+                options.maximum_mesh_file_bytes,
+                options.maximum_vertices)) {
+            return fail(
+                CookedModelLoadErrorCode::invalid_mesh,
+                std::move(skin_error),
+                skel_file.absolute);
+        }
+        if (asset.skin_vertices.size() != asset.vertices.size()) {
+            return fail(
+                CookedModelLoadErrorCode::invalid_mesh,
+                "Cooked skin vertex count does not match mesh vertex count.",
+                skel_file.absolute);
+        }
+        asset.skeleton_relative_path = skel_file.relative;
+    }
+
+    if (const auto anims_it = metadata.find("animations"); anims_it != metadata.end()) {
+        if (!anims_it->is_array()) {
+            return fail(
+                CookedModelLoadErrorCode::invalid_json,
+                "Model animations metadata must be an array.",
+                model_file.absolute);
+        }
+        asset.animation_refs.reserve(anims_it->size());
+        asset.animations.reserve(anims_it->size());
+        for (const Json& anim_entry : *anims_it) {
+            std::string clip_name;
+            std::string anim_ref;
+            if (!anim_entry.is_object() ||
+                !json_string(anim_entry, "path", options.maximum_reference_bytes, anim_ref)) {
+                return fail(
+                    CookedModelLoadErrorCode::invalid_json,
+                    "Animation entry must be an object with a valid path.",
+                    model_file.absolute);
+            }
+            if (anim_entry.contains("name") &&
+                !json_string(anim_entry, "name", options.maximum_name_bytes, clip_name)) {
+                return fail(
+                    CookedModelLoadErrorCode::invalid_json,
+                    "Animation clip name must be a non-empty string.",
+                    model_file.absolute);
+            }
+            const std::filesystem::path authored_anim_ref(anim_ref);
+            if (path_escapes_root(authored_anim_ref)) {
+                return fail(
+                    CookedModelLoadErrorCode::invalid_path,
+                    "Animation path contains traversal or is absolute.",
+                    authored_anim_ref);
+            }
+            const std::filesystem::path anim_relative =
+                (asset_directory / authored_anim_ref).lexically_normal();
+            ResolvedAssetFile anim_file;
+            if (auto error = resolve_asset_file(canonical_root, anim_relative, anim_file)) {
+                return CookedModelLoadResult(std::move(*error));
+            }
+            if (!has_suffix(anim_file.relative, ".vcranim")) {
+                return fail(
+                    CookedModelLoadErrorCode::invalid_path,
+                    "Animation asset must use .vcranim.",
+                    anim_file.relative);
+            }
+            AnimationClip clip;
+            std::string anim_error;
+            if (!load_cooked_anim_file(anim_file.absolute, clip, anim_error)) {
+                return fail(
+                    CookedModelLoadErrorCode::invalid_mesh,
+                    std::move(anim_error),
+                    anim_file.absolute);
+            }
+            if (!clip_name.empty()) {
+                clip.name = clip_name;
+            }
+            if (!asset.skeleton.empty()) {
+                bind_clip_to_skeleton(clip, asset.skeleton);
+            }
+            float duration = clip.duration_seconds;
+            if (anim_entry.contains("duration_seconds")) {
+                float parsed_duration = 0.0F;
+                if (!json_float_in_range(
+                        anim_entry,
+                        "duration_seconds",
+                        0.0F,
+                        std::numeric_limits<float>::max(),
+                        parsed_duration)) {
+                    return fail(
+                        CookedModelLoadErrorCode::invalid_json,
+                        "Animation duration_seconds must be finite and non-negative.",
+                        model_file.absolute);
+                }
+                duration = parsed_duration;
+            }
+            asset.animation_refs.push_back(CookedAnimationReference{
+                .name = clip.name,
+                .relative_path = anim_file.relative,
+                .duration_seconds = duration,
+            });
+            asset.animations.push_back(std::move(clip));
+        }
+    }
+
     return CookedModelLoadResult(std::move(asset));
 }
 

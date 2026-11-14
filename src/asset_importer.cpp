@@ -2,6 +2,11 @@
 
 #include "cooked_audio_asset.hpp"
 #include "pbr_material.hpp"
+#include "skeletal_animation.hpp"
+
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_inverse.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 #include <nlohmann/json.hpp>
 
@@ -1729,6 +1734,140 @@ void write_f32(std::ostream& output, const float value) {
     write_u32(output, std::bit_cast<std::uint32_t>(value));
 }
 
+[[nodiscard]] glm::mat4 ai_mat4_to_glm(const aiMatrix4x4& m) noexcept {
+    glm::mat4 out(1.0F);
+    out[0][0] = m.a1;
+    out[1][0] = m.a2;
+    out[2][0] = m.a3;
+    out[3][0] = m.a4;
+    out[0][1] = m.b1;
+    out[1][1] = m.b2;
+    out[2][1] = m.b3;
+    out[3][1] = m.b4;
+    out[0][2] = m.c1;
+    out[1][2] = m.c2;
+    out[2][2] = m.c3;
+    out[3][2] = m.c4;
+    out[0][3] = m.d1;
+    out[1][3] = m.d2;
+    out[2][3] = m.d3;
+    out[3][3] = m.d4;
+    return out;
+}
+
+void decompose_ai_trs(
+    const aiMatrix4x4& matrix,
+    glm::vec3& out_translation,
+    glm::quat& out_rotation,
+    glm::vec3& out_scale) noexcept {
+    aiVector3D ai_scale(1.0F, 1.0F, 1.0F);
+    aiQuaternion ai_rot(1.0F, 0.0F, 0.0F, 0.0F);
+    aiVector3D ai_pos(0.0F, 0.0F, 0.0F);
+    matrix.Decompose(ai_scale, ai_rot, ai_pos);
+
+    const auto finite_or = [](const float v, const float fallback) noexcept {
+        return std::isfinite(v) ? v : fallback;
+    };
+    out_translation = glm::vec3(
+        finite_or(ai_pos.x, 0.0F),
+        finite_or(ai_pos.y, 0.0F),
+        finite_or(ai_pos.z, 0.0F));
+    out_scale = glm::vec3(
+        finite_or(ai_scale.x, 1.0F),
+        finite_or(ai_scale.y, 1.0F),
+        finite_or(ai_scale.z, 1.0F));
+    for (int i = 0; i < 3; ++i) {
+        if (std::abs(out_scale[i]) < 1.0e-6F) {
+            out_scale[i] = out_scale[i] < 0.0F ? -1.0e-6F : 1.0e-6F;
+        }
+    }
+    glm::quat q(
+        finite_or(ai_rot.w, 1.0F),
+        finite_or(ai_rot.x, 0.0F),
+        finite_or(ai_rot.y, 0.0F),
+        finite_or(ai_rot.z, 0.0F));
+    const float qlen = glm::length(q);
+    out_rotation = qlen > 1.0e-6F
+        ? (q / qlen)
+        : glm::quat(1.0F, 0.0F, 0.0F, 0.0F);
+}
+
+struct RigNodeRecord {
+    const aiNode* node = nullptr;
+    std::int32_t parent_record = -1;
+    std::string name{};
+    glm::mat4 global_bind{1.0F};
+    glm::vec3 local_t{0.0F};
+    glm::quat local_r{1.0F, 0.0F, 0.0F, 0.0F};
+    glm::vec3 local_s{1.0F};
+    bool needed = false;
+};
+
+void collect_rig_nodes_dfs(
+    const aiNode* node,
+    const std::int32_t parent_record,
+    const glm::mat4& parent_global,
+    std::vector<RigNodeRecord>& records,
+    std::unordered_map<std::string, std::uint32_t>& name_to_record,
+    std::vector<std::int32_t>& mesh_to_record) {
+    if (node == nullptr) {
+        return;
+    }
+    const std::int32_t self_idx = static_cast<std::int32_t>(records.size());
+    RigNodeRecord rec{};
+    rec.node = node;
+    rec.parent_record = parent_record;
+    rec.name = node->mName.C_Str();
+    const glm::mat4 local_m = ai_mat4_to_glm(node->mTransformation);
+    rec.global_bind = parent_global * local_m;
+    decompose_ai_trs(node->mTransformation, rec.local_t, rec.local_r, rec.local_s);
+    records.push_back(std::move(rec));
+    if (!records[self_idx].name.empty()) {
+        name_to_record.try_emplace(
+            records[self_idx].name, static_cast<std::uint32_t>(self_idx));
+    }
+    for (std::uint32_t i = 0U; i < node->mNumMeshes; ++i) {
+        const std::uint32_t mesh_idx = node->mMeshes[i];
+        if (mesh_idx < mesh_to_record.size() && mesh_to_record[mesh_idx] < 0) {
+            mesh_to_record[mesh_idx] = self_idx;
+        }
+    }
+    for (std::uint32_t c = 0U; c < node->mNumChildren; ++c) {
+        collect_rig_nodes_dfs(
+            node->mChildren[c],
+            self_idx,
+            records[self_idx].global_bind,
+            records,
+            name_to_record,
+            mesh_to_record);
+    }
+}
+
+[[nodiscard]] bool string_contains_ci(
+    const std::string_view haystack,
+    const std::string_view needle) noexcept {
+    if (needle.empty() || haystack.size() < needle.size()) {
+        return false;
+    }
+    for (std::size_t i = 0U; i + needle.size() <= haystack.size(); ++i) {
+        bool match = true;
+        for (std::size_t j = 0U; j < needle.size(); ++j) {
+            const char a = static_cast<char>(
+                std::tolower(static_cast<unsigned char>(haystack[i + j])));
+            const char b = static_cast<char>(
+                std::tolower(static_cast<unsigned char>(needle[j])));
+            if (a != b) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            return true;
+        }
+    }
+    return false;
+}
+
 [[nodiscard]] AssetImportOutcome<void>
 write_mesh_binary(
     const std::filesystem::path& path,
@@ -1855,8 +1994,11 @@ import_model(
                 return mesh_observer != nullptr &&
                     mesh_observer->HasBones();
             });
-    scene_observer = importer.ApplyPostProcessing(
-        aiProcess_PreTransformVertices);
+    const bool keep_skeleton_rig = source_has_bones;
+    if (!keep_skeleton_rig) {
+        scene_observer = importer.ApplyPostProcessing(
+            aiProcess_PreTransformVertices);
+    }
     if (scene_observer == nullptr ||
         (scene_observer->mFlags & AI_SCENE_FLAGS_INCOMPLETE) != 0U) {
         return make_unexpected_asset_import_error(make_error(
@@ -1954,6 +2096,130 @@ import_model(
     indices.reserve(static_cast<std::size_t>(total_indices));
     submeshes.reserve(scene_observer->mNumMeshes);
 
+    CookedSkeletonAsset cooked_skeleton{};
+    std::vector<CookedSkinVertex> skin_vertices;
+    std::vector<RigNodeRecord> rig_nodes;
+    std::unordered_map<std::string, std::uint32_t> name_to_rig_node;
+    std::vector<std::int32_t> mesh_to_rig_node(scene_observer->mNumMeshes, -1);
+    std::vector<std::int32_t> rig_node_to_bone;
+    std::unordered_map<std::string, std::uint32_t> bone_name_to_index;
+    std::vector<bool> inverse_bind_authored;
+    if (keep_skeleton_rig) {
+        skin_vertices.reserve(static_cast<std::size_t>(total_vertices));
+        collect_rig_nodes_dfs(
+            scene_observer->mRootNode,
+            -1,
+            glm::mat4(1.0F),
+            rig_nodes,
+            name_to_rig_node,
+            mesh_to_rig_node);
+        const auto mark_ancestors = [&](std::int32_t rec_idx) {
+            while (rec_idx >= 0 &&
+                   static_cast<std::size_t>(rec_idx) < rig_nodes.size() &&
+                   !rig_nodes[rec_idx].needed) {
+                rig_nodes[rec_idx].needed = true;
+                rec_idx = rig_nodes[rec_idx].parent_record;
+            }
+        };
+        for (std::uint32_t mi = 0U; mi < scene_observer->mNumMeshes; ++mi) {
+            const aiMesh* const mesh_obs = scene_observer->mMeshes[mi];
+            if (mesh_obs != nullptr && mesh_obs->HasBones() &&
+                mesh_obs->mBones != nullptr) {
+                for (std::uint32_t bi = 0U; bi < mesh_obs->mNumBones; ++bi) {
+                    const aiBone* const bone = mesh_obs->mBones[bi];
+                    if (bone != nullptr) {
+                        const auto found = name_to_rig_node.find(
+                            bone->mName.C_Str());
+                        if (found != name_to_rig_node.end()) {
+                            mark_ancestors(
+                                static_cast<std::int32_t>(found->second));
+                        }
+                    }
+                }
+            } else if (mesh_to_rig_node[mi] >= 0) {
+                mark_ancestors(mesh_to_rig_node[mi]);
+            }
+        }
+        rig_node_to_bone.assign(rig_nodes.size(), -1);
+        for (std::size_t ri = 0U; ri < rig_nodes.size(); ++ri) {
+            if (!rig_nodes[ri].needed) {
+                continue;
+            }
+            if (cooked_skeleton.bones.size() >= max_skeleton_bones) {
+                return make_unexpected_asset_import_error(make_error(
+                    AssetImportErrorCode::asset_too_complex,
+                    "Model skeleton exceeds the maximum supported 256 bones.",
+                    source));
+            }
+            const std::int32_t bone_idx =
+                static_cast<std::int32_t>(cooked_skeleton.bones.size());
+            rig_node_to_bone[ri] = bone_idx;
+            SkeletonBone bone{};
+            bone.name = rig_nodes[ri].name.empty()
+                ? ("bone_" + std::to_string(bone_idx))
+                : rig_nodes[ri].name;
+            bone.parent_index = rig_nodes[ri].parent_record >= 0
+                ? rig_node_to_bone[rig_nodes[ri].parent_record]
+                : -1;
+            bone.local_bind_translation = rig_nodes[ri].local_t;
+            bone.local_bind_rotation = rig_nodes[ri].local_r;
+            bone.local_bind_scale = rig_nodes[ri].local_s;
+            bone.inverse_bind_matrix = glm::inverse(rig_nodes[ri].global_bind);
+            bone_name_to_index.try_emplace(
+                rig_nodes[ri].name, static_cast<std::uint32_t>(bone_idx));
+            cooked_skeleton.bones.push_back(std::move(bone));
+        }
+        // Fallback if bones were declared without matching hierarchy nodes.
+        for (std::uint32_t mi = 0U; mi < scene_observer->mNumMeshes; ++mi) {
+            const aiMesh* const mesh_obs = scene_observer->mMeshes[mi];
+            if (mesh_obs == nullptr || !mesh_obs->HasBones() ||
+                mesh_obs->mBones == nullptr) {
+                continue;
+            }
+            for (std::uint32_t bi = 0U; bi < mesh_obs->mNumBones; ++bi) {
+                const aiBone* const bone = mesh_obs->mBones[bi];
+                if (bone == nullptr) {
+                    continue;
+                }
+                const std::string bname = bone->mName.C_Str();
+                if (!bone_name_to_index.contains(bname)) {
+                    if (cooked_skeleton.bones.size() >= max_skeleton_bones) {
+                        return make_unexpected_asset_import_error(make_error(
+                            AssetImportErrorCode::asset_too_complex,
+                            "Model skeleton exceeds 256 bones.",
+                            source));
+                    }
+                    const auto bone_idx = static_cast<std::uint32_t>(
+                        cooked_skeleton.bones.size());
+                    SkeletonBone orphan{};
+                    orphan.name = bname.empty()
+                        ? ("bone_" + std::to_string(bone_idx))
+                        : bname;
+                    orphan.parent_index =
+                        cooked_skeleton.bones.empty() ? -1 : 0;
+                    cooked_skeleton.bones.push_back(std::move(orphan));
+                    bone_name_to_index.emplace(bname, bone_idx);
+                }
+            }
+        }
+        inverse_bind_authored.assign(cooked_skeleton.bones.size(), false);
+        const std::int32_t hips =
+            cooked_skeleton.find_bone_case_insensitive_contains("hips");
+        const std::int32_t pelvis =
+            cooked_skeleton.find_bone_case_insensitive_contains("pelvis");
+        const std::int32_t root =
+            cooked_skeleton.find_bone_case_insensitive_contains("root");
+        if (hips >= 0) {
+            cooked_skeleton.root_motion_bone_index = hips;
+        } else if (pelvis >= 0) {
+            cooked_skeleton.root_motion_bone_index = pelvis;
+        } else if (root >= 0) {
+            cooked_skeleton.root_motion_bone_index = root;
+        } else {
+            cooked_skeleton.root_motion_bone_index = 0;
+        }
+    }
+
     std::uint32_t vertex_base = 0U;
     for (std::uint32_t mesh_index = 0U;
          mesh_index < scene_observer->mNumMeshes;
@@ -1966,33 +2232,58 @@ import_model(
                 source));
         }
         const std::uint64_t first_index = indices.size();
+        const glm::mat4 mesh_global =
+            (keep_skeleton_rig && mesh_to_rig_node[mesh_index] >= 0)
+                ? rig_nodes[mesh_to_rig_node[mesh_index]].global_bind
+                : glm::mat4(1.0F);
+        glm::mat3 normal_matrix(1.0F);
+        if (keep_skeleton_rig) {
+            const float det = glm::determinant(glm::mat3(mesh_global));
+            normal_matrix = std::abs(det) > 1.0e-8F
+                ? glm::transpose(glm::inverse(glm::mat3(mesh_global)))
+                : glm::mat3(mesh_global);
+        }
+        const glm::mat3 tangent_matrix = glm::mat3(mesh_global);
         for (std::uint32_t vertex_index = 0U;
              vertex_index < mesh.mNumVertices;
              ++vertex_index) {
-            const aiVector3D& position = mesh.mVertices[vertex_index];
-            const aiVector3D normal = mesh.HasNormals()
+            const aiVector3D& src_position = mesh.mVertices[vertex_index];
+            const aiVector3D src_normal = mesh.HasNormals()
                 ? mesh.mNormals[vertex_index]
                 : aiVector3D{0.0F, 1.0F, 0.0F};
             const aiVector3D texcoord =
                 mesh.HasTextureCoords(0U)
                 ? mesh.mTextureCoords[0U][vertex_index]
                 : aiVector3D{};
-            const aiVector3D tangent = mesh.HasTangentsAndBitangents()
+            const aiVector3D src_tangent = mesh.HasTangentsAndBitangents()
                 ? mesh.mTangents[vertex_index]
                 : aiVector3D{1.0F, 0.0F, 0.0F};
-            const aiVector3D bitangent =
-                mesh.HasTangentsAndBitangents()
+            const aiVector3D src_bitangent = mesh.HasTangentsAndBitangents()
                 ? mesh.mBitangents[vertex_index]
                 : aiVector3D{0.0F, 0.0F, 1.0F};
             const float handedness =
-                ((normal ^ tangent) * bitangent) < 0.0F
+                ((src_normal ^ src_tangent) * src_bitangent) < 0.0F
                 ? -1.0F
                 : 1.0F;
+
+            glm::vec3 pos{src_position.x, src_position.y, src_position.z};
+            glm::vec3 nrm{src_normal.x, src_normal.y, src_normal.z};
+            glm::vec3 tng{src_tangent.x, src_tangent.y, src_tangent.z};
+            if (keep_skeleton_rig) {
+                pos = glm::vec3(mesh_global * glm::vec4(pos, 1.0F));
+                nrm = normal_matrix * nrm;
+                const float nlen = glm::length(nrm);
+                nrm = nlen > 1.0e-6F ? (nrm / nlen) : glm::vec3(0.0F, 1.0F, 0.0F);
+                tng = tangent_matrix * tng;
+                const float tlen = glm::length(tng);
+                tng = tlen > 1.0e-6F ? (tng / tlen) : glm::vec3(1.0F, 0.0F, 0.0F);
+            }
+
             const std::array<float, 12U> values{
-                position.x, position.y, position.z,
-                normal.x, normal.y, normal.z,
+                pos.x, pos.y, pos.z,
+                nrm.x, nrm.y, nrm.z,
                 texcoord.x, texcoord.y,
-                tangent.x, tangent.y, tangent.z, handedness,
+                tng.x, tng.y, tng.z, handedness,
             };
             if (!std::all_of(
                     values.begin(),
@@ -2006,13 +2297,84 @@ import_model(
                     source));
             }
             vertices.push_back(MeshVertex{
-                .position =
-                    {position.x, position.y, position.z},
-                .normal = {normal.x, normal.y, normal.z},
+                .position = {pos.x, pos.y, pos.z},
+                .normal = {nrm.x, nrm.y, nrm.z},
                 .texcoord = {texcoord.x, texcoord.y},
-                .tangent =
-                    {tangent.x, tangent.y, tangent.z, handedness},
+                .tangent = {tng.x, tng.y, tng.z, handedness},
             });
+        }
+        if (keep_skeleton_rig) {
+            const std::size_t mesh_skin_base = skin_vertices.size();
+            skin_vertices.resize(
+                mesh_skin_base + mesh.mNumVertices,
+                CookedSkinVertex{
+                    .joints = {0U, 0U, 0U, 0U},
+                    .weights = {0.0F, 0.0F, 0.0F, 0.0F},
+                });
+            if (mesh.HasBones() && mesh.mBones != nullptr) {
+                const glm::mat4 inv_mesh_global = glm::inverse(mesh_global);
+                for (std::uint32_t bi = 0U; bi < mesh.mNumBones; ++bi) {
+                    const aiBone* const bone = mesh.mBones[bi];
+                    if (bone == nullptr) {
+                        continue;
+                    }
+                    const auto b_it = bone_name_to_index.find(
+                        bone->mName.C_Str());
+                    if (b_it == bone_name_to_index.end()) {
+                        continue;
+                    }
+                    const std::uint32_t bone_idx = b_it->second;
+                    if (!inverse_bind_authored[bone_idx]) {
+                        cooked_skeleton.bones[bone_idx].inverse_bind_matrix =
+                            ai_mat4_to_glm(bone->mOffsetMatrix) * inv_mesh_global;
+                        inverse_bind_authored[bone_idx] = true;
+                    }
+                    if (bone->mWeights == nullptr) {
+                        continue;
+                    }
+                    for (std::uint32_t wi = 0U; wi < bone->mNumWeights; ++wi) {
+                        const aiVertexWeight& vw = bone->mWeights[wi];
+                        if (vw.mVertexId >= mesh.mNumVertices ||
+                            !std::isfinite(vw.mWeight) || vw.mWeight <= 0.0F) {
+                            continue;
+                        }
+                        CookedSkinVertex& sv =
+                            skin_vertices[mesh_skin_base + vw.mVertexId];
+                        std::uint32_t target_slot = 0U;
+                        float min_w = sv.weights[0];
+                        for (std::uint32_t slot = 1U; slot < 4U; ++slot) {
+                            if (sv.weights[slot] < min_w) {
+                                min_w = sv.weights[slot];
+                                target_slot = slot;
+                            }
+                        }
+                        if (vw.mWeight > min_w) {
+                            sv.joints[target_slot] =
+                                static_cast<std::uint16_t>(bone_idx);
+                            sv.weights[target_slot] = vw.mWeight;
+                        }
+                    }
+                }
+            } else {
+                const std::uint16_t rigid_bone =
+                    (mesh_to_rig_node[mesh_index] >= 0 &&
+                     rig_node_to_bone[mesh_to_rig_node[mesh_index]] >= 0)
+                        ? static_cast<std::uint16_t>(
+                              rig_node_to_bone[mesh_to_rig_node[mesh_index]])
+                        : 0U;
+                for (std::uint32_t vi = 0U; vi < mesh.mNumVertices; ++vi) {
+                    skin_vertices[mesh_skin_base + vi] = CookedSkinVertex{
+                        .joints = {rigid_bone, 0U, 0U, 0U},
+                        .weights = {1.0F, 0.0F, 0.0F, 0.0F},
+                    };
+                }
+            }
+            const auto bone_count = static_cast<std::uint32_t>(
+                cooked_skeleton.bones.size());
+            for (std::uint32_t vi = 0U; vi < mesh.mNumVertices; ++vi) {
+                sanitize_skin_vertex(
+                    skin_vertices[mesh_skin_base + vi], bone_count);
+            }
         }
         for (std::uint32_t face_index = 0U;
              face_index < mesh.mNumFaces;
@@ -2079,6 +2441,181 @@ import_model(
     }
     record_file(
         context, ImportedAssetKind::mesh_binary, mesh_relative);
+
+    std::optional<std::filesystem::path> skeleton_relative{};
+    Json animations_metadata = Json::array();
+    if (keep_skeleton_rig && !cooked_skeleton.empty() &&
+        skin_vertices.size() == vertices.size()) {
+        const std::filesystem::path skin_rel =
+            std::filesystem::path("mesh") /
+            (context.asset_slug + ".vcrskin");
+        std::string skin_err;
+        if (!write_cooked_skin_file(
+                context.staging_directory / skin_rel,
+                cooked_skeleton,
+                skin_vertices,
+                skin_err)) {
+            return make_unexpected_asset_import_error(make_error(
+                AssetImportErrorCode::serialization_error,
+                skin_err.empty() ? "Unable to write .vcrskin data." : skin_err,
+                skin_rel));
+        }
+        record_file(context, ImportedAssetKind::skeleton, skin_rel);
+        skeleton_relative = skin_rel;
+
+        if (source_has_animations && scene_observer->mAnimations != nullptr &&
+            scene_observer->mNumAnimations > 0U) {
+            const std::filesystem::path anim_dir = "animations";
+            std::filesystem::create_directories(
+                context.staging_directory / anim_dir, filesystem_error);
+            if (filesystem_error) {
+                return make_unexpected_asset_import_error(make_error(
+                    AssetImportErrorCode::filesystem_error,
+                    "Unable to create animations output directory.",
+                    anim_dir));
+            }
+            std::unordered_set<std::string> used_clip_slugs;
+            for (std::uint32_t ai = 0U;
+                 ai < scene_observer->mNumAnimations;
+                 ++ai) {
+                const aiAnimation* const anim =
+                    scene_observer->mAnimations[ai];
+                if (anim == nullptr) {
+                    continue;
+                }
+                const float tps =
+                    (anim->mTicksPerSecond > 0.0 &&
+                     std::isfinite(anim->mTicksPerSecond))
+                        ? static_cast<float>(anim->mTicksPerSecond)
+                        : 30.0F;
+                const float raw_duration =
+                    (anim->mDuration > 0.0 && std::isfinite(anim->mDuration))
+                        ? static_cast<float>(anim->mDuration / tps)
+                        : 0.0F;
+                std::string clip_name = sanitize_asset_name(
+                    anim->mName.C_Str(),
+                    "clip_" + std::to_string(ai));
+                std::string slug = clip_name;
+                std::size_t suffix_num = 1U;
+                while (!used_clip_slugs.insert(slug).second) {
+                    slug = clip_name + "_" + std::to_string(suffix_num++);
+                }
+
+                AnimationClip clip{};
+                clip.name = clip_name;
+                clip.duration_seconds = raw_duration;
+                clip.ticks_per_second = tps;
+                clip.looping = true;
+
+                if (anim->mChannels != nullptr) {
+                    clip.tracks.reserve(anim->mNumChannels);
+                    for (std::uint32_t ci = 0U;
+                         ci < anim->mNumChannels;
+                         ++ci) {
+                        const aiNodeAnim* const ch = anim->mChannels[ci];
+                        if (ch == nullptr) {
+                            continue;
+                        }
+                        BoneAnimationTrack track{};
+                        track.bone_name = ch->mNodeName.C_Str();
+                        track.bone_index = cooked_skeleton.find_bone_index(
+                            track.bone_name);
+                        if (ch->mPositionKeys != nullptr) {
+                            track.translations.reserve(ch->mNumPositionKeys);
+                            for (std::uint32_t ki = 0U;
+                                 ki < ch->mNumPositionKeys;
+                                 ++ki) {
+                                const aiVectorKey& k = ch->mPositionKeys[ki];
+                                track.translations.push_back(Vec3Key{
+                                    .time = std::clamp(
+                                        static_cast<float>(k.mTime / tps),
+                                        0.0F,
+                                        std::max(0.0F, raw_duration)),
+                                    .value = {k.mValue.x, k.mValue.y, k.mValue.z},
+                                });
+                            }
+                        }
+                        if (ch->mRotationKeys != nullptr) {
+                            track.rotations.reserve(ch->mNumRotationKeys);
+                            for (std::uint32_t ki = 0U;
+                                 ki < ch->mNumRotationKeys;
+                                 ++ki) {
+                                const aiQuatKey& k = ch->mRotationKeys[ki];
+                                glm::quat q(
+                                    k.mValue.w, k.mValue.x, k.mValue.y, k.mValue.z);
+                                const float len = glm::length(q);
+                                q = len > 1.0e-6F
+                                    ? (q / len)
+                                    : glm::quat(1.0F, 0.0F, 0.0F, 0.0F);
+                                track.rotations.push_back(QuatKey{
+                                    .time = std::clamp(
+                                        static_cast<float>(k.mTime / tps),
+                                        0.0F,
+                                        std::max(0.0F, raw_duration)),
+                                    .value = q,
+                                });
+                            }
+                        }
+                        if (ch->mScalingKeys != nullptr) {
+                            track.scales.reserve(ch->mNumScalingKeys);
+                            for (std::uint32_t ki = 0U;
+                                 ki < ch->mNumScalingKeys;
+                                 ++ki) {
+                                const aiVectorKey& k = ch->mScalingKeys[ki];
+                                track.scales.push_back(Vec3Key{
+                                    .time = std::clamp(
+                                        static_cast<float>(k.mTime / tps),
+                                        0.0F,
+                                        std::max(0.0F, raw_duration)),
+                                    .value = {k.mValue.x, k.mValue.y, k.mValue.z},
+                                });
+                            }
+                        }
+                        clip.tracks.push_back(std::move(track));
+                    }
+                }
+                if ((string_contains_ci(clip.name, "walk") ||
+                     string_contains_ci(clip.name, "run")) &&
+                    clip.duration_seconds >= 0.2F) {
+                    clip.events.push_back(AnimationEventDef{
+                        .time_seconds = clip.duration_seconds * 0.15F,
+                        .kind = AnimationEventKind::footstep,
+                        .name = "footstep",
+                        .payload = "left",
+                        .float_param = 1.0F,
+                    });
+                    clip.events.push_back(AnimationEventDef{
+                        .time_seconds = clip.duration_seconds * 0.65F,
+                        .kind = AnimationEventKind::footstep,
+                        .name = "footstep",
+                        .payload = "right",
+                        .float_param = 1.0F,
+                    });
+                }
+
+                const std::filesystem::path anim_rel =
+                    anim_dir / (slug + ".vcranim");
+                std::string anim_err;
+                if (!write_cooked_anim_file(
+                        context.staging_directory / anim_rel,
+                        clip,
+                        anim_err)) {
+                    return make_unexpected_asset_import_error(make_error(
+                        AssetImportErrorCode::serialization_error,
+                        anim_err.empty()
+                            ? "Unable to write .vcranim data."
+                            : anim_err,
+                        anim_rel));
+                }
+                record_file(context, ImportedAssetKind::animation, anim_rel);
+                animations_metadata.push_back(Json{
+                    {"name", clip.name},
+                    {"path", anim_rel.generic_string()},
+                    {"duration_seconds", clip.duration_seconds},
+                });
+            }
+        }
+    }
 
     Json submesh_metadata = Json::array();
     for (const MeshSubmesh& submesh : submeshes) {
@@ -2211,7 +2748,7 @@ import_model(
 
     const std::filesystem::path metadata_relative =
         context.asset_slug + ".vcrasset.json";
-    const Json metadata{
+    Json metadata{
         {"schema", asset_schema},
         {"version", asset_schema_version},
         {"kind", "model"},
@@ -2237,8 +2774,17 @@ import_model(
         {"submeshes", std::move(submesh_metadata)},
         {"materials", std::move(material_metadata)},
         {"collision", std::move(collision_metadata)},
-        {"coordinate_space", "assimp_pretransformed_source"},
+        {"coordinate_space",
+         keep_skeleton_rig
+             ? "rigged_root_space"
+             : "assimp_pretransformed_source"},
     };
+    if (skeleton_relative.has_value()) {
+        metadata["skeleton"] = skeleton_relative->generic_string();
+    }
+    if (!animations_metadata.empty()) {
+        metadata["animations"] = std::move(animations_metadata);
+    }
     const auto metadata_written = write_json_file(
         context.staging_directory / metadata_relative, metadata);
     if (!metadata_written) {

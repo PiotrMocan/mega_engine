@@ -99,6 +99,8 @@ struct SceneNodeRecord {
     std::optional<AudioSourceComponent> audio_source{};
     std::optional<AudioListenerComponent> audio_listener{};
     std::optional<AudioReverbZoneComponent> reverb_zone{};
+    std::optional<AnimatorComponent> animator{};
+    std::optional<GameplayComponent> gameplay{};
     std::uint32_t parent_record_index =
         invalid_scene_node_index;
 };
@@ -311,6 +313,42 @@ public:
         return reverb_zones_;
     }
 
+    [[nodiscard]] bool set_animator(
+        SceneNodeId id,
+        const AnimatorComponent& animator);
+    [[nodiscard]] bool remove_animator(SceneNodeId id) noexcept;
+    [[nodiscard]] bool has_animator(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<
+        std::reference_wrapper<const AnimatorComponent>>
+        animator(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<
+        std::reference_wrapper<AnimatorComponent>>
+        animator_mut(SceneNodeId id) noexcept;
+    [[nodiscard]] const SparseComponentPool<
+        SceneNodeId,
+        AnimatorComponent,
+        max_scene_nodes>& animators() const noexcept {
+        return animators_;
+    }
+
+    [[nodiscard]] bool set_gameplay(
+        SceneNodeId id,
+        const GameplayComponent& gameplay);
+    [[nodiscard]] bool remove_gameplay(SceneNodeId id) noexcept;
+    [[nodiscard]] bool has_gameplay(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<
+        std::reference_wrapper<const GameplayComponent>>
+        gameplay(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<
+        std::reference_wrapper<GameplayComponent>>
+        gameplay_mut(SceneNodeId id) noexcept;
+    [[nodiscard]] const SparseComponentPool<
+        SceneNodeId,
+        GameplayComponent,
+        max_scene_nodes>& gameplays() const noexcept {
+        return gameplays_;
+    }
+
     void mark_content_changed() noexcept;
     [[nodiscard]] std::uint32_t last_transform_updates() const noexcept {
         return last_transform_updates_;
@@ -420,6 +458,14 @@ private:
         SceneNodeId,
         AudioReverbZoneComponent,
         max_scene_nodes> reverb_zones_{};
+    SparseComponentPool<
+        SceneNodeId,
+        AnimatorComponent,
+        max_scene_nodes> animators_{};
+    SparseComponentPool<
+        SceneNodeId,
+        GameplayComponent,
+        max_scene_nodes> gameplays_{};
     std::uint32_t first_root_ = invalid_scene_node_index;
     std::uint32_t last_root_ = invalid_scene_node_index;
     std::uint32_t live_count_ = 0U;

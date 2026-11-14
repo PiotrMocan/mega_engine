@@ -299,6 +299,12 @@ AssetEntryKind AssetBrowser::classify(
     if (filename.ends_with(".vcrcue.json")) {
         return AssetEntryKind::sound_cue;
     }
+    if (filename.ends_with(".vcrsave.json")) {
+        return AssetEntryKind::save_state;
+    }
+    if (extension == ".vcranim" || extension == ".vcrskin") {
+        return AssetEntryKind::animation;
+    }
     if (filename.ends_with(".vcraudio.json") ||
         extension == ".wav" || extension == ".ogg" ||
         extension == ".flac") {
@@ -341,9 +347,11 @@ const char* asset_kind_name(const AssetEntryKind kind) noexcept {
     case AssetEntryKind::prefab: return "Prefab";
     case AssetEntryKind::audio: return "Audio";
     case AssetEntryKind::sound_cue: return "Sound Cue";
+    case AssetEntryKind::animation: return "Animation";
     case AssetEntryKind::image: return "Image";
     case AssetEntryKind::shader: return "Shader";
     case AssetEntryKind::scene: return "Scene";
+    case AssetEntryKind::save_state: return "Save State";
     case AssetEntryKind::binary: return "Binary";
     case AssetEntryKind::other: return "Asset";
     }

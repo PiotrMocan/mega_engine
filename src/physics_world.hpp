@@ -95,6 +95,12 @@ public:
         glm::vec3 position,
         glm::quat orientation,
         float delta_seconds) noexcept;
+    bool set_body_state(
+        SceneNodeId id,
+        glm::vec3 position,
+        glm::quat orientation,
+        glm::vec3 linear_velocity,
+        glm::vec3 angular_velocity) noexcept;
 
 private:
     struct Body {

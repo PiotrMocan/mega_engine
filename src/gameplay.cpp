@@ -570,6 +570,19 @@ void ThirdPersonCamera::rotate(
         config_.maximum_pitch_radians);
 }
 
+void ThirdPersonCamera::set_angles(
+    const float yaw_radians,
+    const float pitch_radians) noexcept {
+    if (!std::isfinite(yaw_radians) || !std::isfinite(pitch_radians)) {
+        return;
+    }
+    yaw_radians_ = std::remainder(yaw_radians, two_pi);
+    pitch_radians_ = std::clamp(
+        pitch_radians,
+        config_.minimum_pitch_radians,
+        config_.maximum_pitch_radians);
+}
+
 glm::vec3 ThirdPersonCamera::forward() const noexcept {
     const float cos_pitch = std::cos(pitch_radians_);
     return {

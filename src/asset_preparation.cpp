@@ -64,7 +64,9 @@ PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,
             }
         }
         result.upload_bytes = model.vertices.size() * sizeof(CookedModelVertex) +
-                              model.indices.size() * sizeof(std::uint32_t) + 512;
+                              model.indices.size() * sizeof(std::uint32_t) +
+                              model.skin_vertices.size() * sizeof(CookedSkinVertex) +
+                              (model.skin_vertices.empty() ? 0U : 256U) + 512U;
         if (result.upload_bytes > maximum_prepared_asset_bytes) {
             result.error = "Prepared mesh exceeds the 512 MiB upload budget";
             return result;

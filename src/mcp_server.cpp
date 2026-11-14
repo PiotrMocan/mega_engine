@@ -74,7 +74,7 @@ constexpr std::array<std::string_view, 31> runtime_tool_names{
     "engine.quit",
 };
 
-constexpr std::array<std::string_view, 43> editor_tool_names{
+constexpr std::array<std::string_view, 49> editor_tool_names{
     "render.set_exposure",
     "render.set_color_grading",
     "render.set_subsurface",
@@ -103,6 +103,12 @@ constexpr std::array<std::string_view, 43> editor_tool_names{
     "editor.scene.remove_reverb_zone",
     "editor.audio.set_bus",
     "editor.audio.preview",
+    "editor.scene.set_animator",
+    "editor.scene.remove_animator",
+    "editor.animation.preview",
+    "editor.scene.set_gameplay",
+    "editor.scene.remove_gameplay",
+    "editor.gameplay.save_or_load",
     "editor.prefab.save",
     "editor.prefab.instantiate",
     "editor.prefab.unpack",
@@ -1205,6 +1211,79 @@ private:
             Json::array({"asset_path", "count", "seed", "width", "depth"})),
         false, false, false));
     tools.push_back(tool_definition(
+        "editor.scene.set_animator", "Set scene node animator",
+        "Attach or replace an AnimatorComponent for skeletal animation, blend spaces, state machines, layer masks, root motion, and IK.",
+        object_schema(Json{
+            {"id", handle_schema},
+            {"mode", Json{{"type", "string"}, {"enum", Json::array({"single_clip", "blend_space_1d", "blend_space_2d", "state_machine"})}}},
+            {"clip_name", Json{{"type", "string"}, {"maxLength", max_animator_clip_name_bytes}}},
+            {"secondary_clip_name", Json{{"type", "string"}, {"maxLength", max_animator_clip_name_bytes}}},
+            {"upper_body_root_bone", Json{{"type", "string"}, {"maxLength", max_animator_bone_name_bytes}}},
+            {"upper_body_weight", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 1.0}}},
+            {"upper_body_additive", Json{{"type", "boolean"}}},
+            {"playback_speed", Json{{"type", "number"}, {"minimum", -10.0}, {"maximum", 10.0}}},
+            {"start_time_seconds", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 100000.0}}},
+            {"looping", Json{{"type", "boolean"}}},
+            {"playing", Json{{"type", "boolean"}}},
+            {"root_motion_enabled", Json{{"type", "boolean"}}},
+            {"foot_ik_enabled", Json{{"type", "boolean"}}},
+            {"foot_ik_weight", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 1.0}}},
+            {"look_at_ik_enabled", Json{{"type", "boolean"}}},
+            {"look_at_ik_weight", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 1.0}}},
+            {"look_at_target_world", vec3_schema},
+            {"param_x", Json{{"type", "number"}, {"minimum", -1000.0}, {"maximum", 1000.0}}},
+            {"param_y", Json{{"type", "number"}, {"minimum", -1000.0}, {"maximum", 1000.0}}},
+        }, Json::array({"id"})), false, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.remove_animator", "Remove scene node animator",
+        "Detach the authored AnimatorComponent from a scene node.",
+        object_schema(Json{{"id", handle_schema}}, Json::array({"id"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "editor.animation.preview", "Control Edit-mode animation preview",
+        "Play, pause, scrub, or stop Edit-mode skeletal animation preview and blend parameters on a node.",
+        object_schema(Json{
+            {"id", handle_schema},
+            {"clip_name", Json{{"type", "string"}, {"maxLength", max_animator_clip_name_bytes}}},
+            {"playing", Json{{"type", "boolean"}}},
+            {"stop", Json{{"type", "boolean"}}},
+            {"time_seconds", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 100000.0}}},
+            {"param_x", Json{{"type", "number"}, {"minimum", -1000.0}, {"maximum", 1000.0}}},
+            {"param_y", Json{{"type", "number"}, {"minimum", -1000.0}, {"maximum", 1000.0}}},
+        }, Json::array({"id"})), false, false, false));
+    tools.push_back(tool_definition(
+        "editor.scene.set_gameplay", "Set scene node gameplay component",
+        "Attach or replace a GameplayComponent behavior, health, patrol waypoints, trigger cue, and target link on a scene node.",
+        object_schema(Json{
+            {"id", handle_schema},
+            {"enabled", Json{{"type", "boolean"}}},
+            {"persist_save_state", Json{{"type", "boolean"}}},
+            {"behavior", Json{{"type", "string"}, {"maxLength", max_gameplay_behavior_bytes}}},
+            {"tag", Json{{"type", "string"}, {"maxLength", max_gameplay_tag_bytes}}},
+            {"on_trigger_sound_cue", Json{{"type", "string"}, {"maxLength", max_gameplay_sound_cue_bytes}}},
+            {"health", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 1000000.0}}},
+            {"max_health", Json{{"type", "number"}, {"minimum", 1.0}, {"maximum", 1000000.0}}},
+            {"move_speed", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 1000.0}}},
+            {"interaction_radius", Json{{"type", "number"}, {"minimum", 0.05}, {"maximum", 1000.0}}},
+            {"patrol_point_a", vec3_schema},
+            {"patrol_point_b", vec3_schema},
+            {"target_node_uuid", Json{{"anyOf", Json::array({Json{{"type", "string"}}, Json{{"type", "null"}}})}}},
+            {"custom_param_0", Json{{"type", "number"}, {"minimum", -100000.0}, {"maximum", 100000.0}}},
+            {"custom_param_1", Json{{"type", "number"}, {"minimum", -100000.0}, {"maximum", 100000.0}}},
+        }, Json::array({"id"})), false, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.remove_gameplay", "Remove scene node gameplay component",
+        "Detach the authored GameplayComponent from a scene node.",
+        object_schema(Json{{"id", handle_schema}}, Json::array({"id"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "editor.gameplay.save_or_load", "Control Play mode and game state Save/Load",
+        "Start or stop Play mode, or atomically save/load a sandboxed .vcrsave.json snapshot during Play.",
+        object_schema(Json{
+            {"action", Json{{"type", "string"}, {"enum", Json::array({"save", "load", "start_play", "stop_play"})}}},
+            {"path", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", 255}}},
+        }, Json::array({"action"})), false, false, false));
+    tools.push_back(tool_definition(
         "capture.screenshot", "Capture editor window",
         "Capture the next completed editor swapchain image as PNG image content.",
         object_schema(), true, false, false));
@@ -2188,6 +2267,210 @@ private:
     return true;
 }
 
+[[nodiscard]] bool parse_animator_fields(
+    const Json& object,
+    AnimatorComponent& anim,
+    std::string& error) {
+    if (!only_keys(object, {
+            "id", "mode", "clip_name", "secondary_clip_name",
+            "upper_body_root_bone", "upper_body_weight", "upper_body_additive",
+            "playback_speed", "start_time_seconds", "looping", "playing",
+            "root_motion_enabled", "foot_ik_enabled", "foot_ik_weight",
+            "look_at_ik_enabled", "look_at_ik_weight", "look_at_target_world",
+            "param_x", "param_y"})) {
+        error = "set_animator contains unknown fields";
+        return false;
+    }
+    if (object.contains("mode")) {
+        const auto m = get_string(object, "mode");
+        AnimatorBlendMode parsed_mode{};
+        if (!m || !parse_animator_blend_mode(*m, parsed_mode)) {
+            error = "mode must be single_clip, blend_space_1d, blend_space_2d, or state_machine";
+            return false;
+        }
+        anim.mode = parsed_mode;
+    }
+    if (object.contains("clip_name")) {
+        const auto s = get_string(object, "clip_name");
+        if (!s || !anim.set_clip_name(*s)) {
+            error = "clip_name exceeds limit or contains invalid UTF-8";
+            return false;
+        }
+    }
+    if (object.contains("secondary_clip_name")) {
+        const auto s = get_string(object, "secondary_clip_name");
+        if (!s || !anim.set_secondary_clip_name(*s)) {
+            error = "secondary_clip_name exceeds limit or contains invalid UTF-8";
+            return false;
+        }
+    }
+    if (object.contains("upper_body_root_bone")) {
+        const auto s = get_string(object, "upper_body_root_bone");
+        if (!s || !anim.set_upper_body_bone(*s)) {
+            error = "upper_body_root_bone exceeds limit or contains invalid UTF-8";
+            return false;
+        }
+    }
+    const auto parse_flag = [&](const std::string_view key, bool& out) {
+        if (!object.contains(key)) {
+            return true;
+        }
+        const auto b = get_bool(object, key);
+        if (!b) {
+            error = std::string(key) + " must be a boolean";
+            return false;
+        }
+        out = *b;
+        return true;
+    };
+    const auto parse_num = [&](const std::string_view key,
+                               const float lo,
+                               const float hi,
+                               float& out) {
+        if (!object.contains(key)) {
+            return true;
+        }
+        const auto v = get_finite_float(object, key, lo, hi);
+        if (!v) {
+            error = std::string(key) + " is outside valid animator range";
+            return false;
+        }
+        out = *v;
+        return true;
+    };
+    if (!parse_flag("upper_body_additive", anim.upper_body_additive) ||
+        !parse_flag("looping", anim.looping) ||
+        !parse_flag("playing", anim.playing) ||
+        !parse_flag("root_motion_enabled", anim.root_motion_enabled) ||
+        !parse_flag("foot_ik_enabled", anim.foot_ik_enabled) ||
+        !parse_flag("look_at_ik_enabled", anim.look_at_ik_enabled) ||
+        !parse_num("upper_body_weight", 0.0F, 1.0F, anim.upper_body_weight) ||
+        !parse_num("playback_speed", -10.0F, 10.0F, anim.playback_speed) ||
+        !parse_num("start_time_seconds", 0.0F, 100'000.0F, anim.start_time_seconds) ||
+        !parse_num("foot_ik_weight", 0.0F, 1.0F, anim.foot_ik_weight) ||
+        !parse_num("look_at_ik_weight", 0.0F, 1.0F, anim.look_at_ik_weight) ||
+        !parse_num("param_x", -1000.0F, 1000.0F, anim.param_x) ||
+        !parse_num("param_y", -1000.0F, 1000.0F, anim.param_y)) {
+        return false;
+    }
+    if (object.contains("look_at_target_world") &&
+        !parse_vec3(object, "look_at_target_world", anim.look_at_target_world)) {
+        error = "look_at_target_world must be a finite [x, y, z] array";
+        return false;
+    }
+    if (!valid_animator_component(anim)) {
+        error = "animator fields are outside engine bounds";
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] bool parse_gameplay_fields(
+    const Json& object,
+    GameplayComponent& gp,
+    std::string& error) {
+    if (!only_keys(object, {
+            "id", "enabled", "persist_save_state", "behavior", "tag",
+            "on_trigger_sound_cue", "health", "max_health", "move_speed",
+            "interaction_radius", "patrol_point_a", "patrol_point_b",
+            "target_node_uuid", "custom_param_0", "custom_param_1"})) {
+        error = "set_gameplay contains unknown fields";
+        return false;
+    }
+    if (object.contains("behavior")) {
+        const auto s = get_string(object, "behavior");
+        if (!s || !gp.set_behavior(*s)) {
+            error = "behavior exceeds limit or contains invalid UTF-8";
+            return false;
+        }
+    }
+    if (object.contains("tag")) {
+        const auto s = get_string(object, "tag");
+        if (!s || !gp.set_tag(*s)) {
+            error = "tag exceeds limit or contains invalid UTF-8";
+            return false;
+        }
+    }
+    if (object.contains("on_trigger_sound_cue")) {
+        const auto s = get_string(object, "on_trigger_sound_cue");
+        if (!s || !gp.set_on_trigger_sound_cue(*s)) {
+            error = "on_trigger_sound_cue must be empty or a valid relative audio/cue asset path";
+            return false;
+        }
+    }
+    const auto parse_flag = [&](const std::string_view key, bool& out) {
+        if (!object.contains(key)) {
+            return true;
+        }
+        const auto b = get_bool(object, key);
+        if (!b) {
+            error = std::string(key) + " must be a boolean";
+            return false;
+        }
+        out = *b;
+        return true;
+    };
+    const auto parse_num = [&](const std::string_view key,
+                               const float lo,
+                               const float hi,
+                               float& out) {
+        if (!object.contains(key)) {
+            return true;
+        }
+        const auto v = get_finite_float(object, key, lo, hi);
+        if (!v) {
+            error = std::string(key) + " is outside valid gameplay range";
+            return false;
+        }
+        out = *v;
+        return true;
+    };
+    if (!parse_flag("enabled", gp.enabled) ||
+        !parse_flag("persist_save_state", gp.persist_save_state) ||
+        !parse_num("max_health", 1.0F, 1'000'000.0F, gp.max_health) ||
+        !parse_num("health", 0.0F, 1'000'000.0F, gp.health) ||
+        !parse_num("move_speed", 0.0F, 1000.0F, gp.move_speed) ||
+        !parse_num("interaction_radius", 0.05F, 1000.0F, gp.interaction_radius) ||
+        !parse_num("custom_param_0", -100'000.0F, 100'000.0F, gp.custom_param_0) ||
+        !parse_num("custom_param_1", -100'000.0F, 100'000.0F, gp.custom_param_1)) {
+        return false;
+    }
+    if (!object.contains("health") && gp.health > gp.max_health) {
+        gp.health = gp.max_health;
+    }
+    if (object.contains("patrol_point_a") &&
+        !parse_vec3(object, "patrol_point_a", gp.patrol_point_a)) {
+        error = "patrol_point_a must be a finite [x, y, z] array";
+        return false;
+    }
+    if (object.contains("patrol_point_b") &&
+        !parse_vec3(object, "patrol_point_b", gp.patrol_point_b)) {
+        error = "patrol_point_b must be a finite [x, y, z] array";
+        return false;
+    }
+    if (object.contains("target_node_uuid")) {
+        const Json& u = object["target_node_uuid"];
+        if (u.is_null()) {
+            gp.target_node_uuid = {};
+        } else if (u.is_string()) {
+            const auto parsed = parse_scene_uuid(u.get<std::string_view>());
+            if (!parsed) {
+                error = "target_node_uuid must be a canonical non-zero UUID string or null";
+                return false;
+            }
+            gp.target_node_uuid = *parsed;
+        } else {
+            error = "target_node_uuid must be a UUID string or null";
+            return false;
+        }
+    }
+    if (!valid_gameplay_component(gp)) {
+        error = "gameplay fields are outside engine bounds";
+        return false;
+    }
+    return true;
+}
+
 [[nodiscard]] bool command_from_editor_tool(
     const std::string_view name,
     const Json& arguments,
@@ -2534,6 +2817,156 @@ private:
         }
         command.type = McpCommandType::editor_set_reverb_zone;
         command.reverb_zone = zone;
+        return true;
+    }
+    if (name == "editor.scene.remove_animator") {
+        if (arguments.size() != 1U || !arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "id must be the only argument and contain index/generation";
+            return false;
+        }
+        command.type = McpCommandType::editor_remove_animator;
+        return true;
+    }
+    if (name == "editor.scene.set_animator") {
+        if (!arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "set_animator requires a valid id";
+            return false;
+        }
+        AnimatorComponent anim{};
+        if (!parse_animator_fields(arguments, anim, error)) {
+            return false;
+        }
+        command.type = McpCommandType::editor_set_animator;
+        command.animator = anim;
+        return true;
+    }
+    if (name == "editor.animation.preview") {
+        if (!only_keys(arguments, {
+                "id", "clip_name", "playing", "stop",
+                "time_seconds", "param_x", "param_y"}) ||
+            !arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "animation.preview requires id and valid preview fields";
+            return false;
+        }
+        command.preview_stop = false;
+        if (arguments.contains("stop")) {
+            const auto s = get_bool(arguments, "stop");
+            if (!s) {
+                error = "stop must be a boolean";
+                return false;
+            }
+            command.preview_stop = *s;
+        }
+        command.enabled = true;
+        if (arguments.contains("playing")) {
+            const auto p = get_bool(arguments, "playing");
+            if (!p) {
+                error = "playing must be a boolean";
+                return false;
+            }
+            command.enabled = *p;
+        }
+        if (arguments.contains("clip_name")) {
+            const auto clip = get_string(arguments, "clip_name");
+            if (!clip ||
+                !copy_command_text(*clip, command.text, error, "clip_name")) {
+                if (error.empty()) {
+                    error = "clip_name must be a valid string";
+                }
+                return false;
+            }
+        }
+        if (arguments.contains("time_seconds")) {
+            const auto t = get_finite_float(
+                arguments, "time_seconds", 0.0F, 100'000.0F);
+            if (!t) {
+                error = "time_seconds must be between 0 and 100000";
+                return false;
+            }
+            command.preview_time_seconds = *t;
+        }
+        if (arguments.contains("param_x") || arguments.contains("param_y")) {
+            const auto px = arguments.contains("param_x")
+                ? get_finite_float(arguments, "param_x", -1000.0F, 1000.0F)
+                : std::optional<float>(0.0F);
+            const auto py = arguments.contains("param_y")
+                ? get_finite_float(arguments, "param_y", -1000.0F, 1000.0F)
+                : std::optional<float>(0.0F);
+            if (!px || !py) {
+                error = "param_x and param_y must be between -1000 and 1000";
+                return false;
+            }
+            command.animator.param_x = *px;
+            command.animator.param_y = *py;
+            command.preview_params_supplied = true;
+        }
+        command.type = McpCommandType::editor_animation_preview;
+        return true;
+    }
+    if (name == "editor.scene.remove_gameplay") {
+        if (arguments.size() != 1U || !arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "id must be the only argument and contain index/generation";
+            return false;
+        }
+        command.type = McpCommandType::editor_remove_gameplay;
+        return true;
+    }
+    if (name == "editor.scene.set_gameplay") {
+        if (!arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "set_gameplay requires a valid id";
+            return false;
+        }
+        GameplayComponent gp{};
+        if (!parse_gameplay_fields(arguments, gp, error)) {
+            return false;
+        }
+        command.type = McpCommandType::editor_set_gameplay;
+        command.gameplay = gp;
+        return true;
+    }
+    if (name == "editor.gameplay.save_or_load") {
+        if (!only_keys(arguments, {"action", "path"}) ||
+            !arguments.contains("action")) {
+            error = "gameplay.save_or_load requires action and optional path";
+            return false;
+        }
+        const auto act = get_string(arguments, "action");
+        if (!act) {
+            error = "action must be save, load, start_play, or stop_play";
+            return false;
+        }
+        if (*act == "save") {
+            command.gameplay_io_action = 0U;
+        } else if (*act == "load") {
+            command.gameplay_io_action = 1U;
+        } else if (*act == "start_play") {
+            command.gameplay_io_action = 2U;
+        } else if (*act == "stop_play") {
+            command.gameplay_io_action = 3U;
+        } else {
+            error = "action must be save, load, start_play, or stop_play";
+            return false;
+        }
+        constexpr std::string_view default_path =
+            "saves/quicksave.vcrsave.json";
+        std::string_view rel_path = default_path;
+        if (arguments.contains("path")) {
+            const auto p = get_string(arguments, "path");
+            if (!p || p->empty()) {
+                error = "path must be a non-empty relative .vcrsave.json path";
+                return false;
+            }
+            rel_path = *p;
+        }
+        if (!copy_command_text(rel_path, command.text, error, "path")) {
+            return false;
+        }
+        command.type = McpCommandType::editor_gameplay_save_or_load;
         return true;
     }
     if (name == "editor.audio.set_bus") {

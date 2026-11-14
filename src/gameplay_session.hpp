@@ -3,11 +3,13 @@
 #include "audio_engine.hpp"
 #include "collision.hpp"
 #include "gameplay.hpp"
+#include "gameplay_framework.hpp"
 #include "input_actions.hpp"
 #include "physics_world.hpp"
 #include "scene_document.hpp"
 
 #include <cstdint>
+#include <filesystem>
 #include <span>
 #include <string>
 #include <utility>
@@ -17,6 +19,9 @@ namespace vcr {
 
 class FlyCamera;
 class Renderer;
+
+[[nodiscard]] SkeletalAssetProvider make_renderer_skeletal_provider(
+    Renderer* renderer) noexcept;
 
 struct GameplayFrameInput {
     CharacterInput character{};
@@ -42,7 +47,33 @@ public:
         FlyCamera& output_camera,
         AudioEngine* audio_engine = nullptr,
         InputActionSystem* input_actions = nullptr) noexcept;
-    void stop(AudioEngine* audio_engine = nullptr) noexcept;
+    void stop(
+        AudioEngine* audio_engine = nullptr,
+        Renderer* renderer = nullptr) noexcept;
+
+    [[nodiscard]] bool save_game_state(
+        const std::filesystem::path& path,
+        std::string& error) const;
+    [[nodiscard]] bool load_game_state(
+        const std::filesystem::path& path,
+        const SceneDocument& scene,
+        Renderer& renderer,
+        FlyCamera& output_camera,
+        std::string& error);
+
+    [[nodiscard]] GameplayWorld& gameplay_world() noexcept {
+        return gameplay_world_;
+    }
+    [[nodiscard]] const GameplayWorld& gameplay_world() const noexcept {
+        return gameplay_world_;
+    }
+    [[nodiscard]] AnimatorRuntimeSystem& animator_runtime() noexcept {
+        return animator_runtime_;
+    }
+    [[nodiscard]] const AnimatorRuntimeSystem& animator_runtime()
+        const noexcept {
+        return animator_runtime_;
+    }
 
     [[nodiscard]] bool active() const noexcept { return active_; }
     [[nodiscard]] SceneNodeId player_node() const noexcept {
@@ -88,6 +119,8 @@ private:
     CollisionWorld collision_world_{};
     PhysicsWorld physics_world_{};
     TriggerOverlapTracker trigger_tracker_{};
+    GameplayWorld gameplay_world_{};
+    AnimatorRuntimeSystem animator_runtime_{};
     std::vector<SceneWorldNode> cached_world_nodes_{};
     std::vector<std::uint32_t> world_ancestor_scratch_{};
     std::vector<RuntimeAudioNode> runtime_audio_nodes_{};

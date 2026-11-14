@@ -87,6 +87,23 @@ constexpr float radians_to_degrees = 57.2957795131F;
     return raw * ((speed * clamped_mag) / raw_len);
 }
 
+[[nodiscard]] RuntimeTransformSink make_renderer_transform_sink(
+    Renderer& renderer) noexcept {
+#if VCR_EDITOR_ENABLED
+    return RuntimeTransformSink{
+        .context = &renderer,
+        .apply = +[](void* const ctx,
+                     const SceneNodeId id,
+                     const TransformRows rows) noexcept -> bool {
+            return static_cast<Renderer*>(ctx)->set_runtime_transform(id, rows);
+        },
+    };
+#else
+    (void)renderer;
+    return {};
+#endif
+}
+
 [[nodiscard]] TransformRows player_transform(
     const glm::vec3 feet_position,
     const float facing_yaw) noexcept {
@@ -103,6 +120,42 @@ constexpr float radians_to_degrees = 57.2957795131F;
 }
 
 } // namespace
+
+SkeletalAssetProvider make_renderer_skeletal_provider(
+    Renderer* const renderer) noexcept {
+    if (renderer == nullptr) {
+        return {};
+    }
+#if VCR_EDITOR_ENABLED
+    return SkeletalAssetProvider{
+        .asset_context = renderer,
+        .pose_context = renderer,
+        .find_skeleton = +[](const void* const ctx,
+                             const std::string_view path) noexcept
+                             -> const CookedSkeletonAsset* {
+            return static_cast<const Renderer*>(ctx)->find_model_skeleton(path);
+        },
+        .find_animations = +[](const void* const ctx,
+                               const std::string_view path) noexcept
+                               -> const std::vector<AnimationClip>* {
+            return static_cast<const Renderer*>(ctx)
+                ->find_model_animations(path);
+        },
+        .submit_pose = +[](void* const ctx,
+                           const SceneNodeId id,
+                           const std::string_view path,
+                           const std::span<const glm::mat4> skin) {
+            static_cast<Renderer*>(ctx)->set_skinned_model_pose(id, path, skin);
+        },
+        .remove_pose = +[](void* const ctx,
+                           const SceneNodeId id) noexcept {
+            static_cast<Renderer*>(ctx)->remove_skinned_model_pose(id);
+        },
+    };
+#else
+    return {};
+#endif
+}
 
 bool GameplaySession::start(
     SceneDocument& scene,
@@ -121,6 +174,8 @@ bool GameplaySession::start(
     collision_world_.clear();
     physics_world_.clear();
     trigger_tracker_.reset();
+    gameplay_world_.clear();
+    animator_runtime_.clear(nullptr);
     runtime_audio_nodes_.clear();
     has_prev_listener_position_ = false;
 
@@ -225,6 +280,12 @@ bool GameplaySession::start(
         character_.position(),
         character_.config().capsule_radius,
         character_.config().capsule_height);
+    gameplay_world_.start(
+        scene,
+        &collision_world_,
+        &physics_world_,
+        &animator_runtime_,
+        audio_engine);
 
     const glm::vec3 startup_forward = startup_camera.forward();
     camera_.reset(std::atan2(startup_forward.z, startup_forward.x));
@@ -272,6 +333,12 @@ bool GameplaySession::update(
             bounds_provider,
             collision_provider);
         scene.build_world_nodes(cached_world_nodes_, world_ancestor_scratch_);
+        gameplay_world_.sync_scene(
+            scene,
+            &collision_world_,
+            &physics_world_,
+            &animator_runtime_,
+            audio_engine);
         cached_content_revision_ = scene.content_revision();
         cached_structure_revision_ = scene.structure_revision();
     }
@@ -315,6 +382,49 @@ bool GameplaySession::update(
         character_.position(),
         character_.config().capsule_radius,
         character_.config().capsule_height);
+
+    const RuntimeTransformSink transform_sink =
+        make_renderer_transform_sink(renderer);
+    const SkeletalAssetProvider skeletal_provider =
+        make_renderer_skeletal_provider(&renderer);
+
+    gameplay_world_.update(
+        delta_seconds,
+        scene,
+        character_.position(),
+        input.character.interact,
+        trigger_tracker_.events(),
+        &collision_world_,
+        &physics_world_,
+        &animator_runtime_,
+        audio_engine,
+        transform_sink);
+
+    animator_runtime_.update(
+        delta_seconds,
+        scene,
+        &collision_world_,
+        &physics_world_,
+        skeletal_provider,
+        audio_engine,
+        cached_world_nodes_,
+        false,
+        &transform_sink);
+
+    for (const SceneNodeId anim_id : scene.animators().owners()) {
+        if (const auto anim_comp = scene.animator(anim_id);
+            anim_comp && anim_comp->get().root_motion_enabled) {
+            const AnimatorNodeRuntime* rt =
+                animator_runtime_.node_runtime(anim_id);
+            GameplayEntityState* entity =
+                gameplay_world_.find_entity(anim_id);
+            if (rt != nullptr && entity != nullptr) {
+                entity->runtime_position = rt->root_motion_position;
+                entity->runtime_rotation_degrees =
+                    rt->root_motion_rotation_degrees;
+            }
+        }
+    }
 
     if (!renderer.set_runtime_transform(
             player_node_,
@@ -587,10 +697,76 @@ void GameplaySession::sync_scene_audio(
     }
 }
 
-void GameplaySession::stop(AudioEngine* const audio_engine) noexcept {
+bool GameplaySession::save_game_state(
+    const std::filesystem::path& path,
+    std::string& error) const {
+    if (!active_) {
+        error = "Gameplay session is not active.";
+        return false;
+    }
+    GameStateSnapshot snap{};
+    gameplay_world_.capture_snapshot(
+        character_.position(),
+        character_.facing_yaw(),
+        camera_.yaw(),
+        camera_.pitch(),
+        &physics_world_,
+        &animator_runtime_,
+        snap);
+    return save_game_state_file(path, snap, error);
+}
+
+bool GameplaySession::load_game_state(
+    const std::filesystem::path& path,
+    const SceneDocument& scene,
+    Renderer& renderer,
+    FlyCamera& output_camera,
+    std::string& error) {
+    if (!active_) {
+        error = "Gameplay session is not active.";
+        return false;
+    }
+    GameStateSnapshot snap{};
+    if (!load_game_state_file(path, snap, error)) {
+        return false;
+    }
+    character_.reset(snap.player_position, snap.player_facing_yaw);
+    camera_.set_angles(snap.camera_yaw, snap.camera_pitch);
+    const RuntimeTransformSink transform_sink =
+        make_renderer_transform_sink(renderer);
+    gameplay_world_.restore_snapshot(
+        snap, scene, &physics_world_, &animator_runtime_, transform_sink);
+
+    if (player_node_) {
+        static_cast<void>(renderer.set_runtime_transform(
+            player_node_,
+            player_transform(character_.position(), character_.facing_yaw())));
+    }
+    output_camera = FlyCamera(
+        camera_.position(
+            character_.position(),
+            collision_world_,
+            physics_world_),
+        camera_.yaw(),
+        camera_.pitch());
+    return true;
+}
+
+void GameplaySession::stop(
+    AudioEngine* const audio_engine,
+    Renderer* const renderer) noexcept {
     if (audio_engine != nullptr && audio_engine->initialized()) {
         audio_engine->stop_gameplay_audio(0.03F);
     }
+    const SkeletalAssetProvider skeletal_provider =
+        make_renderer_skeletal_provider(renderer);
+    animator_runtime_.clear(renderer != nullptr ? &skeletal_provider : nullptr);
+#if VCR_EDITOR_ENABLED
+    if (renderer != nullptr) {
+        renderer->clear_skinned_model_poses();
+    }
+#endif
+    gameplay_world_.clear();
     runtime_audio_nodes_.clear();
     has_prev_listener_position_ = false;
     collision_world_.clear();

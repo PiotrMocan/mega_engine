@@ -418,6 +418,7 @@ target_compile_definitions(vcr_asset_import PRIVATE
 target_link_libraries(vcr_asset_import
     PUBLIC
         vcr_cooked_audio_asset
+        vcr_cooked_model_asset
     PRIVATE
         assimp::assimp
         glm::glm
@@ -441,6 +442,7 @@ endif()
 
 add_library(vcr_cooked_model_asset STATIC
     src/cooked_model_asset.cpp
+    src/skeletal_animation.cpp
 )
 target_include_directories(vcr_cooked_model_asset PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -545,6 +547,7 @@ set(VCR_RENDERER_SOURCES
     src/collision.cpp
     src/fly_camera.cpp
     src/gameplay.cpp
+    src/gameplay_framework.cpp
     src/gameplay_session.cpp
     src/input_actions.cpp
     src/physics_world.cpp
@@ -1145,4 +1148,50 @@ if(BUILD_TESTING)
         endif()
     endif()
     add_test(NAME vcr_project_tests COMMAND vcr_project_tests)
+
+    add_executable(vcr_animation_gameplay_tests
+        tests/animation_gameplay_tests.cpp
+        src/audio_engine.cpp
+        src/collision.cpp
+        src/editor_scene_tools.cpp
+        src/gameplay.cpp
+        src/gameplay_framework.cpp
+        src/physics_world.cpp
+        src/prefab_io.cpp
+        src/punctual_light.cpp
+        src/scene_document.cpp
+        src/scene_io.cpp
+        src/scene_uuid.cpp
+        src/sound_cue_io.cpp
+    )
+    target_include_directories(vcr_animation_gameplay_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+    target_compile_definitions(vcr_animation_gameplay_tests PRIVATE
+        GLM_FORCE_DEPTH_ZERO_TO_ONE
+        GLM_FORCE_RADIANS
+    )
+    target_link_libraries(vcr_animation_gameplay_tests PRIVATE
+        vcr_cooked_model_asset
+        vcr_cooked_audio_asset
+        glm::glm
+        nlohmann_json::nlohmann_json
+        Threads::Threads
+    )
+    if(MSVC)
+        target_compile_options(vcr_animation_gameplay_tests PRIVATE
+            /W4 /permissive- /Zc:preprocessor /GR- /EHsc
+        )
+        if(VCR_WARNINGS_AS_ERRORS)
+            target_compile_options(vcr_animation_gameplay_tests PRIVATE /WX)
+        endif()
+    else()
+        target_compile_options(vcr_animation_gameplay_tests PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -fno-rtti
+        )
+        if(VCR_WARNINGS_AS_ERRORS)
+            target_compile_options(vcr_animation_gameplay_tests PRIVATE -Werror)
+        endif()
+    endif()
+    add_test(NAME vcr_animation_gameplay_tests COMMAND vcr_animation_gameplay_tests)
 endif()

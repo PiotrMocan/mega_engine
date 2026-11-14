@@ -110,24 +110,24 @@ performance benchmark используется изолированный `vulka
 - `Scene Hierarchy`: иерархический forest с generational handles,
   работающими chevrons, `Expand all`/`Collapse all`, drag-and-drop reparenting,
   защитой от циклов, фильтром и clipped-отрисовкой.
-- `Inspector`: имя, персистентный `UUID` (с кнопкой копирования), visibility и position/rotation/scale для всех nodes; секция `Prefab` (сохранение выбранного поддерева в `*.vcrprefab.json`, индикация инстанса префаба и распаковка через `Unpack Prefab`); компонент `Collision` (`Auto Bounds`/`Box`/`Sphere`/`Capsule`/`Convex Hull`/`Triangle Mesh`, `Trigger`, offset, размеры, слои) с 3D wireframe-отображением (включая cooked hull/mesh/compound boxes) в `Scene View`; компонент `Rigid Body` (`Dynamic`/`Kinematic`, масса, линейное/угловое затухание, трение, упругость, гравитация, фиксация вращения, старт во сне); компоненты звука `Audio Source` (2D/3D источник или `Sound Cue`, маршрутизация в шины, аттенюация, конус направленности, Доплер, окклюзия, стриминг), `Audio Listener` и `Reverb Zone` (с 3D wireframe-сферами и конусами в `Scene View`);
-  asset path для model
+- `Inspector`: имя, персистентный `UUID` (с кнопкой копирования), visibility и position/rotation/scale для всех nodes; секция `Prefab` (сохранение выбранного поддерева в `*.vcrprefab.json`, индикация инстанса префаба и распаковка через `Unpack Prefab`); компонент `Collision` (`Auto Bounds`/`Box`/`Sphere`/`Capsule`/`Convex Hull`/`Triangle Mesh`, `Trigger`, offset, размеры, слои) с 3D wireframe-отображением (включая cooked hull/mesh/compound boxes) в `Scene View`; компонент `Rigid Body` (`Dynamic`/`Kinematic`, масса, линейное/угловое затухание, трение, упругость, гравитация, фиксация вращения, старт во сне); компоненты звука `Audio Source` (2D/3D источник или `Sound Cue`, маршрутизация в шины, аттенюация, конус направленности, Доплер, окклюзия, стриминг), `Audio Listener` и `Reverb Zone` (с 3D wireframe-сферами и конусами в `Scene View`); компонент скелетной анимации `Animator` (режимы `Single Clip` / `1D Blend Space` / `2D Blend Space` / `State Machine`, выбор primary/secondary клипов, upper-body bone mask + вес и additive-режим, скорость/looping, параметры `param_x`/`param_y`, Root Motion, Foot IK, Look-At IK + цель и скраббинг Edit-mode `Preview Play/Pause/Stop`); геймплейный компонент `Gameplay` (включение, флаг сохранения в Save, поведение `GameplayBehaviorRegistry` — `patrol`/`collectible`/`door`/`trigger_zone`/`destructible`/`health_pack`, тег, `Sound Cue`, здоровье, скорость, радиус взаимодействия, точки патруля, целевой `UUID` и пользовательские параметры); asset path для model
   nodes; PBR base color, metallic, roughness и ambient occlusion для
   cubes/ground. Terrain, sky и sun visibility уже
   управляет renderer, а неподключённые component controls намеренно не
   показываются как работающие.
 - `Audio & Input`: отдельная dockable панель с 5-шинным микшером (`Master`, `Music`, `SFX`, `Voice`, `UI`), пиковыми индикаторами L/R и brickwall-лимитером на `Master`, конструктором пулов вариаций `Sound Cue` (`*.vcrcue.json`), настройкой мёртвых зон/вибрации геймпада (`XInput`) и интерактивным переназначением клавиш/кнопок по контекстам (`Gameplay`, `UI`, `Cutscene`) с детекцией конфликтов и сохранением в `config/input_bindings.json`.
+- `Animation & Gameplay`: отдельная dockable панель (справа/в меню `Window`) со статистикой активных аниматоров, skinned-узлов и gameplay-сущностей, слотами Save/Load (`saves/*.vcrsave.json`), таблицей runtime-переменных и кольцевыми журналами событий `Animation Events` и `Gameplay` в реальном времени.
 - `Scene View`: offscreen Vulkan target, изменяемый размер, ray/AABB picking,
-  selection bounds и transform gizmo. `W/E/R` выбирают move/rotate/scale,
+  selection bounds, тулбар-переключатель wireframe-оверлея скелета (`Skeleton` + маркеры Foot/Look-At IK) и transform gizmo. `W/E/R` выбирают move/rotate/scale,
   доступны World/Local space, постоянный snap и временный snap через `Ctrl`.
   `F` кадрирует выбранный объект, `Ctrl+D` дублирует весь subtree, `Delete`
   удаляет выбранное с возможностью Undo. Fly camera: `RMB + WASD`, `E/Q`,
   `Shift`.
 - `Play/Stop` (`F5`): authoring scene сохраняется перед Play, запускается общая
-  с `vulkan_cube` игровая сессия с runtime-персонажем и камерой от третьего
-  лица, редактирование блокируется, а Stop восстанавливает исходный снимок и
-  редакторскую камеру. В Play: `WASD` — движение и разворот, `Shift` — бег,
-  `Space` — прыжок, мышь — вращение камеры без удержания кнопок. Вход в Play
+  с `vulkan_cube` игровая сессия с runtime-персонажем, камерой от третьего
+  лица, скелетным GPU skinning и `GameplayWorld`; редактирование блокируется,
+  а Stop восстанавливает исходный снимок и редакторскую камеру. В Play: `WASD` — движение и разворот, `Shift` — бег,
+  `Space` — прыжок, мышь — вращение камеры без удержания кнопок, `F5`/`F9` — Quick Save / Quick Load снимка `*.vcrsave.json` в sandbox-папке `saves/`. Вход в Play
   захватывает мышь и скрывает курсор; `Esc` освобождает мышь, не останавливая
   игру, а `ЛКМ` по изображению вьюпорта возвращает захват. Потеря фокуса окна,
   Pause и Stop освобождают мышь; Resume снова захватывает её.
@@ -199,7 +199,7 @@ Resize viewport coalesced с задержкой 140 ms и ограничен `38
 
 ## Осознанные ограничения текущего этапа
 
-- Play имеет корректную границу authoring/runtime snapshot, статические/cooked коллизии (`CollisionWorld`), капсульный `CharacterController` и фиксированный 3D-солвер твёрдых тел (`PhysicsWorld`), но полноценный gameplay scripting и скелетная анимация пока отсутствуют.
+- Play имеет корректную границу authoring/runtime snapshot, статические/cooked коллизии (`CollisionWorld`), капсульный `CharacterController`, фиксированный 3D-солвер твёрдых тел (`PhysicsWorld`), GPU compute skinning (`*.vcrskin`/`*.vcranim`) с аниматором (`Blend Space`, `State Machine`, маски костей, Root Motion, Foot/Look-At IK) и встроенные поведения `GameplayBehaviorRegistry`/`GameplayWorld` с сериализацией `*.vcrsave.json`, но полноценный визуальный граф/scripting язык (Lua/C# или node-graph) и редакторского встраиваемого runtime UI (`HUD`) пока нет.
 - Отдельное окно — окно текущего процесса с зеркалом одной camera, не отдельный
   процесс и не независимо отрендеренная game camera. Main window сейчас
   present-ится до secondary viewport, поэтому FIFO на main window может

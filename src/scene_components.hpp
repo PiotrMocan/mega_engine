@@ -733,6 +733,319 @@ static_assert(std::is_trivially_copyable_v<AudioReverbZoneComponent>);
     return zone;
 }
 
+inline constexpr std::size_t max_animator_clip_name_bytes = 127U;
+inline constexpr std::size_t max_animator_bone_name_bytes = 63U;
+inline constexpr std::size_t max_gameplay_behavior_bytes = 63U;
+inline constexpr std::size_t max_gameplay_tag_bytes = 63U;
+inline constexpr std::size_t max_gameplay_sound_cue_bytes = 255U;
+
+enum class AnimatorBlendMode : std::uint8_t {
+    single_clip = 0U,
+    blend_space_1d = 1U,
+    blend_space_2d = 2U,
+    state_machine = 3U,
+};
+
+[[nodiscard]] inline std::string_view to_token(
+    const AnimatorBlendMode mode) noexcept {
+    switch (mode) {
+    case AnimatorBlendMode::single_clip: return "single_clip";
+    case AnimatorBlendMode::blend_space_1d: return "blend_space_1d";
+    case AnimatorBlendMode::blend_space_2d: return "blend_space_2d";
+    case AnimatorBlendMode::state_machine: return "state_machine";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] inline bool parse_animator_blend_mode(
+    const std::string_view token,
+    AnimatorBlendMode& out) noexcept {
+    if (token == "single_clip") {
+        out = AnimatorBlendMode::single_clip;
+        return true;
+    }
+    if (token == "blend_space_1d") {
+        out = AnimatorBlendMode::blend_space_1d;
+        return true;
+    }
+    if (token == "blend_space_2d") {
+        out = AnimatorBlendMode::blend_space_2d;
+        return true;
+    }
+    if (token == "state_machine") {
+        out = AnimatorBlendMode::state_machine;
+        return true;
+    }
+    return false;
+}
+
+namespace component_detail {
+
+template <std::size_t N>
+[[nodiscard]] inline std::string_view fixed_cstr_view(
+    const std::array<char, N>& buffer) noexcept {
+    const void* nul = std::memchr(buffer.data(), '\0', buffer.size());
+    const std::size_t len = nul != nullptr
+        ? static_cast<std::size_t>(
+              static_cast<const char*>(nul) - buffer.data())
+        : buffer.size();
+    return std::string_view(buffer.data(), len);
+}
+
+template <std::size_t N>
+[[nodiscard]] inline bool set_fixed_cstr(
+    std::array<char, N>& buffer,
+    const std::string_view value) noexcept {
+    static_assert(N >= 2U);
+    if (value.size() >= N ||
+        value.find('\0') != std::string_view::npos ||
+        !valid_utf8_text(value)) {
+        return false;
+    }
+    buffer.fill('\0');
+    if (!value.empty()) {
+        std::memcpy(buffer.data(), value.data(), value.size());
+    }
+    return true;
+}
+
+template <std::size_t N>
+[[nodiscard]] inline bool valid_fixed_cstr(
+    const std::array<char, N>& buffer) noexcept {
+    const void* nul = std::memchr(buffer.data(), '\0', buffer.size());
+    if (nul == nullptr) {
+        return false;
+    }
+    const auto len = static_cast<std::size_t>(
+        static_cast<const char*>(nul) - buffer.data());
+    return valid_utf8_text(std::string_view(buffer.data(), len));
+}
+
+} // namespace component_detail
+
+struct AnimatorComponent {
+    AnimatorBlendMode mode = AnimatorBlendMode::single_clip;
+    std::array<char, 128U> clip_name{};
+    std::array<char, 128U> secondary_clip_name{};
+    std::array<char, 64U> upper_body_root_bone{};
+    float upper_body_weight = 0.0F;
+    bool upper_body_additive = false;
+    float playback_speed = 1.0F;
+    float start_time_seconds = 0.0F;
+    bool looping = true;
+    bool playing = true;
+    bool root_motion_enabled = false;
+    bool foot_ik_enabled = false;
+    float foot_ik_weight = 1.0F;
+    bool look_at_ik_enabled = false;
+    float look_at_ik_weight = 1.0F;
+    glm::vec3 look_at_target_world{0.0F, 1.5F, 2.0F};
+    float param_x = 0.0F;
+    float param_y = 0.0F;
+
+    [[nodiscard]] std::string_view clip_name_view() const noexcept {
+        return component_detail::fixed_cstr_view(clip_name);
+    }
+    [[nodiscard]] bool set_clip_name(const std::string_view v) noexcept {
+        return component_detail::set_fixed_cstr(clip_name, v);
+    }
+    [[nodiscard]] std::string_view secondary_clip_view() const noexcept {
+        return component_detail::fixed_cstr_view(secondary_clip_name);
+    }
+    [[nodiscard]] bool set_secondary_clip_name(const std::string_view v) noexcept {
+        return component_detail::set_fixed_cstr(secondary_clip_name, v);
+    }
+    [[nodiscard]] std::string_view upper_body_bone_view() const noexcept {
+        return component_detail::fixed_cstr_view(upper_body_root_bone);
+    }
+    [[nodiscard]] bool set_upper_body_bone(const std::string_view v) noexcept {
+        return component_detail::set_fixed_cstr(upper_body_root_bone, v);
+    }
+
+    friend bool operator==(
+        const AnimatorComponent&,
+        const AnimatorComponent&) = default;
+};
+
+static_assert(std::is_trivially_copyable_v<AnimatorComponent>);
+
+[[nodiscard]] inline bool valid_animator_component(
+    const AnimatorComponent& anim) noexcept {
+    return to_token(anim.mode) != "unknown" &&
+           component_detail::valid_fixed_cstr(anim.clip_name) &&
+           component_detail::valid_fixed_cstr(anim.secondary_clip_name) &&
+           component_detail::valid_fixed_cstr(anim.upper_body_root_bone) &&
+           std::isfinite(anim.upper_body_weight) &&
+           anim.upper_body_weight >= 0.0F &&
+           anim.upper_body_weight <= 1.0F &&
+           std::isfinite(anim.playback_speed) &&
+           anim.playback_speed >= -10.0F &&
+           anim.playback_speed <= 10.0F &&
+           std::isfinite(anim.start_time_seconds) &&
+           anim.start_time_seconds >= 0.0F &&
+           anim.start_time_seconds <= 100'000.0F &&
+           std::isfinite(anim.foot_ik_weight) &&
+           anim.foot_ik_weight >= 0.0F &&
+           anim.foot_ik_weight <= 1.0F &&
+           std::isfinite(anim.look_at_ik_weight) &&
+           anim.look_at_ik_weight >= 0.0F &&
+           anim.look_at_ik_weight <= 1.0F &&
+           std::isfinite(anim.look_at_target_world.x) &&
+           std::isfinite(anim.look_at_target_world.y) &&
+           std::isfinite(anim.look_at_target_world.z) &&
+           std::isfinite(anim.param_x) &&
+           std::isfinite(anim.param_y);
+}
+
+[[nodiscard]] inline AnimatorComponent sanitize_animator_component(
+    AnimatorComponent anim) noexcept {
+    if (to_token(anim.mode) == "unknown") {
+        anim.mode = AnimatorBlendMode::single_clip;
+    }
+    if (!component_detail::valid_fixed_cstr(anim.clip_name)) {
+        anim.clip_name.fill('\0');
+    }
+    if (!component_detail::valid_fixed_cstr(anim.secondary_clip_name)) {
+        anim.secondary_clip_name.fill('\0');
+    }
+    if (!component_detail::valid_fixed_cstr(anim.upper_body_root_bone)) {
+        anim.upper_body_root_bone.fill('\0');
+    }
+    const auto clamp_or = [](const float v,
+                             const float lo,
+                             const float hi,
+                             const float fallback) noexcept {
+        return std::isfinite(v) ? std::clamp(v, lo, hi) : fallback;
+    };
+    anim.upper_body_weight = clamp_or(anim.upper_body_weight, 0.0F, 1.0F, 0.0F);
+    anim.playback_speed = clamp_or(anim.playback_speed, -10.0F, 10.0F, 1.0F);
+    anim.start_time_seconds =
+        clamp_or(anim.start_time_seconds, 0.0F, 100'000.0F, 0.0F);
+    anim.foot_ik_weight = clamp_or(anim.foot_ik_weight, 0.0F, 1.0F, 1.0F);
+    anim.look_at_ik_weight =
+        clamp_or(anim.look_at_ik_weight, 0.0F, 1.0F, 1.0F);
+    for (int i = 0; i < 3; ++i) {
+        if (!std::isfinite(anim.look_at_target_world[i])) {
+            anim.look_at_target_world[i] = i == 1 ? 1.5F : (i == 2 ? 2.0F : 0.0F);
+        }
+    }
+    anim.param_x = clamp_or(anim.param_x, -1000.0F, 1000.0F, 0.0F);
+    anim.param_y = clamp_or(anim.param_y, -1000.0F, 1000.0F, 0.0F);
+    return anim;
+}
+
+struct GameplayComponent {
+    std::array<char, 64U> behavior{};
+    std::array<char, 64U> tag{};
+    std::array<char, 256U> on_trigger_sound_cue{};
+    bool enabled = true;
+    bool persist_save_state = true;
+    float health = 100.0F;
+    float max_health = 100.0F;
+    float move_speed = 2.5F;
+    float interaction_radius = 2.0F;
+    glm::vec3 patrol_point_a{0.0F};
+    glm::vec3 patrol_point_b{0.0F, 0.0F, 4.0F};
+    SceneUuid target_node_uuid{};
+    float custom_param_0 = 0.0F;
+    float custom_param_1 = 0.0F;
+
+    [[nodiscard]] std::string_view behavior_view() const noexcept {
+        return component_detail::fixed_cstr_view(behavior);
+    }
+    [[nodiscard]] bool set_behavior(const std::string_view v) noexcept {
+        return component_detail::set_fixed_cstr(behavior, v);
+    }
+    [[nodiscard]] std::string_view tag_view() const noexcept {
+        return component_detail::fixed_cstr_view(tag);
+    }
+    [[nodiscard]] bool set_tag(const std::string_view v) noexcept {
+        return component_detail::set_fixed_cstr(tag, v);
+    }
+    [[nodiscard]] std::string_view on_trigger_sound_cue_view() const noexcept {
+        return component_detail::fixed_cstr_view(on_trigger_sound_cue);
+    }
+    [[nodiscard]] bool set_on_trigger_sound_cue(
+        const std::string_view v) noexcept {
+        if (v.empty()) {
+            on_trigger_sound_cue.fill('\0');
+            return true;
+        }
+        return valid_audio_asset_reference(v) &&
+               component_detail::set_fixed_cstr(on_trigger_sound_cue, v);
+    }
+
+    friend bool operator==(
+        const GameplayComponent&,
+        const GameplayComponent&) = default;
+};
+
+static_assert(std::is_trivially_copyable_v<GameplayComponent>);
+
+[[nodiscard]] inline bool valid_gameplay_component(
+    const GameplayComponent& gp) noexcept {
+    const std::string_view cue = gp.on_trigger_sound_cue_view();
+    const bool cue_valid = cue.empty() || valid_audio_asset_reference(cue);
+    return component_detail::valid_fixed_cstr(gp.behavior) &&
+           component_detail::valid_fixed_cstr(gp.tag) &&
+           component_detail::valid_fixed_cstr(gp.on_trigger_sound_cue) &&
+           cue_valid &&
+           std::isfinite(gp.max_health) &&
+           gp.max_health >= 1.0F &&
+           gp.max_health <= 1'000'000.0F &&
+           std::isfinite(gp.health) &&
+           gp.health >= 0.0F &&
+           gp.health <= gp.max_health &&
+           std::isfinite(gp.move_speed) &&
+           gp.move_speed >= 0.0F &&
+           gp.move_speed <= 1000.0F &&
+           std::isfinite(gp.interaction_radius) &&
+           gp.interaction_radius >= 0.05F &&
+           gp.interaction_radius <= 1000.0F &&
+           std::isfinite(gp.patrol_point_a.x) &&
+           std::isfinite(gp.patrol_point_a.y) &&
+           std::isfinite(gp.patrol_point_a.z) &&
+           std::isfinite(gp.patrol_point_b.x) &&
+           std::isfinite(gp.patrol_point_b.y) &&
+           std::isfinite(gp.patrol_point_b.z) &&
+           std::isfinite(gp.custom_param_0) &&
+           std::isfinite(gp.custom_param_1);
+}
+
+[[nodiscard]] inline GameplayComponent sanitize_gameplay_component(
+    GameplayComponent gp) noexcept {
+    if (!component_detail::valid_fixed_cstr(gp.behavior)) {
+        gp.behavior.fill('\0');
+    }
+    if (!component_detail::valid_fixed_cstr(gp.tag)) {
+        gp.tag.fill('\0');
+    }
+    const std::string_view cue = gp.on_trigger_sound_cue_view();
+    if (!cue.empty() && !valid_audio_asset_reference(cue)) {
+        gp.on_trigger_sound_cue.fill('\0');
+    }
+    const auto clamp_or = [](const float v,
+                             const float lo,
+                             const float hi,
+                             const float fallback) noexcept {
+        return std::isfinite(v) ? std::clamp(v, lo, hi) : fallback;
+    };
+    gp.max_health = clamp_or(gp.max_health, 1.0F, 1'000'000.0F, 100.0F);
+    gp.health = clamp_or(gp.health, 0.0F, gp.max_health, gp.max_health);
+    gp.move_speed = clamp_or(gp.move_speed, 0.0F, 1000.0F, 2.5F);
+    gp.interaction_radius =
+        clamp_or(gp.interaction_radius, 0.05F, 1000.0F, 2.0F);
+    for (int i = 0; i < 3; ++i) {
+        if (!std::isfinite(gp.patrol_point_a[i])) gp.patrol_point_a[i] = 0.0F;
+        if (!std::isfinite(gp.patrol_point_b[i])) {
+            gp.patrol_point_b[i] = (i == 2) ? 4.0F : 0.0F;
+        }
+    }
+    if (!std::isfinite(gp.custom_param_0)) gp.custom_param_0 = 0.0F;
+    if (!std::isfinite(gp.custom_param_1)) gp.custom_param_1 = 0.0F;
+    return gp;
+}
+
 // Value-semantic sparse-set component storage keyed by generational SceneNodeId.
 // Empty pools allocate zero heap memory until the first component is attached,
 // and copying a SceneDocument duplicates all pools with value semantics.

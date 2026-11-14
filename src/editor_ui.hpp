@@ -81,7 +81,9 @@ public:
         Renderer& renderer,
         AudioEngine* audio_engine = nullptr,
         InputActionSystem* input_actions = nullptr,
-        std::string_view explicit_project_path = {});
+        std::string_view explicit_project_path = {},
+        GameplaySession* gameplay_session = nullptr,
+        AnimatorRuntimeSystem* edit_animator_preview = nullptr);
     void shutdown() noexcept;
     void process_event(const SDL_Event& event);
     void synchronize_renderer(Renderer& renderer);
@@ -115,6 +117,7 @@ public:
     [[nodiscard]] EditorPlayState play_state() const noexcept {
         return play_state_;
     }
+    void start_play(SceneDocument& scene);
     void stop_play(SceneDocument& scene);
     [[nodiscard]] SceneNodeId selected_node() const noexcept {
         return selected_node_;
@@ -153,6 +156,18 @@ public:
     [[nodiscard]] std::optional<SavedMaterialUpdate>
         consume_saved_material_update() noexcept {
         return std::exchange(saved_material_update_, std::nullopt);
+    }
+    [[nodiscard]] std::optional<std::string> consume_quick_save_request() {
+        return std::exchange(pending_quick_save_path_, std::nullopt);
+    }
+    [[nodiscard]] std::optional<std::string> consume_quick_load_request() {
+        return std::exchange(pending_quick_load_path_, std::nullopt);
+    }
+    void report_save_load_feedback(
+        std::string status,
+        std::string error) {
+        save_load_status_ = std::move(status);
+        save_load_error_ = std::move(error);
     }
     [[nodiscard]] const std::filesystem::path&
         asset_root() const noexcept {
@@ -217,7 +232,9 @@ private:
     void build_main_menu(SceneDocument& scene);
     void build_toolbar(SceneDocument& scene);
     void build_hierarchy(SceneDocument& scene);
-    void build_inspector(SceneDocument& scene);
+    void build_inspector(
+        SceneDocument& scene,
+        Renderer& renderer);
     void build_viewport(
         SceneDocument& scene,
         Renderer& renderer,
@@ -235,6 +252,9 @@ private:
     void build_import_results();
     void build_material_editor(Renderer& renderer);
     void build_audio_input_panel();
+    void build_animation_gameplay_panel(
+        SceneDocument& scene,
+        Renderer& renderer);
     void build_performance(
         SceneDocument& scene,
         Renderer& renderer,
@@ -258,7 +278,6 @@ private:
     void update_camera_input();
     void set_game_mouse_capture(SDL_Window* window) noexcept;
     void update_game_mouse_capture(bool viewport_clicked);
-    void start_play(SceneDocument& scene);
     void request_viewport_extent(
         VkExtent2D extent,
         std::chrono::steady_clock::time_point now) noexcept;
@@ -269,6 +288,16 @@ private:
     SDL_Window* main_window_ = nullptr;
     AudioEngine* audio_engine_ = nullptr;
     InputActionSystem* input_actions_ = nullptr;
+    GameplaySession* gameplay_session_ = nullptr;
+    AnimatorRuntimeSystem* edit_animator_preview_ = nullptr;
+    bool show_skeleton_wireframe_ = true;
+    bool animation_gameplay_panel_open_ = true;
+    std::array<char, 256U> save_slot_path_buf_{};
+    std::optional<std::string> pending_quick_save_path_{};
+    std::optional<std::string> pending_quick_load_path_{};
+    std::string save_load_status_{};
+    std::string save_load_error_{};
+    std::vector<SkeletonDebugSegment> skeleton_wireframe_scratch_{};
     VkDescriptorSet scene_texture_ = VK_NULL_HANDLE;
     VkFormat imgui_color_format_ = VK_FORMAT_UNDEFINED;
     VkPipelineRenderingCreateInfo imgui_rendering_info_{

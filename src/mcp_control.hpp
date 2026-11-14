@@ -81,6 +81,12 @@ enum class McpCommandType : std::uint8_t {
     editor_set_material_tessellation,
     editor_create_flat_ground,
     editor_scatter_model,
+    editor_set_animator,
+    editor_remove_animator,
+    editor_animation_preview,
+    editor_set_gameplay,
+    editor_remove_gameplay,
+    editor_gameplay_save_or_load,
     engine_request_quit,
     engine_commit_quit,
 };
@@ -203,6 +209,12 @@ struct McpCommand {
     bool audio_bus_volume_supplied = false;
     bool audio_bus_muted_supplied = false;
     bool prefab_attach_instance = true;
+    AnimatorComponent animator{};
+    GameplayComponent gameplay{};
+    float preview_time_seconds = -1.0F;
+    bool preview_stop = false;
+    bool preview_params_supplied = false;
+    std::uint8_t gameplay_io_action = 0U;
     SceneNodeKind node_kind = SceneNodeKind::folder;
     SceneTransform transform{};
     PbrMaterial material{};

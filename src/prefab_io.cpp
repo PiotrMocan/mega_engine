@@ -1,4 +1,5 @@
 #include "prefab_io.hpp"
+#include "scene_component_json.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -678,6 +679,8 @@ struct ParsedPrefabNode {
     std::optional<AudioSourceComponent> audio_source{};
     std::optional<AudioListenerComponent> audio_listener{};
     std::optional<AudioReverbZoneComponent> reverb_zone{};
+    std::optional<AnimatorComponent> animator{};
+    std::optional<GameplayComponent> gameplay{};
     std::uint32_t parent_index = invalid_scene_node_index;
 };
 
@@ -893,7 +896,8 @@ bool save_prefab_file(
                 }
             }
             if (record.collider || record.rigid_body || record.audio_source ||
-                record.audio_listener || record.reverb_zone) {
+                record.audio_listener || record.reverb_zone ||
+                record.animator || record.gameplay) {
                 Json components = Json::object();
                 if (record.collider) {
                     components["collider"] = collider_json(*record.collider);
@@ -913,6 +917,14 @@ bool save_prefab_file(
                 if (record.reverb_zone) {
                     components["reverb_zone"] =
                         reverb_zone_json(*record.reverb_zone);
+                }
+                if (record.animator) {
+                    components["animator"] =
+                        component_json::animator_to_json(*record.animator);
+                }
+                if (record.gameplay) {
+                    components["gameplay"] =
+                        component_json::gameplay_to_json(*record.gameplay);
                 }
                 encoded["components"] = std::move(components);
             }
@@ -1272,6 +1284,8 @@ bool instantiate_prefab_file(
             std::optional<AudioSourceComponent> audio_source{};
             std::optional<AudioListenerComponent> audio_listener{};
             std::optional<AudioReverbZoneComponent> reverb_zone{};
+            std::optional<AnimatorComponent> animator{};
+            std::optional<GameplayComponent> gameplay{};
             if (encoded.contains("components")) {
                 const Json& comps = encoded["components"];
                 if (!comps.is_object()) {
@@ -1281,7 +1295,8 @@ bool instantiate_prefab_file(
                 for (const auto& [ckey, _] : comps.items()) {
                     if (ckey != "collider" && ckey != "rigid_body" &&
                         ckey != "audio_source" && ckey != "audio_listener" &&
-                        ckey != "reverb_zone") {
+                        ckey != "reverb_zone" && ckey != "animator" &&
+                        ckey != "gameplay") {
                         error = "Prefab node contains an unknown component.";
                         return false;
                     }
@@ -1326,6 +1341,24 @@ bool instantiate_prefab_file(
                     }
                     reverb_zone = rz;
                 }
+                if (comps.contains("animator")) {
+                    AnimatorComponent anim{};
+                    if (!component_json::read_animator_json(
+                            comps["animator"], anim)) {
+                        error = "Prefab animator component is invalid.";
+                        return false;
+                    }
+                    animator = anim;
+                }
+                if (comps.contains("gameplay")) {
+                    GameplayComponent gp{};
+                    if (!component_json::read_gameplay_json(
+                            comps["gameplay"], gp)) {
+                        error = "Prefab gameplay component is invalid.";
+                        return false;
+                    }
+                    gameplay = gp;
+                }
             }
 
             parsed_nodes.push_back(ParsedPrefabNode{
@@ -1352,6 +1385,8 @@ bool instantiate_prefab_file(
                 .audio_source = audio_source,
                 .audio_listener = audio_listener,
                 .reverb_zone = reverb_zone,
+                .animator = animator,
+                .gameplay = gameplay,
                 .parent_index = parent_index,
             });
         }
@@ -1470,6 +1505,20 @@ bool instantiate_prefab_file(
             }
             target.reverb_zone = *ov.reverb_zone;
         }
+        if (ov.animator) {
+            if (!valid_animator_component(*ov.animator)) {
+                error = "Prefab override animator component is invalid.";
+                return false;
+            }
+            target.animator = *ov.animator;
+        }
+        if (ov.gameplay) {
+            if (!valid_gameplay_component(*ov.gameplay)) {
+                error = "Prefab override gameplay component is invalid.";
+                return false;
+            }
+            target.gameplay = *ov.gameplay;
+        }
     }
 
     std::vector<SceneNodeId> created(parsed_nodes.size());
@@ -1538,6 +1587,18 @@ bool instantiate_prefab_file(
             !scene.set_reverb_zone(id, *spec.reverb_zone)) {
             static_cast<void>(scene.destroy_subtree(root_created));
             error = "Unable to attach prefab reverb_zone component.";
+            return false;
+        }
+        if (spec.animator &&
+            !scene.set_animator(id, *spec.animator)) {
+            static_cast<void>(scene.destroy_subtree(root_created));
+            error = "Unable to attach prefab animator component.";
+            return false;
+        }
+        if (spec.gameplay &&
+            !scene.set_gameplay(id, *spec.gameplay)) {
+            static_cast<void>(scene.destroy_subtree(root_created));
+            error = "Unable to attach prefab gameplay component.";
             return false;
         }
     }

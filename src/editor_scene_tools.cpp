@@ -287,6 +287,18 @@ SceneNodeId duplicate_scene_subtree(
             static_cast<void>(scene.destroy_subtree(duplicate_root));
             return {};
         }
+        if (record.animator &&
+            !scene.set_animator(copy, *record.animator)) {
+            error = "Unable to copy animator component to duplicated node.";
+            static_cast<void>(scene.destroy_subtree(duplicate_root));
+            return {};
+        }
+        if (record.gameplay &&
+            !scene.set_gameplay(copy, *record.gameplay)) {
+            error = "Unable to copy gameplay component to duplicated node.";
+            static_cast<void>(scene.destroy_subtree(duplicate_root));
+            return {};
+        }
         const bool copy_prefab_link =
             record.prefab_instance.has_value() &&
             (record_index != begin ||
@@ -297,6 +309,23 @@ SceneNodeId duplicate_scene_subtree(
             error = "Unable to copy prefab instance metadata to duplicated node.";
             static_cast<void>(scene.destroy_subtree(duplicate_root));
             return {};
+        }
+    }
+    // Remap intra-subtree GameplayComponent::target_node_uuid references.
+    for (std::size_t idx = 0U; idx < copies.size(); ++idx) {
+        const auto gp_opt = scene.gameplay_mut(copies[idx]);
+        if (!gp_opt || !gp_opt->get().target_node_uuid) {
+            continue;
+        }
+        const SceneUuid old_target = gp_opt->get().target_node_uuid;
+        for (std::size_t src_idx = begin; src_idx < end; ++src_idx) {
+            if (records[src_idx].uuid == old_target) {
+                if (const auto new_uuid =
+                        scene.uuid(copies[src_idx - begin])) {
+                    gp_opt->get().target_node_uuid = *new_uuid;
+                }
+                break;
+            }
         }
     }
     duplicated_nodes = static_cast<std::uint32_t>(subtree_size);

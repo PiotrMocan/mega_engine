@@ -1,0 +1,164 @@
+#version 460
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer SourceVertices {
+    uint src_words[];
+};
+
+layout(set = 0, binding = 1, std430) readonly buffer SkinVertices {
+    uint skin_words[];
+};
+
+layout(set = 1, binding = 0, std430) readonly buffer BonePalette {
+    mat4 bones[];
+};
+
+layout(set = 1, binding = 1, std430) writeonly buffer Pool0Vertices {
+    uint pool0_words[];
+};
+
+layout(set = 1, binding = 2, std430) writeonly buffer Pool1Vertices {
+    uint pool1_words[];
+};
+
+layout(push_constant) uniform SkinPushConstants {
+    uint vertex_count;
+    uint words_per_vertex;
+    uint dst_vertex_offset;
+    uint bone_offset;
+    uint bone_count;
+    uint flags;
+} pc;
+
+vec3 safe_normalize3(vec3 v, vec3 fallback) {
+    float len2 = dot(v, v);
+    if (len2 <= 1.0e-12) {
+        return fallback;
+    }
+    return v * inversesqrt(len2);
+}
+
+vec3 unpack_snorm10_xyz(uint word) {
+    float x = float(int(word << 22u) >> 22) / 511.0;
+    float y = float(int(word << 12u) >> 22) / 511.0;
+    float z = float(int(word << 2u) >> 22) / 511.0;
+    return clamp(vec3(x, y, z), vec3(-1.0), vec3(1.0));
+}
+
+uint pack_snorm10_xyz(vec3 dir, uint top2_bits) {
+    vec3 unit = safe_normalize3(dir, vec3(0.0, 1.0, 0.0));
+    uint qx = uint(int(round(clamp(unit.x, -1.0, 1.0) * 511.0))) & 1023u;
+    uint qy = uint(int(round(clamp(unit.y, -1.0, 1.0) * 511.0))) & 1023u;
+    uint qz = uint(int(round(clamp(unit.z, -1.0, 1.0) * 511.0))) & 1023u;
+    return qx | (qy << 10u) | (qz << 20u) | (top2_bits & 0xC0000000u);
+}
+
+mat3 adjugate_transpose(mat3 m) {
+    return mat3(
+        cross(m[1], m[2]),
+        cross(m[2], m[0]),
+        cross(m[0], m[1]));
+}
+
+void write_word(uint idx, uint value) {
+    bool to_pool1 = (pc.flags & 1u) != 0u;
+    bool write_both = (pc.flags & 2u) != 0u;
+    if (to_pool1 || write_both) {
+        pool1_words[idx] = value;
+    }
+    if (!to_pool1 || write_both) {
+        pool0_words[idx] = value;
+    }
+}
+
+void main() {
+    uint vid = gl_GlobalInvocationID.x;
+    if (vid >= pc.vertex_count || pc.bone_count == 0u) {
+        return;
+    }
+
+    uint sbase = vid * 6u;
+    uint j01 = skin_words[sbase + 0u];
+    uint j23 = skin_words[sbase + 1u];
+    uint j0 = min(j01 & 0xFFFFu, pc.bone_count - 1u);
+    uint j1 = min(j01 >> 16u, pc.bone_count - 1u);
+    uint j2 = min(j23 & 0xFFFFu, pc.bone_count - 1u);
+    uint j3 = min(j23 >> 16u, pc.bone_count - 1u);
+
+    float w0 = uintBitsToFloat(skin_words[sbase + 2u]);
+    float w1 = uintBitsToFloat(skin_words[sbase + 3u]);
+    float w2 = uintBitsToFloat(skin_words[sbase + 4u]);
+    float w3 = uintBitsToFloat(skin_words[sbase + 5u]);
+    float w_sum = w0 + w1 + w2 + w3;
+    if (w_sum > 1.0e-6) {
+        float inv_sum = 1.0 / w_sum;
+        w0 *= inv_sum;
+        w1 *= inv_sum;
+        w2 *= inv_sum;
+        w3 *= inv_sum;
+    } else {
+        w0 = 1.0;
+        w1 = 0.0;
+        w2 = 0.0;
+        w3 = 0.0;
+    }
+
+    mat4 skin_m =
+        bones[pc.bone_offset + j0] * w0 +
+        bones[pc.bone_offset + j1] * w1 +
+        bones[pc.bone_offset + j2] * w2 +
+        bones[pc.bone_offset + j3] * w3;
+    mat3 lin_m = mat3(skin_m);
+    float det = determinant(lin_m);
+    mat3 nrm_m = abs(det) > 1.0e-8 ? (adjugate_transpose(lin_m) * (det < 0.0 ? -1.0 : 1.0)) : lin_m;
+
+    uint v_src = vid * pc.words_per_vertex;
+    uint v_dst = (pc.dst_vertex_offset + vid) * pc.words_per_vertex;
+
+    vec3 in_pos = vec3(
+        uintBitsToFloat(src_words[v_src + 0u]),
+        uintBitsToFloat(src_words[v_src + 1u]),
+        uintBitsToFloat(src_words[v_src + 2u]));
+    vec3 out_pos = (skin_m * vec4(in_pos, 1.0)).xyz;
+    write_word(v_dst + 0u, floatBitsToUint(out_pos.x));
+    write_word(v_dst + 1u, floatBitsToUint(out_pos.y));
+    write_word(v_dst + 2u, floatBitsToUint(out_pos.z));
+
+    if (pc.words_per_vertex == 7u) {
+        uint w_nrm = src_words[v_src + 3u];
+        vec3 in_nrm = unpack_snorm10_xyz(w_nrm);
+        vec3 out_nrm = safe_normalize3(nrm_m * in_nrm, vec3(0.0, 1.0, 0.0));
+        write_word(v_dst + 3u, pack_snorm10_xyz(out_nrm, w_nrm & 0xC0000000u));
+
+        write_word(v_dst + 4u, src_words[v_src + 4u]);
+        write_word(v_dst + 5u, src_words[v_src + 5u]);
+
+        uint w_tng = src_words[v_src + 6u];
+        vec3 in_tng = unpack_snorm10_xyz(w_tng);
+        vec3 out_tng = safe_normalize3(lin_m * in_tng, vec3(1.0, 0.0, 0.0));
+        write_word(v_dst + 6u, pack_snorm10_xyz(out_tng, w_tng & 0xC0000000u));
+    } else {
+        vec3 in_nrm = vec3(
+            uintBitsToFloat(src_words[v_src + 3u]),
+            uintBitsToFloat(src_words[v_src + 4u]),
+            uintBitsToFloat(src_words[v_src + 5u]));
+        vec3 out_nrm = safe_normalize3(nrm_m * in_nrm, vec3(0.0, 1.0, 0.0));
+        write_word(v_dst + 3u, floatBitsToUint(out_nrm.x));
+        write_word(v_dst + 4u, floatBitsToUint(out_nrm.y));
+        write_word(v_dst + 5u, floatBitsToUint(out_nrm.z));
+
+        write_word(v_dst + 6u, src_words[v_src + 6u]);
+        write_word(v_dst + 7u, src_words[v_src + 7u]);
+
+        vec3 in_tng = vec3(
+            uintBitsToFloat(src_words[v_src + 8u]),
+            uintBitsToFloat(src_words[v_src + 9u]),
+            uintBitsToFloat(src_words[v_src + 10u]));
+        vec3 out_tng = safe_normalize3(lin_m * in_tng, vec3(1.0, 0.0, 0.0));
+        write_word(v_dst + 8u, floatBitsToUint(out_tng.x));
+        write_word(v_dst + 9u, floatBitsToUint(out_tng.y));
+        write_word(v_dst + 10u, floatBitsToUint(out_tng.z));
+        write_word(v_dst + 11u, src_words[v_src + 11u]);
+    }
+}

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pbr_material.hpp"
+#include "skeletal_animation.hpp"
 
 #include <array>
 #include <cstddef>
@@ -101,9 +102,16 @@ struct CookedModelCollision {
     bool authored_in_metadata = false;
 };
 
+struct CookedAnimationReference {
+    std::string name{};
+    std::filesystem::path relative_path{};
+    float duration_seconds = 0.0F;
+};
+
 struct CookedModelAsset {
     std::filesystem::path metadata_relative_path{};
     std::filesystem::path mesh_relative_path{};
+    std::filesystem::path skeleton_relative_path{};
     std::vector<CookedModelVertex> vertices{};
     std::vector<std::uint32_t> indices{};
     std::vector<CookedModelSubmesh> submeshes{};
@@ -111,7 +119,17 @@ struct CookedModelAsset {
     std::vector<CookedModelLodReference> lods{};
     CookedModelCollision collision{};
     // Imported source-quality assets may opt out of runtime simplification.
+    CookedSkeletonAsset skeleton{};
+    std::vector<CookedSkinVertex> skin_vertices{};
+    std::vector<CookedAnimationReference> animation_refs{};
+    std::vector<AnimationClip> animations{};
     bool generate_lods = true;
+
+    [[nodiscard]] bool is_skinned() const noexcept {
+        return !skeleton.empty() &&
+               !skin_vertices.empty() &&
+               skin_vertices.size() == vertices.size();
+    }
 };
 
 enum class CookedModelLoadErrorCode : std::uint8_t {

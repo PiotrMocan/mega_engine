@@ -47,6 +47,7 @@ layout(set = 0, binding = 5, std430) readonly buffer VisibilityBuffer
 layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inUv;
 layout(location = 3) in vec4 inTangent;
+layout(location = 4) in vec3 inPreviousPosition;
 
 // Locations 0..7 intentionally match editor_scene_aa.vert.
 layout(location = 0) out vec3 outWorldNormal;
@@ -89,7 +90,7 @@ void main()
     const EditorInstanceData instance = instances[sourceIndex];
     const bool isGpuGrass = VCR_ENABLE_GPU_GRASS;
     vec3 sourcePosition = inPosition;
-    vec3 previousSourcePosition = inPosition;
+    vec3 previousSourcePosition = inPreviousPosition;
     vec3 sourceNormal = inNormal;
     vec4 sourceTangent = inTangent;
     vec2 surfaceUv = vec2(inUv.x, 1.0 - inUv.y);
@@ -110,7 +111,7 @@ void main()
             instance.previousRow0,
             instance.previousRow2);
         sourcePosition = frame.globalRotation.z == 0.0 ? inPosition : grass.localPosition;
-        previousSourcePosition = frame.globalRotation.w == 0.0 ? inPosition : previousGrass.localPosition;
+        previousSourcePosition = frame.globalRotation.w == 0.0 ? inPreviousPosition : previousGrass.localPosition;
         sourceNormal = grass.localNormal;
         sourceTangent = vec4(grass.localTangent, 1.0);
         surfaceUv = grass.surfaceUv;

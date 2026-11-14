@@ -1918,4 +1918,34 @@ bool PhysicsWorld::set_kinematic_pose(
     return false;
 }
 
+bool PhysicsWorld::set_body_state(
+    const SceneNodeId id,
+    const glm::vec3 position,
+    const glm::quat orientation,
+    const glm::vec3 linear_velocity,
+    const glm::vec3 angular_velocity) noexcept {
+    if (!id || !finite_vec3(position) || !finite_quat(orientation) ||
+        !finite_vec3(linear_velocity) || !finite_vec3(angular_velocity)) {
+        return false;
+    }
+    const float qlen2 = glm::dot(orientation, orientation);
+    if (qlen2 <= 1.0e-8F) {
+        return false;
+    }
+    const glm::quat normalized_q = glm::normalize(orientation);
+    for (Body& b : bodies_) {
+        if (b.node_id == id) {
+            b.position = position;
+            b.orientation = normalized_q;
+            b.linear_velocity = linear_velocity;
+            b.angular_velocity = b.lock_rotation ? glm::vec3(0.0F) : angular_velocity;
+            b.sleeping = false;
+            b.sleep_timer = 0.0F;
+            update_derived_body_state(b);
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace vcr

@@ -71,6 +71,12 @@ struct FrameContext {
     std::uint32_t scene_cube_count = 0U;
     std::uint32_t scene_color_first_instance = 0U;
     GpuVisibilityFrame visibility{};
+    GpuBuffer skin_palette_buffer{};
+    VkDeviceSize skin_palette_capacity_bytes = 0U;
+    VkDescriptorSet skin_frame_set = VK_NULL_HANDLE;
+    VkBuffer skin_bound_palette = VK_NULL_HANDLE;
+    VkBuffer skin_bound_curr_pool = VK_NULL_HANDLE;
+    VkBuffer skin_bound_prev_pool = VK_NULL_HANDLE;
 #endif
 };
 

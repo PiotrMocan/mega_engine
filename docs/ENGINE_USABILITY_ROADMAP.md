@@ -59,14 +59,22 @@
       предпрослушивание в `Asset Browser` + панель `Audio & Input`.
 
 ### Этап 4. Скелетная анимация и геймплейный фреймворк (**P0**)
-- [ ] Импорт скелетов, весов вершин и анимационных клипов из glTF/FBX в cooked
-      формат; GPU skinning с корректными motion vectors для FSR3 / SMAA / Motion Blur.
-- [ ] Проигрывание клипов, блендинг (`1D/2D Blend Spaces`), `State Machine`,
-      маски слоёв костей, Root Motion, базовый Foot/Look-At IK и `Animation Events`
-      (маркеры шагов, звуков и хитбоксов).
-- [ ] Жизненный цикл геймплейных систем (`on_start`, `on_fixed_update`,
-      `on_update`, события триггеров и столкновений), скриптинг / модульный C++
-      Gameplay API и сериализация состояния игры (`Save / Load Game State`).
+- [x] Импорт скелетов, весов вершин и анимационных клипов из glTF/FBX в cooked
+      формат (`*.vcrskin`, `*.vcranim` внутри `*.vcrasset.json`); GPU compute
+      skinning (`shaders/model_skinning.comp`) с корректными previous/current
+      skinning transforms и motion vectors для FSR3 / SMAA / Motion Blur.
+- [x] Проигрывание клипов, блендинг (`single_clip`, `1D/2D Blend Spaces`),
+      `AnimationStateMachine`, маски слоёв костей (`BoneMask` overrides/additive),
+      Root Motion, двухкостный Foot IK, Look-At IK и `Animation Events`
+      (маркеры шагов, звуковых cues и хитбоксов через кольцевой лог).
+- [x] Жизненный цикл геймплейных систем (`on_start`, `on_fixed_update`,
+      `on_update`, `on_trigger_enter`, `on_trigger_exit`, `on_interact`),
+      модульный C++ `GameplayBehaviorRegistry` + `GameplayWorld` (поведения
+      `patrol`, `collectible`, `door`, `trigger_zone`, `destructible`,
+      `health_pack`), редакторский предпросмотр клипов и визуализация скелета
+      (`Skeleton`), `Animation & Gameplay` панель, 6 MCP-инструментов и
+      сериализация состояния игры (`vcr_game_save` v1, `*.vcrsave.json`, `F5`/`F9`,
+      тесты `vcr_animation_gameplay_tests`).
 
 ### Этап 5. Внутриигровой UI / HUD и локализация (**P0–P1**)
 - [ ] Runtime UI-слой для самой игры (отдельно от Dear ImGui редактора): главное

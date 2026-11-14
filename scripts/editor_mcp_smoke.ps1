@@ -32,6 +32,8 @@ if (-not $process.Start()) {
 $stderrTask = $process.StandardError.ReadToEndAsync()
 $smokePrefabFile = $null
 $smokePrefabDirCreated = $false
+$smokeSaveFile = $null
+$smokeSaveDirCreated = $false
 
 function Send-McpMessage {
     param(
@@ -93,6 +95,12 @@ try {
         "editor.scene.remove_reverb_zone",
         "editor.audio.set_bus",
         "editor.audio.preview",
+        "editor.scene.set_animator",
+        "editor.scene.remove_animator",
+        "editor.animation.preview",
+        "editor.scene.set_gameplay",
+        "editor.scene.remove_gameplay",
+        "editor.gameplay.save_or_load",
         "editor.prefab.save",
         "editor.prefab.instantiate",
         "editor.prefab.unpack",
@@ -111,6 +119,9 @@ try {
         if ($required -notin $toolNames) {
             throw "Required editor MCP tool is missing: $required"
         }
+    }
+    if ($toolNames.Count -ne 49) {
+        throw "Expected 49 editor MCP tools, got $($toolNames.Count)"
     }
 
     $before = Send-McpMessage @{
@@ -435,6 +446,11 @@ try {
             $script:smokePrefabDirCreated = $true
         }
         $script:smokePrefabFile = Join-Path $prefabsDir "_mcp_smoke_test.vcrprefab.json"
+        $savesDir = Join-Path $assetRootPath "saves"
+        if (-not (Test-Path $savesDir)) {
+            $script:smokeSaveDirCreated = $true
+        }
+        $script:smokeSaveFile = Join-Path $savesDir "_mcp_smoke_test.vcrsave.json"
     }
 
     $savePrefab = Send-McpMessage @{
@@ -658,6 +674,164 @@ try {
         throw "editor.scene.remove_audio_* failed to detach audio components"
     }
 
+    $setAnimator = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 821; method = "tools/call"
+        params = @{
+            name = "editor.scene.set_animator"
+            arguments = @{
+                id = $dupId
+                mode = "state_machine"
+                clip_name = "walk"
+                secondary_clip_name = "idle"
+                root_motion_enabled = $true
+                foot_ik_enabled = $true
+                look_at_ik_enabled = $true
+                look_at_target_world = @(1.0, 1.5, 2.0)
+            }
+        }
+    } 821
+    if ($setAnimator.isError -or
+        -not $setAnimator.structuredContent.changed -or
+        $setAnimator.structuredContent.node.animator.mode -cne "state_machine" -or
+        $setAnimator.structuredContent.node.animator.clip_name -cne "walk" -or
+        -not $setAnimator.structuredContent.node.animator.foot_ik_enabled) {
+        throw "editor.scene.set_animator failed to attach animator component"
+    }
+
+    $animPreviewStart = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 822; method = "tools/call"
+        params = @{
+            name = "editor.animation.preview"
+            arguments = @{
+                id = $dupId
+                clip_name = "walk"
+                playing = $false
+                time_seconds = 0.25
+            }
+        }
+    } 822
+    if ($animPreviewStart.isError -or
+        -not $animPreviewStart.structuredContent.preview_active) {
+        throw "editor.animation.preview failed to activate Edit-mode preview"
+    }
+
+    $animPreviewStop = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 823; method = "tools/call"
+        params = @{
+            name = "editor.animation.preview"
+            arguments = @{
+                id = $dupId
+                stop = $true
+            }
+        }
+    } 823
+    if ($animPreviewStop.isError -or
+        $animPreviewStop.structuredContent.preview_active) {
+        throw "editor.animation.preview failed to stop Edit-mode preview"
+    }
+
+    $setGameplay = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 824; method = "tools/call"
+        params = @{
+            name = "editor.scene.set_gameplay"
+            arguments = @{
+                id = $dupId
+                behavior = "collectible"
+                tag = "smoke_coin"
+                interaction_radius = 2.5
+                custom_param_0 = 25.0
+                persist_save_state = $true
+            }
+        }
+    } 824
+    if ($setGameplay.isError -or
+        -not $setGameplay.structuredContent.changed -or
+        $setGameplay.structuredContent.node.gameplay.behavior -cne "collectible" -or
+        $setGameplay.structuredContent.node.gameplay.tag -cne "smoke_coin") {
+        throw "editor.scene.set_gameplay failed to attach gameplay component"
+    }
+
+    $stateWithGameplay = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 825; method = "tools/call"
+        params = @{ name = "editor.get_state"; arguments = @{} }
+    } 825
+    if ($stateWithGameplay.isError -or
+        [int]$stateWithGameplay.structuredContent.animator_count -lt 1 -or
+        [int]$stateWithGameplay.structuredContent.gameplay_count -lt 1 -or
+        $null -eq $stateWithGameplay.structuredContent.animation_gameplay) {
+        throw "editor.get_state missing Stage 4 animation/gameplay counters"
+    }
+
+    $startPlay = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 826; method = "tools/call"
+        params = @{
+            name = "editor.gameplay.save_or_load"
+            arguments = @{ action = "start_play" }
+        }
+    } 826
+    if ($startPlay.isError -or
+        -not $startPlay.structuredContent.gameplay_active) {
+        throw "editor.gameplay.save_or_load start_play failed"
+    }
+
+    $saveGame = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 827; method = "tools/call"
+        params = @{
+            name = "editor.gameplay.save_or_load"
+            arguments = @{
+                action = "save"
+                path = "saves/_mcp_smoke_test.vcrsave.json"
+            }
+        }
+    } 827
+    if ($saveGame.isError -or
+        (-not [string]::IsNullOrWhiteSpace($script:smokeSaveFile) -and
+         -not (Test-Path $script:smokeSaveFile))) {
+        throw "editor.gameplay.save_or_load save failed"
+    }
+
+    $loadGame = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 828; method = "tools/call"
+        params = @{
+            name = "editor.gameplay.save_or_load"
+            arguments = @{
+                action = "load"
+                path = "saves/_mcp_smoke_test.vcrsave.json"
+            }
+        }
+    } 828
+    if ($loadGame.isError) {
+        throw "editor.gameplay.save_or_load load failed"
+    }
+
+    $stopPlay = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 829; method = "tools/call"
+        params = @{
+            name = "editor.gameplay.save_or_load"
+            arguments = @{ action = "stop_play" }
+        }
+    } 829
+    if ($stopPlay.isError -or
+        $stopPlay.structuredContent.gameplay_active -or
+        $stopPlay.structuredContent.mode -cne "edit") {
+        throw "editor.gameplay.save_or_load stop_play failed"
+    }
+
+    $removeAnimator = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 830; method = "tools/call"
+        params = @{ name = "editor.scene.remove_animator"; arguments = @{ id = $dupId } }
+    } 830
+    $removeGameplay = Send-McpMessage @{
+        jsonrpc = "2.0"; id = 831; method = "tools/call"
+        params = @{ name = "editor.scene.remove_gameplay"; arguments = @{ id = $dupId } }
+    } 831
+    if ($removeAnimator.isError -or -not $removeAnimator.structuredContent.changed -or
+        $null -ne $removeAnimator.structuredContent.node.animator -or
+        $removeGameplay.isError -or -not $removeGameplay.structuredContent.changed -or
+        $null -ne $removeGameplay.structuredContent.node.gameplay) {
+        throw "editor.scene.remove_animator / remove_gameplay failed to detach components"
+    }
+
     $reselectDup = Send-McpMessage @{
         jsonrpc = "2.0"; id = 810; method = "tools/call"
         params = @{
@@ -856,6 +1030,14 @@ finally {
         if ($smokePrefabDirCreated -and (Test-Path $prefabParent) -and
             @(Get-ChildItem -LiteralPath $prefabParent -Force).Count -eq 0) {
             Remove-Item -LiteralPath $prefabParent -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($smokeSaveFile) -and (Test-Path $smokeSaveFile)) {
+        Remove-Item -LiteralPath $smokeSaveFile -Force -ErrorAction SilentlyContinue
+        $saveParent = Split-Path -Parent $smokeSaveFile
+        if ($smokeSaveDirCreated -and (Test-Path $saveParent) -and
+            @(Get-ChildItem -LiteralPath $saveParent -Force).Count -eq 0) {
+            Remove-Item -LiteralPath $saveParent -Force -ErrorAction SilentlyContinue
         }
     }
 }
