@@ -1627,6 +1627,7 @@ void build_default_locomotion_fsm(
 
 RootMotionDelta extract_root_motion_delta(
     const CookedSkeletonAsset& skeleton,
+    const std::int32_t root_bone_index,
     const AnimationClip& clip,
     const float prev_time,
     const float curr_time,
@@ -1635,7 +1636,7 @@ RootMotionDelta extract_root_motion_delta(
     const bool lock_y,
     SkeletonPose& in_out_pose) noexcept {
     RootMotionDelta delta{};
-    const std::int32_t root_idx = skeleton.root_motion_bone_index;
+    const std::int32_t root_idx = root_bone_index;
     if (root_idx < 0 ||
         static_cast<std::uint32_t>(root_idx) >= in_out_pose.bone_count ||
         static_cast<std::size_t>(root_idx) >= skeleton.bones.size()) {
@@ -1694,6 +1695,27 @@ RootMotionDelta extract_root_motion_delta(
         root_local.translation.y = bind.local_bind_translation.y;
     }
     return delta;
+}
+
+RootMotionDelta extract_root_motion_delta(
+    const CookedSkeletonAsset& skeleton,
+    const AnimationClip& clip,
+    const float prev_time,
+    const float curr_time,
+    const bool looping,
+    const bool lock_xz,
+    const bool lock_y,
+    SkeletonPose& in_out_pose) noexcept {
+    return extract_root_motion_delta(
+        skeleton,
+        skeleton.root_motion_bone_index,
+        clip,
+        prev_time,
+        curr_time,
+        looping,
+        lock_xz,
+        lock_y,
+        in_out_pose);
 }
 
 void compute_model_space_pose(

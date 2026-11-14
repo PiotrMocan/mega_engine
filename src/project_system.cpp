@@ -20,6 +20,7 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <system_error>
 #include <utility>
@@ -721,12 +722,77 @@ void build_flat_plane_geometry(
     return save_scene_file(scene, assets_dir / "scenes/editor_scene.json", error);
 }
 
+[[nodiscard]] bool generate_cpp_module_template_files(
+    const std::filesystem::path& project_dir,
+    const std::string_view folder_slug,
+    std::string& error) {
+    const std::string module_target = std::string(folder_slug) + "_game";
+    const std::string source_rel = "game/" + module_target + ".cpp";
+
+    const std::string cmake_text =
+        "cmake_minimum_required(VERSION 3.22)\n"
+        "project(" + module_target + "_project LANGUAGES CXX)\n\n"
+        "set(CMAKE_CXX_STANDARD 23)\n"
+        "set(CMAKE_CXX_STANDARD_REQUIRED ON)\n"
+        "set(CMAKE_CXX_EXTENSIONS OFF)\n\n"
+        "if(EXISTS \"${CMAKE_CURRENT_SOURCE_DIR}/engine/cmake/VcrEngineSdk.cmake\")\n"
+        "    include(\"${CMAKE_CURRENT_SOURCE_DIR}/engine/cmake/VcrEngineSdk.cmake\")\n"
+        "elseif(DEFINED VCR_ENGINE_ROOT AND EXISTS \"${VCR_ENGINE_ROOT}/cmake/VcrEngineSdk.cmake\")\n"
+        "    include(\"${VCR_ENGINE_ROOT}/cmake/VcrEngineSdk.cmake\")\n"
+        "elseif(EXISTS \"${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/VcrEngineSdk.cmake\")\n"
+        "    include(\"${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/VcrEngineSdk.cmake\")\n"
+        "else()\n"
+        "    message(FATAL_ERROR \"VcrEngineSdk.cmake not found. Update Engine (.exe + .dll) or set -DVCR_ENGINE_ROOT=...\")\n"
+        "endif()\n\n"
+        "vcr_add_game_module(" + module_target + "\n"
+        "    SOURCES\n"
+        "        " + source_rel + "\n"
+        ")\n";
+
+    if (!atomic_write_text(project_dir / "CMakeLists.txt", cmake_text, error)) {
+        return false;
+    }
+
+    const std::string cpp_text =
+        "#include \"game_module_api.hpp\"\n"
+        "#include \"gameplay_session.hpp\"\n\n"
+        "#include <string>\n\n"
+        "namespace vcr::project_module {\n\n"
+        "class Game final {\n"
+        "public:\n"
+        "    [[nodiscard]] bool configure_module(\n"
+        "        const GameModuleHostContext& host,\n"
+        "        std::string& error) {\n"
+        "        error.clear();\n"
+        "        if (host.session == nullptr) {\n"
+        "            error = \"GameplaySession host pointer is null.\";\n"
+        "            return false;\n"
+        "        }\n"
+        "        GameplayExtensionCallbacks callbacks{};\n"
+        "        callbacks.user_data = this;\n"
+        "        callbacks.on_query_debug_state = +[](\n"
+        "            void* /*user_data*/,\n"
+        "            const GameplaySession& /*session*/,\n"
+        "            std::string& out_json) {\n"
+        "            out_json = R\"({\"project\":\"" + std::string(folder_slug) + "\",\"module_status\":\"active\"})\";\n"
+        "        };\n"
+        "        host.session->set_extension_callbacks(callbacks);\n"
+        "        return true;\n"
+        "    }\n"
+        "};\n\n"
+        "} // namespace vcr::project_module\n\n"
+        "VCR_DEFINE_GAME_MODULE(vcr::project_module::Game, \"" + std::string(folder_slug) + "\")\n";
+
+    return atomic_write_text(project_dir / path_from_utf8(source_rel), cpp_text, error);
+}
+
 } // namespace
 
 std::string_view to_token(const ProjectTemplateKind kind) noexcept {
     switch (kind) {
     case ProjectTemplateKind::standard: return "standard";
     case ProjectTemplateKind::empty: return "empty";
+    case ProjectTemplateKind::cpp_module: return "cpp_module";
     }
     return "standard";
 }
@@ -739,6 +805,9 @@ std::optional<ProjectTemplateKind> parse_project_template_kind(
     if (token == "empty" || token == "minimal") {
         return ProjectTemplateKind::empty;
     }
+    if (token == "cpp_module" || token == "cpp") {
+        return ProjectTemplateKind::cpp_module;
+    }
     return std::nullopt;
 }
 
@@ -746,6 +815,7 @@ const char* project_template_display_name(const ProjectTemplateKind kind) noexce
     switch (kind) {
     case ProjectTemplateKind::standard: return "Standard Starter";
     case ProjectTemplateKind::empty: return "Minimal Plane";
+    case ProjectTemplateKind::cpp_module: return "C++ Game Module";
     }
     return "Standard Starter";
 }
@@ -756,6 +826,8 @@ const char* project_template_description(const ProjectTemplateKind kind) noexcep
         return "Clean ground plane, sun & sky, camera, starter cubes, and cooked cube/plane/prefab assets.";
     case ProjectTemplateKind::empty:
         return "Bare ground plane, sun & sky, and startup camera with empty asset folders.";
+    case ProjectTemplateKind::cpp_module:
+        return "Starter 3D scene plus standalone CMake + C++23 game module DLL linked against vcr_engine.dll.";
     }
     return "";
 }
@@ -911,10 +983,14 @@ bool valid_project_executable_filename(const std::string_view filename) noexcept
     return true;
 }
 
-bool valid_project_icon_relative_path(const std::string_view path) noexcept {
+namespace {
+
+[[nodiscard]] bool valid_safe_relative_file_path(
+    const std::string_view path,
+    const std::string_view extension) noexcept {
     if (path.empty() || path.size() > 256U ||
-        !ascii_ends_with_icase(path, ".ico") ||
-        path.size() <= 4U ||
+        !ascii_ends_with_icase(path, extension) ||
+        path.size() <= extension.size() ||
         !valid_utf8_text(path) || path.front() == '/' || path.front() == '\\') {
         return false;
     }
@@ -938,6 +1014,21 @@ bool valid_project_icon_relative_path(const std::string_view path) noexcept {
         segment_begin = index + 1U;
     }
     return true;
+}
+
+} // namespace
+
+bool valid_project_icon_relative_path(const std::string_view path) noexcept {
+    return valid_safe_relative_file_path(path, ".ico");
+}
+
+std::string default_project_module_relative_path(
+    const std::string_view slug_or_name) {
+    return "bin/" + make_project_folder_slug(slug_or_name) + "_game.dll";
+}
+
+bool valid_project_module_relative_path(const std::string_view path) noexcept {
+    return valid_safe_relative_file_path(path, ".dll");
 }
 
 bool save_project_manifest(
@@ -981,7 +1072,12 @@ bool save_project_manifest(
         error = "Project icon must be a safe relative .ico path inside the project folder.";
         return false;
     }
-    const Json encoded{
+    if (!manifest.game_module.empty() &&
+        !valid_project_module_relative_path(manifest.game_module)) {
+        error = "Project game_module must be a safe relative .dll path inside the project folder.";
+        return false;
+    }
+    Json encoded{
         {"format", std::string(project_manifest_format)},
         {"version", project_manifest_version},
         {"name", manifest.name},
@@ -993,6 +1089,9 @@ bool save_project_manifest(
         {"created_utc",
          manifest.created_utc.empty() ? current_utc_iso8601() : manifest.created_utc},
     };
+    if (!manifest.game_module.empty()) {
+        encoded["game_module"] = manifest.game_module;
+    }
     return atomic_write_text(manifest_file, encoded.dump(2) + "\n", error);
 }
 
@@ -1095,6 +1194,18 @@ bool load_project_manifest(
             return false;
         }
     }
+    if (root.contains("game_module")) {
+        if (!root["game_module"].is_string()) {
+            error = "Project manifest game_module must be a string.";
+            return false;
+        }
+        parsed.game_module = root["game_module"].get<std::string>();
+        if (!parsed.game_module.empty() &&
+            !valid_project_module_relative_path(parsed.game_module)) {
+            error = "Project manifest game_module path is invalid.";
+            return false;
+        }
+    }
     if (root.contains("created_utc") && root["created_utc"].is_string()) {
         parsed.created_utc = root["created_utc"].get<std::string>();
     }
@@ -1149,6 +1260,13 @@ ProjectInspection inspect_project_directory(
     }
     result.executable_path =
         result.project_directory / path_from_utf8(result.manifest.executable);
+    result.engine_dll_path =
+        result.project_directory / engine_shared_library_filename;
+    result.cmake_lists_path = result.project_directory / "CMakeLists.txt";
+    if (!result.manifest.game_module.empty()) {
+        result.game_module_path =
+            result.project_directory / path_from_utf8(result.manifest.game_module);
+    }
     result.icon_file_path =
         result.project_directory / path_from_utf8(result.manifest.icon_path);
 
@@ -1159,6 +1277,16 @@ ProjectInspection inspect_project_directory(
     const bool has_exe =
         std::filesystem::is_regular_file(result.executable_path, ec) && !ec;
     ec.clear();
+    result.engine_dll_exists =
+        std::filesystem::is_regular_file(result.engine_dll_path, ec) && !ec;
+    ec.clear();
+    result.has_cpp_code =
+        std::filesystem::is_regular_file(result.cmake_lists_path, ec) && !ec;
+    ec.clear();
+    result.game_module_built =
+        !result.game_module_path.empty() &&
+        std::filesystem::is_regular_file(result.game_module_path, ec) && !ec;
+    ec.clear();
     const bool has_shaders =
         std::filesystem::is_directory(
             result.project_directory / "engine" / "shaders", ec) && !ec;
@@ -1167,7 +1295,8 @@ ProjectInspection inspect_project_directory(
         std::filesystem::is_regular_file(
             result.project_directory / "engine" / "assets" / "sky_clouds.png",
             ec) && !ec;
-    result.runtime_bundled = has_exe && has_shaders && has_sky;
+    result.runtime_bundled =
+        has_exe && result.engine_dll_exists && has_shaders && has_sky;
 
     result.assets_directory = result.project_directory / "assets";
     const auto assets_status =
@@ -1284,10 +1413,17 @@ bool create_project_on_disk(
         }
     }
 
-    const bool content_ok = options.template_kind == ProjectTemplateKind::standard
-        ? generate_standard_template_content(assets_dir, error)
-        : generate_empty_template_content(assets_dir, error);
+    const bool content_ok = options.template_kind == ProjectTemplateKind::empty
+        ? generate_empty_template_content(assets_dir, error)
+        : generate_standard_template_content(assets_dir, error);
     if (!content_ok) {
+        std::error_code cleanup_ec;
+        std::filesystem::remove_all(project_dir, cleanup_ec);
+        return false;
+    }
+
+    if (options.template_kind == ProjectTemplateKind::cpp_module &&
+        !generate_cpp_module_template_files(project_dir, folder, error)) {
         std::error_code cleanup_ec;
         std::filesystem::remove_all(project_dir, cleanup_ec);
         return false;
@@ -1300,6 +1436,9 @@ bool create_project_on_disk(
         .startup_scene = "scenes/editor_scene.json",
         .executable = default_project_executable_filename(folder),
         .icon_path = "icon.ico",
+        .game_module = options.template_kind == ProjectTemplateKind::cpp_module
+            ? default_project_module_relative_path(folder)
+            : std::string{},
         .created_utc = current_utc_iso8601(),
     };
     if (!save_project_manifest(
@@ -1332,6 +1471,14 @@ bool create_project_on_disk(
         if (bundle_project_runtime(
                 output.project_directory, bundle_res, bundle_err)) {
             output.runtime_bundled = true;
+            if (options.template_kind == ProjectTemplateKind::cpp_module) {
+                CompileProjectModuleResult compile_res{};
+                std::string compile_err;
+                if (!compile_project_game_module(
+                        output.project_directory, compile_res, compile_err)) {
+                    output.bundle_warning = std::move(compile_err);
+                }
+            }
         } else {
             output.bundle_warning = std::move(bundle_err);
         }
@@ -1688,6 +1835,10 @@ public:
             CloseHandle(handle_);
         }
         handle_ = nullptr;
+    }
+
+    [[nodiscard]] HANDLE get() const noexcept {
+        return handle_;
     }
 
 private:
@@ -2245,12 +2396,59 @@ bool bundle_project_runtime(
 
     const std::filesystem::path target_exe =
         inspection.project_directory / path_from_utf8(manifest.executable);
+    const std::filesystem::path target_engine_dll =
+        inspection.project_directory / engine_shared_library_filename;
     const std::filesystem::path target_icon =
         inspection.project_directory / path_from_utf8(manifest.icon_path);
 
-    // 1. Copy the engine runtime executable as <project>/<executable>.
+    const std::filesystem::path engine_dll_src =
+        exe_dir / engine_shared_library_filename;
+    ec.clear();
+    if (!std::filesystem::is_regular_file(engine_dll_src, ec) || ec) {
+        error = "Unable to locate " +
+                std::string(engine_shared_library_filename) + " beside " +
+                path_to_utf8(engine_exe) + ".";
+        return false;
+    }
+
+    // 1. Copy the engine runtime executable and shared core engine DLL.
     if (!copy_file_atomically(engine_exe, target_exe, error)) {
         return false;
+    }
+    if (!copy_file_atomically(engine_dll_src, target_engine_dll, error)) {
+        return false;
+    }
+
+    // Also stage the import library and SDK CMake helper for C++ project builds.
+    std::filesystem::path import_lib_src =
+        exe_dir.parent_path() / "lib" / engine_import_library_filename;
+    ec.clear();
+    if (!std::filesystem::is_regular_file(import_lib_src, ec) || ec) {
+        import_lib_src = exe_dir / engine_import_library_filename;
+        ec.clear();
+    }
+    if (std::filesystem::is_regular_file(import_lib_src, ec) && !ec) {
+        if (!copy_file_atomically(
+                import_lib_src,
+                inspection.project_directory / "engine" / "lib" /
+                    engine_import_library_filename,
+                error)) {
+            return false;
+        }
+    }
+    if (workspace) {
+        const std::filesystem::path sdk_cmake_src =
+            *workspace / "cmake" / "VcrEngineSdk.cmake";
+        ec.clear();
+        if (std::filesystem::is_regular_file(sdk_cmake_src, ec) && !ec) {
+            if (!copy_file_atomically(
+                    sdk_cmake_src,
+                    inspection.project_directory / "engine" / "cmake" /
+                        "VcrEngineSdk.cmake",
+                    error)) {
+                return false;
+            }
+        }
     }
 
     // 2. Copy FidelityFX FSR 3 runtime DLL beside the executable if present.
@@ -2375,11 +2573,293 @@ bool bundle_project_runtime(
 
     output.project_directory = inspection.project_directory;
     output.executable_path = target_exe;
+    output.engine_dll_path = target_engine_dll;
     output.icon_path = target_icon;
     output.copied_shaders = copied_shaders;
+    output.copied_engine_dll = true;
     output.copied_fsr3_dll = copied_fsr3;
     output.icon_embedded = true;
     return true;
+}
+
+bool compile_project_game_module(
+    const std::filesystem::path& project_directory,
+    CompileProjectModuleResult& output,
+    std::string& error,
+    const std::string_view build_config) {
+    output = CompileProjectModuleResult{};
+    error.clear();
+
+    const ProjectInspection inspection =
+        inspect_project_directory(project_directory);
+    if (inspection.state != ProjectDiskState::ready) {
+        error = inspection.diagnostic.empty()
+            ? std::string("Project directory is not ready.")
+            : inspection.diagnostic;
+        return false;
+    }
+    if (!inspection.has_cpp_code) {
+        error = "Project does not contain a CMakeLists.txt for a C++ game module.";
+        return false;
+    }
+
+#if !defined(_WIN32)
+    static_cast<void>(build_config);
+    error = "Standalone C++ game module builds are currently supported only on Windows.";
+    return false;
+#else
+    std::string normalized_config = "Release";
+    std::string folder_tag = "release";
+    if (!build_config.empty()) {
+        if (ascii_ends_with_icase(build_config, "debug") &&
+            build_config.size() == 5U) {
+            normalized_config = "Debug";
+            folder_tag = "debug";
+        } else if (ascii_ends_with_icase(build_config, "asan") &&
+                   build_config.size() == 4U) {
+            normalized_config = "RelWithDebInfo";
+            folder_tag = "asan";
+        } else if (ascii_ends_with_icase(build_config, "relwithdebinfo") &&
+                   build_config.size() == 14U) {
+            normalized_config = "RelWithDebInfo";
+            folder_tag = "relwithdebinfo";
+        } else if (ascii_ends_with_icase(build_config, "release") &&
+                   build_config.size() == 7U) {
+            normalized_config = "Release";
+            folder_tag = "release";
+        } else {
+            error = "Unsupported build configuration for project module: " +
+                    std::string(build_config);
+            return false;
+        }
+    }
+
+    std::error_code ec;
+    const auto workspace = discover_workspace_root();
+
+    // Locate cmake.exe.
+    std::filesystem::path cmake_exe;
+    static constexpr std::array<const char*, 2U> cmake_candidates{
+        "C:/Program Files/CMake/bin/cmake.exe",
+        "C:/Program Files (x86)/CMake/bin/cmake.exe",
+    };
+    for (const char* candidate : cmake_candidates) {
+        if (std::filesystem::is_regular_file(candidate, ec) && !ec) {
+            cmake_exe = candidate;
+            break;
+        }
+        ec.clear();
+    }
+    if (cmake_exe.empty()) {
+        std::array<wchar_t, 32768U> found_buf{};
+        const DWORD len = SearchPathW(
+            nullptr, L"cmake.exe", nullptr,
+            static_cast<DWORD>(found_buf.size()), found_buf.data(), nullptr);
+        if (len > 0U && len < found_buf.size()) {
+            cmake_exe = std::filesystem::path(found_buf.data());
+        }
+    }
+    if (cmake_exe.empty()) {
+        error = "CMake executable (cmake.exe) was not found.";
+        return false;
+    }
+
+    // Locate Visual Studio 2022 vcvars64.bat.
+    std::filesystem::path vcvars_bat;
+    static constexpr std::array<const char*, 4U> vs_editions{
+        "Community",
+        "Professional",
+        "Enterprise",
+        "BuildTools",
+    };
+    for (const char* edition : vs_editions) {
+        const std::filesystem::path candidate =
+            std::filesystem::path("C:/Program Files/Microsoft Visual Studio/2022") /
+            edition / "VC/Auxiliary/Build/vcvars64.bat";
+        ec.clear();
+        if (std::filesystem::is_regular_file(candidate, ec) && !ec) {
+            vcvars_bat = candidate;
+            break;
+        }
+    }
+    if (vcvars_bat.empty()) {
+        error = "Visual Studio 2022 C++ toolchain (vcvars64.bat) was not found.";
+        return false;
+    }
+
+    // Locate ninja.exe (workspace .tools/ninja.exe or PATH).
+    std::filesystem::path ninja_exe;
+    if (workspace) {
+        const std::filesystem::path tools_ninja =
+            *workspace / ".tools" / "ninja.exe";
+        ec.clear();
+        if (std::filesystem::is_regular_file(tools_ninja, ec) && !ec) {
+            ninja_exe = tools_ninja;
+        }
+    }
+    if (ninja_exe.empty()) {
+        std::array<wchar_t, 32768U> found_buf{};
+        const DWORD len = SearchPathW(
+            nullptr, L"ninja.exe", nullptr,
+            static_cast<DWORD>(found_buf.size()), found_buf.data(), nullptr);
+        if (len > 0U && len < found_buf.size()) {
+            ninja_exe = std::filesystem::path(found_buf.data());
+        }
+    }
+    if (ninja_exe.empty()) {
+        error = "Ninja build tool (ninja.exe) was not found in .tools or PATH.";
+        return false;
+    }
+
+    const std::filesystem::path build_dir =
+        inspection.project_directory / "build" / ("windows-" + folder_tag);
+    std::filesystem::create_directories(build_dir, ec);
+    if (ec) {
+        error = "Unable to create module build directory '" +
+                path_to_utf8(build_dir) + "': " + ec.message();
+        return false;
+    }
+
+    std::string script =
+        "@echo off\r\n"
+        "call \"" + path_to_utf8(vcvars_bat) + "\" amd64\r\n"
+        "if errorlevel 1 exit /b %errorlevel%\r\n"
+        "\"" + path_to_utf8(cmake_exe) + "\" -S \"" +
+        path_to_utf8(inspection.project_directory) + "\" -B \"" +
+        path_to_utf8(build_dir) + "\" -G Ninja -DCMAKE_MAKE_PROGRAM=\"" +
+        path_to_utf8(ninja_exe) + "\" -DCMAKE_BUILD_TYPE=" +
+        normalized_config;
+    if (workspace) {
+        script += " -DVCR_ENGINE_ROOT=\"" + path_to_utf8(*workspace) + "\"";
+        if (folder_tag != "release") {
+            ec.clear();
+            const std::filesystem::path sdk_build_dir =
+                *workspace / "build" / ("windows-" + folder_tag);
+            if (std::filesystem::is_directory(sdk_build_dir, ec) && !ec) {
+                script += " -DVCR_ENGINE_SDK_BUILD_DIR=\"" +
+                          path_to_utf8(sdk_build_dir) + "\"";
+            }
+        }
+    }
+    if (folder_tag == "asan") {
+        script += " \"-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /EHsc /fsanitize=address\"";
+    }
+    script += "\r\nif errorlevel 1 exit /b %errorlevel%\r\n";
+    script += "\"" + path_to_utf8(cmake_exe) + "\" --build \"" +
+              path_to_utf8(build_dir) + "\" --parallel\r\n"
+              "exit /b %errorlevel%\r\n";
+
+    const std::filesystem::path script_path = build_dir / "build_module.cmd";
+    const std::filesystem::path log_path = build_dir / "build_module.log";
+    if (!atomic_write_text(script_path, script, error)) {
+        return false;
+    }
+
+    std::array<wchar_t, MAX_PATH> system_dir{};
+    const UINT sys_len =
+        GetSystemDirectoryW(system_dir.data(), static_cast<UINT>(system_dir.size()));
+    const std::filesystem::path cmd_exe =
+        (sys_len > 0U && sys_len < system_dir.size())
+            ? (std::filesystem::path(system_dir.data()) / "cmd.exe")
+            : std::filesystem::path("C:/Windows/System32/cmd.exe");
+
+    SECURITY_ATTRIBUTES sec_attr{};
+    sec_attr.nLength = sizeof(sec_attr);
+    sec_attr.bInheritHandle = TRUE;
+    ScopedWin32Handle log_file(CreateFileW(
+        log_path.c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        &sec_attr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr));
+
+    std::wstring cmd_line;
+    append_win32_quoted_arg(cmd_line, cmd_exe.native());
+    cmd_line += L" /d /c ";
+    append_win32_quoted_arg(cmd_line, script_path.native());
+
+    STARTUPINFOW startup_info{};
+    startup_info.cb = sizeof(startup_info);
+    if (log_file.get() != nullptr && log_file.get() != INVALID_HANDLE_VALUE) {
+        startup_info.dwFlags = STARTF_USESTDHANDLES;
+        startup_info.hStdInput = nullptr;
+        startup_info.hStdOutput = log_file.get();
+        startup_info.hStdError = log_file.get();
+    }
+    PROCESS_INFORMATION process_info{};
+    const BOOL created = CreateProcessW(
+        cmd_exe.c_str(),
+        cmd_line.data(),
+        nullptr,
+        nullptr,
+        log_file.get() != nullptr && log_file.get() != INVALID_HANDLE_VALUE
+            ? TRUE
+            : FALSE,
+        CREATE_NO_WINDOW,
+        nullptr,
+        inspection.project_directory.c_str(),
+        &startup_info,
+        &process_info);
+    log_file.reset();
+    if (created == FALSE) {
+        error = "Failed to launch CMake build command (Win32 error " +
+                std::to_string(GetLastError()) + ").";
+        return false;
+    }
+
+    ScopedWin32Handle proc_handle(process_info.hProcess);
+    ScopedWin32Handle thread_handle(process_info.hThread);
+    WaitForSingleObject(proc_handle.get(), INFINITE);
+
+    DWORD exit_code = 1U;
+    if (GetExitCodeProcess(proc_handle.get(), &exit_code) == FALSE ||
+        exit_code != 0U) {
+        std::string snippet;
+        std::ifstream log_in(log_path, std::ios::binary);
+        if (log_in) {
+            std::string all(
+                (std::istreambuf_iterator<char>(log_in)),
+                std::istreambuf_iterator<char>());
+            constexpr std::size_t max_tail = 1200U;
+            snippet = all.size() > max_tail
+                ? all.substr(all.size() - max_tail)
+                : std::move(all);
+        }
+        error = "Project module build failed (exit code " +
+                std::to_string(exit_code) + ").";
+        if (!snippet.empty()) {
+            error += "\n" + snippet;
+        }
+        return false;
+    }
+
+    if (!inspection.game_module_path.empty()) {
+        const std::filesystem::path built_dll =
+            build_dir / "bin" / inspection.game_module_path.filename();
+        ec.clear();
+        if (std::filesystem::is_regular_file(built_dll, ec) && !ec) {
+            if (!copy_file_atomically(
+                    built_dll, inspection.game_module_path, error)) {
+                return false;
+            }
+        }
+        ec.clear();
+        if (!std::filesystem::is_regular_file(inspection.game_module_path, ec) ||
+            ec) {
+            error = "Build finished, but expected game module DLL was not found: " +
+                    path_to_utf8(inspection.game_module_path);
+            return false;
+        }
+    }
+
+    output.project_directory = inspection.project_directory;
+    output.build_directory = build_dir;
+    output.module_path = inspection.game_module_path;
+    output.built = true;
+    return true;
+#endif
 }
 
 bool set_project_icon(

@@ -4,10 +4,12 @@
 #include "cli_options.hpp"
 #include "editor_ui.hpp"
 #include "fly_camera.hpp"
+#include "game_module_loader.hpp"
 #include "gameplay_session.hpp"
 #include "input_actions.hpp"
 #include "mcp_server.hpp"
 #include "renderer.hpp"
+#include "renderer_gameplay_bridge.hpp"
 #include "scene_document.hpp"
 #include "vulkan_context.hpp"
 
@@ -78,6 +80,8 @@ private:
     SceneDocument scene_{};
     FlyCamera camera_{};
     FlyCamera edit_camera_before_play_{};
+    GameplayRendererBridge gameplay_renderer_bridge_{};
+    LoadedGameModule loaded_game_module_{};
     GameplaySession gameplay_{};
     AnimatorRuntimeSystem edit_animator_preview_{};
     std::vector<SceneGpuInstance> scene_instances_{};

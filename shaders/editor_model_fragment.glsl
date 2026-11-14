@@ -141,6 +141,16 @@ void main()
             inSubsurfaceProfile,
             inSubsurfaceStrength);
         shadedColor = lightingComponents.diffuse + lightingComponents.specular;
+        if (materialIsGlass(pushConstants.padding)) {
+            const vec3 viewDir = safeNormalize(
+                frame.cameraPosition.xyz - inWorldPosition,
+                vec3(0.0, 0.0, 1.0));
+            const float nDotV = max(dot(normalize(normal), viewDir), 0.0);
+            const float fresnel = pow(1.0 - nDotV, 5.0);
+            const vec3 skyReflect = mix(vec3(0.18, 0.24, 0.30), vec3(0.65, 0.80, 0.96), clamp(normal.y * 0.5 + 0.5, 0.0, 1.0));
+            lightingComponents.specular += skyReflect * (0.14 + 0.72 * fresnel);
+            shadedColor = lightingComponents.diffuse * 0.35 + lightingComponents.specular;
+        }
     }
 
     applySurfaceWorkloadModulation(

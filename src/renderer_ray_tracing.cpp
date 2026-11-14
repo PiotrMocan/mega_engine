@@ -848,6 +848,9 @@ void Renderer::prepare_ray_tracing(FrameContext& frame) {
                 VK_GEOMETRY_INSTANCE_TRIANGLE_FRONT_COUNTERCLOCKWISE_BIT_KHR);
         }
         for (const auto& draw : editor_model_draws_) {
+            if (draw.uses_skinned_pool) {
+                continue;
+            }
             const auto& asset = editor_model_assets_[draw.asset_index];
             if (!asset.ready) {
                 continue;
@@ -1119,7 +1122,7 @@ void Renderer::build_model_blas_on_upload(EditorModelAsset& asset) {
             continue;
         }
         const VkGeometryFlagsKHR geom_flags =
-            (submesh.coverage & 1U) == 0U ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0U;
+            (submesh.coverage & (1U | material_coverage_glass_bit)) == 0U ? VK_GEOMETRY_OPAQUE_BIT_KHR : 0U;
         geometries.push_back(VkAccelerationStructureGeometryKHR{
             .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
             .geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR,

@@ -384,6 +384,17 @@ struct RootMotionDelta {
 
 [[nodiscard]] RootMotionDelta extract_root_motion_delta(
     const CookedSkeletonAsset& skeleton,
+    std::int32_t root_bone_index,
+    const AnimationClip& clip,
+    float prev_time,
+    float curr_time,
+    bool looping,
+    bool lock_xz,
+    bool lock_y,
+    SkeletonPose& in_out_pose) noexcept;
+
+[[nodiscard]] RootMotionDelta extract_root_motion_delta(
+    const CookedSkeletonAsset& skeleton,
     const AnimationClip& clip,
     float prev_time,
     float curr_time,

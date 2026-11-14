@@ -461,6 +461,8 @@ void test_project_bundle_and_icon_workflow() {
         std::filesystem::path(self_buf.data()),
         fake_engine_exe,
         std::filesystem::copy_options::overwrite_existing);
+    write_text_file(
+        fake_bin / vcr::engine_shared_library_filename, "FAKE_ENGINE_DLL");
     write_text_file(fake_bin / "amd_fidelityfx_vk.dll", "FAKE_FFX_DLL");
     write_text_file(fake_bin / "shaders/cube.vert.spv", "FAKE_SPV");
     write_text_file(fake_bin / "assets/sky_clouds.png", "FAKE_SKY");
@@ -473,11 +475,14 @@ void test_project_bundle_and_icon_workflow() {
         vcr::bundle_project_runtime(
             created.project_directory, bundle_res, error, fake_engine_exe),
         error);
+    REQUIRE(bundle_res.copied_engine_dll);
     REQUIRE(bundle_res.copied_fsr3_dll);
     REQUIRE(bundle_res.copied_shaders >= 1U);
     REQUIRE(bundle_res.icon_embedded);
     REQUIRE(std::filesystem::is_regular_file(
         created.project_directory / "portable_test_game.exe"));
+    REQUIRE(std::filesystem::is_regular_file(
+        created.project_directory / vcr::engine_shared_library_filename));
     REQUIRE(std::filesystem::is_regular_file(
         created.project_directory / "amd_fidelityfx_vk.dll"));
     REQUIRE(std::filesystem::is_regular_file(
@@ -494,7 +499,24 @@ void test_project_bundle_and_icon_workflow() {
     const vcr::ProjectInspection after_bundle =
         vcr::inspect_project_directory(created.project_directory);
     REQUIRE(after_bundle.runtime_bundled);
+    REQUIRE(after_bundle.engine_dll_exists);
     REQUIRE(after_bundle.icon_exists);
+
+    // Deleting vcr_engine.dll must invalidate runtime_bundled until updated.
+    std::filesystem::remove(after_bundle.engine_dll_path);
+    const vcr::ProjectInspection missing_dll =
+        vcr::inspect_project_directory(created.project_directory);
+    REQUIRE(!missing_dll.engine_dll_exists);
+    REQUIRE(!missing_dll.runtime_bundled);
+
+    REQUIRE_MSG(
+        vcr::bundle_project_runtime(
+            created.project_directory, bundle_res, error, fake_engine_exe),
+        error);
+    const vcr::ProjectInspection restored_bundle =
+        vcr::inspect_project_directory(created.project_directory);
+    REQUIRE(restored_bundle.engine_dll_exists);
+    REQUIRE(restored_bundle.runtime_bundled);
 
     vcr::AssetBrowser browser;
     REQUIRE_MSG(browser.initialize(after_bundle.assets_directory, error), error);
@@ -542,6 +564,52 @@ void test_project_bundle_and_icon_workflow() {
 #endif
 }
 
+void test_cpp_module_project_and_manifest_round_trip() {
+    REQUIRE(vcr::valid_project_module_relative_path("bin/demo_game.dll"));
+    REQUIRE(!vcr::valid_project_module_relative_path(""));
+    REQUIRE(!vcr::valid_project_module_relative_path("../evil.dll"));
+    REQUIRE(!vcr::valid_project_module_relative_path("C:/evil.dll"));
+    REQUIRE(!vcr::valid_project_module_relative_path("bin/evil.exe"));
+
+    const ScopedTempDir temp;
+    vcr::CreateProjectResult created{};
+    std::string error;
+    REQUIRE_MSG(
+        vcr::create_project_on_disk(
+            vcr::CreateProjectOptions{
+                .name = "My Cpp Game",
+                .description = "Standalone C++ DLL module template",
+                .parent_directory = temp.path() / "projects",
+                .template_kind = vcr::ProjectTemplateKind::cpp_module,
+                .bundle_runtime = false,
+            },
+            created,
+            error),
+        error);
+    REQUIRE(created.manifest.template_id == "cpp_module");
+    REQUIRE(created.manifest.game_module == "bin/my_cpp_game_game.dll");
+    REQUIRE(std::filesystem::is_regular_file(
+        created.project_directory / "CMakeLists.txt"));
+    REQUIRE(std::filesystem::is_regular_file(
+        created.project_directory / "game/my_cpp_game_game.cpp"));
+
+    const vcr::ProjectInspection insp =
+        vcr::inspect_project_directory(created.project_directory);
+    REQUIRE(insp.state == vcr::ProjectDiskState::ready);
+    REQUIRE(insp.has_cpp_code);
+    REQUIRE(!insp.game_module_built);
+    REQUIRE(insp.manifest.game_module == "bin/my_cpp_game_game.dll");
+
+    vcr::ProjectManifest loaded{};
+    REQUIRE_MSG(
+        vcr::load_project_manifest(
+            created.project_directory / vcr::project_manifest_filename,
+            loaded,
+            error),
+        error);
+    REQUIRE(loaded.game_module == "bin/my_cpp_game_game.dll");
+}
+
 } // namespace
 
 int main() {
@@ -551,6 +619,7 @@ int main() {
     test_cli_project_option();
     test_icon_generation_conversion_and_pe_patching();
     test_project_bundle_and_icon_workflow();
+    test_cpp_module_project_and_manifest_round_trip();
     std::cout << "All project system tests passed.\n";
     return 0;
 }

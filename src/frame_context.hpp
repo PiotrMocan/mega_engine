@@ -77,6 +77,8 @@ struct FrameContext {
     VkBuffer skin_bound_palette = VK_NULL_HANDLE;
     VkBuffer skin_bound_curr_pool = VK_NULL_HANDLE;
     VkBuffer skin_bound_prev_pool = VK_NULL_HANDLE;
+    GpuBuffer game_ui_vertex_buffer{};
+    std::uint32_t game_ui_vertex_count = 0U;
 #endif
 };
 

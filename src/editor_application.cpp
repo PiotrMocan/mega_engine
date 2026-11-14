@@ -2,11 +2,15 @@
 
 #include "asset_browser.hpp"
 #include "editor_scene_tools.hpp"
+#include "game_module_loader.hpp"
 #include "icon_system.hpp"
 #include "prefab_io.hpp"
+#include "project_system.hpp"
+#include "renderer_gameplay_bridge.hpp"
 #include "runtime_assets.hpp"
 #include "scene_io.hpp"
 #include "vulkan_common.hpp"
+#include "window_icon_sdl.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -989,8 +993,9 @@ void EditorApplication::synchronize_gameplay_state() {
 
     if (observed_play_state_ == EditorPlayState::edit &&
         requested_state != EditorPlayState::edit) {
+        gameplay_renderer_bridge_ = make_gameplay_renderer_bridge(renderer_);
         const SkeletalAssetProvider skeletal_provider =
-            make_renderer_skeletal_provider(&renderer_);
+            gameplay_renderer_bridge_.skeletal_provider;
         edit_animator_preview_.clear(&skeletal_provider);
         renderer_.clear_skinned_model_poses();
         edit_camera_before_play_ = camera_;
@@ -1001,15 +1006,46 @@ void EditorApplication::synchronize_gameplay_state() {
             options_.camera_z_explicit
                 ? std::optional<double>(options_.camera_z)
                 : std::nullopt);
+        loaded_game_module_.unload(&gameplay_);
         std::string error;
+        const std::filesystem::path project_dir = ui_.asset_root().parent_path();
+        if (!project_dir.empty() &&
+            std::filesystem::exists(project_dir / project_manifest_filename)) {
+            const ProjectInspection proj_insp =
+                inspect_project_directory(project_dir);
+            if (!proj_insp.game_module_path.empty()) {
+                const GameModuleHostContext host{
+                    .project_root = &proj_insp.project_directory,
+                    .asset_root = &ui_.asset_root(),
+                    .scene = &scene_,
+                    .session = &gameplay_,
+                    .audio_engine = audio_engine_.initialized()
+                        ? &audio_engine_
+                        : nullptr,
+                    .input_actions = &input_actions_,
+                };
+                if (!loaded_game_module_.load(
+                        proj_insp.game_module_path, host, true, error)) {
+                    ui_.report_asset_error(std::move(error));
+                    ui_.stop_play(scene_);
+                    camera_ = edit_camera_before_play_;
+                    submitted_scene_revision_ = 0U;
+                    renderer_.invalidate_editor_scene();
+                    observed_play_state_ = EditorPlayState::edit;
+                    return;
+                }
+            }
+        }
         if (!gameplay_.start(
                 scene_,
                 initial_view,
                 startup_camera,
                 camera_,
                 error,
-                &renderer_,
-                audio_engine_.initialized() ? &audio_engine_ : nullptr)) {
+                &gameplay_renderer_bridge_,
+                audio_engine_.initialized() ? &audio_engine_ : nullptr,
+                &input_actions_)) {
+            loaded_game_module_.unload(&gameplay_);
             ui_.report_asset_error(std::move(error));
             ui_.stop_play(scene_);
             camera_ = edit_camera_before_play_;
@@ -1022,7 +1058,10 @@ void EditorApplication::synchronize_gameplay_state() {
     } else if (requested_state == EditorPlayState::edit) {
         gameplay_.stop(
             audio_engine_.initialized() ? &audio_engine_ : nullptr,
-            &renderer_);
+            gameplay_renderer_bridge_.context != nullptr
+                ? &gameplay_renderer_bridge_
+                : nullptr);
+        loaded_game_module_.unload(&gameplay_);
         camera_ = edit_camera_before_play_;
         submitted_scene_revision_ = 0U;
         renderer_.invalidate_editor_scene();
@@ -1047,7 +1086,7 @@ void EditorApplication::update_gameplay(
             frame_input,
             delta_seconds,
             scene_,
-            renderer_,
+            gameplay_renderer_bridge_,
             camera_,
             audio_engine_.initialized() ? &audio_engine_ : nullptr,
             &input_actions_)) {
@@ -1185,7 +1224,7 @@ bool EditorApplication::quick_load_gameplay(
     if (full_path.empty()) {
         return false;
     }
-    if (!gameplay_.load_game_state(full_path, scene_, renderer_, camera_, error)) {
+    if (!gameplay_.load_game_state(full_path, scene_, gameplay_renderer_bridge_, camera_, error)) {
         return false;
     }
     out_relative_path.assign(relative_path);
@@ -2981,7 +3020,8 @@ void EditorApplication::shutdown() noexcept {
     edit_animator_preview_.clear(nullptr);
     gameplay_.stop(
         audio_engine_.initialized() ? &audio_engine_ : nullptr,
-        &renderer_);
+        &gameplay_renderer_bridge_);
+    loaded_game_module_.unload(&gameplay_);
     ui_.shutdown();
     audio_engine_.shutdown();
     input_actions_.set_hardware_polling_enabled(false);

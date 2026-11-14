@@ -144,7 +144,8 @@ public:
         glm::vec3 direction,
         float max_distance,
         std::uint32_t layer_mask = 0xFFFFFFFFU,
-        bool include_triggers = false) const noexcept;
+        bool include_triggers = false,
+        SceneNodeId ignored_node = {}) const noexcept;
 
     [[nodiscard]] std::optional<float> sample_supporting_height(
         float x,
@@ -158,7 +159,32 @@ public:
         float radius,
         float height,
         float walkable_normal_y,
-        std::uint32_t layer_mask = 0xFFFFFFFFU) const noexcept;
+        std::uint32_t layer_mask = 0xFFFFFFFFU,
+        SceneNodeId ignored_node = {}) const noexcept;
+
+    [[nodiscard]] bool check_capsule_free(
+        glm::vec3 feet,
+        float radius,
+        float height,
+        std::uint32_t layer_mask = 0xFFFFFFFFU,
+        SceneNodeId ignored_node = {}) const noexcept;
+
+    void reserve_dynamic_boxes(std::size_t count);
+
+    bool upsert_box_collider(
+        SceneNodeId id,
+        glm::vec3 center,
+        glm::mat3 axes,
+        glm::vec3 half_extents,
+        std::uint32_t layer = 1U,
+        std::uint32_t mask = 0xFFFFFFFFU,
+        bool is_trigger = false);
+
+    bool update_collider_transform(
+        SceneNodeId id,
+        const glm::mat4& world_matrix) noexcept;
+
+    void set_collider_enabled(SceneNodeId id, bool enabled) noexcept;
 
     // Collects contacts between a world-space sphere (or point/hull vertex with
     // radius > 0) and all non-trigger static colliders + procedural terrain.
@@ -186,6 +212,7 @@ private:
         std::uint32_t layer = 1U;
         std::uint32_t mask = 0xFFFFFFFFU;
         bool is_trigger = false;
+        bool enabled = true;
     };
 
     struct SphereCollider {
@@ -197,6 +224,7 @@ private:
         std::uint32_t layer = 1U;
         std::uint32_t mask = 0xFFFFFFFFU;
         bool is_trigger = false;
+        bool enabled = true;
     };
 
     struct CapsuleCollider {
@@ -209,6 +237,7 @@ private:
         std::uint32_t layer = 1U;
         std::uint32_t mask = 0xFFFFFFFFU;
         bool is_trigger = false;
+        bool enabled = true;
     };
 
     struct ConvexHullCollider {
@@ -222,6 +251,7 @@ private:
         std::uint32_t layer = 1U;
         std::uint32_t mask = 0xFFFFFFFFU;
         bool is_trigger = false;
+        bool enabled = true;
     };
 
     struct TriangleChunk {
@@ -249,6 +279,7 @@ private:
         std::uint32_t layer = 1U;
         std::uint32_t mask = 0xFFFFFFFFU;
         bool is_trigger = false;
+        bool enabled = true;
     };
 
     [[nodiscard]] std::optional<std::uint32_t> intern_triangle_mesh(

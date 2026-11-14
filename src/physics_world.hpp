@@ -37,6 +37,10 @@ struct PhysicsBodyState {
     float radius = 0.5F;
     float half_segment = 0.5F;
     bool sleeping = false;
+    Bounds world_aabb{};
+    float inv_mass = 1.0F;
+    bool had_contact = false;
+    bool enabled = true;
 };
 
 class PhysicsWorld final {
@@ -70,7 +74,8 @@ public:
         glm::vec3 origin,
         glm::vec3 direction,
         float max_distance,
-        std::uint32_t layer_mask = 0xFFFFFFFFU) const noexcept;
+        std::uint32_t layer_mask = 0xFFFFFFFFU,
+        SceneNodeId ignored_node = {}) const noexcept;
 
     [[nodiscard]] bool empty() const noexcept { return bodies_.empty(); }
 
@@ -101,6 +106,30 @@ public:
         glm::quat orientation,
         glm::vec3 linear_velocity,
         glm::vec3 angular_velocity) noexcept;
+    bool set_body_enabled(SceneNodeId id, bool enabled) noexcept;
+    bool set_body_motion_type(SceneNodeId id, RigidBodyMotionType type,
+        float mass = 1450.0F) noexcept;
+    bool wake_body(SceneNodeId id) noexcept;
+    bool apply_central_force(
+        SceneNodeId id,
+        glm::vec3 force,
+        float dt) noexcept;
+    bool apply_force_at_point(
+        SceneNodeId id,
+        glm::vec3 force,
+        glm::vec3 world_point,
+        float dt) noexcept;
+    bool apply_torque(
+        SceneNodeId id,
+        glm::vec3 torque,
+        float dt) noexcept;
+    bool apply_impulse_at_point(
+        SceneNodeId id,
+        glm::vec3 impulse,
+        glm::vec3 world_point) noexcept;
+    [[nodiscard]] glm::vec3 point_velocity(
+        SceneNodeId id,
+        glm::vec3 world_point) const noexcept;
 
 private:
     struct Body {
@@ -133,6 +162,7 @@ private:
         bool lock_rotation = false;
         bool sleeping = false;
         bool had_contact = false;
+        bool enabled = true;
     };
 
     struct ContactConstraint {

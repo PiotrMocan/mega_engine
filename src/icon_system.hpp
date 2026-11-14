@@ -6,8 +6,6 @@
 #include <string>
 #include <vector>
 
-struct SDL_Window;
-
 namespace vcr {
 
 enum class BuiltinIconKind : std::uint8_t {
@@ -74,18 +72,5 @@ struct IconRgbaImage {
     const std::filesystem::path& executable_path,
     std::uint32_t& out_count,
     std::string& error);
-
-void apply_window_icon_rgba(
-    SDL_Window* window,
-    const IconRgbaImage& image) noexcept;
-
-void apply_window_builtin_icon(
-    SDL_Window* window,
-    BuiltinIconKind kind) noexcept;
-
-void apply_window_icon_from_file_or_builtin(
-    SDL_Window* window,
-    const std::filesystem::path& icon_path,
-    BuiltinIconKind fallback) noexcept;
 
 } // namespace vcr

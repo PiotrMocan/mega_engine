@@ -741,7 +741,7 @@ VkPipeline Renderer::model_geometry_pipeline(
         }
         fatal("GPU grass render pass has no prewarmed geometry pipeline.");
     }
-    if ((draw.coverage & 1U) == 0U &&
+    if ((draw.coverage & (1U | material_coverage_glass_bit)) == 0U &&
         (ordinary == model_shadow_pipeline_.get() || lod_fade_actual() == LodFadePattern::off)) {
         for (std::size_t i = 0; i < opaque_pipeline_variant_count_; ++i) {
             if (opaque_pipeline_variants_[i].ordinary == ordinary)
@@ -793,6 +793,7 @@ void Renderer::initialize(VulkanContext &context, SDL_Window *window,
     local_lights_upload_.reserve(maximum_local_lights);
     editor_model_assets_.reserve(64U);
     editor_texture_assets_.reserve(128U);
+    game_ui_pending_vertices_.reserve(game_ui_max_vertices);
     editor_model_draws_.reserve(max_scene_nodes);
     editor_model_sort_scratch_.reserve(max_scene_nodes);
     scene_metadata_.reserve(maximum_editor_scene_instances);
@@ -843,6 +844,9 @@ void Renderer::initialize(VulkanContext &context, SDL_Window *window,
     create_pipeline_cache();
     create_lighting_resources();
     create_scene_resources();
+#if VCR_EDITOR_ENABLED
+    create_game_ui_resources();
+#endif
     create_display_mapping_resources();
     create_anti_aliasing_resources();
     create_pipeline();
@@ -908,6 +912,9 @@ void Renderer::shutdown() noexcept {
 #endif
     destroy_scene_resources();
     destroy_pipeline();
+#if VCR_EDITOR_ENABLED
+    destroy_game_ui_resources();
+#endif
 #if VCR_EDITOR_ENABLED
     if (editor_material_descriptor_set_layout_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(
@@ -1012,6 +1019,16 @@ void Renderer::create_frame_contexts() {
                     VMA_ALLOCATION_CREATE_MAPPED_BIT,
                 "editor scene upload buffer");
         }
+        frame.game_ui_vertex_buffer.create(
+            *context_,
+            static_cast<VkDeviceSize>(game_ui_max_vertices) *
+                sizeof(GameUiVertex),
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            VMA_MEMORY_USAGE_AUTO,
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                VMA_ALLOCATION_CREATE_MAPPED_BIT,
+            "game overlay vertex buffer");
+        frame.game_ui_vertex_count = 0U;
 #endif
 
         if (context_->timestamp_valid_bits() > 0U) {
@@ -1047,6 +1064,8 @@ void Renderer::destroy_frame_contexts() noexcept {
         frame.workload_buffer.destroy();
         frame.uniform_buffer.destroy();
 #if VCR_EDITOR_ENABLED
+        frame.game_ui_vertex_buffer.destroy();
+        frame.game_ui_vertex_count = 0U;
         frame.scene_upload_buffer.destroy();
         frame.scene_instance_buffer.destroy();
 #endif
@@ -2546,7 +2565,7 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
     if (model.is_skinned()) {
         gpu_asset.bounds.extent = glm::max(
             gpu_asset.bounds.extent * 1.5F,
-            gpu_asset.bounds.extent + glm::vec3(0.35F));
+            gpu_asset.bounds.extent + glm::vec3(0.65F));
         const VkDeviceSize skin_bytes =
             static_cast<VkDeviceSize>(model.skin_vertices.size()) * sizeof(CookedSkinVertex);
         gpu_asset.skin_vertex_buffer.create(
@@ -2879,7 +2898,7 @@ bool Renderer::update_editor_scene(
             static_cast<std::uint64_t>(draw.index_count / 3U) *
             draw.instance_count;
         total_model_instances_ += draw.instance_count;
-        if ((draw.coverage & 1U) != 0U) {
+        if ((draw.coverage & (1U | material_coverage_glass_bit)) != 0U) {
             alpha_masked_model_instances_ += draw.instance_count;
         }
     }
@@ -5073,7 +5092,7 @@ void Renderer::record_shadow_map(VkCommandBuffer command_buffer, FrameContext &f
                 for (std::size_t draw_index = 0U; draw_index < editor_model_draws_.size();
                      ++draw_index) {
                     const auto &draw = editor_model_draws_[draw_index];
-                    const bool alpha_masked_draw = (draw.coverage & 1U) != 0U;
+                    const bool alpha_masked_draw = (draw.coverage & (1U | material_coverage_glass_bit)) != 0U;
                     if (alpha_masked_draw != (coverage_pass == 1U)) continue;
                     const bool tessellated_draw =
                         model_tessellation_enabled_ &&
@@ -8253,6 +8272,105 @@ void Renderer::create_pipeline() {
         hud_blend_attachment,
         swapchain_.depth_format(),
         "anti-aliasing HUD pipeline");
+#if VCR_EDITOR_ENABLED
+    if (game_ui_pipeline_layout_.get() != VK_NULL_HANDLE) {
+        const VkShaderModule ui_vert = cached_shader("game_ui.vert.spv");
+        const VkShaderModule ui_frag = cached_shader("game_ui.frag.spv");
+        const std::array ui_stages{
+            VkPipelineShaderStageCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = VK_SHADER_STAGE_VERTEX_BIT,
+                .module = ui_vert,
+                .pName = "main",
+            },
+            VkPipelineShaderStageCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                .module = ui_frag,
+                .pName = "main",
+            },
+        };
+        const VkVertexInputBindingDescription ui_binding{
+            .binding = 0U,
+            .stride = sizeof(GameUiVertex),
+            .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+        };
+        const std::array ui_attributes{
+            VkVertexInputAttributeDescription{
+                .location = 0U,
+                .binding = 0U,
+                .format = VK_FORMAT_R32G32_SFLOAT,
+                .offset = static_cast<std::uint32_t>(offsetof(GameUiVertex, pos_px)),
+            },
+            VkVertexInputAttributeDescription{
+                .location = 1U,
+                .binding = 0U,
+                .format = VK_FORMAT_R32G32_SFLOAT,
+                .offset = static_cast<std::uint32_t>(offsetof(GameUiVertex, uv)),
+            },
+            VkVertexInputAttributeDescription{
+                .location = 2U,
+                .binding = 0U,
+                .format = VK_FORMAT_R32_UINT,
+                .offset = static_cast<std::uint32_t>(offsetof(GameUiVertex, rgba8)),
+            },
+        };
+        const VkPipelineVertexInputStateCreateInfo ui_vertex_input{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+            .vertexBindingDescriptionCount = 1U,
+            .pVertexBindingDescriptions = &ui_binding,
+            .vertexAttributeDescriptionCount = static_cast<std::uint32_t>(ui_attributes.size()),
+            .pVertexAttributeDescriptions = ui_attributes.data(),
+        };
+        const VkPipelineColorBlendStateCreateInfo ui_blend_state{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+            .attachmentCount = 1U,
+            .pAttachments = &hud_blend_attachment,
+        };
+        const VkFormat ui_color_format = swapchain_.color_format();
+        const auto build_ui_pipeline =
+            [&](const VkFormat depth_format, DeviceObject<VkPipeline>& target, const char* debug_name) {
+                const VkPipelineRenderingCreateInfo rendering_info{
+                    .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+                    .colorAttachmentCount = 1U,
+                    .pColorAttachmentFormats = &ui_color_format,
+                    .depthAttachmentFormat = depth_format,
+                };
+                const VkGraphicsPipelineCreateInfo pipeline_info{
+                    .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                    .pNext = &rendering_info,
+                    .stageCount = static_cast<std::uint32_t>(ui_stages.size()),
+                    .pStages = ui_stages.data(),
+                    .pVertexInputState = &ui_vertex_input,
+                    .pInputAssemblyState = &input_assembly,
+                    .pViewportState = &viewport_state,
+                    .pRasterizationState = &fullscreen_rasterization,
+                    .pMultisampleState = &multisampling,
+                    .pDepthStencilState = &no_depth_stencil,
+                    .pColorBlendState = &ui_blend_state,
+                    .pDynamicState = &dynamic_state,
+                    .layout = game_ui_pipeline_layout_.get(),
+                };
+                VK_CHECK(vkCreateGraphicsPipelines(
+                    context_->device(),
+                    pipeline_cache_,
+                    1U,
+                    &pipeline_info,
+                    nullptr,
+                    target.put(context_->device(), vkDestroyPipeline)));
+                context_->set_debug_name(
+                    VK_OBJECT_TYPE_PIPELINE, handle_value(target.get()), debug_name);
+            };
+        build_ui_pipeline(
+            swapchain_.depth_format(),
+            game_ui_direct_pipeline_,
+            "game UI overlay direct pipeline");
+        build_ui_pipeline(
+            VK_FORMAT_UNDEFINED,
+            game_ui_post_pipeline_,
+            "game UI overlay postprocess pipeline");
+    }
+#endif
 
     const VkPushConstantRange compute_push_constants{
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
@@ -8345,6 +8463,10 @@ void Renderer::destroy_pipeline() noexcept {
             context_->device(), compute_pipeline_layout_, nullptr);
         compute_pipeline_layout_ = VK_NULL_HANDLE;
     }
+#if VCR_EDITOR_ENABLED
+    game_ui_direct_pipeline_.reset();
+    game_ui_post_pipeline_.reset();
+#endif
     if (hud_pipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(context_->device(), hud_pipeline_, nullptr);
         hud_pipeline_ = VK_NULL_HANDLE;
@@ -8594,6 +8716,14 @@ bool Renderer::draw_frame(
     begin = Clock::now();
     update_frame_uniform(frame, view_matrix);
     timings.scene_prepare_ms = milliseconds(begin, Clock::now());
+#if VCR_EDITOR_ENABLED
+    frame.game_ui_vertex_count = static_cast<std::uint32_t>(
+        std::min<std::size_t>(game_ui_pending_vertices_.size(), game_ui_max_vertices));
+    if (frame.game_ui_vertex_count > 0U && frame.game_ui_vertex_buffer) {
+        frame.game_ui_vertex_buffer.write(std::as_bytes(
+            std::span{game_ui_pending_vertices_.data(), frame.game_ui_vertex_count}));
+    }
+#endif
     VK_CHECK(vkResetFences(context_->device(), 1, &frame.fence));
     VK_CHECK(vkResetCommandPool(
         context_->device(), frame.command_pool, 0));
@@ -9372,7 +9502,7 @@ void Renderer::record_commands(
                         for (std::size_t draw_index = 0; include_models && draw_index < model_draws.size();
                              ++draw_index) {
                             const auto &draw = model_draws[draw_index];
-                            const bool alpha_masked = (draw.coverage & 1U) != 0U;
+                            const bool alpha_masked = (draw.coverage & (1U | material_coverage_glass_bit)) != 0U;
                             if (alpha_masked != (coverage_pass != 0U)) {
                                 continue;
                             }
@@ -9383,7 +9513,7 @@ void Renderer::record_commands(
                                 editor_model_assets_[draw.asset_index];
                             const auto &submesh = asset.submeshes[draw.submesh_index];
                             if (interleave_masked_lods) {
-                                if (tessellated_draw) {
+                                if (tessellated_draw || draw.uses_skinned_pool) {
                                     if (lod_band > 0U) continue;
                                 } else if (submesh.lod_count[lod_band] == 0U) {
                                     continue;
@@ -9483,12 +9613,12 @@ void Renderer::record_commands(
                                     (draw_index + 2U) * model_lod_count *
                                     sizeof(VkDrawIndexedIndirectCommand);
                                 if (interleave_masked_lods) {
-                                    const std::size_t active_lod = tessellated_draw ? 0U : lod_band;
+                                    const std::size_t active_lod = (tessellated_draw || draw.uses_skinned_pool) ? 0U : lod_band;
                                     vkCmdDrawIndexedIndirect(
                                         command_buffer, frame.visibility.indirect.handle(),
                                         group_base + active_lod * sizeof(VkDrawIndexedIndirectCommand),
                                         1U, sizeof(VkDrawIndexedIndirectCommand));
-                                } else if (tessellated_draw) {
+                                } else if (tessellated_draw || draw.uses_skinned_pool) {
                                     vkCmdDrawIndexedIndirect(
                                         command_buffer, frame.visibility.indirect.handle(),
                                         group_base, 1U, sizeof(VkDrawIndexedIndirectCommand));
@@ -9833,6 +9963,7 @@ void Renderer::record_commands(
         };
     const auto draw_hud =
         [this, command_buffer, display_extent]() {
+            if (!game_ui_pending_vertices_.empty()) return;
             struct HudPushConstants {
                 std::uint32_t method;
                 std::uint32_t quality;
@@ -9876,6 +10007,54 @@ void Renderer::record_commands(
             vkCmdSetScissor(command_buffer, 0, 1, &hud_scissor);
             vkCmdDraw(command_buffer, 3, 1, 0, 0);
         };
+#if VCR_EDITOR_ENABLED
+    const auto draw_game_ui =
+        [this, command_buffer, display_extent, &frame, &set_viewport](const bool direct_pass) {
+            if (frame.game_ui_vertex_count == 0U ||
+                !frame.game_ui_vertex_buffer ||
+                game_ui_set_ == VK_NULL_HANDLE ||
+                game_ui_pipeline_layout_.get() == VK_NULL_HANDLE) {
+                return;
+            }
+            const VkPipeline pipeline = direct_pass
+                ? game_ui_direct_pipeline_.get()
+                : game_ui_post_pipeline_.get();
+            if (pipeline == VK_NULL_HANDLE) {
+                return;
+            }
+            set_viewport(display_extent);
+            const std::array<float, 4U> ui_push{
+                1.0F / static_cast<float>(std::max(display_extent.width, 1U)),
+                1.0F / static_cast<float>(std::max(display_extent.height, 1U)),
+                0.0F,
+                0.0F,
+            };
+            vkCmdBindPipeline(
+                command_buffer,
+                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                pipeline);
+            vkCmdBindDescriptorSets(
+                command_buffer,
+                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                game_ui_pipeline_layout_.get(),
+                0U,
+                1U,
+                &game_ui_set_,
+                0U,
+                nullptr);
+            vkCmdPushConstants(
+                command_buffer,
+                game_ui_pipeline_layout_.get(),
+                VK_SHADER_STAGE_VERTEX_BIT,
+                0U,
+                sizeof(ui_push),
+                ui_push.data());
+            const VkBuffer vb = frame.game_ui_vertex_buffer.handle();
+            const VkDeviceSize vb_offset = 0U;
+            vkCmdBindVertexBuffers(command_buffer, 0U, 1U, &vb, &vb_offset);
+            vkCmdDraw(command_buffer, frame.game_ui_vertex_count, 1U, 0U, 0U);
+        };
+#endif
 
     if (anti_aliasing_.method == AntiAliasingMethod::off &&
         (!lighting_settings_.dynamic || mode_ == RunMode::instancing) &&
@@ -10005,6 +10184,9 @@ void Renderer::record_commands(
         {
             draw_hud();
         }
+#if VCR_EDITOR_ENABLED
+        draw_game_ui(true);
+#endif
         vkCmdEndRendering(command_buffer);
 #if VCR_EDITOR_ENABLED
         if (editor_frame) {
@@ -10681,6 +10863,9 @@ void Renderer::record_commands(
         {
             draw_hud();
         }
+#if VCR_EDITOR_ENABLED
+        draw_game_ui(false);
+#endif
         vkCmdEndRendering(command_buffer);
 #if VCR_EDITOR_ENABLED
         if (editor_frame) {
@@ -11349,5 +11534,122 @@ void Renderer::print_metrics() const {
               << "  triangles: " << triangle_count() << '\n'
               << std::flush;
 }
+
+#if VCR_EDITOR_ENABLED
+void Renderer::set_game_overlay_vertices(const std::span<const GameUiVertex> vertices) {
+    const std::size_t clamped_count =
+        std::min<std::size_t>(vertices.size(), game_ui_max_vertices);
+    game_ui_pending_vertices_.assign(
+        vertices.begin(),
+        vertices.begin() + static_cast<std::ptrdiff_t>(clamped_count));
+}
+
+void Renderer::create_game_ui_resources() {
+    if (context_ == nullptr || game_ui_atlas_) {
+        return;
+    }
+    std::array<std::uint8_t, game_ui_atlas_size * game_ui_atlas_size> atlas_pixels{};
+    build_game_ui_font_atlas(atlas_pixels);
+    game_ui_atlas_.create_sampled(
+        *context_,
+        game_ui_atlas_size,
+        game_ui_atlas_size,
+        VK_FORMAT_R8_UNORM,
+        VK_FILTER_NEAREST,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        "game overlay font atlas");
+    upload_to_device_texture(
+        game_ui_atlas_,
+        std::as_bytes(std::span{atlas_pixels}),
+        1U,
+        "game overlay font atlas");
+
+    const VkDescriptorSetLayoutBinding binding{
+        .binding = 0U,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .descriptorCount = 1U,
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+    };
+    const VkDescriptorSetLayoutCreateInfo set_layout_info{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 1U,
+        .pBindings = &binding,
+    };
+    VK_CHECK(vkCreateDescriptorSetLayout(
+        context_->device(),
+        &set_layout_info,
+        nullptr,
+        game_ui_set_layout_.put(context_->device(), vkDestroyDescriptorSetLayout)));
+
+    const VkDescriptorPoolSize pool_size{
+        .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .descriptorCount = 1U,
+    };
+    const VkDescriptorPoolCreateInfo pool_info{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1U,
+        .poolSizeCount = 1U,
+        .pPoolSizes = &pool_size,
+    };
+    VK_CHECK(vkCreateDescriptorPool(
+        context_->device(),
+        &pool_info,
+        nullptr,
+        game_ui_pool_.put(context_->device(), vkDestroyDescriptorPool)));
+
+    const VkDescriptorSetLayout layout_handle = game_ui_set_layout_.get();
+    const VkDescriptorSetAllocateInfo alloc_info{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = game_ui_pool_.get(),
+        .descriptorSetCount = 1U,
+        .pSetLayouts = &layout_handle,
+    };
+    VK_CHECK(vkAllocateDescriptorSets(context_->device(), &alloc_info, &game_ui_set_));
+
+    const VkDescriptorImageInfo image_info{
+        .sampler = game_ui_atlas_.sampler(),
+        .imageView = game_ui_atlas_.view(),
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+    const VkWriteDescriptorSet write{
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = game_ui_set_,
+        .dstBinding = 0U,
+        .descriptorCount = 1U,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .pImageInfo = &image_info,
+    };
+    vkUpdateDescriptorSets(context_->device(), 1U, &write, 0U, nullptr);
+
+    const VkPushConstantRange push_range{
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+        .offset = 0U,
+        .size = 16U,
+    };
+    const VkPipelineLayoutCreateInfo pipeline_layout_info{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1U,
+        .pSetLayouts = &layout_handle,
+        .pushConstantRangeCount = 1U,
+        .pPushConstantRanges = &push_range,
+    };
+    VK_CHECK(vkCreatePipelineLayout(
+        context_->device(),
+        &pipeline_layout_info,
+        nullptr,
+        game_ui_pipeline_layout_.put(context_->device(), vkDestroyPipelineLayout)));
+}
+
+void Renderer::destroy_game_ui_resources() noexcept {
+    game_ui_direct_pipeline_.reset();
+    game_ui_post_pipeline_.reset();
+    game_ui_pipeline_layout_.reset();
+    game_ui_set_ = VK_NULL_HANDLE;
+    game_ui_pool_.reset();
+    game_ui_set_layout_.reset();
+    game_ui_atlas_.destroy();
+    game_ui_pending_vertices_.clear();
+}
+#endif
 
 } // namespace vcr

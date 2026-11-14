@@ -169,6 +169,34 @@ constexpr std::array<ActionMetadata, input_action_count> action_table{{
      "pause",
      "Pause",
      {InputKey::escape, InputKey::p, GamepadButton::start}},
+    {InputAction::vehicle_throttle,
+     "vehicle_throttle",
+     "Vehicle Throttle",
+     {InputKey::w, InputKey::up, GamepadButton::right_trigger}},
+    {InputAction::vehicle_brake,
+     "vehicle_brake",
+     "Vehicle Brake / Reverse",
+     {InputKey::s, InputKey::down, GamepadButton::left_trigger}},
+    {InputAction::vehicle_steer_left,
+     "vehicle_steer_left",
+     "Vehicle Steer Left",
+     {InputKey::a, InputKey::left, GamepadButton::none}},
+    {InputAction::vehicle_steer_right,
+     "vehicle_steer_right",
+     "Vehicle Steer Right",
+     {InputKey::d, InputKey::right, GamepadButton::none}},
+    {InputAction::vehicle_handbrake,
+     "vehicle_handbrake",
+     "Vehicle Handbrake",
+     {InputKey::space, InputKey::none, GamepadButton::east}},
+    {InputAction::recover,
+     "recover",
+     "Recover / Reset Pose",
+     {InputKey::r, InputKey::none, GamepadButton::right_shoulder}},
+    {InputAction::quick_reset,
+     "quick_reset",
+     "Quick Reset",
+     {InputKey::f5, InputKey::none, GamepadButton::back}},
     {InputAction::ui_up,
      "ui_up",
      "UI Up",
@@ -233,10 +261,11 @@ constexpr std::array<ActionMetadata, input_action_count> action_table{{
     const InputAction a,
     const InputAction b,
     InputContext& out_shared) noexcept {
-    constexpr std::array<InputContext, 3U> all_contexts{
+    constexpr std::array<InputContext, 4U> all_contexts{
         InputContext::gameplay,
         InputContext::ui,
         InputContext::cutscene,
+        InputContext::vehicle,
     };
     for (const InputContext ctx : all_contexts) {
         if (action_active_in_context(a, ctx) &&
@@ -439,6 +468,7 @@ std::string_view to_token(const InputContext context) noexcept {
     case InputContext::gameplay: return "gameplay";
     case InputContext::ui: return "ui";
     case InputContext::cutscene: return "cutscene";
+    case InputContext::vehicle: return "vehicle";
     }
     return "unknown";
 }
@@ -448,6 +478,7 @@ std::optional<InputContext> parse_input_context(
     if (token == "gameplay") return InputContext::gameplay;
     if (token == "ui") return InputContext::ui;
     if (token == "cutscene") return InputContext::cutscene;
+    if (token == "vehicle") return InputContext::vehicle;
     return std::nullopt;
 }
 
@@ -487,10 +518,19 @@ bool action_active_in_context(
     case InputAction::move_right:
     case InputAction::jump:
     case InputAction::run:
+        return context == InputContext::gameplay;
     case InputAction::interact:
-        return context == InputContext::gameplay;
     case InputAction::pause:
-        return context == InputContext::gameplay;
+    case InputAction::recover:
+    case InputAction::quick_reset:
+        return context == InputContext::gameplay ||
+               context == InputContext::vehicle;
+    case InputAction::vehicle_throttle:
+    case InputAction::vehicle_brake:
+    case InputAction::vehicle_steer_left:
+    case InputAction::vehicle_steer_right:
+    case InputAction::vehicle_handbrake:
+        return context == InputContext::vehicle;
     case InputAction::ui_up:
     case InputAction::ui_down:
     case InputAction::ui_left:
@@ -735,6 +775,9 @@ void InputActionSystem::clear_action_latches() noexcept {
     action_pressed_.fill(false);
     action_released_.fill(false);
     move_axis_ = {0.0F, 0.0F};
+    vehicle_steer_axis_ = 0.0F;
+    vehicle_throttle_value_ = 0.0F;
+    vehicle_brake_value_ = 0.0F;
     look_delta_ = {0.0F, 0.0F};
     ui_nav_step_ = {0.0F, 0.0F};
     ui_repeat_timer_ = 0.0F;
@@ -819,6 +862,29 @@ void InputActionSystem::begin_frame(const float delta_seconds) noexcept {
         action_pressed_[i] = now_down && !was_down;
         action_released_[i] = !now_down && was_down;
     }
+
+    const auto non_trigger_action_down =
+        [&](const InputAction act, const GamepadButton analog_trigger) noexcept {
+            if (!action_active_in_context(act, context_)) {
+                return false;
+            }
+            const ActionBinding& bind = bindings_[static_cast<std::size_t>(act)];
+            if (key_active(bind.primary_key) || key_active(bind.secondary_key)) {
+                return true;
+            }
+            return filtered_gamepad_.connected &&
+                   bind.gamepad_button != analog_trigger &&
+                   filtered_gamepad_.button_down(bind.gamepad_button);
+        };
+    const float digital_throttle_down =
+        non_trigger_action_down(InputAction::vehicle_throttle, GamepadButton::right_trigger)
+            ? 1.0F
+            : 0.0F;
+    const float digital_brake_down =
+        non_trigger_action_down(InputAction::vehicle_brake, GamepadButton::left_trigger)
+            ? 1.0F
+            : 0.0F;
+
     keys_pulsed_.fill(false);
 
     if (context_ == InputContext::gameplay) {
@@ -836,7 +902,34 @@ void InputActionSystem::begin_frame(const float delta_seconds) noexcept {
             combined *= 1.0F / std::sqrt(len_sq);
         }
         move_axis_ = combined;
+        vehicle_steer_axis_ = 0.0F;
+        vehicle_throttle_value_ = 0.0F;
+        vehicle_brake_value_ = 0.0F;
+    } else if (context_ == InputContext::vehicle) {
+        move_axis_ = {0.0F, 0.0F};
+        const float trigger_throttle =
+            filtered_gamepad_.connected ? filtered_gamepad_.right_trigger : 0.0F;
+        const float trigger_brake =
+            filtered_gamepad_.connected ? filtered_gamepad_.left_trigger : 0.0F;
+        vehicle_throttle_value_ = std::clamp(
+            std::max(digital_throttle_down, trigger_throttle), 0.0F, 1.0F);
+        vehicle_brake_value_ = std::clamp(
+            std::max(digital_brake_down, trigger_brake), 0.0F, 1.0F);
 
+        const float digital_steer =
+            static_cast<float>(action_down(InputAction::vehicle_steer_right)) -
+            static_cast<float>(action_down(InputAction::vehicle_steer_left));
+        vehicle_steer_axis_ = std::clamp(
+            digital_steer + filtered_gamepad_.left_stick.x, -1.0F, 1.0F);
+    } else {
+        move_axis_ = {0.0F, 0.0F};
+        vehicle_steer_axis_ = 0.0F;
+        vehicle_throttle_value_ = 0.0F;
+        vehicle_brake_value_ = 0.0F;
+    }
+
+    if (context_ == InputContext::gameplay ||
+        context_ == InputContext::vehicle) {
         const float stick_look_x =
             filtered_gamepad_.right_stick.x *
             gamepad_config_.look_speed_pixels_per_sec * dt;
@@ -850,7 +943,6 @@ void InputActionSystem::begin_frame(const float delta_seconds) noexcept {
             pending_mouse_dy_ + stick_look_y,
         };
     } else {
-        move_axis_ = {0.0F, 0.0F};
         look_delta_ = {0.0F, 0.0F};
     }
     pending_mouse_dx_ = 0.0F;

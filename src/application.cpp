@@ -6,6 +6,7 @@
 #include "scene_io.hpp"
 #include "sdl_input_bridge.hpp"
 #include "vulkan_common.hpp"
+#include "window_icon_sdl.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -491,15 +492,33 @@ void Application::initialize_gameplay(const SceneRenderView& initial_view) {
         options_.camera_z_explicit
             ? std::optional<double>(options_.camera_z)
             : std::nullopt);
+    gameplay_renderer_bridge_ = make_gameplay_renderer_bridge(renderer_);
+    loaded_game_module_.unload(&gameplay_);
     std::string error;
+    if (const auto root = find_runtime_asset_root(options_.project_path);
+        root && !root->game_module_path.empty()) {
+        const GameModuleHostContext host{
+            .project_root = &root->project_root,
+            .asset_root = &root->path,
+            .scene = &scene_,
+            .session = &gameplay_,
+            .audio_engine = audio_engine_.initialized() ? &audio_engine_ : nullptr,
+            .input_actions = &input_actions_,
+        };
+        if (!loaded_game_module_.load(
+                root->game_module_path, host, false, error)) {
+            fatal(error);
+        }
+    }
     if (!gameplay_.start(
             scene_,
             initial_view,
             startup_camera,
             camera_,
             error,
-            &renderer_,
-            audio_engine_.initialized() ? &audio_engine_ : nullptr)) {
+            &gameplay_renderer_bridge_,
+            audio_engine_.initialized() ? &audio_engine_ : nullptr,
+            &input_actions_)) {
         fatal(error);
     }
 }
@@ -741,6 +760,17 @@ void Application::process_event(const SDL_Event& event) {
         }
     }
     const auto key = input_key_from_sdl(event.key.key);
+    if (gameplay_.active() && (event.key.key == SDLK_F9 || event.key.key == SDLK_F10)) {
+        if (const auto root = find_runtime_asset_root(options_.project_path)) {
+            const auto path = root->path / "saves/quicksave.vcrsave.json";
+            std::string error;
+            std::filesystem::create_directories(path.parent_path());
+            const bool ok = event.key.key == SDLK_F9
+                ? gameplay_.save_game_state(path, error)
+                : gameplay_.load_game_state(path, scene_, gameplay_renderer_bridge_, camera_, error);
+            std::cout << (ok ? "Game state updated: " + path.string() : error) << '\n';
+        }
+    }
     if (key) {
         handle_key_action(*key, true);
     }
@@ -814,6 +844,22 @@ void Application::handle_key_action(
 void Application::apply_mcp_key(
     const McpInputKey key,
     const McpInputAction action) {
+    // Feed the same action system used by the physical keyboard and gamepad.
+    InputKey mapped = InputKey::none;
+    switch (key) {
+    case McpInputKey::w: mapped = InputKey::w; break;
+    case McpInputKey::s: mapped = InputKey::s; break;
+    case McpInputKey::a: mapped = InputKey::a; break;
+    case McpInputKey::d: mapped = InputKey::d; break;
+    case McpInputKey::e: mapped = InputKey::e; break;
+    case McpInputKey::space: mapped = InputKey::space; break;
+    case McpInputKey::shift: mapped = InputKey::left_shift; break;
+    default: break;
+    }
+    if (mapped != InputKey::none) {
+        if (action == McpInputAction::press) input_actions_.pulse_key(mapped);
+        else input_actions_.set_key_down(mapped, action == McpInputAction::down);
+    }
     const std::size_t index = key_index(key);
     if (action == McpInputAction::up) {
         mcp_keys_down_.reset(index);
@@ -960,7 +1006,7 @@ void Application::update_camera(const float delta_seconds) {
         },
         delta_seconds,
         scene_,
-        renderer_,
+        gameplay_renderer_bridge_,
         camera_,
         audio_engine_.initialized() ? &audio_engine_ : nullptr,
         &input_actions_)) {
@@ -1283,6 +1329,31 @@ void Application::execute_mcp_command(const McpCommand& command) {
                       Swapchain::present_mode_name(renderer_.swapchain().present_mode())},
                      {"screenshot_pending", renderer_.screenshot_pending()},
                  }},
+                {"gameplay", [&]() {
+                    Json gameplay_json{
+                        {"active", gameplay_.active()},
+                        {"player_position",
+                         {gameplay_.animated_player().world_position().x,
+                          gameplay_.animated_player().world_position().y,
+                          gameplay_.animated_player().world_position().z}},
+                        {"module_loaded", loaded_game_module_.is_loaded()},
+                        {"module_name", loaded_game_module_.module_name()},
+                    };
+                    if (loaded_game_module_.is_loaded()) {
+                        std::string project_state_json;
+                        gameplay_.query_project_debug_state(project_state_json);
+                        if (!project_state_json.empty()) {
+                            const Json parsed = Json::parse(
+                                project_state_json, nullptr, false);
+                            if (parsed.is_object()) {
+                                for (const auto& [k, v] : parsed.items()) {
+                                    gameplay_json[k] = v;
+                                }
+                            }
+                        }
+                    }
+                    return gameplay_json;
+                }()},
                 {"window",
                  Json{
                      {"logical_width", window_width},
@@ -1733,6 +1804,7 @@ void Application::execute_mcp_command(const McpCommand& command) {
     case McpCommandType::input_release_all:
         mcp_keys_down_.reset();
         mcp_keys_pressed_.reset();
+        input_actions_.release_all();
         pending_mcp_mouse_delta_x_ = 0.0F;
         pending_mcp_mouse_delta_y_ = 0.0F;
         succeed(
@@ -2019,7 +2091,12 @@ void Application::shutdown() noexcept {
     mcp_keys_down_.reset();
     mcp_keys_pressed_.reset();
     set_mouse_capture(false);
-    gameplay_.stop(&audio_engine_);
+    gameplay_.stop(
+        audio_engine_.initialized() ? &audio_engine_ : nullptr,
+        gameplay_renderer_bridge_.context != nullptr
+            ? &gameplay_renderer_bridge_
+            : nullptr);
+    loaded_game_module_.unload(&gameplay_);
     input_actions_.stop_rumble();
     input_actions_.set_hardware_polling_enabled(false);
     audio_engine_.shutdown();

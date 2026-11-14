@@ -875,13 +875,24 @@ void Renderer::build_gpu_visibility_scene(std::uint32_t plane_count, std::uint32
     for (const auto &draw : editor_model_draws_) {
         const auto &mesh = editor_model_assets_[draw.asset_index].submeshes[draw.submesh_index];
         const bool tessellated = model_tessellation_enabled_ && draw.tessellation.enabled();
+        const bool skinned = draw.uses_skinned_pool;
         group(draw.first_instance, draw.instance_count, draw.vertex_offset, tessellated,
-              {mesh.lod_count[0], mesh.lod_count[1], mesh.lod_count[2], mesh.lod_count[3]},
-              {mesh.lod_first[0], mesh.lod_first[1], mesh.lod_first[2], mesh.lod_first[3]},
-              {sanitize_error(mesh.lod_count[0], mesh.lod_error[0]),
-               sanitize_error(mesh.lod_count[1], mesh.lod_error[1]),
-               sanitize_error(mesh.lod_count[2], mesh.lod_error[2]),
-               sanitize_error(mesh.lod_count[3], mesh.lod_error[3])});
+              skinned
+                  ? glm::uvec4{mesh.lod_count[0], 0U, 0U, 0U}
+                  : glm::uvec4{
+                        mesh.lod_count[0], mesh.lod_count[1], mesh.lod_count[2], mesh.lod_count[3]},
+              skinned
+                  ? glm::uvec4{mesh.lod_first[0], 0U, 0U, 0U}
+                  : glm::uvec4{
+                        mesh.lod_first[0], mesh.lod_first[1], mesh.lod_first[2], mesh.lod_first[3]},
+              skinned
+                  ? glm::vec4{
+                        sanitize_error(mesh.lod_count[0], mesh.lod_error[0]), -1.0F, -1.0F, -1.0F}
+                  : glm::vec4{
+                        sanitize_error(mesh.lod_count[0], mesh.lod_error[0]),
+                        sanitize_error(mesh.lod_count[1], mesh.lod_error[1]),
+                        sanitize_error(mesh.lod_count[2], mesh.lod_error[2]),
+                        sanitize_error(mesh.lod_count[3], mesh.lod_error[3])});
     }
     std::fill(node_record_heads_.begin(), node_record_heads_.end(), UINT32_MAX);
     node_record_next_.assign(count, UINT32_MAX);

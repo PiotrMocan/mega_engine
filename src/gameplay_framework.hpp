@@ -125,6 +125,7 @@ struct AnimatorNodeRuntime {
     glm::vec3 root_motion_position{0.0F};
     glm::vec3 root_motion_rotation_degrees{0.0F};
     glm::vec3 root_motion_scale{1.0F};
+    std::string root_motion_bone_name{};
 };
 
 struct RuntimeTransformSink;
@@ -160,6 +161,9 @@ public:
         SceneNodeId id,
         float param_x,
         float param_y) noexcept;
+    void set_root_motion_bone(
+        SceneNodeId id,
+        std::string_view bone_name);
 
     [[nodiscard]] const AnimatorNodeRuntime* node_runtime(
         SceneNodeId id) const noexcept;
@@ -315,6 +319,7 @@ struct GameStateSnapshot {
     std::vector<GameplaySaveEntity> entities{};
     std::vector<GameplaySavePhysicsBody> physics_bodies{};
     std::vector<AnimatorSaveEntry> animators{};
+    std::string custom_project_json{};
 };
 
 [[nodiscard]] bool save_game_state_file(

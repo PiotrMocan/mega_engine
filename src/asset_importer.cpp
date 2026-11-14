@@ -1672,9 +1672,9 @@ import_materials(
             {"version", asset_schema_version},
             {"kind", "material"},
             {"name", material_name},
-            {"alpha_mode", std::string_view(alpha_mode.C_Str()) == "MASK" ? "mask" : "opaque"},
+            {"alpha_mode", std::string_view(alpha_mode.C_Str()) == "MASK" ? "mask" : (std::string_view(alpha_mode.C_Str()) == "BLEND" ? "blend" : "opaque")},
             {"alpha_cutoff", std::isfinite(alpha_cutoff) ? std::clamp(alpha_cutoff, 0.0F, 1.0F) : 0.5F},
-            {"double_sided", double_sided != 0},
+            {"double_sided", double_sided != 0 || std::string_view(alpha_mode.C_Str()) == "BLEND"},
             {"pbr",
              {
                  {"base_color",

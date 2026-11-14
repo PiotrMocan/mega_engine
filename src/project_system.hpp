@@ -23,6 +23,19 @@ inline constexpr std::string_view project_registry_format =
     "vulkan_cube_project_registry";
 inline constexpr std::uint32_t project_registry_version = 1U;
 
+inline constexpr std::string_view engine_shared_library_filename =
+#if defined(_WIN32)
+    "vcr_engine.dll";
+#else
+    "libvcr_engine.so";
+#endif
+inline constexpr std::string_view engine_import_library_filename =
+#if defined(_WIN32)
+    "vcr_engine.lib";
+#else
+    "libvcr_engine.so";
+#endif
+
 inline constexpr std::size_t maximum_registered_projects = 1024U;
 inline constexpr std::size_t maximum_project_name_bytes = 128U;
 inline constexpr std::size_t maximum_project_description_bytes = 1024U;
@@ -34,6 +47,7 @@ inline constexpr std::uintmax_t maximum_project_registry_bytes =
 enum class ProjectTemplateKind : std::uint8_t {
     standard,
     empty,
+    cpp_module,
 };
 
 [[nodiscard]] std::string_view to_token(ProjectTemplateKind kind) noexcept;
@@ -51,6 +65,7 @@ struct ProjectManifest {
     std::string startup_scene{"scenes/editor_scene.json"};
     std::string executable{};
     std::string icon_path{"icon.ico"};
+    std::string game_module{};
     std::string created_utc{};
 };
 
@@ -71,10 +86,16 @@ struct ProjectInspection {
     std::filesystem::path project_directory{};
     std::filesystem::path assets_directory{};
     std::filesystem::path executable_path{};
+    std::filesystem::path engine_dll_path{};
+    std::filesystem::path game_module_path{};
+    std::filesystem::path cmake_lists_path{};
     std::filesystem::path icon_file_path{};
     std::vector<std::string> scene_relative_paths{};
     bool startup_scene_exists = false;
     bool runtime_bundled = false;
+    bool engine_dll_exists = false;
+    bool has_cpp_code = false;
+    bool game_module_built = false;
     bool icon_exists = false;
     std::string diagnostic{};
 };
@@ -108,10 +129,19 @@ struct CreateProjectResult {
 struct BundleProjectRuntimeResult {
     std::filesystem::path project_directory{};
     std::filesystem::path executable_path{};
+    std::filesystem::path engine_dll_path{};
     std::filesystem::path icon_path{};
     std::size_t copied_shaders = 0U;
+    bool copied_engine_dll = false;
     bool copied_fsr3_dll = false;
     bool icon_embedded = false;
+};
+
+struct CompileProjectModuleResult {
+    std::filesystem::path project_directory{};
+    std::filesystem::path build_directory{};
+    std::filesystem::path module_path{};
+    bool built = false;
 };
 
 class ProjectRegistry final {
@@ -180,19 +210,36 @@ private:
 [[nodiscard]] bool valid_project_icon_relative_path(
     std::string_view path) noexcept;
 
+// Returns default relative game module DLL path (e.g. "bin/foo_game.dll").
+[[nodiscard]] std::string default_project_module_relative_path(
+    std::string_view slug_or_name);
+
+// Validates a relative .dll path inside <project>/ (e.g. "bin/foo_game.dll").
+[[nodiscard]] bool valid_project_module_relative_path(
+    std::string_view path) noexcept;
+
 // Finds vulkan_cube.exe suitable for packaging into a standalone project,
 // preferring an uninstrumented Release build when available.
 [[nodiscard]] std::optional<std::filesystem::path>
 find_packable_engine_runtime_binary();
 
-// Copies the engine runtime executable, FSR3 DLL (if built), SPIR-V shaders,
-// core renderer assets (sky + SMAA), and licenses into <project>/, ensures
-// icon.ico exists, and embeds the project's icon into its PE executable.
+// Copies the engine runtime executable, vcr_engine.dll (plus import lib & SDK
+// script when available), FSR3 DLL (if built), SPIR-V shaders, core renderer
+// assets (sky + SMAA), and licenses into <project>/, ensures icon.ico exists,
+// and embeds the project's icon into its PE executable.
 [[nodiscard]] bool bundle_project_runtime(
     const std::filesystem::path& project_directory,
     BundleProjectRuntimeResult& output,
     std::string& error,
     const std::filesystem::path& explicit_engine_exe = {});
+
+// Configures and compiles <project>/CMakeLists.txt into <project>/build/windows-<cfg>
+// using native CMake + Ninja + MSVC, producing the project game DLL.
+[[nodiscard]] bool compile_project_game_module(
+    const std::filesystem::path& project_directory,
+    CompileProjectModuleResult& output,
+    std::string& error,
+    std::string_view build_config = "Release");
 
 // Converts/validates source_image_or_ico into multi-resolution .ico bytes,
 // writes <project>/<manifest.icon_path>, bundles runtime if missing & packable

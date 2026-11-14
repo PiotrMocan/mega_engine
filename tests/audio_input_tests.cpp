@@ -250,6 +250,46 @@ void test_input_action_system(const std::filesystem::path& scratch_root) {
             close_to(loaded.gamepad_config().stick_inner_deadzone, 0.22F) &&
             loaded.gamepad_config().invert_look_y,
         "loaded InputActionSystem matches saved bindings and GamepadConfig");
+
+    // Vehicle context: digital & analog throttle/brake/steer + recover/quick_reset + context isolation.
+    vcr::InputActionSystem veh;
+    expect(
+        veh.detect_conflicts(conflicts) == 0U,
+        "default InputActionSystem with vehicle/recover/quick_reset has zero conflicts");
+    veh.set_context(vcr::InputContext::vehicle);
+    veh.set_key_down(vcr::InputKey::w, true);
+    veh.set_key_down(vcr::InputKey::a, true);
+    veh.set_key_down(vcr::InputKey::space, true);
+    veh.set_key_down(vcr::InputKey::r, true);
+    veh.set_key_down(vcr::InputKey::f5, true);
+    veh.begin_frame(1.0F / 60.0F);
+    expect(
+        veh.action_down(vcr::InputAction::vehicle_throttle) &&
+            veh.action_down(vcr::InputAction::vehicle_steer_left) &&
+            veh.action_down(vcr::InputAction::vehicle_handbrake) &&
+            veh.action_pressed(vcr::InputAction::recover) &&
+            veh.action_pressed(vcr::InputAction::quick_reset) &&
+            !veh.action_down(vcr::InputAction::move_forward) &&
+            !veh.action_down(vcr::InputAction::jump) &&
+            close_to(veh.vehicle_throttle_value(), 1.0F) &&
+            close_to(veh.vehicle_steer_axis(), -1.0F),
+        "Vehicle context routes W/A/Space/R/F5 without triggering on-foot gameplay move/jump");
+
+    veh.release_all();
+    vcr::GamepadState vpad{};
+    vpad.connected = true;
+    vpad.right_trigger = 0.75F;
+    vpad.left_trigger = 0.20F;
+    vpad.left_stick = {0.80F, 0.0F};
+    veh.set_synthetic_gamepad(vpad);
+    veh.begin_frame(1.0F / 60.0F);
+    expect(
+        close_to(veh.vehicle_throttle_value(), 0.75F, 0.02F) &&
+            close_to(veh.vehicle_brake_value(), 0.20F, 0.02F) &&
+            veh.vehicle_steer_axis() > 0.5F &&
+            veh.action_down(vcr::InputAction::vehicle_throttle) &&
+            !veh.action_down(vcr::InputAction::vehicle_brake),
+        "Vehicle context evaluates analog triggers and steering stick smoothly");
 }
 
 void test_audio_assets_and_sound_cues(const std::filesystem::path& asset_root) {

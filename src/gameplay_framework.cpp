@@ -340,8 +340,17 @@ void apply_root_motion_step(
     if (!comp.root_motion_enabled) {
         return;
     }
+    std::int32_t bone_idx = skeleton.root_motion_bone_index;
+    if (!rt.root_motion_bone_name.empty()) {
+        const std::int32_t found =
+            skeleton.find_bone_index(rt.root_motion_bone_name);
+        if (found >= 0) {
+            bone_idx = found;
+        }
+    }
     const RootMotionDelta local_rm = extract_root_motion_delta(
         skeleton,
+        bone_idx,
         clip,
         prev_time,
         curr_time,
@@ -787,6 +796,16 @@ void AnimatorRuntimeSystem::set_param_override(
         rt->override_param_x = std::isfinite(param_x) ? param_x : 0.0F;
         rt->override_param_y = std::isfinite(param_y) ? param_y : 0.0F;
     }
+}
+
+void AnimatorRuntimeSystem::set_root_motion_bone(
+    const SceneNodeId id,
+    const std::string_view bone_name) {
+    if (!id) {
+        return;
+    }
+    AnimatorNodeRuntime& rt = get_or_create_runtime(id, SceneUuid{}, {});
+    rt.root_motion_bone_name.assign(bone_name);
 }
 
 void AnimatorRuntimeSystem::update(
@@ -1239,7 +1258,31 @@ void AnimatorRuntimeSystem::update(
                 rt.root_motion_scale = node.transform.scale;
                 rt.root_motion_pose_initialized = true;
             }
-            rt.root_motion_position += rt.root_motion_delta_world;
+            glm::vec3 resolved_rm = rt.root_motion_position;
+            const glm::vec3 rm_delta = rt.root_motion_delta_world;
+            if (collision_world != nullptr && !collision_world->empty()) {
+                const float delta_len = glm::length(rm_delta);
+                const std::uint32_t steps = std::clamp(
+                    static_cast<std::uint32_t>(std::ceil(delta_len / 0.15F)),
+                    1U,
+                    8U);
+                const glm::vec3 step_delta =
+                    rm_delta / static_cast<float>(steps);
+                const float walkable_cos = std::cos(glm::radians(46.0F));
+                for (std::uint32_t s = 0U; s < steps; ++s) {
+                    resolved_rm += step_delta;
+                    resolved_rm = collision_world->resolve_capsule(
+                        resolved_rm,
+                        0.35F,
+                        1.75F,
+                        walkable_cos,
+                        0xFFFFFFFFU,
+                        id).resolved_feet;
+                }
+            } else {
+                resolved_rm += rm_delta;
+            }
+            rt.root_motion_position = resolved_rm;
             rt.root_motion_rotation_degrees.y +=
                 glm::degrees(rt.root_motion_yaw_delta);
             if (transform_sink != nullptr && transform_sink->apply != nullptr) {
@@ -2187,6 +2230,15 @@ bool save_game_state_file(
             });
         }
         root["animators"] = std::move(anims_json);
+        if (!snapshot.custom_project_json.empty()) {
+            Json parsed = Json::parse(
+                snapshot.custom_project_json, nullptr, false);
+            if (!parsed.is_discarded()) {
+                root["project_state"] = std::move(parsed);
+            } else {
+                root["project_state"] = snapshot.custom_project_json;
+            }
+        }
 
         const std::string serialized = root.dump(2);
         std::error_code ec;
@@ -2487,6 +2539,14 @@ bool load_game_state_file(
                     sa.fsm_time = std::max(0.0F, *ft);
                 }
                 out_snapshot.animators.push_back(sa);
+            }
+        }
+        if (root.contains("project_state")) {
+            const Json& ps = root["project_state"];
+            if (ps.is_string()) {
+                out_snapshot.custom_project_json = ps.get<std::string>();
+            } else {
+                out_snapshot.custom_project_json = ps.dump();
             }
         }
         return true;

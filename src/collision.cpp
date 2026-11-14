@@ -1554,7 +1554,8 @@ std::optional<RaycastHit> CollisionWorld::raycast(
     const glm::vec3 direction,
     const float max_distance,
     const std::uint32_t layer_mask,
-    const bool include_triggers) const noexcept {
+    const bool include_triggers,
+    const SceneNodeId ignored_node) const noexcept {
     if (!finite_vec3(origin) ||
         !finite_vec3(direction) ||
         !std::isfinite(max_distance) ||
@@ -1571,7 +1572,9 @@ std::optional<RaycastHit> CollisionWorld::raycast(
     float best_dist = max_distance;
 
     for (const OrientedBox& box : boxes_) {
-        if ((box.layer & layer_mask) == 0U ||
+        if (!box.enabled ||
+            (ignored_node && box.node_id == ignored_node) ||
+            (box.layer & layer_mask) == 0U ||
             (box.is_trigger && !include_triggers)) {
             continue;
         }
@@ -1592,7 +1595,9 @@ std::optional<RaycastHit> CollisionWorld::raycast(
     }
 
     for (const SphereCollider& sphere : spheres_) {
-        if ((sphere.layer & layer_mask) == 0U ||
+        if (!sphere.enabled ||
+            (ignored_node && sphere.node_id == ignored_node) ||
+            (sphere.layer & layer_mask) == 0U ||
             (sphere.is_trigger && !include_triggers)) {
             continue;
         }
@@ -1612,7 +1617,9 @@ std::optional<RaycastHit> CollisionWorld::raycast(
     }
 
     for (const CapsuleCollider& cap : capsules_) {
-        if ((cap.layer & layer_mask) == 0U ||
+        if (!cap.enabled ||
+            (ignored_node && cap.node_id == ignored_node) ||
+            (cap.layer & layer_mask) == 0U ||
             (cap.is_trigger && !include_triggers)) {
             continue;
         }
@@ -1633,7 +1640,9 @@ std::optional<RaycastHit> CollisionWorld::raycast(
     }
 
     for (const ConvexHullCollider& hull : convex_hulls_) {
-        if ((hull.layer & layer_mask) == 0U ||
+        if (!hull.enabled ||
+            (ignored_node && hull.node_id == ignored_node) ||
+            (hull.layer & layer_mask) == 0U ||
             (hull.is_trigger && !include_triggers) ||
             !ray_intersects_aabb(origin, unit_dir, best_dist, hull.world_aabb)) {
             continue;
@@ -1655,7 +1664,9 @@ std::optional<RaycastHit> CollisionWorld::raycast(
     }
 
     for (const TriangleMeshCollider& tmesh : triangle_meshes_) {
-        if ((tmesh.layer & layer_mask) == 0U ||
+        if (!tmesh.enabled ||
+            (ignored_node && tmesh.node_id == ignored_node) ||
+            (tmesh.layer & layer_mask) == 0U ||
             (tmesh.is_trigger && !include_triggers) ||
             !ray_intersects_aabb(origin, unit_dir, best_dist, tmesh.world_aabb)) {
             continue;
@@ -1780,7 +1791,8 @@ CapsuleContactResult CollisionWorld::resolve_capsule(
     const float radius,
     const float height,
     const float walkable_normal_y,
-    const std::uint32_t layer_mask) const noexcept {
+    const std::uint32_t layer_mask,
+    const SceneNodeId ignored_node) const noexcept {
     CapsuleContactResult result{.resolved_feet = feet};
     if (!finite_vec3(feet) ||
         !std::isfinite(radius) ||
@@ -1837,7 +1849,10 @@ CapsuleContactResult CollisionWorld::resolve_capsule(
         };
 
         for (const OrientedBox& box : boxes_) {
-            if (box.is_trigger || (box.layer & layer_mask) == 0U) {
+            if (!box.enabled ||
+                (ignored_node && box.node_id == ignored_node) ||
+                box.is_trigger ||
+                (box.layer & layer_mask) == 0U) {
                 continue;
             }
             const Bounds cap_aabb{
@@ -1862,7 +1877,10 @@ CapsuleContactResult CollisionWorld::resolve_capsule(
         }
 
         for (const SphereCollider& sphere : spheres_) {
-            if (sphere.is_trigger || (sphere.layer & layer_mask) == 0U) {
+            if (!sphere.enabled ||
+                (ignored_node && sphere.node_id == ignored_node) ||
+                sphere.is_trigger ||
+                (sphere.layer & layer_mask) == 0U) {
                 continue;
             }
             const Bounds cap_aabb{
@@ -1886,7 +1904,10 @@ CapsuleContactResult CollisionWorld::resolve_capsule(
         }
 
         for (const CapsuleCollider& cap : capsules_) {
-            if (cap.is_trigger || (cap.layer & layer_mask) == 0U) {
+            if (!cap.enabled ||
+                (ignored_node && cap.node_id == ignored_node) ||
+                cap.is_trigger ||
+                (cap.layer & layer_mask) == 0U) {
                 continue;
             }
             const Bounds cap_aabb{
@@ -1911,7 +1932,10 @@ CapsuleContactResult CollisionWorld::resolve_capsule(
         }
 
         for (const ConvexHullCollider& hull : convex_hulls_) {
-            if (hull.is_trigger || (hull.layer & layer_mask) == 0U) {
+            if (!hull.enabled ||
+                (ignored_node && hull.node_id == ignored_node) ||
+                hull.is_trigger ||
+                (hull.layer & layer_mask) == 0U) {
                 continue;
             }
             const Bounds cap_aabb{
@@ -1937,7 +1961,10 @@ CapsuleContactResult CollisionWorld::resolve_capsule(
         }
 
         for (const TriangleMeshCollider& tmesh : triangle_meshes_) {
-            if (tmesh.is_trigger || (tmesh.layer & layer_mask) == 0U) {
+            if (!tmesh.enabled ||
+                (ignored_node && tmesh.node_id == ignored_node) ||
+                tmesh.is_trigger ||
+                (tmesh.layer & layer_mask) == 0U) {
                 continue;
             }
             const Bounds cap_aabb{
@@ -1996,6 +2023,319 @@ CapsuleContactResult CollisionWorld::resolve_capsule(
     return result;
 }
 
+bool CollisionWorld::check_capsule_free(
+    const glm::vec3 feet,
+    const float radius,
+    const float height,
+    const std::uint32_t layer_mask,
+    const SceneNodeId ignored_node) const noexcept {
+    if (!finite_vec3(feet) ||
+        !std::isfinite(radius) ||
+        radius < minimum_collider_dimension ||
+        !std::isfinite(height)) {
+        return false;
+    }
+    const float safe_height = std::max(height, radius * 2.0F);
+    constexpr float pen_tolerance = 1.0e-3F;
+
+    if (terrain_enabled_ &&
+        (layer_mask & 1U) != 0U &&
+        inside_procedural_terrain_xz(feet.x, feet.z)) {
+        const float terrain_y = procedural_landscape_height(feet.x, feet.z);
+        if (terrain_y - feet.y > pen_tolerance) {
+            return false;
+        }
+    }
+
+    const Bounds cap_aabb{
+        .center = glm::vec3(feet.x, feet.y + 0.5F * safe_height, feet.z),
+        .extent = glm::vec3(radius, 0.5F * safe_height, radius),
+    };
+    const glm::vec3 cap_a = feet + glm::vec3(0.0F, radius, 0.0F);
+    const glm::vec3 cap_b =
+        feet + glm::vec3(0.0F, safe_height - radius, 0.0F);
+
+    for (const OrientedBox& box : boxes_) {
+        if (!box.enabled ||
+            (ignored_node && box.node_id == ignored_node) ||
+            box.is_trigger ||
+            (box.layer & layer_mask) == 0U ||
+            !aabb_overlaps(cap_aabb, box.world_aabb)) {
+            continue;
+        }
+        if (const auto pen = capsule_obb_penetration(
+                cap_a,
+                cap_b,
+                radius,
+                box.center,
+                box.axes,
+                box.half_extents);
+            pen && pen->depth > pen_tolerance) {
+            return false;
+        }
+    }
+
+    for (const SphereCollider& sphere : spheres_) {
+        if (!sphere.enabled ||
+            (ignored_node && sphere.node_id == ignored_node) ||
+            sphere.is_trigger ||
+            (sphere.layer & layer_mask) == 0U ||
+            !aabb_overlaps(cap_aabb, sphere.world_aabb)) {
+            continue;
+        }
+        if (const auto pen = capsule_sphere_penetration(
+                cap_a, cap_b, radius, sphere.center, sphere.radius);
+            pen && pen->depth > pen_tolerance) {
+            return false;
+        }
+    }
+
+    for (const CapsuleCollider& cap : capsules_) {
+        if (!cap.enabled ||
+            (ignored_node && cap.node_id == ignored_node) ||
+            cap.is_trigger ||
+            (cap.layer & layer_mask) == 0U ||
+            !aabb_overlaps(cap_aabb, cap.world_aabb)) {
+            continue;
+        }
+        if (const auto pen = capsule_capsule_penetration(
+                cap_a, cap_b, radius, cap.point_a, cap.point_b, cap.radius);
+            pen && pen->depth > pen_tolerance) {
+            return false;
+        }
+    }
+
+    for (const ConvexHullCollider& hull : convex_hulls_) {
+        if (!hull.enabled ||
+            (ignored_node && hull.node_id == ignored_node) ||
+            hull.is_trigger ||
+            (hull.layer & layer_mask) == 0U ||
+            !aabb_overlaps(cap_aabb, hull.world_aabb)) {
+            continue;
+        }
+        if (const auto pen = capsule_convex_hull_penetration(
+                cap_a,
+                cap_b,
+                radius,
+                std::span<const glm::vec3>(
+                    hull.vertices.data(), hull.vertex_count),
+                hull.centroid,
+                hull.axes);
+            pen && pen->depth > pen_tolerance) {
+            return false;
+        }
+    }
+
+    for (const TriangleMeshCollider& tmesh : triangle_meshes_) {
+        if (!tmesh.enabled ||
+            (ignored_node && tmesh.node_id == ignored_node) ||
+            tmesh.is_trigger ||
+            (tmesh.layer & layer_mask) == 0U ||
+            !aabb_overlaps(cap_aabb, tmesh.world_aabb)) {
+            continue;
+        }
+        const SharedTriangleMesh& shared =
+            shared_meshes_[tmesh.shared_mesh_index];
+        const Bounds local_cap_aabb =
+            transform_aabb_matrix(cap_aabb, tmesh.local_from_world);
+        if (!aabb_overlaps(local_cap_aabb, shared.local_aabb)) {
+            continue;
+        }
+        for (const TriangleChunk& chunk : shared.chunks) {
+            if (!aabb_overlaps(local_cap_aabb, chunk.local_aabb)) {
+                continue;
+            }
+            for (std::uint32_t t = chunk.first_triangle;
+                 t < chunk.first_triangle + chunk.triangle_count;
+                 ++t) {
+                const glm::vec3 v0 = glm::vec3(
+                    tmesh.world_from_local *
+                    glm::vec4(
+                        shared.positions[shared.indices[t * 3U + 0U]], 1.0F));
+                const glm::vec3 v1 = glm::vec3(
+                    tmesh.world_from_local *
+                    glm::vec4(
+                        shared.positions[shared.indices[t * 3U + 1U]], 1.0F));
+                const glm::vec3 v2 = glm::vec3(
+                    tmesh.world_from_local *
+                    glm::vec4(
+                        shared.positions[shared.indices[t * 3U + 2U]], 1.0F));
+                if (const auto pen = capsule_triangle_penetration(
+                        cap_a, cap_b, radius, v0, v1, v2);
+                    pen && pen->depth > pen_tolerance) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+void CollisionWorld::reserve_dynamic_boxes(const std::size_t count) {
+    boxes_.reserve(boxes_.size() + count);
+}
+
+bool CollisionWorld::upsert_box_collider(
+    const SceneNodeId id,
+    const glm::vec3 center,
+    const glm::mat3 axes,
+    const glm::vec3 half_extents,
+    const std::uint32_t layer,
+    const std::uint32_t mask,
+    const bool is_trigger) {
+    if (!id || !finite_vec3(center) || !finite_vec3(half_extents)) {
+        return false;
+    }
+    const glm::vec3 safe_extents =
+        glm::max(half_extents, glm::vec3(minimum_collider_dimension));
+    glm::mat3 clean_axes = axes;
+    for (int i = 0; i < 3; ++i) {
+        const float len = glm::length(clean_axes[i]);
+        if (!std::isfinite(len) || len <= epsilon) {
+            clean_axes = glm::mat3(1.0F);
+            break;
+        }
+        clean_axes[i] /= len;
+    }
+    const Bounds world_aabb = compute_obb_aabb(center, clean_axes, safe_extents);
+    for (OrientedBox& box : boxes_) {
+        if (box.node_id == id) {
+            box.center = center;
+            box.axes = clean_axes;
+            box.half_extents = safe_extents;
+            box.world_aabb = world_aabb;
+            box.layer = layer;
+            box.mask = mask;
+            box.is_trigger = is_trigger;
+            box.enabled = true;
+            return true;
+        }
+    }
+    boxes_.push_back(OrientedBox{
+        .center = center,
+        .axes = clean_axes,
+        .half_extents = safe_extents,
+        .world_aabb = world_aabb,
+        .node_id = id,
+        .node_uuid = {},
+        .layer = layer,
+        .mask = mask,
+        .is_trigger = is_trigger,
+        .enabled = true,
+    });
+    if (is_trigger) {
+        ++trigger_count_;
+    } else {
+        ++solid_count_;
+    }
+    return true;
+}
+
+bool CollisionWorld::update_collider_transform(
+    const SceneNodeId id,
+    const glm::mat4& world_matrix) noexcept {
+    if (!id) {
+        return false;
+    }
+    const auto frame = decompose_world_frame(world_matrix);
+    if (!frame) {
+        return false;
+    }
+    bool updated = false;
+    for (OrientedBox& box : boxes_) {
+        if (box.node_id != id) {
+            continue;
+        }
+        box.center = frame->origin;
+        box.axes = frame->axes;
+        box.world_aabb =
+            compute_obb_aabb(box.center, box.axes, box.half_extents);
+        updated = true;
+    }
+    for (SphereCollider& sphere : spheres_) {
+        if (sphere.node_id != id) {
+            continue;
+        }
+        sphere.center = frame->origin;
+        sphere.world_aabb = Bounds{
+            .center = sphere.center,
+            .extent = glm::vec3(sphere.radius),
+        };
+        updated = true;
+    }
+    for (CapsuleCollider& cap : capsules_) {
+        if (cap.node_id != id) {
+            continue;
+        }
+        const float half_seg = 0.5F * glm::length(cap.point_b - cap.point_a);
+        const glm::vec3 up = frame->axes[1] * half_seg;
+        cap.point_a = frame->origin - up;
+        cap.point_b = frame->origin + up;
+        const glm::vec3 min_pt =
+            glm::min(cap.point_a, cap.point_b) - glm::vec3(cap.radius);
+        const glm::vec3 max_pt =
+            glm::max(cap.point_a, cap.point_b) + glm::vec3(cap.radius);
+        cap.world_aabb = Bounds{
+            .center = 0.5F * (min_pt + max_pt),
+            .extent = 0.5F * (max_pt - min_pt),
+        };
+        updated = true;
+    }
+    for (TriangleMeshCollider& tmesh : triangle_meshes_) {
+        if (tmesh.node_id != id) {
+            continue;
+        }
+        const float det = glm::determinant(world_matrix);
+        if (std::abs(det) <= 1.0e-8F) {
+            continue;
+        }
+        tmesh.world_from_local = world_matrix;
+        tmesh.local_from_world = glm::inverse(world_matrix);
+        tmesh.normal_matrix =
+            glm::transpose(glm::inverse(glm::mat3(world_matrix)));
+        const SharedTriangleMesh& shared =
+            shared_meshes_[tmesh.shared_mesh_index];
+        tmesh.world_aabb =
+            transform_aabb_matrix(shared.local_aabb, world_matrix);
+        updated = true;
+    }
+    return updated;
+}
+
+void CollisionWorld::set_collider_enabled(
+    const SceneNodeId id,
+    const bool enabled) noexcept {
+    if (!id) {
+        return;
+    }
+    for (OrientedBox& box : boxes_) {
+        if (box.node_id == id) {
+            box.enabled = enabled;
+        }
+    }
+    for (SphereCollider& sphere : spheres_) {
+        if (sphere.node_id == id) {
+            sphere.enabled = enabled;
+        }
+    }
+    for (CapsuleCollider& cap : capsules_) {
+        if (cap.node_id == id) {
+            cap.enabled = enabled;
+        }
+    }
+    for (ConvexHullCollider& hull : convex_hulls_) {
+        if (hull.node_id == id) {
+            hull.enabled = enabled;
+        }
+    }
+    for (TriangleMeshCollider& tmesh : triangle_meshes_) {
+        if (tmesh.node_id == id) {
+            tmesh.enabled = enabled;
+        }
+    }
+}
+
 void CollisionWorld::gather_sphere_contacts(
     const glm::vec3 center,
     const float radius,
@@ -2028,7 +2368,8 @@ void CollisionWorld::gather_sphere_contacts(
 
     const Bounds sphere_aabb{.center = center, .extent = glm::vec3(radius)};
     for (const OrientedBox& box : boxes_) {
-        if (box.is_trigger ||
+        if (!box.enabled ||
+            box.is_trigger ||
             (box.layer & layer_mask) == 0U ||
             !aabb_overlaps(sphere_aabb, box.world_aabb)) {
             continue;
@@ -2050,7 +2391,8 @@ void CollisionWorld::gather_sphere_contacts(
     }
 
     for (const SphereCollider& sphere : spheres_) {
-        if (sphere.is_trigger ||
+        if (!sphere.enabled ||
+            sphere.is_trigger ||
             (sphere.layer & layer_mask) == 0U ||
             !aabb_overlaps(sphere_aabb, sphere.world_aabb)) {
             continue;
@@ -2067,7 +2409,8 @@ void CollisionWorld::gather_sphere_contacts(
     }
 
     for (const CapsuleCollider& cap : capsules_) {
-        if (cap.is_trigger ||
+        if (!cap.enabled ||
+            cap.is_trigger ||
             (cap.layer & layer_mask) == 0U ||
             !aabb_overlaps(sphere_aabb, cap.world_aabb)) {
             continue;
@@ -2089,7 +2432,8 @@ void CollisionWorld::gather_sphere_contacts(
     }
 
     for (const ConvexHullCollider& hull : convex_hulls_) {
-        if (hull.is_trigger ||
+        if (!hull.enabled ||
+            hull.is_trigger ||
             (hull.layer & layer_mask) == 0U ||
             !aabb_overlaps(sphere_aabb, hull.world_aabb)) {
             continue;
@@ -2112,7 +2456,8 @@ void CollisionWorld::gather_sphere_contacts(
     }
 
     for (const TriangleMeshCollider& tmesh : triangle_meshes_) {
-        if (tmesh.is_trigger ||
+        if (!tmesh.enabled ||
+            tmesh.is_trigger ||
             (tmesh.layer & layer_mask) == 0U ||
             !aabb_overlaps(sphere_aabb, tmesh.world_aabb)) {
             continue;
@@ -2189,7 +2534,8 @@ void CollisionWorld::query_capsule_triggers(
     };
 
     for (const OrientedBox& box : boxes_) {
-        if (!box.is_trigger ||
+        if (!box.enabled ||
+            !box.is_trigger ||
             (box.layer & layer_mask) == 0U ||
             !aabb_overlaps(cap_aabb, box.world_aabb)) {
             continue;
@@ -2206,7 +2552,8 @@ void CollisionWorld::query_capsule_triggers(
     }
 
     for (const SphereCollider& sphere : spheres_) {
-        if (!sphere.is_trigger ||
+        if (!sphere.enabled ||
+            !sphere.is_trigger ||
             (sphere.layer & layer_mask) == 0U ||
             !aabb_overlaps(cap_aabb, sphere.world_aabb)) {
             continue;
@@ -2222,7 +2569,8 @@ void CollisionWorld::query_capsule_triggers(
     }
 
     for (const CapsuleCollider& cap : capsules_) {
-        if (!cap.is_trigger ||
+        if (!cap.enabled ||
+            !cap.is_trigger ||
             (cap.layer & layer_mask) == 0U ||
             !aabb_overlaps(cap_aabb, cap.world_aabb)) {
             continue;
@@ -2239,7 +2587,8 @@ void CollisionWorld::query_capsule_triggers(
     }
 
     for (const ConvexHullCollider& hull : convex_hulls_) {
-        if (!hull.is_trigger ||
+        if (!hull.enabled ||
+            !hull.is_trigger ||
             (hull.layer & layer_mask) == 0U ||
             !aabb_overlaps(cap_aabb, hull.world_aabb)) {
             continue;
@@ -2257,7 +2606,8 @@ void CollisionWorld::query_capsule_triggers(
     }
 
     for (const TriangleMeshCollider& tmesh : triangle_meshes_) {
-        if (!tmesh.is_trigger ||
+        if (!tmesh.enabled ||
+            !tmesh.is_trigger ||
             (tmesh.layer & layer_mask) == 0U ||
             !aabb_overlaps(cap_aabb, tmesh.world_aabb)) {
             continue;

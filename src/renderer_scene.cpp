@@ -244,7 +244,7 @@ void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExt
             const auto &b = world_bounds_[i];
             const auto lod_view = lod_projection(b, vp, {extent.width, extent.height});
             const unsigned lod =
-                visibility_settings_.lod
+                (visibility_settings_.lod && !draw.uses_skinned_pool)
                     ? select_lod(submesh.lod_error, scale, lod_view.nearest_depth, lod_view.pixels,
                                  instance_lods_[i], visibility_settings_.lod_pixel_error)
                     : 0;

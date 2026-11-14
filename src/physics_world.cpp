@@ -974,6 +974,9 @@ void PhysicsWorld::gather_pair_contacts(
     const std::uint32_t idx_b) noexcept {
     Body& a = bodies_[idx_a];
     Body& b = bodies_[idx_b];
+    if (!a.enabled || !b.enabled) {
+        return;
+    }
     if (a.inv_mass <= 0.0F && b.inv_mass <= 0.0F) {
         return;
     }
@@ -1298,7 +1301,7 @@ void PhysicsWorld::substep(
     // 1. Integrate forces & damping for awake dynamic bodies.
     for (Body& body : bodies_) {
         body.had_contact = false;
-        if (body.inv_mass <= 0.0F || body.sleeping) {
+        if (!body.enabled || body.inv_mass <= 0.0F || body.sleeping) {
             continue;
         }
         body.linear_velocity.y += gravity_accel * body.gravity_scale * dt;
@@ -1316,7 +1319,9 @@ void PhysicsWorld::substep(
     contacts_.clear();
     const auto count = static_cast<std::uint32_t>(bodies_.size());
     for (std::uint32_t i = 0U; i < count; ++i) {
-        if (bodies_[i].inv_mass > 0.0F && !bodies_[i].sleeping) {
+        if (bodies_[i].enabled &&
+            bodies_[i].inv_mass > 0.0F &&
+            !bodies_[i].sleeping) {
             gather_static_contacts(i, static_world);
         }
     }
@@ -1414,7 +1419,7 @@ void PhysicsWorld::substep(
     constexpr float abyss_floor = -500.0F;
 
     for (Body& body : bodies_) {
-        if (body.inv_mass <= 0.0F) {
+        if (!body.enabled || body.inv_mass <= 0.0F) {
             continue;
         }
         if (body.sleeping) {
@@ -1502,7 +1507,29 @@ void PhysicsWorld::step(
 
     int steps = 0;
     while (accumulator_ + 1.0e-6F >= fixed_dt && steps < max_substeps) {
-        substep(fixed_dt, static_world);
+        float max_cfl_ratio = 0.0F;
+        for (const Body& body : bodies_) {
+            if (!body.enabled || body.sleeping || body.inv_mass <= 0.0F) {
+                continue;
+            }
+            const float speed = glm::length(body.linear_velocity);
+            const float min_dim = body.shape == PhysicsShapeKind::box
+                ? std::min({
+                      body.half_extents.x,
+                      body.half_extents.y,
+                      body.half_extents.z,
+                  })
+                : body.radius;
+            const float safe_dim = std::max(min_dim, 0.10F);
+            max_cfl_ratio =
+                std::max(max_cfl_ratio, (speed * fixed_dt) / safe_dim);
+        }
+        const int adaptive_substeps = std::clamp(
+            static_cast<int>(std::ceil(max_cfl_ratio / 0.45F)), 1, 6);
+        const float sub_dt = fixed_dt / static_cast<float>(adaptive_substeps);
+        for (int sub = 0; sub < adaptive_substeps; ++sub) {
+            substep(sub_dt, static_world);
+        }
         accumulator_ = std::max(0.0F, accumulator_ - fixed_dt);
         ++steps;
     }
@@ -1534,7 +1561,8 @@ void PhysicsWorld::apply_character_push(
     };
 
     for (Body& body : bodies_) {
-        if (body.inv_mass <= 0.0F ||
+        if (!body.enabled ||
+            body.inv_mass <= 0.0F ||
             (body.layer & layer_mask) == 0U ||
             !aabb_overlaps(cap_aabb, body.world_aabb)) {
             continue;
@@ -1652,7 +1680,7 @@ void PhysicsWorld::resolve_character_post_step(
     for (int iter = 0; iter < 3; ++iter) {
         bool iter_hit = false;
         for (const Body& body : bodies_) {
-            if ((body.layer & layer_mask) == 0U) {
+            if (!body.enabled || (body.layer & layer_mask) == 0U) {
                 continue;
             }
             const Bounds cap_aabb{
@@ -1746,7 +1774,8 @@ std::optional<RaycastHit> PhysicsWorld::raycast(
     const glm::vec3 origin,
     glm::vec3 direction,
     const float max_distance,
-    const std::uint32_t layer_mask) const noexcept {
+    const std::uint32_t layer_mask,
+    const SceneNodeId ignored_node) const noexcept {
     if (bodies_.empty() ||
         !finite_vec3(origin) ||
         !finite_vec3(direction) ||
@@ -1769,7 +1798,9 @@ std::optional<RaycastHit> PhysicsWorld::raycast(
     std::optional<RaycastHit> best;
     float limit = max_distance;
     for (const Body& body : bodies_) {
-        if ((body.layer & layer_mask) == 0U ||
+        if (!body.enabled ||
+            (ignored_node && body.node_id == ignored_node) ||
+            (body.layer & layer_mask) == 0U ||
             !aabb_overlaps(ray_aabb, body.world_aabb)) {
             continue;
         }
@@ -1850,6 +1881,10 @@ std::optional<PhysicsBodyState> PhysicsWorld::body_state(
                 .radius = b.radius,
                 .half_segment = b.half_segment,
                 .sleeping = b.sleeping,
+                .world_aabb = b.world_aabb,
+                .inv_mass = b.inv_mass,
+                .had_contact = b.had_contact,
+                .enabled = b.enabled,
             };
         }
     }
@@ -1946,6 +1981,193 @@ bool PhysicsWorld::set_body_state(
         }
     }
     return false;
+}
+
+bool PhysicsWorld::set_body_motion_type(
+    const SceneNodeId id, const RigidBodyMotionType type, const float mass) noexcept {
+    if (!std::isfinite(mass) || mass < minimum_rigid_body_mass || mass > maximum_rigid_body_mass ||
+        (type != RigidBodyMotionType::dynamic && type != RigidBodyMotionType::kinematic)) return false;
+    for (Body& body : bodies_) {
+        if (body.node_id != id) continue;
+        body.motion_type = type;
+        body.inv_mass = type == RigidBodyMotionType::dynamic ? 1.0F / mass : 0.0F;
+        body.local_inv_inertia = glm::vec3(0.0F);
+        if (body.inv_mass > 0.0F && !body.lock_rotation) {
+            if (body.shape == PhysicsShapeKind::sphere) {
+                body.local_inv_inertia = glm::vec3(1.0F / std::max(.4F * mass * body.radius * body.radius, 1.0e-5F));
+            } else if (body.shape == PhysicsShapeKind::capsule) {
+                const float r2 = body.radius * body.radius;
+                const float h = body.half_segment + .5F * body.radius;
+                const float iy = std::max(.5F * mass * r2, 1.0e-5F);
+                const float ix = std::max(mass * (.25F * r2 + h * h / 3.0F), 1.0e-5F);
+                body.local_inv_inertia = {1.0F / ix, 1.0F / iy, 1.0F / ix};
+            } else {
+                const auto h = body.half_extents * body.half_extents;
+                body.local_inv_inertia = {3.0F / (mass * (h.y + h.z)),
+                    3.0F / (mass * (h.x + h.z)), 3.0F / (mass * (h.x + h.y))};
+            }
+        }
+        body.sleeping = false;
+        body.sleep_timer = 0;
+        update_derived_body_state(body);
+        return true;
+    }
+    return false;
+}
+
+bool PhysicsWorld::set_body_enabled(
+    const SceneNodeId id,
+    const bool enabled) noexcept {
+    if (!id) {
+        return false;
+    }
+    for (Body& b : bodies_) {
+        if (b.node_id == id) {
+            b.enabled = enabled;
+            if (!enabled) {
+                b.linear_velocity = glm::vec3(0.0F);
+                b.angular_velocity = glm::vec3(0.0F);
+                b.sleeping = true;
+            } else {
+                b.sleeping = false;
+                b.sleep_timer = 0.0F;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+bool PhysicsWorld::wake_body(const SceneNodeId id) noexcept {
+    if (!id) {
+        return false;
+    }
+    for (Body& b : bodies_) {
+        if (b.node_id == id) {
+            b.sleeping = false;
+            b.sleep_timer = 0.0F;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool PhysicsWorld::apply_central_force(
+    const SceneNodeId id,
+    const glm::vec3 force,
+    const float dt) noexcept {
+    if (!id || !finite_vec3(force) || !std::isfinite(dt) || dt <= 0.0F) {
+        return false;
+    }
+    for (Body& b : bodies_) {
+        if (b.node_id == id) {
+            if (!b.enabled || b.inv_mass <= 0.0F) {
+                return false;
+            }
+            b.linear_velocity += force * (b.inv_mass * dt);
+            b.sleeping = false;
+            b.sleep_timer = 0.0F;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool PhysicsWorld::apply_force_at_point(
+    const SceneNodeId id,
+    const glm::vec3 force,
+    const glm::vec3 world_point,
+    const float dt) noexcept {
+    if (!id ||
+        !finite_vec3(force) ||
+        !finite_vec3(world_point) ||
+        !std::isfinite(dt) ||
+        dt <= 0.0F) {
+        return false;
+    }
+    for (Body& b : bodies_) {
+        if (b.node_id == id) {
+            if (!b.enabled || b.inv_mass <= 0.0F) {
+                return false;
+            }
+            const glm::vec3 impulse = force * dt;
+            b.linear_velocity += impulse * b.inv_mass;
+            if (!b.lock_rotation) {
+                const glm::vec3 r = world_point - b.position;
+                b.angular_velocity += b.world_inv_inertia * glm::cross(r, impulse);
+            }
+            b.sleeping = false;
+            b.sleep_timer = 0.0F;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool PhysicsWorld::apply_torque(
+    const SceneNodeId id,
+    const glm::vec3 torque,
+    const float dt) noexcept {
+    if (!id || !finite_vec3(torque) || !std::isfinite(dt) || dt <= 0.0F) {
+        return false;
+    }
+    for (Body& b : bodies_) {
+        if (b.node_id == id) {
+            if (!b.enabled || b.inv_mass <= 0.0F) {
+                return false;
+            }
+            if (!b.lock_rotation) {
+                b.angular_velocity += b.world_inv_inertia * (torque * dt);
+            }
+            b.sleeping = false;
+            b.sleep_timer = 0.0F;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool PhysicsWorld::apply_impulse_at_point(
+    const SceneNodeId id,
+    const glm::vec3 impulse,
+    const glm::vec3 world_point) noexcept {
+    if (!id || !finite_vec3(impulse) || !finite_vec3(world_point)) {
+        return false;
+    }
+    for (Body& b : bodies_) {
+        if (b.node_id == id) {
+            if (!b.enabled || b.inv_mass <= 0.0F) {
+                return false;
+            }
+            b.linear_velocity += impulse * b.inv_mass;
+            if (!b.lock_rotation) {
+                const glm::vec3 r = world_point - b.position;
+                b.angular_velocity += b.world_inv_inertia * glm::cross(r, impulse);
+            }
+            b.sleeping = false;
+            b.sleep_timer = 0.0F;
+            return true;
+        }
+    }
+    return false;
+}
+
+glm::vec3 PhysicsWorld::point_velocity(
+    const SceneNodeId id,
+    const glm::vec3 world_point) const noexcept {
+    if (!id || !finite_vec3(world_point)) {
+        return glm::vec3(0.0F);
+    }
+    for (const Body& b : bodies_) {
+        if (b.node_id == id) {
+            if (!b.enabled) {
+                return glm::vec3(0.0F);
+            }
+            return b.linear_velocity +
+                   glm::cross(b.angular_velocity, world_point - b.position);
+        }
+    }
+    return glm::vec3(0.0F);
 }
 
 } // namespace vcr

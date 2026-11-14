@@ -2,6 +2,7 @@
 
 #include "image_barrier.hpp"
 #include "vulkan_common.hpp"
+#include "window_icon_sdl.hpp"
 
 #include <imgui_impl_sdl3.h>
 #include <nlohmann/json.hpp>
@@ -119,14 +120,14 @@ void print_pm_usage() {
         << "  --create NAME           Create a new project and register it\n"
         << "    --location DIR        Parent folder (default: <engine>/projects)\n"
         << "    --folder SLUG         Override project directory name\n"
-        << "    --template KIND       standard | empty (default: standard)\n"
+        << "    --template KIND       standard | empty | cpp_module (default: standard)\n"
         << "    --description TEXT    Optional project description\n"
         << "  --register DIR          Register an existing project directory\n"
         << "    --init-manifest       Create project.vcrproject.json if missing\n"
         << "  --remove DIR            Remove a project from registry (keeps files)\n"
         << "  --scan DIR              Scan immediate subfolders for projects\n"
-        << "  --build-game DIR        Bundle standalone game .exe and runtime in DIR\n"
-        << "  --build-all-games       Bundle standalone game .exe for all ready projects\n"
+        << "  --build-game DIR        Bundle runtime (.exe + vcr_engine.dll) and compile C++ module in DIR\n"
+        << "  --build-all-games       Update runtime (.exe + vcr_engine.dll) and compile modules for all ready projects\n"
         << "  --set-icon DIR          Apply --icon image/.ico to project DIR\n"
         << "    --icon FILE           Source .png/.ico/.jpg/.bmp/.tga for --set-icon\n"
         << "  -h, --help              Show this help text\n";
@@ -261,7 +262,7 @@ bool ProjectManagerApplication::parse_cli(
             const auto parsed_tpl = parse_project_template_kind(val);
             if (!parsed_tpl) {
                 error = "Unknown --template '" + std::string(val) +
-                        "' (expected standard or empty).";
+                        "' (expected standard, empty, or cpp_module).";
                 return false;
             }
             out.create_template = *parsed_tpl;
@@ -489,6 +490,13 @@ int ProjectManagerApplication::run_cli_action(
                     ? insp.manifest.executable
                     : std::string{};
             item["runtime_bundled"] = insp.runtime_bundled;
+            item["engine_dll_exists"] = insp.engine_dll_exists;
+            item["game_module"] =
+                insp.state == ProjectDiskState::ready
+                    ? insp.manifest.game_module
+                    : std::string{};
+            item["has_cpp_code"] = insp.has_cpp_code;
+            item["game_module_built"] = insp.game_module_built;
             item["icon"] =
                 insp.state == ProjectDiskState::ready
                     ? insp.manifest.icon_path
@@ -535,6 +543,9 @@ int ProjectManagerApplication::run_cli_action(
         out["template"] = created.manifest.template_id;
         out["startup_scene"] = created.manifest.startup_scene;
         out["executable"] = created.manifest.executable;
+        if (!created.manifest.game_module.empty()) {
+            out["game_module"] = created.manifest.game_module;
+        }
         out["runtime_bundled"] = created.runtime_bundled;
         if (!created.bundle_warning.empty()) {
             out["bundle_warning"] = created.bundle_warning;
@@ -600,18 +611,34 @@ int ProjectManagerApplication::run_cli_action(
     if (options.cli_build_game) {
         const std::filesystem::path dir =
             path_from_utf8_str(options.target_directory);
+        const ProjectInspection insp = inspect_project_directory(dir);
         BundleProjectRuntimeResult res{};
         if (!bundle_project_runtime(dir, res, error)) {
             std::cerr << "Build game failed: " << error << '\n';
             return 1;
         }
+        CompileProjectModuleResult mod_res{};
+        bool compiled_module = false;
+        if (insp.has_cpp_code) {
+            if (!compile_project_game_module(dir, mod_res, error)) {
+                std::cerr << "Compile game module failed: " << error << '\n';
+                return 1;
+            }
+            compiled_module = true;
+        }
         Json out = Json::object();
         out["project_directory"] = path_to_utf8_str(res.project_directory);
         out["executable_path"] = path_to_utf8_str(res.executable_path);
+        out["engine_dll_path"] = path_to_utf8_str(res.engine_dll_path);
+        out["copied_engine_dll"] = res.copied_engine_dll;
         out["icon_path"] = path_to_utf8_str(res.icon_path);
         out["copied_shaders"] = res.copied_shaders;
         out["copied_fsr3_dll"] = res.copied_fsr3_dll;
         out["icon_embedded"] = res.icon_embedded;
+        out["compiled_game_module"] = compiled_module;
+        if (compiled_module && !mod_res.module_path.empty()) {
+            out["game_module_path"] = path_to_utf8_str(mod_res.module_path);
+        }
         std::cout << out.dump(2) << '\n';
         return 0;
     }
@@ -629,21 +656,42 @@ int ProjectManagerApplication::run_cli_action(
             ++ready_count;
             BundleProjectRuntimeResult res{};
             std::string build_err;
-            if (bundle_project_runtime(entry.project_directory, res, build_err)) {
-                Json row = Json::object();
-                row["name"] = insp.manifest.name;
-                row["executable_path"] = path_to_utf8_str(res.executable_path);
-                row["icon_embedded"] = res.icon_embedded;
-                row["copied_shaders"] = res.copied_shaders;
-                built.push_back(std::move(row));
-            } else {
+            if (!bundle_project_runtime(entry.project_directory, res, build_err)) {
                 Json row = Json::object();
                 row["name"] = insp.manifest.name;
                 row["project_directory"] =
                     path_to_utf8_str(entry.project_directory);
                 row["error"] = build_err;
                 failed.push_back(std::move(row));
+                continue;
             }
+            CompileProjectModuleResult mod_res{};
+            bool compiled_module = false;
+            if (insp.has_cpp_code) {
+                if (!compile_project_game_module(
+                        entry.project_directory, mod_res, build_err)) {
+                    Json row = Json::object();
+                    row["name"] = insp.manifest.name;
+                    row["project_directory"] =
+                        path_to_utf8_str(entry.project_directory);
+                    row["error"] = build_err;
+                    failed.push_back(std::move(row));
+                    continue;
+                }
+                compiled_module = true;
+            }
+            Json row = Json::object();
+            row["name"] = insp.manifest.name;
+            row["executable_path"] = path_to_utf8_str(res.executable_path);
+            row["engine_dll_path"] = path_to_utf8_str(res.engine_dll_path);
+            row["copied_engine_dll"] = res.copied_engine_dll;
+            row["compiled_game_module"] = compiled_module;
+            if (compiled_module && !mod_res.module_path.empty()) {
+                row["game_module_path"] = path_to_utf8_str(mod_res.module_path);
+            }
+            row["icon_embedded"] = res.icon_embedded;
+            row["copied_shaders"] = res.copied_shaders;
+            built.push_back(std::move(row));
         }
         Json out = Json::object();
         out["ready_projects"] = ready_count;
@@ -1588,10 +1636,23 @@ void ProjectManagerApplication::build_project_list_panel() {
             if (is_ready) {
                 ImGui::SameLine(0.0F, 6.0F);
                 ui_kit_.badge(
-                    item.inspection.runtime_bundled ? "GAME .EXE" : "NO .EXE",
+                    item.inspection.runtime_bundled
+                        ? "ENGINE .EXE+.DLL"
+                        : "NEEDS ENGINE",
                     item.inspection.runtime_bundled
                         ? EditorTone::success
                         : EditorTone::warning);
+                if (item.inspection.has_cpp_code ||
+                    !item.inspection.manifest.game_module.empty()) {
+                    ImGui::SameLine(0.0F, 6.0F);
+                    ui_kit_.badge(
+                        item.inspection.game_module_built
+                            ? "C++ DLL"
+                            : "UNBUILT DLL",
+                        item.inspection.game_module_built
+                            ? EditorTone::info
+                            : EditorTone::warning);
+                }
             }
 
             if (item.entry.pinned) {
@@ -1923,15 +1984,30 @@ void ProjectManagerApplication::build_inspector_panel() {
             "Executable: %s",
             selected.inspection.manifest.executable.c_str());
         ui_kit_.badge(
-            selected.inspection.runtime_bundled ? "GAME .EXE READY" : "NO .EXE",
+            selected.inspection.runtime_bundled
+                ? "ENGINE READY (.EXE+.DLL)"
+                : "NEEDS ENGINE (.EXE+.DLL)",
             selected.inspection.runtime_bundled
                 ? EditorTone::success
                 : EditorTone::warning);
         ImGui::SameLine(0.0F, 6.0F);
         ImGui::TextDisabled(
+            "Engine DLL: %s (%s)",
+            std::string(engine_shared_library_filename).c_str(),
+            selected.inspection.engine_dll_exists ? "ok" : "missing");
+        ImGui::TextDisabled(
             "Icon: %s (%s)",
             selected.inspection.manifest.icon_path.c_str(),
             selected.inspection.icon_exists ? "ok" : "missing");
+        if (!selected.inspection.manifest.game_module.empty() ||
+            selected.inspection.has_cpp_code) {
+            ImGui::TextDisabled(
+                "Game Module: %s (%s)",
+                selected.inspection.manifest.game_module.empty()
+                    ? "CMakeLists.txt"
+                    : selected.inspection.manifest.game_module.c_str(),
+                selected.inspection.game_module_built ? "built" : "not built");
+        }
         ImGui::EndGroup();
 
         ImGui::Spacing();
@@ -1939,14 +2015,27 @@ void ProjectManagerApplication::build_inspector_panel() {
                 "InspectorBundleGame",
                 EditorIcon::cube,
                 selected.inspection.runtime_bundled
-                    ? "Update Game (.exe)"
-                    : "Build Game (.exe)",
+                    ? "Update Engine (.exe + .dll)"
+                    : "Bundle Engine (.exe + .dll)",
                 EditorButtonStyle::secondary,
                 true,
                 false,
                 ImVec2(-1.0F, 0.0F))) {
             bundle_selected_project_runtime();
             return;
+        }
+        if (selected.inspection.has_cpp_code) {
+            if (ui_kit_.action_button(
+                    "InspectorCompileModule",
+                    EditorIcon::cube,
+                    "Compile Game Module (.dll)",
+                    EditorButtonStyle::primary,
+                    true,
+                    false,
+                    ImVec2(-1.0F, 0.0F))) {
+                compile_selected_project_game_module();
+                return;
+            }
         }
         ImGui::Spacing();
         if (ui_kit_.action_button(
@@ -2079,9 +2168,10 @@ void ProjectManagerApplication::build_create_project_modal() {
     }
 
     ui_kit_.section_header(EditorIcon::cube, "Project Template");
-    const std::array<ProjectTemplateKind, 2U> templates{
+    const std::array<ProjectTemplateKind, 3U> templates{
         ProjectTemplateKind::standard,
         ProjectTemplateKind::empty,
+        ProjectTemplateKind::cpp_module,
     };
     for (std::size_t t = 0U; t < templates.size(); ++t) {
         const ProjectTemplateKind kind = templates[t];
@@ -2180,7 +2270,7 @@ void ProjectManagerApplication::build_create_project_modal() {
         path_to_utf8_str(preview_target).c_str());
 
     ImGui::Checkbox(
-        "Bundle standalone game executable (.exe)",
+        "Bundle standalone game runtime (.exe + vcr_engine.dll)",
         &create_bundle_runtime_);
 
     ImGui::Checkbox(
@@ -2709,6 +2799,17 @@ void ProjectManagerApplication::launch_project_in_runtime(
             current_insp = inspect_project_directory(project_dir);
         }
     }
+    if (current_insp.has_cpp_code && !current_insp.game_module_built) {
+        CompileProjectModuleResult mod_res{};
+        std::string mod_err;
+        if (!compile_project_game_module(project_dir, mod_res, mod_err)) {
+            status_message_ = "Game module compile failed: " + mod_err;
+            status_tone_ = EditorTone::danger;
+            return;
+        }
+        refresh_cached_inspections();
+        current_insp = inspect_project_directory(project_dir);
+    }
 
     std::filesystem::path launch_exe{};
     std::vector<std::string> args;
@@ -2815,8 +2916,36 @@ void ProjectManagerApplication::bundle_selected_project_runtime() {
     }
     refresh_cached_inspections();
     status_message_ =
-        "Bundled standalone game '" +
-        path_to_utf8_str(res.executable_path.filename()) + "'.";
+        "Updated engine runtime ('" +
+        path_to_utf8_str(res.executable_path.filename()) + "' + " +
+        std::string(engine_shared_library_filename) + ").";
+    status_tone_ = EditorTone::success;
+}
+
+void ProjectManagerApplication::compile_selected_project_game_module() {
+    if (!selected_index_ || *selected_index_ >= items_.size()) {
+        return;
+    }
+    const CachedProjectItem& selected = items_[*selected_index_];
+    if (selected.inspection.state != ProjectDiskState::ready) {
+        status_message_ = "Selected project is not ready on disk.";
+        status_tone_ = EditorTone::danger;
+        return;
+    }
+    CompileProjectModuleResult res{};
+    std::string err;
+    if (!compile_project_game_module(selected.entry.project_directory, res, err)) {
+        status_message_ = "Game module compile failed: " + err;
+        status_tone_ = EditorTone::danger;
+        return;
+    }
+    refresh_cached_inspections();
+    status_message_ =
+        "Compiled game module '" +
+        (res.module_path.empty()
+             ? selected.entry.name
+             : path_to_utf8_str(res.module_path.filename())) +
+        "'.";
     status_tone_ = EditorTone::success;
 }
 

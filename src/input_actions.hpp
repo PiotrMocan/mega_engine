@@ -18,6 +18,7 @@ enum class InputContext : std::uint8_t {
     gameplay = 0U,
     ui = 1U,
     cutscene = 2U,
+    vehicle = 3U,
 };
 
 enum class InputAction : std::uint8_t {
@@ -29,6 +30,13 @@ enum class InputAction : std::uint8_t {
     run,
     interact,
     pause,
+    vehicle_throttle,
+    vehicle_brake,
+    vehicle_steer_left,
+    vehicle_steer_right,
+    vehicle_handbrake,
+    recover,
+    quick_reset,
     ui_up,
     ui_down,
     ui_left,
@@ -277,6 +285,15 @@ public:
     // In Gameplay context: X in [-1, 1] (right), Y in [-1, 1] (forward).
     // Preserves partial analog tilt (< 1) and clamps length <= 1.
     [[nodiscard]] glm::vec2 move_axis() const noexcept { return move_axis_; }
+    [[nodiscard]] float vehicle_steer_axis() const noexcept {
+        return vehicle_steer_axis_;
+    }
+    [[nodiscard]] float vehicle_throttle_value() const noexcept {
+        return vehicle_throttle_value_;
+    }
+    [[nodiscard]] float vehicle_brake_value() const noexcept {
+        return vehicle_brake_value_;
+    }
 
     // Effective look delta in mouse-equivalent units (combines accumulated
     // mouse motion + right gamepad stick * look_speed_pixels_per_sec * dt).
@@ -323,6 +340,9 @@ private:
     float pending_mouse_dx_ = 0.0F;
     float pending_mouse_dy_ = 0.0F;
     glm::vec2 move_axis_{0.0F, 0.0F};
+    float vehicle_steer_axis_ = 0.0F;
+    float vehicle_throttle_value_ = 0.0F;
+    float vehicle_brake_value_ = 0.0F;
     glm::vec2 look_delta_{0.0F, 0.0F};
     glm::vec2 ui_nav_step_{0.0F, 0.0F};
     float ui_repeat_timer_ = 0.0F;

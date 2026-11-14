@@ -3,10 +3,12 @@
 #include "audio_engine.hpp"
 #include "cli_options.hpp"
 #include "fly_camera.hpp"
+#include "game_module_loader.hpp"
 #include "gameplay_session.hpp"
 #include "input_actions.hpp"
 #include "mcp_server.hpp"
 #include "renderer.hpp"
+#include "renderer_gameplay_bridge.hpp"
 #include "scene_document.hpp"
 #include "vulkan_context.hpp"
 
@@ -76,6 +78,8 @@ private:
     bool stream_asset_placed_ = false;
     double camera_animation_time_ = 0;
     FlyCamera camera_{};
+    GameplayRendererBridge gameplay_renderer_bridge_{};
+    LoadedGameModule loaded_game_module_{};
     GameplaySession gameplay_{};
     InputActionSystem input_actions_{};
     AudioEngine audio_engine_{};

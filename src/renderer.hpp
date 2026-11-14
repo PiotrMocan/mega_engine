@@ -37,6 +37,7 @@
 #if VCR_EDITOR_ENABLED
 #include "cooked_model_asset.hpp"
 #include "cooked_texture_asset.hpp"
+#include "game_overlay.hpp"
 #include "scene_document.hpp"
 #include "skeletal_animation.hpp"
 struct ImDrawData;
@@ -336,6 +337,12 @@ public:
             ? current_render_extent_
             : scene_output_extent();
     }
+    [[nodiscard]] VkExtent2D output_extent() const noexcept {
+        return scene_output_extent();
+    }
+#if VCR_EDITOR_ENABLED
+    void set_game_overlay_vertices(std::span<const GameUiVertex> vertices);
+#endif
     [[nodiscard]] bool fsr3_available() const noexcept {
         return fsr3_upscaler_.available();
     }
@@ -747,6 +754,8 @@ private:
 #if VCR_EDITOR_ENABLED
     void create_editor_viewport(VkExtent2D extent);
     void destroy_editor_viewport() noexcept;
+    void create_game_ui_resources();
+    void destroy_game_ui_resources() noexcept;
     void create_editor_material_resources();
     [[nodiscard]] std::optional<std::uint32_t>
     find_or_load_editor_texture(const PreparedTexture &prepared, std::string &error);
@@ -1148,6 +1157,14 @@ private:
     OceanSettings editor_ocean_{};
     bool authored_scene_enabled_ = false;
     bool editor_output_enabled_ = false;
+    GpuTexture game_ui_atlas_{};
+    DeviceObject<VkDescriptorSetLayout> game_ui_set_layout_{};
+    DeviceObject<VkDescriptorPool> game_ui_pool_{};
+    VkDescriptorSet game_ui_set_ = VK_NULL_HANDLE;
+    DeviceObject<VkPipelineLayout> game_ui_pipeline_layout_{};
+    DeviceObject<VkPipeline> game_ui_direct_pipeline_{};
+    DeviceObject<VkPipeline> game_ui_post_pipeline_{};
+    std::vector<GameUiVertex> game_ui_pending_vertices_{};
 #endif
 };
 

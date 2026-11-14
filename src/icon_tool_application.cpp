@@ -2,6 +2,7 @@
 
 #include "image_barrier.hpp"
 #include "vulkan_common.hpp"
+#include "window_icon_sdl.hpp"
 
 #include <imgui_impl_sdl3.h>
 #include <nlohmann/json.hpp>

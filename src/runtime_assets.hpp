@@ -14,6 +14,7 @@ struct RuntimeAssetRoot {
     std::filesystem::path path{};
     std::filesystem::path project_root{};
     std::filesystem::path project_icon_path{};
+    std::filesystem::path game_module_path{};
     std::string project_name{};
     std::string startup_scene_relative_path{canonical_scene_relative_path};
     bool project_owned = false;

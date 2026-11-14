@@ -2,14 +2,21 @@
 
 #include "project_system.hpp"
 
-#include <SDL3/SDL.h>
-
+#include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <utility>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace vcr {
 namespace {
@@ -17,6 +24,103 @@ namespace {
 [[nodiscard]] std::filesystem::path path_from_utf8_view(
     const std::string_view text) {
     return std::filesystem::path(std::u8string(text.begin(), text.end()));
+}
+
+#if defined(_WIN32)
+[[nodiscard]] std::string wide_to_utf8(const std::wstring_view text) {
+    if (text.empty()) {
+        return {};
+    }
+    const int needed = WideCharToMultiByte(
+        CP_UTF8,
+        WC_ERR_INVALID_CHARS,
+        text.data(),
+        static_cast<int>(text.size()),
+        nullptr,
+        0,
+        nullptr,
+        nullptr);
+    if (needed <= 0) {
+        return {};
+    }
+    std::string utf8(static_cast<std::size_t>(needed), '\0');
+    const int converted = WideCharToMultiByte(
+        CP_UTF8,
+        WC_ERR_INVALID_CHARS,
+        text.data(),
+        static_cast<int>(text.size()),
+        utf8.data(),
+        needed,
+        nullptr,
+        nullptr);
+    if (converted != needed) {
+        return {};
+    }
+    return utf8;
+}
+
+[[nodiscard]] std::optional<std::string> read_environment_utf8(
+    const char* const /*ascii_name*/,
+    const wchar_t* const wide_name) {
+    if (wide_name == nullptr) {
+        return std::nullopt;
+    }
+    std::array<wchar_t, 4096U> stack_buf{};
+    SetLastError(ERROR_SUCCESS);
+    const DWORD len = GetEnvironmentVariableW(
+        wide_name, stack_buf.data(), static_cast<DWORD>(stack_buf.size()));
+    if (len == 0U) {
+        if (GetLastError() == ERROR_ENVVAR_NOT_FOUND) {
+            return std::nullopt;
+        }
+        return std::string{};
+    }
+    if (len < stack_buf.size()) {
+        return wide_to_utf8(std::wstring_view(stack_buf.data(), len));
+    }
+    std::wstring heap_buf(static_cast<std::size_t>(len), L'\0');
+    const DWORD len2 = GetEnvironmentVariableW(wide_name, heap_buf.data(), len);
+    if (len2 == 0U || len2 >= len) {
+        return std::nullopt;
+    }
+    return wide_to_utf8(std::wstring_view(heap_buf.data(), len2));
+}
+
+[[nodiscard]] std::optional<std::filesystem::path> process_executable_directory() {
+    std::wstring buffer(32768U, L'\0');
+    const DWORD length = GetModuleFileNameW(
+        nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (length == 0U || length >= buffer.size()) {
+        return std::nullopt;
+    }
+    buffer.resize(length);
+    return std::filesystem::path(buffer).parent_path();
+}
+#else
+[[nodiscard]] std::optional<std::string> read_environment_utf8(
+    const char* const ascii_name,
+    const wchar_t* const /*wide_name*/) {
+    if (ascii_name == nullptr) {
+        return std::nullopt;
+    }
+    if (const char* const value = std::getenv(ascii_name)) {
+        return std::string(value);
+    }
+    return std::nullopt;
+}
+
+[[nodiscard]] std::optional<std::filesystem::path> process_executable_directory() {
+    return std::nullopt;
+}
+#endif
+
+[[nodiscard]] std::filesystem::path resolve_game_module_path(
+    const ProjectInspection& inspection) {
+    if (inspection.manifest.game_module.empty()) {
+        return {};
+    }
+    return inspection.project_directory /
+           path_from_utf8_view(inspection.manifest.game_module);
 }
 
 [[nodiscard]] std::optional<RuntimeAssetRoot> resolve_explicit_project(
@@ -41,6 +145,7 @@ namespace {
             .path = std::move(canonical_assets),
             .project_root = inspection.project_directory,
             .project_icon_path = inspection.icon_file_path,
+            .game_module_path = resolve_game_module_path(inspection),
             .project_name = inspection.manifest.name,
             .startup_scene_relative_path = inspection.manifest.startup_scene,
             .project_owned = true,
@@ -69,6 +174,7 @@ namespace {
                         .path = std::move(canonical_assets),
                         .project_root = inspection.project_directory,
                         .project_icon_path = inspection.icon_file_path,
+                        .game_module_path = resolve_game_module_path(inspection),
                         .project_name = inspection.manifest.name,
                         .startup_scene_relative_path =
                             inspection.manifest.startup_scene,
@@ -134,23 +240,23 @@ std::optional<RuntimeAssetRoot> find_runtime_asset_root(
         return resolve_explicit_project(explicit_project_path);
     }
 
-    if (const char* env_project = SDL_getenv("VCR_PROJECT_ROOT")) {
-        if (*env_project == '\0') {
+    if (const auto env_project =
+            read_environment_utf8("VCR_PROJECT_ROOT", L"VCR_PROJECT_ROOT")) {
+        if (env_project->empty()) {
             return std::nullopt;
         }
-        return resolve_explicit_project(env_project);
+        return resolve_explicit_project(*env_project);
     }
 
     std::error_code filesystem_error;
-    // SDL_getenv observes SDL's thread-safe environment snapshot. Read once per
-    // cold lookup and immediately copy the borrowed UTF-8 bytes into owned data.
-    if (const char* override_root = SDL_getenv("VCR_ASSET_ROOT")) {
-        if (*override_root == '\0') {
+    if (const auto override_root =
+            read_environment_utf8("VCR_ASSET_ROOT", L"VCR_ASSET_ROOT")) {
+        if (override_root->empty()) {
             return std::nullopt;
         }
         try {
             const std::filesystem::path candidate =
-                path_from_utf8_view(override_root);
+                path_from_utf8_view(*override_root);
             if (!std::filesystem::is_directory(candidate, filesystem_error) ||
                 filesystem_error) {
                 return std::nullopt;
@@ -168,10 +274,9 @@ std::optional<RuntimeAssetRoot> find_runtime_asset_root(
         }
     }
 
-    const char* const base_path = SDL_GetBasePath();
-    if (base_path != nullptr) {
-        if (auto bundled_project =
-                find_ancestor_user_project(std::filesystem::path(base_path))) {
+    const auto exe_dir = process_executable_directory();
+    if (exe_dir) {
+        if (auto bundled_project = find_ancestor_user_project(*exe_dir)) {
             return bundled_project;
         }
     }
@@ -187,16 +292,14 @@ std::optional<RuntimeAssetRoot> find_runtime_asset_root(
         }
     }
 
-    if (base_path == nullptr) {
+    if (!exe_dir) {
         return std::nullopt;
     }
-    if (auto root =
-            find_engine_checkout_assets(std::filesystem::path(base_path))) {
+    if (auto root = find_engine_checkout_assets(*exe_dir)) {
         return root;
     }
 
-    const std::filesystem::path packaged_assets =
-        std::filesystem::path(base_path) / "assets";
+    const std::filesystem::path packaged_assets = *exe_dir / "assets";
     filesystem_error.clear();
     if (std::filesystem::is_directory(packaged_assets, filesystem_error) &&
         !filesystem_error) {
@@ -216,12 +319,11 @@ std::optional<std::filesystem::path> find_engine_workspace_root() {
             return root;
         }
     }
-    if (const char* const base_path = SDL_GetBasePath()) {
-        const std::filesystem::path exe_dir(base_path);
-        if (auto root = find_ancestor_engine_root(exe_dir)) {
+    if (const auto exe_dir = process_executable_directory()) {
+        if (auto root = find_ancestor_engine_root(*exe_dir)) {
             return root;
         }
-        return exe_dir;
+        return *exe_dir;
     }
     return std::nullopt;
 }

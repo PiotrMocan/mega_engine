@@ -15,7 +15,7 @@ void main()
 {
     const vec2 uvDx = dFdx(inUv), uvDy = dFdy(inUv);
     // Opaque materials do not need a texture read in the depth/shadow pass.
-    if ((material.coverage & 1u) != 0u) {
+    if ((material.coverage & 9u) != 0u) {
         const float alpha = textureGrad(materialBaseColorTexture, inUv, uvDx, uvDy).a * inBaseColor.a;
         if (!materialKeepsAlpha(material.coverage, alpha)) discard;
     }

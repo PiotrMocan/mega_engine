@@ -8512,7 +8512,9 @@ GameplayFrameInput EditorUi::gameplay_input(
         return {};
     }
     if (input_actions_ != nullptr) {
-        input_actions_->set_context(InputContext::gameplay);
+        if (input_actions_->context() == InputContext::ui) {
+            input_actions_->set_context(InputContext::gameplay);
+        }
         input_actions_->begin_frame(delta_seconds);
         if (input_actions_->action_pressed(InputAction::pause)) {
             set_game_mouse_capture(nullptr);

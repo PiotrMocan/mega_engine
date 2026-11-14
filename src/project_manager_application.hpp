@@ -123,6 +123,7 @@ private:
 
     void apply_icon_to_selected_project(const std::filesystem::path& source_file);
     void bundle_selected_project_runtime();
+    void compile_selected_project_game_module();
     void reset_selected_project_icon();
     void launch_icon_tool_for_selected_project();
 

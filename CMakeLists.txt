@@ -20,6 +20,10 @@ option(
 )
 option(VCR_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 
+if(MSVC AND CMAKE_CXX_FLAGS MATCHES "/fsanitize=address")
+    add_link_options(/INCREMENTAL:NO)
+endif()
+
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC ON CACHE BOOL "" FORCE)
@@ -357,52 +361,141 @@ target_link_libraries(vcr_imgui PUBLIC
     volk::volk
 )
 
-add_library(vcr_miniaudio STATIC
+find_package(Threads REQUIRED)
+
+set(VCR_ENGINE_CORE_SOURCES
     src/miniaudio_impl.c
+    src/cooked_audio_asset.cpp
+    src/audio_engine.cpp
+    src/sound_cue_io.cpp
+    src/cooked_model_asset.cpp
+    src/skeletal_animation.cpp
+    src/cooked_texture_asset.cpp
+    src/png_encoder.cpp
+    src/icon_system.cpp
+    src/model_lod.cpp
+    src/asset_preparation.cpp
+    src/content_manifest.cpp
+    src/scene_uuid.cpp
+    src/scene_document.cpp
+    src/scene_io.cpp
+    src/prefab_io.cpp
+    src/punctual_light.cpp
+    src/lighting.cpp
+    src/scene_visibility.cpp
+    src/bounds_hierarchy.cpp
+    src/runtime_scene.cpp
+    src/collision.cpp
+    src/physics_world.cpp
+    src/runtime_transform_registry.cpp
+    src/fly_camera.cpp
+    src/input_actions.cpp
+    src/animated_character.cpp
+    src/gameplay.cpp
+    src/gameplay_framework.cpp
+    src/gameplay_session.cpp
+    src/game_overlay.cpp
+    src/navigation_crowd.cpp
+    src/traffic_system.cpp
+    src/vehicle_camera.cpp
+    src/vehicle_controller.cpp
+    src/vehicle_interaction.cpp
+    src/game_module_loader.cpp
+    src/cli_options.cpp
+    src/performance_metrics.cpp
+    src/project_system.cpp
+    src/runtime_assets.cpp
+    src/asset_browser.cpp
+    src/editor_scene_tools.cpp
+    src/render_fixture_scene.cpp
 )
-set_target_properties(vcr_miniaudio PROPERTIES
+
+add_library(vcr_engine SHARED ${VCR_ENGINE_CORE_SOURCES})
+add_library(vcr::engine ALIAS vcr_engine)
+set_source_files_properties(src/miniaudio_impl.c PROPERTIES
+    COMPILE_OPTIONS "$<IF:$<C_COMPILER_ID:MSVC>,/W0,-w>"
+)
+set_target_properties(vcr_engine PROPERTIES
     C_STANDARD 11
     C_STANDARD_REQUIRED ON
     C_EXTENSIONS OFF
+    WINDOWS_EXPORT_ALL_SYMBOLS ON
+    OUTPUT_NAME "vcr_engine"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
 )
-target_include_directories(vcr_miniaudio SYSTEM PUBLIC
-    "${miniaudio_SOURCE_DIR}"
-)
-if(MSVC)
-    target_compile_options(vcr_miniaudio PRIVATE /W0)
-else()
-    target_compile_options(vcr_miniaudio PRIVATE -w)
-endif()
-if(UNIX AND NOT APPLE)
-    target_link_libraries(vcr_miniaudio PUBLIC m pthread dl)
-endif()
-
-add_library(vcr_cooked_audio_asset STATIC
-    src/cooked_audio_asset.cpp
-)
-target_include_directories(vcr_cooked_audio_asset PUBLIC
+target_include_directories(vcr_engine PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
-target_link_libraries(vcr_cooked_audio_asset
+target_include_directories(vcr_engine SYSTEM PRIVATE
+    "${miniaudio_SOURCE_DIR}"
+    "${assimp_SOURCE_DIR}/contrib/stb"
+    "${openexr_SOURCE_DIR}/src/lib/OpenEXR"
+    "${openexr_BINARY_DIR}/src/lib/OpenEXR"
+    "${openexr_BINARY_DIR}/cmake"
+)
+target_compile_definitions(vcr_engine
+    PUBLIC
+        GLM_FORCE_DEPTH_ZERO_TO_ONE
+        GLM_FORCE_RADIANS
+    PRIVATE
+        "VCR_VALIDATION_DEFAULT=$<IF:$<OR:$<BOOL:${VCR_ENABLE_VALIDATION}>,$<CONFIG:Debug>>,1,0>"
+)
+target_link_libraries(vcr_engine
     PUBLIC
         glm::glm
-        vcr_miniaudio
-    PRIVATE
         nlohmann_json::nlohmann_json
+        Threads::Threads
+    PRIVATE
+        OpenEXR::OpenEXR
+        meshoptimizer
+)
+if(WIN32)
+    target_link_libraries(vcr_engine PRIVATE shell32)
+elseif(UNIX AND NOT APPLE)
+    target_link_libraries(vcr_engine PRIVATE m dl)
+endif()
+if(MSVC)
+    target_compile_options(vcr_engine PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:/W4;/permissive-;/Zc:preprocessor;/GR-;/EHsc>
+    )
+    if(VCR_WARNINGS_AS_ERRORS)
+        target_compile_options(vcr_engine PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/WX>
+        )
+    endif()
+else()
+    target_compile_options(vcr_engine PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic;-Wconversion;-Wshadow;-fno-rtti>
+    )
+    if(VCR_WARNINGS_AS_ERRORS)
+        target_compile_options(vcr_engine PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:-Werror>
+        )
+    endif()
+endif()
+
+add_library(vcr_window_icon STATIC
+    src/window_icon_sdl.cpp
+)
+target_link_libraries(vcr_window_icon PUBLIC
+    vcr_engine
+    SDL3::SDL3-static
 )
 if(MSVC)
-    target_compile_options(vcr_cooked_audio_asset PRIVATE
+    target_compile_options(vcr_window_icon PRIVATE
         /W4 /permissive- /Zc:preprocessor /GR- /EHsc
     )
     if(VCR_WARNINGS_AS_ERRORS)
-        target_compile_options(vcr_cooked_audio_asset PRIVATE /WX)
+        target_compile_options(vcr_window_icon PRIVATE /WX)
     endif()
 else()
-    target_compile_options(vcr_cooked_audio_asset PRIVATE
+    target_compile_options(vcr_window_icon PRIVATE
         -Wall -Wextra -Wpedantic -Wconversion -Wshadow -fno-rtti
     )
     if(VCR_WARNINGS_AS_ERRORS)
-        target_compile_options(vcr_cooked_audio_asset PRIVATE -Werror)
+        target_compile_options(vcr_window_icon PRIVATE -Werror)
     endif()
 endif()
 
@@ -417,8 +510,7 @@ target_compile_definitions(vcr_asset_import PRIVATE
 )
 target_link_libraries(vcr_asset_import
     PUBLIC
-        vcr_cooked_audio_asset
-        vcr_cooked_model_asset
+        vcr_engine
     PRIVATE
         assimp::assimp
         glm::glm
@@ -440,140 +532,58 @@ else()
     endif()
 endif()
 
-add_library(vcr_cooked_model_asset STATIC
-    src/cooked_model_asset.cpp
-    src/skeletal_animation.cpp
-)
-target_include_directories(vcr_cooked_model_asset PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"
-)
-target_link_libraries(vcr_cooked_model_asset
-    PUBLIC glm::glm
-    PRIVATE nlohmann_json::nlohmann_json
-)
-if(MSVC)
-    target_compile_options(vcr_cooked_model_asset PRIVATE
-        /W4 /permissive- /Zc:preprocessor /GR- /EHsc
-    )
-    if(VCR_WARNINGS_AS_ERRORS)
-        target_compile_options(vcr_cooked_model_asset PRIVATE /WX)
-    endif()
-else()
-    target_compile_options(vcr_cooked_model_asset PRIVATE
-        -Wall -Wextra -Wpedantic -Wconversion -Wshadow -fno-rtti
-    )
-    if(VCR_WARNINGS_AS_ERRORS)
-        target_compile_options(vcr_cooked_model_asset PRIVATE -Werror)
-    endif()
-endif()
-
 # Explicit offline asset step. LOD meshes share materials and are compacted;
 # ordinary scene loading reads the prepared four-level chain without simplifying.
 add_executable(vcr_asset_lod_cooker EXCLUDE_FROM_ALL
-    tools/asset_lod_cooker.cpp src/model_lod.cpp)
+    tools/asset_lod_cooker.cpp
+)
 target_link_libraries(vcr_asset_lod_cooker PRIVATE
-    vcr_cooked_model_asset meshoptimizer nlohmann_json::nlohmann_json)
+    vcr_engine meshoptimizer nlohmann_json::nlohmann_json)
 set_target_properties(vcr_asset_lod_cooker PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 if(MSVC)
     target_compile_options(vcr_asset_lod_cooker PRIVATE /W4 /permissive- /EHsc /GR-)
 endif()
 
-add_library(vcr_cooked_texture_asset STATIC
-    src/cooked_texture_asset.cpp
+add_executable(vcr_content_cooker
+    tools/vcr_content_cooker.cpp
 )
-target_include_directories(vcr_cooked_texture_asset PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"
-)
-target_include_directories(vcr_cooked_texture_asset SYSTEM PRIVATE
-    "${assimp_SOURCE_DIR}/contrib/stb"
-    "${openexr_SOURCE_DIR}/src/lib/OpenEXR"
-    "${openexr_BINARY_DIR}/src/lib/OpenEXR"
-    "${openexr_BINARY_DIR}/cmake"
-)
-target_link_libraries(vcr_cooked_texture_asset PRIVATE
-    OpenEXR::OpenEXR
+target_link_libraries(vcr_content_cooker PRIVATE
+    vcr_engine
+    vcr_asset_import
+    glm::glm
     nlohmann_json::nlohmann_json
+    Threads::Threads
+)
+set_target_properties(vcr_content_cooker PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 if(MSVC)
-    target_compile_options(vcr_cooked_texture_asset PRIVATE
+    target_compile_options(vcr_content_cooker PRIVATE
         /W4 /permissive- /Zc:preprocessor /GR- /EHsc
     )
     if(VCR_WARNINGS_AS_ERRORS)
-        target_compile_options(vcr_cooked_texture_asset PRIVATE /WX)
+        target_compile_options(vcr_content_cooker PRIVATE /WX)
     endif()
 else()
-    target_compile_options(vcr_cooked_texture_asset PRIVATE
+    target_compile_options(vcr_content_cooker PRIVATE
         -Wall -Wextra -Wpedantic -Wconversion -Wshadow -fno-rtti
     )
     if(VCR_WARNINGS_AS_ERRORS)
-        target_compile_options(vcr_cooked_texture_asset PRIVATE -Werror)
+        target_compile_options(vcr_content_cooker PRIVATE -Werror)
     endif()
 endif()
 
-add_library(vcr_icon_system STATIC
-    src/icon_system.cpp
-)
-target_include_directories(vcr_icon_system PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"
-)
-target_include_directories(vcr_icon_system SYSTEM PRIVATE
-    "${assimp_SOURCE_DIR}/contrib/stb"
-)
-target_link_libraries(vcr_icon_system
-    PUBLIC SDL3::SDL3-static
-)
-if(WIN32)
-    target_link_libraries(vcr_icon_system PRIVATE shell32)
-endif()
-if(MSVC)
-    target_compile_options(vcr_icon_system PRIVATE
-        /W4 /permissive- /Zc:preprocessor /GR- /EHsc
-    )
-    if(VCR_WARNINGS_AS_ERRORS)
-        target_compile_options(vcr_icon_system PRIVATE /WX)
-    endif()
-else()
-    target_compile_options(vcr_icon_system PRIVATE
-        -Wall -Wextra -Wpedantic -Wconversion -Wshadow -fno-rtti
-    )
-    if(VCR_WARNINGS_AS_ERRORS)
-        target_compile_options(vcr_icon_system PRIVATE -Werror)
-    endif()
-endif()
-
-set(VCR_RENDERER_SOURCES
-    src/audio_engine.cpp
-    src/cli_options.cpp
-    src/collision.cpp
-    src/fly_camera.cpp
-    src/gameplay.cpp
-    src/gameplay_framework.cpp
-    src/gameplay_session.cpp
-    src/input_actions.cpp
-    src/physics_world.cpp
-    src/scene_uuid.cpp
-    src/sound_cue_io.cpp
+set(VCR_VULKAN_RENDERER_SOURCES
     src/fsr3_upscaler.cpp
     src/gpu_buffer.cpp
     src/gpu_texture.cpp
-    src/performance_metrics.cpp
-    src/png_encoder.cpp
     src/renderer.cpp
-    src/runtime_scene.cpp
     src/renderer_scene.cpp
-    src/lighting.cpp
-    src/punctual_light.cpp
     src/renderer_lighting.cpp
     src/renderer_ray_tracing.cpp
     src/renderer_gpu_visibility.cpp
-    src/model_lod.cpp
-    src/asset_preparation.cpp
     src/upload_batch.cpp
     src/renderer_assets.cpp
-    src/scene_visibility.cpp
-    src/bounds_hierarchy.cpp
-    src/project_system.cpp
-    src/runtime_assets.cpp
     src/swapchain.cpp
     src/vma.cpp
     src/vulkan_context.cpp
@@ -582,33 +592,22 @@ set(VCR_RENDERER_SOURCES
 add_executable(vulkan_cube
     src/main.cpp
     src/application.cpp
-    src/render_fixture_scene.cpp
     src/mcp_server.cpp
-    src/scene_document.cpp
-    src/scene_io.cpp
-    src/prefab_io.cpp
-    ${VCR_RENDERER_SOURCES}
+    ${VCR_VULKAN_RENDERER_SOURCES}
 )
 
 add_executable(vulkan_editor
     src/editor_main.cpp
     src/editor_application.cpp
-    src/editor_scene_tools.cpp
     src/editor_ui.cpp
     src/editor_ui_kit.cpp
     src/mcp_server.cpp
-    src/asset_browser.cpp
-    src/scene_document.cpp
-    src/scene_io.cpp
-    src/prefab_io.cpp
-    ${VCR_RENDERER_SOURCES}
+    ${VCR_VULKAN_RENDERER_SOURCES}
 )
 
 add_executable(vulkan_project_manager
     src/project_manager_main.cpp
     src/project_manager_application.cpp
-    src/project_system.cpp
-    src/runtime_assets.cpp
     src/editor_ui_kit.cpp
     src/vulkan_context.cpp
     src/swapchain.cpp
@@ -616,20 +615,11 @@ add_executable(vulkan_project_manager
     src/gpu_buffer.cpp
     src/gpu_texture.cpp
     src/ui_texture_preview.cpp
-    src/scene_document.cpp
-    src/scene_io.cpp
-    src/prefab_io.cpp
-    src/scene_uuid.cpp
-    src/collision.cpp
-    src/punctual_light.cpp
-    src/png_encoder.cpp
 )
 
 add_executable(vulkan_icon_tool
     src/icon_tool_main.cpp
     src/icon_tool_application.cpp
-    src/project_system.cpp
-    src/runtime_assets.cpp
     src/editor_ui_kit.cpp
     src/vulkan_context.cpp
     src/swapchain.cpp
@@ -637,16 +627,7 @@ add_executable(vulkan_icon_tool
     src/gpu_buffer.cpp
     src/gpu_texture.cpp
     src/ui_texture_preview.cpp
-    src/scene_document.cpp
-    src/scene_io.cpp
-    src/prefab_io.cpp
-    src/scene_uuid.cpp
-    src/collision.cpp
-    src/punctual_light.cpp
-    src/png_encoder.cpp
 )
-
-find_package(Threads REQUIRED)
 
 function(vcr_configure_executable target editor_enabled)
     target_include_directories(${target} PRIVATE
@@ -661,6 +642,7 @@ function(vcr_configure_executable target editor_enabled)
     endif()
 
     target_link_libraries(${target} PRIVATE
+        vcr_engine
         SDL3::SDL3-static
         volk::volk
         glm::glm
@@ -765,34 +747,26 @@ if(WIN32)
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         USES_TERMINAL VERBATIM)
 endif()
-target_link_libraries(vulkan_cube PRIVATE vcr_imgui)
 target_link_libraries(
     vulkan_cube PRIVATE
-    vcr_cooked_audio_asset
-    vcr_cooked_model_asset
-    vcr_cooked_texture_asset
-    vcr_icon_system
+    vcr_imgui
+    vcr_window_icon
 )
-target_link_libraries(vulkan_editor PRIVATE vcr_imgui)
 target_link_libraries(
     vulkan_editor PRIVATE
+    vcr_imgui
     vcr_asset_import
-    vcr_cooked_audio_asset
-    vcr_cooked_model_asset
-    vcr_cooked_texture_asset
-    vcr_icon_system
+    vcr_window_icon
 )
 target_link_libraries(
     vulkan_project_manager PRIVATE
     vcr_imgui
-    vcr_cooked_model_asset
-    vcr_icon_system
+    vcr_window_icon
 )
 target_link_libraries(
     vulkan_icon_tool PRIVATE
     vcr_imgui
-    vcr_cooked_model_asset
-    vcr_icon_system
+    vcr_window_icon
 )
 
 # Both executables share one output directory. A single dependency target
@@ -833,23 +807,11 @@ add_dependencies(vulkan_icon_tool vcr_runtime_assets)
 
 include(CTest)
 if(BUILD_TESTING)
-    add_executable(vcr_gameplay_tests
-        tests/gameplay_tests.cpp
-        src/collision.cpp
-        src/gameplay.cpp
-        src/physics_world.cpp
-        src/punctual_light.cpp
-        src/scene_document.cpp
-        src/scene_uuid.cpp
+    add_executable(vcr_gameplay_tests tests/gameplay_tests.cpp)
+    target_link_libraries(vcr_gameplay_tests PRIVATE vcr_engine glm::glm)
+    set_target_properties(vcr_gameplay_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
-    target_include_directories(vcr_gameplay_tests PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    )
-    target_compile_definitions(vcr_gameplay_tests PRIVATE
-        GLM_FORCE_DEPTH_ZERO_TO_ONE
-        GLM_FORCE_RADIANS
-    )
-    target_link_libraries(vcr_gameplay_tests PRIVATE glm::glm)
     if(MSVC)
         target_compile_options(vcr_gameplay_tests PRIVATE /W4 /permissive- /EHsc)
     else()
@@ -859,30 +821,15 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME vcr_gameplay_tests COMMAND vcr_gameplay_tests)
 
-    add_executable(vcr_audio_input_tests
-        tests/audio_input_tests.cpp
-        src/audio_engine.cpp
-        src/collision.cpp
-        src/input_actions.cpp
-        src/prefab_io.cpp
-        src/punctual_light.cpp
-        src/scene_document.cpp
-        src/scene_io.cpp
-        src/scene_uuid.cpp
-        src/sound_cue_io.cpp
-    )
-    target_include_directories(vcr_audio_input_tests PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    )
-    target_compile_definitions(vcr_audio_input_tests PRIVATE
-        GLM_FORCE_DEPTH_ZERO_TO_ONE
-        GLM_FORCE_RADIANS
-    )
+    add_executable(vcr_audio_input_tests tests/audio_input_tests.cpp)
     target_link_libraries(vcr_audio_input_tests PRIVATE
-        vcr_cooked_audio_asset
+        vcr_engine
         glm::glm
         nlohmann_json::nlohmann_json
         Threads::Threads
+    )
+    set_target_properties(vcr_audio_input_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
     if(MSVC)
         target_compile_options(vcr_audio_input_tests PRIVATE
@@ -903,6 +850,9 @@ if(BUILD_TESTING)
 
     add_executable(vcr_fog_tests tests/fog_tests.cpp)
     target_include_directories(vcr_fog_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    set_target_properties(vcr_fog_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
     if(MSVC)
         target_compile_options(vcr_fog_tests PRIVATE /W4 /permissive- /EHsc)
     endif()
@@ -911,6 +861,9 @@ if(BUILD_TESTING)
     add_executable(vcr_packed_model_vertex_tests tests/packed_model_vertex_tests.cpp)
     target_include_directories(vcr_packed_model_vertex_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_link_libraries(vcr_packed_model_vertex_tests PRIVATE glm::glm)
+    set_target_properties(vcr_packed_model_vertex_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
     if(MSVC)
         target_compile_options(vcr_packed_model_vertex_tests PRIVATE /W4 /permissive- /EHsc)
     endif()
@@ -919,6 +872,9 @@ if(BUILD_TESTING)
     add_executable(vcr_gpu_grass_tests tests/gpu_grass_tests.cpp)
     target_include_directories(vcr_gpu_grass_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_link_libraries(vcr_gpu_grass_tests PRIVATE glm::glm)
+    set_target_properties(vcr_gpu_grass_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
     if(MSVC)
         target_compile_options(vcr_gpu_grass_tests PRIVATE /W4 /permissive- /EHsc)
     endif()
@@ -926,6 +882,9 @@ if(BUILD_TESTING)
 
     add_executable(vcr_exposure_tests tests/exposure_tests.cpp)
     target_include_directories(vcr_exposure_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    set_target_properties(vcr_exposure_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
     if(MSVC)
         target_compile_options(vcr_exposure_tests PRIVATE /W4 /permissive- /EHsc)
     endif()
@@ -933,59 +892,45 @@ if(BUILD_TESTING)
 
     add_executable(vcr_lod_transition_tests tests/lod_transition_tests.cpp)
     target_include_directories(vcr_lod_transition_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    set_target_properties(vcr_lod_transition_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
     if(MSVC)
         target_compile_options(vcr_lod_transition_tests PRIVATE /W4 /permissive- /EHsc)
     endif()
     add_test(NAME vcr_lod_transition_tests COMMAND vcr_lod_transition_tests)
-    add_executable(vcr_lighting_tests tests/lighting_tests.cpp src/lighting.cpp
-        src/punctual_light.cpp src/scene_visibility.cpp)
-    target_include_directories(vcr_lighting_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
-    target_link_libraries(vcr_lighting_tests PRIVATE glm::glm)
-    target_compile_definitions(vcr_lighting_tests PRIVATE GLM_FORCE_DEPTH_ZERO_TO_ONE GLM_FORCE_RADIANS)
+
+    add_executable(vcr_lighting_tests tests/lighting_tests.cpp)
+    target_link_libraries(vcr_lighting_tests PRIVATE vcr_engine glm::glm)
+    set_target_properties(vcr_lighting_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
     if(MSVC)
         target_compile_options(vcr_lighting_tests PRIVATE /W4 /permissive- /EHsc)
     endif()
     add_test(NAME vcr_lighting_tests COMMAND vcr_lighting_tests)
-    add_executable(vcr_runtime_tests tests/runtime_scene_tests.cpp
-        src/runtime_scene.cpp src/scene_visibility.cpp src/bounds_hierarchy.cpp src/scene_document.cpp
-        src/model_lod.cpp src/asset_preparation.cpp src/punctual_light.cpp src/scene_uuid.cpp)
-    target_include_directories(vcr_runtime_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
-    target_link_libraries(vcr_runtime_tests PRIVATE glm::glm meshoptimizer
-        vcr_cooked_model_asset vcr_cooked_texture_asset Threads::Threads)
-    target_compile_definitions(vcr_runtime_tests PRIVATE GLM_FORCE_DEPTH_ZERO_TO_ONE GLM_FORCE_RADIANS)
+
+    add_executable(vcr_runtime_tests tests/runtime_scene_tests.cpp)
+    target_link_libraries(vcr_runtime_tests PRIVATE vcr_engine glm::glm meshoptimizer Threads::Threads)
+    set_target_properties(vcr_runtime_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
     if(MSVC)
         target_compile_options(vcr_runtime_tests PRIVATE /W4 /permissive- /EHsc)
     endif()
     add_test(NAME vcr_runtime_tests COMMAND vcr_runtime_tests)
-    add_executable(vcr_core_tests
-        tests/core_tests.cpp
-        src/asset_browser.cpp
-        src/cli_options.cpp
-        src/editor_scene_tools.cpp
-        src/fly_camera.cpp
-        src/performance_metrics.cpp
-        src/punctual_light.cpp
-        src/png_encoder.cpp
-        src/render_fixture_scene.cpp
-        src/scene_document.cpp
-        src/scene_io.cpp
-        src/prefab_io.cpp
-        src/scene_uuid.cpp
-        src/collision.cpp
-    )
-    target_include_directories(vcr_core_tests PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    )
-    target_compile_definitions(vcr_core_tests PRIVATE
-        GLM_FORCE_DEPTH_ZERO_TO_ONE
-        GLM_FORCE_RADIANS
-        VCR_VALIDATION_DEFAULT=0
-    )
+
+    add_executable(vcr_core_tests tests/core_tests.cpp)
+    target_compile_definitions(vcr_core_tests PRIVATE VCR_VALIDATION_DEFAULT=0)
     target_link_libraries(
         vcr_core_tests PRIVATE
+        vcr_engine
         glm::glm
         nlohmann_json::nlohmann_json
         Threads::Threads
+    )
+    set_target_properties(vcr_core_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
     if(MSVC)
         target_compile_options(
@@ -1003,8 +948,12 @@ if(BUILD_TESTING)
     )
     target_link_libraries(
         vcr_asset_import_tests PRIVATE
+        vcr_engine
         vcr_asset_import
         nlohmann_json::nlohmann_json
+    )
+    set_target_properties(vcr_asset_import_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
     if(MSVC)
         target_compile_options(
@@ -1033,8 +982,11 @@ if(BUILD_TESTING)
     )
     target_link_libraries(
         vcr_cooked_model_asset_tests PRIVATE
-        vcr_cooked_model_asset
+        vcr_engine
         nlohmann_json::nlohmann_json
+    )
+    set_target_properties(vcr_cooked_model_asset_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
     if(MSVC)
         target_compile_options(
@@ -1059,10 +1011,6 @@ if(BUILD_TESTING)
 
     add_executable(vcr_cooked_texture_asset_tests
         tests/cooked_texture_asset_tests.cpp
-        src/png_encoder.cpp
-    )
-    target_include_directories(vcr_cooked_texture_asset_tests PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/src"
     )
     target_include_directories(
         vcr_cooked_texture_asset_tests SYSTEM PRIVATE
@@ -1072,9 +1020,12 @@ if(BUILD_TESTING)
     )
     target_link_libraries(
         vcr_cooked_texture_asset_tests PRIVATE
-        vcr_cooked_texture_asset
+        vcr_engine
         OpenEXR::OpenEXR
         nlohmann_json::nlohmann_json
+    )
+    set_target_properties(vcr_cooked_texture_asset_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
     if(MSVC)
         target_compile_options(
@@ -1097,37 +1048,19 @@ if(BUILD_TESTING)
         )
     endif()
 
-    add_executable(vcr_project_tests
-        tests/project_tests.cpp
-        src/project_system.cpp
-        src/runtime_assets.cpp
-        src/asset_browser.cpp
-        src/cli_options.cpp
-        src/png_encoder.cpp
-        src/scene_document.cpp
-        src/scene_io.cpp
-        src/prefab_io.cpp
-        src/scene_uuid.cpp
-        src/punctual_light.cpp
-        src/collision.cpp
-    )
-    target_include_directories(vcr_project_tests PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    )
-    target_compile_definitions(vcr_project_tests PRIVATE
-        GLM_FORCE_DEPTH_ZERO_TO_ONE
-        GLM_FORCE_RADIANS
-        VCR_VALIDATION_DEFAULT=0
-    )
+    add_executable(vcr_project_tests tests/project_tests.cpp)
+    target_compile_definitions(vcr_project_tests PRIVATE VCR_VALIDATION_DEFAULT=0)
     target_link_libraries(
         vcr_project_tests PRIVATE
-        vcr_cooked_model_asset
-        vcr_cooked_texture_asset
-        vcr_icon_system
+        vcr_engine
+        vcr_window_icon
         SDL3::SDL3-static
         glm::glm
         nlohmann_json::nlohmann_json
         Threads::Threads
+    )
+    set_target_properties(vcr_project_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
     if(WIN32)
         target_link_libraries(vcr_project_tests PRIVATE shell32)
@@ -1149,34 +1082,15 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME vcr_project_tests COMMAND vcr_project_tests)
 
-    add_executable(vcr_animation_gameplay_tests
-        tests/animation_gameplay_tests.cpp
-        src/audio_engine.cpp
-        src/collision.cpp
-        src/editor_scene_tools.cpp
-        src/gameplay.cpp
-        src/gameplay_framework.cpp
-        src/physics_world.cpp
-        src/prefab_io.cpp
-        src/punctual_light.cpp
-        src/scene_document.cpp
-        src/scene_io.cpp
-        src/scene_uuid.cpp
-        src/sound_cue_io.cpp
-    )
-    target_include_directories(vcr_animation_gameplay_tests PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    )
-    target_compile_definitions(vcr_animation_gameplay_tests PRIVATE
-        GLM_FORCE_DEPTH_ZERO_TO_ONE
-        GLM_FORCE_RADIANS
-    )
+    add_executable(vcr_animation_gameplay_tests tests/animation_gameplay_tests.cpp)
     target_link_libraries(vcr_animation_gameplay_tests PRIVATE
-        vcr_cooked_model_asset
-        vcr_cooked_audio_asset
+        vcr_engine
         glm::glm
         nlohmann_json::nlohmann_json
         Threads::Threads
+    )
+    set_target_properties(vcr_animation_gameplay_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
     if(MSVC)
         target_compile_options(vcr_animation_gameplay_tests PRIVATE
@@ -1194,4 +1108,37 @@ if(BUILD_TESTING)
         endif()
     endif()
     add_test(NAME vcr_animation_gameplay_tests COMMAND vcr_animation_gameplay_tests)
+
+    add_executable(vcr_engine_gameplay_api_tests tests/engine_gameplay_api_tests.cpp)
+    target_compile_definitions(vcr_engine_gameplay_api_tests PRIVATE
+        VCR_EDITOR_ENABLED=0
+        "VCR_CONTENT_COOKER_BIN=\"$<TARGET_FILE:vcr_content_cooker>\""
+    )
+    target_link_libraries(vcr_engine_gameplay_api_tests PRIVATE
+        vcr_engine
+        vcr_asset_import
+        glm::glm
+        nlohmann_json::nlohmann_json
+        Threads::Threads
+    )
+    set_target_properties(vcr_engine_gameplay_api_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+    add_dependencies(vcr_engine_gameplay_api_tests vcr_content_cooker)
+    if(MSVC)
+        target_compile_options(vcr_engine_gameplay_api_tests PRIVATE
+            /W4 /permissive- /Zc:preprocessor /GR- /EHsc
+        )
+        if(VCR_WARNINGS_AS_ERRORS)
+            target_compile_options(vcr_engine_gameplay_api_tests PRIVATE /WX)
+        endif()
+    else()
+        target_compile_options(vcr_engine_gameplay_api_tests PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -fno-rtti
+        )
+        if(VCR_WARNINGS_AS_ERRORS)
+            target_compile_options(vcr_engine_gameplay_api_tests PRIVATE -Werror)
+        endif()
+    endif()
+    add_test(NAME vcr_engine_gameplay_api_tests COMMAND vcr_engine_gameplay_api_tests)
 endif()
