@@ -608,6 +608,85 @@ void test_cpp_module_project_and_manifest_round_trip() {
             error),
         error);
     REQUIRE(loaded.game_module == "bin/my_cpp_game_game.dll");
+
+#if defined(_WIN32)
+    const std::filesystem::path workspace_root =
+        vcr::default_projects_root_directory().parent_path();
+    const std::filesystem::path sdk_src =
+        workspace_root / "cmake" / "VcrEngineSdk.cmake";
+    std::error_code fs_ec;
+    if (std::filesystem::is_regular_file(sdk_src, fs_ec) && !fs_ec) {
+        std::filesystem::create_directories(
+            created.project_directory / "engine" / "cmake", fs_ec);
+        REQUIRE_MSG(!fs_ec, fs_ec.message());
+        std::filesystem::copy_file(
+            sdk_src,
+            created.project_directory / "engine" / "cmake" / "VcrEngineSdk.cmake",
+            std::filesystem::copy_options::overwrite_existing,
+            fs_ec);
+        REQUIRE_MSG(!fs_ec, fs_ec.message());
+
+        const std::filesystem::path debug_build_dir =
+            workspace_root / "build" / "windows-debug";
+        if (std::filesystem::is_regular_file(
+                debug_build_dir / "bin" / "vcr_engined.dll", fs_ec) &&
+            !fs_ec &&
+            std::filesystem::is_regular_file(
+                debug_build_dir / "lib" / "vcr_engined.lib", fs_ec) &&
+            !fs_ec) {
+            vcr::CompileProjectModuleResult debug_res{};
+            REQUIRE_MSG(
+                vcr::compile_project_game_module(
+                    created.project_directory, debug_res, error, "Debug"),
+                error);
+            REQUIRE(debug_res.built);
+            REQUIRE(std::filesystem::is_regular_file(
+                created.project_directory / "build" / "windows-debug" / "bin" /
+                    "my_cpp_game_game.dll"));
+            REQUIRE(std::filesystem::is_regular_file(
+                created.project_directory / "build" / "windows-debug" / "bin" /
+                    "vcr_engined.dll"));
+        }
+
+        const std::filesystem::path release_build_dir =
+            workspace_root / "build" / "windows-release";
+        const std::filesystem::path release_dll =
+            release_build_dir / "bin" / "vcr_engine.dll";
+        const std::filesystem::path release_lib =
+            release_build_dir / "lib" / "vcr_engine.lib";
+        fs_ec.clear();
+        if (std::filesystem::is_regular_file(release_dll, fs_ec) && !fs_ec &&
+            std::filesystem::is_regular_file(release_lib, fs_ec) && !fs_ec) {
+            std::filesystem::create_directories(
+                created.project_directory / "engine" / "lib", fs_ec);
+            REQUIRE_MSG(!fs_ec, fs_ec.message());
+            std::filesystem::copy_file(
+                release_dll,
+                created.project_directory / "vcr_engine.dll",
+                std::filesystem::copy_options::overwrite_existing,
+                fs_ec);
+            REQUIRE_MSG(!fs_ec, fs_ec.message());
+            std::filesystem::copy_file(
+                release_lib,
+                created.project_directory / "engine" / "lib" / "vcr_engine.lib",
+                std::filesystem::copy_options::overwrite_existing,
+                fs_ec);
+            REQUIRE_MSG(!fs_ec, fs_ec.message());
+
+            vcr::CompileProjectModuleResult release_res{};
+            REQUIRE_MSG(
+                vcr::compile_project_game_module(
+                    created.project_directory, release_res, error, "Release"),
+                error);
+            REQUIRE(release_res.built);
+            REQUIRE(std::filesystem::is_regular_file(
+                created.project_directory / "build" / "windows-release" /
+                    "bin" / "my_cpp_game_game.dll"));
+            REQUIRE(std::filesystem::is_regular_file(
+                created.project_directory / "bin" / "my_cpp_game_game.dll"));
+        }
+    }
+#endif
 }
 
 } // namespace
