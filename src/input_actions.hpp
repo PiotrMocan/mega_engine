@@ -18,7 +18,7 @@ enum class InputContext : std::uint8_t {
     gameplay = 0U,
     ui = 1U,
     cutscene = 2U,
-    vehicle = 3U,
+    secondary = 3U,
 };
 
 enum class InputAction : std::uint8_t {
@@ -30,11 +30,11 @@ enum class InputAction : std::uint8_t {
     run,
     interact,
     pause,
-    vehicle_throttle,
-    vehicle_brake,
-    vehicle_steer_left,
-    vehicle_steer_right,
-    vehicle_handbrake,
+    secondary_up,
+    secondary_down,
+    secondary_left,
+    secondary_right,
+    secondary_action,
     recover,
     quick_reset,
     ui_up,
@@ -282,17 +282,19 @@ public:
     [[nodiscard]] bool action_pressed(InputAction action) const noexcept;
     [[nodiscard]] bool action_released(InputAction action) const noexcept;
 
+    // Analog value in [0, 1] for any action active in the current context:
+    // 1.0 when a bound key or digital button is held, or continuous trigger
+    // travel when bound to left_trigger / right_trigger.
+    [[nodiscard]] float action_value(InputAction action) const noexcept;
+
     // In Gameplay context: X in [-1, 1] (right), Y in [-1, 1] (forward).
     // Preserves partial analog tilt (< 1) and clamps length <= 1.
     [[nodiscard]] glm::vec2 move_axis() const noexcept { return move_axis_; }
-    [[nodiscard]] float vehicle_steer_axis() const noexcept {
-        return vehicle_steer_axis_;
-    }
-    [[nodiscard]] float vehicle_throttle_value() const noexcept {
-        return vehicle_throttle_value_;
-    }
-    [[nodiscard]] float vehicle_brake_value() const noexcept {
-        return vehicle_brake_value_;
+
+    // In Secondary context: composite 2D axis in [-1, 1]^2 combining
+    // secondary_left/right/down/up with filtered left gamepad stick.
+    [[nodiscard]] glm::vec2 secondary_axis() const noexcept {
+        return secondary_axis_;
     }
 
     // Effective look delta in mouse-equivalent units (combines accumulated
@@ -330,6 +332,7 @@ private:
     std::array<bool, input_action_count> action_down_{};
     std::array<bool, input_action_count> action_pressed_{};
     std::array<bool, input_action_count> action_released_{};
+    std::array<float, input_action_count> action_value_{};
     GamepadConfig gamepad_config_{};
     std::optional<GamepadState> synthetic_gamepad_{};
     GamepadState raw_gamepad_{};
@@ -340,9 +343,7 @@ private:
     float pending_mouse_dx_ = 0.0F;
     float pending_mouse_dy_ = 0.0F;
     glm::vec2 move_axis_{0.0F, 0.0F};
-    float vehicle_steer_axis_ = 0.0F;
-    float vehicle_throttle_value_ = 0.0F;
-    float vehicle_brake_value_ = 0.0F;
+    glm::vec2 secondary_axis_{0.0F, 0.0F};
     glm::vec2 look_delta_{0.0F, 0.0F};
     glm::vec2 ui_nav_step_{0.0F, 0.0F};
     float ui_repeat_timer_ = 0.0F;

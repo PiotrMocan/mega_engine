@@ -10,7 +10,6 @@
 #include "physics_world.hpp"
 #include "runtime_transform_registry.hpp"
 #include "scene_document.hpp"
-#include "vehicle_camera.hpp"
 
 #include <glm/vec2.hpp>
 #include <glm/vec3.hpp>
@@ -70,6 +69,7 @@ struct GameplayUpdateContext {
     float camera_override_yaw_radians = -1.57079632679F;
     float camera_override_pitch_radians = -0.20943951023F;
     bool has_camera_override = false;
+    bool suppress_default_camera_look = false;
 
     void set_camera_pose(
         const glm::vec3& position,
@@ -223,11 +223,11 @@ public:
         const noexcept {
         return animated_player_;
     }
-    [[nodiscard]] GameplayCameraRig& camera_rig() noexcept {
-        return camera_rig_;
+    void set_default_camera_look_enabled(const bool enabled) noexcept {
+        default_camera_look_enabled_ = enabled;
     }
-    [[nodiscard]] const GameplayCameraRig& camera_rig() const noexcept {
-        return camera_rig_;
+    [[nodiscard]] bool default_camera_look_enabled() const noexcept {
+        return default_camera_look_enabled_;
     }
     [[nodiscard]] ThirdPersonCamera& third_person_camera() noexcept {
         return camera_;
@@ -300,7 +300,6 @@ private:
     CharacterController character_{};
     AnimatedCharacterController animated_player_{};
     ThirdPersonCamera camera_{};
-    GameplayCameraRig camera_rig_{};
     CollisionWorld collision_world_{};
     PhysicsWorld physics_world_{};
     TriggerOverlapTracker trigger_tracker_{};
@@ -321,6 +320,7 @@ private:
     bool owns_player_cube_ = false;
     std::uint64_t cached_content_revision_ = 0U;
     std::uint64_t cached_structure_revision_ = 0U;
+    bool default_camera_look_enabled_ = true;
     bool active_ = false;
 };
 

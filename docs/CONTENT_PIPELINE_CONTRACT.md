@@ -38,8 +38,8 @@ To ensure 1:1 orientation and scale alignment between Blender scenes and the VCR
 1. **Apply Transforms**: All meshes and armatures must have transforms applied prior to export:
    `Object -> Apply -> All Transforms` (`Ctrl + A`).
 2. **Facing Direction**:
-   - Vehicles, characters, and directional props must face towards Blender's `-Y` axis (which maps to VCR's `+Z` forward axis).
-   - Character feet / vehicle contact points must rest on Blender's ground plane ($Z = 0$).
+   - Characters and directional props must face towards Blender's `-Y` axis (which maps to VCR's `+Z` forward axis).
+   - Character feet and ground contact points must rest on Blender's ground plane ($Z = 0$).
 3. **Unit Scale**:
    - Scene unit system: Metric.
    - Unit Scale: `1.0`.
@@ -61,22 +61,22 @@ When exporting `.glb` or `.gltf` from Blender (via `File -> Export -> glTF 2.0`)
 
 ## 3. Runtime Sockets Contract
 
-Sockets represent named attachment frames local to an asset. Children attach directly to sockets on parents (e.g. characters sitting in vehicles, holding tools, or IK targets).
+Sockets represent named attachment frames local to an asset. Children attach directly to sockets on parents (e.g. holding tools, mounting modular attachments, or IK targets).
 
 ### Standard Socket Names
-The runtime reserves and recognizes standard socket identifiers:
+The runtime supports standard socket identifiers alongside custom names:
 
 | Socket Name | Description | Typical Owner | Local Forward / Up |
 | :--- | :--- | :--- | :--- |
-| `seat_driver` | Driver seat reference pose | Vehicle | Forward `+Z`, Up `+Y` |
-| `entry_driver` | Interaction trigger / entry pose | Vehicle | Facing vehicle door |
-| `exit_driver` | Egress placement point | Vehicle | Ground level outside door |
-| `hand_l` | Left hand tool / weapon mount point | Character / Armature | Aligned with palm |
-| `hand_r` | Right hand tool / weapon mount point | Character / Armature | Aligned with palm |
+| `mount_primary` | Primary attachment mount pose | Modular Asset / Prop | Forward `+Z`, Up `+Y` |
+| `interact_entry` | Interaction trigger reference pose | Interactive Prop | Facing interaction side |
+| `interact_exit` | Egress placement point | Interactive Prop | Ground level outside prop |
+| `hand_l` | Left hand tool / mount point | Character / Armature | Aligned with palm |
+| `hand_r` | Right hand tool / mount point | Character / Armature | Aligned with palm |
 | `foot_l` | Left foot IK contact / surface FX | Character / Armature | Soles facing `-Y` |
 | `foot_r` | Right foot IK contact / surface FX | Character / Armature | Soles facing `-Y` |
 
-Custom sockets (e.g. `turret_mount`, `exhaust_fx`, `camera_attach`) are fully supported using arbitrary string identifiers.
+Custom sockets (e.g. `turret_mount`, `muzzle_fx`, `camera_attach`) are fully supported using arbitrary string identifiers.
 
 ---
 
@@ -99,17 +99,17 @@ Defines base asset entities, including geometry sources, LOD chains, composite s
   "version": 1,
   "assets": [
     {
-      "id": "sedan_car",
-      "type": "vehicle",
-      "file": "vehicles/sedan.glb",
+      "id": "modular_turret",
+      "type": "prop",
+      "file": "props/turret_base.glb",
       "lods": [
-        { "level": 1, "file": "vehicles/sedan_lod1.glb" },
-        { "level": 2, "file": "vehicles/sedan_lod2.glb" }
+        { "level": 1, "file": "props/turret_base_lod1.glb" },
+        { "level": 2, "file": "props/turret_base_lod2.glb" }
       ],
       "parts": [
         {
-          "name": "wheel_fl",
-          "asset_id": "wheel_sport",
+          "name": "rotor_left",
+          "asset_id": "rotor_unit",
           "position": [-0.85, 0.35, 1.4],
           "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
           "scale": [1.0, 1.0, 1.0]
@@ -117,12 +117,12 @@ Defines base asset entities, including geometry sources, LOD chains, composite s
       ],
       "sockets": [
         {
-          "name": "seat_driver",
+          "name": "mount_primary",
           "position": [-0.38, 0.55, -0.2],
           "rotation_xyzw": [0.0, 0.0, 0.0, 1.0]
         },
         {
-          "name": "entry_driver",
+          "name": "interact_entry",
           "position": [-1.2, 0.0, -0.2],
           "rotation_xyzw": [0.0, 0.7071068, 0.0, 0.7071068]
         }
@@ -130,7 +130,7 @@ Defines base asset entities, including geometry sources, LOD chains, composite s
       "colliders": [
         {
           "shape": "box",
-          "name": "chassis",
+          "name": "body_bounds",
           "position": [0.0, 0.6, 0.0],
           "size": [0.9, 0.5, 2.1],
           "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
@@ -143,7 +143,7 @@ Defines base asset entities, including geometry sources, LOD chains, composite s
 }
 ```
 
-*Note on Sockets:* `"sockets"` can be authored as an array of objects (`[{"name": "...", ...}]`) or as a key-value object map (`{"seat_driver": {"position": [...], "rotation_xyzw": [...]}}`). The parser transparently normalizes both representations.
+*Note on Sockets:* `"sockets"` can be authored as an array of objects (`[{"name": "...", ...}]`) or as a key-value object map (`{"mount_primary": {"position": [...], "rotation_xyzw": [...]}}`). The parser transparently normalizes both representations.
 
 ### 4.2 `scene_layout.json`
 
@@ -155,8 +155,8 @@ Specifies world entity instances and non-rendered gameplay markers.
   "version": 1,
   "instances": [
     {
-      "id": "car_hero",
-      "asset_id": "sedan_car",
+      "id": "turret_01",
+      "asset_id": "modular_turret",
       "position": [12.5, 0.0, -4.2],
       "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
       "scale": [1.0, 1.0, 1.0]
@@ -168,8 +168,8 @@ Specifies world entity instances and non-rendered gameplay markers.
       "kind": "player_start",
       "position": [10.0, 0.0, -4.2],
       "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
-      "links": ["car_hero"],
-      "group": "district_west"
+      "links": ["turret_01"],
+      "group": "sector_west"
     }
   ]
 }
@@ -248,16 +248,16 @@ The resulting `cooked_catalog.json` in `--cooked-dir` provides the runtime with 
 {
   "version": 1,
   "assets": {
-    "sedan_car": {
-      "id": "sedan_car",
-      "type": "vehicle",
-      "source_file": "vehicles/sedan.glb",
-      "primary_asset": "models/vehicles/sedan/sedan.vcrmodel.json",
+    "modular_turret": {
+      "id": "modular_turret",
+      "type": "prop",
+      "source_file": "props/turret_base.glb",
+      "primary_asset": "models/props/turret_base/turret_base.vcrmodel.json",
       "lods": [
         {
           "level": 1,
-          "source_file": "vehicles/sedan_lod1.glb",
-          "file": "models/vehicles/sedan_lod1/sedan_lod1.vcrmodel.json"
+          "source_file": "props/turret_base_lod1.glb",
+          "file": "models/props/turret_base_lod1/turret_base_lod1.vcrmodel.json"
         }
       ],
       "parts": [...],

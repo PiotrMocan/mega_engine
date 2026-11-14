@@ -1,6 +1,6 @@
 # Engine Gameplay & Content API Reference
 
-This document describes the reusable C++23 core engine APIs available for game projects (such as third-person urban sandbox games) without modifying core renderer internals or embedding project-specific mission logic into the engine.
+This document describes the reusable C++23 core engine APIs available for game projects without modifying core renderer internals or embedding project-specific gameplay logic into the engine.
 
 See also [CONTENT_PIPELINE_CONTRACT.md](CONTENT_PIPELINE_CONTRACT.md) for the Blender/glTF export JSON schema (`asset_manifest.json`, `scene_layout.json`, `animation_manifest.json`).
 
@@ -9,7 +9,7 @@ See also [CONTENT_PIPELINE_CONTRACT.md](CONTENT_PIPELINE_CONTRACT.md) for the Bl
 ## 1. Coordinate System & Units
 
 - **Units**: metric meters (`1.0` = 1 meter), radians internally in C++ physics/controllers.
-- **World / Runtime Axes**: right-handed, `+Y` up, `+Z` forward for authored characters and vehicles (`yaw = 0` points along `+Z`).
+- **World / Runtime Axes**: right-handed, `+Y` up, `+Z` forward for authored characters and directional assets (`yaw = 0` points along `+Z`).
 - **JSON Quaternions**: serialized as `[x, y, z, w]` arrays in content manifests (converted cleanly to/from `glm::quat(w, x, y, z)`).
 
 ---
@@ -24,7 +24,7 @@ Headers: [`src/gameplay_session.hpp`](../src/gameplay_session.hpp), [`src/gamepl
 2. **Stage 2 — Movement & Physics** (`AnimatedCharacterController` or `CharacterController`, `on_movement_physics`, `PhysicsWorld::step`, trigger & entity updates)
 3. **Stage 3 — Transforms & Child Attachments** (`RuntimeTransformRegistry::sync_outputs` updating live `CollisionWorld` colliders + `Renderer` transforms, `on_post_transforms`)
 4. **Stage 4 — Animation & IK** (`AnimatorRuntimeSystem::update` reading updated live world matrices, `on_post_animation`)
-5. **Stage 5 — Camera, Spatial Audio & UI Overlay** (`GameplayCameraRig` / `ThirdPersonCamera`, `GameOverlayCanvas`, `Renderer::set_game_overlay_vertices`, `AudioEngine` spatial sync from `RuntimeTransformRegistry`)
+5. **Stage 5 — Camera, Spatial Audio & UI Overlay** (`ThirdPersonCamera` or `GameplayUpdateContext::set_camera_pose` / `set_camera_angles` overrides, `GameOverlayCanvas`, `Renderer::set_game_overlay_vertices`, `AudioEngine` spatial sync from `RuntimeTransformRegistry`)
 
 ### Project Customization Hooks
 
@@ -33,8 +33,9 @@ Headers: [`src/gameplay_session.hpp`](../src/gameplay_session.hpp), [`src/gamepl
   - `disable_default_player_cube`: opt out of automatic cube creation.
   - `use_animated_character` & `animated_character_config`: switch on `AnimatedCharacterController`.
   - `spawn_position`, `spawn_yaw_radians`, `initial_input_context`.
+- `GameplaySession::set_default_camera_look_enabled(bool)` and `GameplayUpdateContext::suppress_default_camera_look`: allow project modules to suppress built-in `ThirdPersonCamera` mouse/stick orbit during cutscenes, custom cameras, or alternate control modes.
 - `GameplaySession::set_extension_callbacks(const GameplayExtensionCallbacks&)`:
-  - Stateless C function pointers + `void* user_data` for `on_start`, `on_stop`, `on_input_ai`, `on_movement_physics`, `on_post_transforms`, `on_post_animation`, `on_camera_audio_overlay`, `on_save_project_state`, `on_load_project_state`.
+  - Stateless C function pointers + `void* user_data` for `on_start`, `on_stop`, `on_input_ai`, `on_movement_physics`, `on_post_transforms`, `on_post_animation`, `on_camera_audio_overlay`, `on_save_project_state`, `on_load_project_state`, `on_query_debug_state`.
 - `GameStateSnapshot::custom_project_json`: persisted under `"project_state"` in save files via `save_game_state` / `load_game_state`.
 
 ---
@@ -44,11 +45,11 @@ Headers: [`src/gameplay_session.hpp`](../src/gameplay_session.hpp), [`src/gamepl
 Header: [`src/runtime_transform_registry.hpp`](../src/runtime_transform_registry.hpp)
 
 - Register runtime nodes (`register_node`, `register_node_pose`) and local sockets (`register_socket(owner, name, local_pose)`).
-- Attach rigid children (`attach_child`, `attach_child_to_socket`) for doors, wheels, headlights, or seated drivers with cycle detection.
+- Attach rigid children (`attach_child`, `attach_child_to_socket`) for articulated props, attachments, or mounted characters with cycle detection.
 - Query world transforms (`world_matrix`, `world_pose`, `socket_world_matrix`, `socket_world_pose`) or call `sync_outputs(&collision_world, &renderer_sink)` once after transform updates.
 
-Standard vehicle/character socket conventions:
-- `seat_driver`, `entry_driver`, `exit_driver`, `hand_l`, `hand_r`, `foot_l`, `foot_r`.
+Common socket naming conventions:
+- Character limbs & IK contacts: `hand_l`, `hand_r`, `foot_l`, `foot_r`, plus arbitrary project-defined mount sockets.
 
 ---
 
@@ -64,42 +65,26 @@ Headers: [`src/animated_character.hpp`](../src/animated_character.hpp), [`src/sk
 
 ---
 
-## 5. Vehicles, Occupancy & Cameras
+## 5. Physics & Action Input Contexts
 
-- **Vehicle Physics** ([`src/vehicle_controller.hpp`](../src/vehicle_controller.hpp)):
-  - `VehicleController` / `VehicleConfig::make_default_sedan`: 4-wheel raycast spring-damper suspension, lateral cornering grip + handbrake drift scaling, anti-roll bars, brake/reverse light flags, wheel spin/steer/compression, and engine RPM telemetry.
-  - Backed by extended `PhysicsWorld` APIs (`apply_central_force`, `apply_force_at_point`, `apply_torque`, `apply_impulse_at_point`, `point_velocity`, `set_body_enabled`, adaptive CFL substeps, and `ignored_node` raycasts).
-- **Vehicle Occupancy** ([`src/vehicle_interaction.hpp`](../src/vehicle_interaction.hpp)):
-  - `VehicleInteractionController`: manages `on_foot`, `entering_vehicle`, `driving`, `exiting_vehicle`.
-  - Evaluates `entry_driver` / `seat_driver` / `exit_driver` sockets, animates door opening angle, switches `desired_input_context()` (`gameplay` ↔ `vehicle`), toggles character collider via `CollisionWorld::set_collider_enabled`, and verifies `check_capsule_free` with fallback exit positions (staying in `driving` if all exits are blocked).
-- **Camera & Input** ([`src/vehicle_camera.hpp`](../src/vehicle_camera.hpp), [`src/input_actions.hpp`](../src/input_actions.hpp)):
-  - `VehicleCamera`: spring-damped chase camera with look-ahead, orbit auto-recenter, wall pull-in raycasts, and speed-based FOV boost.
-  - `GameplayCameraRig`: smooth transition blending between on-foot and vehicle modes.
-  - `InputActionSystem`: `InputContext::vehicle` with `vehicle_throttle`, `vehicle_brake`, `vehicle_steer_left`, `vehicle_steer_right`, `vehicle_handbrake`, `recover`, `quick_reset`, plus analog `vehicle_steer_axis()`, `vehicle_throttle_value()`, `vehicle_brake_value()`.
+Headers: [`src/physics_world.hpp`](../src/physics_world.hpp), [`src/input_actions.hpp`](../src/input_actions.hpp)
+
+- **PhysicsWorld**: rigid-body dynamics and raycasts (`apply_central_force`, `apply_force_at_point`, `apply_torque`, `apply_impulse_at_point`, `point_velocity`, `set_body_enabled`, adaptive CFL substeps, and `ignored_node` raycasts) reusable by arbitrary custom game controllers inside game modules.
+- **InputActionSystem**: context-isolated action/axis mapping (`InputContext::gameplay`, `InputContext::ui`, `InputContext::cutscene`, `InputContext::secondary`) with analog trigger/button values (`action_value(InputAction)`), normalized `move_axis()`, secondary-context 2D `secondary_axis()`, `look_delta()`, rumble motors, conflict detection, and JSON persistence.
 
 ---
 
-## 6. Pedestrian Crowd & City Traffic
-
-- **Pedestrian Crowd** ([`src/navigation_crowd.hpp`](../src/navigation_crowd.hpp)):
-  - `NavigationGraph` + `CrowdSystem`: preallocated budgeted agent simulation (`walk`, `wait_crosswalk`, `look_around`, `evade_threat`), neighbor separation, ground height snapping, and `SignalPassableFn` crosswalk queries.
-- **Signals & Traffic** ([`src/traffic_system.hpp`](../src/traffic_system.hpp)):
-  - `SignalIntersectionSystem` (`green -> yellow -> all_red` phases, `query_pedestrian_signal` helper).
-  - `LaneGraph` + `TrafficSystem`: IDM longitudinal following, red/yellow stop-line braking, obstacle emergency braking, far-agent recycling, and `release_vehicle_to_player(vehicle_id)` hijacking handoff.
-
----
-
-## 7. Materials & 2D/Projected UI Overlay
+## 6. Materials & 2D/Projected UI Overlay
 
 - **Glass Materials** ([`src/cooked_model_asset.hpp`](../src/cooked_model_asset.hpp)):
-  - `material_coverage_glass_bit` enables two-sided Fresnel sky reflection + Bayer screen-door transparency in forward/deferred/depth shaders and non-opaque ray-tracing BLAS handling.
+  - `material_coverage_glass_bit` marks architectural/prop dielectric glass for physical specular reflection/transmission rendering and non-opaque ray-tracing BLAS handling.
 - **UI Overlay Canvas** ([`src/game_overlay.hpp`](../src/game_overlay.hpp)):
   - `GameOverlayCanvas`: zero steady-state allocation 2D HUD renderer with ASCII + Cyrillic bitmap atlas (`pack_rgba8`, `draw_rect`, `draw_rect_outline`, `draw_line`, `draw_progress_bar`, `draw_arc`, `draw_text`, `measure_text`, `project_world_to_screen`).
   - Submitted automatically at the end of Stage 5 via `Renderer::set_game_overlay_vertices`.
 
 ---
 
-## 8. Content Manifests & Cooker CLI
+## 7. Content Manifests & Cooker CLI
 
 Headers/Tools: [`src/content_manifest.hpp`](../src/content_manifest.hpp), [`tools/vcr_content_cooker.cpp`](../tools/vcr_content_cooker.cpp)
 
@@ -114,7 +99,7 @@ Validates `version == 1` schemas (`asset_manifest.json`, `scene_layout.json`, `a
 
 ---
 
-## 9. C++ Game Module ABI v2 & SDK
+## 8. C++ Game Module ABI v2 & SDK
 
 Headers/CMake: [`src/game_module_api.hpp`](../src/game_module_api.hpp), [`src/game_module_loader.hpp`](../src/game_module_loader.hpp), [`cmake/VcrEngineSdk.cmake`](../cmake/VcrEngineSdk.cmake)
 

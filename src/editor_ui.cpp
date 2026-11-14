@@ -7361,6 +7361,7 @@ void EditorUi::build_audio_input_panel() {
                     "##InputContextCombo", to_token(current_ctx).data())) {
                 for (const InputContext candidate : {
                          InputContext::gameplay,
+                         InputContext::secondary,
                          InputContext::ui,
                          InputContext::cutscene}) {
                     if (ImGui::Selectable(

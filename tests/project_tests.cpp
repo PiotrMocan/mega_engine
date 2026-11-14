@@ -83,7 +83,7 @@ void require_true(
 
 void test_slug_and_scene_path_validation() {
     REQUIRE(vcr::make_project_folder_slug("My Cool Game!") == "my_cool_game");
-    REQUIRE(vcr::make_project_folder_slug("  Neon -- Night 2077  ") == "neon_night_2077");
+    REQUIRE(vcr::make_project_folder_slug("  Sample -- Game 2077  ") == "sample_game_2077");
     REQUIRE(vcr::make_project_folder_slug("!!!") == "new_project");
 
     REQUIRE(vcr::valid_project_scene_relative_path("scenes/editor_scene.json"));
@@ -95,10 +95,10 @@ void test_slug_and_scene_path_validation() {
     REQUIRE(!vcr::valid_project_scene_relative_path("scenes\\editor_scene.json"));
     REQUIRE(!vcr::valid_project_scene_relative_path("/scenes/editor_scene.json"));
 
-    REQUIRE(vcr::default_project_executable_filename("Neon City") == "neon_city.exe");
-    REQUIRE(vcr::valid_project_executable_filename("neon_city.exe"));
-    REQUIRE(!vcr::valid_project_executable_filename("dir/neon_city.exe"));
-    REQUIRE(!vcr::valid_project_executable_filename("neon_city.txt"));
+    REQUIRE(vcr::default_project_executable_filename("Sample Game") == "sample_game.exe");
+    REQUIRE(vcr::valid_project_executable_filename("sample_game.exe"));
+    REQUIRE(!vcr::valid_project_executable_filename("dir/sample_game.exe"));
+    REQUIRE(!vcr::valid_project_executable_filename("sample_game.txt"));
     REQUIRE(vcr::valid_project_icon_relative_path("icon.ico"));
     REQUIRE(!vcr::valid_project_icon_relative_path("../icon.ico"));
     REQUIRE(!vcr::valid_project_icon_relative_path("icon.png"));
@@ -297,10 +297,10 @@ void test_empty_template_and_registry_lifecycle() {
 
 void test_cli_project_option() {
     {
-        const char* argv[] = {"vulkan_cube", "--project", "projects/neon_night_city"};
+        const char* argv[] = {"vulkan_cube", "--project", "projects/sample_game"};
         const vcr::CliParseResult parsed = vcr::parse_cli_options(3, argv);
         REQUIRE_MSG(static_cast<bool>(parsed), parsed.error);
-        REQUIRE(parsed.options.project_path == "projects/neon_night_city");
+        REQUIRE(parsed.options.project_path == "projects/sample_game");
     }
     {
         const char* argv[] = {"vulkan_cube", "--project"};

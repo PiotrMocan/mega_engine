@@ -6,14 +6,9 @@
 #include "gameplay_framework.hpp"
 #include "gameplay_session.hpp"
 #include "input_actions.hpp"
-#include "navigation_crowd.hpp"
 #include "physics_world.hpp"
 #include "runtime_transform_registry.hpp"
 #include "scene_document.hpp"
-#include "traffic_system.hpp"
-#include "vehicle_camera.hpp"
-#include "vehicle_controller.hpp"
-#include "vehicle_interaction.hpp"
 
 #include <glm/gtc/matrix_access.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -225,40 +220,40 @@ void test_content_manifests_and_cooker(const std::filesystem::path& root) {
     const std::filesystem::path export_dir = root / "content_export";
     const std::filesystem::path cooked_dir = root / "content_cooked";
     expect(
-        write_minimal_triangle_glb(export_dir / "models" / "sedan.glb"),
+        write_minimal_triangle_glb(export_dir / "models" / "robot_chassis.glb"),
         "Write minimal GLB fixture");
     expect(
-        write_minimal_triangle_glb(export_dir / "models" / "sedan_lod1.glb"),
+        write_minimal_triangle_glb(export_dir / "models" / "robot_chassis_lod1.glb"),
         "Write LOD1 GLB fixture");
     expect(
-        write_minimal_triangle_glb(export_dir / "models" / "wheel.glb"),
-        "Write wheel GLB fixture");
+        write_minimal_triangle_glb(export_dir / "models" / "rotor.glb"),
+        "Write rotor GLB fixture");
 
     const nlohmann::json asset_json = {
         {"version", 1},
         {"assets", {
-            {{"id", "wheel_std"},
+            {{"id", "rotor_std"},
              {"type", "prop"},
-             {"file", "models/wheel.glb"}},
-            {{"id", "sedan_city"},
-             {"type", "vehicle"},
-             {"file", "models/sedan.glb"},
-             {"lods", {{{"level", 1}, {"file", "models/sedan_lod1.glb"}}}},
-             {"parts", {{{"name", "wheel_fl"},
-                         {"asset_id", "wheel_std"},
+             {"file", "models/rotor.glb"}},
+            {{"id", "robot_unit"},
+             {"type", "character"},
+             {"file", "models/robot_chassis.glb"},
+             {"lods", {{{"level", 1}, {"file", "models/robot_chassis_lod1.glb"}}}},
+             {"parts", {{{"name", "arm_left"},
+                         {"asset_id", "rotor_std"},
                          {"position", {-0.85, 0.34, 1.35}},
                          {"rotation_xyzw", {0.0, 0.0, 0.0, 1.0}},
                          {"scale", {1.0, 1.0, 1.0}}}}},
              {"sockets", {
-                 {{"name", "seat_driver"},
+                 {{"name", "mount_primary"},
                   {"position", {-0.42, 0.55, 0.10}},
                   {"rotation_xyzw", {0.0, 0.0, 0.0, 1.0}}},
-                 {{"name", "exit_driver"},
+                 {{"name", "exit_point"},
                   {"position", {-1.45, 0.0, 0.10}},
                   {"rotation_xyzw", {0.0, 0.0, 0.0, 1.0}}}
              }},
              {"colliders", {{{"shape", "box"},
-                             {"name", "chassis"},
+                             {"name", "torso"},
                              {"position", {0.0, 0.7, 0.0}},
                              {"size", {1.9, 1.2, 4.4}},
                              {"rotation_xyzw", {0.0, 0.0, 0.0, 1.0}},
@@ -269,31 +264,31 @@ void test_content_manifests_and_cooker(const std::filesystem::path& root) {
     const nlohmann::json layout_json = {
         {"version", 1},
         {"instances", {
-            {{"id", "car_01"},
-             {"asset_id", "sedan_city"},
+            {{"id", "unit_01"},
+             {"asset_id", "robot_unit"},
              {"position", {4.0, 0.0, -6.0}},
              {"rotation_xyzw", {0.0, 0.0, 0.0, 1.0}},
              {"scale", {1.0, 1.0, 1.0}}}
         }},
         {"markers", {
-            {{"id", "lane_0"},
-             {"kind", "traffic_lane"},
+            {{"id", "wp_0"},
+             {"kind", "patrol_waypoint"},
              {"position", {0.0, 0.0, 0.0}},
              {"rotation_xyzw", {0.0, 0.0, 0.0, 1.0}},
-             {"links", {"lane_1"}},
-             {"group", "north_south"}},
-            {{"id", "lane_1"},
-             {"kind", "traffic_lane"},
+             {"links", {"wp_1"}},
+             {"group", "sector_alpha"}},
+            {{"id", "wp_1"},
+             {"kind", "patrol_waypoint"},
              {"position", {0.0, 0.0, 30.0}},
              {"rotation_xyzw", {0.0, 0.0, 0.0, 1.0}},
              {"links", nlohmann::json::array()},
-             {"group", "north_south"}}
+             {"group", "sector_alpha"}}
         }}
     };
     const nlohmann::json anim_json = {
         {"version", 1},
         {"clips", {
-            {{"asset_id", "sedan_city"},
+            {{"asset_id", "robot_unit"},
              {"name", "walk_loop"},
              {"loop", true},
              {"root_motion", true},
@@ -363,49 +358,49 @@ void test_runtime_transform_registry() {
     vcr::RuntimeTransformRegistry reg;
     reg.reserve(8U);
 
-    constexpr vcr::SceneNodeId vehicle{1U, 1U};
-    constexpr vcr::SceneNodeId door{2U, 1U};
-    constexpr vcr::SceneNodeId wheel{3U, 1U};
-    constexpr vcr::SceneNodeId driver{4U, 1U};
-    constexpr vcr::SceneNodeId headlight{5U, 1U};
+    constexpr vcr::SceneNodeId rig_root{1U, 1U};
+    constexpr vcr::SceneNodeId arm_left{2U, 1U};
+    constexpr vcr::SceneNodeId rotor{3U, 1U};
+    constexpr vcr::SceneNodeId payload{4U, 1U};
+    constexpr vcr::SceneNodeId beacon{5U, 1U};
 
     expect(
-        reg.register_node_pose(vehicle, {.position = {10.0F, 0.5F, 2.0F}}) &&
-            reg.register_node(door) &&
-            reg.register_node(wheel) &&
-            reg.register_node(driver) &&
-            reg.register_node(headlight),
-        "Register vehicle hierarchy nodes");
+        reg.register_node_pose(rig_root, {.position = {10.0F, 0.5F, 2.0F}}) &&
+            reg.register_node(arm_left) &&
+            reg.register_node(rotor) &&
+            reg.register_node(payload) &&
+            reg.register_node(beacon),
+        "Register rig hierarchy nodes");
     expect(
         reg.register_socket(
-            vehicle,
-            "seat_driver",
+            rig_root,
+            "mount_socket",
             vcr::RuntimePose{.position = {-0.4F, 0.6F, 0.2F}}) &&
-            reg.attach_child(door, vehicle, {.position = {-0.95F, 0.5F, 0.3F}}) &&
-            reg.attach_child(wheel, vehicle, {.position = {-0.85F, -0.2F, 1.3F}}) &&
-            reg.attach_child(headlight, vehicle, {.position = {0.65F, 0.4F, 2.1F}}) &&
-            reg.attach_child_to_socket(driver, vehicle, "seat_driver"),
-        "Attach driver to socket and door/wheel/headlight to chassis");
+            reg.attach_child(arm_left, rig_root, {.position = {-0.95F, 0.5F, 0.3F}}) &&
+            reg.attach_child(rotor, rig_root, {.position = {-0.85F, -0.2F, 1.3F}}) &&
+            reg.attach_child(beacon, rig_root, {.position = {0.65F, 0.4F, 2.1F}}) &&
+            reg.attach_child_to_socket(payload, rig_root, "mount_socket"),
+        "Attach payload to socket and child parts to rig root");
     // Cycle detection check
-    expect(!reg.attach_child(vehicle, driver), "Cycle attachment rejected");
+    expect(!reg.attach_child(rig_root, payload), "Cycle attachment rejected");
 
-    // Rotate vehicle 90 deg around +Y (PI/2)
+    // Rotate rig root 90 deg around +Y (PI/2)
     const glm::quat yaw_90 =
         glm::angleAxis(glm::radians(90.0F), glm::vec3{0.0F, 1.0F, 0.0F});
     expect(
         reg.set_world_pose(
-            vehicle,
+            rig_root,
             vcr::RuntimePose{.position = {10.0F, 0.5F, 2.0F}, .rotation = yaw_90}),
-        "Rotate parent vehicle 90 degrees");
+        "Rotate parent rig 90 degrees");
 
     vcr::CollisionWorld collision;
     collision.upsert_box_collider(
-        vehicle, {0.0F, 0.0F, 0.0F}, glm::mat3(1.0F), {1.0F, 0.7F, 2.2F});
+        rig_root, {0.0F, 0.0F, 0.0F}, glm::mat3(1.0F), {1.0F, 0.7F, 2.2F});
     collision.upsert_box_collider(
-        headlight, {0.0F, 0.0F, 0.0F}, glm::mat3(1.0F), {0.1F, 0.1F, 0.1F});
+        beacon, {0.0F, 0.0F, 0.0F}, glm::mat3(1.0F), {0.1F, 0.1F, 0.1F});
 
     struct SinkCapture {
-        glm::vec3 driver_pos{};
+        glm::vec3 payload_pos{};
         std::uint32_t count = 0U;
     } capture{};
     vcr::RuntimeTransformSink sink{
@@ -414,31 +409,31 @@ void test_runtime_transform_registry() {
             auto* cap = static_cast<SinkCapture*>(ctx);
             ++cap->count;
             if (id.index == 4U) {
-                cap->driver_pos = {rows.x.w, rows.y.w, rows.z.w};
+                cap->payload_pos = {rows.x.w, rows.y.w, rows.z.w};
             }
             return true;
         },
     };
 
     reg.sync_outputs(&collision, &sink);
-    const auto drv_pose = reg.world_pose(driver);
-    const auto sock_pose = reg.socket_world_pose(vehicle, "seat_driver");
+    const auto payload_pose = reg.world_pose(payload);
+    const auto sock_pose = reg.socket_world_pose(rig_root, "mount_socket");
     expect(
-        drv_pose.has_value() && sock_pose.has_value() &&
-            close_to(drv_pose->position.x, sock_pose->position.x) &&
-            close_to(drv_pose->position.x, 10.2F, 0.02F) &&
-            close_to(drv_pose->position.z, 2.4F, 0.02F) &&
-            close_to(capture.driver_pos.x, sock_pose->position.x, 0.02F) &&
+        payload_pose.has_value() && sock_pose.has_value() &&
+            close_to(payload_pose->position.x, sock_pose->position.x) &&
+            close_to(payload_pose->position.x, 10.2F, 0.02F) &&
+            close_to(payload_pose->position.z, 2.4F, 0.02F) &&
+            close_to(capture.payload_pos.x, sock_pose->position.x, 0.02F) &&
             capture.count == 5U,
         "Socket attachment propagates parent +90deg Y rotation accurately");
 
-    // Confirm headlight dynamic collider moved with chassis
+    // Confirm beacon dynamic collider moved with rig root
     const auto ray_hit = collision.raycast(
         {12.1F, 0.9F, 1.35F},
         {0.0F, 0.0F, -1.0F},
         2.0F);
     expect(
-        ray_hit.has_value() && ray_hit->node_id == headlight,
+        ray_hit.has_value() && ray_hit->node_id == beacon,
         "CollisionWorld dynamic collider tracks RuntimeTransformRegistry child pose");
 }
 
@@ -565,412 +560,7 @@ void test_animated_character_controller() {
 }
 
 // -----------------------------------------------------------------------------
-// 4. VehicleController
-// -----------------------------------------------------------------------------
-void test_vehicle_controller() {
-    vcr::SceneDocument scene;
-    const vcr::SceneNodeId ground_id =
-        scene.create_node("Road", vcr::SceneNodeKind::cube);
-    scene.node(ground_id)->get().transform.translation = {0.0F, -0.5F, 0.0F};
-    scene.node(ground_id)->get().transform.scale = {80.0F, 0.5F, 80.0F};
-    static_cast<void>(scene.set_collider(ground_id, vcr::ColliderComponent{}));
-
-    const vcr::SceneNodeId car_id =
-        scene.create_node("Sedan", vcr::SceneNodeKind::cube);
-    scene.node(car_id)->get().transform.translation = {0.0F, 0.65F, 0.0F};
-    scene.node(car_id)->get().transform.scale = {0.95F, 0.35F, 2.2F};
-    vcr::RigidBodyComponent rb{};
-    rb.motion_type = vcr::RigidBodyMotionType::dynamic;
-    rb.mass = 1350.0F;
-    static_cast<void>(scene.set_rigid_body(car_id, rb));
-    static_cast<void>(scene.set_collider(car_id, vcr::ColliderComponent{}));
-
-    vcr::CollisionWorld collision;
-    collision.rebuild_from_scene(scene, {}, {}, {}, true);
-    vcr::PhysicsWorld physics;
-    physics.rebuild_from_scene(scene, {}, {}, {});
-
-    const vcr::VehicleConfig vcfg = vcr::VehicleController::make_default_sedan(car_id);
-    vcr::VehicleController vehicle(vcfg);
-    vehicle.reset(physics, {0.0F, 0.65F, 0.0F}, {1.0F, 0.0F, 0.0F, 0.0F});
-
-    const float dt = 1.0F / 60.0F;
-    for (int i = 0; i < 45; ++i) {
-        vehicle.update(vcr::VehicleControlInput{}, dt, physics, &collision);
-        physics.step(dt, collision);
-    }
-    expect(
-        vehicle.telemetry().any_wheel_grounded &&
-            vehicle.telemetry().world_position.y > 0.1F &&
-            vehicle.telemetry().world_position.y < 1.5F,
-        "Vehicle settles smoothly onto 4-wheel raycast suspension");
-
-    // Throttle acceleration + steering (2.0s so 1450kg sedan exceeds 7.8 m/s / 15% RPM)
-    for (int i = 0; i < 120; ++i) {
-        vehicle.update(
-            vcr::VehicleControlInput{.throttle = 1.0F, .steer = 0.35F},
-            dt,
-            physics,
-            &collision);
-        physics.step(dt, collision);
-    }
-    if (!(vehicle.telemetry().forward_speed_mps > 3.5F &&
-          vehicle.telemetry().normalized_rpm > 0.15F &&
-          !vehicle.telemetry().braking_lights)) {
-        std::fprintf(
-            stderr,
-            "Vehicle diag: grounded=%d pos=(%.2f,%.2f,%.2f) fwd_speed=%.2f rpm=%.3f\n",
-            static_cast<int>(vehicle.telemetry().any_wheel_grounded),
-            vehicle.telemetry().world_position.x,
-            vehicle.telemetry().world_position.y,
-            vehicle.telemetry().world_position.z,
-            vehicle.telemetry().forward_speed_mps,
-            vehicle.telemetry().normalized_rpm);
-    }
-    expect(
-        vehicle.telemetry().forward_speed_mps > 3.5F &&
-            vehicle.telemetry().normalized_rpm > 0.15F &&
-            !vehicle.telemetry().braking_lights,
-        "Vehicle accelerates forward under throttle with RPM telemetry");
-
-    // Brake & brake lights
-    const float speed_before_brake = vehicle.telemetry().forward_speed_mps;
-    for (int i = 0; i < 30; ++i) {
-        vehicle.update(
-            vcr::VehicleControlInput{.brake_reverse = 1.0F, .handbrake = true},
-            dt,
-            physics,
-            &collision);
-        physics.step(dt, collision);
-    }
-    expect(
-        vehicle.telemetry().forward_speed_mps < speed_before_brake &&
-            vehicle.telemetry().braking_lights,
-        "Vehicle decelerates under brake and activates braking_lights");
-}
-
-// -----------------------------------------------------------------------------
-// 5. VehicleInteractionController
-// -----------------------------------------------------------------------------
-void test_vehicle_interaction() {
-    vcr::CollisionWorld world;
-    world.upsert_box_collider(
-        vcr::SceneNodeId{1U, 1U},
-        {0.0F, -0.5F, 0.0F},
-        glm::mat3(1.0F),
-        {30.0F, 0.5F, 30.0F});
-
-    const vcr::SceneNodeId char_node{2U, 1U};
-    const vcr::SceneNodeId car_node{3U, 1U};
-    vcr::AnimatedCharacterConfig ccfg{};
-    ccfg.character_node = char_node;
-    vcr::AnimatedCharacterController character(ccfg);
-    character.reset({-1.6F, 0.0F, 0.0F}, 0.0F);
-
-    vcr::VehicleSeatTarget target{};
-    target.vehicle_node = car_node;
-    target.enter_duration_seconds = 0.30F;
-    target.exit_duration_seconds = 0.25F;
-
-    vcr::VehicleSocketTransforms sockets{};
-    sockets.vehicle_world = glm::mat4(1.0F);
-    sockets.seat_driver_world =
-        glm::translate(glm::mat4(1.0F), {-0.45F, 0.55F, 0.1F});
-    sockets.entry_driver_world =
-        glm::translate(glm::mat4(1.0F), {-1.45F, 0.0F, 0.1F});
-    sockets.exit_driver_world = sockets.entry_driver_world;
-    sockets.has_seat = true;
-    sockets.has_entry = true;
-    sockets.has_exit = true;
-
-    vcr::VehicleInteractionController interact;
-    expect(
-        interact.state() == vcr::VehicleOccupancyState::on_foot &&
-            interact.desired_input_context() == vcr::InputContext::gameplay,
-        "VehicleInteraction starts on_foot with gameplay InputContext");
-
-    // Begin entering
-    interact.update(
-        true, 1.0F / 60.0F, character.world_position(), char_node, target, sockets, &world, &character);
-    expect(
-        interact.state() == vcr::VehicleOccupancyState::entering_vehicle &&
-            interact.door_open_angle_radians() >= 0.0F,
-        "Pressing interact near driver socket enters EnteringVehicle");
-
-    // Advance until Driving
-    for (int i = 0; i < 30; ++i) {
-        interact.update(
-            false, 1.0F / 60.0F, character.world_position(), char_node, target, sockets, &world, &character);
-    }
-    expect(
-        interact.is_driving() &&
-            interact.desired_input_context() == vcr::InputContext::vehicle &&
-            !character.movement_enabled() &&
-            interact.ik_targets().valid,
-        "Reaches Driving with InputContext::vehicle and disables on-foot movement");
-
-    // Block ALL exit points around the vehicle -> exit MUST safely stay in driving
-    const vcr::SceneNodeId blocker_node{4U, 1U};
-    world.upsert_box_collider(
-        blocker_node, {0.0F, 1.0F, 0.0F}, glm::mat3(1.0F), {6.0F, 1.5F, 6.0F});
-    interact.update(
-        true, 1.0F / 60.0F, character.world_position(), char_node, target, sockets, &world, &character);
-    expect(
-        interact.state() == vcr::VehicleOccupancyState::driving,
-        "All exits blocked refuses exit and keeps player in Driving state");
-
-    // Disable blocker -> clean exit succeeds
-    world.set_collider_enabled(blocker_node, false);
-    interact.update(
-        true, 1.0F / 60.0F, character.world_position(), char_node, target, sockets, &world, &character);
-    expect(
-        interact.state() == vcr::VehicleOccupancyState::exiting_vehicle,
-        "Clear exit starts ExitingVehicle transition");
-    for (int i = 0; i < 30; ++i) {
-        interact.update(
-            false, 1.0F / 60.0F, character.world_position(), char_node, target, sockets, &world, &character);
-    }
-    expect(
-        interact.state() == vcr::VehicleOccupancyState::on_foot &&
-            interact.desired_input_context() == vcr::InputContext::gameplay &&
-            character.movement_enabled(),
-        "Completing exit returns to on_foot with gameplay context and re-enabled movement");
-}
-
-// -----------------------------------------------------------------------------
-// 6. VehicleCamera & GameplayCameraRig
-// -----------------------------------------------------------------------------
-void test_vehicle_camera_and_rig() {
-    vcr::CollisionWorld world;
-    // Wall right behind vehicle at z = -3.0
-    world.upsert_box_collider(
-        vcr::SceneNodeId{1U, 1U},
-        {0.0F, 1.5F, -3.2F},
-        glm::mat3(1.0F),
-        {10.0F, 2.0F, 0.5F});
-
-    vcr::VehicleCamera vcam;
-    vcam.reset({0.0F, 0.5F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 1.0F, 0.0F});
-    for (int i = 0; i < 40; ++i) {
-        vcam.update(
-            {0.0F, 0.5F, 0.0F},
-            {0.0F, 0.0F, 1.0F},
-            {0.0F, 1.0F, 0.0F},
-            {0.0F, 0.0F, 30.0F},
-            0.0F,
-            0.0F,
-            1.0F / 60.0F,
-            &world);
-    }
-    expect(
-        vcam.position().z > -2.75F &&
-            vcam.recommended_fov_degrees() > vcam.config().fov_base_degrees,
-        "VehicleCamera pulls in before rear wall and expands FOV at speed");
-
-    vcr::GameplayCameraRig rig;
-    rig.reset({-3.0F, 2.0F, -2.0F}, {0.0F, 0.0F, 1.0F}, 68.0F);
-    rig.switch_to_vehicle(0.30F);
-    expect(
-        rig.mode() == vcr::CameraRigMode::transitioning_to_vehicle &&
-            rig.is_transitioning(),
-        "GameplayCameraRig begins smooth transition to vehicle");
-    for (int i = 0; i < 30; ++i) {
-        rig.update(
-            {-3.0F, 2.0F, -2.0F},
-            {0.0F, 0.0F, 1.0F},
-            68.0F,
-            vcam,
-            1.0F / 60.0F,
-            &world);
-    }
-    expect(
-        rig.mode() == vcr::CameraRigMode::driving && !rig.is_transitioning(),
-        "GameplayCameraRig settles into driving mode after blend duration");
-}
-
-// -----------------------------------------------------------------------------
-// 7. NavigationGraph & CrowdSystem
-// -----------------------------------------------------------------------------
-void test_navigation_crowd() {
-    vcr::NavigationGraph nav;
-    const auto n0 = nav.add_node({.position = {0.0F, 0.0F, 0.0F}});
-    const auto n1 = nav.add_node({.position = {0.0F, 0.0F, 2.0F}});
-    const auto n2 = nav.add_node({.position = {0.0F, 0.0F, 12.0F}});
-    nav.add_edge({
-        .from_node = n0,
-        .to_node = n1,
-        .bidirectional = false,
-        .is_crosswalk = false,
-        .signal_group_id = 0U,
-        .speed_limit_mps = 1.5F,
-    });
-    nav.add_edge({
-        .from_node = n1,
-        .to_node = n2,
-        .bidirectional = false,
-        .is_crosswalk = true,
-        .signal_group_id = 1U,
-        .speed_limit_mps = 1.5F,
-    });
-    expect(nav.build(), "NavigationGraph builds adjacency lists");
-
-    bool ped_green = false;
-    const auto signal_cb = +[](std::uint32_t, void* ud) noexcept -> bool {
-        return *static_cast<const bool*>(ud);
-    };
-
-    vcr::CrowdConfig cfg{};
-    cfg.max_agents = 8U;
-    cfg.max_updates_per_tick = 8U;
-    vcr::CrowdSystem crowd;
-    crowd.initialize(cfg, nav);
-    const auto agent_id = crowd.spawn_agent(n0);
-    expect(agent_id.has_value() && crowd.active_agent_count() == 1U, "Spawn crowd agent");
-
-    // Advance while crosswalk light is red -> agent waits at n1
-    for (int i = 0; i < 120; ++i) {
-        crowd.update(1.0F / 30.0F, nav, {}, signal_cb, &ped_green);
-    }
-    expect(
-        crowd.agents()[0].state == vcr::CrowdAgentState::wait_crosswalk &&
-            crowd.agents()[0].position.z <= 2.9F,
-        "Pedestrian waits at crosswalk when signal is red");
-
-    // Turn green -> agent crosses toward n2
-    ped_green = true;
-    for (int i = 0; i < 60; ++i) {
-        crowd.update(1.0F / 30.0F, nav, {}, signal_cb, &ped_green);
-    }
-    expect(
-        crowd.agents()[0].position.z > 2.5F,
-        "Pedestrian proceeds across crosswalk once signal turns green");
-
-    // Approaching fast vehicle triggers evade_threat
-    const std::array<vcr::CrowdThreat, 1U> threats{{
-        vcr::CrowdThreat{
-            .position = crowd.agents()[0].position + glm::vec3{0.0F, 0.0F, 3.5F},
-            .velocity = {0.0F, 0.0F, -12.0F},
-            .radius = 2.0F,
-        },
-    }};
-    crowd.update(1.0F / 30.0F, nav, threats, signal_cb, &ped_green);
-    expect(
-        crowd.agents()[0].state == vcr::CrowdAgentState::evade_threat,
-        "Approaching fast vehicle triggers pedestrian evade_threat state");
-}
-
-// -----------------------------------------------------------------------------
-// 8. SignalIntersectionSystem, LaneGraph & TrafficSystem
-// -----------------------------------------------------------------------------
-void test_traffic_and_signals() {
-    vcr::SignalIntersectionSystem signals;
-    const std::array<vcr::SignalPhaseConfig, 2U> phases{{
-        vcr::SignalPhaseConfig{
-            .active_vehicle_group = 1U,
-            .active_pedestrian_group = 2U,
-            .green_seconds = 5.0F,
-            .yellow_seconds = 2.0F,
-            .all_red_seconds = 1.0F,
-        },
-        vcr::SignalPhaseConfig{
-            .active_vehicle_group = 2U,
-            .active_pedestrian_group = 1U,
-            .green_seconds = 5.0F,
-            .yellow_seconds = 2.0F,
-            .all_red_seconds = 1.0F,
-        },
-    }};
-    signals.configure(phases);
-    expect(
-        signals.vehicle_signal(1U) == vcr::SignalAspect::green &&
-            signals.vehicle_signal(2U) == vcr::SignalAspect::red &&
-            signals.pedestrian_can_cross(2U) &&
-            !signals.pedestrian_can_cross(1U),
-        "Signal phase 0 sets group 1 vehicle green and ped 2 green");
-
-    vcr::LaneGraph lanes;
-    const auto ln0 = lanes.add_node({.position = {0.0F, 0.0F, 0.0F}, .forward = {0.0F, 0.0F, 1.0F}});
-    const auto ln1 = lanes.add_node({.position = {0.0F, 0.0F, 40.0F}, .forward = {0.0F, 0.0F, 1.0F}});
-    const auto ln2 = lanes.add_node({.position = {0.0F, 0.0F, 90.0F}, .forward = {0.0F, 0.0F, 1.0F}});
-    const auto s0 = lanes.add_segment({
-        .start_node = ln0,
-        .end_node = ln1,
-        .speed_limit_mps = 12.0F,
-        .has_stop_line = true,
-        .stop_line_offset_from_end = 2.0F,
-        .signal_group_id = 2U, // RED initially!
-        .next_segments = {1U, 0U, 0U, 0U},
-        .next_count = 1U,
-    });
-    const auto s1 = lanes.add_segment({
-        .start_node = ln1,
-        .end_node = ln2,
-        .speed_limit_mps = 12.0F,
-        .has_stop_line = false,
-        .signal_group_id = 2U,
-        .next_segments = {0U, 0U, 0U, 0U},
-        .next_count = 1U,
-    });
-    static_cast<void>(s1);
-    expect(lanes.build(), "LaneGraph builds connected segments");
-
-    vcr::TrafficSystem traffic;
-    traffic.initialize(vcr::TrafficConfig{.max_vehicles = 4U}, lanes);
-    const auto tv_id = traffic.spawn_vehicle(s0, 20.0F, vcr::SceneNodeId{50U, 1U});
-    expect(tv_id.has_value() && traffic.active_vehicle_count() == 1U, "Spawn traffic vehicle");
-
-    // Signal group 2 is RED -> vehicle must stop before stop line (z = 38.0)
-    for (int i = 0; i < 210; ++i) {
-        traffic.update(1.0F / 30.0F, lanes, &signals);
-    }
-    if (!(traffic.vehicles()[0].position.z <= 38.5F &&
-          traffic.vehicles()[0].speed_mps < 0.5F)) {
-        std::fprintf(
-            stderr,
-            "Traffic red diag: pos_z=%.2f speed=%.2f throttle=%.2f brake=%.2f\n",
-            traffic.vehicles()[0].position.z,
-            traffic.vehicles()[0].speed_mps,
-            traffic.vehicles()[0].throttle,
-            traffic.vehicles()[0].brake);
-    }
-    expect(
-        traffic.vehicles()[0].position.z <= 38.5F &&
-            traffic.vehicles()[0].speed_mps < 0.5F,
-        "Traffic vehicle brakes cleanly before red stop line");
-
-    // Advance signals into phase 1 (group 2 green)
-    signals.update(8.5F);
-    expect(
-        signals.vehicle_signal(2U) == vcr::SignalAspect::green,
-        "Signals cycle into phase 1 green for group 2");
-    for (int i = 0; i < 60; ++i) {
-        traffic.update(1.0F / 30.0F, lanes, &signals);
-    }
-    expect(
-        traffic.vehicles()[0].speed_mps > 2.0F,
-        "Traffic vehicle accelerates past stop line on green");
-
-    // Obstacle ahead -> brake!
-    const std::array<vcr::TrafficObstacle, 1U> obs{{
-        vcr::TrafficObstacle{
-            .position = traffic.vehicles()[0].position + glm::vec3{0.0F, 0.0F, 4.0F},
-            .radius = 0.8F,
-        },
-    }};
-    traffic.update(1.0F / 30.0F, lanes, &signals, obs);
-    expect(
-        traffic.vehicles()[0].brake > 0.1F && traffic.vehicles()[0].brake_lights,
-        "Traffic vehicle brakes for ahead obstacle");
-
-    // Release vehicle to player
-    expect(
-        traffic.release_vehicle_to_player(*tv_id) &&
-            traffic.active_vehicle_count() == 0U,
-        "release_vehicle_to_player hands control out of TrafficSystem");
-}
-
-// -----------------------------------------------------------------------------
-// 9. GameOverlayCanvas
+// 4. GameOverlayCanvas
 // -----------------------------------------------------------------------------
 void test_game_overlay_canvas() {
     vcr::GameOverlayCanvas canvas;
@@ -988,7 +578,7 @@ void test_game_overlay_canvas() {
         1.0F);
     canvas.draw_text(
         {20.0F, 80.0F},
-        "HP: 100% / Сесть [E]",
+        "HP: 100% / Действие [E]",
         1.5F,
         vcr::pack_rgba8(255U, 255U, 255U));
     expect(
@@ -1140,10 +730,23 @@ void test_gameplay_session_hooks_and_lifecycle(const std::filesystem::path& root
         hook_state.stopped && !session.active() && cleared_poses,
         "GameplaySession stop fires on_stop and clears poses via GameplayRendererBridge");
 
-    // Repeated start/stop sanity
+    // Repeated start/stop sanity + default camera look suppression
     expect(
         session.start(scene, empty_view, startup_cam, out_cam, error),
         "GameplaySession supports repeated start after stop");
+    const float yaw_before_suppressed_look = session.third_person_camera().yaw();
+    vcr::GameplayExtensionCallbacks look_suppress_cb = session.extension_callbacks();
+    look_suppress_cb.on_input_ai = +[](void*, vcr::GameplaySession&, vcr::GameplayUpdateContext& ctx) noexcept {
+        ctx.suppress_default_camera_look = true;
+    };
+    session.set_extension_callbacks(look_suppress_cb);
+    vcr::GameplayFrameInput look_in{};
+    look_in.mouse_delta_x = 120.0F;
+    look_in.mouse_delta_y = -40.0F;
+    expect(
+        session.update_headless(look_in, 1.0F / 60.0F, scene, out_cam) &&
+            close_to(session.third_person_camera().yaw(), yaw_before_suppressed_look, 1.0e-5F),
+        "GameplayUpdateContext::suppress_default_camera_look freezes built-in ThirdPersonCamera rotation");
     session.stop();
 }
 
@@ -1154,19 +757,19 @@ void test_smoothness_and_collider_offset_regressions() {
     // 1. ColliderWorld::update_collider_transform preserves center_offset and ground slab offset.
     vcr::SceneDocument scene;
     const vcr::SceneNodeId ground_id =
-        scene.create_node("CityGround", vcr::SceneNodeKind::ground);
+        scene.create_node("GroundSlab", vcr::SceneNodeKind::ground);
     scene.node(ground_id)->get().transform.translation = {0.0F, 0.0F, 0.0F};
     scene.node(ground_id)->get().transform.scale = {40.0F, 1.0F, 40.0F};
     static_cast<void>(scene.set_collider(
         ground_id,
         vcr::ColliderComponent{.center_offset = {0.0F, -0.08F, 0.0F}}));
 
-    const vcr::SceneNodeId sidewalk_id =
-        scene.create_node("Sidewalk", vcr::SceneNodeKind::cube);
-    scene.node(sidewalk_id)->get().transform.translation = {0.0F, 0.0F, 0.0F};
-    scene.node(sidewalk_id)->get().transform.scale = {3.0F, 1.0F, 4.0F};
+    const vcr::SceneNodeId platform_id =
+        scene.create_node("RaisedPlatform", vcr::SceneNodeKind::cube);
+    scene.node(platform_id)->get().transform.translation = {0.0F, 0.0F, 0.0F};
+    scene.node(platform_id)->get().transform.scale = {3.0F, 1.0F, 4.0F};
     static_cast<void>(scene.set_collider(
-        sidewalk_id,
+        platform_id,
         vcr::ColliderComponent{
             .center_offset = {0.0F, 0.075F, 0.0F},
             .half_extents = {1.0F, 0.075F, 1.0F},
@@ -1189,23 +792,23 @@ void test_smoothness_and_collider_offset_regressions() {
     }
     registry.sync_outputs(&collision, nullptr);
 
-    // Move sidewalk by +0.5 in X to force dirty collider transform update too.
+    // Move platform by +0.5 in X to force dirty collider transform update too.
     expect(
         registry.set_world_pose(
-            sidewalk_id,
+            platform_id,
             vcr::RuntimePose{.position = {0.5F, 0.0F, 0.0F}, .scale = {3.0F, 1.0F, 4.0F}}),
-        "Update sidewalk world pose in RuntimeTransformRegistry");
+        "Update platform world pose in RuntimeTransformRegistry");
     registry.sync_outputs(&collision, nullptr);
 
     const auto ground_hit = collision.raycast(
         {8.0F, 2.0F, 0.0F}, {0.0F, -1.0F, 0.0F}, 10.0F, 0xFFFFFFFFU, false);
-    const auto sidewalk_hit = collision.raycast(
+    const auto platform_hit = collision.raycast(
         {0.5F, 2.0F, 0.0F}, {0.0F, -1.0F, 0.0F}, 10.0F, 0xFFFFFFFFU, false);
     expect(
         ground_hit.has_value() && close_to(ground_hit->point.y, -0.08F, 2.0e-3F),
         "CollisionWorld::update_collider_transform preserves ground center_offset and slab offset");
     expect(
-        sidewalk_hit.has_value() && close_to(sidewalk_hit->point.y, 0.15F, 2.0e-3F),
+        platform_hit.has_value() && close_to(platform_hit->point.y, 0.15F, 2.0e-3F),
         "CollisionWorld::update_collider_transform preserves box center_offset and scale");
 
     // 2. High-FPS AnimatedCharacterController idle & walk stability (zero fall flicker).
@@ -1228,7 +831,7 @@ void test_smoothness_and_collider_offset_regressions() {
         vcr::AnimationClip{.name = "hero_idle", .duration_seconds = 2.4F, .looping = true},
         vcr::AnimationClip{.name = "hero_walk", .duration_seconds = 0.93F, .looping = true},
         vcr::AnimationClip{.name = "hero_fall", .duration_seconds = 0.6F, .looping = true},
-        vcr::AnimationClip{.name = "enter_car", .duration_seconds = 0.5F, .looping = false},
+        vcr::AnimationClip{.name = "interact_once", .duration_seconds = 0.5F, .looping = false},
     };
 
     bool idle_all_grounded = true;
@@ -1311,405 +914,34 @@ void test_smoothness_and_collider_offset_regressions() {
         .remove_pose = +[](void*, vcr::SceneNodeId) noexcept {},
     };
     vcr::AnimatorRuntimeSystem anim_runtime;
-    anim_runtime.set_preview(npc_id, "enter_car", false, 0.75F);
+    anim_runtime.set_preview(npc_id, "interact_once", false, 0.75F);
     anim_runtime.update(0.0F, anim_scene, &collision, nullptr, anim_provider);
     const auto* preview_rt = anim_runtime.node_runtime(npc_id);
     expect(
         preview_rt != nullptr && close_to(preview_rt->current_time, 0.5F, 1.0e-3F),
         "AnimatorRuntimeSystem::set_preview honors non-looping clip duration");
-
-    // 3. High-FPS Vehicle & VehicleCamera sub-tick interpolation smoothness (1000 FPS).
-    vcr::SceneDocument vscene;
-    const vcr::SceneNodeId vroad =
-        vscene.create_node("SmoothRoad", vcr::SceneNodeKind::cube);
-    vscene.node(vroad)->get().transform.translation = {0.0F, -0.5F, 0.0F};
-    vscene.node(vroad)->get().transform.scale = {80.0F, 0.5F, 200.0F};
-    static_cast<void>(vscene.set_collider(vroad, vcr::ColliderComponent{}));
-
-    const vcr::SceneNodeId vcar =
-        vscene.create_node("SmoothSedan", vcr::SceneNodeKind::cube);
-    vscene.node(vcar)->get().transform.translation = {0.0F, 0.65F, 0.0F};
-    vscene.node(vcar)->get().transform.scale = {0.95F, 0.35F, 2.2F};
-    vcr::RigidBodyComponent vrb{};
-    vrb.motion_type = vcr::RigidBodyMotionType::dynamic;
-    vrb.mass = 1350.0F;
-    static_cast<void>(vscene.set_rigid_body(vcar, vrb));
-    static_cast<void>(vscene.set_collider(vcar, vcr::ColliderComponent{}));
-
-    vcr::CollisionWorld vcollision;
-    vcollision.rebuild_from_scene(vscene, {}, {}, {}, true);
-    vcr::PhysicsWorld vphysics;
-    vphysics.rebuild_from_scene(vscene, {}, {}, {});
-    vcr::VehicleController vehicle(vcr::VehicleController::make_default_sedan(vcar));
-    vehicle.reset(vphysics, {0.0F, 0.65F, 0.0F}, {1.0F, 0.0F, 0.0F, 0.0F});
-
-    vcr::RuntimeTransformRegistry vreg;
-    expect(vreg.register_node(vcar, glm::mat4(1.0F)), "Register vehicle transform node");
-    vcr::VehicleCamera vcam;
-    vcam.reset({0.0F, 0.65F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 1.0F, 0.0F});
-
-    const float hf_dt = 1.0F / 1000.0F;
-    for (int i = 0; i < 400; ++i) {
-        vehicle.update(vcr::VehicleControlInput{}, hf_dt, vphysics, &vcollision);
-        vphysics.step(hf_dt, vcollision);
-    }
-    for (int i = 0; i < 1500; ++i) {
-        vehicle.update(
-            vcr::VehicleControlInput{.throttle = 1.0F},
-            hf_dt,
-            vphysics,
-            &vcollision);
-        vphysics.step(hf_dt, vcollision);
-    }
-
-    float prev_car_z = 0.0F;
-    float prev_cam_dist = 0.0F;
-    float min_dz = 1.0e9F;
-    float max_dz = 0.0F;
-    float max_cam_dist_step = 0.0F;
-    bool sample_initialized = false;
-    bool strictly_advancing = true;
-
-    for (int i = 0; i < 120; ++i) {
-        vehicle.update(
-            vcr::VehicleControlInput{.throttle = 1.0F},
-            hf_dt,
-            vphysics,
-            &vcollision);
-        vphysics.step(hf_dt, vcollision);
-
-        const vcr::TransformRows rows = vphysics.body_transform_rows(0U);
-        const glm::mat4 wm(
-            glm::vec4(rows.x.x, rows.y.x, rows.z.x, 0.0F),
-            glm::vec4(rows.x.y, rows.y.y, rows.z.y, 0.0F),
-            glm::vec4(rows.x.z, rows.y.z, rows.z.z, 0.0F),
-            glm::vec4(rows.x.w, rows.y.w, rows.z.w, 1.0F));
-        static_cast<void>(vreg.set_world_matrix(vcar, wm));
-        vreg.sync_outputs(&vcollision, nullptr);
-        const auto body = vphysics.body_state(vcar);
-        const glm::vec3 vel = body ? body->linear_velocity : glm::vec3(0.0F);
-        vcam.update(
-            glm::vec3(wm[3]),
-            glm::vec3(wm[2]),
-            glm::vec3(wm[1]),
-            vel,
-            0.0F,
-            0.0F,
-            hf_dt,
-            &vcollision,
-            vcar);
-
-        const float car_z = wm[3].z;
-        const float cam_dist = glm::length(glm::vec2(
-            vcam.position().x - wm[3].x,
-            vcam.position().z - wm[3].z));
-        if (sample_initialized) {
-            const float dz = car_z - prev_car_z;
-            if (dz <= 1.0e-4F) {
-                strictly_advancing = false;
-            }
-            min_dz = std::min(min_dz, dz);
-            max_dz = std::max(max_dz, dz);
-            max_cam_dist_step =
-                std::max(max_cam_dist_step, std::abs(cam_dist - prev_cam_dist));
-        } else {
-            sample_initialized = true;
-        }
-        prev_car_z = car_z;
-        prev_cam_dist = cam_dist;
-    }
-
-    expect(
-        strictly_advancing &&
-            min_dz > 1.0e-4F &&
-            max_dz < min_dz * 2.5F &&
-            max_cam_dist_step < 0.01F,
-        "Vehicle visual pose & VehicleCamera advance monotonically every 1000-FPS frame without staircase jumps");
 }
 
-void test_stage3_stability_and_input_regressions() {
-    // 1. LaneGraph 0-length segment, multi-hop advancement, and node-width obstacle corridor.
-    {
-        vcr::LaneGraph lanes;
-        const std::uint32_t n0 = lanes.add_node({.position = {0.0F, 0.0F, 0.0F}, .forward = {0.0F, 0.0F, 1.0F}, .width = 3.5F});
-        const std::uint32_t n1 = lanes.add_node({.position = {0.0F, 0.0F, 0.0F}, .forward = {0.0F, 0.0F, 1.0F}, .width = 3.5F});
-        const std::uint32_t n2 = lanes.add_node({.position = {0.0F, 0.0F, 15.0F}, .forward = {0.0F, 0.0F, 1.0F}, .width = 3.5F});
-        const std::uint32_t n3 = lanes.add_node({.position = {0.0F, 0.0F, 15.1F}, .forward = {0.0F, 0.0F, 1.0F}, .width = 3.5F});
-        const std::uint32_t n4 = lanes.add_node({.position = {0.0F, 0.0F, 15.2F}, .forward = {0.0F, 0.0F, 1.0F}, .width = 3.5F});
-        const std::uint32_t n5 = lanes.add_node({.position = {0.0F, 0.0F, 15.3F}, .forward = {0.0F, 0.0F, 1.0F}, .width = 3.5F});
-        const std::uint32_t n6 = lanes.add_node({.position = {0.0F, 0.0F, 65.0F}, .forward = {0.0F, 0.0F, 1.0F}, .width = 3.5F});
-        const std::uint32_t s0 = lanes.add_segment({
-            .start_node = n0, .end_node = n1, .speed_limit_mps = 12.0F,
-            .next_segments = {1U, 0U, 0U, 0U}, .next_count = 1U,
-        });
-        const std::uint32_t s1 = lanes.add_segment({
-            .start_node = n1, .end_node = n2, .speed_limit_mps = 12.0F,
-            .next_segments = {2U, 0U, 0U, 0U}, .next_count = 1U,
-        });
-        const std::uint32_t s2 = lanes.add_segment({
-            .start_node = n2, .end_node = n3, .speed_limit_mps = 12.0F,
-            .next_segments = {3U, 0U, 0U, 0U}, .next_count = 1U,
-        });
-        const std::uint32_t s3 = lanes.add_segment({
-            .start_node = n3, .end_node = n4, .speed_limit_mps = 12.0F,
-            .next_segments = {4U, 0U, 0U, 0U}, .next_count = 1U,
-        });
-        const std::uint32_t s4 = lanes.add_segment({
-            .start_node = n4, .end_node = n5, .speed_limit_mps = 12.0F,
-            .next_segments = {5U, 0U, 0U, 0U}, .next_count = 1U,
-        });
-        const std::uint32_t s5 = lanes.add_segment({
-            .start_node = n5, .end_node = n6, .speed_limit_mps = 12.0F,
-            .next_segments = {0U, 0U, 0U, 0U}, .next_count = 0U,
-        });
-        static_cast<void>(s2);
-        static_cast<void>(s3);
-        static_cast<void>(s4);
-        expect(lanes.build(), "LaneGraph::build accepts 0-length segment without divide-by-zero");
-
-        const glm::vec3 dir0 = lanes.segment_direction(s0);
-        expect(
-            std::isfinite(dir0.x) && std::isfinite(dir0.y) && std::isfinite(dir0.z) &&
-                close_to(glm::length(dir0), 1.0F, 1.0e-3F),
-            "Zero-length segment preserves finite unit direction from start node");
-
-        vcr::TrafficConfig tcfg{};
-        tcfg.max_vehicles = 2U;
-        tcfg.idm_max_accel_mps2 = 60.0F;
-        vcr::TrafficSystem traffic;
-        traffic.initialize(tcfg, lanes);
-        const auto tv = traffic.spawn_vehicle(s0, 0.0F, vcr::SceneNodeId{});
-        expect(tv.has_value(), "Spawn traffic vehicle on 0-length segment");
-
-        traffic.update(1.0F / 30.0F, lanes, nullptr);
-        expect(
-            traffic.vehicles()[0].segment_id == s1 &&
-                std::isfinite(traffic.vehicles()[0].position.z) &&
-                std::isfinite(traffic.vehicles()[0].yaw_radians),
-            "TrafficSystem exits 0-length segment onto next segment cleanly");
-
-        bool crossed_multi_hop = false;
-        for (int step = 0; step < 120; ++step) {
-            const std::uint32_t prev_seg = traffic.vehicles()[0].segment_id;
-            traffic.update(1.0F / 30.0F, lanes, nullptr);
-            if (prev_seg == s1 && traffic.vehicles()[0].segment_id == s5) {
-                crossed_multi_hop = true;
-                break;
-            }
-        }
-        const auto& snap = traffic.vehicles()[0];
-        expect(
-            crossed_multi_hop &&
-                std::isfinite(snap.position.x) && std::isfinite(snap.position.y) &&
-                std::isfinite(snap.position.z) && std::isfinite(snap.yaw_radians) &&
-                snap.segment_id == s5 && snap.position.z > 15.3F,
-            "TrafficSystem hops past 0-length and multiple short segments cleanly in one update");
-
-        // LaneNode::width scales obstacle avoidance corridor.
-        auto run_corridor = [](const float lane_width) -> float {
-            vcr::LaneGraph lg;
-            const auto a = lg.add_node({.position = {0.0F, 0.0F, 0.0F}, .forward = {0.0F, 0.0F, 1.0F}, .width = lane_width});
-            const auto b = lg.add_node({.position = {0.0F, 0.0F, 80.0F}, .forward = {0.0F, 0.0F, 1.0F}, .width = lane_width});
-            const auto seg = lg.add_segment({.start_node = a, .end_node = b, .speed_limit_mps = 12.0F});
-            if (!lg.build()) {
-                return -1.0F;
-            }
-            vcr::TrafficConfig cfg{};
-            cfg.max_vehicles = 1U;
-            vcr::TrafficSystem ts;
-            ts.initialize(cfg, lg);
-            static_cast<void>(ts.spawn_vehicle(seg, 0.0F, vcr::SceneNodeId{}));
-            for (int f = 0; f < 15; ++f) {
-                ts.update(1.0F / 30.0F, lg, nullptr);
-            }
-            const std::array<vcr::TrafficObstacle, 1U> obs{{
-                vcr::TrafficObstacle{
-                    .position = ts.vehicles()[0].position + glm::vec3{2.6F, 0.0F, 4.0F},
-                    .radius = 0.4F,
-                },
-            }};
-            ts.update(1.0F / 30.0F, lg, nullptr, obs);
-            return ts.vehicles()[0].brake;
-        };
-        const float narrow_brake = run_corridor(1.6F);
-        const float wide_brake = run_corridor(6.0F);
-        expect(
-            narrow_brake >= 0.0F && narrow_brake < 0.05F && wide_brake > 0.1F,
-            "TrafficSystem obstacle lateral corridor scales with LaneNode::width");
-    }
-
-    // 2. CrowdSystem non-finite/negative delta_seconds and zero-distance threat resilience.
-    {
-        vcr::NavigationGraph nav;
-        const auto n0 = nav.add_node({.position = {0.0F, 0.0F, 0.0F}});
-        const auto n1 = nav.add_node({.position = {0.0F, 0.0F, 10.0F}});
-        nav.add_edge({.from_node = n0, .to_node = n1, .speed_limit_mps = 1.5F});
-        expect(nav.build(), "NavigationGraph builds for CrowdSystem NaN regression test");
-
-        vcr::CrowdConfig cfg{};
-        cfg.max_agents = 4U;
-        vcr::CrowdSystem crowd;
-        crowd.initialize(cfg, nav);
-        const auto agent_id = crowd.spawn_agent(n0);
-        expect(agent_id.has_value(), "Spawn crowd agent for resilience test");
-
-        crowd.update(std::numeric_limits<float>::quiet_NaN(), nav, {});
-        crowd.update(-0.25F, nav, {});
-        const std::array<vcr::CrowdThreat, 1U> co_located_threat{{
-            vcr::CrowdThreat{
-                .position = crowd.agents()[0].position,
-                .velocity = {0.0F, 0.0F, 0.0F},
-                .radius = 2.0F,
-            },
-        }};
-        crowd.update(1.0F / 30.0F, nav, co_located_threat);
-        const auto& agent = crowd.agents()[0];
-        expect(
-            std::isfinite(agent.position.x) && std::isfinite(agent.position.y) &&
-                std::isfinite(agent.position.z) && std::isfinite(agent.yaw_radians),
-            "CrowdSystem ignores NaN/negative dt and handles zero-distance threats without NaN");
-    }
-
-    // 3. VehicleCamera sphere-radius pull-in and degenerate view_matrix safety.
-    {
-        vcr::CollisionWorld wall_world;
-        wall_world.upsert_box_collider(
-            vcr::SceneNodeId{1U, 1U},
-            {0.0F, 1.5F, -3.2F},
-            glm::mat3(1.0F),
-            {10.0F, 2.0F, 0.5F});
-
-        vcr::VehicleCameraConfig cfg_zero{};
-        cfg_zero.follow_distance = 5.0F;
-        cfg_zero.collision_sphere_radius = 0.0F;
-        cfg_zero.collision_pull_in_offset = 0.1F;
-        vcr::VehicleCameraConfig cfg_sphere = cfg_zero;
-        cfg_sphere.collision_sphere_radius = 0.45F;
-
-        vcr::VehicleCamera cam_zero(cfg_zero);
-        vcr::VehicleCamera cam_sphere(cfg_sphere);
-        cam_zero.reset({0.0F, 0.5F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 1.0F, 0.0F});
-        cam_sphere.reset({0.0F, 0.5F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 1.0F, 0.0F});
-        for (int i = 0; i < 60; ++i) {
-            cam_zero.update(
-                {0.0F, 0.5F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 1.0F, 0.0F},
-                {0.0F, 0.0F, 0.0F}, 0.0F, 0.0F, 1.0F / 60.0F, &wall_world);
-            cam_sphere.update(
-                {0.0F, 0.5F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 1.0F, 0.0F},
-                {0.0F, 0.0F, 0.0F}, 0.0F, 0.0F, 1.0F / 60.0F, &wall_world);
-        }
-        expect(
-            cam_sphere.position().z > cam_zero.position().z + 0.35F,
-            "VehicleCamera accounts for collision_sphere_radius when pulling in from walls");
-
-        vcr::VehicleCamera deg_cam(cfg_sphere);
-        const float nan_f = std::numeric_limits<float>::quiet_NaN();
-        deg_cam.reset({nan_f, nan_f, nan_f}, {0.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 0.0F});
-        const glm::mat4 vm = deg_cam.view_matrix();
-        bool vm_finite = true;
-        for (int c = 0; c < 4; ++c) {
-            for (int r = 0; r < 4; ++r) {
-                vm_finite = vm_finite && std::isfinite(vm[c][r]);
-            }
-        }
-        expect(vm_finite, "VehicleCamera::view_matrix remains finite after NaN/zero reset inputs");
-    }
-
-    // 4. VehicleController Ackermann steering geometry and combined friction ellipse stability.
-    {
-        vcr::SceneDocument scene;
-        const vcr::SceneNodeId road_id = scene.create_node("Road", vcr::SceneNodeKind::cube);
-        scene.node(road_id)->get().transform.translation = {0.0F, -0.5F, 0.0F};
-        scene.node(road_id)->get().transform.scale = {80.0F, 0.5F, 80.0F};
-        static_cast<void>(scene.set_collider(road_id, vcr::ColliderComponent{}));
-
-        const vcr::SceneNodeId car_id = scene.create_node("AckermannCar", vcr::SceneNodeKind::cube);
-        scene.node(car_id)->get().transform.translation = {0.0F, 0.65F, 0.0F};
-        scene.node(car_id)->get().transform.scale = {0.95F, 0.35F, 2.2F};
-        vcr::RigidBodyComponent rb{};
-        rb.motion_type = vcr::RigidBodyMotionType::dynamic;
-        rb.mass = 1450.0F;
-        static_cast<void>(scene.set_rigid_body(car_id, rb));
-        static_cast<void>(scene.set_collider(car_id, vcr::ColliderComponent{}));
-
-        vcr::CollisionWorld collision;
-        collision.rebuild_from_scene(scene, {}, {}, {}, true);
-        vcr::PhysicsWorld physics;
-        physics.rebuild_from_scene(scene, {}, {}, {});
-
-        vcr::VehicleController vehicle(vcr::VehicleController::make_default_sedan(car_id));
-        vehicle.reset(physics, {0.0F, 0.65F, 0.0F}, {1.0F, 0.0F, 0.0F, 0.0F});
-        const float dt = 1.0F / 60.0F;
-        for (int i = 0; i < 30; ++i) {
-            vehicle.update(vcr::VehicleControlInput{}, dt, physics, &collision);
-            physics.step(dt, collision);
-        }
-        for (int i = 0; i < 60; ++i) {
-            vehicle.update(
-                vcr::VehicleControlInput{.throttle = 1.0F, .steer = 0.8F, .handbrake = true},
-                dt, physics, &collision);
-            physics.step(dt, collision);
-        }
-        const auto& tel = vehicle.telemetry();
-        bool finite_tel = std::isfinite(tel.world_position.x) &&
-            std::isfinite(tel.world_position.y) &&
-            std::isfinite(tel.world_position.z) &&
-            std::isfinite(tel.world_rotation.w) &&
-            std::isfinite(tel.forward_speed_mps);
-        for (const auto& w : tel.wheels) {
-            finite_tel = finite_tel &&
-                std::isfinite(w.steer_angle_radians) &&
-                std::isfinite(w.world_hub_position.x) &&
-                std::isfinite(w.world_hub_position.y) &&
-                std::isfinite(w.world_hub_position.z);
-        }
-        const float w0_right = tel.wheels[0].steer_angle_radians;
-        const float w1_right = tel.wheels[1].steer_angle_radians;
-
-        // Flip steer direction to verify opposite inner/outer wheel asymmetry.
-        vehicle.reset(physics, {0.0F, 0.65F, 0.0F}, {1.0F, 0.0F, 0.0F, 0.0F});
-        for (int i = 0; i < 45; ++i) {
-            vehicle.update(
-                vcr::VehicleControlInput{.throttle = 0.4F, .steer = -0.8F},
-                dt, physics, &collision);
-            physics.step(dt, collision);
-        }
-        const float w0_left = vehicle.telemetry().wheels[0].steer_angle_radians;
-        const float w1_left = vehicle.telemetry().wheels[1].steer_angle_radians;
-        const bool same_sign_right = w0_right * w1_right > 0.0F;
-        const bool same_sign_left = w0_left * w1_left > 0.0F;
-        const bool opposite_inner =
-            (std::abs(w0_right) > std::abs(w1_right) + 0.02F &&
-             std::abs(w1_left) > std::abs(w0_left) + 0.02F) ||
-            (std::abs(w1_right) > std::abs(w0_right) + 0.02F &&
-             std::abs(w0_left) > std::abs(w1_left) + 0.02F);
-        expect(
-            finite_tel && same_sign_right && same_sign_left && opposite_inner,
-            "VehicleController applies Ackermann inner/outer steering and stays finite under throttle+steer+handbrake");
-    }
-
-    // 5. InputActionSystem derives vehicle throttle/brake dynamically from bound gamepad triggers.
-    {
-        vcr::InputActionSystem actions;
-        actions.set_hardware_polling_enabled(false);
-        actions.set_context(vcr::InputContext::vehicle);
-        actions.set_binding(
-            vcr::InputAction::vehicle_throttle,
-            vcr::ActionBinding{.gamepad_button = vcr::GamepadButton::left_trigger});
-        actions.set_binding(
-            vcr::InputAction::vehicle_brake,
-            vcr::ActionBinding{.gamepad_button = vcr::GamepadButton::right_trigger});
-        actions.set_synthetic_gamepad(vcr::GamepadState{
-            .left_trigger = 0.8F,
-            .right_trigger = 0.25F,
-            .connected = true,
-        });
-        actions.begin_frame(1.0F / 60.0F);
-        expect(
-            close_to(actions.vehicle_throttle_value(), 0.8F, 0.02F) &&
-                close_to(actions.vehicle_brake_value(), 0.25F, 0.02F),
-            "InputActionSystem honors rebound left/right gamepad triggers for vehicle throttle and brake");
-    }
+void test_input_action_trigger_rebinding() {
+    vcr::InputActionSystem actions;
+    actions.set_hardware_polling_enabled(false);
+    actions.set_context(vcr::InputContext::secondary);
+    actions.set_binding(
+        vcr::InputAction::secondary_up,
+        vcr::ActionBinding{.gamepad_button = vcr::GamepadButton::left_trigger});
+    actions.set_binding(
+        vcr::InputAction::secondary_down,
+        vcr::ActionBinding{.gamepad_button = vcr::GamepadButton::right_trigger});
+    actions.set_synthetic_gamepad(vcr::GamepadState{
+        .left_trigger = 0.8F,
+        .right_trigger = 0.25F,
+        .connected = true,
+    });
+    actions.begin_frame(1.0F / 60.0F);
+    expect(
+        close_to(actions.action_value(vcr::InputAction::secondary_up), 0.8F, 0.02F) &&
+            close_to(actions.action_value(vcr::InputAction::secondary_down), 0.25F, 0.02F),
+        "InputActionSystem honors rebound left/right gamepad triggers for secondary analog actions");
 }
 
 } // namespace
@@ -1721,15 +953,10 @@ int main() {
     test_content_manifests_and_cooker(scratch.path());
     test_runtime_transform_registry();
     test_animated_character_controller();
-    test_vehicle_controller();
-    test_vehicle_interaction();
-    test_vehicle_camera_and_rig();
-    test_navigation_crowd();
-    test_traffic_and_signals();
     test_game_overlay_canvas();
     test_gameplay_session_hooks_and_lifecycle(scratch.path());
     test_smoothness_and_collider_offset_regressions();
-    test_stage3_stability_and_input_regressions();
+    test_input_action_trigger_rebinding();
 
     if (g_failures != 0) {
         std::cerr << g_failures << " engine gameplay API test(s) failed\n";

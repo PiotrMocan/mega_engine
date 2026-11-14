@@ -184,6 +184,7 @@ bool GameplaySession::start(
     overlay_canvas_.clear();
     runtime_audio_nodes_.clear();
     has_prev_listener_position_ = false;
+    default_camera_look_enabled_ = true;
 
     glm::vec3 movement_forward = startup_camera.forward();
     movement_forward.y = 0.0F;
@@ -364,10 +365,6 @@ bool GameplaySession::start(
         collision_world_,
         physics_world_);
     output_camera = FlyCamera(initial_cam_pos, camera_.yaw(), camera_.pitch());
-    camera_rig_.reset(
-        initial_cam_pos,
-        output_camera.forward(),
-        68.0F);
 
     if (input_actions != nullptr) {
         input_actions->set_context(player_setup_.initial_input_context);
@@ -519,7 +516,7 @@ bool GameplaySession::update_internal(
         extensions_.on_input_ai(extensions_.user_data, *this, ctx);
     }
     dt = std::clamp(ctx.delta_seconds, 0.0F, maximum_session_delta_seconds);
-    if (camera_rig_.mode() == CameraRigMode::on_foot) {
+    if (default_camera_look_enabled_ && !ctx.suppress_default_camera_look) {
         camera_.rotate(ctx.input.mouse_delta_x, ctx.input.mouse_delta_y);
     }
 
@@ -688,7 +685,7 @@ bool GameplaySession::update_internal(
 
     if (extensions_.on_post_transforms != nullptr) {
         extensions_.on_post_transforms(extensions_.user_data, *this, ctx);
-        // Publish project-driven doors, wheels and drivers in this submission.
+        // Publish project-driven transform updates in this submission.
         transform_registry_.sync_outputs(
             &collision_world_, mutable_sink.apply != nullptr ? &mutable_sink : nullptr);
     }
@@ -739,13 +736,6 @@ bool GameplaySession::update_internal(
     const glm::vec3 on_foot_cam_pos = camera_.position(
         cam_focus, collision_world_, physics_world_);
     output_camera = FlyCamera(on_foot_cam_pos, camera_.yaw(), camera_.pitch());
-
-    if (camera_rig_.mode() != CameraRigMode::on_foot) {
-        float rig_yaw = camera_.yaw();
-        float rig_pitch = camera_.pitch();
-        forward_to_yaw_pitch(camera_rig_.forward(), rig_yaw, rig_pitch);
-        output_camera = FlyCamera(camera_rig_.position(), rig_yaw, rig_pitch);
-    }
 
     const std::uint32_t vp_w = std::max(1U, viewport_extent.x);
     const std::uint32_t vp_h = std::max(1U, viewport_extent.y);
@@ -1163,6 +1153,7 @@ void GameplaySession::stop(
     player_initial_scale_ = glm::vec3(1.0F);
     cached_content_revision_ = 0U;
     cached_structure_revision_ = 0U;
+    default_camera_look_enabled_ = true;
     active_ = false;
 }
 

@@ -204,7 +204,7 @@ private:
     std::string_view path) noexcept;
 
 // Returns a default Windows executable filename derived from a project slug/name
-// (e.g. "neon_night_city" -> "neon_night_city.exe").
+// (e.g. "sample_game" -> "sample_game.exe").
 [[nodiscard]] std::string default_project_executable_filename(
     std::string_view slug_or_name);
 

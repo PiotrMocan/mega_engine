@@ -413,11 +413,6 @@ set(VCR_ENGINE_CORE_SOURCES
     src/gameplay_framework.cpp
     src/gameplay_session.cpp
     src/game_overlay.cpp
-    src/navigation_crowd.cpp
-    src/traffic_system.cpp
-    src/vehicle_camera.cpp
-    src/vehicle_controller.cpp
-    src/vehicle_interaction.cpp
     src/game_module_loader.cpp
     src/cli_options.cpp
     src/performance_metrics.cpp

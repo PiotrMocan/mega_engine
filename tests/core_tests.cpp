@@ -2206,8 +2206,8 @@ int main() {
         }
         if (auto model = source_scene.node(scene_model)) {
             model->get().asset_path =
-                "tree_stump_01_4k/"
-                "tree_stump_01_4k.vcrasset.json";
+                "props/test_mesh/"
+                "test_mesh.vcrasset.json";
             model->get().transform.translation =
                 glm::vec3(-2.0F, 0.0F, -5.0F);
             source_scene.mark_content_changed();
@@ -2269,8 +2269,8 @@ int main() {
                 loaded_records[2].value.kind ==
                     vcr::SceneNodeKind::model &&
                 loaded_records[2].value.asset_path ==
-                    "tree_stump_01_4k/"
-                    "tree_stump_01_4k.vcrasset.json" &&
+                    "props/test_mesh/"
+                    "test_mesh.vcrasset.json" &&
                 close_to(
                     loaded_records[1].value.transform.scale.z,
                     4.0,
