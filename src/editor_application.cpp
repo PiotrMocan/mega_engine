@@ -280,6 +280,11 @@ using Json = nlohmann::json;
     } else {
         result["ui_marker"] = nullptr;
     }
+    if (const auto sp = scene.spline(id)) {
+        result["spline"] = component_json::spline_to_json(sp->get());
+    } else {
+        result["spline"] = nullptr;
+    }
     if (renderer != nullptr &&
         value.kind == SceneNodeKind::model &&
         !value.asset_path.empty()) {
@@ -721,7 +726,7 @@ void EditorApplication::initialize(const CliOptions& options) {
     if (!renderer_.set_fog_settings(resolve_scene_fog(options, scene_.fog))) {
         fatal("Invalid fog settings or unsupported sampled depth/HDR blending");
     }
-    if (!renderer_.set_exposure_settings(options.exposure)) {
+    if (!renderer_.set_exposure_settings(resolve_scene_exposure(options, scene_.exposure))) {
         fatal("Invalid exposure settings");
     }
     if (!renderer_.set_color_grading(
@@ -883,6 +888,8 @@ void EditorApplication::main_loop() {
                 ? std::optional<double>(options_.camera_z) : std::nullopt);
         }
         if (ui_.consume_scene_replaced()) {
+            if (!renderer_.set_exposure_settings(resolve_scene_exposure(options_, scene_.exposure)))
+                fatal("Scene exposure settings are invalid.");
             if (!renderer_.set_lighting_settings(resolve_scene_lighting(options_, scene_.lighting)))
                 fatal("Scene lighting is unavailable; restart the editor with --gi voxel or a supported shadow resolution.");
             if (!renderer_.set_tone_mapper(
@@ -932,14 +939,20 @@ void EditorApplication::main_loop() {
             ui_.play_state() == EditorPlayState::paused);
         audio_engine_.set_gameplay_paused(
             ui_.play_state() == EditorPlayState::paused);
+        if (ui_.play_state() == EditorPlayState::edit) {
+            ui_.update_sequencer_edit_preview(
+                delta_seconds, scene_, renderer_, camera_);
+        }
         update_scene_snapshot();
         if (ui_.play_state() == EditorPlayState::playing) {
             update_gameplay(delta_seconds);
         } else {
             input_actions_.begin_frame(delta_seconds);
             if (ui_.play_state() == EditorPlayState::edit) {
-                camera_.update(
-                    ui_.camera_input(), delta_seconds);
+                if (!ui_.sequencer_locks_edit_camera()) {
+                    camera_.update(
+                        ui_.camera_input(), delta_seconds);
+                }
                 const SkeletalAssetProvider skeletal_provider =
                     make_renderer_skeletal_provider(&renderer_);
                 edit_animator_preview_.update(
@@ -1156,7 +1169,9 @@ void EditorApplication::synchronize_gameplay_state() {
             std::filesystem::exists(project_dir / project_manifest_filename)) {
             const ProjectInspection proj_insp =
                 inspect_project_directory(project_dir);
-            if (!proj_insp.game_module_path.empty()) {
+            const std::filesystem::path module_dll =
+                resolve_project_game_module_path(proj_insp);
+            if (!module_dll.empty()) {
                 loaded_module_project_root_ = proj_insp.project_directory;
                 loaded_module_asset_root_ = ui_.asset_root();
                 const GameModuleHostContext host{
@@ -1170,7 +1185,7 @@ void EditorApplication::synchronize_gameplay_state() {
                     .input_actions = &input_actions_,
                 };
                 if (!loaded_game_module_.load(
-                        proj_insp.game_module_path, host, true, error)) {
+                        module_dll, host, true, error)) {
                     ui_.report_asset_error(std::move(error));
                     ui_.stop_play(scene_);
                     camera_ = edit_camera_before_play_;
@@ -1415,6 +1430,71 @@ void EditorApplication::process_mcp_commands() {
     }
 }
 
+namespace {
+
+[[nodiscard]] Json sequencer_status_json(const SequencerStatusSnapshot& s) {
+    return Json{
+        {"has_sequence", s.has_sequence},
+        {"relative_path", s.relative_path},
+        {"sequence_id", s.sequence_id},
+        {"title", s.title},
+        {"dirty", s.dirty},
+        {"preview_active", s.preview_active},
+        {"preview_playing", s.preview_playing},
+        {"lock_camera", s.lock_camera},
+        {"looping", s.looping},
+        {"playhead_seconds", s.playhead_seconds},
+        {"duration_seconds", s.duration_seconds},
+        {"frame_rate", s.frame_rate},
+        {"camera_cut_count", s.camera_cut_count},
+        {"camera_shake_count", s.camera_shake_count},
+        {"property_track_count", s.property_track_count},
+        {"animation_clip_count", s.animation_clip_count},
+        {"audio_clip_count", s.audio_clip_count},
+        {"subtitle_count", s.subtitle_count},
+        {"event_key_count", s.event_key_count},
+    };
+}
+
+[[nodiscard]] bool is_scene_mutating_mcp_command(
+    const McpCommandType type) noexcept {
+    switch (type) {
+    case McpCommandType::editor_set_collider:
+    case McpCommandType::editor_remove_collider:
+    case McpCommandType::editor_set_rigid_body:
+    case McpCommandType::editor_remove_rigid_body:
+    case McpCommandType::editor_set_audio_source:
+    case McpCommandType::editor_remove_audio_source:
+    case McpCommandType::editor_set_audio_listener:
+    case McpCommandType::editor_remove_audio_listener:
+    case McpCommandType::editor_set_reverb_zone:
+    case McpCommandType::editor_remove_reverb_zone:
+    case McpCommandType::editor_set_animator:
+    case McpCommandType::editor_remove_animator:
+    case McpCommandType::editor_set_gameplay:
+    case McpCommandType::editor_remove_gameplay:
+    case McpCommandType::editor_set_ui_marker:
+    case McpCommandType::editor_remove_ui_marker:
+    case McpCommandType::editor_set_spline:
+    case McpCommandType::editor_remove_spline:
+    case McpCommandType::editor_prefab_save:
+    case McpCommandType::editor_prefab_instantiate:
+    case McpCommandType::editor_prefab_unpack:
+    case McpCommandType::editor_create_node:
+    case McpCommandType::editor_update_node:
+    case McpCommandType::editor_delete_node:
+    case McpCommandType::editor_reparent_node:
+    case McpCommandType::editor_duplicate_node:
+    case McpCommandType::editor_create_flat_ground:
+    case McpCommandType::editor_scatter_model:
+        return true;
+    default:
+        return false;
+    }
+}
+
+} // namespace
+
 void EditorApplication::execute_mcp_command(
     const McpCommand& command) {
     const auto succeed = [this, &command](
@@ -1450,6 +1530,11 @@ void EditorApplication::execute_mcp_command(
         McpCommand::edit_spot_inner |
         McpCommand::edit_spot_outer;
 
+    if (is_scene_mutating_mcp_command(command.type) &&
+        ui_.play_state() == EditorPlayState::edit) {
+        ui_.stop_sequencer_preview(scene_, &renderer_, &camera_);
+    }
+
     switch (command.type) {
     case McpCommandType::editor_get_state: {
         const char* play_state = "edit";
@@ -1471,8 +1556,10 @@ void EditorApplication::execute_mcp_command(
                 {"reverb_zone_count", scene_.reverb_zones().size()},
                 {"animator_count", scene_.animators().size()},
                 {"gameplay_count", scene_.gameplays().size()},
+                {"spline_count", scene_.splines().size()},
                 {"skinned_active_nodes", renderer_.skinning_active_node_count()},
                 {"prefab_instance_count", scene_.prefab_instances().size()},
+                {"sequencer", sequencer_status_json(ui_.sequencer_status())},
                 {"audio", audio_engine_state_json(audio_engine_)},
                 {"animation_gameplay", Json{
                     {"animator_count", scene_.animators().size()},
@@ -2436,6 +2523,149 @@ void EditorApplication::execute_mcp_command(
             });
         return;
     }
+    case McpCommandType::editor_set_spline: {
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!valid_spline_component(command.spline)) {
+            fail("spline component values are outside engine bounds");
+            return;
+        }
+        const SplineComponent sanitized = sanitize_spline_component(command.spline);
+        if (const auto existing = scene_.spline(command.node_id);
+            existing && existing->get() == sanitized) {
+            succeed(
+                "spline component already matches",
+                Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        if (!scene_.set_spline(command.node_id, sanitized)) {
+            fail("unable to attach spline component");
+            return;
+        }
+        succeed(
+            "spline component updated",
+            Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                 {"changed", true}});
+        return;
+    }
+    case McpCommandType::editor_remove_spline:
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!scene_.has_spline(command.node_id)) {
+            succeed(
+                "node has no spline component",
+                Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        static_cast<void>(scene_.remove_spline(command.node_id));
+        succeed(
+            "spline component removed",
+            Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                 {"changed", true}});
+        return;
+    case McpCommandType::editor_sequencer_control: {
+        const McpSequencerControlPayload& sq = command.sequencer;
+        std::string error;
+        std::string saved_path;
+        bool ok = false;
+        const std::optional<float> scrub_opt = sq.has_scrub_time
+            ? std::optional<float>{sq.scrub_time_seconds}
+            : std::nullopt;
+        const std::optional<bool> lock_opt = sq.has_lock_camera
+            ? std::optional<bool>{sq.lock_camera}
+            : std::nullopt;
+        switch (sq.action) {
+        case McpSequencerAction::new_sequence:
+            ok = ui_.mcp_sequencer_new(
+                scene_,
+                sq.id.data(),
+                sq.title.data(),
+                sq.duration_seconds,
+                sq.frame_rate,
+                sq.looping,
+                error);
+            break;
+        case McpSequencerAction::open_sequence:
+            ok = ui_.mcp_sequencer_open(scene_, command.text.data(), error);
+            break;
+        case McpSequencerAction::save_sequence:
+            ok = ui_.mcp_sequencer_save(
+                command.text.data(), saved_path, error);
+            break;
+        case McpSequencerAction::play_preview:
+            ok = ui_.mcp_sequencer_set_playback(
+                scene_,
+                renderer_,
+                camera_,
+                true,
+                true,
+                scrub_opt,
+                lock_opt,
+                error);
+            break;
+        case McpSequencerAction::pause_preview:
+            ok = ui_.mcp_sequencer_set_playback(
+                scene_,
+                renderer_,
+                camera_,
+                true,
+                false,
+                scrub_opt,
+                lock_opt,
+                error);
+            break;
+        case McpSequencerAction::stop_preview:
+            ok = ui_.mcp_sequencer_set_playback(
+                scene_,
+                renderer_,
+                camera_,
+                false,
+                false,
+                scrub_opt,
+                lock_opt,
+                error);
+            break;
+        case McpSequencerAction::scrub_preview:
+            ok = ui_.mcp_sequencer_set_playback(
+                scene_,
+                renderer_,
+                camera_,
+                true,
+                false,
+                scrub_opt,
+                lock_opt,
+                error);
+            break;
+        }
+        if (!ok) {
+            fail(std::move(error));
+            return;
+        }
+        Json out{
+            {"sequencer", sequencer_status_json(ui_.sequencer_status())},
+        };
+        if (!saved_path.empty()) {
+            out["saved_path"] = saved_path;
+        }
+        succeed("sequencer state updated", out);
+        return;
+    }
     case McpCommandType::editor_prefab_save: {
         if (ui_.play_state() != EditorPlayState::edit) {
             fail("scene editing is locked during Play");
@@ -3077,6 +3307,8 @@ void EditorApplication::execute_mcp_command(
             return;
         }
         renderer_.reset_metrics();
+        scene_.exposure = command.exposure;
+        scene_.mark_content_changed();
         succeed("Exposure settings applied", Json{
             {"mode_requested", to_token(renderer_.exposure_settings().mode)},
             {"mode_actual", to_token(renderer_.exposure_mode_actual())},

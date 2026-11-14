@@ -30,7 +30,7 @@ vec3 dynamicSkyHemisphereAmbient(vec3 normal) {
     float upWeight = clamp(normal.y * 0.5 + 0.5, 0.0, 1.0);
     vec3 skyDome = mix(lighting.skyHorizon.rgb, lighting.skyZenith.rgb, 0.58) * 0.255;
     vec3 groundBounce = (lighting.skyHorizon.rgb * vec3(0.95, 0.86, 0.70) + lighting.skyZenith.rgb * 0.22) * 0.095;
-    return mix(groundBounce, skyDome, upWeight);
+    return mix(groundBounce, skyDome, upWeight) * lighting.skyZenith.w;
 }
 vec3 dynamicSky(vec3 direction) {
     vec3 color=dynamicSkyBackground(direction);

@@ -12,6 +12,7 @@ namespace vcr {
 struct SunState {
     glm::vec4 direction_intensity{};
     glm::vec4 color{};
+    // RGB: visible sky radiance; w: sky illumination multiplier.
     glm::vec4 sky_zenith{};
     glm::vec4 sky_horizon{};
 };
@@ -125,4 +126,8 @@ class VoxelSceneTracker {
 [[nodiscard]] std::array<glm::mat4, 4> shadow_cascades(const glm::mat4 &view, float aspect,
                                                        glm::vec3 light_direction,
                                                        unsigned tile_resolution = 1024) noexcept;
+[[nodiscard]] std::array<glm::mat4, 4> shadow_cascades(const glm::mat4 &view, float aspect,
+                                                       glm::vec3 light_direction,
+                                                       unsigned tile_resolution,
+                                                       float vertical_fov_degrees) noexcept;
 } // namespace vcr

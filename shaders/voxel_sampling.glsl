@@ -21,7 +21,7 @@ vec3 voxelDiffuseSurface(vec3 position,vec3 normal,vec3 geometricNormal) {
     vec3 volumePosition=(position-lighting.volumeOriginCell.xyz)*invExtent;
     vec3 edge=min(volumePosition,vec3(1)-volumePosition);
     float edgeDistance=min(edge.x,min(edge.y,edge.z));
-    vec3 fallback=(lighting.skyZenith.rgb+lighting.skyHorizon.rgb)*0.175;
+    vec3 fallback=(lighting.skyZenith.rgb+lighting.skyHorizon.rgb)*0.175*lighting.skyZenith.w;
     // Outside the cache there is no voxel visibility or radiance to integrate.
     // Fade over two cells to avoid a hard seam when the camera recenters it.
     if(edgeDistance<=0) return fallback;
@@ -36,7 +36,7 @@ vec3 voxelDiffuseSurface(vec3 position,vec3 normal,vec3 geometricNormal) {
     for(int i=0;i<5;++i) {
         vec4 cone=voxelCone(startUv,directions[i]*cellUv);
         coneSum+=cone.rgb;
-        skySum+=dynamicSkyBackground(directions[i])*cone.a;
+        skySum+=dynamicSkyBackground(directions[i])*cone.a*lighting.skyZenith.w;
     }
 #ifdef VCR_RAY_QUERY
     if (lighting.volumeParameters.w > 0.5 && dot(normal, geometricNormal) > 0.02) {
@@ -91,7 +91,7 @@ vec3 voxelBackTranslucency(vec3 position,vec3 backNormal) {
     vec4 sampleValue=textureLod(voxelRadiance,sampleUv,2.25);
     float skyVisibility=1.0-clamp(sampleValue.a,0.0,1.0);
     vec3 indirect=sampleValue.rgb*(3.14159265359*lighting.options.z*2.2)
-        +dynamicSkyBackground(backNormal)*(skyVisibility*1.75);
+        +dynamicSkyBackground(backNormal)*(skyVisibility*1.75*lighting.skyZenith.w);
     return mix(fallback,indirect*0.2,smoothstep(0,2.0/lighting.volumeParameters.y,edgeDistance));
 }
 #endif

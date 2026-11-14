@@ -268,6 +268,7 @@ bool SceneDocument::destroy_subtree(const SceneNodeId id) {
         animators_.remove_slot(*iterator);
         gameplays_.remove_slot(*iterator);
         ui_markers_.remove_slot(*iterator);
+        splines_.remove_slot(*iterator);
         slot.uuid = {};
         slot.value = {};
         slot.world_matrix = glm::mat4(1.0F);
@@ -851,6 +852,52 @@ SceneDocument::ui_marker_mut(const SceneNodeId id) noexcept {
     return ui_markers_.get_mut(id);
 }
 
+bool SceneDocument::set_spline(
+    const SceneNodeId id,
+    const SplineComponent& spline_value) {
+    if (!valid(id) || !valid_spline_component(spline_value)) {
+        return false;
+    }
+    const SplineComponent sanitized = sanitize_spline_component(spline_value);
+    if (const auto existing = splines_.get(id);
+        existing && existing->get() == sanitized) {
+        return true;
+    }
+    if (!splines_.upsert(id, sanitized)) {
+        return false;
+    }
+    ++content_revision_;
+    return true;
+}
+
+bool SceneDocument::remove_spline(const SceneNodeId id) noexcept {
+    if (!valid(id) || !splines_.remove(id)) {
+        return false;
+    }
+    ++content_revision_;
+    return true;
+}
+
+bool SceneDocument::has_spline(const SceneNodeId id) const noexcept {
+    return valid(id) && splines_.contains(id);
+}
+
+std::optional<std::reference_wrapper<const SplineComponent>>
+SceneDocument::spline(const SceneNodeId id) const noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return splines_.get(id);
+}
+
+std::optional<std::reference_wrapper<SplineComponent>>
+SceneDocument::spline_mut(const SceneNodeId id) noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return splines_.get_mut(id);
+}
+
 void SceneDocument::mark_content_changed() noexcept {
     ++content_revision_;
 }
@@ -945,6 +992,10 @@ void SceneDocument::build_node_records(
         if (const auto attached_um = ui_markers_.get(current_id)) {
             node_ui_marker = attached_um->get();
         }
+        std::optional<SplineComponent> node_spline{};
+        if (const auto attached_spline = splines_.get(current_id)) {
+            node_spline = attached_spline->get();
+        }
         output.push_back(SceneNodeRecord{
             .id = current_id,
             .uuid = slots_[index].uuid,
@@ -958,6 +1009,7 @@ void SceneDocument::build_node_records(
             .animator = node_animator,
             .gameplay = node_gameplay,
             .ui_marker = node_ui_marker,
+            .spline = node_spline,
             .parent_record_index = parent_record,
         });
         if (ancestor_records.size() <= depth) {

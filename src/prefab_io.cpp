@@ -682,6 +682,7 @@ struct ParsedPrefabNode {
     std::optional<AnimatorComponent> animator{};
     std::optional<GameplayComponent> gameplay{};
     std::optional<UiMarkerComponent> ui_marker{};
+    std::optional<SplineComponent> spline{};
     std::uint32_t parent_index = invalid_scene_node_index;
 };
 
@@ -898,7 +899,8 @@ bool save_prefab_file(
             }
             if (record.collider || record.rigid_body || record.audio_source ||
                 record.audio_listener || record.reverb_zone ||
-                record.animator || record.gameplay || record.ui_marker) {
+                record.animator || record.gameplay || record.ui_marker ||
+                record.spline) {
                 Json components = Json::object();
                 if (record.collider) {
                     components["collider"] = collider_json(*record.collider);
@@ -930,6 +932,10 @@ bool save_prefab_file(
                 if (record.ui_marker) {
                     components["ui_marker"] =
                         component_json::ui_marker_to_json(*record.ui_marker);
+                }
+                if (record.spline) {
+                    components["spline"] =
+                        component_json::spline_to_json(*record.spline);
                 }
                 encoded["components"] = std::move(components);
             }
@@ -1292,6 +1298,7 @@ bool instantiate_prefab_file(
             std::optional<AnimatorComponent> animator{};
             std::optional<GameplayComponent> gameplay{};
             std::optional<UiMarkerComponent> ui_marker{};
+            std::optional<SplineComponent> spline{};
             if (encoded.contains("components")) {
                 const Json& comps = encoded["components"];
                 if (!comps.is_object()) {
@@ -1302,7 +1309,8 @@ bool instantiate_prefab_file(
                     if (ckey != "collider" && ckey != "rigid_body" &&
                         ckey != "audio_source" && ckey != "audio_listener" &&
                         ckey != "reverb_zone" && ckey != "animator" &&
-                        ckey != "gameplay" && ckey != "ui_marker") {
+                        ckey != "gameplay" && ckey != "ui_marker" &&
+                        ckey != "spline") {
                         error = "Prefab node contains an unknown component.";
                         return false;
                     }
@@ -1374,6 +1382,15 @@ bool instantiate_prefab_file(
                     }
                     ui_marker = marker;
                 }
+                if (comps.contains("spline")) {
+                    SplineComponent sp{};
+                    if (!component_json::parse_spline_json(
+                            comps["spline"], sp)) {
+                        error = "Prefab spline component is invalid.";
+                        return false;
+                    }
+                    spline = sp;
+                }
             }
 
             parsed_nodes.push_back(ParsedPrefabNode{
@@ -1403,6 +1420,7 @@ bool instantiate_prefab_file(
                 .animator = animator,
                 .gameplay = gameplay,
                 .ui_marker = ui_marker,
+                .spline = spline,
                 .parent_index = parent_index,
             });
         }
@@ -1542,6 +1560,13 @@ bool instantiate_prefab_file(
             }
             target.ui_marker = *ov.ui_marker;
         }
+        if (ov.spline) {
+            if (!valid_spline_component(*ov.spline)) {
+                error = "Prefab override spline component is invalid.";
+                return false;
+            }
+            target.spline = sanitize_spline_component(*ov.spline);
+        }
     }
 
     std::vector<SceneNodeId> created(parsed_nodes.size());
@@ -1628,6 +1653,12 @@ bool instantiate_prefab_file(
             !scene.set_ui_marker(id, *spec.ui_marker)) {
             static_cast<void>(scene.destroy_subtree(root_created));
             error = "Unable to attach prefab ui_marker component.";
+            return false;
+        }
+        if (spec.spline &&
+            !scene.set_spline(id, *spec.spline)) {
+            static_cast<void>(scene.destroy_subtree(root_created));
+            error = "Unable to attach prefab spline component.";
             return false;
         }
     }

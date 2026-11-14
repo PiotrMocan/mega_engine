@@ -50,7 +50,8 @@ bool Renderer::set_lighting_settings(LightingSettings settings) noexcept {
     if (settings.cascade_cache != lighting_settings_.cascade_cache)
         shadow_dirty_ = true;
     if (settings.dynamic != lighting_settings_.dynamic ||
-        settings.hour != lighting_settings_.hour) {
+        settings.hour != lighting_settings_.hour ||
+        settings.sky_intensity != lighting_settings_.sky_intensity) {
         shadow_dirty_ = true;
         lighting_shadow_initialized_ = false;
         invalidate_temporal_history();
@@ -565,7 +566,8 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
     const std::uint32_t viewport_height = std::max(extent.height, 1U);
     const float aspect =
         static_cast<float>(viewport_width) / static_cast<float>(viewport_height);
-    glm::mat4 projection = camera_projection(aspect);
+    glm::mat4 projection = camera_projection(
+        aspect, camera_near, camera_far, vertical_fov_degrees_);
     projection[1][1] *= -1.0F;
     u.camera_view = view;
     u.cluster_projection = glm::vec4(
@@ -598,18 +600,20 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
     u.sun_color = sun.color;
     u.sky_zenith = sun.sky_zenith;
     u.sky_horizon = sun.sky_horizon;
+    u.sky_zenith.w = lighting_settings_.sky_intensity;
     if (authored_scene_enabled_ && !editor_sun_visible_)
         u.sun_direction_intensity.w = 0;
     const double shadow_hour = std::floor(lighting_settings_.hour * 3600.0) / 3600.0;
     if (mode_ != RunMode::instancing &&
         (!lighting_shadow_initialized_ || lighting_shadow_view_ != view ||
-         lighting_shadow_hour_ != shadow_hour || lighting_shadow_aspect_ != aspect)) {
+         lighting_shadow_hour_ != shadow_hour || lighting_shadow_aspect_ != aspect ||
+         lighting_shadow_fov_ != vertical_fov_degrees_)) {
         // One in-game second bounds solar stepping to a much smaller angle than
         // the old 15-second interval; paused lighting reuses the exact same atlas.
         const auto shadow_sun = evaluate_sun(shadow_hour);
         const auto tile_resolution = shadow_map_.width() / 2;
         const auto matrices = shadow_cascades(view, aspect, glm::vec3(shadow_sun.direction_intensity),
-                                               tile_resolution);
+                                               tile_resolution, vertical_fov_degrees_);
         if (!lighting_shadow_initialized_ || matrices != u.shadow_matrices) {
             for (unsigned i = 0; i < matrices.size(); ++i) {
                 if (!lighting_settings_.cascade_cache || !lighting_shadow_initialized_ ||
@@ -629,6 +633,7 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
         lighting_shadow_view_ = view;
         lighting_shadow_hour_ = shadow_hour;
         lighting_shadow_aspect_ = aspect;
+        lighting_shadow_fov_ = vertical_fov_degrees_;
     }
     const RayTracingMode rt_actual = ray_tracing_mode_actual();
     const bool rt_shadows = ray_tracing_uses_shadows(rt_actual);

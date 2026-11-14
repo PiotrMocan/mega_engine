@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -7,6 +8,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 namespace vcr {
@@ -99,6 +101,40 @@ struct ProjectInspection {
     bool icon_exists = false;
     std::string diagnostic{};
 };
+
+// Resolves the configuration-matching game module DLL path evaluated in the
+// caller's build mode (Debug/ASan check <project>/build/windows-{debug,asan},
+// Release returns inspection.game_module_path in <project>/bin/).
+[[nodiscard]] inline std::filesystem::path resolve_project_game_module_path(
+    const ProjectInspection& inspection) {
+    if (inspection.manifest.game_module.empty() ||
+        inspection.game_module_path.empty()) {
+        return {};
+    }
+#if defined(_DEBUG) || defined(__SANITIZE_ADDRESS__)
+#if defined(_DEBUG)
+    constexpr std::string_view build_dir_name = "windows-debug";
+#else
+    constexpr std::string_view build_dir_name = "windows-asan";
+#endif
+    const std::filesystem::path rel =
+        inspection.game_module_path.lexically_relative(
+            inspection.project_directory);
+    const std::filesystem::path cfg_root =
+        inspection.project_directory / "build" / build_dir_name;
+    const std::array<std::filesystem::path, 2U> candidates{
+        cfg_root / rel,
+        cfg_root / "bin" / inspection.game_module_path.filename(),
+    };
+    for (const auto& candidate : candidates) {
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(candidate, ec) && !ec) {
+            return candidate;
+        }
+    }
+#endif
+    return inspection.game_module_path;
+}
 
 struct ProjectRegistryEntry {
     std::string name{};

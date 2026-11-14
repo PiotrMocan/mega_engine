@@ -1,6 +1,7 @@
 #include "mcp_server.hpp"
 
 #include "png_encoder.hpp"
+#include "scene_component_json.hpp"
 
 #include <nlohmann/json.hpp>
 #include <glm/common.hpp>
@@ -74,7 +75,7 @@ constexpr std::array<std::string_view, 31> runtime_tool_names{
     "engine.quit",
 };
 
-constexpr std::array<std::string_view, 52> editor_tool_names{
+constexpr std::array<std::string_view, 55> editor_tool_names{
     "render.set_exposure",
     "render.set_color_grading",
     "render.set_subsurface",
@@ -112,6 +113,9 @@ constexpr std::array<std::string_view, 52> editor_tool_names{
     "editor.scene.set_ui_marker",
     "editor.scene.remove_ui_marker",
     "editor.ui.configure",
+    "editor.scene.set_spline",
+    "editor.scene.remove_spline",
+    "editor.sequencer.control",
     "editor.prefab.save",
     "editor.prefab.instantiate",
     "editor.prefab.unpack",
@@ -1333,6 +1337,51 @@ private:
             {"dialogue_id", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", 63}}},
             {"duration_seconds", Json{{"type", "number"}, {"minimum", 0.2}, {"maximum", 60.0}}},
         }), false, false, false));
+    tools.push_back(tool_definition(
+        "editor.scene.set_spline", "Attach or update SplineComponent on a scene node",
+        "Attach or replace a 3D spline path component (linear, catmull_rom, cubic_hermite) on a scene node.",
+        object_schema(Json{
+            {"id", handle_schema},
+            {"basis", Json{{"type", "string"}, {"enum", Json::array({"linear", "catmull_rom", "cubic_hermite"})}}},
+            {"closed_loop", Json{{"type", "boolean"}}},
+            {"tension", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 1.0}}},
+            {"points", Json{
+                {"type", "array"},
+                {"minItems", 2},
+                {"maxItems", max_spline_control_points},
+                {"items", Json{
+                    {"type", "object"},
+                    {"properties", Json{
+                        {"position", vec3_schema},
+                        {"tangent_in", vec3_schema},
+                        {"tangent_out", vec3_schema},
+                        {"roll_degrees", Json{{"type", "number"}, {"minimum", -180.0}, {"maximum", 180.0}}},
+                        {"speed_scale", Json{{"type", "number"}, {"minimum", 0.01}, {"maximum", 20.0}}},
+                    }},
+                    {"additionalProperties", false},
+                }},
+            }},
+        }, Json::array({"id"})), false, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.remove_spline", "Remove SplineComponent from a scene node",
+        "Detach any 3D spline component attached to the specified scene node.",
+        object_schema(Json{
+            {"id", handle_schema},
+        }, Json::array({"id"})), false, false, true));
+    tools.push_back(tool_definition(
+        "editor.sequencer.control", "Control Cutscene Sequencer editor state and Edit-mode preview",
+        "Create, open, save .vcrseq.json cutscenes or control non-destructive Edit-mode timeline preview playback/scrubbing.",
+        object_schema(Json{
+            {"action", Json{{"type", "string"}, {"enum", Json::array({"new", "open", "save", "play_preview", "pause_preview", "stop_preview", "scrub"})}}},
+            {"path", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", max_scene_asset_path_bytes}}},
+            {"id", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", 95}}},
+            {"title", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", 127}}},
+            {"duration_seconds", Json{{"type", "number"}, {"minimum", 0.25}, {"maximum", 3600.0}}},
+            {"frame_rate", Json{{"type", "number"}, {"minimum", 1.0}, {"maximum", 240.0}}},
+            {"looping", Json{{"type", "boolean"}}},
+            {"time_seconds", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 3600.0}}},
+            {"lock_camera", Json{{"type", "boolean"}}},
+        }, Json::array({"action"})), false, false, false));
     tools.push_back(tool_definition(
         "capture.screenshot", "Capture editor window",
         "Capture the next completed editor swapchain image as PNG image content.",
@@ -3292,6 +3341,148 @@ private:
         }
         command.type = McpCommandType::editor_configure_ui;
         command.ui_config = cfg;
+        return true;
+    }
+    if (name == "editor.scene.set_spline") {
+        if (!arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "set_spline requires a valid id";
+            return false;
+        }
+        Json spline_json = arguments;
+        spline_json.erase("id");
+        SplineComponent sp{};
+        if (!vcr::component_json::parse_spline_json(spline_json, sp)) {
+            error = "invalid spline component fields or points";
+            return false;
+        }
+        command.type = McpCommandType::editor_set_spline;
+        command.spline = sp;
+        return true;
+    }
+    if (name == "editor.scene.remove_spline") {
+        if (arguments.size() != 1U || !arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "id must be the only argument and contain index/generation";
+            return false;
+        }
+        command.type = McpCommandType::editor_remove_spline;
+        return true;
+    }
+    if (name == "editor.sequencer.control") {
+        if (!only_keys(arguments, {
+                "action", "path", "id", "title", "duration_seconds",
+                "frame_rate", "looping", "time_seconds", "lock_camera"}) ||
+            !arguments.contains("action") ||
+            !arguments["action"].is_string()) {
+            error = "sequencer.control requires action and valid optional fields";
+            return false;
+        }
+        const std::string action_str = arguments["action"].get<std::string>();
+        McpSequencerControlPayload payload{};
+        if (action_str == "new") {
+            payload.action = McpSequencerAction::new_sequence;
+        } else if (action_str == "open") {
+            payload.action = McpSequencerAction::open_sequence;
+            if (!arguments.contains("path")) {
+                error = "sequencer.control action 'open' requires path";
+                return false;
+            }
+        } else if (action_str == "save") {
+            payload.action = McpSequencerAction::save_sequence;
+        } else if (action_str == "play_preview") {
+            payload.action = McpSequencerAction::play_preview;
+        } else if (action_str == "pause_preview") {
+            payload.action = McpSequencerAction::pause_preview;
+        } else if (action_str == "stop_preview") {
+            payload.action = McpSequencerAction::stop_preview;
+        } else if (action_str == "scrub") {
+            payload.action = McpSequencerAction::scrub_preview;
+            if (!arguments.contains("time_seconds")) {
+                error = "sequencer.control action 'scrub' requires time_seconds";
+                return false;
+            }
+        } else {
+            error = "unknown sequencer.control action";
+            return false;
+        }
+        if (arguments.contains("path")) {
+            const auto p = get_string(arguments, "path");
+            if (!p || p->empty() ||
+                !copy_command_text(*p, command.text, error, "path")) {
+                if (error.empty()) {
+                    error = "path must be a non-empty string";
+                }
+                return false;
+            }
+        }
+        if (arguments.contains("id")) {
+            const auto sid = get_string(arguments, "id");
+            if (!sid || sid->empty() ||
+                !copy_command_text(*sid, payload.id, error, "id")) {
+                if (error.empty()) {
+                    error = "id must be a non-empty string up to 95 chars";
+                }
+                return false;
+            }
+        }
+        if (arguments.contains("title")) {
+            const auto stitle = get_string(arguments, "title");
+            if (!stitle || stitle->empty() ||
+                !copy_command_text(*stitle, payload.title, error, "title")) {
+                if (error.empty()) {
+                    error = "title must be a non-empty string up to 127 chars";
+                }
+                return false;
+            }
+        }
+        if (arguments.contains("duration_seconds")) {
+            const auto d = get_finite_float(
+                arguments, "duration_seconds", 0.25F, 3600.0F);
+            if (!d) {
+                error = "duration_seconds must be within [0.25, 3600.0]";
+                return false;
+            }
+            payload.duration_seconds = *d;
+        }
+        if (arguments.contains("frame_rate")) {
+            const auto fps = get_finite_float(
+                arguments, "frame_rate", 1.0F, 240.0F);
+            if (!fps) {
+                error = "frame_rate must be within [1.0, 240.0]";
+                return false;
+            }
+            payload.frame_rate = *fps;
+        }
+        if (arguments.contains("looping")) {
+            const auto b = get_bool(arguments, "looping");
+            if (!b) {
+                error = "looping must be a boolean";
+                return false;
+            }
+            payload.looping = *b;
+        }
+        if (arguments.contains("time_seconds")) {
+            const auto ts = get_finite_float(
+                arguments, "time_seconds", 0.0F, 3600.0F);
+            if (!ts) {
+                error = "time_seconds must be within [0.0, 3600.0]";
+                return false;
+            }
+            payload.scrub_time_seconds = *ts;
+            payload.has_scrub_time = true;
+        }
+        if (arguments.contains("lock_camera")) {
+            const auto b = get_bool(arguments, "lock_camera");
+            if (!b) {
+                error = "lock_camera must be a boolean";
+                return false;
+            }
+            payload.lock_camera = *b;
+            payload.has_lock_camera = true;
+        }
+        command.type = McpCommandType::editor_sequencer_control;
+        command.sequencer = payload;
         return true;
     }
     if (name == "editor.audio.set_bus") {

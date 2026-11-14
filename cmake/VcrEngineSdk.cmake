@@ -161,9 +161,16 @@ endif()
 
 get_filename_component(VCR_ENGINE_DLL_NAME "${VCR_ENGINE_DLL}" NAME)
 
-set(_vcr_engine_include_dirs "${VCR_ENGINE_ROOT}/src")
+set(_vcr_engine_include_dirs "")
 if(EXISTS "${CMAKE_SOURCE_DIR}/engine/include")
-    list(PREPEND _vcr_engine_include_dirs "${CMAKE_SOURCE_DIR}/engine/include")
+    list(APPEND _vcr_engine_include_dirs "${CMAKE_SOURCE_DIR}/engine/include")
+endif()
+if(EXISTS "${VCR_ENGINE_ROOT}/src")
+    list(APPEND _vcr_engine_include_dirs "${VCR_ENGINE_ROOT}/src")
+endif()
+if(_vcr_engine_include_dirs STREQUAL "")
+    message(FATAL_ERROR
+        "Unable to locate VCR engine headers in '${CMAKE_SOURCE_DIR}/engine/include' or '${VCR_ENGINE_ROOT}/src'.")
 endif()
 
 if(NOT "${_vcr_sdk_deps_dir}" STREQUAL "" AND
@@ -173,6 +180,9 @@ if(NOT "${_vcr_sdk_deps_dir}" STREQUAL "" AND
         "${_vcr_sdk_deps_dir}/glm-src"
         "${_vcr_sdk_deps_dir}/nlohmann_json-src/include"
     )
+elseif(EXISTS "${CMAKE_SOURCE_DIR}/engine/include/glm/glm.hpp" AND
+       EXISTS "${CMAKE_SOURCE_DIR}/engine/include/nlohmann/json.hpp")
+    # Pre-vendored third-party headers are already under engine/include.
 else()
     include(FetchContent)
     FetchContent_Declare(
@@ -227,7 +237,7 @@ if(NOT TARGET vcr::engine)
     endif()
 endif()
 
-if("${VCR_ENGINE_SDK_BUILD_DIR}" STREQUAL "" AND NOT _vcr_is_debug AND NOT _vcr_is_asan)
+if(NOT _vcr_is_debug AND NOT _vcr_is_asan)
     set(_vcr_default_stage_module ON)
 else()
     set(_vcr_default_stage_module OFF)

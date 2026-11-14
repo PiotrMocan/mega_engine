@@ -20,12 +20,21 @@ FlyCamera::FlyCamera(
     const glm::vec3 position,
     const float yaw_radians,
     const float pitch_radians,
-    const FlyCameraConfig config) noexcept
+    const FlyCameraConfig config,
+    const float roll_radians) noexcept
     : position_(position),
       yaw_radians_(yaw_radians),
       pitch_radians_(
           std::clamp(pitch_radians, -maximum_pitch, maximum_pitch)),
+      roll_radians_(std::isfinite(roll_radians) ? std::remainder(roll_radians, two_pi) : 0.0F),
       config_(config) {
+    rebuild_basis();
+}
+
+void FlyCamera::set_roll_radians(const float roll_radians) noexcept {
+    roll_radians_ = std::isfinite(roll_radians)
+        ? std::remainder(roll_radians, two_pi)
+        : 0.0F;
     rebuild_basis();
 }
 
@@ -89,7 +98,10 @@ void FlyCamera::focus(
 }
 
 glm::mat4 FlyCamera::view_matrix() const noexcept {
-    return glm::lookAt(position_, position_ + forward_, world_up);
+    if (std::abs(roll_radians_) <= 1.0e-6F) {
+        return glm::lookAt(position_, position_ + forward_, world_up);
+    }
+    return glm::lookAt(position_, position_ + forward_, up_);
 }
 
 void FlyCamera::rebuild_basis() noexcept {
@@ -99,6 +111,14 @@ void FlyCamera::rebuild_basis() noexcept {
         std::sin(pitch_radians_),
         cos_pitch * std::sin(yaw_radians_)));
     right_ = glm::normalize(glm::cross(forward_, world_up));
+    const glm::vec3 ortho_up = glm::normalize(glm::cross(right_, forward_));
+    if (std::abs(roll_radians_) <= 1.0e-6F) {
+        up_ = ortho_up;
+    } else {
+        up_ = glm::normalize(
+            ortho_up * std::cos(roll_radians_) +
+            right_ * std::sin(roll_radians_));
+    }
 }
 
 } // namespace vcr

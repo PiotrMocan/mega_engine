@@ -36,6 +36,7 @@ struct Fsr3Dispatch {
     VkExtent2D display_extent{};
     Fsr3Jitter jitter{};
     float frame_time_ms = 16.6667F;
+    float vertical_fov_degrees = 65.0F;
 };
 
 class Fsr3Upscaler final {

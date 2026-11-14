@@ -88,6 +88,11 @@ int main() {
     }
     LightingSettings settings;
     expect(valid_lighting_settings(settings), "defaults valid");
+    settings.sky_intensity = std::numeric_limits<float>::quiet_NaN();
+    expect(!valid_lighting_settings(settings), "nonfinite sky intensity rejected");
+    settings.sky_intensity = -1.0F;
+    expect(!valid_lighting_settings(settings), "negative sky intensity rejected");
+    settings.sky_intensity = 1.0F;
     expect(settings.shadow_resolution == 2048, "default atlas size preserves existing rendering");
     for (const auto resolution : shadow_resolutions) {
         settings.shadow_resolution = resolution;

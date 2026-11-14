@@ -2444,16 +2444,68 @@ bool bundle_project_runtime(
             return false;
         }
     }
-    if (workspace) {
-        const std::filesystem::path sdk_cmake_src =
-            *workspace / "cmake" / "VcrEngineSdk.cmake";
+    std::filesystem::path sdk_cmake_src =
+        workspace ? (*workspace / "cmake" / "VcrEngineSdk.cmake")
+                  : std::filesystem::path{};
+    ec.clear();
+    if (sdk_cmake_src.empty() ||
+        !std::filesystem::is_regular_file(sdk_cmake_src, ec) || ec) {
+        sdk_cmake_src = exe_dir / "engine" / "cmake" / "VcrEngineSdk.cmake";
         ec.clear();
-        if (std::filesystem::is_regular_file(sdk_cmake_src, ec) && !ec) {
-            if (!copy_file_atomically(
-                    sdk_cmake_src,
-                    inspection.project_directory / "engine" / "cmake" /
-                        "VcrEngineSdk.cmake",
-                    error)) {
+        if (!std::filesystem::is_regular_file(sdk_cmake_src, ec) || ec) {
+            sdk_cmake_src = exe_dir.parent_path() / "cmake" / "VcrEngineSdk.cmake";
+            ec.clear();
+        }
+    }
+    if (!sdk_cmake_src.empty() &&
+        std::filesystem::is_regular_file(sdk_cmake_src, ec) && !ec) {
+        if (!copy_file_atomically(
+                sdk_cmake_src,
+                inspection.project_directory / "engine" / "cmake" /
+                    "VcrEngineSdk.cmake",
+                error)) {
+            return false;
+        }
+    }
+
+    // Stage engine C++ headers into <project>/engine/include/ so C++ game modules
+    // can configure/build standalone even outside the engine workspace.
+    std::filesystem::path headers_src =
+        workspace ? (*workspace / "src") : std::filesystem::path{};
+    ec.clear();
+    if (headers_src.empty() ||
+        !std::filesystem::is_directory(headers_src, ec) || ec) {
+        headers_src = exe_dir / "engine" / "include";
+        ec.clear();
+        if (!std::filesystem::is_directory(headers_src, ec) || ec) {
+            headers_src = exe_dir.parent_path() / "include";
+            ec.clear();
+        }
+    }
+    if (!headers_src.empty() &&
+        std::filesystem::is_directory(headers_src, ec) && !ec) {
+        const std::filesystem::path target_include =
+            inspection.project_directory / "engine" / "include";
+        for (const auto& entry :
+             std::filesystem::recursive_directory_iterator(headers_src, ec)) {
+            if (ec) {
+                error = "Failed iterating engine headers: " + ec.message();
+                return false;
+            }
+            std::error_code item_ec;
+            if (!entry.is_regular_file(item_ec) || item_ec) {
+                continue;
+            }
+            const std::filesystem::path ext = entry.path().extension();
+            if (ext != ".hpp" && ext != ".h") {
+                continue;
+            }
+            const std::filesystem::path rel =
+                std::filesystem::relative(entry.path(), headers_src, item_ec);
+            if (item_ec || rel.empty()) {
+                continue;
+            }
+            if (!copy_file_atomically(entry.path(), target_include / rel, error)) {
                 return false;
             }
         }
@@ -2751,6 +2803,9 @@ bool compile_project_game_module(
         return false;
     }
 
+    const bool stage_to_project_bin =
+        (folder_tag == "release" || folder_tag == "relwithdebinfo");
+
     std::string script =
         "@echo off\r\n"
         "call \"" + vcvars_utf8 + "\" amd64\r\n"
@@ -2759,7 +2814,9 @@ bool compile_project_game_module(
         proj_utf8 + "\" -B \"" +
         build_utf8 + "\" -G Ninja -DCMAKE_MAKE_PROGRAM=\"" +
         ninja_utf8 + "\" -DCMAKE_BUILD_TYPE=" +
-        normalized_config;
+        normalized_config +
+        " -DVCR_STAGE_MODULE_TO_PROJECT_BIN=" +
+        (stage_to_project_bin ? "ON" : "OFF");
     if (workspace) {
         script += " -DVCR_ENGINE_ROOT=\"" + path_to_utf8(*workspace) + "\"";
         {
@@ -2866,28 +2923,41 @@ bool compile_project_game_module(
         return false;
     }
 
+    std::filesystem::path resolved_module_path = inspection.game_module_path;
     if (!inspection.game_module_path.empty()) {
         const std::filesystem::path built_dll =
             build_dir / "bin" / inspection.game_module_path.filename();
-        ec.clear();
-        if (std::filesystem::is_regular_file(built_dll, ec) && !ec) {
-            if (!copy_file_atomically(
-                    built_dll, inspection.game_module_path, error)) {
+        if (stage_to_project_bin) {
+            ec.clear();
+            if (std::filesystem::is_regular_file(built_dll, ec) && !ec) {
+                if (!copy_file_atomically(
+                        built_dll, inspection.game_module_path, error)) {
+                    return false;
+                }
+            }
+            ec.clear();
+            if (!std::filesystem::is_regular_file(
+                    inspection.game_module_path, ec) ||
+                ec) {
+                error = "Build finished, but expected game module DLL was not found: " +
+                        path_to_utf8(inspection.game_module_path);
                 return false;
             }
-        }
-        ec.clear();
-        if (!std::filesystem::is_regular_file(inspection.game_module_path, ec) ||
-            ec) {
-            error = "Build finished, but expected game module DLL was not found: " +
-                    path_to_utf8(inspection.game_module_path);
-            return false;
+            resolved_module_path = inspection.game_module_path;
+        } else {
+            ec.clear();
+            if (!std::filesystem::is_regular_file(built_dll, ec) || ec) {
+                error = "Build finished, but expected game module DLL was not found: " +
+                        path_to_utf8(built_dll);
+                return false;
+            }
+            resolved_module_path = built_dll;
         }
     }
 
     output.project_directory = inspection.project_directory;
     output.build_directory = build_dir;
-    output.module_path = inspection.game_module_path;
+    output.module_path = std::move(resolved_module_path);
     output.built = true;
     return true;
 #endif

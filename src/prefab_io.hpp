@@ -41,6 +41,7 @@ struct PrefabNodeOverride {
     std::optional<AnimatorComponent> animator{};
     std::optional<GameplayComponent> gameplay{};
     std::optional<UiMarkerComponent> ui_marker{};
+    std::optional<SplineComponent> spline{};
 };
 
 struct PrefabInstantiateOptions {

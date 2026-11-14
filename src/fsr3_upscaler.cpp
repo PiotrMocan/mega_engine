@@ -332,8 +332,11 @@ void Fsr3Upscaler::dispatch(const Fsr3Dispatch& description) {
     // FidelityFX's inverted-depth API names follow depth 0 and depth 1.
     dispatch_description.cameraNear = camera_far;
     dispatch_description.cameraFar = camera_near;
+    const float safe_fov = std::isfinite(description.vertical_fov_degrees)
+        ? std::clamp(description.vertical_fov_degrees, 10.0F, 140.0F)
+        : camera_vertical_fov;
     dispatch_description.cameraFovAngleVertical =
-        glm::radians(camera_vertical_fov);
+        glm::radians(safe_fov);
     dispatch_description.viewSpaceToMetersFactor = 1.0F;
 
     const ffxReturnCode_t result = dispatch_(

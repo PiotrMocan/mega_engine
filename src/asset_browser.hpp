@@ -17,6 +17,7 @@ enum class AssetEntryKind : std::uint8_t {
     prefab,
     audio,
     sound_cue,
+    cutscene,
     animation,
     image,
     shader,

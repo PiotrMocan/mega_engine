@@ -402,6 +402,8 @@ set(VCR_ENGINE_CORE_SOURCES
     src/lighting.cpp
     src/scene_visibility.cpp
     src/bounds_hierarchy.cpp
+    src/cinematic_camera.cpp
+    src/cutscene_sequencer.cpp
     src/runtime_scene.cpp
     src/collision.cpp
     src/physics_world.cpp
@@ -685,6 +687,10 @@ function(vcr_configure_executable target editor_enabled)
             ${target} PRIVATE
             /W4 /permissive- /Zc:preprocessor /GR- /EHsc
         )
+        # Dense-scene editor initialization plus Vulkan loader/validation calls
+        # can exhaust the default 1 MiB main-thread stack. Reserve virtual space;
+        # Windows commits stack pages only as they are touched.
+        target_link_options(${target} PRIVATE /STACK:8388608)
         if(VCR_WARNINGS_AS_ERRORS)
             target_compile_options(${target} PRIVATE /WX)
         endif()
@@ -1025,6 +1031,19 @@ if(BUILD_TESTING)
     )
     vcr_apply_cxx_warning_flags(vcr_animation_gameplay_tests)
     add_test(NAME vcr_animation_gameplay_tests COMMAND vcr_animation_gameplay_tests)
+
+    add_executable(vcr_sequencer_camera_tests tests/sequencer_camera_tests.cpp)
+    target_link_libraries(vcr_sequencer_camera_tests PRIVATE
+        vcr_engine
+        glm::glm
+        nlohmann_json::nlohmann_json
+        Threads::Threads
+    )
+    set_target_properties(vcr_sequencer_camera_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+    vcr_apply_cxx_warning_flags(vcr_sequencer_camera_tests)
+    add_test(NAME vcr_sequencer_camera_tests COMMAND vcr_sequencer_camera_tests)
 
     add_executable(vcr_engine_gameplay_api_tests tests/engine_gameplay_api_tests.cpp)
     target_compile_definitions(vcr_engine_gameplay_api_tests PRIVATE

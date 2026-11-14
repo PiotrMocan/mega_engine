@@ -220,7 +220,7 @@ void Application::initialize(const CliOptions& options) {
     if (!renderer_.set_fog_settings(resolve_scene_fog(options, scene_.fog))) {
         fatal("Invalid fog settings or unsupported sampled depth/HDR blending");
     }
-    if (!renderer_.set_exposure_settings(options.exposure)) {
+    if (!renderer_.set_exposure_settings(resolve_scene_exposure(options, scene_.exposure))) {
         fatal("Invalid exposure settings");
     }
     if (!renderer_.set_color_grading(
@@ -678,6 +678,7 @@ void Application::restart_gameplay_session() {
         options_.camera_z_explicit
             ? std::optional<double>(options_.camera_z)
             : std::nullopt);
+    gameplay_.set_startup_cutscene(options_.startup_cutscene);
     if (!gameplay_.start(
             scene_,
             view,
@@ -745,6 +746,7 @@ void Application::initialize_gameplay(const SceneRenderView& initial_view) {
         gameplay_.configure_game_ui(cfg);
     }
     bind_game_ui_callbacks();
+    gameplay_.set_startup_cutscene(options_.startup_cutscene);
     if (!gameplay_.start(
             scene_,
             initial_view,
@@ -1059,6 +1061,9 @@ void Application::handle_key_action(
             }
             break;
         }
+        if (gameplay_.active() && gameplay_.cutscene_player().captures_input()) {
+            break;
+        }
         if (mouse_captured_ && !options_.benchmark) {
             set_mouse_capture(false);
         } else if (allow_quit) {
@@ -1179,9 +1184,18 @@ void Application::update_camera(const float delta_seconds) {
     if (!options_.benchmark) {
         if (gameplay_.active()) {
             const bool ui_wants_cursor = gameplay_.game_ui().wants_mouse_cursor();
-            if (ui_wants_cursor && input_actions_.context() != InputContext::ui) {
-                input_actions_.set_context(InputContext::ui);
-            } else if (!ui_wants_cursor && input_actions_.context() == InputContext::ui) {
+            const bool cutscene_captures =
+                gameplay_.cutscene_player().captures_input();
+            if (ui_wants_cursor) {
+                if (input_actions_.context() != InputContext::ui) {
+                    input_actions_.set_context(InputContext::ui);
+                }
+            } else if (cutscene_captures) {
+                if (input_actions_.context() != InputContext::cutscene) {
+                    input_actions_.set_context(InputContext::cutscene);
+                }
+            } else if (input_actions_.context() == InputContext::ui ||
+                       input_actions_.context() == InputContext::cutscene) {
                 input_actions_.set_context(InputContext::gameplay);
             }
             if (ui_wants_cursor && mouse_captured_) {
@@ -1538,6 +1552,7 @@ void Application::execute_mcp_command(const McpCommand& command) {
                      {"lighting",
                       Json{{"dynamic", renderer_.lighting_settings().dynamic},
                            {"hour", renderer_.lighting_settings().hour},
+                           {"sky_intensity", renderer_.lighting_settings().sky_intensity},
                            {"cycle", renderer_.lighting_settings().cycle},
                            {"voxel_gi", renderer_.lighting_settings().voxel_gi},
                            {"shadow_resolution", renderer_.shadow_resolution()},

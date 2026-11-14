@@ -116,31 +116,7 @@ namespace {
 
 [[nodiscard]] std::filesystem::path resolve_game_module_path(
     const ProjectInspection& inspection) {
-    if (inspection.manifest.game_module.empty()) {
-        return {};
-    }
-    const std::filesystem::path rel =
-        path_from_utf8_view(inspection.manifest.game_module);
-#if defined(_DEBUG) || defined(__SANITIZE_ADDRESS__)
-#if defined(_DEBUG)
-    constexpr std::string_view build_dir_name = "windows-debug";
-#else
-    constexpr std::string_view build_dir_name = "windows-asan";
-#endif
-    const std::filesystem::path cfg_root =
-        inspection.project_directory / "build" / build_dir_name;
-    const std::array<std::filesystem::path, 2U> candidates{
-        cfg_root / rel,
-        cfg_root / "bin" / rel.filename(),
-    };
-    for (const auto& candidate : candidates) {
-        std::error_code ec;
-        if (std::filesystem::is_regular_file(candidate, ec) && !ec) {
-            return candidate;
-        }
-    }
-#endif
-    return inspection.project_directory / rel;
+    return resolve_project_game_module_path(inspection);
 }
 
 [[nodiscard]] std::optional<RuntimeAssetRoot> resolve_explicit_project(

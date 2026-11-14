@@ -78,6 +78,9 @@ struct CookedModelMaterial {
     // Linear glTF packing: G roughness, B metallic; optional R occlusion.
     std::optional<std::filesystem::path> metallic_roughness_texture{};
     std::optional<std::filesystem::path> displacement_texture{};
+    // Linear emitted radiance, independent of the surface's reflected color.
+    glm::vec4 emissive_factor{0.0F};
+    std::optional<std::filesystem::path> emissive_texture{};
     MaterialTessellation tessellation{};
     // Bits 0/1 select alpha masking/two-sided shading, bit 2 packed occlusion;
     // high 16 bits hold cutoff.

@@ -92,6 +92,7 @@ struct CliOptions {
     ToneMapper tone_mapper = ToneMapper::reinhard;
     bool tone_mapper_override = false;
     ExposureSettings exposure{};
+    bool exposure_override = false;
     FogSettings fog{};
     FogOverrides fog_overrides{};
     ColorGrading color_grading = ColorGrading::off;
@@ -120,6 +121,7 @@ struct CliOptions {
     std::string project_path{};
     std::string scene_asset{};
     std::string stream_asset{};
+    std::string startup_cutscene{};
     bool start_in_main_menu = false;
     std::string locale{};
     bool animate_camera = false;
@@ -141,6 +143,8 @@ struct CliOptions {
     const CliOptions &options, const std::optional<LightingSettings> &authored) noexcept;
 [[nodiscard]] ToneMapper resolve_scene_tone_mapper(
     const CliOptions& options, std::optional<ToneMapper> authored) noexcept;
+[[nodiscard]] ExposureSettings resolve_scene_exposure(
+    const CliOptions& options, const std::optional<ExposureSettings>& authored) noexcept;
 [[nodiscard]] SubsurfaceMode resolve_scene_subsurface(
     const CliOptions& options, std::optional<SubsurfaceMode> authored) noexcept;
 [[nodiscard]] FogSettings resolve_scene_fog(

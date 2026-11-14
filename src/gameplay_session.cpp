@@ -3,7 +3,9 @@
 #include "fly_camera.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdio>
 
 #include <glm/geometric.hpp>
 #include <glm/gtc/matrix_access.hpp>
@@ -16,6 +18,85 @@ namespace {
 constexpr glm::vec3 player_half_extents{0.45F, 0.9F, 0.3F};
 constexpr float radians_to_degrees = 57.2957795131F;
 constexpr float maximum_session_delta_seconds = 0.1F;
+
+void flush_cutscene_events(
+    const CutsceneRuntimePlayer& player,
+    GameplayWorld& world,
+    const SceneDocument& scene,
+    const CollisionWorld* const collision_world,
+    const PhysicsWorld* const physics_world,
+    AnimatorRuntimeSystem* const animators,
+    AudioEngine* const audio_engine) {
+    const auto& events = player.sequence().event_keys;
+    for (const std::size_t ev_idx : player.frame_fired_event_indices()) {
+        if (ev_idx >= events.size()) {
+            continue;
+        }
+        const SequencerEventKey& ev = events[ev_idx];
+        std::array<char, 160U> msg{};
+        std::snprintf(
+            msg.data(),
+            msg.size(),
+            "seq:%.*s (%.*s)",
+            static_cast<int>(std::min<std::size_t>(ev.event_name.size(), 48U)),
+            ev.event_name.data(),
+            static_cast<int>(std::min<std::size_t>(ev.payload.size(), 80U)),
+            ev.payload.data());
+        world.push_event_log(msg.data());
+        if (ev.target_node_uuid) {
+            const bool is_interact =
+                (ev.event_name != "trigger" &&
+                 ev.event_name != "trigger_enter");
+            static_cast<void>(world.trigger_entity_event(
+                ev.target_node_uuid,
+                is_interact,
+                scene,
+                collision_world,
+                physics_world,
+                animators,
+                audio_engine));
+        }
+    }
+}
+
+[[nodiscard]] TransformRows mat4_to_rows(const glm::mat4& m) noexcept {
+    return TransformRows{
+        glm::row(m, 0),
+        glm::row(m, 1),
+        glm::row(m, 2),
+    };
+}
+
+void restore_cutscene_node_overrides(
+    std::vector<SceneNodeId>& overridden_nodes,
+    const std::span<const SceneWorldNode> world_nodes,
+    const RuntimeTransformSink& sink) noexcept {
+    if (sink.apply == nullptr) {
+        overridden_nodes.clear();
+        return;
+    }
+    for (const SceneNodeId id : overridden_nodes) {
+        for (const SceneWorldNode& wn : world_nodes) {
+            if (wn.id != id) {
+                continue;
+            }
+            if (wn.world_visible) {
+                static_cast<void>(
+                    sink.apply(sink.context, id, mat4_to_rows(wn.world_matrix)));
+            } else {
+                const glm::vec3 p = glm::vec3(wn.world_matrix[3]);
+                const TransformRows hidden_rows{
+                    glm::vec4{0.0F, 0.0F, 0.0F, p.x},
+                    glm::vec4{0.0F, 0.0F, 0.0F, p.y},
+                    glm::vec4{0.0F, 0.0F, 0.0F, p.z},
+                };
+                static_cast<void>(sink.apply(sink.context, id, hidden_rows));
+            }
+            break;
+        }
+    }
+    overridden_nodes.clear();
+}
 
 [[nodiscard]] glm::vec3 compute_desired_planar_velocity(
     const CharacterInput& input,
@@ -69,14 +150,6 @@ constexpr float maximum_session_delta_seconds = 0.1F;
     model = glm::rotate(model, yaw_radians, glm::vec3(0.0F, 1.0F, 0.0F));
     model = glm::scale(model, scale);
     return model;
-}
-
-[[nodiscard]] TransformRows mat4_to_rows(const glm::mat4& m) noexcept {
-    return TransformRows{
-        glm::row(m, 0),
-        glm::row(m, 1),
-        glm::row(m, 2),
-    };
 }
 
 [[nodiscard]] glm::mat4 rows_to_mat4(const TransformRows& r) noexcept {
@@ -406,12 +479,146 @@ bool GameplaySession::start(
     }
     game_ui_.reset_session_state();
     ui_audio_paused_ = false;
+    camera_shake_.reset();
+    cutscene_player_.stop(audio_engine);
+    cutscene_overridden_nodes_.clear();
+    cutscene_overridden_nodes_.reserve(64U);
+    pending_cutscene_scratch_.clear();
+    pending_cutscene_scratch_.reserve(256U);
+    current_lens_fov_ = camera_vertical_fov;
+    current_lens_exposure_ev_ = 0.0F;
+    current_lens_focus_ = CameraFocusState{};
+    cutscene_was_active_ = false;
+    lens_cut_pending_ = false;
+
+    if (renderer_bridge != nullptr) {
+        if (renderer_bridge->set_vertical_fov_degrees != nullptr) {
+            renderer_bridge->set_vertical_fov_degrees(
+                renderer_bridge->context, current_lens_fov_);
+        }
+        if (renderer_bridge->set_camera_exposure_offset_ev != nullptr) {
+            renderer_bridge->set_camera_exposure_offset_ev(
+                renderer_bridge->context, 0.0F);
+        }
+        if (renderer_bridge->set_camera_focus_state != nullptr) {
+            renderer_bridge->set_camera_focus_state(
+                renderer_bridge->context, CameraFocusState{});
+        }
+    }
 
     if (audio_engine != nullptr && audio_engine->initialized()) {
         audio_engine->set_gameplay_paused(false);
         sync_scene_audio(scene, output_camera, 0.0F, true, *audio_engine);
     }
+
+    if (!startup_cutscene_id_.empty()) {
+        if (!play_cutscene(
+                startup_cutscene_id_,
+                scene,
+                output_camera,
+                audio_engine,
+                &error)) {
+            stop(audio_engine, renderer_bridge);
+            return false;
+        }
+        if (cutscene_player_.captures_input() && input_actions != nullptr) {
+            input_actions->set_context(InputContext::cutscene);
+        }
+    }
     return true;
+}
+
+void GameplaySession::set_startup_cutscene(
+    const std::string_view cutscene_id_or_path) {
+    startup_cutscene_id_.assign(cutscene_id_or_path);
+}
+
+bool GameplaySession::play_cutscene(
+    const std::string_view cutscene_id_or_path,
+    const SceneDocument& scene,
+    const FlyCamera& current_camera,
+    AudioEngine* const audio_engine,
+    std::string* const out_error) {
+    if (cutscene_id_or_path.empty()) {
+        if (out_error != nullptr) {
+            *out_error = "Cutscene identifier or path is empty.";
+        }
+        return false;
+    }
+    if (content_asset_root_.empty()) {
+        if (out_error != nullptr) {
+            *out_error = "Content asset root is not configured.";
+        }
+        return false;
+    }
+    std::string rel_path;
+    if (!resolve_cutscene_relative_path(
+            content_asset_root_, cutscene_id_or_path, rel_path)) {
+        if (out_error != nullptr) {
+            *out_error = "Cutscene asset not found: " +
+                         std::string(cutscene_id_or_path);
+        }
+        return false;
+    }
+    CutsceneSequence sequence;
+    std::string load_error;
+    if (!load_cutscene_sequence_file(
+            content_asset_root_, rel_path, sequence, load_error)) {
+        if (out_error != nullptr) {
+            *out_error = std::move(load_error);
+        }
+        return false;
+    }
+    const CinematicCameraPose entry_pose = pose_from_fly_camera(
+        current_camera,
+        current_lens_fov_,
+        current_lens_exposure_ev_,
+        current_lens_focus_);
+    if (!cutscene_player_.start(
+            std::move(sequence),
+            scene,
+            entry_pose,
+            content_asset_root_,
+            audio_engine)) {
+        if (out_error != nullptr) {
+            *out_error = "Failed to initialize cutscene runtime player.";
+        }
+        return false;
+    }
+    cutscene_overridden_nodes_.clear();
+    cutscene_was_active_ = true;
+    lens_cut_pending_ =
+        cutscene_player_.last_frame().camera_cut_discontinuity;
+    return true;
+}
+
+void GameplaySession::stop_cutscene(
+    const GameplayRendererBridge* const renderer_bridge,
+    AudioEngine* const audio_engine) noexcept {
+    cutscene_player_.stop(audio_engine);
+    cutscene_overridden_nodes_.clear();
+    cutscene_was_active_ = false;
+    current_lens_fov_ = camera_vertical_fov;
+    current_lens_exposure_ev_ = 0.0F;
+    current_lens_focus_ = CameraFocusState{};
+    lens_cut_pending_ = false;
+    if (renderer_bridge != nullptr) {
+        if (renderer_bridge->set_vertical_fov_degrees != nullptr) {
+            renderer_bridge->set_vertical_fov_degrees(
+                renderer_bridge->context, camera_vertical_fov);
+        }
+        if (renderer_bridge->set_camera_exposure_offset_ev != nullptr) {
+            renderer_bridge->set_camera_exposure_offset_ev(
+                renderer_bridge->context, 0.0F);
+        }
+        if (renderer_bridge->set_camera_focus_state != nullptr) {
+            renderer_bridge->set_camera_focus_state(
+                renderer_bridge->context, CameraFocusState{});
+        }
+        if (renderer_bridge->notify_camera_cut != nullptr) {
+            renderer_bridge->notify_camera_cut(renderer_bridge->context);
+        }
+    }
 }
 
 bool GameplaySession::update(
@@ -561,6 +768,10 @@ bool GameplaySession::update_internal(
             static_cast<float>(vp_h));
         overlay_canvas_.clear();
         game_ui_.render(overlay_canvas_, ui_in);
+        if (input_actions != nullptr && game_ui_.wants_mouse_cursor() &&
+            input_actions->context() != InputContext::ui) {
+            input_actions->set_context(InputContext::ui);
+        }
         return true;
     }
     if (ui_audio_paused_) {
@@ -569,6 +780,41 @@ bool GameplaySession::update_internal(
         }
         ui_audio_paused_ = false;
     }
+
+    if (gameplay_world_.consume_cutscene_request(pending_cutscene_scratch_)) {
+        if (!play_cutscene(
+                pending_cutscene_scratch_,
+                scene,
+                output_camera,
+                audio_engine,
+                nullptr)) {
+            std::array<char, 160U> msg{};
+            std::snprintf(
+                msg.data(),
+                msg.size(),
+                "cutscene_load_failed: %s",
+                pending_cutscene_scratch_.c_str());
+            gameplay_world_.push_event_log(msg.data());
+        }
+    }
+
+    if (cutscene_player_.active() && cutscene_player_.skippable() &&
+        input_actions != nullptr &&
+        input_actions->action_pressed(InputAction::cutscene_skip)) {
+        cutscene_player_.skip(audio_engine);
+        flush_cutscene_events(
+            cutscene_player_,
+            gameplay_world_,
+            scene,
+            &collision_world_,
+            &physics_world_,
+            &animator_runtime_,
+            audio_engine);
+    }
+
+    camera_shake_.update(dt);
+    const bool cutscene_pauses_sim =
+        cutscene_player_.pauses_gameplay_simulation();
 
     GameplayUpdateContext ctx{
         .input = input,
@@ -579,7 +825,7 @@ bool GameplaySession::update_internal(
         .input_actions = input_actions,
         .delta_seconds = dt,
     };
-    if (game_ui_.blocks_player_control()) {
+    if (game_ui_.blocks_player_control() || cutscene_player_.captures_input()) {
         ctx.input.character = CharacterInput{};
         ctx.input.mouse_delta_x = 0.0F;
         ctx.input.mouse_delta_y = 0.0F;
@@ -588,6 +834,7 @@ bool GameplaySession::update_internal(
         ctx.suppress_default_camera_look = true;
     }
 
+    if (!cutscene_pauses_sim) {
     // Stage 1: Input & AI.
     if (extensions_.on_input_ai != nullptr) {
         extensions_.on_input_ai(extensions_.user_data, *this, ctx);
@@ -766,6 +1013,96 @@ bool GameplaySession::update_internal(
         transform_registry_.sync_outputs(
             &collision_world_, mutable_sink.apply != nullptr ? &mutable_sink : nullptr);
     }
+    } // if (!cutscene_pauses_sim)
+
+    const glm::vec3 active_player_pos =
+        player_setup_.use_animated_character
+            ? animated_player_.world_position()
+            : character_.position();
+    RuntimeTransformSink mutable_sink = transform_sink;
+
+    if (cutscene_player_.active()) {
+        cutscene_was_active_ = true;
+        const float aspect =
+            static_cast<float>(vp_w) / static_cast<float>(vp_h);
+        const glm::vec3 fb_pos = camera_.position(
+            active_player_pos, collision_world_, physics_world_);
+        const FlyCamera fb_fly(fb_pos, camera_.yaw(), camera_.pitch());
+        const CinematicCameraPose fb_pose = pose_from_fly_camera(
+            fb_fly, camera_vertical_fov, 0.0F, {});
+
+        cutscene_player_.update(dt, scene, fb_pose, aspect, audio_engine);
+
+        for (const SequencerGameplayVarSample& var :
+             cutscene_player_.gameplay_vars()) {
+            gameplay_world_.set_variable(var.name, var.value);
+        }
+        flush_cutscene_events(
+            cutscene_player_,
+            gameplay_world_,
+            scene,
+            &collision_world_,
+            &physics_world_,
+            &animator_runtime_,
+            audio_engine);
+
+        for (const CutsceneEvaluatedNodePose& pose :
+             cutscene_player_.evaluated_nodes()) {
+            if (!pose.node_id) {
+                continue;
+            }
+            if (pose.visibility_modified && !pose.visible) {
+                if (mutable_sink.apply != nullptr) {
+                    const glm::vec3 p = glm::vec3(pose.world_matrix[3]);
+                    const TransformRows hidden_rows{
+                        glm::vec4{0.0F, 0.0F, 0.0F, p.x},
+                        glm::vec4{0.0F, 0.0F, 0.0F, p.y},
+                        glm::vec4{0.0F, 0.0F, 0.0F, p.z},
+                    };
+                    static_cast<void>(mutable_sink.apply(
+                        mutable_sink.context, pose.node_id, hidden_rows));
+                }
+                if (!transform_registry_.has_node(pose.node_id) &&
+                    std::ranges::find(
+                        cutscene_overridden_nodes_, pose.node_id) ==
+                        cutscene_overridden_nodes_.end()) {
+                    cutscene_overridden_nodes_.push_back(pose.node_id);
+                }
+            } else if (pose.transform_modified) {
+                if (transform_registry_.has_node(pose.node_id)) {
+                    static_cast<void>(transform_registry_.set_world_matrix(
+                        pose.node_id, pose.world_matrix));
+                } else if (std::ranges::find(
+                               cutscene_overridden_nodes_, pose.node_id) ==
+                           cutscene_overridden_nodes_.end()) {
+                    cutscene_overridden_nodes_.push_back(pose.node_id);
+                }
+                if (mutable_sink.apply != nullptr) {
+                    static_cast<void>(mutable_sink.apply(
+                        mutable_sink.context,
+                        pose.node_id,
+                        mat4_to_rows(pose.world_matrix)));
+                }
+            }
+            if (pose.has_anim_clip || pose.animator_modified) {
+                animator_runtime_.set_preview(
+                    pose.node_id,
+                    pose.active_anim_clip_name,
+                    false,
+                    pose.anim_eval_time,
+                    pose.animator.looping);
+            }
+        }
+    }
+
+    if (cutscene_was_active_ && !cutscene_player_.active()) {
+        restore_cutscene_node_overrides(
+            cutscene_overridden_nodes_, cached_world_nodes_, mutable_sink);
+        cutscene_was_active_ = false;
+        if (cutscene_player_.sequence().blend_out_seconds <= 1.0e-4F) {
+            lens_cut_pending_ = true;
+        }
+    }
 
     // Stage 4: Animation & IK (uses updated live world matrices).
     const auto& live_pool = transform_registry_.live_world_nodes();
@@ -801,7 +1138,7 @@ bool GameplaySession::update_internal(
         }
     }
 
-    if (extensions_.on_post_animation != nullptr) {
+    if (extensions_.on_post_animation != nullptr && !cutscene_pauses_sim) {
         extensions_.on_post_animation(extensions_.user_data, *this, ctx);
     }
 
@@ -819,7 +1156,7 @@ bool GameplaySession::update_internal(
         static_cast<float>(vp_h));
     overlay_canvas_.clear();
 
-    if (extensions_.on_camera_audio_overlay != nullptr) {
+    if (extensions_.on_camera_audio_overlay != nullptr && !cutscene_pauses_sim) {
         extensions_.on_camera_audio_overlay(extensions_.user_data, *this, ctx);
         if (ctx.has_camera_override) {
             output_camera = FlyCamera(
@@ -827,6 +1164,52 @@ bool GameplaySession::update_internal(
                 ctx.camera_override_yaw_radians,
                 ctx.camera_override_pitch_radians);
         }
+    }
+
+    CinematicCameraPose lens_pose = pose_from_fly_camera(
+        output_camera, camera_vertical_fov, 0.0F, {});
+    bool camera_cut_discontinuity = false;
+
+    if (cutscene_player_.active()) {
+        const CutsceneFrameResult& cframe = cutscene_player_.last_frame();
+        camera_cut_discontinuity = cframe.camera_cut_discontinuity;
+        if (cframe.has_camera) {
+            lens_pose = cframe.camera_pose;
+            if (camera_shake_.has_active_shake()) {
+                camera_shake_.apply_to_pose(lens_pose);
+            }
+            pose_to_fly_camera(lens_pose, output_camera);
+        } else if (camera_shake_.has_active_shake()) {
+            camera_shake_.apply_to_pose(lens_pose);
+            pose_to_fly_camera(lens_pose, output_camera);
+        }
+    } else if (camera_shake_.has_active_shake()) {
+        camera_shake_.apply_to_pose(lens_pose);
+        pose_to_fly_camera(lens_pose, output_camera);
+    }
+
+    current_lens_fov_ = lens_pose.vertical_fov_degrees;
+    current_lens_exposure_ev_ = lens_pose.exposure_offset_ev;
+    current_lens_focus_ = lens_pose.focus;
+
+    if (renderer_bridge != nullptr) {
+        if (renderer_bridge->set_vertical_fov_degrees != nullptr) {
+            renderer_bridge->set_vertical_fov_degrees(
+                renderer_bridge->context, current_lens_fov_);
+        }
+        if (renderer_bridge->set_camera_exposure_offset_ev != nullptr) {
+            renderer_bridge->set_camera_exposure_offset_ev(
+                renderer_bridge->context, current_lens_exposure_ev_);
+        }
+        if (renderer_bridge->set_camera_focus_state != nullptr) {
+            renderer_bridge->set_camera_focus_state(
+                renderer_bridge->context, current_lens_focus_);
+        }
+        if ((camera_cut_discontinuity || lens_cut_pending_) &&
+            renderer_bridge->notify_camera_cut != nullptr) {
+            renderer_bridge->notify_camera_cut(renderer_bridge->context);
+        }
+        lens_cut_pending_ = false;
     }
 
     const GameUiUpdateInput ui_final_input{
@@ -848,8 +1231,14 @@ bool GameplaySession::update_internal(
         .audio_engine = audio_engine,
         .localization = &localization_,
     };
-    game_ui_.refresh_markers(ui_final_input);
-    game_ui_.render(overlay_canvas_, ui_final_input);
+    if (!cutscene_player_.hides_hud()) {
+        game_ui_.refresh_markers(ui_final_input);
+        game_ui_.render(overlay_canvas_, ui_final_input);
+    }
+    if (cutscene_player_.active()) {
+        render_cutscene_overlay(
+            cutscene_player_.last_frame(), localization_, overlay_canvas_);
+    }
 
     if (input_actions != nullptr) {
         if (player_setup_.use_animated_character) {
@@ -869,6 +1258,18 @@ bool GameplaySession::update_internal(
                 input_actions->trigger_rumble(
                     intensity, intensity * 0.6F, 0.12F);
             }
+        }
+        if (game_ui_.wants_mouse_cursor()) {
+            if (input_actions->context() != InputContext::ui) {
+                input_actions->set_context(InputContext::ui);
+            }
+        } else if (cutscene_player_.captures_input()) {
+            if (input_actions->context() != InputContext::cutscene) {
+                input_actions->set_context(InputContext::cutscene);
+            }
+        } else if (input_actions->context() == InputContext::ui ||
+                   input_actions->context() == InputContext::cutscene) {
+            input_actions->set_context(player_setup_.initial_input_context);
         }
     }
 
@@ -1227,6 +1628,9 @@ void GameplaySession::stop(
         audio_engine->stop_gameplay_audio(0.03F);
     }
     ui_audio_paused_ = false;
+    camera_shake_.reset();
+    stop_cutscene(renderer_bridge, audio_engine);
+    pending_cutscene_scratch_.clear();
     game_ui_.reset_session_state();
     const SkeletalAssetProvider skeletal_provider =
         renderer_bridge != nullptr

@@ -28,7 +28,7 @@ const float pi = 3.141592653589793;
 vec3 reflectedSky(vec3 direction)
 {
     if (lighting.options.x > 0.5)
-        return dynamicSkyBackground(direction);
+        return dynamicSkyBackground(direction) * lighting.skyZenith.w;
     vec2 uv = vec2(atan(direction.x, -direction.z) / (2.0 * pi)
                   + 0.5 + frame.sunColorSkyYaw.w,
                   acos(clamp(direction.y, -1.0, 1.0)) / pi);
@@ -142,7 +142,7 @@ void main()
     vec3 glint = sun * distribution * visibility * sunFresnel
         / max(4.0 * nDotV, 0.001);
     vec3 ambient = lighting.options.x > 0.5
-        ? lighting.skyHorizon.rgb : frame.skyAmbient.rgb;
+        ? lighting.skyHorizon.rgb * lighting.skyZenith.w : frame.skyAmbient.rgb;
     float opticalDepth = frame.oceanColorDepth.a / max(-ray.y, 0.15);
     float transmission = frame.oceanDirectionTransparency.z * exp(-opticalDepth * 0.04);
     vec3 waterTint = frame.oceanColorDepth.rgb

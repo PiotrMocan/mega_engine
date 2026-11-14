@@ -90,6 +90,9 @@ enum class McpCommandType : std::uint8_t {
     editor_set_ui_marker,
     editor_remove_ui_marker,
     editor_configure_ui,
+    editor_set_spline,
+    editor_remove_spline,
+    editor_sequencer_control,
     engine_request_quit,
     engine_commit_quit,
 };
@@ -194,6 +197,31 @@ struct McpUiConfigPayload {
 
 static_assert(std::is_trivially_copyable_v<McpUiConfigPayload>);
 
+enum class McpSequencerAction : std::uint8_t {
+    new_sequence = 0U,
+    open_sequence = 1U,
+    save_sequence = 2U,
+    play_preview = 3U,
+    pause_preview = 4U,
+    stop_preview = 5U,
+    scrub_preview = 6U,
+};
+
+struct McpSequencerControlPayload {
+    McpSequencerAction action = McpSequencerAction::new_sequence;
+    bool looping = false;
+    bool has_scrub_time = false;
+    bool lock_camera = true;
+    bool has_lock_camera = false;
+    float duration_seconds = 5.0F;
+    float frame_rate = 30.0F;
+    float scrub_time_seconds = 0.0F;
+    std::array<char, 96U> id{};
+    std::array<char, 128U> title{};
+};
+
+static_assert(std::is_trivially_copyable_v<McpSequencerControlPayload>);
+
 struct McpCommand {
     static constexpr std::size_t text_capacity =
         max_scene_asset_path_bytes + 1U;
@@ -257,6 +285,8 @@ struct McpCommand {
     GameplayComponent gameplay{};
     UiMarkerComponent ui_marker{};
     McpUiConfigPayload ui_config{};
+    SplineComponent spline{};
+    McpSequencerControlPayload sequencer{};
     float preview_time_seconds = -1.0F;
     bool preview_stop = false;
     bool preview_params_supplied = false;

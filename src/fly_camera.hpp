@@ -36,14 +36,21 @@ public:
         glm::vec3 position = glm::vec3(0.0F, 4.0F, 12.0F),
         float yaw_radians = -1.57079632679F,
         float pitch_radians = -0.20943951023F,
-        FlyCameraConfig config = {}) noexcept;
+        FlyCameraConfig config = {},
+        float roll_radians = 0.0F) noexcept;
 
     void update(const FlyCameraInput& input, float delta_seconds) noexcept;
     void focus(glm::vec3 target, float distance) noexcept;
+    void set_roll_radians(float roll_radians) noexcept;
 
     [[nodiscard]] glm::mat4 view_matrix() const noexcept;
     [[nodiscard]] glm::vec3 position() const noexcept { return position_; }
     [[nodiscard]] glm::vec3 forward() const noexcept { return forward_; }
+    [[nodiscard]] glm::vec3 right() const noexcept { return right_; }
+    [[nodiscard]] glm::vec3 up() const noexcept { return up_; }
+    [[nodiscard]] float yaw_radians() const noexcept { return yaw_radians_; }
+    [[nodiscard]] float pitch_radians() const noexcept { return pitch_radians_; }
+    [[nodiscard]] float roll_radians() const noexcept { return roll_radians_; }
 
 private:
     void rebuild_basis() noexcept;
@@ -51,8 +58,10 @@ private:
     glm::vec3 position_{};
     glm::vec3 forward_{0.0F, 0.0F, -1.0F};
     glm::vec3 right_{1.0F, 0.0F, 0.0F};
+    glm::vec3 up_{0.0F, 1.0F, 0.0F};
     float yaw_radians_ = -1.57079632679F;
     float pitch_radians_ = 0.0F;
+    float roll_radians_ = 0.0F;
     FlyCameraConfig config_{};
 };
 

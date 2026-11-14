@@ -423,4 +423,121 @@ using Json = nlohmann::json;
     return true;
 }
 
+[[nodiscard]] inline Json spline_to_json(const SplineComponent& spline) {
+    Json points = Json::array();
+    const std::uint32_t count = std::min(
+        spline.point_count, max_spline_control_points);
+    for (std::uint32_t i = 0U; i < count; ++i) {
+        const SplineControlPoint& pt = spline.points[i];
+        points.push_back(Json{
+            {"position", {pt.position.x, pt.position.y, pt.position.z}},
+            {"tangent_in", {pt.tangent_in.x, pt.tangent_in.y, pt.tangent_in.z}},
+            {"tangent_out", {pt.tangent_out.x, pt.tangent_out.y, pt.tangent_out.z}},
+            {"roll_degrees", pt.roll_degrees},
+            {"speed_scale", pt.speed_scale},
+        });
+    }
+    return Json{
+        {"basis", to_token(spline.basis)},
+        {"closed_loop", spline.closed_loop},
+        {"tension", spline.tension},
+        {"points", std::move(points)},
+    };
+}
+
+[[nodiscard]] inline bool parse_spline_json(
+    const Json& source,
+    SplineComponent& out) {
+    if (!source.is_object()) {
+        return false;
+    }
+    for (const auto& [key, _] : source.items()) {
+        if (key != "basis" &&
+            key != "closed_loop" &&
+            key != "tension" &&
+            key != "points") {
+            return false;
+        }
+    }
+    SplineComponent parsed{};
+    if (const auto it = source.find("basis"); it != source.end()) {
+        if (!it->is_string()) {
+            return false;
+        }
+        const auto basis = parse_spline_basis(it->get<std::string>());
+        if (!basis) {
+            return false;
+        }
+        parsed.basis = *basis;
+    }
+    if (const auto it = source.find("closed_loop"); it != source.end()) {
+        if (!it->is_boolean()) {
+            return false;
+        }
+        parsed.closed_loop = it->get<bool>();
+    }
+    if (const auto it = source.find("tension"); it != source.end()) {
+        if (!read_bounded_float(*it, 0.0F, 1.0F, parsed.tension)) {
+            return false;
+        }
+    }
+    if (const auto it = source.find("points"); it != source.end()) {
+        if (!it->is_array() ||
+            it->size() < 2U ||
+            it->size() > max_spline_control_points) {
+            return false;
+        }
+        parsed.point_count = static_cast<std::uint32_t>(it->size());
+        for (std::uint32_t i = 0U; i < parsed.point_count; ++i) {
+            const Json& item = (*it)[i];
+            if (!item.is_object()) {
+                return false;
+            }
+            for (const auto& [pkey, _] : item.items()) {
+                if (pkey != "position" &&
+                    pkey != "tangent_in" &&
+                    pkey != "tangent_out" &&
+                    pkey != "roll_degrees" &&
+                    pkey != "speed_scale") {
+                    return false;
+                }
+            }
+            SplineControlPoint pt{};
+            if (const auto pit = item.find("position"); pit != item.end()) {
+                if (!read_vec3(*pit, 0.0F, 100'000.0F, pt.position)) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+            if (const auto tit = item.find("tangent_in"); tit != item.end()) {
+                if (!read_vec3(*tit, 0.0F, 100'000.0F, pt.tangent_in)) {
+                    return false;
+                }
+            }
+            if (const auto tit = item.find("tangent_out"); tit != item.end()) {
+                if (!read_vec3(*tit, 0.0F, 100'000.0F, pt.tangent_out)) {
+                    return false;
+                }
+            }
+            if (const auto rit = item.find("roll_degrees"); rit != item.end()) {
+                if (!read_bounded_float(*rit, -360.0F, 360.0F, pt.roll_degrees)) {
+                    return false;
+                }
+            }
+            if (const auto sit = item.find("speed_scale"); sit != item.end()) {
+                if (!read_bounded_float(*sit, 0.05F, 20.0F, pt.speed_scale)) {
+                    return false;
+                }
+            }
+            parsed.points[i] = pt;
+        }
+    }
+    if (!valid_spline_component(parsed)) {
+        return false;
+    }
+    out = sanitize_spline_component(parsed);
+    return true;
+}
+
 } // namespace vcr::component_json

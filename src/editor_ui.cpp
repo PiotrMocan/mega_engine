@@ -1,8 +1,10 @@
 #include "editor_ui.hpp"
 
 #include "asset_importer.hpp"
+#include "cinematic_camera.hpp"
 #include "cooked_audio_asset.hpp"
 #include "cooked_model_asset.hpp"
+#include "cutscene_sequencer.hpp"
 #include "editor_scene_tools.hpp"
 #include "gameplay_framework.hpp"
 #include "project_system.hpp"
@@ -185,6 +187,106 @@ struct AudioInputUiState {
     std::string status{};
     std::string error{};
     bool open = true;
+};
+
+struct SequencerEditorUiState {
+    enum class SelectionKind : std::uint8_t {
+        none,
+        camera_cut,
+        camera_shake,
+        property_track,
+        animation_clip,
+        audio_clip,
+        subtitle,
+        event_key,
+    };
+
+    enum class CameraSubCurve : std::uint8_t {
+        fov = 0U,
+        roll = 1U,
+        exposure = 2U,
+        focus_distance = 3U,
+        rail_u = 4U,
+    };
+
+    CutsceneSequence sequence{};
+    std::string relative_path{};
+    std::array<char, max_scene_asset_path_bytes + 1U> path_buffer{};
+    std::array<char, 96U> id_buffer{};
+    std::array<char, 128U> title_buffer{};
+    bool has_sequence = false;
+    bool dirty = false;
+    bool preview_active = false;
+    bool preview_playing = false;
+    bool lock_camera = true;
+    bool show_curve_editor = false;
+    bool files_scanned = false;
+    bool needs_preview_eval = false;
+    bool dragging_playhead = false;
+    bool show_settings = false;
+    float playhead_seconds = 0.0F;
+    float timeline_zoom = 1.0F;
+    float timeline_scroll_seconds = 0.0F;
+    std::optional<SceneDocument> baseline_scene{};
+    std::optional<FlyCamera> baseline_camera{};
+    std::vector<SceneNodeId> previewed_anim_nodes{};
+    std::vector<SceneWorldNode> wireframe_world_nodes{};
+    std::vector<std::uint32_t> wireframe_ancestors{};
+    CutsceneEvalScratch eval_scratch{};
+    CutsceneFrameResult last_eval_frame{};
+    std::vector<std::string> available_files{};
+    SelectionKind selection_kind = SelectionKind::none;
+    std::size_t selected_track_index = 0U;
+    std::size_t selected_key_index = 0U;
+    CameraSubCurve camera_sub_curve = CameraSubCurve::fov;
+    std::string pending_runtime_cutscene{};
+    std::string status{};
+    std::string error{};
+
+    SequencerEditorUiState() {
+        reset_to_default();
+    }
+
+    void reset_to_default(
+        const std::string_view new_id = "sequence",
+        const std::string_view new_title = "Cutscene",
+        const float duration_sec = 5.0F,
+        const float fps = 30.0F,
+        const bool is_looping = false) {
+        sequence = CutsceneSequence{};
+        sequence.id = new_id.empty() ? std::string{"sequence"} : std::string{new_id};
+        sequence.title = new_title.empty() ? std::string{"Cutscene"} : std::string{new_title};
+        sequence.duration_seconds = std::clamp(duration_sec, 0.25F, 3600.0F);
+        sequence.frame_rate = std::clamp(fps, 1.0F, 240.0F);
+        sequence.looping = is_looping;
+        sequence = sanitize_cutscene_sequence(std::move(sequence));
+        relative_path = make_default_cutscene_relative_path(sequence.id);
+        has_sequence = true;
+        dirty = false;
+        preview_active = false;
+        preview_playing = false;
+        needs_preview_eval = false;
+        playhead_seconds = 0.0F;
+        timeline_scroll_seconds = 0.0F;
+        selection_kind = SelectionKind::none;
+        selected_track_index = 0U;
+        selected_key_index = 0U;
+        eval_scratch.reset_frame_state();
+        last_eval_frame = {};
+        sync_buffers();
+    }
+
+    void sync_buffers() {
+        path_buffer.fill('\0');
+        const std::size_t path_copy = std::min(relative_path.size(), path_buffer.size() - 1U);
+        std::memcpy(path_buffer.data(), relative_path.data(), path_copy);
+        id_buffer.fill('\0');
+        const std::size_t id_copy = std::min(sequence.id.size(), id_buffer.size() - 1U);
+        std::memcpy(id_buffer.data(), sequence.id.data(), id_copy);
+        title_buffer.fill('\0');
+        const std::size_t title_copy = std::min(sequence.title.size(), title_buffer.size() - 1U);
+        std::memcpy(title_buffer.data(), sequence.title.data(), title_copy);
+    }
 };
 
 class AssetImportWorker final {
@@ -413,19 +515,27 @@ struct EditorViewportRay {
 
 [[nodiscard]] glm::mat4 editor_projection(
     const float width,
-    const float height) noexcept {
+    const float height,
+    const float vertical_fov_degrees = camera_vertical_fov) noexcept {
+    const float fov = std::clamp(
+        std::isfinite(vertical_fov_degrees)
+            ? vertical_fov_degrees
+            : camera_vertical_fov,
+        minimum_camera_vertical_fov,
+        maximum_camera_vertical_fov);
     return glm::perspective(
-        glm::radians(65.0F),
+        glm::radians(fov),
         width / std::max(height, 1.0F),
-        0.1F,
-        500.0F);
+        camera_near,
+        camera_far);
 }
 
 [[nodiscard]] std::optional<EditorViewportRay> viewport_ray(
     const ImVec2 mouse,
     const ImVec2 minimum,
     const ImVec2 maximum,
-    const FlyCamera& camera) noexcept {
+    const FlyCamera& camera,
+    const float vertical_fov_degrees = camera_vertical_fov) noexcept {
     const float width = maximum.x - minimum.x;
     const float height = maximum.y - minimum.y;
     if (width <= 1.0F || height <= 1.0F ||
@@ -438,7 +548,8 @@ struct EditorViewportRay {
     const float normalized_y =
         1.0F - ((mouse.y - minimum.y) / height) * 2.0F;
     const glm::mat4 inverse_view_projection = glm::inverse(
-        editor_projection(width, height) * camera.view_matrix());
+        editor_projection(width, height, vertical_fov_degrees) *
+        camera.view_matrix());
     glm::vec4 far_point = inverse_view_projection * glm::vec4(
         normalized_x, normalized_y, 1.0F, 1.0F);
     if (!std::isfinite(far_point.w) ||
@@ -521,6 +632,7 @@ struct EditorViewportRay {
     case AssetEntryKind::audio: return EditorIcon::play;
     case AssetEntryKind::sound_cue: return EditorIcon::play;
     case AssetEntryKind::animation: return EditorIcon::play;
+    case AssetEntryKind::cutscene: return EditorIcon::camera;
     case AssetEntryKind::save_state: return EditorIcon::cube;
     case AssetEntryKind::binary: return EditorIcon::import_asset;
     case AssetEntryKind::other: return EditorIcon::import_asset;
@@ -1424,8 +1536,10 @@ void EditorUi::initialize(
     gameplay_session_ = gameplay_session;
     edit_animator_preview_ = edit_animator_preview;
     show_skeleton_wireframe_ = true;
+    show_spline_wireframe_ = true;
     animation_gameplay_panel_open_ = true;
     ui_localization_panel_open_ = true;
+    sequencer_panel_open_ = true;
     ui_loc_status_.clear();
     save_slot_path_buf_.fill('\0');
     constexpr std::string_view default_save_slot =
@@ -1446,6 +1560,8 @@ void EditorUi::initialize(
         std::make_unique<MaterialEditorUiState>();
     audio_input_ui_ =
         std::make_unique<AudioInputUiState>();
+    sequencer_ui_ =
+        std::make_unique<SequencerEditorUiState>();
     constexpr std::string_view default_scatter_name{"Plant"};
     std::memcpy(
         scatter_name_prefix_.data(),
@@ -1573,6 +1689,7 @@ void EditorUi::shutdown() noexcept {
     saved_content_revision_ = 0U;
     saved_structure_revision_ = 0U;
     selected_asset_.reset();
+    sequencer_ui_.reset();
     audio_input_ui_.reset();
     material_editor_.reset();
     external_drop_.reset();
@@ -1890,6 +2007,7 @@ bool EditorUi::duplicate_selection(
     SceneDocument& scene,
     std::uint32_t& duplicated_nodes,
     std::string& error) {
+    stop_sequencer_preview(scene);
     if (play_state_ != EditorPlayState::edit ||
         !scene.valid(selected_node_)) {
         duplicated_nodes = 0U;
@@ -1994,6 +2112,7 @@ void EditorUi::begin_frame(
 
     if (toggle_play_requested_) {
         if (play_state_ == EditorPlayState::edit) {
+            stop_sequencer_preview(scene, &renderer, &camera);
             start_play(scene);
         } else {
             stop_play(scene);
@@ -2076,19 +2195,20 @@ void EditorUi::begin_frame(
             ImGui::DockBuilderDockWindow("Animation & Gameplay", right);
             ImGui::DockBuilderDockWindow("UI & Localization", right);
             ImGui::DockBuilderDockWindow("Assets", bottom);
+            ImGui::DockBuilderDockWindow("Sequencer", bottom);
             ImGui::DockBuilderDockWindow("Scene View", center);
             ImGui::DockBuilderFinish(dockspace_id);
         }
         default_layout_initialized_ = true;
         reset_layout_requested_ = false;
     }
-    build_main_menu(scene);
-    build_toolbar(scene);
+    build_main_menu(scene, renderer, camera);
+    build_toolbar(scene, renderer, camera);
     build_hierarchy(scene);
-    build_inspector(scene, renderer);
+    build_inspector(scene, renderer, camera);
     build_viewport(scene, renderer, camera, now);
     build_assets(scene, renderer);
-    build_landscape(scene, renderer);
+    build_landscape(scene, renderer, camera);
     if (import_dialog_requested_) {
         queue_import_sources({});
         import_dialog_requested_ = false;
@@ -2099,9 +2219,10 @@ void EditorUi::begin_frame(
     build_audio_input_panel();
     build_animation_gameplay_panel(scene, renderer);
     build_ui_localization_panel(scene, renderer);
+    build_sequencer_panel(scene, renderer, camera);
     build_performance(scene, renderer, performance);
     build_external_game_window(now);
-    process_file_commands(scene);
+    process_file_commands(scene, renderer, camera);
     apply_deferred_scene_commands(scene);
     update_camera_input();
 }
@@ -2201,7 +2322,10 @@ void EditorUi::unregister_scene_texture() noexcept {
     scene_texture_ = VK_NULL_HANDLE;
 }
 
-void EditorUi::build_main_menu(SceneDocument& scene) {
+void EditorUi::build_main_menu(
+    SceneDocument& scene,
+    Renderer& renderer,
+    FlyCamera& camera) {
     if (!ImGui::BeginMainMenuBar()) {
         return;
     }
@@ -2384,6 +2508,9 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Scene")) {
+        auto prepare_scene_edit = [&]() {
+            stop_sequencer_preview(scene, &renderer, &camera);
+        };
         const SceneNodeId parent =
             scene.valid(selected_node_)
             ? selected_node_
@@ -2393,6 +2520,7 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
                 nullptr,
                 false,
                 play_state_ == EditorPlayState::edit)) {
+            prepare_scene_edit();
             checkpoint_scene(scene);
             selected_node_ = scene.create_node(
                 "Folder", SceneNodeKind::folder, parent);
@@ -2402,6 +2530,7 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
                 nullptr,
                 false,
                 play_state_ == EditorPlayState::edit)) {
+            prepare_scene_edit();
             checkpoint_scene(scene);
             const SceneNodeId cube = scene.create_node(
                 "Cube", SceneNodeKind::cube, parent);
@@ -2412,8 +2541,21 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
             }
             selected_node_ = cube;
         }
+        if (ImGui::MenuItem("Add camera", nullptr, false,
+                            play_state_ == EditorPlayState::edit)) {
+            prepare_scene_edit();
+            checkpoint_scene(scene);
+            const SceneNodeId cam_node = scene.create_node(
+                "Camera", SceneNodeKind::camera, parent);
+            if (auto node = scene.node(cam_node)) {
+                node->get().transform.translation = glm::vec3(0.0F, 2.0F, -5.0F);
+                scene.mark_content_changed();
+            }
+            selected_node_ = cam_node;
+        }
         if (ImGui::MenuItem("Add ocean", nullptr, false,
                             play_state_ == EditorPlayState::edit)) {
+            prepare_scene_edit();
             checkpoint_scene(scene);
             selected_node_ = scene.create_node("Ocean", SceneNodeKind::ocean, parent);
             if (auto node = scene.node(selected_node_)) {
@@ -2425,6 +2567,7 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
             play_state_ == EditorPlayState::edit &&
             scene.local_light_count() < maximum_local_lights;
         if (ImGui::MenuItem("Add point light", nullptr, false, can_add_light)) {
+            prepare_scene_edit();
             checkpoint_scene(scene);
             const SceneNodeId light = scene.create_node(
                 "Point Light", SceneNodeKind::point_light, parent);
@@ -2435,6 +2578,7 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
             selected_node_ = light;
         }
         if (ImGui::MenuItem("Add spot light", nullptr, false, can_add_light)) {
+            prepare_scene_edit();
             checkpoint_scene(scene);
             const SceneNodeId light = scene.create_node(
                 "Spot Light", SceneNodeKind::spot_light, parent);
@@ -2450,6 +2594,7 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
                 nullptr,
                 false,
                 play_state_ == EditorPlayState::edit)) {
+            prepare_scene_edit();
             checkpoint_scene(scene);
             const SceneNodeId emitter = scene.create_node(
                 "Audio Emitter", SceneNodeKind::folder, parent);
@@ -2476,6 +2621,7 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
                 nullptr,
                 false,
                 play_state_ == EditorPlayState::edit)) {
+            prepare_scene_edit();
             checkpoint_scene(scene);
             const SceneNodeId listener = scene.create_node(
                 "Audio Listener", SceneNodeKind::folder, parent);
@@ -2490,6 +2636,7 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
                 nullptr,
                 false,
                 play_state_ == EditorPlayState::edit)) {
+            prepare_scene_edit();
             checkpoint_scene(scene);
             const SceneNodeId zone = scene.create_node(
                 "Reverb Zone", SceneNodeKind::folder, parent);
@@ -2497,6 +2644,31 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
                 static_cast<void>(scene.set_reverb_zone(
                     zone, AudioReverbZoneComponent{}));
                 selected_node_ = zone;
+            }
+        }
+        if (ImGui::MenuItem(
+                "Add 3D spline",
+                nullptr,
+                false,
+                play_state_ == EditorPlayState::edit)) {
+            prepare_scene_edit();
+            checkpoint_scene(scene);
+            const SceneNodeId spline_node = scene.create_node(
+                "Spline Path", SceneNodeKind::folder, parent);
+            if (spline_node) {
+                SplineComponent def_spline{};
+                def_spline.basis = SplineBasis::catmull_rom;
+                def_spline.closed_loop = false;
+                def_spline.tension = 0.5F;
+                def_spline.point_count = 4U;
+                def_spline.points[0].position = glm::vec3{0.0F, 0.0F, 0.0F};
+                def_spline.points[1].position = glm::vec3{4.0F, 1.0F, -4.0F};
+                def_spline.points[2].position = glm::vec3{8.0F, 1.0F, -2.0F};
+                def_spline.points[3].position = glm::vec3{12.0F, 0.0F, -6.0F};
+                def_spline = sanitize_spline_component(def_spline);
+                static_cast<void>(scene.set_spline(spline_node, def_spline));
+                selected_node_ = spline_node;
+                hierarchy_revision_ = 0U;
             }
         }
         ImGui::EndMenu();
@@ -2556,6 +2728,12 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
                 ui_localization_panel_open_)) {
             ui_localization_panel_open_ = !ui_localization_panel_open_;
         }
+        if (ImGui::MenuItem(
+                "Sequencer",
+                nullptr,
+                sequencer_panel_open_)) {
+            sequencer_panel_open_ = !sequencer_panel_open_;
+        }
         ImGui::Separator();
         if (ImGui::MenuItem("Reset editor layout")) {
             reset_layout_requested_ = true;
@@ -2565,7 +2743,10 @@ void EditorUi::build_main_menu(SceneDocument& scene) {
     ImGui::EndMainMenuBar();
 }
 
-void EditorUi::build_toolbar(SceneDocument& scene) {
+void EditorUi::build_toolbar(
+    SceneDocument& scene,
+    Renderer& renderer,
+    FlyCamera& camera) {
     ImGui::SetNextWindowSize(
         ImVec2(840.0F, 66.0F), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin(
@@ -2623,6 +2804,7 @@ void EditorUi::build_toolbar(SceneDocument& scene) {
                 "Play",
                 EditorButtonStyle::primary,
                 can_play)) {
+            stop_sequencer_preview(scene, &renderer, &camera);
             start_play(scene);
         }
         if (!can_play &&
@@ -2955,19 +3137,32 @@ namespace {
 
 void EditorUi::build_inspector(
     SceneDocument& scene,
-    Renderer& renderer) {
+    Renderer& renderer,
+    FlyCamera& camera) {
     ImGui::SetNextWindowSize(
         ImVec2(340.0F, 570.0F), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Inspector")) {
         ImGui::End();
         return;
     }
+    const bool preview_locked = sequencer_preview_active();
     const auto selected = scene.node(selected_node_);
     if (!selected) {
         ui_kit_.panel_header(
             EditorIcon::eye,
             "INSPECTOR",
             "Properties and components");
+        if (preview_locked) {
+            ui_kit_.badge("SEQUENCER PREVIEW ACTIVE", EditorTone::warning);
+            if (ui_kit_.action_button(
+                    "StopPreviewEmptyInspector",
+                    EditorIcon::stop,
+                    "Stop Sequencer Preview",
+                    EditorButtonStyle::secondary,
+                    true)) {
+                stop_sequencer_preview(scene, &renderer, &camera);
+            }
+        }
         ui_kit_.empty_state(
             EditorIcon::cube,
             "Nothing selected",
@@ -2982,7 +3177,16 @@ void EditorUi::build_inspector(
         node.name.c_str(),
         to_string(node.kind).data());
 
-    const bool editable = play_state_ == EditorPlayState::edit;
+    if (preview_locked) {
+        ui_kit_.badge("SEQUENCER PREVIEW ACTIVE", EditorTone::warning);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Stop Sequencer Preview")) {
+            stop_sequencer_preview(scene, &renderer, &camera);
+        }
+    }
+
+    const bool editable =
+        play_state_ == EditorPlayState::edit && !sequencer_preview_active();
     ImGui::BeginDisabled(!editable);
     if (name_buffer_node_ != selected_node_) {
         selected_name_buffer_.fill('\0');
@@ -4239,7 +4443,7 @@ void EditorUi::build_inspector(
                     &edited_gp.persist_save_state);
 
                 ui_kit_.property_row("Behavior");
-                constexpr std::array<const char*, 8U> kBehaviors{
+                constexpr std::array<const char*, 10U> kBehaviors{
                     "patrol",
                     "collectible",
                     "health_pack",
@@ -4248,6 +4452,8 @@ void EditorUi::build_inspector(
                     "dialogue",
                     "trigger_zone",
                     "destructible",
+                    "cutscene_trigger",
+                    "spline_mover",
                 };
                 if (ImGui::BeginCombo(
                         "##GameplayBehaviorCombo",
@@ -4539,6 +4745,181 @@ void EditorUi::build_inspector(
                 UiMarkerComponent initial{};
                 static_cast<void>(initial.set_label(node.name));
                 static_cast<void>(scene.set_ui_marker(selected_node_, initial));
+            }
+        }
+    }
+    {
+        ui_kit_.section_header(EditorIcon::camera, "3D Spline");
+        if (const auto attached_spline = scene.spline(selected_node_)) {
+            SplineComponent edited_spline = attached_spline->get();
+            bool spline_changed = false;
+            bool remove_spline_requested = false;
+            if (ui_kit_.begin_property_grid("SplineProperties")) {
+                ui_kit_.property_row("Basis");
+                if (ImGui::BeginCombo(
+                        "##SplineBasisCombo",
+                        to_token(edited_spline.basis).data())) {
+                    for (const SplineBasis b : {
+                             SplineBasis::linear,
+                             SplineBasis::catmull_rom,
+                             SplineBasis::cubic_hermite}) {
+                        const bool is_sel = edited_spline.basis == b;
+                        if (ImGui::Selectable(to_token(b).data(), is_sel)) {
+                            edited_spline.basis = b;
+                            spline_changed = true;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+
+                ui_kit_.property_row("Closed loop");
+                spline_changed |= ImGui::Checkbox(
+                    "##SplineClosedLoop", &edited_spline.closed_loop);
+
+                ui_kit_.property_row("Tension");
+                spline_changed |= ImGui::SliderFloat(
+                    "##SplineTension",
+                    &edited_spline.tension,
+                    0.0F,
+                    1.0F,
+                    "%.2f",
+                    ImGuiSliderFlags_AlwaysClamp);
+
+                const glm::mat4 spline_world =
+                    scene_world_matrix(scene, selected_node_)
+                        .value_or(glm::mat4{1.0F});
+                const SplineArcLengthTable arc =
+                    build_spline_arc_table(edited_spline, spline_world);
+                ui_kit_.property_row("Length / Points");
+                ImGui::Text(
+                    "%.2f m  (%u / %zu)",
+                    arc.total_length,
+                    edited_spline.point_count,
+                    max_spline_control_points);
+
+                ui_kit_.property_row("Component");
+                if (ImGui::SmallButton("Remove 3D Spline")) {
+                    remove_spline_requested = true;
+                }
+                ui_kit_.end_property_grid();
+            }
+
+            if (ImGui::SmallButton("Add Point##SplineAddPt") &&
+                edited_spline.point_count < max_spline_control_points) {
+                const std::uint32_t count = edited_spline.point_count;
+                SplineControlPoint new_pt{};
+                if (count >= 2U) {
+                    const glm::vec3 d =
+                        edited_spline.points[count - 1U].position -
+                        edited_spline.points[count - 2U].position;
+                    new_pt.position =
+                        edited_spline.points[count - 1U].position +
+                        (glm::dot(d, d) > 1.0e-4F
+                             ? d
+                             : glm::vec3{2.0F, 0.0F, 0.0F});
+                } else {
+                    new_pt.position =
+                        glm::vec3{static_cast<float>(count) * 4.0F, 0.0F, 0.0F};
+                }
+                edited_spline.points[count] = new_pt;
+                edited_spline.point_count = count + 1U;
+                spline_changed = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Remove Last##SplineRemoveLast") &&
+                edited_spline.point_count > 2U) {
+                edited_spline.point_count -= 1U;
+                spline_changed = true;
+            }
+
+            for (std::uint32_t i = 0U; i < edited_spline.point_count; ++i) {
+                ImGui::PushID(static_cast<int>(i));
+                std::array<char, 32U> hdr{};
+                std::snprintf(hdr.data(), hdr.size(), "Point %u", i);
+                if (ImGui::TreeNodeEx(
+                        hdr.data(),
+                        i < 2U ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
+                    spline_changed |= ui_kit_.drag_vec3(
+                        "##SplinePtPos",
+                        "Position",
+                        &edited_spline.points[i].position.x,
+                        0.05F,
+                        0.0F);
+                    if (edited_spline.basis == SplineBasis::cubic_hermite) {
+                        spline_changed |= ui_kit_.drag_vec3(
+                            "##SplinePtTin",
+                            "Tangent In",
+                            &edited_spline.points[i].tangent_in.x,
+                            0.05F,
+                            0.0F);
+                        spline_changed |= ui_kit_.drag_vec3(
+                            "##SplinePtTout",
+                            "Tangent Out",
+                            &edited_spline.points[i].tangent_out.x,
+                            0.05F,
+                            0.0F);
+                    }
+                    ImGui::SetNextItemWidth(110.0F);
+                    spline_changed |= ImGui::DragFloat(
+                        "Roll (deg)##SplinePtRoll",
+                        &edited_spline.points[i].roll_degrees,
+                        0.5F,
+                        -180.0F,
+                        180.0F,
+                        "%.1f");
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(110.0F);
+                    spline_changed |= ImGui::DragFloat(
+                        "Speed##SplinePtSpeed",
+                        &edited_spline.points[i].speed_scale,
+                        0.02F,
+                        0.01F,
+                        20.0F,
+                        "%.2f");
+                    ImGui::TreePop();
+                }
+                ImGui::PopID();
+            }
+
+            if (remove_spline_requested) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                static_cast<void>(scene.remove_spline(selected_node_));
+            } else if (spline_changed) {
+                edited_spline = sanitize_spline_component(edited_spline);
+                if (!inspector_edit_snapshot_) {
+                    inspector_edit_snapshot_ = scene;
+                    if (auto previous =
+                            inspector_edit_snapshot_->node(selected_node_)) {
+                        previous->get() = node_before_edit;
+                    }
+                }
+                static_cast<void>(
+                    scene.set_spline(selected_node_, edited_spline));
+            }
+        } else {
+            if (ui_kit_.action_button(
+                    "AddSplineButton",
+                    EditorIcon::add,
+                    "Add 3D Spline",
+                    EditorButtonStyle::secondary,
+                    editable)) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                SplineComponent initial{};
+                initial.basis = SplineBasis::catmull_rom;
+                initial.point_count = 3U;
+                initial.points[0].position = glm::vec3{0.0F, 0.0F, 0.0F};
+                initial.points[1].position = glm::vec3{4.0F, 0.5F, -3.0F};
+                initial.points[2].position = glm::vec3{8.0F, 0.0F, -6.0F};
+                initial = sanitize_spline_component(initial);
+                static_cast<void>(scene.set_spline(selected_node_, initial));
             }
         }
     }
@@ -5082,6 +5463,151 @@ void draw_skeleton_wireframe(
     }
 }
 
+void draw_spline_and_camera_wireframe(
+    ImDrawList* const draw_list,
+    const SceneDocument& scene,
+    const SceneNodeId selected_node,
+    const glm::mat4& view_projection,
+    const ImVec2 image_minimum,
+    const float image_width,
+    const float image_height,
+    std::vector<SceneWorldNode>& world_nodes_scratch,
+    std::vector<std::uint32_t>& ancestors_scratch) noexcept {
+    if (draw_list == nullptr ||
+        image_width <= 1.0F ||
+        image_height <= 1.0F) {
+        return;
+    }
+
+    const auto project_point = [&](const glm::vec3 world_pt,
+                                   ImVec2& out_screen) noexcept -> bool {
+        const glm::vec4 clip = view_projection * glm::vec4(world_pt, 1.0F);
+        if (!std::isfinite(clip.w) || clip.w <= 0.01F) {
+            return false;
+        }
+        const glm::vec3 ndc = glm::vec3(clip) / clip.w;
+        out_screen = ImVec2(
+            image_minimum.x + (ndc.x * 0.5F + 0.5F) * image_width,
+            image_minimum.y + (0.5F - ndc.y * 0.5F) * image_height);
+        return std::isfinite(out_screen.x) && std::isfinite(out_screen.y);
+    };
+
+    const auto draw_segment = [&](const glm::vec3 a,
+                                  const glm::vec3 b,
+                                  const ImU32 color,
+                                  const float thickness = 1.75F) noexcept {
+        ImVec2 sa{};
+        ImVec2 sb{};
+        if (project_point(a, sa) && project_point(b, sb)) {
+            draw_list->AddLine(sa, sb, color, thickness);
+        }
+    };
+
+    const auto owners = scene.splines().owners();
+    const auto values = scene.splines().values();
+    for (std::size_t i = 0U; i < owners.size(); ++i) {
+        const SceneNodeId spline_node = owners[i];
+        const SplineComponent& spline = values[i];
+        if (!scene.valid(spline_node) || spline.point_count < 2U) {
+            continue;
+        }
+        const auto world_opt = scene_world_matrix(scene, spline_node);
+        if (!world_opt) {
+            continue;
+        }
+        const glm::mat4& world = *world_opt;
+        const bool is_selected = spline_node == selected_node;
+        const ImU32 curve_color = is_selected
+            ? IM_COL32(255, 198, 64, 240)
+            : IM_COL32(76, 198, 245, 195);
+        const ImU32 pt_color = is_selected
+            ? IM_COL32(255, 240, 160, 255)
+            : IM_COL32(160, 228, 255, 210);
+        const std::size_t segments = std::clamp<std::size_t>(
+            static_cast<std::size_t>(spline.point_count) * 16U,
+            24U,
+            256U);
+        SplineSample prev = evaluate_spline(spline, world, 0.0F);
+        for (std::size_t s = 1U; s <= segments; ++s) {
+            const float u = static_cast<float>(s) / static_cast<float>(segments);
+            const SplineSample curr = evaluate_spline(spline, world, u);
+            draw_segment(
+                prev.position,
+                curr.position,
+                curve_color,
+                is_selected ? 2.4F : 1.6F);
+            prev = curr;
+        }
+        for (std::uint32_t p = 0U; p < spline.point_count; ++p) {
+            const glm::vec3 wp = glm::vec3(
+                world * glm::vec4(spline.points[p].position, 1.0F));
+            ImVec2 sp{};
+            if (project_point(wp, sp)) {
+                draw_list->AddCircleFilled(
+                    sp, is_selected ? 4.2F : 3.0F, pt_color, 10);
+            }
+            if (spline.basis == SplineBasis::cubic_hermite && is_selected) {
+                const glm::mat3 linear_mat(world);
+                draw_segment(
+                    wp,
+                    wp + linear_mat * spline.points[p].tangent_out * 0.35F,
+                    IM_COL32(255, 118, 96, 220),
+                    1.2F);
+                draw_segment(
+                    wp,
+                    wp - linear_mat * spline.points[p].tangent_in * 0.35F,
+                    IM_COL32(128, 220, 140, 200),
+                    1.2F);
+            }
+        }
+    }
+
+    world_nodes_scratch.clear();
+    ancestors_scratch.clear();
+    scene.build_world_nodes(world_nodes_scratch, ancestors_scratch);
+    for (const SceneWorldNode& wn : world_nodes_scratch) {
+        if (wn.kind != SceneNodeKind::camera || !wn.world_visible) {
+            continue;
+        }
+        const bool is_selected = wn.id == selected_node;
+        const ImU32 cam_color = is_selected
+            ? IM_COL32(255, 224, 96, 240)
+            : IM_COL32(150, 210, 235, 175);
+        const glm::vec3 origin = glm::vec3(wn.world_matrix[3]);
+        const auto safe_norm = [](const glm::vec3 v, const glm::vec3 fb) noexcept {
+            const float ls = glm::dot(v, v);
+            return ls > 1.0e-6F ? v / std::sqrt(ls) : fb;
+        };
+        const glm::vec3 right = safe_norm(
+            glm::vec3(wn.world_matrix[0]), glm::vec3(1.0F, 0.0F, 0.0F));
+        const glm::vec3 up = safe_norm(
+            glm::vec3(wn.world_matrix[1]), glm::vec3(0.0F, 1.0F, 0.0F));
+        const glm::vec3 fwd = safe_norm(
+            -glm::vec3(wn.world_matrix[2]), glm::vec3(0.0F, 0.0F, -1.0F));
+
+        constexpr float depth = 0.9F;
+        constexpr float hw = 0.45F;
+        constexpr float hh = 0.28F;
+        const glm::vec3 c = origin + fwd * depth;
+        const glm::vec3 tl = c - right * hw + up * hh;
+        const glm::vec3 tr = c + right * hw + up * hh;
+        const glm::vec3 br = c + right * hw - up * hh;
+        const glm::vec3 bl = c - right * hw - up * hh;
+        draw_segment(origin, tl, cam_color, is_selected ? 2.0F : 1.3F);
+        draw_segment(origin, tr, cam_color, is_selected ? 2.0F : 1.3F);
+        draw_segment(origin, br, cam_color, is_selected ? 2.0F : 1.3F);
+        draw_segment(origin, bl, cam_color, is_selected ? 2.0F : 1.3F);
+        draw_segment(tl, tr, cam_color, is_selected ? 2.0F : 1.3F);
+        draw_segment(tr, br, cam_color, is_selected ? 2.0F : 1.3F);
+        draw_segment(br, bl, cam_color, is_selected ? 2.0F : 1.3F);
+        draw_segment(bl, tl, cam_color, is_selected ? 2.0F : 1.3F);
+        // Up triangle indicator above frustum top edge.
+        const glm::vec3 top_apex = c + up * (hh + 0.16F);
+        draw_segment(tl * 0.7F + tr * 0.3F, top_apex, cam_color, 1.3F);
+        draw_segment(tr * 0.7F + tl * 0.3F, top_apex, cam_color, 1.3F);
+    }
+}
+
 } // namespace
 
 void EditorUi::build_viewport(
@@ -5196,6 +5722,8 @@ void EditorUi::build_viewport(
     ImGui::EndDisabled();
     ImGui::SameLine(0.0F, 14.0F);
     static_cast<void>(ImGui::Checkbox("Skeleton", &show_skeleton_wireframe_));
+    ImGui::SameLine(0.0F, 10.0F);
+    static_cast<void>(ImGui::Checkbox("Splines", &show_spline_wireframe_));
 
     const ImVec2 available = ImGui::GetContentRegionAvail();
     const float dpi = std::max(
@@ -5288,9 +5816,10 @@ void EditorUi::build_viewport(
 
     const float image_width = image_maximum.x - image_minimum.x;
     const float image_height = image_maximum.y - image_minimum.y;
+    const float viewport_fov = renderer.vertical_fov_degrees();
     const glm::mat4 view = camera.view_matrix();
     const glm::mat4 projection = editor_projection(
-        image_width, image_height);
+        image_width, image_height, viewport_fov);
     if (const auto bounds = renderer.editor_node_bounds(selected_node_)) {
         ImVec2 selection_minimum(
             std::numeric_limits<float>::infinity(),
@@ -5364,10 +5893,100 @@ void EditorUi::build_viewport(
             image_height,
             skeleton_wireframe_scratch_);
     }
+    if (sequencer_ui_ != nullptr &&
+        image_width > 1.0F &&
+        image_height > 1.0F) {
+        sequencer_ui_->eval_scratch.viewport_aspect =
+            image_width / image_height;
+        if (sequencer_ui_->preview_active) {
+            sequencer_ui_->last_eval_frame.letterbox_bar_fraction =
+                compute_letterbox_bar_fraction(
+                    sequencer_ui_->eval_scratch.viewport_aspect,
+                    sequencer_ui_->sequence.letterbox_aspect);
+        }
+    }
+    if (show_spline_wireframe_ && sequencer_ui_ != nullptr) {
+        draw_spline_and_camera_wireframe(
+            ImGui::GetWindowDrawList(),
+            scene,
+            selected_node_,
+            projection * view,
+            image_minimum,
+            image_width,
+            image_height,
+            sequencer_ui_->wireframe_world_nodes,
+            sequencer_ui_->wireframe_ancestors);
+    }
+
+    if (play_state_ == EditorPlayState::edit &&
+        sequencer_preview_active() &&
+        sequencer_ui_ != nullptr) {
+        ImDrawList* const vp_draw = ImGui::GetWindowDrawList();
+        const CutsceneFrameResult& frame = sequencer_ui_->last_eval_frame;
+        vp_draw->PushClipRect(image_minimum, image_maximum, true);
+        if (frame.letterbox_bar_fraction > 0.001F) {
+            const float bar_h = image_height * frame.letterbox_bar_fraction;
+            vp_draw->AddRectFilled(
+                image_minimum,
+                ImVec2(image_maximum.x, image_minimum.y + bar_h),
+                IM_COL32(0, 0, 0, 255));
+            vp_draw->AddRectFilled(
+                ImVec2(image_minimum.x, image_maximum.y - bar_h),
+                image_maximum,
+                IM_COL32(0, 0, 0, 255));
+        }
+        if (!frame.active_subtitle_text.empty()) {
+            const auto resolve_sub = [&](const std::string_view key_or_text) {
+                return gameplay_session_ != nullptr
+                    ? gameplay_session_->localization().resolve(key_or_text)
+                    : key_or_text;
+            };
+            const std::string_view speaker =
+                resolve_sub(frame.active_subtitle_speaker);
+            const std::string_view text =
+                resolve_sub(frame.active_subtitle_text);
+            std::array<char, 512U> sub_line{};
+            if (!speaker.empty()) {
+                std::snprintf(
+                    sub_line.data(),
+                    sub_line.size(),
+                    "%.*s: %.*s",
+                    static_cast<int>(speaker.size()),
+                    speaker.data(),
+                    static_cast<int>(text.size()),
+                    text.data());
+            } else {
+                std::snprintf(
+                    sub_line.data(),
+                    sub_line.size(),
+                    "%.*s",
+                    static_cast<int>(text.size()),
+                    text.data());
+            }
+            const ImVec2 txt_size = ImGui::CalcTextSize(sub_line.data());
+            const float bar_h = image_height * frame.letterbox_bar_fraction;
+            const ImVec2 txt_pos(
+                image_minimum.x + std::max(8.0F, (image_width - txt_size.x) * 0.5F),
+                image_maximum.y - std::max(bar_h, 12.0F) - txt_size.y - 14.0F);
+            vp_draw->AddRectFilled(
+                ImVec2(txt_pos.x - 10.0F, txt_pos.y - 6.0F),
+                ImVec2(txt_pos.x + txt_size.x + 10.0F, txt_pos.y + txt_size.y + 6.0F),
+                IM_COL32(10, 12, 16, 200),
+                6.0F);
+            const std::uint32_t rgba = frame.active_subtitle_color;
+            const ImU32 sub_col = IM_COL32(
+                (rgba >> 24U) & 0xFFU,
+                (rgba >> 16U) & 0xFFU,
+                (rgba >> 8U) & 0xFFU,
+                rgba & 0xFFU);
+            vp_draw->AddText(txt_pos, sub_col, sub_line.data());
+        }
+        vp_draw->PopClipRect();
+    }
 
     bool gizmo_over = false;
     bool gizmo_using = false;
-    if (editable && scene.valid(selected_node_)) {
+    if (editable && !sequencer_preview_active() && scene.valid(selected_node_)) {
         if (auto world = scene_world_matrix(scene, selected_node_)) {
             ImGuizmo::SetDrawlist(ImGui::GetWindowDrawList());
             ImGuizmo::SetRect(
@@ -5430,7 +6049,7 @@ void EditorUi::build_viewport(
 
     if (viewport_clicked && editable && !gizmo_over && !gizmo_using) {
         const auto ray = viewport_ray(
-            io.MousePos, image_minimum, image_maximum, camera);
+            io.MousePos, image_minimum, image_maximum, camera, viewport_fov);
         if (ray) {
             const auto picked = renderer.pick_editor_scene(
                 ray->origin, ray->direction);
@@ -5773,6 +6392,9 @@ void EditorUi::build_assets(
                         entry.relative_display,
                         entry.display_name));
                 } else if (row_result.double_clicked &&
+                           entry.kind == AssetEntryKind::cutscene) {
+                    open_cutscene_in_sequencer(scene, entry.relative_display);
+                } else if (row_result.double_clicked &&
                            (entry.kind == AssetEntryKind::audio ||
                             entry.kind == AssetEntryKind::sound_cue) &&
                            audio_engine_ != nullptr) {
@@ -5798,6 +6420,10 @@ void EditorUi::build_assets(
                 if (entry.kind == AssetEntryKind::material &&
                     ImGui::MenuItem("Open in Material Editor")) {
                     open_material_editor(entry.relative_path);
+                }
+                if (entry.kind == AssetEntryKind::cutscene &&
+                    ImGui::MenuItem("Open in Sequencer")) {
+                    open_cutscene_in_sequencer(scene, entry.relative_display);
                 }
                 if ((entry.kind == AssetEntryKind::audio ||
                      entry.kind == AssetEntryKind::sound_cue) &&
@@ -5895,7 +6521,8 @@ void EditorUi::build_assets(
 
 void EditorUi::build_landscape(
     SceneDocument& scene,
-    Renderer& renderer) {
+    Renderer& renderer,
+    FlyCamera& camera) {
     ImGui::SetNextWindowSize(
         ImVec2(360.0F, 470.0F), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Landscape")) {
@@ -5935,6 +6562,7 @@ void EditorUi::build_landscape(
             "Create flat terrain",
             EditorButtonStyle::primary,
             editable)) {
+        stop_sequencer_preview(scene, &renderer, &camera);
         SceneNodeId parent{};
         if (const auto selected = scene.node(selected_node_);
             selected && selected->get().kind == SceneNodeKind::folder) {
@@ -6034,6 +6662,7 @@ void EditorUi::build_landscape(
                 ? "Model preparation started; retry scatter when it completes."
                 : std::move(error);
         } else {
+            stop_sequencer_preview(scene, &renderer, &camera);
             SceneNodeId parent{};
             if (const auto selected = scene.node(selected_node_);
                 selected && selected->get().kind == SceneNodeKind::folder) {
@@ -6277,6 +6906,7 @@ bool EditorUi::add_model_asset_to_scene(
         return false;
     }
     if (valid_prefab_asset_path(relative_path)) {
+        stop_sequencer_preview(scene, &renderer, nullptr);
         SceneNodeId parent{};
         if (const auto selected = scene.node(selected_node_);
             selected && selected->get().kind == SceneNodeKind::folder) {
@@ -6344,6 +6974,7 @@ bool EditorUi::add_model_asset_to_scene(
             emitter_name.size() > max_scene_node_name_bytes) {
             emitter_name = "Audio Emitter";
         }
+        stop_sequencer_preview(scene, &renderer, nullptr);
         SceneNodeId parent{};
         if (const auto selected = scene.node(selected_node_);
             selected && selected->get().kind == SceneNodeKind::folder) {
@@ -6373,6 +7004,7 @@ bool EditorUi::add_model_asset_to_scene(
             "to the scene.";
         return false;
     }
+    stop_sequencer_preview(scene, &renderer, nullptr);
 
     try {
         std::error_code filesystem_error;
@@ -8113,6 +8745,1501 @@ void EditorUi::build_ui_localization_panel(
     ImGui::End();
 }
 
+namespace {
+
+[[nodiscard]] std::vector<SequencerKeyframe>& camera_cut_sub_curve(
+    CameraCutClip& clip,
+    const SequencerEditorUiState::CameraSubCurve sub) noexcept {
+    switch (sub) {
+    case SequencerEditorUiState::CameraSubCurve::fov: return clip.fov_keys;
+    case SequencerEditorUiState::CameraSubCurve::roll: return clip.roll_keys;
+    case SequencerEditorUiState::CameraSubCurve::exposure: return clip.exposure_keys;
+    case SequencerEditorUiState::CameraSubCurve::focus_distance:
+        return clip.focus_distance_keys;
+    case SequencerEditorUiState::CameraSubCurve::rail_u: return clip.rail_u_keys;
+    }
+    return clip.fov_keys;
+}
+
+[[nodiscard]] const char* camera_sub_curve_label(
+    const SequencerEditorUiState::CameraSubCurve sub) noexcept {
+    switch (sub) {
+    case SequencerEditorUiState::CameraSubCurve::fov: return "FOV (deg)";
+    case SequencerEditorUiState::CameraSubCurve::roll: return "Roll (deg)";
+    case SequencerEditorUiState::CameraSubCurve::exposure: return "Exposure (EV)";
+    case SequencerEditorUiState::CameraSubCurve::focus_distance:
+        return "Focus Dist (m)";
+    case SequencerEditorUiState::CameraSubCurve::rail_u: return "Rail U (0..1)";
+    }
+    return "FOV (deg)";
+}
+
+[[nodiscard]] std::vector<SequencerKeyframe>* resolve_active_curve(
+    SequencerEditorUiState& st,
+    float& out_default_value) noexcept {
+    out_default_value = 0.0F;
+    if (st.selection_kind == SequencerEditorUiState::SelectionKind::property_track &&
+        st.selected_track_index < st.sequence.property_tracks.size()) {
+        return &st.sequence.property_tracks[st.selected_track_index].keys;
+    }
+    if (st.selection_kind == SequencerEditorUiState::SelectionKind::camera_cut &&
+        st.selected_track_index < st.sequence.camera_cuts.size()) {
+        CameraCutClip& clip = st.sequence.camera_cuts[st.selected_track_index];
+        switch (st.camera_sub_curve) {
+        case SequencerEditorUiState::CameraSubCurve::fov:
+            out_default_value = clip.default_fov_degrees;
+            break;
+        case SequencerEditorUiState::CameraSubCurve::exposure:
+            out_default_value = clip.default_exposure_ev;
+            break;
+        case SequencerEditorUiState::CameraSubCurve::focus_distance:
+            out_default_value = clip.default_focus_distance;
+            break;
+        case SequencerEditorUiState::CameraSubCurve::roll:
+            out_default_value = 0.0F;
+            break;
+        case SequencerEditorUiState::CameraSubCurve::rail_u:
+            out_default_value = clip.rail_start_u;
+            break;
+        }
+        return &camera_cut_sub_curve(clip, st.camera_sub_curve);
+    }
+    return nullptr;
+}
+
+void scan_cutscene_files(
+    const std::filesystem::path& asset_root,
+    std::vector<std::string>& out_files) {
+    out_files.clear();
+    if (asset_root.empty()) {
+        return;
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_directory(asset_root, ec) || ec) {
+        return;
+    }
+    for (const auto& entry :
+         std::filesystem::recursive_directory_iterator(
+             asset_root,
+             std::filesystem::directory_options::skip_permission_denied,
+             ec)) {
+        if (ec) {
+            break;
+        }
+        std::error_code file_ec;
+        if (!entry.is_regular_file(file_ec) || file_ec) {
+            continue;
+        }
+        std::error_code rel_ec;
+        const std::filesystem::path rel =
+            std::filesystem::relative(entry.path(), asset_root, rel_ec);
+        if (rel_ec) {
+            continue;
+        }
+        const std::string rel_utf8 = rel.generic_string();
+        if (!rel_utf8.empty() && rel_utf8.ends_with(".vcrseq.json")) {
+            out_files.push_back(rel_utf8);
+        }
+    }
+    std::sort(out_files.begin(), out_files.end());
+}
+
+void draw_node_uuid_binder(
+    const char* const id_suffix,
+    const char* const label,
+    SceneUuid& uuid_field,
+    const SceneDocument& scene,
+    const SceneNodeId selected_node,
+    bool& modified) {
+    ImGui::PushID(id_suffix);
+    std::string desc = "(none)";
+    if (uuid_field) {
+        const SceneNodeId bound = scene.find_by_uuid(uuid_field);
+        if (const auto nr = scene.node(bound)) {
+            desc = nr->get().name + " [" +
+                format_scene_uuid(uuid_field).substr(0U, 8U) + "]";
+        } else {
+            desc = format_scene_uuid(uuid_field);
+        }
+    }
+    ImGui::Text("%s: %s", label, desc.c_str());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Bind Selected") && scene.valid(selected_node)) {
+        if (const auto u = scene.uuid(selected_node)) {
+            uuid_field = *u;
+            modified = true;
+        }
+    }
+    if (uuid_field) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear")) {
+            uuid_field = {};
+            modified = true;
+        }
+    }
+    ImGui::PopID();
+}
+
+} // namespace
+
+bool EditorUi::sequencer_preview_active() const noexcept {
+    return sequencer_ui_ != nullptr && sequencer_ui_->preview_active;
+}
+
+bool EditorUi::sequencer_locks_edit_camera() const noexcept {
+    return sequencer_ui_ != nullptr &&
+        sequencer_ui_->preview_active &&
+        sequencer_ui_->lock_camera;
+}
+
+SequencerStatusSnapshot EditorUi::sequencer_status() const {
+    SequencerStatusSnapshot snap{};
+    if (sequencer_ui_ == nullptr) {
+        return snap;
+    }
+    snap.has_sequence = sequencer_ui_->has_sequence;
+    snap.relative_path = sequencer_ui_->relative_path;
+    snap.sequence_id = sequencer_ui_->sequence.id;
+    snap.title = sequencer_ui_->sequence.title;
+    snap.dirty = sequencer_ui_->dirty;
+    snap.preview_active = sequencer_ui_->preview_active;
+    snap.preview_playing = sequencer_ui_->preview_playing;
+    snap.lock_camera = sequencer_ui_->lock_camera;
+    snap.looping = sequencer_ui_->sequence.looping;
+    snap.playhead_seconds = sequencer_ui_->playhead_seconds;
+    snap.duration_seconds = sequencer_ui_->sequence.duration_seconds;
+    snap.frame_rate = sequencer_ui_->sequence.frame_rate;
+    snap.camera_cut_count = sequencer_ui_->sequence.camera_cuts.size();
+    snap.camera_shake_count = sequencer_ui_->sequence.camera_shakes.size();
+    snap.property_track_count = sequencer_ui_->sequence.property_tracks.size();
+    snap.animation_clip_count = sequencer_ui_->sequence.animation_clips.size();
+    snap.audio_clip_count = sequencer_ui_->sequence.audio_clips.size();
+    snap.subtitle_count = sequencer_ui_->sequence.subtitles.size();
+    snap.event_key_count = sequencer_ui_->sequence.event_keys.size();
+    return snap;
+}
+
+void EditorUi::stop_sequencer_preview(
+    SceneDocument& scene,
+    Renderer* const renderer,
+    FlyCamera* const camera) noexcept {
+    if (sequencer_ui_ == nullptr) {
+        return;
+    }
+    if (edit_animator_preview_ != nullptr) {
+        for (const SceneNodeId id : sequencer_ui_->previewed_anim_nodes) {
+            edit_animator_preview_->clear_preview(id);
+            if (renderer != nullptr) {
+                renderer->remove_skinned_model_pose(id);
+            }
+        }
+    }
+    sequencer_ui_->previewed_anim_nodes.clear();
+    if (sequencer_ui_->baseline_scene) {
+        scene = std::move(*sequencer_ui_->baseline_scene);
+        sequencer_ui_->baseline_scene.reset();
+        scene_replaced_ = true;
+        hierarchy_revision_ = 0U;
+        inspector_edit_snapshot_.reset();
+        gizmo_edit_snapshot_.reset();
+        if (!scene.valid(selected_node_)) {
+            selected_node_ = {};
+            name_buffer_node_ = {};
+        }
+    }
+    if (sequencer_ui_->baseline_camera && camera != nullptr) {
+        *camera = *sequencer_ui_->baseline_camera;
+    }
+    sequencer_ui_->baseline_camera.reset();
+    if (renderer != nullptr) {
+        renderer->set_vertical_fov_degrees(camera_vertical_fov);
+        renderer->set_camera_exposure_offset_ev(0.0F);
+        renderer->set_camera_focus_state(CameraFocusState{});
+        renderer->notify_camera_cut();
+    }
+    sequencer_ui_->preview_active = false;
+    sequencer_ui_->preview_playing = false;
+    sequencer_ui_->needs_preview_eval = false;
+    sequencer_ui_->last_eval_frame = {};
+    sequencer_ui_->eval_scratch.reset_frame_state();
+}
+
+void EditorUi::update_sequencer_edit_preview(
+    const float delta_seconds,
+    SceneDocument& scene,
+    Renderer& renderer,
+    FlyCamera& camera) {
+    if (sequencer_ui_ == nullptr ||
+        play_state_ != EditorPlayState::edit ||
+        !sequencer_ui_->preview_active) {
+        return;
+    }
+    if (!sequencer_ui_->baseline_scene) {
+        sequencer_ui_->baseline_scene = scene;
+        sequencer_ui_->baseline_camera = camera;
+        sequencer_ui_->needs_preview_eval = true;
+    }
+    const float duration =
+        std::max(sequencer_ui_->sequence.duration_seconds, 0.05F);
+    if (sequencer_ui_->preview_playing && !sequencer_ui_->dragging_playhead) {
+        sequencer_ui_->playhead_seconds += std::max(delta_seconds, 0.0F);
+        if (sequencer_ui_->playhead_seconds >= duration) {
+            if (sequencer_ui_->sequence.looping) {
+                sequencer_ui_->playhead_seconds =
+                    std::fmod(sequencer_ui_->playhead_seconds, duration);
+            } else {
+                sequencer_ui_->playhead_seconds = duration;
+                sequencer_ui_->preview_playing = false;
+            }
+        }
+        sequencer_ui_->needs_preview_eval = true;
+    }
+    sequencer_ui_->playhead_seconds =
+        std::clamp(sequencer_ui_->playhead_seconds, 0.0F, duration);
+    if (!sequencer_ui_->needs_preview_eval) {
+        return;
+    }
+
+    if (edit_animator_preview_ != nullptr) {
+        for (const SceneNodeId prev_id : sequencer_ui_->previewed_anim_nodes) {
+            edit_animator_preview_->clear_preview(prev_id);
+            renderer.remove_skinned_model_pose(prev_id);
+        }
+    }
+    sequencer_ui_->previewed_anim_nodes.clear();
+
+    scene = *sequencer_ui_->baseline_scene;
+    sequencer_ui_->last_eval_frame = evaluate_cutscene_at_time(
+        sequencer_ui_->sequence,
+        *sequencer_ui_->baseline_scene,
+        sequencer_ui_->playhead_seconds,
+        sequencer_ui_->eval_scratch);
+
+    bool any_scene_mutation = false;
+    for (const CutsceneEvaluatedNodePose& pose :
+         sequencer_ui_->eval_scratch.nodes) {
+        SceneNodeId id = pose.node_id;
+        if (!scene.valid(id) && pose.node_uuid) {
+            id = scene.find_by_uuid(pose.node_uuid);
+        }
+        if (!scene.valid(id)) {
+            continue;
+        }
+        if (auto node_ref = scene.node(id)) {
+            SceneNode& n = node_ref->get();
+            if (pose.transform_modified) {
+                n.transform = pose.transform;
+                any_scene_mutation = true;
+            }
+            if (pose.visibility_modified) {
+                n.visible = pose.visible;
+                any_scene_mutation = true;
+            }
+            if (pose.light_modified) {
+                n.light = pose.light;
+                any_scene_mutation = true;
+            }
+            if (pose.material_modified) {
+                n.material = pose.material;
+                any_scene_mutation = true;
+            }
+        }
+        if (pose.animator_modified) {
+            static_cast<void>(scene.set_animator(id, pose.animator));
+            any_scene_mutation = true;
+        }
+        if (edit_animator_preview_ != nullptr &&
+            pose.has_anim_clip &&
+            !pose.active_anim_clip_name.empty()) {
+            edit_animator_preview_->set_preview(
+                id,
+                pose.active_anim_clip_name,
+                false,
+                pose.anim_eval_time,
+                pose.animator.looping);
+            sequencer_ui_->previewed_anim_nodes.push_back(id);
+        }
+    }
+    if (any_scene_mutation) {
+        scene.mark_content_changed();
+    }
+
+    if (sequencer_ui_->last_eval_frame.has_camera &&
+        sequencer_ui_->lock_camera) {
+        pose_to_fly_camera(sequencer_ui_->last_eval_frame.camera_pose, camera);
+        renderer.set_vertical_fov_degrees(
+            sequencer_ui_->last_eval_frame.camera_pose.vertical_fov_degrees);
+        renderer.set_camera_exposure_offset_ev(
+            sequencer_ui_->last_eval_frame.camera_pose.exposure_offset_ev);
+        renderer.set_camera_focus_state(
+            sequencer_ui_->last_eval_frame.camera_pose.focus);
+        if (sequencer_ui_->last_eval_frame.camera_cut_discontinuity) {
+            renderer.notify_camera_cut();
+        }
+    } else if (!sequencer_ui_->lock_camera) {
+        renderer.set_vertical_fov_degrees(camera_vertical_fov);
+        renderer.set_camera_exposure_offset_ev(0.0F);
+        renderer.set_camera_focus_state(CameraFocusState{});
+    }
+    sequencer_ui_->needs_preview_eval = false;
+}
+
+void EditorUi::open_cutscene_in_sequencer(
+    SceneDocument& scene,
+    const std::string_view relative_path) {
+    if (sequencer_ui_ == nullptr) {
+        return;
+    }
+    sequencer_panel_open_ = true;
+    std::string err;
+    if (!mcp_sequencer_open(scene, relative_path, err)) {
+        sequencer_ui_->error = std::move(err);
+    }
+}
+
+bool EditorUi::mcp_sequencer_new(
+    SceneDocument& scene,
+    const std::string_view id,
+    const std::string_view title,
+    const float duration_seconds,
+    const float frame_rate,
+    const bool looping,
+    std::string& error) {
+    error.clear();
+    if (sequencer_ui_ == nullptr) {
+        error = "Sequencer UI state is unavailable.";
+        return false;
+    }
+    if (!std::isfinite(duration_seconds) || duration_seconds < 0.25F ||
+        duration_seconds > 3600.0F) {
+        error = "Cutscene duration_seconds must be within [0.25, 3600.0].";
+        return false;
+    }
+    if (!std::isfinite(frame_rate) || frame_rate < 1.0F || frame_rate > 240.0F) {
+        error = "Cutscene frame_rate must be within [1.0, 240.0].";
+        return false;
+    }
+    stop_sequencer_preview(scene);
+    sequencer_panel_open_ = true;
+    sequencer_ui_->reset_to_default(
+        id, title, duration_seconds, frame_rate, looping);
+    sequencer_ui_->dirty = true;
+    sequencer_ui_->status =
+        "Created new sequence '" + sequencer_ui_->sequence.id + "'.";
+    sequencer_ui_->error.clear();
+    return true;
+}
+
+bool EditorUi::mcp_sequencer_open(
+    SceneDocument& scene,
+    const std::string_view relative_path,
+    std::string& error) {
+    error.clear();
+    if (sequencer_ui_ == nullptr) {
+        error = "Sequencer UI state is unavailable.";
+        return false;
+    }
+    CutsceneSequence loaded{};
+    if (!load_cutscene_sequence_file(
+            asset_browser_.root(), relative_path, loaded, error)) {
+        return false;
+    }
+    stop_sequencer_preview(scene);
+    sequencer_panel_open_ = true;
+    sequencer_ui_->sequence = std::move(loaded);
+    sequencer_ui_->relative_path = std::string(relative_path);
+    sequencer_ui_->has_sequence = true;
+    sequencer_ui_->dirty = false;
+    sequencer_ui_->playhead_seconds = 0.0F;
+    sequencer_ui_->timeline_scroll_seconds = 0.0F;
+    sequencer_ui_->selection_kind = SequencerEditorUiState::SelectionKind::none;
+    sequencer_ui_->selected_track_index = 0U;
+    sequencer_ui_->selected_key_index = 0U;
+    sequencer_ui_->eval_scratch.reset_frame_state();
+    sequencer_ui_->last_eval_frame = {};
+    sequencer_ui_->sync_buffers();
+    sequencer_ui_->status = "Opened " + sequencer_ui_->relative_path;
+    sequencer_ui_->error.clear();
+    return true;
+}
+
+bool EditorUi::mcp_sequencer_save(
+    const std::string_view custom_relative_path,
+    std::string& out_saved_path,
+    std::string& error) {
+    error.clear();
+    out_saved_path.clear();
+    if (sequencer_ui_ == nullptr || !sequencer_ui_->has_sequence) {
+        error = "No cutscene sequence is loaded in Sequencer.";
+        return false;
+    }
+    std::string target = custom_relative_path.empty()
+        ? sequencer_ui_->relative_path
+        : std::string(custom_relative_path);
+    if (target.empty()) {
+        target = make_default_cutscene_relative_path(sequencer_ui_->sequence.id);
+    }
+    sequencer_ui_->sequence =
+        sanitize_cutscene_sequence(std::move(sequencer_ui_->sequence));
+    if (!save_cutscene_sequence_file(
+            sequencer_ui_->sequence,
+            asset_browser_.root(),
+            target,
+            error)) {
+        return false;
+    }
+    sequencer_ui_->relative_path = target;
+    sequencer_ui_->dirty = false;
+    sequencer_ui_->sync_buffers();
+    sequencer_ui_->files_scanned = false;
+    refresh_asset_browser();
+    out_saved_path = std::move(target);
+    sequencer_ui_->status = "Saved " + out_saved_path;
+    sequencer_ui_->error.clear();
+    return true;
+}
+
+bool EditorUi::mcp_sequencer_set_playback(
+    SceneDocument& scene,
+    Renderer& renderer,
+    FlyCamera& camera,
+    const bool active,
+    const bool playing,
+    const std::optional<float> scrub_time_seconds,
+    const std::optional<bool> lock_camera,
+    std::string& error) {
+    error.clear();
+    if (sequencer_ui_ == nullptr || !sequencer_ui_->has_sequence) {
+        error = "No cutscene sequence is loaded in Sequencer.";
+        return false;
+    }
+    if (play_state_ != EditorPlayState::edit) {
+        error = "Sequencer preview control is only available in Edit mode.";
+        return false;
+    }
+    if (!active) {
+        stop_sequencer_preview(scene, &renderer, &camera);
+        if (scrub_time_seconds) {
+            if (!std::isfinite(*scrub_time_seconds)) {
+                error = "scrub_time_seconds must be finite.";
+                return false;
+            }
+            sequencer_ui_->playhead_seconds = std::clamp(
+                *scrub_time_seconds,
+                0.0F,
+                std::max(sequencer_ui_->sequence.duration_seconds, 0.05F));
+        }
+        sequencer_ui_->status = "Sequencer preview stopped.";
+        sequencer_ui_->error.clear();
+        return true;
+    }
+    if (scrub_time_seconds && !std::isfinite(*scrub_time_seconds)) {
+        error = "scrub_time_seconds must be finite.";
+        return false;
+    }
+    if (!sequencer_ui_->preview_active) {
+        sequencer_ui_->baseline_scene = scene;
+        sequencer_ui_->baseline_camera = camera;
+        sequencer_ui_->preview_active = true;
+    }
+    sequencer_ui_->preview_playing = playing;
+    if (lock_camera) {
+        const bool was_locked = sequencer_ui_->lock_camera;
+        sequencer_ui_->lock_camera = *lock_camera;
+        if (was_locked && !*lock_camera) {
+            if (sequencer_ui_->baseline_camera) {
+                camera = *sequencer_ui_->baseline_camera;
+            }
+            renderer.set_vertical_fov_degrees(camera_vertical_fov);
+            renderer.set_camera_exposure_offset_ev(0.0F);
+            renderer.set_camera_focus_state(CameraFocusState{});
+        }
+    }
+    if (scrub_time_seconds) {
+        sequencer_ui_->playhead_seconds = std::clamp(
+            *scrub_time_seconds,
+            0.0F,
+            std::max(sequencer_ui_->sequence.duration_seconds, 0.05F));
+        sequencer_ui_->eval_scratch.reset_frame_state();
+    }
+    sequencer_ui_->needs_preview_eval = true;
+    update_sequencer_edit_preview(0.0F, scene, renderer, camera);
+    sequencer_ui_->status = playing
+        ? "Sequencer preview playing."
+        : "Sequencer preview active.";
+    sequencer_ui_->error.clear();
+    return true;
+}
+
+void EditorUi::build_sequencer_panel(
+    SceneDocument& scene,
+    Renderer& renderer,
+    FlyCamera& camera) {
+    if (sequencer_ui_ != nullptr &&
+        !sequencer_ui_->pending_runtime_cutscene.empty() &&
+        play_state_ == EditorPlayState::playing &&
+        gameplay_session_ != nullptr &&
+        gameplay_session_->active()) {
+        gameplay_session_->gameplay_world().request_cutscene(
+            sequencer_ui_->pending_runtime_cutscene);
+        sequencer_ui_->pending_runtime_cutscene.clear();
+    }
+    if (!sequencer_panel_open_ || sequencer_ui_ == nullptr) {
+        return;
+    }
+    SequencerEditorUiState& st = *sequencer_ui_;
+    if (!st.files_scanned) {
+        scan_cutscene_files(asset_browser_.root(), st.available_files);
+        st.files_scanned = true;
+    }
+
+    ImGui::SetNextWindowSize(
+        ImVec2(840.0F, 300.0F), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Sequencer", &sequencer_panel_open_)) {
+        ImGui::End();
+        return;
+    }
+
+    const bool can_edit = play_state_ == EditorPlayState::edit;
+    CutsceneSequence& seq = st.sequence;
+
+    // 1. File / Transport bar
+    if (ImGui::SmallButton("New##SeqNew")) {
+        stop_sequencer_preview(scene, &renderer, &camera);
+        st.reset_to_default();
+        st.dirty = true;
+        st.status = "Created new sequence.";
+        st.error.clear();
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(170.0F);
+    if (ImGui::BeginCombo(
+            "##SeqFilePicker",
+            st.relative_path.empty()
+                ? "(choose cutscene)"
+                : st.relative_path.c_str())) {
+        if (ImGui::Selectable("Refresh list...##SeqRefreshList", false)) {
+            scan_cutscene_files(asset_browser_.root(), st.available_files);
+        }
+        ImGui::Separator();
+        for (const std::string& rel : st.available_files) {
+            const bool is_sel = rel == st.relative_path;
+            if (ImGui::Selectable(rel.c_str(), is_sel)) {
+                std::string err;
+                if (!mcp_sequencer_open(scene, rel, err)) {
+                    st.error = std::move(err);
+                }
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(210.0F);
+    if (ImGui::InputText(
+            "##SeqPathInput",
+            st.path_buffer.data(),
+            st.path_buffer.size())) {
+        st.relative_path = st.path_buffer.data();
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Open##SeqOpenBtn")) {
+        std::string err;
+        if (!mcp_sequencer_open(scene, st.path_buffer.data(), err)) {
+            st.error = std::move(err);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Save##SeqSaveBtn")) {
+        std::string saved;
+        std::string err;
+        if (!mcp_sequencer_save(st.path_buffer.data(), saved, err)) {
+            st.error = std::move(err);
+        }
+    }
+
+    ImGui::SameLine(0.0F, 14.0F);
+    ImGui::BeginDisabled(!can_edit);
+    if (st.preview_playing) {
+        if (ImGui::SmallButton("Pause##SeqPause")) {
+            st.preview_playing = false;
+        }
+    } else {
+        if (ImGui::SmallButton("Play##SeqPlay")) {
+            if (!st.preview_active) {
+                st.baseline_scene = scene;
+                st.baseline_camera = camera;
+                st.preview_active = true;
+            }
+            if (st.playhead_seconds >= seq.duration_seconds - 1.0e-3F) {
+                st.playhead_seconds = 0.0F;
+                st.eval_scratch.reset_frame_state();
+            }
+            st.preview_playing = true;
+            st.needs_preview_eval = true;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Stop##SeqStop")) {
+        stop_sequencer_preview(scene, &renderer, &camera);
+        st.playhead_seconds = 0.0F;
+    }
+    ImGui::EndDisabled();
+
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Play Runtime##SeqPlayGame")) {
+        std::string saved_rel;
+        std::string save_err;
+        if (mcp_sequencer_save(st.path_buffer.data(), saved_rel, save_err)) {
+            if (play_state_ == EditorPlayState::edit) {
+                stop_sequencer_preview(scene, &renderer, &camera);
+                st.pending_runtime_cutscene = saved_rel;
+                start_play(scene);
+            } else if (gameplay_session_ != nullptr &&
+                       gameplay_session_->active()) {
+                gameplay_session_->gameplay_world().request_cutscene(saved_rel);
+            }
+        } else {
+            st.error = std::move(save_err);
+        }
+    }
+
+    // Row 2: Scrub, Duration, FPS, Flags
+    bool seq_edited = false;
+    const float duration = std::max(seq.duration_seconds, 0.25F);
+    ImGui::SetNextItemWidth(160.0F);
+    if (ImGui::SliderFloat(
+            "##SeqPlayhead",
+            &st.playhead_seconds,
+            0.0F,
+            duration,
+            "%.2fs",
+            ImGuiSliderFlags_AlwaysClamp) &&
+        can_edit) {
+        if (!st.preview_active) {
+            st.baseline_scene = scene;
+            st.baseline_camera = camera;
+            st.preview_active = true;
+        }
+        st.preview_playing = false;
+        st.needs_preview_eval = true;
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(76.0F);
+    if (ImGui::DragFloat(
+            "Dur##SeqDur",
+            &seq.duration_seconds,
+            0.1F,
+            0.25F,
+            3600.0F,
+            "%.2fs",
+            ImGuiSliderFlags_AlwaysClamp)) {
+        st.playhead_seconds =
+            std::min(st.playhead_seconds, seq.duration_seconds);
+        seq_edited = true;
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(62.0F);
+    if (ImGui::DragFloat(
+            "FPS##SeqFps",
+            &seq.frame_rate,
+            0.5F,
+            1.0F,
+            240.0F,
+            "%.0f",
+            ImGuiSliderFlags_AlwaysClamp)) {
+        seq_edited = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Loop##SeqLoop", &seq.looping)) {
+        seq_edited = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Lock Cam##SeqLockCam", &st.lock_camera) &&
+        st.preview_active) {
+        if (!st.lock_camera) {
+            if (st.baseline_camera) {
+                camera = *st.baseline_camera;
+            }
+            renderer.set_vertical_fov_degrees(camera_vertical_fov);
+            renderer.set_camera_exposure_offset_ev(0.0F);
+            renderer.set_camera_focus_state(CameraFocusState{});
+        } else {
+            st.needs_preview_eval = true;
+        }
+    }
+    ImGui::SameLine();
+    static_cast<void>(ImGui::Checkbox("Curves##SeqCurves", &st.show_curve_editor));
+    ImGui::SameLine();
+    static_cast<void>(ImGui::Checkbox("Settings##SeqSettings", &st.show_settings));
+    if (st.dirty) {
+        ImGui::SameLine();
+        ui_kit_.badge("UNSAVED", EditorTone::warning);
+    }
+
+    if (st.show_settings) {
+        ImGui::Separator();
+        ImGui::SetNextItemWidth(160.0F);
+        if (ImGui::InputText("ID##SeqId", st.id_buffer.data(), st.id_buffer.size())) {
+            seq.id = st.id_buffer.data();
+            seq_edited = true;
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(200.0F);
+        if (ImGui::InputText(
+                "Title##SeqTitle", st.title_buffer.data(), st.title_buffer.size())) {
+            seq.title = st.title_buffer.data();
+            seq_edited = true;
+        }
+        ImGui::SameLine();
+        seq_edited |= ImGui::Checkbox("Skippable##SeqSkip", &seq.skippable);
+        ImGui::SameLine();
+        seq_edited |= ImGui::Checkbox("Lock Input##SeqLockIn", &seq.lock_player_input);
+        ImGui::SameLine();
+        seq_edited |=
+            ImGui::Checkbox("Pause Sim##SeqPauseSim", &seq.pause_gameplay_simulation);
+        ImGui::SameLine();
+        seq_edited |= ImGui::Checkbox("Hide HUD##SeqHideHud", &seq.hide_hud);
+        ImGui::SetNextItemWidth(90.0F);
+        seq_edited |= ImGui::DragFloat(
+            "Letterbox##SeqLb", &seq.letterbox_aspect, 0.05F, 0.0F, 4.0F, "%.2f");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(80.0F);
+        seq_edited |= ImGui::DragFloat(
+            "Blend In##SeqBI", &seq.blend_in_seconds, 0.05F, 0.0F, 10.0F, "%.2fs");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(80.0F);
+        seq_edited |= ImGui::DragFloat(
+            "Blend Out##SeqBO", &seq.blend_out_seconds, 0.05F, 0.0F, 10.0F, "%.2fs");
+    }
+
+    // Track creation buttons
+    ImGui::Separator();
+    const SceneUuid selected_uuid =
+        scene.valid(selected_node_)
+            ? scene.uuid(selected_node_).value_or(SceneUuid{})
+            : SceneUuid{};
+    if (ImGui::SmallButton("+ Cam Cut") &&
+        seq.camera_cuts.size() < maximum_cutscene_clips) {
+        CameraCutClip clip{};
+        clip.start_time = st.playhead_seconds;
+        clip.end_time = std::min(seq.duration_seconds, st.playhead_seconds + 2.5F);
+        if (clip.end_time <= clip.start_time + 0.05F) {
+            clip.end_time = clip.start_time + 0.5F;
+        }
+        clip.camera_node_uuid = selected_uuid;
+        seq.camera_cuts.push_back(std::move(clip));
+        st.selection_kind = SequencerEditorUiState::SelectionKind::camera_cut;
+        st.selected_track_index = seq.camera_cuts.size() - 1U;
+        seq_edited = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("+ Shake") &&
+        seq.camera_shakes.size() < maximum_cutscene_clips) {
+        CameraShakeClip shake{};
+        shake.start_time = st.playhead_seconds;
+        shake.duration = 0.6F;
+        seq.camera_shakes.push_back(shake);
+        st.selection_kind = SequencerEditorUiState::SelectionKind::camera_shake;
+        st.selected_track_index = seq.camera_shakes.size() - 1U;
+        seq_edited = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("+ Property") &&
+        seq.property_tracks.size() < maximum_cutscene_tracks) {
+        SequencerPropertyTrack tr{};
+        tr.target_node_uuid = selected_uuid;
+        tr.keys.push_back(SequencerKeyframe{.time = 0.0F, .value = 0.0F});
+        tr.keys.push_back(SequencerKeyframe{
+            .time = std::max(0.5F, seq.duration_seconds), .value = 1.0F});
+        seq.property_tracks.push_back(std::move(tr));
+        st.selection_kind =
+            SequencerEditorUiState::SelectionKind::property_track;
+        st.selected_track_index = seq.property_tracks.size() - 1U;
+        st.selected_key_index = 0U;
+        seq_edited = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("+ Anim") &&
+        seq.animation_clips.size() < maximum_cutscene_clips) {
+        SequencerAnimationClip ac{};
+        ac.target_node_uuid = selected_uuid;
+        ac.start_time = st.playhead_seconds;
+        ac.end_time = std::min(seq.duration_seconds, st.playhead_seconds + 2.0F);
+        if (ac.end_time <= ac.start_time + 0.05F) {
+            ac.end_time = ac.start_time + 0.5F;
+        }
+        seq.animation_clips.push_back(std::move(ac));
+        st.selection_kind =
+            SequencerEditorUiState::SelectionKind::animation_clip;
+        st.selected_track_index = seq.animation_clips.size() - 1U;
+        seq_edited = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("+ Audio") &&
+        seq.audio_clips.size() < maximum_cutscene_clips) {
+        SequencerAudioClip au{};
+        au.start_time = st.playhead_seconds;
+        au.spatial_node_uuid = selected_uuid;
+        seq.audio_clips.push_back(std::move(au));
+        st.selection_kind = SequencerEditorUiState::SelectionKind::audio_clip;
+        st.selected_track_index = seq.audio_clips.size() - 1U;
+        seq_edited = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("+ Subtitle") &&
+        seq.subtitles.size() < maximum_cutscene_clips) {
+        SequencerSubtitleClip sub{};
+        sub.start_time = st.playhead_seconds;
+        sub.end_time = std::min(seq.duration_seconds, st.playhead_seconds + 2.5F);
+        if (sub.end_time <= sub.start_time + 0.05F) {
+            sub.end_time = sub.start_time + 0.5F;
+        }
+        sub.speaker_key = "Speaker";
+        sub.text_key = "Subtitle text";
+        seq.subtitles.push_back(std::move(sub));
+        st.selection_kind = SequencerEditorUiState::SelectionKind::subtitle;
+        st.selected_track_index = seq.subtitles.size() - 1U;
+        seq_edited = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("+ Event") &&
+        seq.event_keys.size() < maximum_cutscene_clips) {
+        SequencerEventKey ev{};
+        ev.time = st.playhead_seconds;
+        ev.event_name = "event";
+        ev.target_node_uuid = selected_uuid;
+        seq.event_keys.push_back(std::move(ev));
+        st.selection_kind = SequencerEditorUiState::SelectionKind::event_key;
+        st.selected_track_index = seq.event_keys.size() - 1U;
+        seq_edited = true;
+    }
+    ImGui::SameLine(0.0F, 14.0F);
+    ImGui::SetNextItemWidth(90.0F);
+    static_cast<void>(ImGui::SliderFloat(
+        "Zoom##SeqZoom",
+        &st.timeline_zoom,
+        0.25F,
+        8.0F,
+        "%.2fx",
+        ImGuiSliderFlags_AlwaysClamp));
+
+    if (!st.error.empty()) {
+        ui_kit_.status_text(st.error.c_str(), EditorTone::danger);
+    } else if (!st.status.empty()) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", st.status.c_str());
+    }
+
+    // 2. Main Split: Timeline/Curve on left, Track Inspector on right
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const float inspector_width = std::clamp(avail.x * 0.34F, 260.0F, 420.0F);
+    const float canvas_width = std::max(avail.x - inspector_width - 8.0F, 220.0F);
+    const float body_height = std::max(avail.y, 130.0F);
+
+    if (ImGui::BeginChild(
+            "##SeqTimelineArea", ImVec2(canvas_width, body_height), true)) {
+        const float px_per_sec =
+            std::max((canvas_width - 140.0F) / std::max(duration, 0.25F), 16.0F) *
+            st.timeline_zoom;
+        const float label_col_w = 130.0F;
+        const float ruler_h = 22.0F;
+        const float row_h = 22.0F;
+
+        const ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
+        const float timeline_x0 = canvas_pos.x + label_col_w;
+        const float timeline_w = std::max(
+            ImGui::GetContentRegionAvail().x - label_col_w, 60.0F);
+        const auto time_to_x = [&](const float t) noexcept {
+            return timeline_x0 +
+                (t - st.timeline_scroll_seconds) * px_per_sec;
+        };
+        const auto x_to_time = [&](const float x) noexcept {
+            return std::clamp(
+                st.timeline_scroll_seconds + (x - timeline_x0) / px_per_sec,
+                0.0F,
+                duration);
+        };
+
+        // Ruler interaction
+        ImGui::SetCursorScreenPos(ImVec2(timeline_x0, canvas_pos.y));
+        static_cast<void>(ImGui::InvisibleButton(
+            "##SeqRulerHit", ImVec2(timeline_w, ruler_h)));
+        if (ImGui::IsItemActive() &&
+            ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
+            can_edit) {
+            st.dragging_playhead = true;
+            st.playhead_seconds = x_to_time(ImGui::GetIO().MousePos.x);
+            if (!st.preview_active) {
+                st.baseline_scene = scene;
+                st.baseline_camera = camera;
+                st.preview_active = true;
+            }
+            st.preview_playing = false;
+            st.needs_preview_eval = true;
+        } else if (st.dragging_playhead &&
+                   !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            st.dragging_playhead = false;
+        }
+
+        ImDrawList* const dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(
+            canvas_pos,
+            ImVec2(canvas_pos.x + label_col_w + timeline_w, canvas_pos.y + ruler_h),
+            IM_COL32(34, 38, 46, 255));
+        dl->PushClipRect(
+            ImVec2(timeline_x0, canvas_pos.y),
+            ImVec2(timeline_x0 + timeline_w, canvas_pos.y + body_height),
+            true);
+        const float step_sec = st.timeline_zoom >= 3.0F
+            ? 0.25F
+            : (st.timeline_zoom >= 1.5F ? 0.5F : 1.0F);
+        for (float t = 0.0F; t <= duration + 1.0e-4F; t += step_sec) {
+            const float tx = time_to_x(t);
+            if (tx < timeline_x0 - 2.0F || tx > timeline_x0 + timeline_w + 2.0F) {
+                continue;
+            }
+            dl->AddLine(
+                ImVec2(tx, canvas_pos.y + ruler_h - 7.0F),
+                ImVec2(tx, canvas_pos.y + ruler_h),
+                IM_COL32(150, 165, 185, 190));
+            std::array<char, 16U> tick_buf{};
+            std::snprintf(tick_buf.data(), tick_buf.size(), "%.1fs", t);
+            dl->AddText(
+                ImVec2(tx + 2.0F, canvas_pos.y + 3.0F),
+                IM_COL32(190, 200, 215, 220),
+                tick_buf.data());
+        }
+        dl->PopClipRect();
+
+        if (!st.show_curve_editor) {
+            // Track rows
+            std::size_t row_idx = 0U;
+            const auto draw_bar_row = [&](const char* const row_label,
+                                          const float t0,
+                                          const float t1,
+                                          const ImU32 bar_col,
+                                          const SequencerEditorUiState::SelectionKind kind,
+                                          const std::size_t idx) {
+                const float y0 = canvas_pos.y + ruler_h +
+                    static_cast<float>(row_idx) * row_h;
+                const float y1 = y0 + row_h - 2.0F;
+                const bool is_sel =
+                    st.selection_kind == kind && st.selected_track_index == idx;
+                dl->AddRectFilled(
+                    ImVec2(canvas_pos.x, y0),
+                    ImVec2(canvas_pos.x + label_col_w - 2.0F, y1),
+                    is_sel ? IM_COL32(58, 74, 102, 230) : IM_COL32(30, 34, 42, 210),
+                    3.0F);
+                dl->AddText(
+                    ImVec2(canvas_pos.x + 6.0F, y0 + 3.0F),
+                    IM_COL32(230, 235, 245, 240),
+                    row_label);
+
+                dl->PushClipRect(
+                    ImVec2(timeline_x0, y0),
+                    ImVec2(timeline_x0 + timeline_w, y1),
+                    true);
+                dl->AddRectFilled(
+                    ImVec2(timeline_x0, y0),
+                    ImVec2(timeline_x0 + timeline_w, y1),
+                    (row_idx % 2U) == 0U
+                        ? IM_COL32(24, 27, 34, 210)
+                        : IM_COL32(28, 31, 39, 210));
+                const float bx0 = time_to_x(t0);
+                const float bx1 = std::max(bx0 + 6.0F, time_to_x(t1));
+                dl->AddRectFilled(
+                    ImVec2(bx0, y0 + 2.0F),
+                    ImVec2(bx1, y1 - 2.0F),
+                    bar_col,
+                    3.0F);
+                if (is_sel) {
+                    dl->AddRect(
+                        ImVec2(bx0, y0 + 2.0F),
+                        ImVec2(bx1, y1 - 2.0F),
+                        IM_COL32(255, 230, 120, 255),
+                        3.0F,
+                        0,
+                        1.5F);
+                }
+                dl->PopClipRect();
+
+                ImGui::SetCursorScreenPos(ImVec2(canvas_pos.x, y0));
+                ImGui::PushID(static_cast<int>(row_idx));
+                if (ImGui::InvisibleButton(
+                        "##SeqRowHit",
+                        ImVec2(label_col_w + timeline_w, row_h))) {
+                    st.selection_kind = kind;
+                    st.selected_track_index = idx;
+                    st.selected_key_index = 0U;
+                }
+                ImGui::PopID();
+                ++row_idx;
+            };
+
+            for (std::size_t i = 0U; i < seq.camera_cuts.size(); ++i) {
+                std::array<char, 40U> lbl{};
+                std::snprintf(lbl.data(), lbl.size(), "Cam Cut #%zu", i);
+                draw_bar_row(
+                    lbl.data(),
+                    seq.camera_cuts[i].start_time,
+                    seq.camera_cuts[i].end_time,
+                    IM_COL32(72, 160, 232, 225),
+                    SequencerEditorUiState::SelectionKind::camera_cut,
+                    i);
+            }
+            for (std::size_t i = 0U; i < seq.camera_shakes.size(); ++i) {
+                std::array<char, 40U> lbl{};
+                std::snprintf(lbl.data(), lbl.size(), "Cam Shake #%zu", i);
+                draw_bar_row(
+                    lbl.data(),
+                    seq.camera_shakes[i].start_time,
+                    seq.camera_shakes[i].start_time + seq.camera_shakes[i].duration,
+                    IM_COL32(230, 130, 72, 225),
+                    SequencerEditorUiState::SelectionKind::camera_shake,
+                    i);
+            }
+            for (std::size_t i = 0U; i < seq.property_tracks.size(); ++i) {
+                const SequencerPropertyTrack& tr = seq.property_tracks[i];
+                const float y0 = canvas_pos.y + ruler_h +
+                    static_cast<float>(row_idx) * row_h;
+                const float y1 = y0 + row_h - 2.0F;
+                const bool is_sel =
+                    st.selection_kind ==
+                        SequencerEditorUiState::SelectionKind::property_track &&
+                    st.selected_track_index == i;
+                dl->AddRectFilled(
+                    ImVec2(canvas_pos.x, y0),
+                    ImVec2(canvas_pos.x + label_col_w - 2.0F, y1),
+                    is_sel ? IM_COL32(58, 74, 102, 230) : IM_COL32(30, 34, 42, 210),
+                    3.0F);
+                dl->AddText(
+                    ImVec2(canvas_pos.x + 6.0F, y0 + 3.0F),
+                    IM_COL32(220, 238, 215, 240),
+                    to_token(tr.property).data());
+                dl->PushClipRect(
+                    ImVec2(timeline_x0, y0),
+                    ImVec2(timeline_x0 + timeline_w, y1),
+                    true);
+                dl->AddRectFilled(
+                    ImVec2(timeline_x0, y0),
+                    ImVec2(timeline_x0 + timeline_w, y1),
+                    (row_idx % 2U) == 0U
+                        ? IM_COL32(24, 27, 34, 210)
+                        : IM_COL32(28, 31, 39, 210));
+                for (std::size_t k = 0U; k < tr.keys.size(); ++k) {
+                    const float kx = time_to_x(tr.keys[k].time);
+                    const float ky = (y0 + y1) * 0.5F;
+                    const bool key_sel = is_sel && st.selected_key_index == k;
+                    dl->AddQuadFilled(
+                        ImVec2(kx, ky - 5.0F),
+                        ImVec2(kx + 5.0F, ky),
+                        ImVec2(kx, ky + 5.0F),
+                        ImVec2(kx - 5.0F, ky),
+                        key_sel
+                            ? IM_COL32(255, 232, 96, 255)
+                            : IM_COL32(118, 224, 148, 240));
+                }
+                dl->PopClipRect();
+                ImGui::SetCursorScreenPos(ImVec2(canvas_pos.x, y0));
+                ImGui::PushID(static_cast<int>(row_idx));
+                if (ImGui::InvisibleButton(
+                        "##SeqRowPropHit",
+                        ImVec2(label_col_w + timeline_w, row_h))) {
+                    st.selection_kind =
+                        SequencerEditorUiState::SelectionKind::property_track;
+                    st.selected_track_index = i;
+                    st.selected_key_index = 0U;
+                }
+                ImGui::PopID();
+                ++row_idx;
+            }
+            for (std::size_t i = 0U; i < seq.animation_clips.size(); ++i) {
+                draw_bar_row(
+                    seq.animation_clips[i].clip_name.empty()
+                        ? "Anim Clip"
+                        : seq.animation_clips[i].clip_name.c_str(),
+                    seq.animation_clips[i].start_time,
+                    seq.animation_clips[i].end_time,
+                    IM_COL32(168, 120, 232, 225),
+                    SequencerEditorUiState::SelectionKind::animation_clip,
+                    i);
+            }
+            for (std::size_t i = 0U; i < seq.audio_clips.size(); ++i) {
+                std::array<char, 40U> lbl{};
+                std::snprintf(lbl.data(), lbl.size(), "Audio #%zu", i);
+                draw_bar_row(
+                    lbl.data(),
+                    seq.audio_clips[i].start_time,
+                    seq.audio_clips[i].start_time + 1.0F,
+                    IM_COL32(72, 205, 195, 225),
+                    SequencerEditorUiState::SelectionKind::audio_clip,
+                    i);
+            }
+            for (std::size_t i = 0U; i < seq.subtitles.size(); ++i) {
+                std::array<char, 40U> lbl{};
+                std::snprintf(lbl.data(), lbl.size(), "Subtitle #%zu", i);
+                draw_bar_row(
+                    lbl.data(),
+                    seq.subtitles[i].start_time,
+                    seq.subtitles[i].end_time,
+                    IM_COL32(215, 198, 92, 225),
+                    SequencerEditorUiState::SelectionKind::subtitle,
+                    i);
+            }
+            for (std::size_t i = 0U; i < seq.event_keys.size(); ++i) {
+                draw_bar_row(
+                    seq.event_keys[i].event_name.empty()
+                        ? "Event"
+                        : seq.event_keys[i].event_name.c_str(),
+                    seq.event_keys[i].time,
+                    seq.event_keys[i].time + 0.15F,
+                    IM_COL32(238, 102, 136, 225),
+                    SequencerEditorUiState::SelectionKind::event_key,
+                    i);
+            }
+        } else {
+            // Curve Editor
+            float default_val = 0.0F;
+            std::vector<SequencerKeyframe>* const keys =
+                resolve_active_curve(st, default_val);
+            const ImVec2 plot_min(
+                timeline_x0, canvas_pos.y + ruler_h + 4.0F);
+            const ImVec2 plot_max(
+                timeline_x0 + timeline_w,
+                canvas_pos.y + body_height - 16.0F);
+            dl->PushClipRect(plot_min, plot_max, true);
+            dl->AddRectFilled(plot_min, plot_max, IM_COL32(20, 23, 29, 255));
+            dl->AddRect(plot_min, plot_max, IM_COL32(62, 70, 84, 255));
+            if (keys == nullptr || plot_max.y <= plot_min.y + 20.0F) {
+                dl->AddText(
+                    ImVec2(plot_min.x + 12.0F, plot_min.y + 12.0F),
+                    IM_COL32(180, 190, 205, 220),
+                    "Select a Camera Cut or Property Track to edit its keyframe curve.");
+            } else {
+                float min_v = default_val - 1.0F;
+                float max_v = default_val + 1.0F;
+                for (const SequencerKeyframe& k : *keys) {
+                    min_v = std::min(min_v, k.value);
+                    max_v = std::max(max_v, k.value);
+                }
+                const float span_v = std::max(max_v - min_v, 0.25F);
+                min_v -= span_v * 0.15F;
+                max_v += span_v * 0.15F;
+                const auto val_to_y = [&](const float v) noexcept {
+                    const float n = (v - min_v) / std::max(max_v - min_v, 1.0e-4F);
+                    return plot_max.y - n * (plot_max.y - plot_min.y);
+                };
+                constexpr std::size_t plot_samples = 96U;
+                for (std::size_t s = 1U; s <= plot_samples; ++s) {
+                    const float t0 = duration *
+                        static_cast<float>(s - 1U) /
+                        static_cast<float>(plot_samples);
+                    const float t1 = duration *
+                        static_cast<float>(s) /
+                        static_cast<float>(plot_samples);
+                    const float v0 = evaluate_sequencer_curve(
+                        *keys, t0, default_val);
+                    const float v1 = evaluate_sequencer_curve(
+                        *keys, t1, default_val);
+                    dl->AddLine(
+                        ImVec2(time_to_x(t0), val_to_y(v0)),
+                        ImVec2(time_to_x(t1), val_to_y(v1)),
+                        IM_COL32(92, 204, 255, 240),
+                        2.0F);
+                }
+                const ImVec2 mouse = ImGui::GetIO().MousePos;
+                const bool click_plot = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+                for (std::size_t k = 0U; k < keys->size(); ++k) {
+                    const ImVec2 kp(
+                        time_to_x((*keys)[k].time),
+                        val_to_y((*keys)[k].value));
+                    const bool is_ksel = st.selected_key_index == k;
+                    dl->AddCircleFilled(
+                        kp,
+                        is_ksel ? 5.5F : 4.0F,
+                        is_ksel
+                            ? IM_COL32(255, 224, 80, 255)
+                            : IM_COL32(130, 235, 160, 240),
+                        12);
+                    if (click_plot) {
+                        const float dx = mouse.x - kp.x;
+                        const float dy = mouse.y - kp.y;
+                        if (dx * dx + dy * dy <= 64.0F) {
+                            st.selected_key_index = k;
+                        }
+                    }
+                }
+            }
+            dl->PopClipRect();
+        }
+
+        // Playhead vertical line
+        const float px = time_to_x(st.playhead_seconds);
+        if (px >= timeline_x0 && px <= timeline_x0 + timeline_w) {
+            dl->AddLine(
+                ImVec2(px, canvas_pos.y),
+                ImVec2(px, canvas_pos.y + body_height),
+                IM_COL32(255, 76, 76, 245),
+                2.0F);
+        }
+    }
+    ImGui::EndChild();
+
+    ImGui::SameLine();
+    if (ImGui::BeginChild(
+            "##SeqTrackInspector",
+            ImVec2(inspector_width, body_height),
+            true)) {
+        using SK = SequencerEditorUiState::SelectionKind;
+        if (st.selection_kind == SK::camera_cut &&
+            st.selected_track_index < seq.camera_cuts.size()) {
+            CameraCutClip& clip = seq.camera_cuts[st.selected_track_index];
+            ImGui::Text("Camera Cut #%zu", st.selected_track_index);
+            seq_edited |= ImGui::DragFloat("Start##CCStart", &clip.start_time, 0.05F, 0.0F, duration);
+            seq_edited |= ImGui::DragFloat("End##CCEnd", &clip.end_time, 0.05F, 0.05F, duration);
+            draw_node_uuid_binder("CCCam", "Camera Node", clip.camera_node_uuid, scene, selected_node_, seq_edited);
+            draw_node_uuid_binder("CCLook", "Look-At Node", clip.look_at_target_uuid, scene, selected_node_, seq_edited);
+            draw_node_uuid_binder("CCRail", "Rail Spline", clip.rail_spline_uuid, scene, selected_node_, seq_edited);
+            seq_edited |= ImGui::DragFloat("Default FOV##CCDefFov", &clip.default_fov_degrees, 0.5F, minimum_camera_vertical_fov, maximum_camera_vertical_fov);
+            seq_edited |= ImGui::DragFloat("Blend In##CCBI", &clip.blend_in_seconds, 0.05F, 0.0F, 10.0F);
+            seq_edited |= ImGui::Checkbox("DoF##CCDof", &clip.dof_enabled);
+            ImGui::SameLine();
+            seq_edited |= ImGui::Checkbox("Auto Focus##CCAF", &clip.auto_focus_look_at);
+            ImGui::SetNextItemWidth(140.0F);
+            if (ImGui::BeginCombo("Curve##CCSubCurve", camera_sub_curve_label(st.camera_sub_curve))) {
+                for (const auto sub : {
+                         SequencerEditorUiState::CameraSubCurve::fov,
+                         SequencerEditorUiState::CameraSubCurve::roll,
+                         SequencerEditorUiState::CameraSubCurve::exposure,
+                         SequencerEditorUiState::CameraSubCurve::focus_distance,
+                         SequencerEditorUiState::CameraSubCurve::rail_u}) {
+                    if (ImGui::Selectable(camera_sub_curve_label(sub), st.camera_sub_curve == sub)) {
+                        st.camera_sub_curve = sub;
+                        st.selected_key_index = 0U;
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            if (ImGui::SmallButton("Delete Cut##DelCC")) {
+                seq.camera_cuts.erase(seq.camera_cuts.begin() + static_cast<std::ptrdiff_t>(st.selected_track_index));
+                st.selection_kind = SK::none;
+                seq_edited = true;
+            }
+        } else if (st.selection_kind == SK::camera_shake &&
+                   st.selected_track_index < seq.camera_shakes.size()) {
+            CameraShakeClip& sh = seq.camera_shakes[st.selected_track_index];
+            ImGui::Text("Camera Shake #%zu", st.selected_track_index);
+            seq_edited |= ImGui::DragFloat("Start##ShStart", &sh.start_time, 0.05F, 0.0F, duration);
+            seq_edited |= ImGui::DragFloat("Duration##ShDur", &sh.duration, 0.05F, 0.05F, 30.0F);
+            seq_edited |= ImGui::DragFloat3(
+                "Pos Amp##ShPos", &sh.params.amplitude_position.x, 0.005F, 0.0F, 5.0F);
+            seq_edited |= ImGui::DragFloat3(
+                "Rot Amp##ShRot", &sh.params.amplitude_rotation_degrees.x, 0.1F, 0.0F, 45.0F);
+            seq_edited |= ImGui::DragFloat(
+                "FOV Amp##ShFov", &sh.params.amplitude_fov_degrees, 0.1F, 0.0F, 30.0F);
+            seq_edited |= ImGui::DragFloat("Frequency##ShFreq", &sh.params.frequency_hz, 0.5F, 0.5F, 60.0F);
+            if (ImGui::SmallButton("Delete Shake##DelSh")) {
+                seq.camera_shakes.erase(seq.camera_shakes.begin() + static_cast<std::ptrdiff_t>(st.selected_track_index));
+                st.selection_kind = SK::none;
+                seq_edited = true;
+            }
+        } else if (st.selection_kind == SK::property_track &&
+                   st.selected_track_index < seq.property_tracks.size()) {
+            SequencerPropertyTrack& tr = seq.property_tracks[st.selected_track_index];
+            ImGui::Text("Property Track #%zu", st.selected_track_index);
+            draw_node_uuid_binder("PTNode", "Target Node", tr.target_node_uuid, scene, selected_node_, seq_edited);
+            draw_node_uuid_binder("PTSpline", "Ref Spline", tr.reference_spline_uuid, scene, selected_node_, seq_edited);
+            if (ImGui::BeginCombo("Property##PTProp", to_token(tr.property).data())) {
+                for (std::uint8_t pi = 0U; pi <= 23U; ++pi) {
+                    const auto tgt = static_cast<SequencerPropertyTarget>(pi);
+                    if (ImGui::Selectable(to_token(tgt).data(), tr.property == tgt)) {
+                        tr.property = tgt;
+                        seq_edited = true;
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            seq_edited |= ImGui::Checkbox("Muted##PTMute", &tr.muted);
+            if (ImGui::SmallButton("Delete Track##DelPT")) {
+                seq.property_tracks.erase(seq.property_tracks.begin() + static_cast<std::ptrdiff_t>(st.selected_track_index));
+                st.selection_kind = SK::none;
+                seq_edited = true;
+            }
+        } else if (st.selection_kind == SK::animation_clip &&
+                   st.selected_track_index < seq.animation_clips.size()) {
+            SequencerAnimationClip& ac = seq.animation_clips[st.selected_track_index];
+            ImGui::Text("Animation Clip #%zu", st.selected_track_index);
+            draw_node_uuid_binder("ACNode", "Target Node", ac.target_node_uuid, scene, selected_node_, seq_edited);
+            std::array<char, 96U> ac_buf{};
+            std::memcpy(ac_buf.data(), ac.clip_name.data(), std::min(ac.clip_name.size(), ac_buf.size() - 1U));
+            if (ImGui::InputText("Clip Name##ACName", ac_buf.data(), ac_buf.size())) {
+                ac.clip_name = ac_buf.data();
+                seq_edited = true;
+            }
+            seq_edited |= ImGui::DragFloat("Start##ACStart", &ac.start_time, 0.05F, 0.0F, duration);
+            seq_edited |= ImGui::DragFloat("End##ACEnd", &ac.end_time, 0.05F, 0.05F, duration);
+            seq_edited |= ImGui::DragFloat("Speed##ACSpd", &ac.playback_speed, 0.05F, 0.0F, 10.0F);
+            seq_edited |= ImGui::Checkbox("Loop##ACLoop", &ac.looping);
+            if (ImGui::SmallButton("Delete Anim##DelAC")) {
+                seq.animation_clips.erase(seq.animation_clips.begin() + static_cast<std::ptrdiff_t>(st.selected_track_index));
+                st.selection_kind = SK::none;
+                seq_edited = true;
+            }
+        } else if (st.selection_kind == SK::audio_clip &&
+                   st.selected_track_index < seq.audio_clips.size()) {
+            SequencerAudioClip& au = seq.audio_clips[st.selected_track_index];
+            ImGui::Text("Audio Clip #%zu", st.selected_track_index);
+            std::array<char, 160U> au_buf{};
+            std::memcpy(au_buf.data(), au.audio_asset_path.data(), std::min(au.audio_asset_path.size(), au_buf.size() - 1U));
+            if (ImGui::InputText("Asset##AuPath", au_buf.data(), au_buf.size())) {
+                au.audio_asset_path = au_buf.data();
+                seq_edited = true;
+            }
+            draw_node_uuid_binder("AuNode", "Spatial Node", au.spatial_node_uuid, scene, selected_node_, seq_edited);
+            seq_edited |= ImGui::DragFloat("Start##AuStart", &au.start_time, 0.05F, 0.0F, duration);
+            seq_edited |= ImGui::DragFloat("Volume##AuVol", &au.volume, 0.02F, 0.0F, 2.0F);
+            seq_edited |= ImGui::Checkbox("Stop on End##AuStop", &au.stop_on_cutscene_end);
+            if (ImGui::SmallButton("Delete Audio##DelAu")) {
+                seq.audio_clips.erase(seq.audio_clips.begin() + static_cast<std::ptrdiff_t>(st.selected_track_index));
+                st.selection_kind = SK::none;
+                seq_edited = true;
+            }
+        } else if (st.selection_kind == SK::subtitle &&
+                   st.selected_track_index < seq.subtitles.size()) {
+            SequencerSubtitleClip& sub = seq.subtitles[st.selected_track_index];
+            ImGui::Text("Subtitle #%zu", st.selected_track_index);
+            std::array<char, 96U> sp_buf{};
+            std::array<char, 256U> tx_buf{};
+            std::memcpy(sp_buf.data(), sub.speaker_key.data(), std::min(sub.speaker_key.size(), sp_buf.size() - 1U));
+            std::memcpy(tx_buf.data(), sub.text_key.data(), std::min(sub.text_key.size(), tx_buf.size() - 1U));
+            if (ImGui::InputText("Speaker##SubSp", sp_buf.data(), sp_buf.size())) {
+                sub.speaker_key = sp_buf.data();
+                seq_edited = true;
+            }
+            if (ImGui::InputText("Text##SubTx", tx_buf.data(), tx_buf.size())) {
+                sub.text_key = tx_buf.data();
+                seq_edited = true;
+            }
+            seq_edited |= ImGui::DragFloat("Start##SubStart", &sub.start_time, 0.05F, 0.0F, duration);
+            seq_edited |= ImGui::DragFloat("End##SubEnd", &sub.end_time, 0.05F, 0.05F, duration);
+            if (ImGui::SmallButton("Delete Sub##DelSub")) {
+                seq.subtitles.erase(seq.subtitles.begin() + static_cast<std::ptrdiff_t>(st.selected_track_index));
+                st.selection_kind = SK::none;
+                seq_edited = true;
+            }
+        } else if (st.selection_kind == SK::event_key &&
+                   st.selected_track_index < seq.event_keys.size()) {
+            SequencerEventKey& ev = seq.event_keys[st.selected_track_index];
+            ImGui::Text("Event Key #%zu", st.selected_track_index);
+            std::array<char, 96U> ev_name{};
+            std::array<char, 160U> ev_pay{};
+            std::memcpy(ev_name.data(), ev.event_name.data(), std::min(ev.event_name.size(), ev_name.size() - 1U));
+            std::memcpy(ev_pay.data(), ev.payload.data(), std::min(ev.payload.size(), ev_pay.size() - 1U));
+            if (ImGui::InputText("Name##EvName", ev_name.data(), ev_name.size())) {
+                ev.event_name = ev_name.data();
+                seq_edited = true;
+            }
+            if (ImGui::InputText("Payload##EvPay", ev_pay.data(), ev_pay.size())) {
+                ev.payload = ev_pay.data();
+                seq_edited = true;
+            }
+            draw_node_uuid_binder("EvNode", "Target Node", ev.target_node_uuid, scene, selected_node_, seq_edited);
+            seq_edited |= ImGui::DragFloat("Time##EvTime", &ev.time, 0.05F, 0.0F, duration);
+            if (ImGui::SmallButton("Delete Event##DelEv")) {
+                seq.event_keys.erase(seq.event_keys.begin() + static_cast<std::ptrdiff_t>(st.selected_track_index));
+                st.selection_kind = SK::none;
+                seq_edited = true;
+            }
+        } else {
+            ImGui::TextDisabled("Select a track/clip on the timeline.");
+        }
+
+        // Keyframe controls for curve-backed tracks
+        float dummy_def = 0.0F;
+        if (std::vector<SequencerKeyframe>* const curve =
+                resolve_active_curve(st, dummy_def);
+            curve != nullptr) {
+            ImGui::Separator();
+            ImGui::Text("Keyframes (%zu)", curve->size());
+            if (ImGui::SmallButton("+ Key @ Playhead") &&
+                curve->size() < maximum_cutscene_keys_per_track) {
+                const float v =
+                    evaluate_sequencer_curve(*curve, st.playhead_seconds, dummy_def);
+                curve->push_back(SequencerKeyframe{
+                    .time = st.playhead_seconds,
+                    .value = v,
+                });
+                sort_and_sanitize_keyframes(*curve, duration);
+                seq_edited = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Auto Tangents")) {
+                auto_compute_curve_tangents(*curve);
+                seq_edited = true;
+            }
+            if (!curve->empty()) {
+                st.selected_key_index =
+                    std::min(st.selected_key_index, curve->size() - 1U);
+                int k_idx = static_cast<int>(st.selected_key_index);
+                if (ImGui::SliderInt(
+                        "Key Index##KeyIdx",
+                        &k_idx,
+                        0,
+                        static_cast<int>(curve->size() - 1U))) {
+                    st.selected_key_index = static_cast<std::size_t>(k_idx);
+                }
+                SequencerKeyframe& kf = (*curve)[st.selected_key_index];
+                bool key_time_edited = false;
+                key_time_edited |= ImGui::DragFloat(
+                    "Key Time##KeyT", &kf.time, 0.02F, 0.0F, duration);
+                seq_edited |= ImGui::DragFloat(
+                    "Key Value##KeyV", &kf.value, 0.05F);
+                if (ImGui::BeginCombo("Interp##KeyInterp", to_token(kf.interp).data())) {
+                    for (const CurveInterpMode m : {
+                             CurveInterpMode::constant,
+                             CurveInterpMode::linear,
+                             CurveInterpMode::cubic_hermite,
+                             CurveInterpMode::cubic_bezier}) {
+                        if (ImGui::Selectable(to_token(m).data(), kf.interp == m)) {
+                            kf.interp = m;
+                            seq_edited = true;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                if (kf.interp == CurveInterpMode::cubic_hermite ||
+                    kf.interp == CurveInterpMode::cubic_bezier) {
+                    seq_edited |= ImGui::DragFloat2(
+                        "Tangents##KeyTan", &kf.in_tangent, 0.05F);
+                }
+                if (kf.interp == CurveInterpMode::cubic_bezier) {
+                    seq_edited |= ImGui::DragFloat2(
+                        "Weights##KeyWgt", &kf.in_weight, 0.01F, 0.01F, 0.99F);
+                }
+                if (key_time_edited) {
+                    sort_and_sanitize_keyframes(*curve, duration);
+                    seq_edited = true;
+                }
+                if (ImGui::SmallButton("Delete Key##DelKey")) {
+                    curve->erase(
+                        curve->begin() +
+                        static_cast<std::ptrdiff_t>(st.selected_key_index));
+                    st.selected_key_index = 0U;
+                    seq_edited = true;
+                }
+            }
+        }
+    }
+    ImGui::EndChild();
+
+    if (seq_edited) {
+        st.dirty = true;
+        st.needs_preview_eval = st.preview_active;
+    }
+
+    ImGui::End();
+}
+
 void EditorUi::build_performance(
     SceneDocument& scene,
     Renderer& renderer,
@@ -8366,7 +10493,10 @@ void EditorUi::build_performance(
             "Darken seconds", &exposure.darken_seconds, 0.01F, 0.01F, 60.0F,
             "%.2f", ImGuiSliderFlags_AlwaysClamp);
     }
-    if (exposure_changed) static_cast<void>(renderer.set_exposure_settings(exposure));
+    if (exposure_changed && renderer.set_exposure_settings(exposure)) {
+        scene.exposure = exposure;
+        scene.mark_content_changed();
+    }
     ImGui::TextDisabled(
         "Actual %s, %.3fx, target %.3fx, luminance %.4f",
         to_token(renderer.exposure_mode_actual()).data(),
@@ -8473,6 +10603,8 @@ void EditorUi::build_performance(
         lighting.day_seconds = day;
         lighting_changed = true;
     }
+    lighting_changed |=
+        ImGui::SliderFloat("Sky light intensity", &lighting.sky_intensity, 0, 8, "%.2f");
     ImGui::BeginDisabled(!renderer.gi_provisioned() || !lighting.dynamic);
     if (ImGui::Checkbox("Voxel indirect lighting", &lighting.voxel_gi)) {
         lighting_changed = true;
@@ -8592,10 +10724,14 @@ void EditorUi::build_performance(
     ImGui::End();
 }
 
-void EditorUi::process_file_commands(SceneDocument& scene) {
+void EditorUi::process_file_commands(
+    SceneDocument& scene,
+    Renderer& renderer,
+    FlyCamera& camera) {
     if (save_requested_) {
         save_requested_ = false;
         if (play_state_ == EditorPlayState::edit) {
+            stop_sequencer_preview(scene, &renderer, &camera);
             save_scene(scene);
         }
     }
@@ -8605,6 +10741,7 @@ void EditorUi::process_file_commands(SceneDocument& scene) {
             if (scene_is_dirty(scene)) {
                 open_confirmation_requested_ = true;
             } else {
+                stop_sequencer_preview(scene, &renderer, &camera);
                 if (!pending_open_scene_path_.empty()) {
                     scene_path_ = std::exchange(pending_open_scene_path_, {});
                     scene_file_name_ = scene_path_.filename().string();
@@ -8619,6 +10756,8 @@ void EditorUi::process_file_commands(SceneDocument& scene) {
         quit_requested_ = false;
         if (play_state_ != EditorPlayState::edit) {
             stop_play(scene);
+        } else {
+            stop_sequencer_preview(scene, &renderer, &camera);
         }
         const bool material_dirty =
             material_editor_ != nullptr &&
@@ -8650,6 +10789,7 @@ void EditorUi::process_file_commands(SceneDocument& scene) {
                 ? "(scene path unavailable)"
                 : target_scene_path.string().c_str());
         if (ImGui::Button("Discard and open")) {
+            stop_sequencer_preview(scene, &renderer, &camera);
             if (!pending_open_scene_path_.empty()) {
                 scene_path_ = std::exchange(pending_open_scene_path_, {});
                 scene_file_name_ = scene_path_.filename().string();
@@ -8724,6 +10864,7 @@ void EditorUi::save_scene(SceneDocument& scene) {
 }
 
 void EditorUi::open_scene(SceneDocument& scene) {
+    stop_sequencer_preview(scene);
     if (scene_path_.empty()) {
         scene_file_status_ =
             "Open failed: scene path is unavailable.";
@@ -8762,10 +10903,16 @@ void EditorUi::open_scene(SceneDocument& scene) {
 
 bool EditorUi::scene_is_dirty(
     const SceneDocument& scene) const noexcept {
-    return saved_content_revision_ != 0U &&
-        (scene.content_revision() != saved_content_revision_ ||
-         scene.structure_revision() !=
-             saved_structure_revision_);
+    if (saved_content_revision_ == 0U) {
+        return false;
+    }
+    const SceneDocument& author_scene =
+        (sequencer_ui_ != nullptr && sequencer_ui_->baseline_scene.has_value())
+            ? *sequencer_ui_->baseline_scene
+            : scene;
+    return author_scene.content_revision() != saved_content_revision_ ||
+        author_scene.structure_revision() !=
+            saved_structure_revision_;
 }
 
 void EditorUi::push_undo_snapshot(SceneDocument snapshot) {
@@ -8781,6 +10928,7 @@ void EditorUi::checkpoint_scene(const SceneDocument& scene) {
 }
 
 bool EditorUi::undo_scene(SceneDocument& scene) {
+    stop_sequencer_preview(scene);
     if (play_state_ != EditorPlayState::edit || undo_history_.empty()) {
         return false;
     }
@@ -8800,6 +10948,7 @@ bool EditorUi::undo_scene(SceneDocument& scene) {
 }
 
 bool EditorUi::redo_scene(SceneDocument& scene) {
+    stop_sequencer_preview(scene);
     if (play_state_ != EditorPlayState::edit || redo_history_.empty()) {
         return false;
     }
@@ -8821,6 +10970,7 @@ bool EditorUi::redo_scene(SceneDocument& scene) {
 bool EditorUi::save_scene_external(
     SceneDocument& scene,
     std::string& error) {
+    stop_sequencer_preview(scene);
     error.clear();
     if (play_state_ != EditorPlayState::edit) {
         error = "Scene save is available only in Edit mode.";
@@ -8884,6 +11034,12 @@ std::string_view EditorUi::asset_import_status() const noexcept {
 
 void EditorUi::apply_deferred_scene_commands(
     SceneDocument& scene) {
+    if (play_state_ == EditorPlayState::edit &&
+        (scene.valid(pending_duplicate_) ||
+         (pending_reparent_child_ && pending_reparent_parent_) ||
+         pending_delete_)) {
+        stop_sequencer_preview(scene);
+    }
     if (play_state_ == EditorPlayState::edit &&
         scene.valid(pending_duplicate_)) {
         static_cast<void>(select_node(scene, pending_duplicate_));
@@ -9108,14 +11264,29 @@ GameplayFrameInput EditorUi::gameplay_input(
     const glm::vec2 mouse_px = play_mouse_pos_px_;
     const bool left_down = play_mouse_left_down_;
     const bool left_pressed = std::exchange(play_mouse_left_pressed_, false);
+    const bool cutscene_active =
+        gameplay_session_ != nullptr &&
+        gameplay_session_->active() &&
+        gameplay_session_->cutscene_player().active();
+    const bool cutscene_captures =
+        cutscene_active &&
+        gameplay_session_->cutscene_player().captures_input();
     if (input_actions_ != nullptr) {
-        if (ui_wants_cursor && input_actions_->context() != InputContext::ui) {
-            input_actions_->set_context(InputContext::ui);
-        } else if (!ui_wants_cursor && input_actions_->context() == InputContext::ui) {
+        if (ui_wants_cursor) {
+            if (input_actions_->context() != InputContext::ui) {
+                input_actions_->set_context(InputContext::ui);
+            }
+        } else if (cutscene_captures) {
+            if (input_actions_->context() != InputContext::cutscene) {
+                input_actions_->set_context(InputContext::cutscene);
+            }
+        } else if (input_actions_->context() == InputContext::ui ||
+                   input_actions_->context() == InputContext::cutscene) {
             input_actions_->set_context(InputContext::gameplay);
         }
         input_actions_->begin_frame(delta_seconds);
-        if (!ui_handles_esc && input_actions_->action_pressed(InputAction::pause)) {
+        if (!ui_handles_esc && !cutscene_active &&
+            input_actions_->action_pressed(InputAction::pause)) {
             set_game_mouse_capture(nullptr);
             play_state_ = EditorPlayState::paused;
             return {};
@@ -9174,6 +11345,7 @@ GameplayFrameInput EditorUi::gameplay_input(
 }
 
 void EditorUi::start_play(SceneDocument& scene) {
+    stop_sequencer_preview(scene);
     if (play_state_ != EditorPlayState::edit) {
         return;
     }

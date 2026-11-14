@@ -122,6 +122,7 @@ PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,
             texture(material.normal_texture);
             texture(material.metallic_roughness_texture);
             texture(material.displacement_texture);
+            texture(material.emissive_texture);
         }
         result.submesh_rt_alpha_paths.resize(model.submeshes.size());
         result.submesh_rt_triangles.resize(model.submeshes.size());

@@ -1687,6 +1687,15 @@ import_materials(
             (gltf_transmissive && pbr.base_color.w >= 0.999F)
                 ? std::clamp(1.0F - transmission_factor, 0.08F, 0.95F)
                 : pbr.base_color.w;
+        aiColor3D emissive_color(0.0F, 0.0F, 0.0F);
+        static_cast<void>(material_observer->Get(AI_MATKEY_COLOR_EMISSIVE, emissive_color));
+        float emissive_strength = 1.0F;
+        static_cast<void>(material_observer->Get(AI_MATKEY_EMISSIVE_INTENSITY, emissive_strength));
+        if (!std::isfinite(emissive_strength) || emissive_strength < 0.0F) emissive_strength = 0.0F;
+        const auto emission_channel = [emissive_strength](const float value) noexcept {
+            const double scaled = static_cast<double>(value) * emissive_strength;
+            return std::isfinite(scaled) ? std::clamp(scaled, 0.0, 65504.0) : 0.0;
+        };
         Json metadata{
             {"schema", asset_schema},
             {"version", asset_schema_version},
@@ -1709,6 +1718,8 @@ import_materials(
                  {"model", to_token(pbr.model)},
                  {"subsurface_profile", to_token(pbr.subsurface_profile)},
                  {"subsurface_strength", pbr.subsurface_strength},
+                 {"emissive", {emission_channel(emissive_color.r),
+                     emission_channel(emissive_color.g), emission_channel(emissive_color.b)}},
              }},
             {"textures", std::move(texture_references)},
         };

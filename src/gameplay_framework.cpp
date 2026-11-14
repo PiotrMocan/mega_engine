@@ -1,5 +1,8 @@
 #include "gameplay_framework.hpp"
 
+#include "cinematic_camera.hpp"
+#include "cutscene_sequencer.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <glm/gtc/matrix_access.hpp>
@@ -555,6 +558,196 @@ void behavior_dialogue_interact(GameplayBehaviorContext& ctx) {
         e.node_id.index,
         e.tag.empty() ? "-" : e.tag.c_str());
     ctx.world.push_event_log(msg.data());
+}
+
+void trigger_cutscene_entity(
+    GameplayBehaviorContext& ctx,
+    const bool from_interact) {
+    GameplayEntityState& e = ctx.entity;
+    if (!e.enabled || e.destroyed) {
+        return;
+    }
+    // custom_param_1 <= 0.5 => one-shot; > 0.5 => repeatable on re-enter/interact.
+    if (e.custom_param_1 <= 0.5F && e.collected) {
+        return;
+    }
+    // custom_param_0: < 0.5 trigger/proximity, [0.5, 1.5] both, >= 1.5 interact-only.
+    if (e.custom_param_0 >= 1.5F && !from_interact) {
+        return;
+    }
+    if (e.custom_param_0 < 0.5F && from_interact) {
+        return;
+    }
+    if (e.tag.empty()) {
+        return;
+    }
+
+    e.toggled = true;
+    e.open_alpha = 1.0F;
+    if (e.custom_param_1 <= 0.5F) {
+        e.collected = true;
+    }
+    ctx.world.play_entity_cue(e, ctx.audio_engine);
+    ctx.world.request_cutscene(e.tag);
+    ctx.world.set_variable("cutscene.requested", 1.0F);
+    ctx.world.set_variable(
+        "cutscene.trigger_node_index", static_cast<float>(e.node_id.index));
+
+    std::array<char, 160U> msg{};
+    std::snprintf(
+        msg.data(),
+        msg.size(),
+        "cutscene_trigger node#%u -> %s",
+        e.node_id.index,
+        e.tag.c_str());
+    ctx.world.push_event_log(msg.data());
+}
+
+void behavior_cutscene_trigger_enter(GameplayBehaviorContext& ctx) {
+    trigger_cutscene_entity(ctx, false);
+}
+
+void behavior_cutscene_trigger_interact(GameplayBehaviorContext& ctx) {
+    trigger_cutscene_entity(ctx, true);
+}
+
+void behavior_cutscene_trigger_update(GameplayBehaviorContext& ctx) {
+    GameplayEntityState& e = ctx.entity;
+    if (!e.enabled || e.destroyed || e.custom_param_0 >= 1.5F) {
+        return;
+    }
+    if (e.custom_param_1 <= 0.5F && e.collected) {
+        return;
+    }
+    const float radius = e.interaction_radius;
+    if (!std::isfinite(radius) || radius <= 0.05F) {
+        return;
+    }
+    const glm::vec3 diff = ctx.world.player_position() - e.runtime_position;
+    const bool inside = glm::dot(diff, diff) <= (radius * radius);
+    if (!inside) {
+        e.open_alpha = 0.0F;
+        return;
+    }
+    if (e.open_alpha >= 0.5F) {
+        return;
+    }
+    trigger_cutscene_entity(ctx, false);
+}
+
+[[nodiscard]] glm::mat4 compute_spline_world_matrix_no_alloc(
+    const SceneDocument& scene,
+    const SceneNodeId id) noexcept {
+    std::array<SceneNodeId, 64U> chain{};
+    std::size_t depth = 0U;
+    SceneNodeId cur = id;
+    while (cur && depth < chain.size()) {
+        chain[depth++] = cur;
+        cur = scene.parent(cur);
+    }
+    glm::mat4 world{1.0F};
+    while (depth > 0U) {
+        if (const auto n = scene.node(chain[--depth])) {
+            world *= scene_local_transform_matrix(n->get().transform);
+        }
+    }
+    return world;
+}
+
+void apply_spline_mover_step(
+    GameplayBehaviorContext& ctx,
+    const float step_dt) noexcept {
+    GameplayEntityState& e = ctx.entity;
+    const SceneNodeId spline_node = e.target_node_uuid
+        ? ctx.scene.find_by_uuid(e.target_node_uuid)
+        : e.node_id;
+    if (!spline_node) {
+        return;
+    }
+    const auto sp_opt = ctx.scene.spline(spline_node);
+    if (!sp_opt) {
+        return;
+    }
+    const SplineComponent& spline = sp_opt->get();
+    const glm::mat4 sp_world = compute_spline_world_matrix_no_alloc(
+        ctx.scene, spline_node);
+    const SplineArcLengthTable arc = build_spline_arc_table(spline, sp_world);
+    if (!std::isfinite(arc.total_length) || arc.total_length <= 1.0e-5F) {
+        return;
+    }
+
+    float curr_dist = std::clamp(
+        std::isfinite(e.patrol_alpha) ? e.patrol_alpha : 0.0F,
+        0.0F,
+        1.0F) * arc.total_length;
+
+    if (step_dt > 0.0F && std::isfinite(e.move_speed) && e.move_speed > 0.0F) {
+        const float u_prev = map_distance_to_spline_u(
+            arc, curr_dist, spline.closed_loop);
+        const SplineSample prev_sample = evaluate_spline(spline, sp_world, u_prev);
+        const float dist_delta =
+            e.move_speed * std::max(0.05F, prev_sample.speed_scale) * step_dt;
+
+        if (spline.closed_loop) {
+            curr_dist = std::fmod(curr_dist + dist_delta, arc.total_length);
+            if (curr_dist < 0.0F) {
+                curr_dist += arc.total_length;
+            }
+            e.patrol_alpha = std::clamp(curr_dist / arc.total_length, 0.0F, 1.0F);
+        } else if (e.custom_param_0 > 1.5F) {
+            curr_dist = std::min(arc.total_length, curr_dist + dist_delta);
+            e.patrol_alpha = std::clamp(curr_dist / arc.total_length, 0.0F, 1.0F);
+        } else if (e.custom_param_0 > 0.5F) {
+            curr_dist = std::fmod(curr_dist + dist_delta, arc.total_length);
+            e.patrol_alpha = std::clamp(curr_dist / arc.total_length, 0.0F, 1.0F);
+        } else {
+            if (e.patrol_forward) {
+                curr_dist += dist_delta;
+                if (curr_dist >= arc.total_length) {
+                    curr_dist = std::max(0.0F, 2.0F * arc.total_length - curr_dist);
+                    e.patrol_forward = false;
+                }
+            } else {
+                curr_dist -= dist_delta;
+                if (curr_dist <= 0.0F) {
+                    curr_dist = std::min(arc.total_length, -curr_dist);
+                    e.patrol_forward = true;
+                }
+            }
+            e.patrol_alpha = std::clamp(curr_dist / arc.total_length, 0.0F, 1.0F);
+        }
+    }
+
+    const float eval_dist = std::clamp(e.patrol_alpha, 0.0F, 1.0F) * arc.total_length;
+    const float u = map_distance_to_spline_u(arc, eval_dist, spline.closed_loop);
+    const SplineSample s = evaluate_spline(spline, sp_world, u);
+    e.runtime_position = s.position;
+    if (e.custom_param_1 <= 0.5F) {
+        const float fl = glm::length(s.tangent);
+        const float ul = glm::length(s.up);
+        if (fl > 1.0e-5F && ul > 1.0e-5F) {
+            const glm::vec3 nf = s.tangent / fl;
+            const glm::vec3 nu = s.up / ul;
+            const glm::vec3 raw_r = glm::cross(nf, nu);
+            const float rl = glm::length(raw_r);
+            if (rl > 1.0e-5F) {
+                const glm::vec3 r = raw_r / rl;
+                const glm::vec3 ortho_u = glm::normalize(glm::cross(r, nf));
+                const glm::mat3 basis(r, ortho_u, -nf);
+                const glm::quat q = glm::normalize(glm::quat_cast(basis));
+                e.runtime_rotation_degrees = glm::degrees(glm::eulerAngles(q));
+            }
+        }
+    }
+    e.transform_dirty = true;
+}
+
+void behavior_spline_mover_start(GameplayBehaviorContext& ctx) {
+    apply_spline_mover_step(ctx, 0.0F);
+}
+
+void behavior_spline_mover_fixed_update(GameplayBehaviorContext& ctx) {
+    apply_spline_mover_step(ctx, ctx.delta_seconds);
 }
 
 void behavior_trigger_zone_enter(GameplayBehaviorContext& ctx) {
@@ -1613,6 +1806,19 @@ void GameplayBehaviorRegistry::register_default_behaviors() {
         GameplayBehaviorCallbacks{
             .on_interact = &behavior_dialogue_interact,
         });
+    register_behavior(
+        "cutscene_trigger",
+        GameplayBehaviorCallbacks{
+            .on_update = &behavior_cutscene_trigger_update,
+            .on_trigger_enter = &behavior_cutscene_trigger_enter,
+            .on_interact = &behavior_cutscene_trigger_interact,
+        });
+    register_behavior(
+        "spline_mover",
+        GameplayBehaviorCallbacks{
+            .on_start = &behavior_spline_mover_start,
+            .on_fixed_update = &behavior_spline_mover_fixed_update,
+        });
 }
 
 bool GameplayBehaviorRegistry::register_behavior(
@@ -1658,6 +1864,7 @@ void GameplayWorld::clear() noexcept {
     fixed_accumulator_ = 0.0F;
     fixed_step_count_ = 0U;
     interact_was_down_ = false;
+    pending_cutscene_request_.clear();
     event_head_ = 0U;
     event_count_ = 0U;
 }
@@ -1988,6 +2195,68 @@ void GameplayWorld::add_variable(const std::string_view name, const float delta)
         return;
     }
     set_variable(name, get_variable(name) + delta);
+}
+
+void GameplayWorld::request_cutscene(const std::string_view cutscene_id_or_path) {
+    if (cutscene_id_or_path.empty() || cutscene_id_or_path.size() > 256U) {
+        return;
+    }
+    pending_cutscene_request_.assign(cutscene_id_or_path);
+}
+
+bool GameplayWorld::consume_cutscene_request(
+    std::string& out_cutscene_id_or_path) {
+    if (pending_cutscene_request_.empty()) {
+        return false;
+    }
+    out_cutscene_id_or_path.assign(pending_cutscene_request_);
+    pending_cutscene_request_.clear();
+    return true;
+}
+
+bool GameplayWorld::trigger_entity_event(
+    const SceneUuid target_uuid,
+    const bool is_interact,
+    const SceneDocument& scene,
+    const CollisionWorld* const collision_world,
+    const PhysicsWorld* const physics_world,
+    AnimatorRuntimeSystem* const animators,
+    AudioEngine* const audio_engine) {
+    GameplayEntityState* entity = find_entity_by_uuid(target_uuid);
+    if (entity == nullptr || !entity->enabled || entity->destroyed) {
+        return false;
+    }
+    GameplayBehaviorContext ctx{
+        .world = *this,
+        .entity = *entity,
+        .scene = scene,
+        .collision_world = collision_world,
+        .physics_world = physics_world,
+        .animators = animators,
+        .audio_engine = audio_engine,
+        .delta_seconds = 0.0F,
+    };
+    if (const GameplayBehaviorCallbacks* cb = behaviors_.find(entity->behavior)) {
+        if (is_interact && cb->on_interact != nullptr) {
+            cb->on_interact(ctx);
+            return true;
+        }
+        if (!is_interact && cb->on_trigger_enter != nullptr) {
+            cb->on_trigger_enter(ctx);
+            return true;
+        }
+        if (cb->on_interact != nullptr) {
+            cb->on_interact(ctx);
+            return true;
+        }
+        if (cb->on_trigger_enter != nullptr) {
+            cb->on_trigger_enter(ctx);
+            return true;
+        }
+    }
+    entity->toggled = !entity->toggled;
+    play_entity_cue(*entity, audio_engine);
+    return true;
 }
 
 void GameplayWorld::set_player_health(const float value) noexcept {

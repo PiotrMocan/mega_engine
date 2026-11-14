@@ -54,6 +54,11 @@ layout(set = 1, binding = 0) uniform sampler2D materialBaseColorTexture;
 layout(set = 1, binding = 1) uniform sampler2D materialNormalTexture;
 // Linear glTF data: G roughness, B metallic; white preserves scalar factors.
 layout(set = 1, binding = 2) uniform sampler2D materialMetallicRoughnessTexture;
+layout(set = 1, binding = 4) uniform sampler2D materialEmissiveTexture;
+layout(set = 1, binding = 5, std140) uniform MaterialEmission
+{
+    vec4 emissiveFactor;
+} materialEmission;
 
 vec3 safeNormalize(vec3 value, vec3 fallback)
 {
@@ -153,6 +158,12 @@ void main()
     applySurfaceWorkloadModulation(
         inInstanceIndex, shadedColor, lightingComponents);
 
+    vec3 emittedRadiance = vec3(0.0);
+    if (any(greaterThan(materialEmission.emissiveFactor.rgb, vec3(0.0)))) {
+        emittedRadiance = textureGrad(materialEmissiveTexture, inUv, uvDx, uvDy).rgb
+            * materialEmission.emissiveFactor.rgb;
+    }
+
 #ifdef VCR_TRANSPARENT_PASS
     const float lodPresence = lodKeep(inLodToken, uvec2(gl_FragCoord.xy)) ? 1.0 : 0.0;
     const float rawOpacity = clamp(baseColor.a, 0.0, 1.0);
@@ -162,7 +173,7 @@ void main()
     vec3 premulRgb = vec3(0.0);
     if (inMaterialModel == 1u) {
         effectiveAlpha = rawOpacity * (backFaceTwoSided ? 0.5 : 1.0) * lodPresence;
-        premulRgb = min(clampedBaseColor * effectiveAlpha, vec3(65504.0));
+        premulRgb = min((clampedBaseColor + emittedRadiance) * effectiveAlpha, vec3(65504.0));
     } else {
         const vec3 viewDir = safeNormalize(
             frame.cameraPosition.xyz - inWorldPosition,
@@ -183,7 +194,8 @@ void main()
             bodyOpacity + (1.0 - bodyOpacity) * max(fresnelStrength, dielectricGlassFactor) * specWeight,
             0.0, 1.0) * lodPresence;
         premulRgb = min(
-            (lightingComponents.diffuse * bodyOpacity + lightingComponents.specular * specWeight)
+            (lightingComponents.diffuse * bodyOpacity + lightingComponents.specular * specWeight
+                + emittedRadiance * bodyOpacity)
                 * lodPresence,
             vec3(65504.0));
     }
@@ -195,7 +207,8 @@ void main()
 #endif
 #else
     writeLitSurface(
-        lightingComponents.diffuse, lightingComponents.specular, shadedColor,
+        lightingComponents.diffuse, lightingComponents.specular + emittedRadiance,
+        shadedColor + emittedRadiance,
         baseColor.a, inMaterialModel, inSubsurfaceProfile,
         inSubsurfaceStrength);
 #endif

@@ -96,10 +96,13 @@ struct LightingSettings {
     ShadowDepthFormat shadow_depth = ShadowDepthFormat::automatic;
     // Optional hardware ray-query path (VK_KHR_ray_query); off preserves raster baseline.
     RayTracingMode ray_tracing = RayTracingMode::off;
+    // Multiplier for sky illumination; the visible sky remains unchanged.
+    float sky_intensity = 1.0F;
 };
 [[nodiscard]] inline bool valid_lighting_settings(const LightingSettings &s) noexcept {
     return (!s.voxel_gi || s.dynamic) &&
            (s.ray_tracing == RayTracingMode::off || s.dynamic) &&
+           std::isfinite(s.sky_intensity) && s.sky_intensity >= 0 && s.sky_intensity <= 64 &&
            std::isfinite(s.hour) && std::isfinite(s.day_seconds) &&
            s.day_seconds >= 1 && s.day_seconds <= 864000 && std::isfinite(s.gi_extent) &&
            s.gi_extent >= 16 && s.gi_extent <= 256 && std::isfinite(s.gi_strength) &&

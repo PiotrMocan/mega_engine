@@ -1276,4 +1276,131 @@ static_assert(std::is_trivially_copyable_v<UiMarkerComponent>);
     return marker;
 }
 
+inline constexpr std::uint32_t max_spline_control_points = 16U;
+
+enum class SplineBasis : std::uint8_t {
+    linear = 0U,
+    catmull_rom = 1U,
+    cubic_hermite = 2U,
+};
+
+[[nodiscard]] constexpr std::string_view to_token(
+    const SplineBasis basis) noexcept {
+    switch (basis) {
+    case SplineBasis::linear: return "linear";
+    case SplineBasis::catmull_rom: return "catmull_rom";
+    case SplineBasis::cubic_hermite: return "cubic_hermite";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] constexpr std::optional<SplineBasis> parse_spline_basis(
+    const std::string_view token) noexcept {
+    if (token == "linear") return SplineBasis::linear;
+    if (token == "catmull_rom") return SplineBasis::catmull_rom;
+    if (token == "cubic_hermite") return SplineBasis::cubic_hermite;
+    return std::nullopt;
+}
+
+struct SplineControlPoint {
+    glm::vec3 position{0.0F};
+    glm::vec3 tangent_in{0.0F, 0.0F, -1.0F};
+    glm::vec3 tangent_out{0.0F, 0.0F, 1.0F};
+    float roll_degrees = 0.0F;
+    float speed_scale = 1.0F;
+
+    friend bool operator==(
+        const SplineControlPoint&,
+        const SplineControlPoint&) = default;
+};
+
+static_assert(std::is_trivially_copyable_v<SplineControlPoint>);
+
+struct SplineComponent {
+    std::array<SplineControlPoint, max_spline_control_points> points{
+        SplineControlPoint{.position = {0.0F, 0.0F, 0.0F}},
+        SplineControlPoint{.position = {0.0F, 0.0F, 6.0F}},
+    };
+    std::uint32_t point_count = 2U;
+    SplineBasis basis = SplineBasis::catmull_rom;
+    bool closed_loop = false;
+    float tension = 0.5F;
+
+    friend bool operator==(
+        const SplineComponent&,
+        const SplineComponent&) = default;
+};
+
+static_assert(std::is_trivially_copyable_v<SplineComponent>);
+
+[[nodiscard]] inline bool valid_spline_component(
+    const SplineComponent& spline) noexcept {
+    if (to_token(spline.basis) == "unknown" ||
+        spline.point_count < 2U ||
+        spline.point_count > max_spline_control_points ||
+        !std::isfinite(spline.tension) ||
+        spline.tension < 0.0F ||
+        spline.tension > 1.0F) {
+        return false;
+    }
+    const auto finite_bounded_vec3 = [](const glm::vec3& v) noexcept {
+        return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z) &&
+               std::abs(v.x) <= 100'000.0F &&
+               std::abs(v.y) <= 100'000.0F &&
+               std::abs(v.z) <= 100'000.0F;
+    };
+    for (std::uint32_t i = 0U; i < spline.point_count; ++i) {
+        const SplineControlPoint& pt = spline.points[i];
+        if (!finite_bounded_vec3(pt.position) ||
+            !finite_bounded_vec3(pt.tangent_in) ||
+            !finite_bounded_vec3(pt.tangent_out) ||
+            !std::isfinite(pt.roll_degrees) ||
+            pt.roll_degrees < -360.0F ||
+            pt.roll_degrees > 360.0F ||
+            !std::isfinite(pt.speed_scale) ||
+            pt.speed_scale < 0.05F ||
+            pt.speed_scale > 20.0F) {
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] inline SplineComponent sanitize_spline_component(
+    SplineComponent spline) noexcept {
+    if (to_token(spline.basis) == "unknown") {
+        spline.basis = SplineBasis::catmull_rom;
+    }
+    spline.point_count = std::clamp(
+        spline.point_count, 2U, max_spline_control_points);
+    spline.tension = std::isfinite(spline.tension)
+        ? std::clamp(spline.tension, 0.0F, 1.0F)
+        : 0.5F;
+    const auto clamp_vec3 = [](glm::vec3& v, const glm::vec3& fallback) noexcept {
+        for (int axis = 0; axis < 3; ++axis) {
+            if (!std::isfinite(v[axis])) {
+                v[axis] = fallback[axis];
+            } else {
+                v[axis] = std::clamp(v[axis], -100'000.0F, 100'000.0F);
+            }
+        }
+    };
+    for (std::uint32_t i = 0U; i < spline.point_count; ++i) {
+        SplineControlPoint& pt = spline.points[i];
+        clamp_vec3(pt.position, glm::vec3{0.0F, 0.0F, static_cast<float>(i) * 3.0F});
+        clamp_vec3(pt.tangent_in, glm::vec3{0.0F, 0.0F, -1.0F});
+        clamp_vec3(pt.tangent_out, glm::vec3{0.0F, 0.0F, 1.0F});
+        pt.roll_degrees = std::isfinite(pt.roll_degrees)
+            ? std::clamp(pt.roll_degrees, -360.0F, 360.0F)
+            : 0.0F;
+        pt.speed_scale = std::isfinite(pt.speed_scale)
+            ? std::clamp(pt.speed_scale, 0.05F, 20.0F)
+            : 1.0F;
+    }
+    for (std::uint32_t i = spline.point_count; i < max_spline_control_points; ++i) {
+        spline.points[i] = SplineControlPoint{};
+    }
+    return spline;
+}
+
 } // namespace vcr

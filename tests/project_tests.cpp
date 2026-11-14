@@ -492,6 +492,7 @@ void test_shipping_runtime_content_and_rollback() {
     audio.shutdown();
     REQUIRE(!std::filesystem::exists(destination / "game"));
     REQUIRE(!std::filesystem::exists(destination / "build"));
+    REQUIRE(!std::filesystem::exists(destination / "engine/include"));
     REQUIRE(!std::filesystem::exists(destination / "engine/lib"));
     REQUIRE(!std::filesystem::exists(destination / "engine/cmake"));
     REQUIRE(!std::filesystem::exists(destination / "assets/source"));
@@ -740,32 +741,40 @@ void test_cpp_module_project_and_manifest_round_trip() {
             REQUIRE(std::filesystem::is_regular_file(
                 created.project_directory / "build" / "windows-debug" / "bin" /
                     "vcr_engined.dll"));
+            // Debug module builds must never clobber the Release <project>/bin/ DLL.
+            REQUIRE(!std::filesystem::exists(
+                created.project_directory / "bin" / "my_cpp_game_game.dll"));
         }
 
         const std::filesystem::path release_build_dir =
             workspace_root / "build" / "windows-release";
+        const std::filesystem::path release_exe =
+            release_build_dir / "bin" / "vulkan_cube.exe";
         const std::filesystem::path release_dll =
             release_build_dir / "bin" / "vcr_engine.dll";
         const std::filesystem::path release_lib =
             release_build_dir / "lib" / "vcr_engine.lib";
         fs_ec.clear();
-        if (std::filesystem::is_regular_file(release_dll, fs_ec) && !fs_ec &&
+        if (std::filesystem::is_regular_file(release_exe, fs_ec) && !fs_ec &&
+            std::filesystem::is_regular_file(release_dll, fs_ec) && !fs_ec &&
             std::filesystem::is_regular_file(release_lib, fs_ec) && !fs_ec) {
-            std::filesystem::create_directories(
-                created.project_directory / "engine" / "lib", fs_ec);
-            REQUIRE_MSG(!fs_ec, fs_ec.message());
-            std::filesystem::copy_file(
-                release_dll,
-                created.project_directory / "vcr_engine.dll",
-                std::filesystem::copy_options::overwrite_existing,
-                fs_ec);
-            REQUIRE_MSG(!fs_ec, fs_ec.message());
-            std::filesystem::copy_file(
-                release_lib,
-                created.project_directory / "engine" / "lib" / "vcr_engine.lib",
-                std::filesystem::copy_options::overwrite_existing,
-                fs_ec);
-            REQUIRE_MSG(!fs_ec, fs_ec.message());
+            vcr::BundleProjectRuntimeResult cpp_bundle{};
+            REQUIRE_MSG(
+                vcr::bundle_project_runtime(
+                    created.project_directory, cpp_bundle, error, release_exe),
+                error);
+            REQUIRE(std::filesystem::is_regular_file(
+                created.project_directory / "my_cpp_game.exe"));
+            REQUIRE(std::filesystem::is_regular_file(
+                created.project_directory / "vcr_engine.dll"));
+            REQUIRE(std::filesystem::is_regular_file(
+                created.project_directory / "engine" / "lib" / "vcr_engine.lib"));
+            REQUIRE(std::filesystem::is_regular_file(
+                created.project_directory / "engine" / "cmake" / "VcrEngineSdk.cmake"));
+            REQUIRE(std::filesystem::is_regular_file(
+                created.project_directory / "engine" / "include" / "game_module_api.hpp"));
+            REQUIRE(std::filesystem::is_regular_file(
+                created.project_directory / "engine" / "include" / "gameplay_session.hpp"));
 
             vcr::CompileProjectModuleResult release_res{};
             REQUIRE_MSG(
@@ -778,6 +787,26 @@ void test_cpp_module_project_and_manifest_round_trip() {
                     "bin" / "my_cpp_game_game.dll"));
             REQUIRE(std::filesystem::is_regular_file(
                 created.project_directory / "bin" / "my_cpp_game_game.dll"));
+
+            // Re-running a Debug build after Release must preserve the Release DLL in bin/.
+            if (std::filesystem::is_regular_file(
+                    debug_build_dir / "bin" / "vcr_engined.dll", fs_ec) &&
+                !fs_ec &&
+                std::filesystem::is_regular_file(
+                    debug_build_dir / "lib" / "vcr_engined.lib", fs_ec) &&
+                !fs_ec) {
+                const auto release_dll_bytes = read_binary_file(
+                    created.project_directory / "bin" / "my_cpp_game_game.dll");
+                vcr::CompileProjectModuleResult debug_after{};
+                REQUIRE_MSG(
+                    vcr::compile_project_game_module(
+                        created.project_directory, debug_after, error, "Debug"),
+                    error);
+                REQUIRE(debug_after.built);
+                REQUIRE(read_binary_file(
+                            created.project_directory / "bin" /
+                            "my_cpp_game_game.dll") == release_dll_bytes);
+            }
         }
     }
 #endif

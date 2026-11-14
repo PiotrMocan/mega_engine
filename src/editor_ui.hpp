@@ -35,6 +35,29 @@ struct AssetImportUiState;
 struct ExternalAssetDropState;
 struct MaterialEditorUiState;
 struct AudioInputUiState;
+struct SequencerEditorUiState;
+
+struct SequencerStatusSnapshot {
+    bool has_sequence = false;
+    std::string relative_path{};
+    std::string sequence_id{};
+    std::string title{};
+    bool dirty = false;
+    bool preview_active = false;
+    bool preview_playing = false;
+    bool lock_camera = true;
+    bool looping = false;
+    float playhead_seconds = 0.0F;
+    float duration_seconds = 0.0F;
+    float frame_rate = 30.0F;
+    std::size_t camera_cut_count = 0U;
+    std::size_t camera_shake_count = 0U;
+    std::size_t property_track_count = 0U;
+    std::size_t animation_clip_count = 0U;
+    std::size_t audio_clip_count = 0U;
+    std::size_t subtitle_count = 0U;
+    std::size_t event_key_count = 0U;
+};
 
 enum class EditorPlayState : std::uint8_t {
     edit,
@@ -226,17 +249,65 @@ public:
         MaterialEditorSnapshot& snapshot,
         std::string& error);
 
+    void open_cutscene_in_sequencer(
+        SceneDocument& scene,
+        std::string_view relative_path);
+    void update_sequencer_edit_preview(
+        float delta_seconds,
+        SceneDocument& scene,
+        Renderer& renderer,
+        FlyCamera& camera);
+    void stop_sequencer_preview(
+        SceneDocument& scene,
+        Renderer* renderer = nullptr,
+        FlyCamera* camera = nullptr) noexcept;
+    [[nodiscard]] bool sequencer_preview_active() const noexcept;
+    [[nodiscard]] bool sequencer_locks_edit_camera() const noexcept;
+    [[nodiscard]] SequencerStatusSnapshot sequencer_status() const;
+    [[nodiscard]] bool mcp_sequencer_new(
+        SceneDocument& scene,
+        std::string_view id,
+        std::string_view title,
+        float duration_seconds,
+        float frame_rate,
+        bool looping,
+        std::string& error);
+    [[nodiscard]] bool mcp_sequencer_open(
+        SceneDocument& scene,
+        std::string_view relative_path,
+        std::string& error);
+    [[nodiscard]] bool mcp_sequencer_save(
+        std::string_view custom_relative_path,
+        std::string& out_saved_path,
+        std::string& error);
+    [[nodiscard]] bool mcp_sequencer_set_playback(
+        SceneDocument& scene,
+        Renderer& renderer,
+        FlyCamera& camera,
+        bool active,
+        bool playing,
+        std::optional<float> scrub_time_seconds,
+        std::optional<bool> lock_camera,
+        std::string& error);
+
 private:
     void initialize_vulkan_backend(Renderer& renderer);
     void shutdown_vulkan_backend() noexcept;
     void register_scene_texture(Renderer& renderer);
     void unregister_scene_texture() noexcept;
-    void build_main_menu(SceneDocument& scene);
-    void build_toolbar(SceneDocument& scene);
+    void build_main_menu(
+        SceneDocument& scene,
+        Renderer& renderer,
+        FlyCamera& camera);
+    void build_toolbar(
+        SceneDocument& scene,
+        Renderer& renderer,
+        FlyCamera& camera);
     void build_hierarchy(SceneDocument& scene);
     void build_inspector(
         SceneDocument& scene,
-        Renderer& renderer);
+        Renderer& renderer,
+        FlyCamera& camera);
     void build_viewport(
         SceneDocument& scene,
         Renderer& renderer,
@@ -249,7 +320,8 @@ private:
         Renderer& renderer);
     void build_landscape(
         SceneDocument& scene,
-        Renderer& renderer);
+        Renderer& renderer,
+        FlyCamera& camera);
     void build_import_window();
     void build_import_results();
     void build_material_editor(Renderer& renderer);
@@ -260,11 +332,18 @@ private:
     void build_ui_localization_panel(
         SceneDocument& scene,
         Renderer& renderer);
+    void build_sequencer_panel(
+        SceneDocument& scene,
+        Renderer& renderer,
+        FlyCamera& camera);
     void build_performance(
         SceneDocument& scene,
         Renderer& renderer,
         const PerformanceSnapshot& performance);
-    void process_file_commands(SceneDocument& scene);
+    void process_file_commands(
+        SceneDocument& scene,
+        Renderer& renderer,
+        FlyCamera& camera);
     void process_import_pipeline();
     void queue_import_sources(
         std::vector<std::filesystem::path> sources);
@@ -301,8 +380,10 @@ private:
     GameplaySession* gameplay_session_ = nullptr;
     AnimatorRuntimeSystem* edit_animator_preview_ = nullptr;
     bool show_skeleton_wireframe_ = true;
+    bool show_spline_wireframe_ = true;
     bool animation_gameplay_panel_open_ = true;
     bool ui_localization_panel_open_ = true;
+    bool sequencer_panel_open_ = true;
     std::array<char, 64U> ui_test_speaker_buf_{"Narrator"};
     std::array<char, 256U> ui_test_text_buf_{"ui.dialogue.greeting"};
     std::array<char, 64U> ui_test_dialogue_id_buf_{};
@@ -404,6 +485,7 @@ private:
     std::unique_ptr<ExternalAssetDropState> external_drop_;
     std::unique_ptr<MaterialEditorUiState> material_editor_;
     std::unique_ptr<AudioInputUiState> audio_input_ui_;
+    std::unique_ptr<SequencerEditorUiState> sequencer_ui_;
     std::string asset_error_{};
     std::string pending_model_path_{}, pending_model_name_{};
     SceneNodeId pending_model_parent_{};

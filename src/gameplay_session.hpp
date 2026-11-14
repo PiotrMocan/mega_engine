@@ -2,7 +2,10 @@
 
 #include "animated_character.hpp"
 #include "audio_engine.hpp"
+#include "camera_projection.hpp"
+#include "cinematic_camera.hpp"
 #include "collision.hpp"
+#include "cutscene_sequencer.hpp"
 #include "game_overlay.hpp"
 #include "game_ui_runtime.hpp"
 #include "gameplay.hpp"
@@ -41,6 +44,16 @@ struct GameplayRendererBridge {
         void* context,
         std::span<const GameUiVertex> vertices) = nullptr;
     void (*clear_skinned_poses)(void* context) noexcept = nullptr;
+    void (*set_vertical_fov_degrees)(
+        void* context,
+        float degrees) noexcept = nullptr;
+    void (*set_camera_exposure_offset_ev)(
+        void* context,
+        float offset_ev) noexcept = nullptr;
+    void (*set_camera_focus_state)(
+        void* context,
+        const CameraFocusState& state) noexcept = nullptr;
+    void (*notify_camera_cut)(void* context) noexcept = nullptr;
 };
 
 struct GameplayFrameInput {
@@ -279,6 +292,33 @@ public:
         return physics_world_;
     }
 
+    [[nodiscard]] CameraShakeSystem& camera_shake() noexcept {
+        return camera_shake_;
+    }
+    [[nodiscard]] const CameraShakeSystem& camera_shake() const noexcept {
+        return camera_shake_;
+    }
+    [[nodiscard]] CutsceneRuntimePlayer& cutscene_player() noexcept {
+        return cutscene_player_;
+    }
+    [[nodiscard]] const CutsceneRuntimePlayer& cutscene_player()
+        const noexcept {
+        return cutscene_player_;
+    }
+    void set_startup_cutscene(std::string_view cutscene_id_or_path);
+    [[nodiscard]] std::string_view startup_cutscene() const noexcept {
+        return startup_cutscene_id_;
+    }
+    [[nodiscard]] bool play_cutscene(
+        std::string_view cutscene_id_or_path,
+        const SceneDocument& scene,
+        const FlyCamera& current_camera,
+        AudioEngine* audio_engine = nullptr,
+        std::string* out_error = nullptr);
+    void stop_cutscene(
+        const GameplayRendererBridge* renderer_bridge = nullptr,
+        AudioEngine* audio_engine = nullptr) noexcept;
+
     [[nodiscard]] bool active() const noexcept { return active_; }
     [[nodiscard]] SceneNodeId player_node() const noexcept {
         return player_node_;
@@ -343,6 +383,16 @@ private:
     bool game_ui_configured_ = false;
     bool ui_audio_paused_ = false;
     AnimatorComponent player_anim_scratch_{};
+    CameraShakeSystem camera_shake_{};
+    CutsceneRuntimePlayer cutscene_player_{};
+    std::string startup_cutscene_id_{};
+    std::string pending_cutscene_scratch_{};
+    std::vector<SceneNodeId> cutscene_overridden_nodes_{};
+    float current_lens_fov_ = camera_vertical_fov;
+    float current_lens_exposure_ev_ = 0.0F;
+    CameraFocusState current_lens_focus_{};
+    bool cutscene_was_active_ = false;
+    bool lens_cut_pending_ = false;
 
     std::vector<SceneWorldNode> cached_world_nodes_{};
     std::vector<std::uint32_t> world_ancestor_scratch_{};

@@ -138,7 +138,7 @@ vec3 sampleEnvironment(
         return mix(
             dynamicSkyBackground(reflectionDirection),
             lighting.skyZenith.rgb * 0.5 + lighting.skyHorizon.rgb * 0.5,
-            roughness * roughness);
+            roughness * roughness) * lighting.skyZenith.w;
     }
     const int levelCount = textureQueryLevels(skyTexture);
     const float maximumLod =

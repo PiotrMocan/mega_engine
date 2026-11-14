@@ -2232,6 +2232,7 @@ int main() {
             source_scene.mark_content_changed();
         }
         source_scene.tone_mapper = vcr::ToneMapper::gt7;
+        source_scene.exposure = vcr::ExposureSettings{.compensation_ev = 4.830075F};
         source_scene.fog = vcr::FogSettings{
             .enabled = true,
             .color = {1.5F, 0.4F, 0.2F},
@@ -2297,6 +2298,7 @@ int main() {
                 loaded_records[4].value.light.inner_cone_degrees == 12.0F &&
                 loaded_records[4].value.light.outer_cone_degrees == 27.0F &&
                 loaded_scene.tone_mapper == vcr::ToneMapper::gt7 &&
+                loaded_scene.exposure == source_scene.exposure &&
                 loaded_scene.fog && loaded_scene.fog->enabled &&
                 loaded_scene.fog->color == std::array{1.5F, 0.4F, 0.2F} &&
                 loaded_scene.fog->density == 0.015F &&
@@ -2402,12 +2404,13 @@ int main() {
                "explicit default CLI Z still overrides authored pose");
         source_scene.lighting = vcr::LightingSettings{
             .cycle = false, .cascade_cache = true, .hour = 17.2,
-            .shadow_depth = vcr::ShadowDepthFormat::d16};
+            .shadow_depth = vcr::ShadowDepthFormat::d16, .sky_intensity = 3.0F};
         const auto startup_file = temporary_root / "startup.scene.json";
         expect(vcr::save_scene_file(source_scene, startup_file, error) &&
                    vcr::load_scene_file(startup_file, loaded_scene, error),
                "authored startup settings round trip");
         expect(loaded_scene.lighting && !loaded_scene.lighting->cycle &&
+                   close_to(loaded_scene.lighting->sky_intensity, 3.0, .0001) &&
                    loaded_scene.lighting->cascade_cache &&
                    loaded_scene.lighting->shadow_depth == vcr::ShadowDepthFormat::d16 &&
                    close_to(loaded_scene.lighting->hour, 17.2, .0001) &&

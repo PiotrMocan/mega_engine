@@ -498,6 +498,28 @@ int main() {
     expect(has_error(vcr::load_cooked_model_asset(asset_root, packed.metadata_relative),
                      CookedModelLoadErrorCode::invalid_material),
            "packed texture rejects non-string reference");
+    Fixture emitting = create_fixture(asset_root, "emitting");
+    emitting.material["pbr"]["emissive"] = {24.0, 8.0, 0.5};
+    emitting.material["textures"]["emissive"] = "light.vcrtexture.json";
+    expect(write_json(asset_root / "emitting/light.vcrtexture.json", Json::object()) &&
+               write_json(emitting.material_absolute, emitting.material),
+           "HDR emissive fixture is written");
+    const auto emitting_loaded = vcr::load_cooked_model_asset(asset_root, emitting.metadata_relative);
+    expect(emitting_loaded && emitting_loaded->materials[0].emissive_factor.x == 24.0F &&
+               emitting_loaded->materials[0].emissive_factor.y == 8.0F &&
+               emitting_loaded->materials[0].emissive_texture ==
+                   std::filesystem::path("emitting/light.vcrtexture.json"),
+           "emission remains HDR and resolves independently of albedo");
+    emitting.material["pbr"]["emissive"] = {-1.0, 0.0, 0.0};
+    expect(write_json(emitting.material_absolute, emitting.material), "invalid emission fixture written");
+    expect(has_error(vcr::load_cooked_model_asset(asset_root, emitting.metadata_relative),
+                     CookedModelLoadErrorCode::invalid_material),
+           "negative emitted radiance is rejected");
+    emitting.material["pbr"]["emissive"] = {65505.0, 0.0, 0.0};
+    expect(write_json(emitting.material_absolute, emitting.material), "overflowing emission fixture written");
+    expect(has_error(vcr::load_cooked_model_asset(asset_root, emitting.metadata_relative),
+                     CookedModelLoadErrorCode::invalid_material),
+           "emission above the HDR attachment range is rejected");
     Fixture displaced = create_fixture(asset_root, "displaced");
     displaced.material["textures"]["displacement"] =
         "displacement.vcrtexture.json";

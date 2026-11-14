@@ -266,6 +266,7 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
 
         const std::string_view raw = argv[index];
         const Argument argument = split_argument(raw);
+        if (argument.name.starts_with("--exposure")) result.options.exposure_override = true;
 
         if (argument.name == "--help" || argument.name == "-h") {
             if (argument.has_inline_value) {
@@ -733,6 +734,21 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
             result.options.locale = value;
             continue;
         }
+        if (argument.name == "--cutscene") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) {
+                return result;
+            }
+            if (value.empty() ||
+                value.size() > 256 ||
+                value.find("..") != std::string_view::npos ||
+                value.find('\\') != std::string_view::npos ||
+                value.find(':') != std::string_view::npos) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.startup_cutscene = value;
+            continue;
+        }
         if (argument.name == "--culling" || argument.name == "--lod" ||
             argument.name == "--dynamic-shadows" || argument.name == "--scene-count" ||
             argument.name == "--scene-asset" || argument.name == "--stream-asset" ||
@@ -1095,6 +1111,11 @@ ToneMapper resolve_scene_tone_mapper(
         : *authored;
 }
 
+ExposureSettings resolve_scene_exposure(
+    const CliOptions& options, const std::optional<ExposureSettings>& authored) noexcept {
+    return options.exposure_override ? options.exposure : authored.value_or(options.exposure);
+}
+
 SubsurfaceMode resolve_scene_subsurface(
     const CliOptions& options, const std::optional<SubsurfaceMode> authored) noexcept {
     const SubsurfaceMode resolved = options.subsurface_override || !authored
@@ -1131,6 +1152,7 @@ std::string cli_usage(std::string_view executable_name) {
     result.append(" [options]\n"
                   "  --project PATH          Open project directory or project.vcrproject.json\n"
                   "  --main-menu             Open standalone runtime in main menu screen\n"
+                  "  --cutscene ID           Play cutscene ID or relative .vcrseq.json on startup\n"
                   "  --locale CODE           Select initial localization code (e.g. en, ru)\n"
                   "  --benchmark             Run timed benchmark and write benchmark.json\n"
                   "  --mcp-stdio             Expose AI toolsets over MCP stdio\n"

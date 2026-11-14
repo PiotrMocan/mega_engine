@@ -127,12 +127,20 @@ void VoxelSceneTracker::set_transform(SceneNodeId id, TransformRows transform,
 }
 std::array<glm::mat4, 4> shadow_cascades(const glm::mat4 &view, float aspect, glm::vec3 direction,
                                          unsigned tile_resolution) noexcept {
+    return shadow_cascades(view, aspect, direction, tile_resolution, 65.0F);
+}
+std::array<glm::mat4, 4> shadow_cascades(const glm::mat4 &view, float aspect, glm::vec3 direction,
+                                         unsigned tile_resolution,
+                                         float vertical_fov_degrees) noexcept {
     assert(tile_resolution > 8);
     const glm::mat4 inverse = glm::inverse(view);
     constexpr std::array<float, 5> splits{0.1F, 12, 32, 80, 192};
     std::array<glm::mat4, 4> result{};
     const glm::vec3 up = std::abs(direction.y) > 0.98F ? glm::vec3(0, 0, 1) : glm::vec3(0, 1, 0);
-    const float tangent = std::tan(glm::radians(65.0F) * 0.5F);
+    const float clamped_fov = std::isfinite(vertical_fov_degrees)
+        ? std::clamp(vertical_fov_degrees, 10.0F, 140.0F)
+        : 65.0F;
+    const float tangent = std::tan(glm::radians(clamped_fov) * 0.5F);
     // The light basis must not depend on subtraction of two large world positions.
     const auto light_rotation = glm::lookAt(glm::vec3(0), -direction, up);
     for (std::size_t cascade = 0; cascade < result.size(); ++cascade) {

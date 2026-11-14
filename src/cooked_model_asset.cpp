@@ -730,6 +730,29 @@ parse_material(
             return std::nullopt;
         };
 
+    glm::vec4 emissive_factor(0.0F);
+    if (const auto emissive = pbr->find("emissive"); emissive != pbr->end()) {
+        if (!emissive->is_array() || emissive->size() != 3U) {
+            return CookedModelLoadError{.code = CookedModelLoadErrorCode::invalid_material,
+                .message = "Material emissive must contain three linear HDR channels.", .path = file.absolute};
+        }
+        for (std::size_t channel = 0U; channel < 3U; ++channel) {
+            if (!emissive->at(channel).is_number()) {
+                return CookedModelLoadError{.code = CookedModelLoadErrorCode::invalid_material,
+                    .message = "Material emissive channel must be numeric.", .path = file.absolute};
+            }
+            const double value = emissive->at(channel).get<double>();
+            if (!std::isfinite(value) || value < 0.0 || value > 65504.0) {
+                return CookedModelLoadError{.code = CookedModelLoadErrorCode::invalid_material,
+                    .message = "Material emissive channel must be finite and in [0, 65504].", .path = file.absolute};
+            }
+            emissive_factor[static_cast<glm::length_t>(channel)] = static_cast<float>(value);
+        }
+    }
+    std::optional<std::filesystem::path> emissive_texture;
+    if (auto error = read_texture_reference("emissive", emissive_texture)) {
+        return error;
+    }
     std::optional<std::filesystem::path> base_color_texture;
     std::optional<std::filesystem::path> normal_texture;
     std::optional<std::filesystem::path> metallic_roughness_texture;
@@ -917,6 +940,8 @@ parse_material(
         .normal_texture = std::move(normal_texture),
         .metallic_roughness_texture = std::move(metallic_roughness_texture),
         .displacement_texture = std::move(displacement_texture),
+        .emissive_factor = emissive_factor,
+        .emissive_texture = std::move(emissive_texture),
         .tessellation = tessellation,
         .coverage = coverage,
     };

@@ -155,6 +155,7 @@ template <typename T>
         read_setting(source, "day_seconds", s.day_seconds, 1, 864000) &&
         read_setting(source, "gi_extent", s.gi_extent, 16, 256) &&
         read_setting(source, "gi_strength", s.gi_strength, 0, 4) &&
+        read_setting(source, "sky_intensity", s.sky_intensity, 0, 64) &&
         read_setting(source, "triangle_budget", s.triangle_budget, 1024, 262144) &&
         read_setting(source, "gi_update_hz", s.gi_update_hz, 1, 120) &&
         read_setting(source, "shadow_resolution", s.shadow_resolution, 1024, 8192) &&
@@ -164,7 +165,8 @@ template <typename T>
 [[nodiscard]] Json lighting_json(const LightingSettings &s) {
     return Json{{"dynamic", s.dynamic}, {"voxel_gi", s.voxel_gi}, {"cycle", s.cycle},
                 {"hour", s.hour}, {"day_seconds", s.day_seconds}, {"gi_extent", s.gi_extent},
-                {"gi_strength", s.gi_strength}, {"triangle_budget", s.triangle_budget},
+                {"gi_strength", s.gi_strength}, {"sky_intensity", s.sky_intensity},
+                {"triangle_budget", s.triangle_budget},
                 {"gi_update_hz", s.gi_update_hz}, {"shadow_resolution", s.shadow_resolution},
                 {"shadow_depth", to_token(s.shadow_depth)},
                 {"cascade_cache", s.cascade_cache},
@@ -846,6 +848,19 @@ bool save_scene_file(
         }
         metadata["subsurface"] = to_token(*scene.subsurface);
     }
+    if (scene.exposure) {
+        const auto& e = *scene.exposure;
+        if (!valid_exposure_settings(e)) {
+            error = "Scene exposure settings are invalid.";
+            return false;
+        }
+        metadata["exposure"] = Json{
+            {"mode", to_token(e.mode)}, {"metering", to_token(e.metering)},
+            {"compensation_ev", e.compensation_ev}, {"minimum_ev", e.minimum_ev},
+            {"maximum_ev", e.maximum_ev},
+            {"low_percentile", e.low_percentile}, {"high_percentile", e.high_percentile},
+            {"brighten_seconds", e.brighten_seconds}, {"darken_seconds", e.darken_seconds}};
+    }
     if (scene.fog) {
         if (!valid_fog_settings(*scene.fog)) {
             error = "Scene fog settings are invalid.";
@@ -945,7 +960,7 @@ bool save_scene_file(
         if (record.collider || record.rigid_body || record.prefab_instance ||
             record.audio_source || record.audio_listener ||
             record.reverb_zone || record.animator || record.gameplay ||
-            record.ui_marker) {
+            record.ui_marker || record.spline) {
             Json components = Json::object();
             if (record.collider) {
                 components["collider"] = collider_json(*record.collider);
@@ -980,6 +995,10 @@ bool save_scene_file(
             if (record.ui_marker) {
                 components["ui_marker"] =
                     component_json::ui_marker_to_json(*record.ui_marker);
+            }
+            if (record.spline) {
+                components["spline"] =
+                    component_json::spline_to_json(*record.spline);
             }
             encoded["components"] = std::move(components);
         }
@@ -1371,6 +1390,7 @@ bool load_scene_file(
             std::optional<AnimatorComponent> parsed_animator{};
             std::optional<GameplayComponent> parsed_gameplay{};
             std::optional<UiMarkerComponent> parsed_ui_marker{};
+            std::optional<SplineComponent> parsed_spline{};
             if (encoded.contains("components")) {
                 const Json& components = encoded["components"];
                 if (!components.is_object()) {
@@ -1386,7 +1406,8 @@ bool load_scene_file(
                         component_key != "reverb_zone" &&
                         component_key != "animator" &&
                         component_key != "gameplay" &&
-                        component_key != "ui_marker") {
+                        component_key != "ui_marker" &&
+                        component_key != "spline") {
                         error = "Scene node contains an unknown component.";
                         return false;
                     }
@@ -1474,6 +1495,15 @@ bool load_scene_file(
                     }
                     parsed_ui_marker = marker_value;
                 }
+                if (components.contains("spline")) {
+                    SplineComponent spline_value{};
+                    if (!component_json::parse_spline_json(
+                            components["spline"], spline_value)) {
+                        error = "Scene node spline component is invalid.";
+                        return false;
+                    }
+                    parsed_spline = spline_value;
+                }
             }
             const SceneNodeId id = parsed_uuid
                 ? loaded.create_node_with_uuid(name, *kind, *parsed_uuid, parent_id)
@@ -1525,6 +1555,11 @@ bool load_scene_file(
             if (parsed_ui_marker &&
                 !loaded.set_ui_marker(id, *parsed_ui_marker)) {
                 error = "Unable to attach scene ui_marker component.";
+                return false;
+            }
+            if (parsed_spline &&
+                !loaded.set_spline(id, *parsed_spline)) {
+                error = "Unable to attach scene spline component.";
                 return false;
             }
             auto node = loaded.node(id);
@@ -1612,6 +1647,35 @@ bool load_scene_file(
                 return false;
             }
             loaded.subsurface = *mode;
+        }
+        if (root.contains("exposure")) {
+            const auto& v = root["exposure"];
+            ExposureSettings e;
+            if (!v.is_object() || (v.contains("mode") && !v["mode"].is_string()) ||
+                (v.contains("metering") && !v["metering"].is_string())) {
+                error = "Scene exposure schema is invalid.";
+                return false;
+            }
+            const auto mode = parse_exposure_mode(v.value("mode", std::string("fixed")));
+            const auto metering = parse_exposure_metering(v.value("metering", std::string("uniform")));
+            if (!mode || !metering ||
+                !read_setting(v, "compensation_ev", e.compensation_ev, -24, 24) ||
+                !read_setting(v, "minimum_ev", e.minimum_ev, -24, 24) ||
+                !read_setting(v, "maximum_ev", e.maximum_ev, -24, 24) ||
+                !read_setting(v, "low_percentile", e.low_percentile, 0, 1) ||
+                !read_setting(v, "high_percentile", e.high_percentile, 0, 1) ||
+                !read_setting(v, "brighten_seconds", e.brighten_seconds, .01, 60) ||
+                !read_setting(v, "darken_seconds", e.darken_seconds, .01, 60)) {
+                error = "Scene exposure settings are invalid.";
+                return false;
+            }
+            e.mode = *mode;
+            e.metering = *metering;
+            if (!valid_exposure_settings(e)) {
+                error = "Scene exposure ranges are invalid.";
+                return false;
+            }
+            loaded.exposure = e;
         }
         if (root.contains("fog")) {
             FogSettings settings;

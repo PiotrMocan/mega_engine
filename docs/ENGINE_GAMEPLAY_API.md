@@ -124,3 +124,26 @@ Headers: [`src/game_overlay.hpp`](../src/game_overlay.hpp), [`src/localization.h
 - **3D World Markers & Editor / MCP Integration**:
   - `UiMarkerComponent` (`objective`, `waypoint`, `interact`, `speaker`, `hazard`, `info`) projects 3D entity positions via `project_world_indicator` with off-screen edge clamping, distance fading, optional health bars, subtitles, and `dialogue_id` triggers (`"dialogue"` default gameplay behavior).
   - Editor tools: `Inspector -> UI Marker` section with undo support, docked `UI & Localization` panel, Play viewport hover/click cursor tracking, shipping validation (`ship_project` for `.vcrloc.json`, `.vcrdlg.json`, `.vcrfont.json` + `.png`), and MCP tools `editor_set_ui_marker`, `editor_remove_ui_marker`, and `editor_configure_ui`.
+
+---
+
+## 10. Cutscene Sequencer, 3D Splines & Cinematic Camera (Stage 6)
+
+Headers: [`src/cutscene_sequencer.hpp`](../src/cutscene_sequencer.hpp), [`src/cinematic_camera.hpp`](../src/cinematic_camera.hpp), [`src/scene_components.hpp`](../src/scene_components.hpp), [`src/camera_projection.hpp`](../src/camera_projection.hpp)
+
+- **3D Splines (`SplineComponent`, `evaluate_spline`, `build_spline_arc_table`)**:
+  - `SceneDocument` nodes support optional `SplineComponent` (`Linear`, `Catmull-Rom`, `Cubic Hermite`, optional `closed_loop`, tension, per-control-point `roll_degrees` and `speed_scale`), saved in `.vcrscene.json` and overridable on `.vcrprefab.json` instances (`PrefabNodeOverride::spline`).
+  - `build_spline_arc_table` and `map_distance_to_spline_u` provide constant-speed distance traversal; `closest_spline_u_to_world_point` projects arbitrary world coordinates onto a spline rail.
+  - Built-in `"spline_mover"` gameplay behavior moves an entity along its referenced spline path with optional orientation alignment.
+- **Cinematic Camera, Shake & Pose Blending**:
+  - `CinematicCameraPose` extends `FlyCamera` (`roll_radians()` / `set_roll_radians()`) with dynamic vertical FOV, exposure offset EV, and `CameraFocusState` (`focus_distance_meters`, `aperture_fstop`).
+  - `CameraShakeSystem` layers decayable trauma and clip-driven `CameraShakeParams` offsets/rotations/FOV pulses without heap allocations.
+  - `blend_camera_poses` interpolates smoothly between gameplay and cutscene camera poses (`cut`, `linear`, `smoothstep`, `ease_in_out_cubic`).
+- **Cutscene Sequences (`.vcrseq.json`) & Runtime Playback (`CutsceneRuntimePlayer`)**:
+  - `CutsceneSequence` stores `camera_cuts` (rail spline, look-at target, FOV/roll/exposure/focus/rail-u keyframe curves, blend-in easing), `camera_shakes`, `property_tracks` (transforms, `spline_distance_u`, light intensity scale, material colors/alpha, animator parameters, and `gameplay_float_var`), `animation_clips`, `audio_clips`, localized `subtitles`, and `event_keys` with `Constant`, `Linear`, `Cubic Hermite`, and `Cubic Bezier` curve interpolation.
+  - `GameplaySession` integrates `CutsceneRuntimePlayer` with `--cutscene <id_or_path>`, `play_cutscene` / `stop_cutscene`, the `"cutscene_trigger"` behavior, optional simulation pause, temporary non-destructive scene node overrides restored on completion, letterbox + localized subtitle rendering via `render_cutscene_overlay`, and `InputContext::cutscene` (`cutscene_skip`, `cutscene_advance`).
+- **Editor Sequencer, Viewport Gizmos, Shipping & MCP**:
+  - `vulkan_editor` adds a docked `Sequencer` panel (multi-track `ImDrawList` timeline with scrubbing, Hermite/Bezier Curve Editor, track/clip/keyframe inspectors, Live Edit-mode preview with baseline scene protection), `Inspector -> 3D Spline` with undo support, and viewport 3D spline/handle/camera-frustum wireframes.
+  - `ship_project` validates `.vcrseq.json` files and copies referenced runtime audio clips cleanly.
+  - MCP tools: `editor.scene.set_spline`, `editor.scene.remove_spline`, and `editor.sequencer.control` (total 55 MCP tools, plus `"spline"` node telemetry and `"sequencer"` status in `editor.get_state`).
+

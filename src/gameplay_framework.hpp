@@ -406,6 +406,18 @@ public:
     void set_variable(std::string_view name, float value);
     void add_variable(std::string_view name, float delta);
 
+    void request_cutscene(std::string_view cutscene_id_or_path);
+    [[nodiscard]] bool consume_cutscene_request(
+        std::string& out_cutscene_id_or_path);
+    bool trigger_entity_event(
+        SceneUuid target_uuid,
+        bool is_interact,
+        const SceneDocument& scene,
+        const CollisionWorld* collision_world,
+        const PhysicsWorld* physics_world,
+        AnimatorRuntimeSystem* animators,
+        AudioEngine* audio_engine);
+
     [[nodiscard]] float player_health() const noexcept {
         return player_health_;
     }
@@ -487,6 +499,7 @@ private:
     float fixed_accumulator_ = 0.0F;
     std::uint64_t fixed_step_count_ = 0U;
     bool interact_was_down_ = false;
+    std::string pending_cutscene_request_{};
     std::array<std::array<char, 160U>, max_event_log_entries> event_ring_{};
     std::size_t event_head_ = 0U;
     std::size_t event_count_ = 0U;

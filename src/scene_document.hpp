@@ -1,6 +1,7 @@
 #pragma once
 
 #include "fog.hpp"
+#include "exposure.hpp"
 #include "lighting_settings.hpp"
 #include "ocean_settings.hpp"
 #include "pbr_material.hpp"
@@ -102,6 +103,7 @@ struct SceneNodeRecord {
     std::optional<AnimatorComponent> animator{};
     std::optional<GameplayComponent> gameplay{};
     std::optional<UiMarkerComponent> ui_marker{};
+    std::optional<SplineComponent> spline{};
     std::uint32_t parent_record_index =
         invalid_scene_node_index;
 };
@@ -173,6 +175,7 @@ public:
     SceneNodeId startup_camera{};
     std::optional<LightingSettings> lighting{};
     std::optional<ToneMapper> tone_mapper{};
+    std::optional<ExposureSettings> exposure{};
     std::optional<SubsurfaceMode> subsurface{};
     std::optional<FogSettings> fog{};
     [[nodiscard]] std::optional<SceneCameraPose> startup_camera_pose() const noexcept;
@@ -368,6 +371,20 @@ public:
         return ui_markers_;
     }
 
+    bool set_spline(SceneNodeId id, const SplineComponent& spline_value);
+    bool remove_spline(SceneNodeId id) noexcept;
+    [[nodiscard]] bool has_spline(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<std::reference_wrapper<const SplineComponent>>
+    spline(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<std::reference_wrapper<SplineComponent>>
+    spline_mut(SceneNodeId id) noexcept;
+    [[nodiscard]] const SparseComponentPool<
+        SceneNodeId,
+        SplineComponent,
+        max_scene_nodes>& splines() const noexcept {
+        return splines_;
+    }
+
     void mark_content_changed() noexcept;
     [[nodiscard]] std::uint32_t last_transform_updates() const noexcept {
         return last_transform_updates_;
@@ -489,6 +506,10 @@ private:
         SceneNodeId,
         UiMarkerComponent,
         max_scene_nodes> ui_markers_{};
+    SparseComponentPool<
+        SceneNodeId,
+        SplineComponent,
+        max_scene_nodes> splines_{};
     std::uint32_t first_root_ = invalid_scene_node_index;
     std::uint32_t last_root_ = invalid_scene_node_index;
     std::uint32_t live_count_ = 0U;

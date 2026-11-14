@@ -1204,6 +1204,19 @@ bool Renderer::prepare_editor_viewport(VkExtent2D extent) {
 }
 
 void Renderer::create_editor_material_resources() {
+    const auto& limits = context_->properties().limits;
+    editor_material_emissive_stride_ = std::max({VkDeviceSize{16},
+        limits.minUniformBufferOffsetAlignment, limits.nonCoherentAtomSize});
+    if (editor_material_emissive_stride_ > 16U * 1024U ||
+        limits.maxPerStageDescriptorUniformBuffers < 3U ||
+        limits.maxPerStageDescriptorSamplers < 8U) {
+        throw std::runtime_error("Device limits cannot support material emission descriptors.");
+    }
+    editor_material_emissive_factors_.create(*context_,
+        editor_material_emissive_stride_ * maximum_editor_material_descriptors,
+        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+        "immutable material emission factors");
     constexpr std::array<std::uint8_t, 4U> white_pixel{
         255U, 255U, 255U, 255U};
     constexpr std::array<std::uint8_t, 4U> flat_normal_pixel{
@@ -1384,6 +1397,8 @@ Renderer::create_editor_material_descriptor(
     const GpuTexture& normal,
     const GpuTexture& metallic_roughness,
     const GpuTexture& displacement,
+    const GpuTexture& emissive,
+    const glm::vec4& emissive_factor,
     std::string& error) {
     if (editor_material_descriptor_pool_ == VK_NULL_HANDLE ||
         editor_material_descriptor_set_layout_ == VK_NULL_HANDLE) {
@@ -1397,6 +1412,17 @@ Renderer::create_editor_material_descriptor(
             "4096-set limit.";
         return std::nullopt;
     }
+    const VkDeviceSize factor_offset =
+        editor_material_emissive_stride_ * editor_material_descriptor_count_;
+    // The new region shares neither a descriptor nor a noncoherent memory atom
+    // with an existing GPU reader. No published record is overwritten.
+    editor_material_emissive_factors_.write(
+        std::as_bytes(std::span{&emissive_factor, 1U}), factor_offset);
+    const VkDescriptorBufferInfo emission_info{
+        .buffer = editor_material_emissive_factors_.handle(),
+        .offset = factor_offset,
+        .range = sizeof(glm::vec4),
+    };
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
     const VkDescriptorSetAllocateInfo allocate_info{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -1434,6 +1460,11 @@ Renderer::create_editor_material_descriptor(
             .imageView = displacement.view(),
             .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         },
+        VkDescriptorImageInfo{
+            .sampler = emissive.sampler(),
+            .imageView = emissive.view(),
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        },
     };
     const std::array writes{
         VkWriteDescriptorSet{
@@ -1469,6 +1500,22 @@ Renderer::create_editor_material_descriptor(
             .descriptorCount = 1U,
             .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
             .pImageInfo = &image_infos[3U],
+        },
+        VkWriteDescriptorSet{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = descriptor_set,
+            .dstBinding = 4U,
+            .descriptorCount = 1U,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &image_infos[4U],
+        },
+        VkWriteDescriptorSet{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = descriptor_set,
+            .dstBinding = 5U,
+            .descriptorCount = 1U,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .pBufferInfo = &emission_info,
         },
     };
     vkUpdateDescriptorSets(
@@ -2513,6 +2560,7 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
         std::optional<std::uint32_t> normal_index;
         std::optional<std::uint32_t> metallic_roughness_index;
         std::optional<std::uint32_t> displacement_index;
+        std::optional<std::uint32_t> emissive_index;
         const auto load_slot =
             [this, &prepared, &relative_path](const std::optional<std::filesystem::path> &reference,
                                               const CookedTextureSemantic expected_semantic,
@@ -2583,6 +2631,11 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
                 CookedTextureSemantic::displacement,
                 CookedTextureColorSpace::linear,
                 displacement_index);
+            load_slot(
+                material->emissive_texture,
+                CookedTextureSemantic::emissive,
+                CookedTextureColorSpace::srgb,
+                emissive_index);
         }
         const GpuTexture& base_color =
             base_color_index
@@ -2602,7 +2655,12 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
             : editor_default_displacement_texture_;
         const auto descriptor =
             create_editor_material_descriptor(
-                base_color, normal, metallic_roughness, displacement, error);
+                base_color, normal, metallic_roughness, displacement,
+                emissive_index ? editor_texture_assets_[*emissive_index].texture
+                    : editor_default_base_color_texture_,
+                material != nullptr &&
+                        (!material->emissive_texture || emissive_index)
+                    ? material->emissive_factor : glm::vec4(0.0F), error);
         if (!descriptor) {
             if (material_index > 0U) {
                 const std::uint32_t allocated_count =
@@ -4581,6 +4639,8 @@ void Renderer::destroy_scene_resources() noexcept {
         editor_material_descriptor_pool_ = VK_NULL_HANDLE;
     }
     editor_material_descriptor_count_ = 0U;
+    editor_material_emissive_factors_.destroy();
+    editor_material_emissive_stride_ = 0U;
     tessellated_material_count_ = 0U;
     editor_model_assets_.clear();
     editor_texture_assets_.clear();
@@ -4664,18 +4724,19 @@ void Renderer::create_descriptors() {
 #if VCR_EDITOR_ENABLED
     if (authored_scene_enabled_ &&
         editor_material_descriptor_pool_ == VK_NULL_HANDLE) {
-        const VkDescriptorPoolSize material_pool_size{
-            .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .descriptorCount =
-                maximum_editor_material_descriptors * 4U,
+        const std::array material_pool_sizes{
+            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                maximum_editor_material_descriptors * 5U},
+            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                maximum_editor_material_descriptors},
         };
         const VkDescriptorPoolCreateInfo material_pool_info{
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .flags =
                 VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
             .maxSets = maximum_editor_material_descriptors,
-            .poolSizeCount = 1U,
-            .pPoolSizes = &material_pool_size,
+            .poolSizeCount = static_cast<std::uint32_t>(material_pool_sizes.size()),
+            .pPoolSizes = material_pool_sizes.data(),
         };
         VK_CHECK(vkCreateDescriptorPool(
             context_->device(),
@@ -5799,7 +5860,7 @@ void Renderer::record_subsurface(
             camera_near,
             camera_far,
             0.5F * static_cast<float>(extent.height) /
-                std::tan(glm::radians(camera_vertical_fov) * 0.5F),
+                std::tan(glm::radians(vertical_fov_degrees_) * 0.5F),
             0.35F),
         .render_extent = glm::uvec2(extent.width, extent.height),
     };
@@ -6070,7 +6131,10 @@ void Renderer::record_auto_exposure(
         .metering = static_cast<std::uint32_t>(exposure_settings_.metering),
         .reset = exposure_reset_pending_ || raw_delta_seconds > 0.25F ? 1U : 0U,
         .delta_seconds = std::min(raw_delta_seconds, 0.25F),
-        .compensation_ev = exposure_settings_.compensation_ev,
+        .compensation_ev = std::clamp(
+            exposure_settings_.compensation_ev + camera_exposure_offset_ev_,
+            -24.0F,
+            24.0F),
         .minimum_ev = exposure_settings_.minimum_ev,
         .maximum_ev = exposure_settings_.maximum_ev,
         .low_percentile = exposure_settings_.low_percentile,
@@ -6187,7 +6251,7 @@ void Renderer::update_frame_uniform(
     const float aspect =
         static_cast<float>(extent.width) / static_cast<float>(extent.height);
     glm::mat4 unjittered_projection =
-        camera_projection(aspect);
+        camera_projection(aspect, camera_near, camera_far, vertical_fov_degrees_);
     unjittered_projection[1][1] *= -1.0F;
     const glm::mat4 unjittered_view_projection =
         unjittered_projection * view_matrix;
@@ -6524,6 +6588,18 @@ void Renderer::create_pipeline() {
                 .descriptorCount = 1U,
                 .stageFlags = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
                 .pImmutableSamplers = nullptr,
+            },
+            VkDescriptorSetLayoutBinding{
+                .binding = 4U,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = 1U,
+                .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+            },
+            VkDescriptorSetLayoutBinding{
+                .binding = 5U,
+                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .descriptorCount = 1U,
+                .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
             },
         };
         const VkDescriptorSetLayoutCreateInfo material_layout_info{
@@ -10460,6 +10536,11 @@ void Renderer::record_commands(
     if (motion_blur_before_smaa) {
         motion_blur_flags |= 1U << 5U;
     }
+    ExposureSettings effective_exposure = exposure_settings_;
+    effective_exposure.compensation_ev = std::clamp(
+        effective_exposure.compensation_ev + camera_exposure_offset_ev_,
+        -24.0F,
+        24.0F);
     const PostProcessPushConstants post_process_push{
         {1.0F / static_cast<float>(display_extent.width),
          1.0F / static_cast<float>(display_extent.height)},
@@ -10470,7 +10551,7 @@ void Renderer::record_commands(
         lighting_settings_.dynamic && mode_ != RunMode::instancing
             ? static_cast<std::uint32_t>(tone_mapper_) : 0U,
         static_cast<std::uint32_t>(exposure_mode_actual()),
-        fixed_exposure_multiplier(exposure_settings_),
+        fixed_exposure_multiplier(effective_exposure),
         static_cast<std::uint32_t>(color_grading_actual()),
         grading_lut_size(color_grading_lut_size_),
         motion_blur_flags,
@@ -11416,6 +11497,7 @@ void Renderer::record_commands(
                 .display_extent = display_extent,
                 .jitter = current_jitter_,
                 .frame_time_ms = fsr_frame_time_ms_,
+                .vertical_fov_degrees = vertical_fov_degrees_,
             });
             transition_tracked_image(
                 command_buffer,

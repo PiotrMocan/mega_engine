@@ -1,6 +1,7 @@
 #pragma once
 
 #include "asset_preparation.hpp"
+#include "camera_projection.hpp"
 #include "cli_options.hpp"
 #include "device_object.hpp"
 #include "depth_prepass.hpp"
@@ -210,6 +211,36 @@ public:
         return exposure_readback_;
     }
     void request_exposure_reset() noexcept { exposure_reset_pending_ = true; }
+    void set_vertical_fov_degrees(const float degrees) noexcept {
+        vertical_fov_degrees_ = std::isfinite(degrees)
+            ? std::clamp(degrees, minimum_camera_vertical_fov, maximum_camera_vertical_fov)
+            : camera_vertical_fov;
+    }
+    [[nodiscard]] float vertical_fov_degrees() const noexcept {
+        return vertical_fov_degrees_;
+    }
+    void set_camera_exposure_offset_ev(const float offset_ev) noexcept {
+        camera_exposure_offset_ev_ = std::isfinite(offset_ev)
+            ? std::clamp(offset_ev, -24.0F, 24.0F)
+            : 0.0F;
+    }
+    [[nodiscard]] float camera_exposure_offset_ev() const noexcept {
+        return camera_exposure_offset_ev_;
+    }
+    void set_camera_focus_state(const CameraFocusState& state) noexcept {
+        camera_focus_state_ = state;
+    }
+    [[nodiscard]] const CameraFocusState& camera_focus_state() const noexcept {
+        return camera_focus_state_;
+    }
+    void notify_camera_cut() noexcept {
+        invalidate_temporal_history();
+        exposure_reset_pending_ = true;
+        lighting_shadow_initialized_ = false;
+#if VCR_EDITOR_ENABLED
+        shadow_dirty_ = true;
+#endif
+    }
     [[nodiscard]] ColorGrading color_grading() const noexcept {
         return color_grading_;
     }
@@ -796,6 +827,8 @@ private:
         const GpuTexture& normal,
         const GpuTexture& metallic_roughness,
         const GpuTexture& displacement,
+        const GpuTexture& emissive,
+        const glm::vec4& emissive_factor,
         std::string& error);
     [[nodiscard]] std::optional<std::uint32_t>
         find_or_load_editor_model(
@@ -836,6 +869,9 @@ private:
     LightingSettings lighting_settings_{};
     ToneMapper tone_mapper_ = ToneMapper::reinhard;
     ExposureSettings exposure_settings_{};
+    float vertical_fov_degrees_ = camera_vertical_fov;
+    float camera_exposure_offset_ev_ = 0.0F;
+    CameraFocusState camera_focus_state_{};
     ExposureGpuReadback exposure_readback_{};
     FogSettings fog_settings_{};
     ColorGrading color_grading_ = ColorGrading::off;
@@ -911,6 +947,7 @@ private:
     glm::mat4 lighting_shadow_view_{1};
     double lighting_shadow_hour_ = 0;
     float lighting_shadow_aspect_ = 0;
+    float lighting_shadow_fov_ = camera_vertical_fov;
     double gi_light_elapsed_ = 1000.0, gi_geometry_elapsed_ = 1000.0;
     bool gi_geometry_urgent_ = false;
     std::chrono::steady_clock::time_point gi_dirty_since_{};
@@ -1202,6 +1239,10 @@ private:
     GpuTexture editor_default_normal_texture_{};
     GpuTexture editor_default_metallic_roughness_texture_{};
     GpuTexture editor_default_displacement_texture_{};
+    // Append-only, aligned records. A published material's region is immutable
+    // until the descriptor pool is retired at device-idle shutdown.
+    GpuBuffer editor_material_emissive_factors_{};
+    VkDeviceSize editor_material_emissive_stride_ = 0U;
     VkDeviceSize editor_model_gpu_bytes_ = 0U;
     VkDeviceSize editor_texture_gpu_bytes_ = 0U;
     std::uint32_t editor_material_descriptor_count_ = 0U;

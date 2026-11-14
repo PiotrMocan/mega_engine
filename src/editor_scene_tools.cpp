@@ -305,6 +305,12 @@ SceneNodeId duplicate_scene_subtree(
             static_cast<void>(scene.destroy_subtree(duplicate_root));
             return {};
         }
+        if (record.spline &&
+            !scene.set_spline(copy, *record.spline)) {
+            error = "Unable to copy spline component to duplicated node.";
+            static_cast<void>(scene.destroy_subtree(duplicate_root));
+            return {};
+        }
         const bool copy_prefab_link =
             record.prefab_instance.has_value() &&
             (record_index != begin ||

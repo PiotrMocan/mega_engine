@@ -90,12 +90,11 @@
       набор тестов `vcr_game_ui_localization_tests`.
 
 ### Этап 6. Редактор кат-сцен (Sequencer / Timeline) и камеры (**P1**)
-- [ ] Нелинейный `Timeline / Cutscene Sequencer` в `vulkan_editor` со скраббингом:
-      - дорожки трансформаций и свойств с кривыми интерполяции (Bezier / Hermite);
-      - `Camera Cut Track` (смена ракурсов, анимация FOV, экспозиции и фокуса);
-      - дорожки запуска скелетных анимаций, реплик/музыки/SFX, субтитров и событий.
-- [ ] 3D-сплайны (рельсы движения камер и объектов), процедурный `Camera Shake`
-      и плавный блендинг между игровой камерой и кат-сценой.
+- [x] Нелинейный `Timeline / Cutscene Sequencer` в `vulkan_editor` со скраббингом (`CutsceneSequence` / `*.vcrseq.json`, `CutsceneRuntimePlayer`, панель `Sequencer` с мультиканальной лентой, редактором кривых и Live Edit-mode превью):
+      - дорожки трансформаций, сплайнового движения, света, материалов, параметров аниматора и gameplay-переменных с кривыми интерполяции (`Constant` / `Linear` / `Cubic Hermite` / `Cubic Bezier`);
+      - `Camera Cut Track` (смена ракурсов, привязка к `Look-At` цели и рельсовому сплайну, анимация FOV, экспозиции, roll и глубины фокуса `DoF`, letterbox);
+      - дорожки запуска скелетных анимаций, реплик/музыки/SFX, локализованных субтитров и событий, CLI `--cutscene` и поведение `cutscene_trigger`.
+- [x] 3D-сплайны (`SplineComponent` для `Linear` / `Catmull-Rom` / `Cubic Hermite` с замкнутыми контурами, arc-length параметризацией, поведением `spline_mover`, секцией Inspector `3D Spline` и wireframe/frustum-гизмо в viewport), процедурный `Camera Shake` (`CameraShakeSystem`), плавный блендинг между игровой камерой и кат-сценой (`blend_camera_poses`), 3 MCP-инструмента (`editor.scene.set_spline`, `editor.scene.remove_spline`, `editor.sequencer.control`) и набор тестов `vcr_sequencer_camera_tests`.
 
 ### Этап 7. Навигация и искусственный интеллект (**P1**)
 - [ ] Генерация и запекание `NavMesh` по статической геометрии и террейну,

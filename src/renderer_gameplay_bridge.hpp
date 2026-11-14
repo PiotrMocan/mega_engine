@@ -93,6 +93,21 @@ namespace vcr {
         .clear_skinned_poses = +[](void* const ctx) noexcept {
             static_cast<Renderer*>(ctx)->clear_skinned_model_poses();
         },
+        .set_vertical_fov_degrees = +[](void* const ctx,
+                                        const float degrees) noexcept {
+            static_cast<Renderer*>(ctx)->set_vertical_fov_degrees(degrees);
+        },
+        .set_camera_exposure_offset_ev = +[](void* const ctx,
+                                             const float offset_ev) noexcept {
+            static_cast<Renderer*>(ctx)->set_camera_exposure_offset_ev(offset_ev);
+        },
+        .set_camera_focus_state = +[](void* const ctx,
+                                      const CameraFocusState& state) noexcept {
+            static_cast<Renderer*>(ctx)->set_camera_focus_state(state);
+        },
+        .notify_camera_cut = +[](void* const ctx) noexcept {
+            static_cast<Renderer*>(ctx)->notify_camera_cut();
+        },
     };
 #else
     (void)renderer;

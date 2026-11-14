@@ -3,6 +3,7 @@
 #include "cooked_audio_asset.hpp"
 #include "cooked_model_asset.hpp"
 #include "cooked_texture_asset.hpp"
+#include "cutscene_sequencer.hpp"
 #include "game_overlay.hpp"
 #include "localization.hpp"
 #include "runtime_assets.hpp"
@@ -166,6 +167,7 @@ private:
     std::vector<std::filesystem::path> scenes;
     std::vector<std::filesystem::path> fonts;
     std::vector<std::filesystem::path> localizations;
+    std::vector<std::filesystem::path> cutscenes;
     for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
         if (++file_count > 1'000'000U) {
             error = "Project content exceeds the shipping file limit.";
@@ -188,9 +190,11 @@ private:
             (*rel.begin() == "localization" && ext == ".json");
         const bool dialogue = name.ends_with(".vcrdlg.json") ||
             (*rel.begin() == "dialogues" && ext == ".json");
+        const bool cutscene = name.ends_with(".vcrseq.json") ||
+            (*rel.begin() == "cutscenes" && ext == ".json");
         const bool font = name.ends_with(".vcrfont.json");
         const bool metadata = texture || model || audio || scene || config ||
-            localization || dialogue || font ||
+            localization || dialogue || cutscene || font ||
             name.ends_with(".vcrmaterial.json") || name.ends_with(".vcrprefab.json") ||
             name.ends_with(".vcrcue.json");
         if (ext == ".wav" || ext == ".ogg" || ext == ".flac") {
@@ -242,6 +246,14 @@ private:
                 localizations.push_back(rel);
             } else if (dialogue) {
                 // Keep localized dialogue graph JSON files intact.
+            } else if (cutscene) {
+                CutsceneSequence cs_check;
+                if (!load_cutscene_sequence_file(root, name, cs_check, error)) {
+                    error = "Shipping cutscene validation failed for '" + name + "': " + error;
+                    return false;
+                }
+                if (!copy_audio_references(doc, root, target, error)) return false;
+                cutscenes.push_back(rel);
             } else if (font) {
                 if (!doc.contains("image") || !doc["image"].is_string() ||
                     doc["image"].get_ref<const std::string&>().empty()) {
@@ -295,6 +307,13 @@ private:
         GameUiFontAtlas font_verify;
         if (!load_game_ui_font_atlas_file(target / font_rel, font_verify, &error)) {
             error = "Shipping font validation failed for '" + utf8(font_rel) + "': " + error;
+            return false;
+        }
+    }
+    for (const auto& cs_rel : cutscenes) {
+        CutsceneSequence cs_verify;
+        if (!load_cutscene_sequence_file(target, utf8(cs_rel), cs_verify, error)) {
+            error = "Shipping cutscene validation failed for '" + utf8(cs_rel) + "': " + error;
             return false;
         }
     }
@@ -385,6 +404,7 @@ bool ship_project(
         BundleProjectRuntimeResult bundled;
         if (!bundle_project_runtime(staging_path, bundled, error, runtime)) return false;
         // Bundle Runtime also supports development projects. Ship drops the SDK.
+        std::filesystem::remove_all(staging_path / "engine/include");
         std::filesystem::remove_all(staging_path / "engine/lib");
         std::filesystem::remove_all(staging_path / "engine/cmake");
         if (!manifest.game_module.empty()) {
