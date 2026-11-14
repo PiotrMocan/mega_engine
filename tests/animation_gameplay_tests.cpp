@@ -807,9 +807,12 @@ void test_animator_runtime_integration() {
         !segs.empty() && has_ik_markers,
         "collect_debug_skeleton_segments outputs bone segments and IK markers");
 
+    expect(
+        !runtime.has_any_active_preview(),
+        "AnimatorRuntimeSystem reports no active preview before set_preview");
     runtime.set_preview(hero, "idle", false, 0.5F);
     expect(
-        runtime.has_active_preview(hero),
+        runtime.has_active_preview(hero) && runtime.has_any_active_preview(),
         "AnimatorRuntimeSystem tracks Edit-mode preview override");
     runtime.update(0.0F, doc, nullptr, nullptr, provider, nullptr, {}, true, nullptr);
     expect(
@@ -817,8 +820,14 @@ void test_animator_runtime_integration() {
         "Edit-mode preview scrubs clip time cleanly");
     runtime.clear_preview(hero);
     expect(
-        !runtime.has_active_preview(hero),
+        !runtime.has_active_preview(hero) && !runtime.has_any_active_preview(),
         "clear_preview clears Edit-mode preview state");
+    reg.pose_removed = false;
+    expect(doc.remove_animator(hero), "removed hero AnimatorComponent");
+    runtime.update(0.016F, doc, nullptr, nullptr, provider, nullptr, {}, true, nullptr);
+    expect(
+        reg.pose_removed && runtime.node_runtime(hero) == nullptr,
+        "AnimatorRuntimeSystem cleans up stale pose when zero animators remain in scene");
 }
 
 void test_gameplay_world_and_save_load(const std::filesystem::path& dir) {

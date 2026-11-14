@@ -414,6 +414,7 @@ bool GameplaySession::start(
     }
 
     scene.build_world_nodes(cached_world_nodes_, world_ancestor_scratch_);
+    cached_scene_instance_id_ = scene.instance_id();
     cached_content_revision_ = scene.content_revision();
     cached_structure_revision_ = scene.structure_revision();
     runtime_audio_nodes_.reserve(scene.audio_sources().size() + 8U);
@@ -454,6 +455,7 @@ bool GameplaySession::start(
         }
         transform_registry_.propagate_hierarchy();
         scene.build_world_nodes(cached_world_nodes_, world_ancestor_scratch_);
+        cached_scene_instance_id_ = scene.instance_id();
         cached_content_revision_ = scene.content_revision();
         cached_structure_revision_ = scene.structure_revision();
     }
@@ -698,7 +700,8 @@ bool GameplaySession::update_internal(
         0.0F,
         maximum_session_delta_seconds);
 
-    if (scene.content_revision() != cached_content_revision_ ||
+    if (scene.instance_id() != cached_scene_instance_id_ ||
+        scene.content_revision() != cached_content_revision_ ||
         scene.structure_revision() != cached_structure_revision_) {
         const ModelBoundsProvider bounds_provider =
             renderer_bridge != nullptr
@@ -726,6 +729,7 @@ bool GameplaySession::update_internal(
             &physics_world_,
             &animator_runtime_,
             audio_engine);
+        cached_scene_instance_id_ = scene.instance_id();
         cached_content_revision_ = scene.content_revision();
         cached_structure_revision_ = scene.structure_revision();
     }
@@ -1657,6 +1661,7 @@ void GameplaySession::stop(
     player_node_ = {};
     owns_player_cube_ = false;
     player_initial_scale_ = glm::vec3(1.0F);
+    cached_scene_instance_id_ = 0U;
     cached_content_revision_ = 0U;
     cached_structure_revision_ = 0U;
     default_camera_look_enabled_ = true;

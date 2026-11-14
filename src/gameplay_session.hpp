@@ -403,6 +403,7 @@ private:
     bool has_prev_listener_position_ = false;
     SceneNodeId player_node_{};
     bool owns_player_cube_ = false;
+    std::uint64_t cached_scene_instance_id_ = 0U;
     std::uint64_t cached_content_revision_ = 0U;
     std::uint64_t cached_structure_revision_ = 0U;
     bool default_camera_look_enabled_ = true;

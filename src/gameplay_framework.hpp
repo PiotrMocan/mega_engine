@@ -170,6 +170,7 @@ public:
         std::optional<bool> looping_override = std::nullopt);
     void clear_preview(SceneNodeId id) noexcept;
     [[nodiscard]] bool has_active_preview(SceneNodeId id) const noexcept;
+    [[nodiscard]] bool has_any_active_preview() const noexcept;
 
     void set_param_override(
         SceneNodeId id,

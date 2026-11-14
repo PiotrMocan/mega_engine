@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <limits>
 #include <utility>
@@ -11,6 +12,13 @@
 
 namespace vcr {
 namespace {
+
+[[nodiscard]] std::uint64_t next_document_instance_id() noexcept {
+    // Relaxed ordering suffices: only uniqueness of monotonic IDs is needed;
+    // SceneDocument instances follow single-writer ownership.
+    static std::atomic<std::uint64_t> counter{1U};
+    return counter.fetch_add(1U, std::memory_order_relaxed);
+}
 
 [[nodiscard]] std::size_t hash_scene_uuid(const SceneUuid uuid) noexcept {
     std::uint64_t mixed =
@@ -156,6 +164,27 @@ std::optional<SceneCameraPose> SceneDocument::startup_camera_pose() const noexce
         glm::vec3(world[3]),
         static_cast<float>(std::atan2(forward.z, forward.x)),
         static_cast<float>(std::asin(std::clamp(forward.y, -1.0, 1.0)))};
+}
+
+SceneDocument::DocumentStamp::DocumentStamp() noexcept
+    : value_(next_document_instance_id()) {}
+
+SceneDocument::DocumentStamp::DocumentStamp(const DocumentStamp&) noexcept
+    : value_(next_document_instance_id()) {}
+
+SceneDocument::DocumentStamp::DocumentStamp(DocumentStamp&&) noexcept
+    : value_(next_document_instance_id()) {}
+
+SceneDocument::DocumentStamp& SceneDocument::DocumentStamp::operator=(
+    const DocumentStamp&) noexcept {
+    value_ = next_document_instance_id();
+    return *this;
+}
+
+SceneDocument::DocumentStamp& SceneDocument::DocumentStamp::operator=(
+    DocumentStamp&&) noexcept {
+    value_ = next_document_instance_id();
+    return *this;
 }
 
 SceneDocument::SceneDocument() {
@@ -1024,6 +1053,10 @@ void SceneDocument::build_node_records(
 void SceneDocument::build_world_nodes(
     std::vector<SceneWorldNode>& output,
     std::vector<std::uint32_t>& ancestor_scratch) const {
+    constexpr std::uint32_t ancestor_cache_valid_bit = 1U << 31U;
+    constexpr std::uint32_t ancestor_index_mask = ~ancestor_cache_valid_bit;
+    static_assert(max_scene_nodes <= ancestor_index_mask);
+
     output.clear();
     ancestor_scratch.clear();
     if (output.capacity() < live_count_) {
@@ -1037,23 +1070,43 @@ void SceneDocument::build_world_nodes(
     std::uint32_t depth = 0U;
     while (index != invalid_scene_node_index) {
         const Slot& slot = slots_[index];
-        bool world_visible = slot.value.visible;
+        const bool parent_cache_valid =
+            (depth == 0U) ||
+            ((ancestor_scratch[depth - 1U] & ancestor_cache_valid_bit) != 0U);
+        const SceneNodeId parent_id = id_for_index(slot.parent);
+        const std::uint64_t parent_revision =
+            parent_id ? slots_[slot.parent].world_revision : 0U;
+        const bool slot_cache_valid =
+            parent_cache_valid &&
+            slot.world_revision != 0U &&
+            slot.cached_transform == slot.value.transform &&
+            slot.cached_visible == slot.value.visible &&
+            slot.cached_parent == parent_id &&
+            slot.cached_parent_revision == parent_revision;
+
+        bool world_visible = false;
         glm::mat4 world_matrix(1.0F);
-        if (!finite_transform(slot.value.transform)) {
-            world_visible = false;
+        if (slot_cache_valid) {
+            world_matrix = slot.world_matrix;
+            world_visible = slot.world_visible;
         } else {
-            world_matrix = local_matrix(slot.value.transform);
-            if (depth > 0U) {
-                const SceneWorldNode& parent_world =
-                    output[ancestor_scratch[depth - 1U]];
-                world_matrix =
-                    parent_world.world_matrix * world_matrix;
-                world_visible =
-                    world_visible && parent_world.world_visible;
-            }
-            if (!finite_matrix(world_matrix)) {
-                world_matrix = glm::mat4(1.0F);
+            world_visible = slot.value.visible;
+            if (!finite_transform(slot.value.transform)) {
                 world_visible = false;
+            } else {
+                world_matrix = local_matrix(slot.value.transform);
+                if (depth > 0U) {
+                    const SceneWorldNode& parent_world = output
+                        [ancestor_scratch[depth - 1U] & ancestor_index_mask];
+                    world_matrix =
+                        parent_world.world_matrix * world_matrix;
+                    world_visible =
+                        world_visible && parent_world.world_visible;
+                }
+                if (!finite_matrix(world_matrix)) {
+                    world_matrix = glm::mat4(1.0F);
+                    world_visible = false;
+                }
             }
         }
         const auto record_index =
@@ -1065,10 +1118,12 @@ void SceneDocument::build_world_nodes(
             .kind = slot.value.kind,
             .world_visible = world_visible,
         });
+        const std::uint32_t encoded_ancestor =
+            record_index | (slot_cache_valid ? ancestor_cache_valid_bit : 0U);
         if (ancestor_scratch.size() <= depth) {
-            ancestor_scratch.push_back(record_index);
+            ancestor_scratch.push_back(encoded_ancestor);
         } else {
-            ancestor_scratch[depth] = record_index;
+            ancestor_scratch[depth] = encoded_ancestor;
         }
         index = traversal_next(index, depth, true);
     }

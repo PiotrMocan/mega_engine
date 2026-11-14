@@ -21,6 +21,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace vcr {
@@ -415,10 +416,30 @@ public:
     [[nodiscard]] std::uint64_t content_revision() const noexcept {
         return content_revision_;
     }
+    [[nodiscard]] std::uint64_t instance_id() const noexcept {
+        return instance_stamp_.value();
+    }
 
     [[nodiscard]] static SceneDocument make_default();
 
 private:
+    class DocumentStamp final {
+    public:
+        DocumentStamp() noexcept;
+        DocumentStamp(const DocumentStamp&) noexcept;
+        DocumentStamp(DocumentStamp&&) noexcept;
+        DocumentStamp& operator=(const DocumentStamp&) noexcept;
+        DocumentStamp& operator=(DocumentStamp&&) noexcept;
+        ~DocumentStamp() = default;
+
+        [[nodiscard]] std::uint64_t value() const noexcept {
+            return value_;
+        }
+
+    private:
+        std::uint64_t value_ = 0U;
+    };
+
     struct Slot {
         SceneUuid uuid{};
         SceneNode value{};
@@ -516,7 +537,12 @@ private:
     std::uint32_t last_transform_updates_ = 0;
     std::uint64_t structure_revision_ = 1U;
     std::uint64_t content_revision_ = 1U;
+    DocumentStamp instance_stamp_{};
 };
+
+static_assert(
+    std::is_nothrow_move_constructible_v<SceneDocument> &&
+    std::is_nothrow_move_assignable_v<SceneDocument>);
 
 [[nodiscard]] std::string_view to_string(
     SceneNodeKind kind) noexcept;

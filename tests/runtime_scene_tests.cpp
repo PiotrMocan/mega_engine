@@ -529,6 +529,63 @@ int main() {
     expect(scene.reparent(child, {}), "reparent succeeds");
     static_cast<void>(scene.build_render_view(cubes, models, lights));
     expect(cubes[0].model_row_0.w == 0, "reparent invalidates cached world transform");
+    {
+        vcr::SceneDocument stamped_a;
+        const std::uint64_t id_a = stamped_a.instance_id();
+        expect(id_a != 0U, "SceneDocument instance_id is non-zero");
+        const vcr::SceneDocument stamped_copy(stamped_a);
+        const std::uint64_t id_copy = stamped_copy.instance_id();
+        expect(id_copy > id_a, "copy-constructed SceneDocument receives fresh instance_id");
+        vcr::SceneDocument stamped_moved(std::move(stamped_a));
+        const std::uint64_t id_moved = stamped_moved.instance_id();
+        expect(id_moved > id_copy, "move-constructed SceneDocument receives fresh instance_id");
+        vcr::SceneDocument stamped_b;
+        const std::uint64_t id_b_before = stamped_b.instance_id();
+        stamped_b = stamped_copy;
+        expect(stamped_b.instance_id() > id_b_before,
+               "copy-assigned SceneDocument receives fresh instance_id");
+        const std::uint64_t id_b_after_copy = stamped_b.instance_id();
+        stamped_b = std::move(stamped_moved);
+        expect(stamped_b.instance_id() > id_b_after_copy,
+               "move-assigned SceneDocument receives fresh instance_id");
+
+        vcr::SceneDocument world_doc;
+        const auto wp = world_doc.create_node("world_parent", vcr::SceneNodeKind::folder);
+        const auto wc = world_doc.create_node("world_child", vcr::SceneNodeKind::cube, wp);
+        world_doc.node(wp)->get().transform.translation = {2.0F, 3.0F, -1.0F};
+        world_doc.node(wp)->get().transform.rotation_degrees = {0.0F, 90.0F, 0.0F};
+        world_doc.node(wc)->get().transform.translation = {0.0F, 0.0F, 4.0F};
+        std::vector<vcr::SceneWorldNode> wn_uncached;
+        std::vector<vcr::SceneWorldNode> wn_cached;
+        std::vector<std::uint32_t> scratch;
+        world_doc.build_world_nodes(wn_uncached, scratch);
+        expect(world_doc.last_transform_updates() == 0U && wn_uncached.size() == 2U,
+               "build_world_nodes does not mutate Slot update counter before build_render_view");
+        static_cast<void>(world_doc.build_render_view(cubes, models, lights));
+        expect(world_doc.last_transform_updates() == 2U,
+               "build_render_view still detects both initial transforms after build_world_nodes");
+        world_doc.build_world_nodes(wn_cached, scratch);
+        expect(world_doc.last_transform_updates() == 2U && wn_cached.size() == wn_uncached.size(),
+               "build_world_nodes preserves last_transform_updates on cached path");
+        for (std::size_t wi = 0U; wi < wn_uncached.size(); ++wi) {
+            expect(wn_cached[wi].id == wn_uncached[wi].id &&
+                   wn_cached[wi].world_visible == wn_uncached[wi].world_visible &&
+                   wn_cached[wi].world_matrix == wn_uncached[wi].world_matrix,
+                   "cached build_world_nodes matches uncached slow path");
+        }
+        world_doc.node(wp)->get().transform.translation.x = 10.0F;
+        world_doc.node(wc)->get().visible = false;
+        world_doc.build_world_nodes(wn_cached, scratch);
+        expect(std::abs(wn_cached[0].world_matrix[3][0] - 10.0F) < 1.0e-4F &&
+               std::abs(wn_cached[1].world_matrix[3][0] - 14.0F) < 1.0e-4F &&
+               wn_cached[0].world_visible &&
+               !wn_cached[1].world_visible,
+               "build_world_nodes reflects dirty ancestor transform and child visibility prior to build_render_view");
+        expect(world_doc.reparent(wc, {}), "world_doc reparent succeeds");
+        world_doc.build_world_nodes(wn_cached, scratch);
+        expect(wn_cached[1].world_matrix[3][0] == 0.0F && wn_cached[1].world_matrix[3][2] == 4.0F,
+               "build_world_nodes reflects reparent prior to build_render_view");
+    }
     vcr::CookedModelAsset model;
     constexpr unsigned side = 24;
     for (unsigned y = 0; y <= side; ++y) {

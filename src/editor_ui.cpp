@@ -209,6 +209,11 @@ struct SequencerEditorUiState {
         rail_u = 4U,
     };
 
+    struct CachedCameraWireframe {
+        SceneNodeId id{};
+        glm::mat4 world_matrix{1.0F};
+    };
+
     CutsceneSequence sequence{};
     std::string relative_path{};
     std::array<char, max_scene_asset_path_bytes + 1U> path_buffer{};
@@ -232,6 +237,10 @@ struct SequencerEditorUiState {
     std::vector<SceneNodeId> previewed_anim_nodes{};
     std::vector<SceneWorldNode> wireframe_world_nodes{};
     std::vector<std::uint32_t> wireframe_ancestors{};
+    std::vector<CachedCameraWireframe> wireframe_cameras{};
+    std::uint64_t wireframe_scene_instance_id = 0U;
+    std::uint64_t wireframe_content_revision = 0U;
+    std::uint64_t wireframe_structure_revision = 0U;
     CutsceneEvalScratch eval_scratch{};
     CutsceneFrameResult last_eval_frame{};
     std::vector<std::string> available_files{};
@@ -273,6 +282,10 @@ struct SequencerEditorUiState {
         selected_key_index = 0U;
         eval_scratch.reset_frame_state();
         last_eval_frame = {};
+        wireframe_cameras.clear();
+        wireframe_scene_instance_id = 0U;
+        wireframe_content_revision = 0U;
+        wireframe_structure_revision = 0U;
         sync_buffers();
     }
 
@@ -5471,8 +5484,7 @@ void draw_spline_and_camera_wireframe(
     const ImVec2 image_minimum,
     const float image_width,
     const float image_height,
-    std::vector<SceneWorldNode>& world_nodes_scratch,
-    std::vector<std::uint32_t>& ancestors_scratch) noexcept {
+    SequencerEditorUiState& sequencer_state) {
     if (draw_list == nullptr ||
         image_width <= 1.0F ||
         image_height <= 1.0F) {
@@ -5562,28 +5574,42 @@ void draw_spline_and_camera_wireframe(
         }
     }
 
-    world_nodes_scratch.clear();
-    ancestors_scratch.clear();
-    scene.build_world_nodes(world_nodes_scratch, ancestors_scratch);
-    for (const SceneWorldNode& wn : world_nodes_scratch) {
-        if (wn.kind != SceneNodeKind::camera || !wn.world_visible) {
-            continue;
+    if (sequencer_state.wireframe_scene_instance_id != scene.instance_id() ||
+        sequencer_state.wireframe_content_revision != scene.content_revision() ||
+        sequencer_state.wireframe_structure_revision != scene.structure_revision()) {
+        sequencer_state.wireframe_cameras.clear();
+        scene.build_world_nodes(
+            sequencer_state.wireframe_world_nodes,
+            sequencer_state.wireframe_ancestors);
+        for (const SceneWorldNode& wn : sequencer_state.wireframe_world_nodes) {
+            if (wn.kind == SceneNodeKind::camera && wn.world_visible) {
+                sequencer_state.wireframe_cameras.push_back(
+                    SequencerEditorUiState::CachedCameraWireframe{
+                        .id = wn.id,
+                        .world_matrix = wn.world_matrix,
+                    });
+            }
         }
-        const bool is_selected = wn.id == selected_node;
+        sequencer_state.wireframe_scene_instance_id = scene.instance_id();
+        sequencer_state.wireframe_content_revision = scene.content_revision();
+        sequencer_state.wireframe_structure_revision = scene.structure_revision();
+    }
+    for (const auto& cam : sequencer_state.wireframe_cameras) {
+        const bool is_selected = cam.id == selected_node;
         const ImU32 cam_color = is_selected
             ? IM_COL32(255, 224, 96, 240)
             : IM_COL32(150, 210, 235, 175);
-        const glm::vec3 origin = glm::vec3(wn.world_matrix[3]);
+        const glm::vec3 origin = glm::vec3(cam.world_matrix[3]);
         const auto safe_norm = [](const glm::vec3 v, const glm::vec3 fb) noexcept {
             const float ls = glm::dot(v, v);
             return ls > 1.0e-6F ? v / std::sqrt(ls) : fb;
         };
         const glm::vec3 right = safe_norm(
-            glm::vec3(wn.world_matrix[0]), glm::vec3(1.0F, 0.0F, 0.0F));
+            glm::vec3(cam.world_matrix[0]), glm::vec3(1.0F, 0.0F, 0.0F));
         const glm::vec3 up = safe_norm(
-            glm::vec3(wn.world_matrix[1]), glm::vec3(0.0F, 1.0F, 0.0F));
+            glm::vec3(cam.world_matrix[1]), glm::vec3(0.0F, 1.0F, 0.0F));
         const glm::vec3 fwd = safe_norm(
-            -glm::vec3(wn.world_matrix[2]), glm::vec3(0.0F, 0.0F, -1.0F));
+            -glm::vec3(cam.world_matrix[2]), glm::vec3(0.0F, 0.0F, -1.0F));
 
         constexpr float depth = 0.9F;
         constexpr float hw = 0.45F;
@@ -5914,8 +5940,7 @@ void EditorUi::build_viewport(
             image_minimum,
             image_width,
             image_height,
-            sequencer_ui_->wireframe_world_nodes,
-            sequencer_ui_->wireframe_ancestors);
+            *sequencer_ui_);
     }
 
     if (play_state_ == EditorPlayState::edit &&

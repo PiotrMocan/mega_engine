@@ -740,7 +740,8 @@ void EditorApplication::initialize(const CliOptions& options) {
     if (!renderer_.set_motion_blur_settings(options.motion_blur)) {
         fatal("Invalid motion blur settings for the selected AA mode");
     }
-    if (!renderer_.set_depth_prepass(options.depth_prepass)) {
+    if (!renderer_.set_depth_prepass(
+            options.depth_prepass, options.depth_prepass_override)) {
         fatal("Invalid depth prepass mode");
     }
     if (!renderer_.set_lod_fade(options.lod_fade, options.lod_fade_seconds)) {
@@ -955,6 +956,24 @@ void EditorApplication::main_loop() {
                 }
                 const SkeletalAssetProvider skeletal_provider =
                     make_renderer_skeletal_provider(&renderer_);
+                std::span<const SceneWorldNode> preview_world_nodes{};
+                if (!scene_.animators().owners().empty() &&
+                    edit_animator_preview_.has_any_active_preview()) {
+                    if (edit_world_instance_id_ != scene_.instance_id() ||
+                        edit_world_content_revision_ !=
+                            scene_.content_revision() ||
+                        edit_world_structure_revision_ !=
+                            scene_.structure_revision()) {
+                        scene_.build_world_nodes(
+                            edit_world_nodes_, edit_world_ancestors_);
+                        edit_world_instance_id_ = scene_.instance_id();
+                        edit_world_content_revision_ =
+                            scene_.content_revision();
+                        edit_world_structure_revision_ =
+                            scene_.structure_revision();
+                    }
+                    preview_world_nodes = edit_world_nodes_;
+                }
                 edit_animator_preview_.update(
                     delta_seconds,
                     scene_,
@@ -962,7 +981,7 @@ void EditorApplication::main_loop() {
                     nullptr,
                     skeletal_provider,
                     audio_engine_.initialized() ? &audio_engine_ : nullptr,
-                    {},
+                    preview_world_nodes,
                     true);
                 audio_engine_.set_listener(AudioListenerState{
                     .position = camera_.position(),
@@ -3518,7 +3537,8 @@ void EditorApplication::complete_mcp_screenshot() {
 }
 
 void EditorApplication::update_scene_snapshot() {
-    if (submitted_scene_revision_ ==
+    if (submitted_scene_instance_id_ == scene_.instance_id() &&
+        submitted_scene_revision_ ==
             scene_.content_revision() &&
         !renderer_.editor_scene_needs_sync()) {
         return;
@@ -3531,6 +3551,7 @@ void EditorApplication::update_scene_snapshot() {
             view, ui_.asset_root(), asset_error)) {
         ui_.report_asset_error(std::move(asset_error));
     }
+    submitted_scene_instance_id_ = scene_.instance_id();
     submitted_scene_revision_ = view.revision;
 }
 

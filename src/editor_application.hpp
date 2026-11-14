@@ -90,11 +90,17 @@ private:
     std::vector<SceneGpuInstance> scene_instances_{};
     std::vector<SceneModelInstance> scene_models_{};
     std::vector<ScenePunctualLight> scene_lights_{};
+    std::vector<SceneWorldNode> edit_world_nodes_{};
+    std::vector<std::uint32_t> edit_world_ancestors_{};
     CliOptions options_{};
     std::string project_name_{};
     McpControlPlane mcp_control_{};
     McpServer mcp_server_{mcp_control_, McpServerProfile::editor};
+    std::uint64_t submitted_scene_instance_id_ = 0U;
     std::uint64_t submitted_scene_revision_ = 0U;
+    std::uint64_t edit_world_instance_id_ = 0U;
+    std::uint64_t edit_world_content_revision_ = 0U;
+    std::uint64_t edit_world_structure_revision_ = 0U;
     EditorPlayState observed_play_state_ = EditorPlayState::edit;
     std::uint32_t main_window_id_ = 0U;
     bool running_ = false;

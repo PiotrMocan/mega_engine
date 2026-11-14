@@ -1027,6 +1027,15 @@ bool AnimatorRuntimeSystem::has_active_preview(
     return rt != nullptr && rt->preview_override;
 }
 
+bool AnimatorRuntimeSystem::has_any_active_preview() const noexcept {
+    return std::any_of(
+        nodes_.begin(),
+        nodes_.end(),
+        [](const AnimatorNodeRuntime& rt) noexcept {
+            return rt.preview_override;
+        });
+}
+
 void AnimatorRuntimeSystem::set_param_override(
     const SceneNodeId id,
     const float param_x,
@@ -1069,10 +1078,7 @@ void AnimatorRuntimeSystem::update(
     const bool preview_only_mode,
     const RuntimeTransformSink* const transform_sink) {
     active_ids_scratch_.clear();
-    if (cached_world_nodes.empty()) {
-        scene.build_world_nodes(local_world_scratch_, ancestor_scratch_);
-        cached_world_nodes = local_world_scratch_;
-    }
+    bool local_world_built = false;
 
     const float raw_dt = std::isfinite(delta_seconds) ? delta_seconds : 0.0F;
     const float dt = std::clamp(raw_dt, 0.0F, 0.1F);
@@ -1094,25 +1100,6 @@ void AnimatorRuntimeSystem::update(
             provider.remove(id);
             continue;
         }
-        bool world_visible = false;
-        const glm::mat4 node_world =
-            find_node_world_matrix(id, cached_world_nodes, node, world_visible);
-        if (!world_visible) {
-            if (AnimatorNodeRuntime* const hidden_rt = find_runtime_mut(id)) {
-                hidden_rt->skin_submitted = false;
-            }
-            provider.remove(id);
-            continue;
-        }
-        const CookedSkeletonAsset* skeleton = provider.skeleton(node.asset_path);
-        if (skeleton == nullptr || skeleton->empty()) {
-            if (AnimatorNodeRuntime* const invalid_rt = find_runtime_mut(id)) {
-                invalid_rt->skin_submitted = false;
-            }
-            provider.remove(id);
-            continue;
-        }
-
         if (preview_only_mode) {
             AnimatorNodeRuntime* const existing = find_runtime_mut(id);
             if (existing == nullptr || !existing->preview_override) {
@@ -1122,6 +1109,29 @@ void AnimatorRuntimeSystem::update(
                 provider.remove(id);
                 continue;
             }
+        }
+        const CookedSkeletonAsset* skeleton = provider.skeleton(node.asset_path);
+        if (skeleton == nullptr || skeleton->empty()) {
+            if (AnimatorNodeRuntime* const invalid_rt = find_runtime_mut(id)) {
+                invalid_rt->skin_submitted = false;
+            }
+            provider.remove(id);
+            continue;
+        }
+        if (cached_world_nodes.empty() && !local_world_built) {
+            scene.build_world_nodes(local_world_scratch_, ancestor_scratch_);
+            cached_world_nodes = local_world_scratch_;
+            local_world_built = true;
+        }
+        bool world_visible = false;
+        const glm::mat4 node_world =
+            find_node_world_matrix(id, cached_world_nodes, node, world_visible);
+        if (!world_visible) {
+            if (AnimatorNodeRuntime* const hidden_rt = find_runtime_mut(id)) {
+                hidden_rt->skin_submitted = false;
+            }
+            provider.remove(id);
+            continue;
         }
 
         const SceneUuid uuid = scene.uuid(id).value_or(SceneUuid{});
