@@ -665,6 +665,14 @@ TransformRows compose_transform_rows(
     };
 }
 
+AnimatorRuntimeSystem::AnimatorRuntimeSystem() {
+    nodes_.reserve(32U);
+    active_ids_scratch_.reserve(32U);
+    local_world_scratch_.reserve(256U);
+    ancestor_scratch_.reserve(256U);
+    audio_error_scratch_.reserve(256U);
+}
+
 void AnimatorRuntimeSystem::clear(
     const SkeletalAssetProvider* const provider) noexcept {
     if (provider != nullptr) {
@@ -733,6 +741,9 @@ AnimatorNodeRuntime& AnimatorRuntimeSystem::get_or_create_runtime(
             existing->fsm_initialized = false;
             existing->ik_bones_cached = false;
             existing->active_hitbox = false;
+            existing->dirty = true;
+            existing->initialized_once = false;
+            existing->skin_submitted = false;
             existing->cached_mask_bone.clear();
             if (had_previous_asset) {
                 existing->current_time = 0.0F;
@@ -744,12 +755,22 @@ AnimatorNodeRuntime& AnimatorRuntimeSystem::get_or_create_runtime(
         }
         return *existing;
     }
-    nodes_.push_back(AnimatorNodeRuntime{
-        .node_id = id,
-        .node_uuid = uuid,
-        .asset_path = std::string(asset_path),
-    });
-    return nodes_.back();
+    nodes_.emplace_back();
+    AnimatorNodeRuntime& created = nodes_.back();
+    created.node_id = id;
+    created.node_uuid = uuid;
+    created.asset_path.reserve(128U);
+    created.asset_path.assign(asset_path);
+    created.cached_mask_bone.reserve(64U);
+    created.preview_clip_name.reserve(64U);
+    created.root_motion_bone_name.reserve(64U);
+    created.cached_clip_name.reserve(64U);
+    created.cached_secondary_clip.reserve(64U);
+    created.cached_upper_bone_input.reserve(64U);
+    created.dirty = true;
+    created.initialized_once = false;
+    created.skin_submitted = false;
+    return created;
 }
 
 void AnimatorRuntimeSystem::set_preview(
@@ -766,6 +787,7 @@ void AnimatorRuntimeSystem::set_preview(
     rt.preview_clip_name.assign(clip_name);
     rt.preview_playing = playing;
     rt.preview_looping_override = looping_override;
+    rt.dirty = true;
     if (std::isfinite(time_seconds) && time_seconds >= 0.0F) {
         rt.current_time = time_seconds;
         if (rt.last_clip_duration > 1.0e-5F) {
@@ -781,6 +803,7 @@ void AnimatorRuntimeSystem::clear_preview(const SceneNodeId id) noexcept {
         rt->preview_clip_name.clear();
         rt->preview_playing = false;
         rt->preview_looping_override.reset();
+        rt->dirty = true;
     }
 }
 
@@ -795,9 +818,16 @@ void AnimatorRuntimeSystem::set_param_override(
     const float param_x,
     const float param_y) noexcept {
     if (AnimatorNodeRuntime* rt = find_runtime_mut(id)) {
+        const float px = std::isfinite(param_x) ? param_x : 0.0F;
+        const float py = std::isfinite(param_y) ? param_y : 0.0F;
+        if (!rt->param_override_active ||
+            rt->override_param_x != px ||
+            rt->override_param_y != py) {
+            rt->dirty = true;
+        }
         rt->param_override_active = true;
-        rt->override_param_x = std::isfinite(param_x) ? param_x : 0.0F;
-        rt->override_param_y = std::isfinite(param_y) ? param_y : 0.0F;
+        rt->override_param_x = px;
+        rt->override_param_y = py;
     }
 }
 
@@ -808,7 +838,10 @@ void AnimatorRuntimeSystem::set_root_motion_bone(
         return;
     }
     AnimatorNodeRuntime& rt = get_or_create_runtime(id, SceneUuid{}, {});
-    rt.root_motion_bone_name.assign(bone_name);
+    if (rt.root_motion_bone_name != bone_name) {
+        rt.root_motion_bone_name.assign(bone_name);
+        rt.dirty = true;
+    }
 }
 
 void AnimatorRuntimeSystem::update(
@@ -851,18 +884,27 @@ void AnimatorRuntimeSystem::update(
         const glm::mat4 node_world =
             find_node_world_matrix(id, cached_world_nodes, node, world_visible);
         if (!world_visible) {
+            if (AnimatorNodeRuntime* const hidden_rt = find_runtime_mut(id)) {
+                hidden_rt->skin_submitted = false;
+            }
             provider.remove(id);
             continue;
         }
         const CookedSkeletonAsset* skeleton = provider.skeleton(node.asset_path);
         if (skeleton == nullptr || skeleton->empty()) {
+            if (AnimatorNodeRuntime* const invalid_rt = find_runtime_mut(id)) {
+                invalid_rt->skin_submitted = false;
+            }
             provider.remove(id);
             continue;
         }
 
         if (preview_only_mode) {
-            const AnimatorNodeRuntime* existing = node_runtime(id);
+            AnimatorNodeRuntime* const existing = find_runtime_mut(id);
             if (existing == nullptr || !existing->preview_override) {
+                if (existing != nullptr) {
+                    existing->skin_submitted = false;
+                }
                 provider.remove(id);
                 continue;
             }
@@ -883,6 +925,40 @@ void AnimatorRuntimeSystem::update(
             rt.ik_bones_cached = true;
         }
 
+        const float eff_x =
+            rt.param_override_active ? rt.override_param_x : comp.param_x;
+        const float eff_y =
+            rt.param_override_active ? rt.override_param_y : comp.param_y;
+        const std::string_view comp_clip = comp.clip_name_view();
+        const std::string_view comp_sec = comp.secondary_clip_view();
+        const std::string_view comp_upper = comp.upper_body_bone_view();
+        const bool comp_changed =
+            !rt.initialized_once ||
+            rt.cached_mode != comp.mode ||
+            rt.cached_param_x != eff_x ||
+            rt.cached_param_y != eff_y ||
+            rt.cached_start_time != comp.start_time_seconds ||
+            rt.cached_upper_weight != comp.upper_body_weight ||
+            rt.cached_upper_additive != comp.upper_body_additive ||
+            rt.cached_looping != comp.looping ||
+            rt.cached_foot_ik != comp.foot_ik_enabled ||
+            rt.cached_look_at_ik != comp.look_at_ik_enabled ||
+            rt.cached_clip_name != comp_clip ||
+            rt.cached_secondary_clip != comp_sec ||
+            rt.cached_upper_bone_input != comp_upper;
+
+        if (!comp.playing &&
+            !rt.preview_override &&
+            !rt.dirty &&
+            rt.skin_submitted &&
+            !comp_changed &&
+            !comp.foot_ik_enabled &&
+            !comp.look_at_ik_enabled) {
+            rt.root_motion_delta_world = glm::vec3(0.0F);
+            rt.root_motion_yaw_delta = 0.0F;
+            continue;
+        }
+
         const std::vector<AnimationClip>* clips_ptr =
             provider.animations(node.asset_path);
         const std::span<const AnimationClip> clips =
@@ -893,10 +969,6 @@ void AnimatorRuntimeSystem::update(
         std::size_t fired_count = 0U;
         rt.root_motion_delta_world = glm::vec3(0.0F);
         rt.root_motion_yaw_delta = 0.0F;
-        const float eff_x =
-            rt.param_override_active ? rt.override_param_x : comp.param_x;
-        const float eff_y =
-            rt.param_override_active ? rt.override_param_y : comp.param_y;
 
         if (clips.empty()) {
             set_bind_pose(*skeleton, rt.base_pose);
@@ -992,8 +1064,8 @@ void AnimatorRuntimeSystem::update(
                     eff_x,
                     rt.normalized_phase,
                     comp.looping,
-                    rt.scratch_a,
-                    rt.scratch_b,
+                    scratch_a_,
+                    scratch_b_,
                     rt.base_pose,
                     &eff_dur);
                 eff_dur = std::max(eff_dur, 1.0e-4F);
@@ -1069,8 +1141,8 @@ void AnimatorRuntimeSystem::update(
                     glm::vec2(eff_x, eff_y),
                     rt.normalized_phase,
                     comp.looping,
-                    rt.scratch_a,
-                    rt.scratch_b,
+                    scratch_a_,
+                    scratch_b_,
                     rt.base_pose,
                     &eff_dur);
                 eff_dur = std::max(eff_dur, 1.0e-4F);
@@ -1104,11 +1176,12 @@ void AnimatorRuntimeSystem::update(
                     *skeleton,
                     clips,
                     step_dt,
-                    rt.scratch_a,
-                    rt.scratch_b,
+                    scratch_a_,
+                    scratch_b_,
                     rt.base_pose,
                     fired_events_scratch_,
-                    &fired_count);
+                    &fired_count,
+                    &scratch_c_);
                 rt.current_time = rt.fsm_instance.state_time;
                 if (rt.fsm_instance.current_state >= 0 &&
                     static_cast<std::uint32_t>(rt.fsm_instance.current_state) <
@@ -1147,19 +1220,19 @@ void AnimatorRuntimeSystem::update(
                     clips[sec_idx],
                     rt.current_time,
                     comp.looping,
-                    rt.layer_pose);
+                    layer_pose_scratch_);
                 if (comp.upper_body_additive) {
                     blend_pose_masked_additive(
                         *skeleton,
                         rt.base_pose,
-                        rt.layer_pose,
+                        layer_pose_scratch_,
                         rt.upper_mask,
                         comp.upper_body_weight,
                         rt.base_pose);
                 } else {
                     blend_pose_masked_override(
                         rt.base_pose,
-                        rt.layer_pose,
+                        layer_pose_scratch_,
                         rt.upper_mask,
                         comp.upper_body_weight,
                         rt.base_pose);
@@ -1255,6 +1328,27 @@ void AnimatorRuntimeSystem::update(
 
         compute_skinning_matrices(*skeleton, rt.base_pose);
         provider.submit(id, node.asset_path, rt.base_pose.active_skin_matrices());
+        rt.skin_submitted = true;
+        rt.initialized_once = true;
+        rt.dirty = false;
+        rt.cached_mode = comp.mode;
+        rt.cached_param_x = eff_x;
+        rt.cached_param_y = eff_y;
+        rt.cached_start_time = comp.start_time_seconds;
+        rt.cached_upper_weight = comp.upper_body_weight;
+        rt.cached_upper_additive = comp.upper_body_additive;
+        rt.cached_looping = comp.looping;
+        rt.cached_foot_ik = comp.foot_ik_enabled;
+        rt.cached_look_at_ik = comp.look_at_ik_enabled;
+        if (rt.cached_clip_name != comp_clip) {
+            rt.cached_clip_name.assign(comp_clip);
+        }
+        if (rt.cached_secondary_clip != comp_sec) {
+            rt.cached_secondary_clip.assign(comp_sec);
+        }
+        if (rt.cached_upper_bone_input != comp_upper) {
+            rt.cached_upper_bone_input.assign(comp_upper);
+        }
 
         if (!rt.preview_override && comp.root_motion_enabled) {
             if (!rt.root_motion_pose_initialized) {
@@ -1326,8 +1420,8 @@ void AnimatorRuntimeSystem::update(
                 params.volume = std::clamp(ev->float_param, 0.0F, 2.0F);
                 params.spatial = true;
                 params.spatial_params.position = glm::vec3(node_world[3]);
-                std::string play_error;
-                (void)audio_engine->play_asset(ev->payload, params, play_error);
+                audio_error_scratch_.clear();
+                (void)audio_engine->play_asset(ev->payload, params, audio_error_scratch_);
             }
         }
     }
@@ -1787,18 +1881,18 @@ void GameplayWorld::update(
         fixed_accumulator_ -= fixed_timestep_seconds;
         ++substeps;
         ++fixed_step_count_;
-        for (GameplayEntityState& entity : entities_) {
-            if (!entity.enabled || entity.destroyed) {
+        for (std::size_t i = 0U; i < entities_.size(); ++i) {
+            if (!entities_[i].enabled || entities_[i].destroyed) {
                 continue;
             }
             const GameplayBehaviorCallbacks* cb =
-                behaviors_.find(entity.behavior);
+                behaviors_.find(entities_[i].behavior);
             if (cb == nullptr || cb->on_fixed_update == nullptr) {
                 continue;
             }
             GameplayBehaviorContext ctx{
                 .world = *this,
-                .entity = entity,
+                .entity = entities_[i],
                 .scene = scene,
                 .collision_world = collision_world,
                 .physics_world = physics_world,
@@ -1814,17 +1908,17 @@ void GameplayWorld::update(
         fixed_accumulator_ = std::fmod(fixed_accumulator_, fixed_timestep_seconds);
     }
 
-    for (GameplayEntityState& entity : entities_) {
-        if (!entity.enabled || entity.destroyed) {
-            apply_entity_transform(entity, physics_world, transform_sink, dt);
+    for (std::size_t i = 0U; i < entities_.size(); ++i) {
+        if (!entities_[i].enabled || entities_[i].destroyed) {
+            apply_entity_transform(entities_[i], physics_world, transform_sink, dt);
             continue;
         }
         if (const GameplayBehaviorCallbacks* cb =
-                behaviors_.find(entity.behavior)) {
+                behaviors_.find(entities_[i].behavior)) {
             if (cb->on_update != nullptr) {
                 GameplayBehaviorContext ctx{
                     .world = *this,
-                    .entity = entity,
+                    .entity = entities_[i],
                     .scene = scene,
                     .collision_world = collision_world,
                     .physics_world = physics_world,
@@ -1835,7 +1929,7 @@ void GameplayWorld::update(
                 cb->on_update(ctx);
             }
         }
-        apply_entity_transform(entity, physics_world, transform_sink, dt);
+        apply_entity_transform(entities_[i], physics_world, transform_sink, dt);
     }
 }
 

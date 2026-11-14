@@ -98,10 +98,22 @@ struct AnimatorNodeRuntime {
     AnimationStateMachine fsm{};
     AnimationStateMachineInstance fsm_instance{};
     bool fsm_initialized = false;
+    bool dirty = true;
+    bool initialized_once = false;
+    bool skin_submitted = false;
+    AnimatorBlendMode cached_mode = AnimatorBlendMode::single_clip;
+    float cached_param_x = 0.0F;
+    float cached_param_y = 0.0F;
+    float cached_start_time = 0.0F;
+    float cached_upper_weight = 0.0F;
+    bool cached_upper_additive = false;
+    bool cached_looping = true;
+    bool cached_foot_ik = false;
+    bool cached_look_at_ik = false;
+    std::string cached_clip_name{};
+    std::string cached_secondary_clip{};
+    std::string cached_upper_bone_input{};
     SkeletonPose base_pose{};
-    SkeletonPose layer_pose{};
-    SkeletonPose scratch_a{};
-    SkeletonPose scratch_b{};
     BoneMask upper_mask{};
     std::string cached_mask_bone{};
     bool active_hitbox = false;
@@ -135,7 +147,7 @@ class AnimatorRuntimeSystem final {
 public:
     static constexpr std::size_t max_event_log_entries = 16U;
 
-    AnimatorRuntimeSystem() = default;
+    AnimatorRuntimeSystem();
 
     void clear(const SkeletalAssetProvider* provider = nullptr) noexcept;
 
@@ -205,6 +217,11 @@ private:
     std::vector<SceneWorldNode> local_world_scratch_{};
     std::vector<std::uint32_t> ancestor_scratch_{};
     std::array<const AnimationEventDef*, 16U> fired_events_scratch_{};
+    SkeletonPose layer_pose_scratch_{};
+    SkeletonPose scratch_a_{};
+    SkeletonPose scratch_b_{};
+    SkeletonPose scratch_c_{};
+    std::string audio_error_scratch_{};
     std::array<std::array<char, 160U>, max_event_log_entries> event_ring_{};
     std::size_t event_head_ = 0U;
     std::size_t event_count_ = 0U;

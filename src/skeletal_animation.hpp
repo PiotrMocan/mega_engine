@@ -370,7 +370,8 @@ struct AnimationStateMachineInstance {
         SkeletonPose& scratch_b,
         SkeletonPose& out_pose,
         std::span<const AnimationEventDef*> out_events = {},
-        std::size_t* out_event_count = nullptr) noexcept;
+        std::size_t* out_event_count = nullptr,
+        SkeletonPose* scratch_prev = nullptr) noexcept;
 };
 
 void build_default_locomotion_fsm(

@@ -258,7 +258,10 @@ void CrowdSystem::update(
     SignalPassableFn signal_query,
     void* signal_user_data,
     const CollisionWorld* ground_raycast_world) noexcept {
-    if (active_count_ == 0U || agents_.empty()) {
+    if (active_count_ == 0U ||
+        agents_.empty() ||
+        !std::isfinite(delta_seconds) ||
+        delta_seconds <= 0.0F) {
         return;
     }
 
@@ -295,12 +298,17 @@ void CrowdSystem::update(
                         if (lat_dist < (threat.radius + config_.agent_radius + 1.5F)) {
                             agent.state = CrowdAgentState::evade_threat;
                             agent.state_timer_s = 1.6F;
-                            if (lat_dist > 0.01F) {
-                                agent.evade_direction = glm::normalize(
-                                    glm::vec3(lateral.x, 0.0F, lateral.z));
+                            const glm::vec3 lat_xz(lateral.x, 0.0F, lateral.z);
+                            const float lat_xz_len = glm::length(lat_xz);
+                            if (lat_dist > 0.01F && std::isfinite(lat_xz_len) && lat_xz_len > 1e-4F) {
+                                agent.evade_direction = lat_xz / lat_xz_len;
                             } else {
-                                agent.evade_direction = glm::normalize(
-                                    glm::vec3(-threat_dir.z, 0.0F, threat_dir.x));
+                                const glm::vec3 perp_xz(-threat_dir.z, 0.0F, threat_dir.x);
+                                const float perp_len = glm::length(perp_xz);
+                                agent.evade_direction =
+                                    (std::isfinite(perp_len) && perp_len > 1e-4F)
+                                        ? (perp_xz / perp_len)
+                                        : glm::vec3(1.0F, 0.0F, 0.0F);
                             }
                             break;
                         }

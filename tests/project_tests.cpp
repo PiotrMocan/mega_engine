@@ -1,7 +1,11 @@
 #include "asset_browser.hpp"
+#include "audio_engine.hpp"
 #include "cli_options.hpp"
 #include "cooked_model_asset.hpp"
 #include "cooked_texture_asset.hpp"
+#include "game_module_api.hpp"
+#include "game_module_loader.hpp"
+#include "gameplay_session.hpp"
 #include "icon_system.hpp"
 #include "png_encoder.hpp"
 #include "prefab_io.hpp"
@@ -11,6 +15,8 @@
 #include "scene_io.hpp"
 
 #include <array>
+#include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -431,6 +437,94 @@ void test_icon_generation_conversion_and_pe_patching() {
 #endif
 }
 
+void test_shipping_runtime_content_and_rollback() {
+    const ScopedTempDir temp;
+    vcr::CreateProjectResult created;
+    std::string error;
+    REQUIRE_MSG(vcr::create_project_on_disk(vcr::CreateProjectOptions{
+        .name = "Shipping Test", .parent_directory = temp.path(),
+        .bundle_runtime = false}, created, error), error);
+    const auto project = created.project_directory;
+    write_text_file(project / "game/private.cpp", "private source code");
+    write_text_file(project / "build/windows-release/game.pdb", "debug symbols");
+    write_text_file(project / "assets/source/original.fbx", "source model");
+    write_text_file(project / "assets/unused.png", "unreferenced image");
+    write_text_file(project / "assets/saves/private.vcrsave.json", "save data");
+    write_text_file(project / "assets/config/input_bindings.json", "{}");
+    // Game modules construct paths at runtime; no JSON references this clip.
+    const auto audio_path = project / "assets/audio/from_code.wav";
+    std::filesystem::create_directories(audio_path.parent_path());
+    {
+        std::ofstream wav(audio_path, std::ios::binary);
+        const auto u32 = [&](const std::uint32_t value) {
+            const auto bytes = std::bit_cast<std::array<char, 4>>(value);
+            wav.write(bytes.data(), bytes.size());
+        };
+        const auto u16 = [&](const std::uint16_t value) {
+            const auto bytes = std::bit_cast<std::array<char, 2>>(value);
+            wav.write(bytes.data(), bytes.size());
+        };
+        wav.write("RIFF", 4); u32(36U + 9600U);
+        wav.write("WAVEfmt ", 8); u32(16U); u16(1U); u16(1U);
+        u32(48000U); u32(96000U); u16(2U); u16(16U);
+        wav.write("data", 4); u32(9600U);
+        for (std::uint32_t frame = 0U; frame < 4800U; ++frame) {
+            const std::int16_t sample = (frame / 24U) % 2U == 0U ? 8192 : -8192;
+            u16(std::bit_cast<std::uint16_t>(sample));
+        }
+        wav.close();
+        REQUIRE(wav.good());
+    }
+    const auto destination = temp.path() / std::filesystem::path(u8"готовая игра") / "game";
+    vcr::ShipProjectResult shipped;
+    REQUIRE_MSG(vcr::ship_project(project, destination, shipped, error), error);
+    REQUIRE(shipped.output_directory == std::filesystem::canonical(destination));
+    REQUIRE(std::filesystem::is_regular_file(shipped.executable_path));
+    REQUIRE(std::filesystem::is_regular_file(destination / "vcr_engine.dll"));
+    REQUIRE(shipped.cooked_textures == 1U);
+    vcr::AudioEngine audio;
+    REQUIRE_MSG(audio.initialize({.asset_root = destination / "assets",
+        .enable_hardware_output = false}, error), error);
+    REQUIRE_MSG(static_cast<bool>(audio.play_asset("audio/from_code.wav", {}, error)), error);
+    std::array<float, 2048U> mixed{};
+    audio.render_frames_for_test(mixed);
+    REQUIRE(std::ranges::any_of(mixed, [](float sample) { return sample > 0.01F || sample < -0.01F; }));
+    audio.shutdown();
+    REQUIRE(!std::filesystem::exists(destination / "game"));
+    REQUIRE(!std::filesystem::exists(destination / "build"));
+    REQUIRE(!std::filesystem::exists(destination / "engine/lib"));
+    REQUIRE(!std::filesystem::exists(destination / "engine/cmake"));
+    REQUIRE(!std::filesystem::exists(destination / "assets/source"));
+    REQUIRE(!std::filesystem::exists(destination / "assets/unused.png"));
+    REQUIRE(!std::filesystem::exists(destination / "assets/saves"));
+    REQUIRE(std::filesystem::is_regular_file(destination / "assets/config/input_bindings.json"));
+    const auto texture_rel = "starter/flat_plane/textures/grid_floor.vcrtexture.json";
+    const auto texture = vcr::load_cooked_texture_asset(destination / "assets", texture_rel);
+    REQUIRE_MSG(static_cast<bool>(texture), texture ? "" : texture.error().message);
+    REQUIRE(texture->source_relative_path.extension() == ".rgba8");
+    REQUIRE(texture->width == 128U && texture->height == 128U);
+    REQUIRE(!std::filesystem::exists(destination / "assets/starter/flat_plane/textures/grid_floor.png"));
+    REQUIRE(std::filesystem::is_regular_file(project / "assets/starter/flat_plane/textures/grid_floor.png"));
+    for (const auto& file : std::filesystem::recursive_directory_iterator(destination)) {
+        const auto ext = file.path().extension();
+        REQUIRE(ext != ".cpp" && ext != ".hpp" && ext != ".pdb" &&
+                ext != ".obj" && ext != ".lib" && ext != ".fbx");
+    }
+    REQUIRE(!vcr::ship_project(project, destination, shipped, error));
+    REQUIRE(error.find("already exists") != std::string::npos);
+    REQUIRE(std::filesystem::is_regular_file(destination / "shipping_test.exe"));
+    REQUIRE(!vcr::ship_project(project, project / "export", shipped, error));
+    REQUIRE(!std::filesystem::exists(project / "export"));
+    write_text_file(project / "assets/starter/flat_plane/textures/grid_floor.png", "invalid image");
+    const auto failed = temp.path() / "failed_export";
+    REQUIRE(!vcr::ship_project(project, failed, shipped, error));
+    REQUIRE(error.find("Texture cook failed") != std::string::npos);
+    REQUIRE(!std::filesystem::exists(failed));
+    for (const auto& entry : std::filesystem::directory_iterator(temp.path())) {
+        REQUIRE(entry.path().filename().string().find(".shipping-") == std::string::npos);
+    }
+}
+
 void test_project_bundle_and_icon_workflow() {
     const ScopedTempDir temp;
     const std::filesystem::path projects_dir = temp.path() / "projects";
@@ -689,6 +783,34 @@ void test_cpp_module_project_and_manifest_round_trip() {
 #endif
 }
 
+void test_game_module_loader_hardening() {
+    REQUIRE(vcr::vcr_game_module_api_version == 2U);
+    REQUIRE(vcr::vcr_current_module_abi_stamp() != 0U);
+
+    ScopedTempDir temp;
+    vcr::SceneDocument scene;
+    vcr::GameplaySession session;
+    vcr::LoadedGameModule mod;
+    const vcr::GameModuleHostContext host{
+        .project_root = &temp.path(),
+        .asset_root = &temp.path(),
+        .scene = &scene,
+        .session = &session,
+    };
+
+    std::string error;
+    REQUIRE(!mod.load(temp.path() / "does_not_exist_game.dll", host, false, error));
+    REQUIRE(!mod.is_loaded());
+    REQUIRE(!error.empty());
+
+    const std::filesystem::path dir_path = temp.path() / "not_a_regular_dll";
+    std::filesystem::create_directories(dir_path);
+    error.clear();
+    REQUIRE(!mod.load(dir_path, host, true, error));
+    REQUIRE(!mod.is_loaded());
+    REQUIRE(!error.empty());
+}
+
 } // namespace
 
 int main() {
@@ -698,7 +820,9 @@ int main() {
     test_cli_project_option();
     test_icon_generation_conversion_and_pe_patching();
     test_project_bundle_and_icon_workflow();
+    test_shipping_runtime_content_and_rollback();
     test_cpp_module_project_and_manifest_round_trip();
+    test_game_module_loader_hardening();
     std::cout << "All project system tests passed.\n";
     return 0;
 }

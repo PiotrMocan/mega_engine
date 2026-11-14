@@ -1,4 +1,5 @@
 #include "vehicle_interaction.hpp"
+#include "collision_math.hpp"
 
 #include <glm/geometric.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -18,6 +19,15 @@ constexpr float two_pi = 6.28318530718F;
     return t * t * (3.0F - 2.0F * t);
 }
 
+[[nodiscard]] glm::vec3 safe_normalize_or(
+    const glm::vec3& v,
+    const glm::vec3& fallback) noexcept {
+    const float len = glm::length(v);
+    return (finite_vec3(v) && std::isfinite(len) && len > 1.0e-4F)
+        ? (v / len)
+        : fallback;
+}
+
 [[nodiscard]] glm::mat4 interpolate_matrix(
     const glm::mat4& a,
     const glm::mat4& b,
@@ -26,8 +36,8 @@ constexpr float two_pi = 6.28318530718F;
     const glm::vec3 pos_b(b[3]);
     const glm::vec3 pos = glm::mix(pos_a, pos_b, t);
 
-    const glm::quat rot_a = glm::quat_cast(a);
-    const glm::quat rot_b = glm::quat_cast(b);
+    const glm::quat rot_a = glm::normalize(glm::quat_cast(orthonormalize_axes(glm::mat3(a))));
+    const glm::quat rot_b = glm::normalize(glm::quat_cast(orthonormalize_axes(glm::mat3(b))));
     const glm::quat rot = glm::slerp(rot_a, rot_b, t);
 
     glm::mat4 result = glm::mat4_cast(rot);
@@ -65,7 +75,9 @@ InputContext VehicleInteractionController::desired_input_context() const noexcep
 }
 
 float VehicleInteractionController::driver_yaw_radians() const noexcept {
-    const glm::vec3 fwd = glm::normalize(glm::vec3(current_driver_matrix_[2]));
+    const glm::vec3 fwd = safe_normalize_or(
+        glm::vec3(current_driver_matrix_[2]),
+        glm::vec3(0.0F, 0.0F, 1.0F));
     return std::atan2(fwd.x, fwd.z);
 }
 
@@ -78,9 +90,15 @@ VehicleIKTargets VehicleInteractionController::ik_targets() const noexcept {
     }
 
     const glm::vec3 seat_pos(current_driver_matrix_[3]);
-    const glm::vec3 seat_right = glm::normalize(glm::vec3(current_driver_matrix_[0]));
-    const glm::vec3 seat_up = glm::normalize(glm::vec3(current_driver_matrix_[1]));
-    const glm::vec3 seat_fwd = glm::normalize(glm::vec3(current_driver_matrix_[2]));
+    const glm::vec3 seat_right = safe_normalize_or(
+        glm::vec3(current_driver_matrix_[0]),
+        glm::vec3(1.0F, 0.0F, 0.0F));
+    const glm::vec3 seat_up = safe_normalize_or(
+        glm::vec3(current_driver_matrix_[1]),
+        glm::vec3(0.0F, 1.0F, 0.0F));
+    const glm::vec3 seat_fwd = safe_normalize_or(
+        glm::vec3(current_driver_matrix_[2]),
+        glm::vec3(0.0F, 0.0F, 1.0F));
 
     // Virtual steering wheel placement
     const glm::vec3 wheel_center = seat_pos + seat_fwd * 0.48F + seat_up * 0.42F;
@@ -103,8 +121,12 @@ bool VehicleInteractionController::find_safe_exit_spot(
     float& out_yaw) const noexcept {
     // Basis from vehicle world matrix
     const glm::vec3 v_pos(sockets.vehicle_world[3]);
-    const glm::vec3 v_right = glm::normalize(glm::vec3(sockets.vehicle_world[0]));
-    const glm::vec3 v_fwd = glm::normalize(glm::vec3(sockets.vehicle_world[2]));
+    const glm::vec3 v_right = safe_normalize_or(
+        glm::vec3(sockets.vehicle_world[0]),
+        glm::vec3(1.0F, 0.0F, 0.0F));
+    const glm::vec3 v_fwd = safe_normalize_or(
+        glm::vec3(sockets.vehicle_world[2]),
+        glm::vec3(0.0F, 0.0F, 1.0F));
 
     // Exit yaw faces along vehicle forward
     out_yaw = std::atan2(v_fwd.x, v_fwd.z);

@@ -20,6 +20,24 @@ option(
 )
 option(VCR_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 
+function(vcr_apply_cxx_warning_flags target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE
+            /W4 /permissive- /Zc:preprocessor /GR- /EHsc
+        )
+        if(VCR_WARNINGS_AS_ERRORS)
+            target_compile_options(${target} PRIVATE /WX)
+        endif()
+    else()
+        target_compile_options(${target} PRIVATE
+            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -fno-rtti
+        )
+        if(VCR_WARNINGS_AS_ERRORS)
+            target_compile_options(${target} PRIVATE -Werror)
+        endif()
+    endif()
+endfunction()
+
 if(MSVC AND CMAKE_CXX_FLAGS MATCHES "/fsanitize=address")
     add_link_options(/INCREMENTAL:NO)
 endif()
@@ -404,6 +422,7 @@ set(VCR_ENGINE_CORE_SOURCES
     src/cli_options.cpp
     src/performance_metrics.cpp
     src/project_system.cpp
+    src/project_shipping.cpp
     src/runtime_assets.cpp
     src/asset_browser.cpp
     src/editor_scene_tools.cpp
@@ -421,6 +440,7 @@ set_target_properties(vcr_engine PROPERTIES
     C_EXTENSIONS OFF
     WINDOWS_EXPORT_ALL_SYMBOLS ON
     OUTPUT_NAME "vcr_engine"
+    DEBUG_POSTFIX "d"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
@@ -540,9 +560,7 @@ add_executable(vcr_asset_lod_cooker EXCLUDE_FROM_ALL
 target_link_libraries(vcr_asset_lod_cooker PRIVATE
     vcr_engine meshoptimizer nlohmann_json::nlohmann_json)
 set_target_properties(vcr_asset_lod_cooker PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
-if(MSVC)
-    target_compile_options(vcr_asset_lod_cooker PRIVATE /W4 /permissive- /EHsc /GR-)
-endif()
+vcr_apply_cxx_warning_flags(vcr_asset_lod_cooker)
 
 add_executable(vcr_content_cooker
     tools/vcr_content_cooker.cpp
@@ -812,13 +830,7 @@ if(BUILD_TESTING)
     set_target_properties(vcr_gameplay_tests PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
-    if(MSVC)
-        target_compile_options(vcr_gameplay_tests PRIVATE /W4 /permissive- /EHsc)
-    else()
-        target_compile_options(vcr_gameplay_tests PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-        )
-    endif()
+    vcr_apply_cxx_warning_flags(vcr_gameplay_tests)
     add_test(NAME vcr_gameplay_tests COMMAND vcr_gameplay_tests)
 
     add_executable(vcr_audio_input_tests tests/audio_input_tests.cpp)
@@ -831,21 +843,7 @@ if(BUILD_TESTING)
     set_target_properties(vcr_audio_input_tests PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
-    if(MSVC)
-        target_compile_options(vcr_audio_input_tests PRIVATE
-            /W4 /permissive- /Zc:preprocessor /GR- /EHsc
-        )
-        if(VCR_WARNINGS_AS_ERRORS)
-            target_compile_options(vcr_audio_input_tests PRIVATE /WX)
-        endif()
-    else()
-        target_compile_options(vcr_audio_input_tests PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -fno-rtti
-        )
-        if(VCR_WARNINGS_AS_ERRORS)
-            target_compile_options(vcr_audio_input_tests PRIVATE -Werror)
-        endif()
-    endif()
+    vcr_apply_cxx_warning_flags(vcr_audio_input_tests)
     add_test(NAME vcr_audio_input_tests COMMAND vcr_audio_input_tests)
 
     add_executable(vcr_fog_tests tests/fog_tests.cpp)
@@ -853,9 +851,7 @@ if(BUILD_TESTING)
     set_target_properties(vcr_fog_tests PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
-    if(MSVC)
-        target_compile_options(vcr_fog_tests PRIVATE /W4 /permissive- /EHsc)
-    endif()
+    vcr_apply_cxx_warning_flags(vcr_fog_tests)
     add_test(NAME vcr_fog_tests COMMAND vcr_fog_tests)
 
     add_executable(vcr_packed_model_vertex_tests tests/packed_model_vertex_tests.cpp)
@@ -864,9 +860,7 @@ if(BUILD_TESTING)
     set_target_properties(vcr_packed_model_vertex_tests PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
-    if(MSVC)
-        target_compile_options(vcr_packed_model_vertex_tests PRIVATE /W4 /permissive- /EHsc)
-    endif()
+    vcr_apply_cxx_warning_flags(vcr_packed_model_vertex_tests)
     add_test(NAME vcr_packed_model_vertex_tests COMMAND vcr_packed_model_vertex_tests)
 
     add_executable(vcr_gpu_grass_tests tests/gpu_grass_tests.cpp)
@@ -875,9 +869,7 @@ if(BUILD_TESTING)
     set_target_properties(vcr_gpu_grass_tests PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
-    if(MSVC)
-        target_compile_options(vcr_gpu_grass_tests PRIVATE /W4 /permissive- /EHsc)
-    endif()
+    vcr_apply_cxx_warning_flags(vcr_gpu_grass_tests)
     add_test(NAME vcr_gpu_grass_tests COMMAND vcr_gpu_grass_tests)
 
     add_executable(vcr_exposure_tests tests/exposure_tests.cpp)
@@ -885,9 +877,7 @@ if(BUILD_TESTING)
     set_target_properties(vcr_exposure_tests PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
-    if(MSVC)
-        target_compile_options(vcr_exposure_tests PRIVATE /W4 /permissive- /EHsc)
-    endif()
+    vcr_apply_cxx_warning_flags(vcr_exposure_tests)
     add_test(NAME vcr_exposure_tests COMMAND vcr_exposure_tests)
 
     add_executable(vcr_lod_transition_tests tests/lod_transition_tests.cpp)
@@ -895,9 +885,7 @@ if(BUILD_TESTING)
     set_target_properties(vcr_lod_transition_tests PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
-    if(MSVC)
-        target_compile_options(vcr_lod_transition_tests PRIVATE /W4 /permissive- /EHsc)
-    endif()
+    vcr_apply_cxx_warning_flags(vcr_lod_transition_tests)
     add_test(NAME vcr_lod_transition_tests COMMAND vcr_lod_transition_tests)
 
     add_executable(vcr_lighting_tests tests/lighting_tests.cpp)
@@ -905,9 +893,7 @@ if(BUILD_TESTING)
     set_target_properties(vcr_lighting_tests PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
-    if(MSVC)
-        target_compile_options(vcr_lighting_tests PRIVATE /W4 /permissive- /EHsc)
-    endif()
+    vcr_apply_cxx_warning_flags(vcr_lighting_tests)
     add_test(NAME vcr_lighting_tests COMMAND vcr_lighting_tests)
 
     add_executable(vcr_runtime_tests tests/runtime_scene_tests.cpp)
@@ -915,9 +901,7 @@ if(BUILD_TESTING)
     set_target_properties(vcr_runtime_tests PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
-    if(MSVC)
-        target_compile_options(vcr_runtime_tests PRIVATE /W4 /permissive- /EHsc)
-    endif()
+    vcr_apply_cxx_warning_flags(vcr_runtime_tests)
     add_test(NAME vcr_runtime_tests COMMAND vcr_runtime_tests)
 
     add_executable(vcr_core_tests tests/core_tests.cpp)
@@ -932,15 +916,7 @@ if(BUILD_TESTING)
     set_target_properties(vcr_core_tests PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
-    if(MSVC)
-        target_compile_options(
-            vcr_core_tests PRIVATE /W4 /permissive- /EHsc
-        )
-    else()
-        target_compile_options(vcr_core_tests PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-        )
-    endif()
+    vcr_apply_cxx_warning_flags(vcr_core_tests)
     add_test(NAME vcr_core_tests COMMAND vcr_core_tests)
 
     add_executable(vcr_asset_import_tests
@@ -955,15 +931,7 @@ if(BUILD_TESTING)
     set_target_properties(vcr_asset_import_tests PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
-    if(MSVC)
-        target_compile_options(
-            vcr_asset_import_tests PRIVATE /W4 /permissive- /EHsc
-        )
-    else()
-        target_compile_options(vcr_asset_import_tests PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-        )
-    endif()
+    vcr_apply_cxx_warning_flags(vcr_asset_import_tests)
     add_test(
         NAME vcr_asset_import_tests
         COMMAND vcr_asset_import_tests
@@ -988,17 +956,7 @@ if(BUILD_TESTING)
     set_target_properties(vcr_cooked_model_asset_tests PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
-    if(MSVC)
-        target_compile_options(
-            vcr_cooked_model_asset_tests PRIVATE
-            /W4 /permissive- /EHsc
-        )
-    else()
-        target_compile_options(
-            vcr_cooked_model_asset_tests PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-        )
-    endif()
+    vcr_apply_cxx_warning_flags(vcr_cooked_model_asset_tests)
     add_test(
         NAME vcr_cooked_model_asset_tests
         COMMAND vcr_cooked_model_asset_tests
@@ -1027,17 +985,7 @@ if(BUILD_TESTING)
     set_target_properties(vcr_cooked_texture_asset_tests PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
-    if(MSVC)
-        target_compile_options(
-            vcr_cooked_texture_asset_tests PRIVATE
-            /W4 /permissive- /EHsc
-        )
-    else()
-        target_compile_options(
-            vcr_cooked_texture_asset_tests PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow
-        )
-    endif()
+    vcr_apply_cxx_warning_flags(vcr_cooked_texture_asset_tests)
     add_test(
         NAME vcr_cooked_texture_asset_tests
         COMMAND vcr_cooked_texture_asset_tests
@@ -1065,21 +1013,7 @@ if(BUILD_TESTING)
     if(WIN32)
         target_link_libraries(vcr_project_tests PRIVATE shell32)
     endif()
-    if(MSVC)
-        target_compile_options(vcr_project_tests PRIVATE
-            /W4 /permissive- /Zc:preprocessor /GR- /EHsc
-        )
-        if(VCR_WARNINGS_AS_ERRORS)
-            target_compile_options(vcr_project_tests PRIVATE /WX)
-        endif()
-    else()
-        target_compile_options(vcr_project_tests PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -fno-rtti
-        )
-        if(VCR_WARNINGS_AS_ERRORS)
-            target_compile_options(vcr_project_tests PRIVATE -Werror)
-        endif()
-    endif()
+    vcr_apply_cxx_warning_flags(vcr_project_tests)
     add_test(NAME vcr_project_tests COMMAND vcr_project_tests)
 
     add_executable(vcr_animation_gameplay_tests tests/animation_gameplay_tests.cpp)
@@ -1092,21 +1026,7 @@ if(BUILD_TESTING)
     set_target_properties(vcr_animation_gameplay_tests PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
-    if(MSVC)
-        target_compile_options(vcr_animation_gameplay_tests PRIVATE
-            /W4 /permissive- /Zc:preprocessor /GR- /EHsc
-        )
-        if(VCR_WARNINGS_AS_ERRORS)
-            target_compile_options(vcr_animation_gameplay_tests PRIVATE /WX)
-        endif()
-    else()
-        target_compile_options(vcr_animation_gameplay_tests PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -fno-rtti
-        )
-        if(VCR_WARNINGS_AS_ERRORS)
-            target_compile_options(vcr_animation_gameplay_tests PRIVATE -Werror)
-        endif()
-    endif()
+    vcr_apply_cxx_warning_flags(vcr_animation_gameplay_tests)
     add_test(NAME vcr_animation_gameplay_tests COMMAND vcr_animation_gameplay_tests)
 
     add_executable(vcr_engine_gameplay_api_tests tests/engine_gameplay_api_tests.cpp)
@@ -1125,21 +1045,7 @@ if(BUILD_TESTING)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     )
     add_dependencies(vcr_engine_gameplay_api_tests vcr_content_cooker)
-    if(MSVC)
-        target_compile_options(vcr_engine_gameplay_api_tests PRIVATE
-            /W4 /permissive- /Zc:preprocessor /GR- /EHsc
-        )
-        if(VCR_WARNINGS_AS_ERRORS)
-            target_compile_options(vcr_engine_gameplay_api_tests PRIVATE /WX)
-        endif()
-    else()
-        target_compile_options(vcr_engine_gameplay_api_tests PRIVATE
-            -Wall -Wextra -Wpedantic -Wconversion -Wshadow -fno-rtti
-        )
-        if(VCR_WARNINGS_AS_ERRORS)
-            target_compile_options(vcr_engine_gameplay_api_tests PRIVATE -Werror)
-        endif()
-    endif()
+    vcr_apply_cxx_warning_flags(vcr_engine_gameplay_api_tests)
     add_test(NAME vcr_engine_gameplay_api_tests COMMAND vcr_engine_gameplay_api_tests)
 
     add_executable(vcr_renderer_skinning_tests

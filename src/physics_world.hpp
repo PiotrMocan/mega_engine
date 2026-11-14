@@ -108,7 +108,7 @@ public:
         glm::vec3 angular_velocity) noexcept;
     bool set_body_enabled(SceneNodeId id, bool enabled) noexcept;
     bool set_body_motion_type(SceneNodeId id, RigidBodyMotionType type,
-        float mass = 1450.0F) noexcept;
+        float mass = 0.0F) noexcept;
     bool wake_body(SceneNodeId id) noexcept;
     bool apply_central_force(
         SceneNodeId id,
@@ -163,11 +163,13 @@ private:
         float gravity_scale = 1.0F;
         float sleep_timer = 0.0F;
         Bounds world_aabb{};
+        float authored_mass = 1.0F;
         std::uint32_t layer = 1U;
         std::uint32_t mask = 0xFFFFFFFFU;
         bool lock_rotation = false;
         bool sleeping = false;
         bool had_contact = false;
+        bool kinematic_moved_this_step = false;
         bool enabled = true;
     };
 
@@ -207,7 +209,11 @@ private:
         float penetration,
         float dt) noexcept;
 
+    [[nodiscard]] Body* find_body_mut(SceneNodeId id) noexcept;
+    [[nodiscard]] const Body* find_body(SceneNodeId id) const noexcept;
+
     std::vector<Body> bodies_{};
+    std::vector<std::uint32_t> node_slot_to_body_{};
     std::vector<ContactConstraint> contacts_{};
     std::vector<SphereContact> sphere_contacts_scratch_{};
     std::vector<SceneWorldNode> world_nodes_scratch_{};

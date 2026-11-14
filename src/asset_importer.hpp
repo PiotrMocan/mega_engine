@@ -161,6 +161,9 @@ struct ImportAssetOptions {
     std::uint32_t maximum_textures = 100'000U;
 };
 
+[[nodiscard]] std::string sanitize_imported_asset_slug(
+    std::string_view name);
+
 [[nodiscard]] AssetSourceKind classify_asset_source(
     const std::filesystem::path& source);
 

@@ -575,8 +575,7 @@ private:
         std::array<std::uint32_t, model_lod_count> lod_first{};
         std::array<std::uint32_t, model_lod_count> lod_count{};
         std::array<float, model_lod_count> lod_error{};
-
-
+        bool blas_dirty = false;
     };
 
     struct EditorModelAsset {
@@ -808,18 +807,22 @@ private:
     [[nodiscard]] std::vector<std::string> resident_editor_texture_paths() const;
     [[nodiscard]] std::optional<std::uint32_t> publish_editor_model(const PreparedModel &prepared,
                                                                     std::string &error);
-    [[nodiscard]] bool ensure_skinning_pipeline_and_pools(
-        std::uint32_t required_vertices,
-        std::uint32_t required_bones);
+    void create_skinning_resources();
+    void prepare_skinning_resources_for_frame(FrameContext& frame);
     void destroy_skinning_resources() noexcept;
     void record_model_skinning(
         VkCommandBuffer command_buffer,
         FrameContext& frame);
     [[nodiscard]] bool update_skinning_asset_descriptor(
         EditorModelAsset& asset) noexcept;
+    [[nodiscard]] std::optional<std::size_t> find_skinned_slot_index(
+        SceneNodeId node_id) const noexcept;
+    void assign_skinned_slot_index(SceneNodeId node_id, std::size_t slot_index);
+    void rebuild_skinned_slot_lookup() noexcept;
     void compact_skinned_node_slots() noexcept;
     void invalidate_skinned_draws() noexcept;
     void sync_gpu_visibility_skinned_draws() noexcept;
+    void refresh_dirty_model_blas();
 #endif
     [[nodiscard]] VkExtent2D scene_output_extent() const noexcept;
 
@@ -892,6 +895,7 @@ private:
     bool rt_provisioned_ = false, rt_provision_pending_ = false;
     bool lighting_layout_has_rt_ = false;
     bool rt_tlas_build_due_ = false, gi_last_rt_active_ = false;
+    bool rt_blas_refresh_pending_ = false;
     AccelerationStructure blas_cube_{}, blas_plane_{}, blas_sphere_{}, blas_terrain_{};
     GpuBuffer rt_opacity_micromaps_{}, rt_alpha_texels_{}, rt_upload_scratch_{};
     std::uint32_t rt_opacity_triangle_count_ = 0U;
@@ -1163,6 +1167,8 @@ private:
     bool async_assets_ = false;
     std::vector<EditorModelAsset> editor_model_assets_{};
     std::vector<EditorModelDraw> editor_model_draws_{};
+    static constexpr std::uint32_t max_skinned_pool_vertices = 2'097'152U;
+    static constexpr std::uint32_t max_skinned_total_bones = 16'384U;
     struct SkinnedNodeSlot {
         SceneNodeId node_id{};
         std::uint32_t asset_index = 0U;
@@ -1171,9 +1177,12 @@ private:
         std::uint32_t bone_offset = 0U;
         std::uint32_t bone_count = 0U;
         bool initialized_prev_pool = false;
+        std::uint8_t dirty_pools_remaining = 2U;
     };
     std::vector<SkinnedNodeSlot> skinned_node_slots_{};
+    std::vector<std::uint32_t> skinned_slot_by_node_index_{};
     std::vector<glm::mat4> skinned_bone_matrices_{};
+    std::uint64_t skin_palette_revision_ = 1U;
     DeviceObject<VkDescriptorSetLayout> skin_asset_set_layout_{};
     DeviceObject<VkDescriptorSetLayout> skin_frame_set_layout_{};
     DeviceObject<VkDescriptorPool> skin_descriptor_pool_{};

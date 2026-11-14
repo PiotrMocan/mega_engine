@@ -1,5 +1,6 @@
 #include "skeletal_animation.hpp"
 
+#include <glm/gtc/constants.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <algorithm>
@@ -1237,6 +1238,7 @@ void evaluate_blend_space_2d(
         return;
     }
 
+    (void)scratch_b;
     float accumulated_weight = 0.0F;
     float effective_duration = 0.0F;
     bool initialized = false;
@@ -1248,18 +1250,18 @@ void evaluate_blend_space_2d(
         const std::uint32_t idx = std::min<std::uint32_t>(
             space.samples[i].clip_index, static_cast<std::uint32_t>(clips.size() - 1U));
         const float dur = clip_duration_or_default(clips, idx);
-        sample_animation_clip(skeleton, clips[idx], normalized_phase * dur, looping, scratch_a);
+        const float scaled_dur = (dur / std::max(space.samples[i].playback_rate, 0.05F)) * w;
         if (!initialized) {
-            out_pose = scratch_a;
+            sample_animation_clip(skeleton, clips[idx], normalized_phase * dur, looping, out_pose);
             accumulated_weight = w;
-            effective_duration = (dur / std::max(space.samples[i].playback_rate, 0.05F)) * w;
+            effective_duration = scaled_dur;
             initialized = true;
         } else {
+            sample_animation_clip(skeleton, clips[idx], normalized_phase * dur, looping, scratch_a);
             accumulated_weight += w;
             const float blend_alpha = w / accumulated_weight;
-            scratch_b = out_pose;
-            blend_poses(scratch_b, scratch_a, blend_alpha, out_pose);
-            effective_duration += (dur / std::max(space.samples[i].playback_rate, 0.05F)) * w;
+            blend_poses(out_pose, scratch_a, blend_alpha, out_pose);
+            effective_duration += scaled_dur;
         }
     }
     if (out_effective_duration != nullptr) {
@@ -1397,7 +1399,8 @@ void AnimationStateMachineInstance::evaluate(
     SkeletonPose& scratch_b,
     SkeletonPose& out_pose,
     std::span<const AnimationEventDef*> out_events,
-    std::size_t* out_event_count) noexcept {
+    std::size_t* out_event_count,
+    SkeletonPose* const scratch_prev) noexcept {
     if (out_event_count != nullptr) {
         *out_event_count = 0U;
     }
@@ -1480,14 +1483,20 @@ void AnimationStateMachineInstance::evaluate(
             const AnimStateDef& prev_def =
                 machine.states[static_cast<std::size_t>(previous_state)];
             previous_state_time += safe_dt * prev_def.speed;
-            SkeletonPose prev_pose{};
             float prev_duration = 1.0F;
-            evaluate_state_source(
-                prev_def, skeleton, clips, previous_state_time, px, py,
-                scratch_a, scratch_b, prev_pose, prev_duration);
             const float alpha = std::clamp(crossfade_elapsed / crossfade_duration, 0.0F, 1.0F);
-            scratch_a = out_pose;
-            blend_poses(prev_pose, scratch_a, alpha, out_pose);
+            if (scratch_prev != nullptr) {
+                evaluate_state_source(
+                    prev_def, skeleton, clips, previous_state_time, px, py,
+                    scratch_a, scratch_b, *scratch_prev, prev_duration);
+                blend_poses(*scratch_prev, out_pose, alpha, out_pose);
+            } else {
+                SkeletonPose fallback_prev{};
+                evaluate_state_source(
+                    prev_def, skeleton, clips, previous_state_time, px, py,
+                    scratch_a, scratch_b, fallback_prev, prev_duration);
+                blend_poses(fallback_prev, out_pose, alpha, out_pose);
+            }
         }
     }
 }
@@ -1680,10 +1689,15 @@ RootMotionDelta extract_root_motion_delta(
         const float yend = extract_yaw(sample_r(dur));
         const float ystart = extract_yaw(sample_r(0.0F));
         const float y1 = extract_yaw(sample_r(t1));
-        delta.local_yaw_delta_radians = (yend - y0) + (y1 - ystart);
+        const float dy_end = std::remainder(yend - y0, glm::two_pi<float>());
+        const float dy_start = std::remainder(y1 - ystart, glm::two_pi<float>());
+        delta.local_yaw_delta_radians =
+            std::remainder(dy_end + dy_start, glm::two_pi<float>());
     } else {
         delta.local_translation_delta = sample_t(t1) - sample_t(t0);
-        delta.local_yaw_delta_radians = extract_yaw(sample_r(t1)) - extract_yaw(sample_r(t0));
+        delta.local_yaw_delta_radians = std::remainder(
+            extract_yaw(sample_r(t1)) - extract_yaw(sample_r(t0)),
+            glm::two_pi<float>());
     }
 
     BoneLocalTransform& root_local = in_out_pose.local[static_cast<std::size_t>(root_idx)];

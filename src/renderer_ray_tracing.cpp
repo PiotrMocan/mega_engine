@@ -667,6 +667,7 @@ void Renderer::destroy_ray_tracing() noexcept {
     rt_provisioned_ = false;
     rt_provision_pending_ = false;
     rt_tlas_build_due_ = false;
+    rt_blas_refresh_pending_ = false;
     gi_last_rt_active_ = false;
     lighting_statistics_.blas_count = 0U;
     lighting_statistics_.tlas_instances = 0U;
@@ -1122,6 +1123,7 @@ void Renderer::build_model_blas_on_upload(EditorModelAsset& asset) {
     for (auto& submesh : asset.submeshes) {
         const std::uint32_t triangle_count = submesh.index_count / 3U;
         if (triangle_count == 0U ||
+            submesh.blas ||
             (submesh.coverage & material_coverage_transparent_mask) != 0U) {
             continue;
         }
@@ -1346,6 +1348,59 @@ void Renderer::compact_model_blas(EditorModelAsset& asset) {
         }
     }
     refresh_ray_tracing_statistics();
+}
+
+void Renderer::refresh_dirty_model_blas() {
+    rt_blas_refresh_pending_ = false;
+    if (!rt_provisioned_ || context_ == nullptr || context_->device() == VK_NULL_HANDLE) {
+        return;
+    }
+    bool any_dirty = false;
+    for (const EditorModelAsset& asset : editor_model_assets_) {
+        for (const EditorModelSubmesh& submesh : asset.submeshes) {
+            if (submesh.blas_dirty) {
+                any_dirty = true;
+                break;
+            }
+        }
+        if (any_dirty) {
+            break;
+        }
+    }
+    if (!any_dirty) {
+        return;
+    }
+    std::array<VkFence, max_frames_in_flight> in_flight_fences{};
+    std::uint32_t fence_count = 0U;
+    for (const FrameContext& f : frames_) {
+        if (f.fence != VK_NULL_HANDLE) {
+            in_flight_fences[fence_count++] = f.fence;
+        }
+    }
+    if (fence_count > 0U) {
+        VK_CHECK(vkWaitForFences(
+            context_->device(),
+            fence_count,
+            in_flight_fences.data(),
+            VK_TRUE,
+            UINT64_MAX));
+    }
+    for (EditorModelAsset& asset : editor_model_assets_) {
+        bool asset_needs_rebuild = false;
+        for (EditorModelSubmesh& submesh : asset.submeshes) {
+            if (submesh.blas_dirty) {
+                submesh.blas = {};
+                submesh.blas_dirty = false;
+                if ((submesh.coverage & material_coverage_transparent_mask) == 0U) {
+                    asset_needs_rebuild = true;
+                }
+            }
+        }
+        if (asset_needs_rebuild) {
+            build_model_blas_on_upload(asset);
+            compact_model_blas(asset);
+        }
+    }
 }
 #endif
 

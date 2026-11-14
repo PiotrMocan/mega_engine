@@ -256,8 +256,30 @@ void VehicleController::update(
                 hp_world,
                 delta);
 
-            // Wheel steer angle
-            const float steer_angle = w_cfg.steerable ? current_steer_angle_ : 0.0F;
+            // Wheel steer angle (Ackermann geometry across front track)
+            float steer_angle = 0.0F;
+            if (w_cfg.steerable) {
+                if (std::abs(current_steer_angle_) > 1.0e-4F &&
+                    std::abs(w_cfg.hardpoint_local.x) > 1.0e-3F) {
+                    const float wheelbase = std::max(
+                        0.5F,
+                        std::abs(
+                            config_.wheels[0].hardpoint_local.z -
+                            config_.wheels[2].hardpoint_local.z));
+                    const float tan_s = std::tan(
+                        std::clamp(current_steer_angle_, -1.30F, 1.30F));
+                    const float denom = std::max(
+                        0.25F,
+                        wheelbase - w_cfg.hardpoint_local.x * tan_s);
+                    const float max_ackermann = w_cfg.max_steer_radians * 1.25F;
+                    steer_angle = std::clamp(
+                        std::atan2(wheelbase * tan_s, denom),
+                        -max_ackermann,
+                        max_ackermann);
+                } else {
+                    steer_angle = current_steer_angle_;
+                }
+            }
             w_tel.steer_angle_radians = steer_angle;
 
             const glm::quat steer_rot = glm::angleAxis(steer_angle, chassis_up);
@@ -298,15 +320,26 @@ void VehicleController::update(
             // Rolling resistance
             f_long -= v_long * (config_.rolling_resistance * config_.mass_kg * gravity_accel / 4.0F);
 
-            // Lateral cornering force with Pacejka-lite friction circle
+            // Lateral cornering force with Pacejka-lite friction ellipse
             const float rear_grip_scale = (input.handbrake && w_cfg.handbrake_affected)
-                ? config_.handbrake_rear_grip_scale
+                ? std::clamp(config_.handbrake_rear_grip_scale, 0.05F, 1.0F)
                 : 1.0F;
-            const float max_tire_grip = f_susp * config_.max_lateral_grip * rear_grip_scale;
+            const float max_long_grip = f_susp * config_.max_lateral_grip;
+            const float max_lat_grip = max_long_grip * rear_grip_scale;
 
             float f_lat = -v_lat * config_.cornering_stiffness * (f_susp / std::max(100.0F, config_.mass_kg * 2.5F));
-            f_lat = std::clamp(f_lat, -max_tire_grip, max_tire_grip);
-            f_long = std::clamp(f_long, -max_tire_grip, max_tire_grip);
+            f_lat = std::clamp(f_lat, -max_lat_grip, max_lat_grip);
+            f_long = std::clamp(f_long, -max_long_grip, max_long_grip);
+            if (max_long_grip > 1.0e-4F && max_lat_grip > 1.0e-4F) {
+                const float nx = f_long / max_long_grip;
+                const float ny = f_lat / max_lat_grip;
+                const float ellipse_norm = std::hypot(nx, ny);
+                if (ellipse_norm > 1.0F) {
+                    const float inv_norm = 1.0F / ellipse_norm;
+                    f_long *= inv_norm;
+                    f_lat *= inv_norm;
+                }
+            }
 
             // Apply combined tire friction at contact point
             const glm::vec3 f_tire = wheel_forward * f_long + wheel_right * f_lat;
@@ -385,7 +418,8 @@ void VehicleController::update(
     const float tilt_mag = glm::length(tilt_axis);
     if (tilt_mag > 0.02F && glm::dot(chassis_up, world_up) > 0.1F) {
         const glm::vec3 norm_tilt = tilt_axis / tilt_mag;
-        float stab_torque = 5200.0F * std::min(tilt_mag, 1.0F);
+        const float mass_scale = std::clamp(config_.mass_kg / 1450.0F, 0.25F, 8.0F);
+        float stab_torque = 5200.0F * mass_scale * std::min(tilt_mag, 1.0F);
         if (!any_grounded) {
             stab_torque *= 1.6F;
         }

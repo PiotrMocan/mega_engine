@@ -76,6 +76,8 @@ glm::mat4 RuntimePose::to_matrix() const noexcept {
 void RuntimeTransformRegistry::clear() noexcept {
     nodes_.clear();
     topological_order_.clear();
+    depth_visit_state_.clear();
+    depth_chain_scratch_.clear();
     std::fill(slot_to_node_.begin(), slot_to_node_.end(), UINT32_MAX);
     live_world_nodes_.clear();
     hierarchy_dirty_ = false;
@@ -87,6 +89,8 @@ void RuntimeTransformRegistry::reserve(std::size_t expected_nodes) {
     }
     nodes_.reserve(expected_nodes);
     topological_order_.reserve(expected_nodes);
+    depth_visit_state_.reserve(expected_nodes);
+    depth_chain_scratch_.reserve(64U);
     if (slot_to_node_.size() < expected_nodes) {
         slot_to_node_.resize(expected_nodes, UINT32_MAX);
     }
@@ -120,8 +124,12 @@ bool RuntimeTransformRegistry::register_node(
     record.world_pose = matrix_to_pose(initial_world);
     record.local_pose = record.world_pose;
     record.depth = 0U;
+    record.cached_socket_index = UINT32_MAX;
     record.is_attached = false;
     record.collision_dirty = true;
+    record.local_dirty = true;
+    record.world_dirty = true;
+    record.renderer_dirty = true;
 
     nodes_.push_back(std::move(record));
     slot_to_node_[id.index] = node_idx;
@@ -147,6 +155,9 @@ bool RuntimeTransformRegistry::register_node_pose(
         node->world_pose = pose;
         node->local_pose = pose;
         node->collision_dirty = true;
+        node->local_dirty = true;
+        node->world_dirty = true;
+        node->renderer_dirty = true;
     }
     return true;
 }
@@ -214,7 +225,10 @@ bool RuntimeTransformRegistry::set_world_pose(
     if (auto ref = live_world_nodes_.get_mut(id)) {
         ref->get() = node->world_matrix;
     }
+    node->local_dirty = false;
+    node->world_dirty = true;
     node->collision_dirty = true;
+    node->renderer_dirty = true;
     return true;
 }
 
@@ -245,7 +259,10 @@ bool RuntimeTransformRegistry::set_world_matrix(
     if (auto ref = live_world_nodes_.get_mut(id)) {
         ref->get() = world_matrix;
     }
+    node->local_dirty = false;
+    node->world_dirty = true;
     node->collision_dirty = true;
+    node->renderer_dirty = true;
     return true;
 }
 
@@ -271,7 +288,10 @@ bool RuntimeTransformRegistry::set_local_pose(
     if (auto ref = live_world_nodes_.get_mut(id)) {
         ref->get() = node->world_matrix;
     }
+    node->local_dirty = true;
+    node->world_dirty = true;
     node->collision_dirty = true;
+    node->renderer_dirty = true;
     return true;
 }
 
@@ -296,12 +316,16 @@ bool RuntimeTransformRegistry::attach_child(
     child_node->is_attached = true;
     child_node->parent_id = parent;
     child_node->socket_name.clear();
+    child_node->cached_socket_index = UINT32_MAX;
     child_node->local_pose = local_offset;
 
     child_node->world_matrix =
         parent_node->world_matrix * local_offset.to_matrix();
     child_node->world_pose = matrix_to_pose(child_node->world_matrix);
+    child_node->local_dirty = true;
+    child_node->world_dirty = true;
     child_node->collision_dirty = true;
+    child_node->renderer_dirty = true;
 
     if (auto ref = live_world_nodes_.get_mut(child)) {
         ref->get() = child_node->world_matrix;
@@ -330,28 +354,33 @@ bool RuntimeTransformRegistry::attach_child_to_socket(
         return false;
     }
 
-    bool socket_found = false;
+    std::uint32_t found_sock_idx = UINT32_MAX;
     glm::mat4 socket_local{1.0F};
-    for (const LocalSocket& sock : parent_node->sockets) {
+    for (std::size_t i = 0U; i < parent_node->sockets.size(); ++i) {
+        const LocalSocket& sock = parent_node->sockets[i];
         if (sock.name == socket_name) {
             socket_local = sock.local_pose.to_matrix();
-            socket_found = true;
+            found_sock_idx = static_cast<std::uint32_t>(i);
             break;
         }
     }
-    if (!socket_found) {
+    if (found_sock_idx == UINT32_MAX) {
         return false;
     }
 
     child_node->is_attached = true;
     child_node->parent_id = parent;
     child_node->socket_name = std::string(socket_name);
+    child_node->cached_socket_index = found_sock_idx;
     child_node->local_pose = extra_offset;
 
     const glm::mat4 socket_world = parent_node->world_matrix * socket_local;
     child_node->world_matrix = socket_world * extra_offset.to_matrix();
     child_node->world_pose = matrix_to_pose(child_node->world_matrix);
+    child_node->local_dirty = true;
+    child_node->world_dirty = true;
     child_node->collision_dirty = true;
+    child_node->renderer_dirty = true;
 
     if (auto ref = live_world_nodes_.get_mut(child)) {
         ref->get() = child_node->world_matrix;
@@ -386,8 +415,12 @@ bool RuntimeTransformRegistry::detach_child(
     child_node->is_attached = false;
     child_node->parent_id = SceneNodeId{};
     child_node->socket_name.clear();
+    child_node->cached_socket_index = UINT32_MAX;
     child_node->depth = 0U;
+    child_node->local_dirty = true;
+    child_node->world_dirty = true;
     child_node->collision_dirty = true;
+    child_node->renderer_dirty = true;
 
     hierarchy_dirty_ = true;
     return true;
@@ -424,6 +457,7 @@ bool RuntimeTransformRegistry::register_socket(
     for (LocalSocket& sock : node->sockets) {
         if (sock.name == name) {
             sock.local_pose = local_pose;
+            node->world_dirty = true;
             hierarchy_dirty_ = true;
             return true;
         }
@@ -433,6 +467,7 @@ bool RuntimeTransformRegistry::register_socket(
         .name = std::string(name),
         .local_pose = local_pose,
     });
+    node->world_dirty = true;
     hierarchy_dirty_ = true;
     return true;
 }
@@ -513,20 +548,35 @@ void RuntimeTransformRegistry::propagate_hierarchy() noexcept {
         NodeRecord& node = nodes_[idx];
         if (node.is_attached) {
             const NodeRecord* const parent = find_node(node.parent_id);
-            if (parent != nullptr && parent->collision_dirty) {
-                node.collision_dirty = true;
+            const bool needs_update =
+                node.local_dirty ||
+                node.world_dirty ||
+                (parent != nullptr && parent->world_dirty);
+            if (needs_update) {
+                const glm::mat4 prev_world = node.world_matrix;
+                const glm::mat4 parent_frame = compute_parent_frame(node);
+                node.world_matrix = parent_frame * node.local_pose.to_matrix();
+                node.world_pose = matrix_to_pose(node.world_matrix);
+                if (node.world_matrix != prev_world) {
+                    node.world_dirty = true;
+                    node.collision_dirty = true;
+                    node.renderer_dirty = true;
+                }
+                if (auto ref = live_world_nodes_.get_mut(node.id)) {
+                    ref->get() = node.world_matrix;
+                }
+                node.local_dirty = false;
             }
-            const glm::mat4 prev_world = node.world_matrix;
-            const glm::mat4 parent_frame = compute_parent_frame(node);
-            node.world_matrix = parent_frame * node.local_pose.to_matrix();
-            node.world_pose = matrix_to_pose(node.world_matrix);
-            if (node.world_matrix != prev_world) {
-                node.collision_dirty = true;
+        } else if (node.local_dirty || node.world_dirty) {
+            if (auto ref = live_world_nodes_.get_mut(node.id)) {
+                ref->get() = node.world_matrix;
             }
+            node.local_dirty = false;
         }
-        if (auto ref = live_world_nodes_.get_mut(node.id)) {
-            ref->get() = node.world_matrix;
-        }
+    }
+
+    for (const std::uint32_t idx : topological_order_) {
+        nodes_[idx].world_dirty = false;
     }
 }
 
@@ -548,13 +598,17 @@ void RuntimeTransformRegistry::sync_outputs(
 
     if (renderer_sink != nullptr && renderer_sink->apply != nullptr) {
         for (const std::uint32_t idx : topological_order_) {
-            const NodeRecord& node = nodes_[idx];
+            NodeRecord& node = nodes_[idx];
+            if (!node.renderer_dirty) {
+                continue;
+            }
             const TransformRows rows{
                 glm::row(node.world_matrix, 0),
                 glm::row(node.world_matrix, 1),
                 glm::row(node.world_matrix, 2),
             };
             renderer_sink->apply(renderer_sink->context, node.id, rows);
+            node.renderer_dirty = false;
         }
     }
 }
@@ -620,10 +674,15 @@ glm::mat4 RuntimeTransformRegistry::compute_parent_frame(
 
     glm::mat4 frame = parent->world_matrix;
     if (!node.socket_name.empty()) {
-        for (const LocalSocket& sock : parent->sockets) {
-            if (sock.name == node.socket_name) {
-                frame = frame * sock.local_pose.to_matrix();
-                break;
+        if (node.cached_socket_index < parent->sockets.size() &&
+            parent->sockets[node.cached_socket_index].name == node.socket_name) {
+            frame = frame * parent->sockets[node.cached_socket_index].local_pose.to_matrix();
+        } else {
+            for (const LocalSocket& sock : parent->sockets) {
+                if (sock.name == node.socket_name) {
+                    frame = frame * sock.local_pose.to_matrix();
+                    break;
+                }
             }
         }
     }
@@ -633,30 +692,47 @@ glm::mat4 RuntimeTransformRegistry::compute_parent_frame(
 void RuntimeTransformRegistry::rebuild_topological_order() noexcept {
     const auto count = static_cast<std::uint32_t>(nodes_.size());
     topological_order_.resize(count);
+    depth_visit_state_.assign(count, 0U);
+
     for (std::uint32_t i = 0U; i < count; ++i) {
         topological_order_[i] = i;
-        if (!nodes_[i].is_attached) {
-            nodes_[i].depth = 0U;
+        if (depth_visit_state_[i] == 2U) {
+            continue;
         }
-    }
-
-    bool changed = true;
-    std::uint32_t pass = 0U;
-    while (changed && pass < count) {
-        changed = false;
-        ++pass;
-        for (std::uint32_t i = 0U; i < count; ++i) {
-            if (nodes_[i].is_attached) {
-                const NodeRecord* const parent =
-                    find_node(nodes_[i].parent_id);
-                const std::uint32_t parent_depth =
-                    parent != nullptr ? parent->depth : 0U;
-                const std::uint32_t expected = parent_depth + 1U;
-                if (nodes_[i].depth != expected) {
-                    nodes_[i].depth = expected;
-                    changed = true;
+        depth_chain_scratch_.clear();
+        std::uint32_t curr = i;
+        std::uint32_t base_depth = 0U;
+        while (true) {
+            depth_visit_state_[curr] = 1U;
+            depth_chain_scratch_.push_back(curr);
+            const NodeRecord& rec = nodes_[curr];
+            if (!rec.is_attached) {
+                base_depth = 0U;
+                break;
+            }
+            std::uint32_t p_idx = UINT32_MAX;
+            if (rec.parent_id && rec.parent_id.index < slot_to_node_.size()) {
+                const std::uint32_t candidate = slot_to_node_[rec.parent_id.index];
+                if (candidate < count && nodes_[candidate].id == rec.parent_id) {
+                    p_idx = candidate;
                 }
             }
+            if (p_idx == UINT32_MAX || depth_visit_state_[p_idx] == 1U) {
+                base_depth = 0U;
+                break;
+            }
+            if (depth_visit_state_[p_idx] == 2U) {
+                base_depth = nodes_[p_idx].depth + 1U;
+                break;
+            }
+            curr = p_idx;
+        }
+
+        std::uint32_t d = base_depth;
+        for (std::size_t k = depth_chain_scratch_.size(); k > 0U; --k) {
+            const std::uint32_t node_i = depth_chain_scratch_[k - 1U];
+            nodes_[node_i].depth = d++;
+            depth_visit_state_[node_i] = 2U;
         }
     }
 

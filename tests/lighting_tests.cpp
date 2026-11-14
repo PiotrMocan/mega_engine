@@ -254,14 +254,14 @@ int main() {
                 glm::vec3(static_cast<float>(pose) * 2.17F, 7, -static_cast<float>(pose));
             const auto moved_view = glm::lookAt(
                 position, position + glm::vec3(0.1F * pose, -1, -10), glm::vec3(0, 1, 0));
-            const auto moved = shadow_cascades(moved_view, 16.0F / 9, direction, tile);
+            const auto shifted = shadow_cascades(moved_view, 16.0F / 9, direction, tile);
             for (unsigned cascade = 0; cascade < 4; ++cascade) {
                 for (unsigned column = 0; column < 3; ++column)
-                    expect(glm::length(moved[cascade][column] - reference[cascade][column]) < 1e-7F,
+                    expect(glm::length(shifted[cascade][column] - reference[cascade][column]) < 1e-7F,
                            "camera pose cannot change shadow scale or light basis");
                 for (unsigned axis = 0; axis < 2; ++axis) {
                     const float shift =
-                        (moved[cascade][3][axis] - reference[cascade][3][axis]) * (tile / 2);
+                        (shifted[cascade][3][axis] - reference[cascade][3][axis]) * (tile / 2);
                     expect(std::abs(shift - std::round(shift)) < 0.002F,
                            "camera moves shadows by integer texels only");
                 }

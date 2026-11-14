@@ -127,6 +127,8 @@ void print_pm_usage() {
         << "  --remove DIR            Remove a project from registry (keeps files)\n"
         << "  --scan DIR              Scan immediate subfolders for projects\n"
         << "  --build-game DIR        Bundle runtime (.exe + vcr_engine.dll) and compile C++ module in DIR\n"
+        << "  --ship DIR              Export a standalone Release game from DIR\n"
+        << "    --output DIR          New destination folder (must not exist)\n"
         << "  --build-all-games       Update runtime (.exe + vcr_engine.dll) and compile modules for all ready projects\n"
         << "  --set-icon DIR          Apply --icon image/.ico to project DIR\n"
         << "    --icon FILE           Source .png/.ico/.jpg/.bmp/.tga for --set-icon\n"
@@ -308,6 +310,17 @@ bool ProjectManagerApplication::parse_cli(
             out.cli_build_all_games = true;
             continue;
         }
+        if (arg == "--ship" || arg == "--output") {
+            std::string_view val;
+            if (!require_value(val)) return false;
+            if (arg == "--ship") {
+                out.cli_ship = true;
+                out.target_directory = std::string(val);
+            } else {
+                out.ship_output_directory = std::string(val);
+            }
+            continue;
+        }
         if (arg == "--set-icon") {
             std::string_view val;
             if (!require_value(val)) {
@@ -393,10 +406,11 @@ bool ProjectManagerApplication::parse_cli(
         (out.cli_remove ? 1 : 0) +
         (out.cli_scan ? 1 : 0) +
         (out.cli_build_game ? 1 : 0) +
+        (out.cli_ship ? 1 : 0) +
         (out.cli_build_all_games ? 1 : 0) +
         (out.cli_set_icon ? 1 : 0);
     if (action_count > 1) {
-        error = "Specify only one CLI action (--list, --create, --register, --remove, --scan, --build-game, --build-all-games, or --set-icon).";
+        error = "Specify only one CLI action (--list, --create, --register, --remove, --scan, --build-game, --ship, --build-all-games, or --set-icon).";
         return false;
     }
     if (out.cli_set_icon && out.icon_source_path.empty()) {
@@ -405,6 +419,10 @@ bool ProjectManagerApplication::parse_cli(
     }
     if (!out.icon_source_path.empty() && !out.cli_set_icon) {
         error = "--icon can only be used together with --set-icon <DIR>.";
+        return false;
+    }
+    if (out.cli_ship != !out.ship_output_directory.empty()) {
+        error = "Use --ship <project> together with --output <new destination folder>.";
         return false;
     }
     return true;
@@ -427,6 +445,7 @@ int ProjectManagerApplication::run(const int argc, char** const argv) {
     if (options_.cli_list || options_.cli_create ||
         options_.cli_register || options_.cli_remove || options_.cli_scan ||
         options_.cli_build_game || options_.cli_build_all_games ||
+        options_.cli_ship ||
         options_.cli_set_icon) {
         return run_cli_action(options_);
     }
@@ -439,6 +458,18 @@ int ProjectManagerApplication::run(const int argc, char** const argv) {
 
 int ProjectManagerApplication::run_cli_action(
     const ProjectManagerCliOptions& options) {
+    if (options.cli_ship) {
+        ShipProjectResult result;
+        std::string error;
+        if (!ship_project(path_from_utf8_str(options.target_directory),
+                path_from_utf8_str(options.ship_output_directory), result, error)) {
+            std::cerr << "Ship failed: " << error << '\n';
+            return 1;
+        }
+        std::cout << "Shipped game: " << path_to_utf8_str(result.executable_path)
+                  << " (cooked textures: " << result.cooked_textures << ")\n";
+        return 0;
+    }
     std::error_code ec;
     const bool registry_existed =
         std::filesystem::is_regular_file(registry_file_path_, ec) && !ec;
@@ -1118,7 +1149,7 @@ void ProjectManagerApplication::draw_frame() {
     const VkSemaphoreSubmitInfo signal_info{
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
         .semaphore = render_finished,
-        .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
     };
     const VkSubmitInfo2 submit_info{
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
@@ -1161,6 +1192,11 @@ void ProjectManagerApplication::draw_frame() {
 
 void ProjectManagerApplication::shutdown() noexcept {
     running_ = false;
+    if (shipping_worker_.joinable()) {
+        shipping_worker_.request_stop();
+        shipping_wake_.notify_all();
+        shipping_worker_.join();
+    }
     if (context_.device() != VK_NULL_HANDLE) {
         const VkResult idle = vkDeviceWaitIdle(context_.device());
         if (idle != VK_SUCCESS) {
@@ -1365,6 +1401,7 @@ void ProjectManagerApplication::sync_inspector_from_selection() {
 }
 
 void ProjectManagerApplication::build_ui() {
+    poll_shipping_result();
     const ImGuiViewport* const viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
     ImGui::SetNextWindowSize(viewport->WorkSize);
@@ -1383,6 +1420,7 @@ void ProjectManagerApplication::build_ui() {
     ImGui::PopStyleVar(2);
 
     if (host_open) {
+        ImGui::BeginDisabled(shipping_in_progress_);
         build_header_bar();
         ImGui::Spacing();
         ImGui::Separator();
@@ -1413,6 +1451,7 @@ void ProjectManagerApplication::build_ui() {
         }
         ImGui::EndChild();
 
+        ImGui::EndDisabled();
         ImGui::Spacing();
         if (!status_message_.empty()) {
             ui_kit_.status_text(status_message_.c_str(), status_tone_);
@@ -1741,11 +1780,11 @@ void ProjectManagerApplication::build_project_list_panel() {
             const bool hovered_card =
                 ImGui::IsMouseHoveringRect(card_min, card_max) &&
                 !ImGui::IsAnyItemHovered();
-            if (hovered_card && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            if (!shipping_in_progress_ && hovered_card && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                 selected_index_ = i;
                 sync_inspector_from_selection();
             }
-            if (hovered_card &&
+            if (!shipping_in_progress_ && hovered_card &&
                 ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
                 is_ready) {
                 selected_index_ = i;
@@ -2010,6 +2049,15 @@ void ProjectManagerApplication::build_inspector_panel() {
         }
         ImGui::EndGroup();
 
+        ImGui::Spacing();
+        if (ui_kit_.action_button(
+                "InspectorShipGame", EditorIcon::external_window, "Ship...",
+                EditorButtonStyle::primary, true, false, ImVec2(-1.0F, 0.0F))) {
+            ship_project_directory_ = selected.entry.project_directory;
+            open_folder_picker(FolderPickerTarget::ship_output,
+                selected.entry.project_directory.parent_path().parent_path());
+        }
+        ImGui::TextWrapped("Export a Release game to a new folder. No source code, debug files or source textures.");
         ImGui::Spacing();
         if (ui_kit_.action_button(
                 "InspectorBundleGame",
@@ -2620,6 +2668,10 @@ void ProjectManagerApplication::build_folder_picker_modal() {
 
     ImGui::Separator();
 
+    if (folder_picker_target_ == FolderPickerTarget::ship_output) {
+        const auto folder = make_project_folder_slug(path_to_utf8_str(ship_project_directory_.filename()));
+        ImGui::TextWrapped("Ship destination: %s/%s", folder_picker_current_utf8_.c_str(), folder.c_str());
+    }
     const float list_height = ImGui::GetContentRegionAvail().y - 76.0F;
     if (ImGui::BeginChild(
             "##DirEntries",
@@ -2674,9 +2726,11 @@ void ProjectManagerApplication::build_folder_picker_modal() {
     if (ui_kit_.action_button(
             "SelectThisFolderBtn",
             EditorIcon::folder,
-            "Select Current Folder",
+            folder_picker_target_ == FolderPickerTarget::ship_output ? "Ship Here" : "Select Current Folder",
             EditorButtonStyle::primary)) {
-        if (folder_picker_target_ == FolderPickerTarget::create_parent) {
+        if (folder_picker_target_ == FolderPickerTarget::ship_output) {
+            ship_selected_project(folder_picker_current_);
+        } else if (folder_picker_target_ == FolderPickerTarget::create_parent) {
             copy_to_cstr_buffer(
                 create_location_buffer_, folder_picker_current_utf8_);
         } else if (folder_picker_target_ == FolderPickerTarget::add_existing) {
@@ -2895,6 +2949,62 @@ void ProjectManagerApplication::apply_icon_to_selected_project(
     status_message_ =
         "Updated icon for '" + selected.entry.name + "'.";
     status_tone_ = EditorTone::success;
+}
+
+void ProjectManagerApplication::ship_selected_project(
+    const std::filesystem::path& parent_directory) {
+    if (shipping_in_progress_ || ship_project_directory_.empty()) return;
+    const auto destination = parent_directory / path_from_utf8_str(
+        make_project_folder_slug(path_to_utf8_str(ship_project_directory_.filename())));
+    if (!shipping_worker_.joinable()) {
+        shipping_worker_ = std::jthread([this](const std::stop_token stop) {
+            for (;;) {
+                ShippingRequest request;
+                {
+                    std::unique_lock lock(shipping_mutex_);
+                    if (!shipping_wake_.wait(lock, stop,
+                            [this] { return shipping_request_.has_value(); })) return;
+                    request = std::move(*shipping_request_);
+                    shipping_request_.reset();
+                }
+                ShippingCompletion completion;
+                completion.success = ship_project(request.project, request.destination,
+                    completion.result, completion.error);
+                {
+                    std::lock_guard lock(shipping_mutex_);
+                    shipping_completion_ = std::move(completion);
+                }
+            }
+        });
+    }
+    status_message_ = "Shipping Release game to " + path_to_utf8_str(destination) + "...";
+    status_tone_ = EditorTone::primary;
+    shipping_in_progress_ = true;
+    {
+        std::lock_guard lock(shipping_mutex_);
+        shipping_request_ = ShippingRequest{ship_project_directory_, destination};
+    }
+    shipping_wake_.notify_one();
+}
+
+void ProjectManagerApplication::poll_shipping_result() {
+    if (!shipping_in_progress_) return;
+    std::optional<ShippingCompletion> completion;
+    {
+        std::lock_guard lock(shipping_mutex_);
+        if (!shipping_completion_) return;
+        completion = std::move(shipping_completion_);
+        shipping_completion_.reset();
+    }
+    shipping_in_progress_ = false;
+    if (completion->success) {
+        status_message_ = "Shipped game: " + path_to_utf8_str(completion->result.executable_path);
+        status_tone_ = EditorTone::success;
+        refresh_cached_inspections();
+    } else {
+        status_message_ = "Ship failed: " + completion->error;
+        status_tone_ = EditorTone::danger;
+    }
 }
 
 void ProjectManagerApplication::bundle_selected_project_runtime() {

@@ -172,10 +172,17 @@ bool LaneGraph::build() {
         const glm::vec3 p1 = nodes_[s.end_node].position;
         const glm::vec3 diff = p1 - p0;
         const float len = glm::length(diff);
-        segment_lengths_[i] = len;
-        segment_directions_[i] = (len > 0.0001F)
-            ? (diff / len)
-            : nodes_[s.start_node].forward;
+        const float safe_len = (std::isfinite(len) && len > 0.0001F) ? len : 0.0F;
+        segment_lengths_[i] = safe_len;
+        if (safe_len > 0.0F) {
+            segment_directions_[i] = diff / safe_len;
+        } else {
+            const glm::vec3 fallback_fwd = nodes_[s.start_node].forward;
+            const float fwd_len = glm::length(fallback_fwd);
+            segment_directions_[i] = (std::isfinite(fwd_len) && fwd_len > 0.0001F)
+                ? (fallback_fwd / fwd_len)
+                : glm::vec3(0.0F, 0.0F, 1.0F);
+        }
     }
 
     built_ = true;
@@ -368,6 +375,21 @@ void TrafficSystem::update(
         const float seg_len = graph.segment_length(v.segment_id);
         const glm::vec3 seg_dir = graph.segment_direction(v.segment_id);
         const float speed_limit = cur_seg->speed_limit_mps;
+        const LaneNode* start_n = graph.node(cur_seg->start_node);
+        const LaneNode* end_n = graph.node(cur_seg->end_node);
+        float width_sum = 0.0F;
+        std::uint32_t width_count = 0U;
+        if (start_n != nullptr && std::isfinite(start_n->width) && start_n->width > 0.0F) {
+            width_sum += start_n->width;
+            ++width_count;
+        }
+        if (end_n != nullptr && std::isfinite(end_n->width) && end_n->width > 0.0F) {
+            width_sum += end_n->width;
+            ++width_count;
+        }
+        const float lane_half_width = (width_count > 0U)
+            ? (0.5F * (width_sum / static_cast<float>(width_count)))
+            : 1.8F;
         const float v_curr = v.speed_mps;
 
         float lead_gap = std::numeric_limits<float>::max();
@@ -454,7 +476,6 @@ void TrafficSystem::update(
             if (fwd > 0.0F && fwd < 25.0F) {
                 const glm::vec3 lat = to_obs - fwd * seg_dir;
                 const float lat_dist = std::hypot(lat.x, lat.z);
-                constexpr float lane_half_width = 1.8F;
                 if (lat_dist < (lane_half_width + obs.radius)) {
                     const float gap = std::max(0.1F, fwd - obs.radius);
                     if (gap < lead_gap) {
@@ -524,13 +545,39 @@ void TrafficSystem::update(
 
         // Advance distance along lane
         v.distance_along += v.speed_mps * clamped_dt;
-        if (v.distance_along >= seg_len) {
-            if (cur_seg->next_count > 0U) {
-                const std::uint32_t choice = prng_.next_u64() % cur_seg->next_count;
-                const std::uint32_t next_seg_id = cur_seg->next_segments[choice];
-                v.distance_along -= seg_len;
-                v.segment_id = next_seg_id;
-                cur_seg = graph.segment(v.segment_id);
+        float hop_seg_len = std::max(0.0F, seg_len);
+        constexpr std::uint32_t max_hops = 16U;
+        for (std::uint32_t hop = 0U; hop < max_hops && cur_seg != nullptr; ++hop) {
+            const std::uint32_t valid_next = std::min<std::uint32_t>(
+                cur_seg->next_count,
+                static_cast<std::uint32_t>(cur_seg->next_segments.size()));
+            if (valid_next == 0U || v.distance_along < hop_seg_len) {
+                break;
+            }
+            const std::uint32_t choice = static_cast<std::uint32_t>(
+                prng_.next_u64() % valid_next);
+            const std::uint32_t next_seg_id = cur_seg->next_segments[choice];
+            v.distance_along -= hop_seg_len;
+            v.segment_id = next_seg_id;
+            cur_seg = graph.segment(v.segment_id);
+            hop_seg_len = (cur_seg != nullptr)
+                ? std::max(0.0F, graph.segment_length(v.segment_id))
+                : 0.0F;
+        }
+        if (cur_seg == nullptr) {
+            v.active = false;
+            snapshots_[i].active = false;
+            if (active_count_ > 0U) {
+                --active_count_;
+            }
+            continue;
+        }
+        const std::uint32_t remaining_next = std::min<std::uint32_t>(
+            cur_seg->next_count,
+            static_cast<std::uint32_t>(cur_seg->next_segments.size()));
+        if (v.distance_along >= hop_seg_len) {
+            if (remaining_next > 0U) {
+                v.distance_along = std::min(v.distance_along, hop_seg_len);
             } else {
                 v.active = false;
                 snapshots_[i].active = false;
@@ -554,7 +601,11 @@ void TrafficSystem::update(
             v.yaw_radians + std::clamp(yaw_diff, -turn_speed * clamped_dt, turn_speed * clamped_dt));
 
         // Stuck detection
-        if (v.speed_mps < 0.25F && !stopped_at_red) {
+        const bool blocked_legitimately =
+            stopped_at_red ||
+            emergency_brake ||
+            (has_lead && lead_gap <= (config_.idm_min_gap_m + 10.0F));
+        if (speed_limit > 0.5F && v.speed_mps < 0.25F && !blocked_legitimately) {
             v.stuck_timer_s += clamped_dt;
             if (v.stuck_timer_s > config_.stuck_timeout_s) {
                 const float dist_cam = glm::distance(v.position, camera_position);

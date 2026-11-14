@@ -144,6 +144,12 @@ struct CompileProjectModuleResult {
     bool built = false;
 };
 
+struct ShipProjectResult {
+    std::filesystem::path output_directory{};
+    std::filesystem::path executable_path{};
+    std::size_t cooked_textures = 0U;
+};
+
 class ProjectRegistry final {
 public:
     [[nodiscard]] bool load_or_initialize(
@@ -240,6 +246,15 @@ find_packable_engine_runtime_binary();
     CompileProjectModuleResult& output,
     std::string& error,
     std::string_view build_config = "Release");
+
+// Publishes a new, standalone Windows Release game directory. Copies only
+// runtime content, cooks texture payloads, and never overwrites an existing
+// destination. Failed exports are removed without touching the source project.
+[[nodiscard]] bool ship_project(
+    const std::filesystem::path& project_directory,
+    const std::filesystem::path& output_directory,
+    ShipProjectResult& output,
+    std::string& error);
 
 // Converts/validates source_image_or_ico into multi-resolution .ico bytes,
 // writes <project>/<manifest.icon_path>, bundles runtime if missing & packable

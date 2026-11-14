@@ -2817,12 +2817,12 @@ import_model(
     context.result.primary_asset =
         context.result_prefix / metadata_relative;
 
-    if (source_has_animations) {
+    if (source_has_animations && animations_metadata.empty()) {
         context.result.warnings.push_back(
-            "Animations remain in the copied source, but the normalized "
-            "runtime mesh is a static pre-transformed snapshot.");
+            "Animations remain in the copied source, but no normalized "
+            "runtime clips were exported.");
     }
-    if (source_has_bones) {
+    if (source_has_bones && !skeleton_relative.has_value()) {
         context.result.warnings.push_back(
             "Skinning data remains in the copied source and is not present "
             "in the normalized static runtime mesh.");
@@ -2845,6 +2845,10 @@ import_model(
 #endif
 
 } // namespace
+
+std::string sanitize_imported_asset_slug(const std::string_view name) {
+    return sanitize_asset_name(name, "asset");
+}
 
 AssetSourceKind classify_asset_source(
     const std::filesystem::path& source) {

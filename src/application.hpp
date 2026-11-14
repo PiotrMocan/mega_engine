@@ -79,6 +79,8 @@ private:
     double camera_animation_time_ = 0;
     FlyCamera camera_{};
     GameplayRendererBridge gameplay_renderer_bridge_{};
+    std::filesystem::path loaded_module_project_root_{};
+    std::filesystem::path loaded_module_asset_root_{};
     LoadedGameModule loaded_game_module_{};
     GameplaySession gameplay_{};
     InputActionSystem input_actions_{};

@@ -365,7 +365,7 @@ void GameOverlayCanvas::push_quad(
     const glm::vec2 uv_min,
     const glm::vec2 uv_max,
     const std::uint32_t rgba8) noexcept {
-    if (vertices_.size() + 6U > max_vertices_) {
+    if (max_vertices_ < 6U || vertices_.size() > max_vertices_ - 6U) {
         truncated_ = true;
         return;
     }

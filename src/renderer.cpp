@@ -847,6 +847,7 @@ void Renderer::initialize(VulkanContext &context, SDL_Window *window,
     create_scene_resources();
 #if VCR_EDITOR_ENABLED
     create_game_ui_resources();
+    create_skinning_resources();
 #endif
     create_display_mapping_resources();
     create_anti_aliasing_resources();
@@ -1618,42 +1619,89 @@ Renderer::RenderedNodeDiagnostics Renderer::inspect_rendered_node(
     return diag;
 }
 
+std::optional<std::size_t> Renderer::find_skinned_slot_index(
+    const SceneNodeId node_id) const noexcept {
+    if (!node_id) {
+        return std::nullopt;
+    }
+    if (node_id.index < skinned_slot_by_node_index_.size()) {
+        const std::uint32_t encoded = skinned_slot_by_node_index_[node_id.index];
+        if (encoded > 0U) {
+            const std::size_t idx = static_cast<std::size_t>(encoded - 1U);
+            if (idx < skinned_node_slots_.size() &&
+                skinned_node_slots_[idx].node_id == node_id) {
+                return idx;
+            }
+        }
+    }
+    for (std::size_t i = 0U; i < skinned_node_slots_.size(); ++i) {
+        if (skinned_node_slots_[i].node_id == node_id) {
+            return i;
+        }
+    }
+    return std::nullopt;
+}
+
+void Renderer::assign_skinned_slot_index(
+    const SceneNodeId node_id,
+    const std::size_t slot_index) {
+    if (!node_id || node_id.index >= 1'048'576U) {
+        return;
+    }
+    if (node_id.index >= skinned_slot_by_node_index_.size()) {
+        skinned_slot_by_node_index_.resize(
+            static_cast<std::size_t>(node_id.index) + 1U, 0U);
+    }
+    skinned_slot_by_node_index_[node_id.index] =
+        static_cast<std::uint32_t>(slot_index + 1U);
+}
+
+void Renderer::rebuild_skinned_slot_lookup() noexcept {
+    std::fill(skinned_slot_by_node_index_.begin(), skinned_slot_by_node_index_.end(), 0U);
+    for (std::size_t i = 0U; i < skinned_node_slots_.size(); ++i) {
+        const SceneNodeId id = skinned_node_slots_[i].node_id;
+        if (id && id.index < skinned_slot_by_node_index_.size()) {
+            skinned_slot_by_node_index_[id.index] = static_cast<std::uint32_t>(i + 1U);
+        }
+    }
+}
+
 void Renderer::compact_skinned_node_slots() noexcept {
     std::uint32_t vertex_cursor = 0U;
     std::uint32_t bone_cursor = 0U;
-    std::vector<glm::mat4> compacted_bones{};
-    for (const SkinnedNodeSlot& slot : skinned_node_slots_) {
-        bone_cursor += slot.bone_count;
-    }
-    compacted_bones.resize(bone_cursor, glm::mat4(1.0F));
-    bone_cursor = 0U;
     for (SkinnedNodeSlot& slot : skinned_node_slots_) {
         if (slot.vertex_offset != vertex_cursor) {
             slot.vertex_offset = vertex_cursor;
             slot.initialized_prev_pool = false;
+            slot.dirty_pools_remaining = 2U;
         }
         const std::uint32_t old_bone_offset = slot.bone_offset;
         slot.bone_offset = bone_cursor;
-        if (old_bone_offset + slot.bone_count <= skinned_bone_matrices_.size() &&
-            slot.bone_count > 0U) {
+        if (slot.bone_count > 0U &&
+            old_bone_offset != bone_cursor &&
+            static_cast<std::size_t>(old_bone_offset) + slot.bone_count <=
+                skinned_bone_matrices_.size()) {
             std::copy_n(
                 skinned_bone_matrices_.data() + old_bone_offset,
                 slot.bone_count,
-                compacted_bones.data() + bone_cursor);
+                skinned_bone_matrices_.data() + bone_cursor);
         }
         vertex_cursor += slot.vertex_count;
         bone_cursor += slot.bone_count;
     }
     skinned_pool_vertex_cursor_ = vertex_cursor;
-    skinned_bone_matrices_ = std::move(compacted_bones);
+    skinned_bone_matrices_.resize(bone_cursor);
+    rebuild_skinned_slot_lookup();
+    ++skin_palette_revision_;
     bool draws_changed = false;
     for (EditorModelDraw& draw : editor_model_draws_) {
         if (!draw.node_id) {
             continue;
         }
         bool matched = false;
-        for (const SkinnedNodeSlot& slot : skinned_node_slots_) {
-            if (slot.node_id == draw.node_id && slot.asset_index == draw.asset_index) {
+        if (const auto slot_idx = find_skinned_slot_index(draw.node_id); slot_idx.has_value()) {
+            const SkinnedNodeSlot& slot = skinned_node_slots_[*slot_idx];
+            if (slot.asset_index == draw.asset_index) {
                 const std::int32_t new_offset = static_cast<std::int32_t>(slot.vertex_offset);
                 if (!draw.uses_skinned_pool || draw.vertex_offset != new_offset) {
                     draw.uses_skinned_pool = true;
@@ -1661,7 +1709,6 @@ void Renderer::compact_skinned_node_slots() noexcept {
                     draws_changed = true;
                 }
                 matched = true;
-                break;
             }
         }
         if (!matched && (draw.uses_skinned_pool || draw.vertex_offset != 0)) {
@@ -1704,34 +1751,48 @@ void Renderer::set_skinned_model_pose(
         return;
     }
 
-    for (SkinnedNodeSlot& slot : skinned_node_slots_) {
-        if (slot.node_id == node_id) {
-            if (slot.asset_index == *found_asset_index &&
-                slot.vertex_count == asset.vertex_count &&
-                slot.bone_count == bone_count &&
-                static_cast<std::size_t>(slot.bone_offset) + bone_count <=
-                    skinned_bone_matrices_.size()) {
-                const std::size_t copy_bytes =
-                    static_cast<std::size_t>(bone_count) * sizeof(glm::mat4);
-                glm::mat4* const dst = skinned_bone_matrices_.data() + slot.bone_offset;
-                if (std::memcmp(dst, skin_matrices.data(), copy_bytes) != 0) {
-                    std::copy_n(skin_matrices.data(), bone_count, dst);
-                    shadow_dirty_ = true;
-                }
-                return;
+    if (const auto existing_idx = find_skinned_slot_index(node_id); existing_idx.has_value()) {
+        SkinnedNodeSlot& slot = skinned_node_slots_[*existing_idx];
+        if (slot.asset_index == *found_asset_index &&
+            slot.vertex_count == asset.vertex_count &&
+            slot.bone_count == bone_count &&
+            static_cast<std::size_t>(slot.bone_offset) + bone_count <=
+                skinned_bone_matrices_.size()) {
+            const std::size_t copy_bytes =
+                static_cast<std::size_t>(bone_count) * sizeof(glm::mat4);
+            glm::mat4* const dst = skinned_bone_matrices_.data() + slot.bone_offset;
+            if (std::memcmp(dst, skin_matrices.data(), copy_bytes) != 0) {
+                std::copy_n(skin_matrices.data(), bone_count, dst);
+                slot.dirty_pools_remaining = 2U;
+                ++skin_palette_revision_;
+                shadow_dirty_ = true;
             }
-            slot.asset_index = *found_asset_index;
-            slot.vertex_count = asset.vertex_count;
-            slot.bone_count = bone_count;
-            slot.initialized_prev_pool = false;
-            compact_skinned_node_slots();
-            std::copy_n(
-                skin_matrices.data(),
-                bone_count,
-                skinned_bone_matrices_.data() + slot.bone_offset);
-            shadow_dirty_ = true;
             return;
         }
+        const std::uint32_t remaining_vertices =
+            skinned_pool_vertex_cursor_ >= slot.vertex_count
+                ? skinned_pool_vertex_cursor_ - slot.vertex_count
+                : 0U;
+        const std::size_t remaining_bones =
+            skinned_bone_matrices_.size() >= slot.bone_count
+                ? skinned_bone_matrices_.size() - slot.bone_count
+                : 0U;
+        if (remaining_vertices > max_skinned_pool_vertices ||
+            asset.vertex_count > max_skinned_pool_vertices - remaining_vertices ||
+            remaining_bones > max_skinned_total_bones ||
+            bone_count > max_skinned_total_bones - remaining_bones) {
+            return;
+        }
+        skinned_node_slots_.erase(
+            skinned_node_slots_.begin() + static_cast<std::ptrdiff_t>(*existing_idx));
+        compact_skinned_node_slots();
+    }
+
+    if (skinned_pool_vertex_cursor_ > max_skinned_pool_vertices ||
+        asset.vertex_count > max_skinned_pool_vertices - skinned_pool_vertex_cursor_ ||
+        skinned_bone_matrices_.size() > max_skinned_total_bones ||
+        bone_count > max_skinned_total_bones - skinned_bone_matrices_.size()) {
+        return;
     }
 
     SkinnedNodeSlot new_slot{};
@@ -1742,12 +1803,15 @@ void Renderer::set_skinned_model_pose(
     new_slot.bone_offset = static_cast<std::uint32_t>(skinned_bone_matrices_.size());
     new_slot.bone_count = bone_count;
     new_slot.initialized_prev_pool = false;
+    new_slot.dirty_pools_remaining = 2U;
     skinned_pool_vertex_cursor_ += new_slot.vertex_count;
     skinned_node_slots_.push_back(new_slot);
+    assign_skinned_slot_index(node_id, skinned_node_slots_.size() - 1U);
     skinned_bone_matrices_.insert(
         skinned_bone_matrices_.end(),
         skin_matrices.begin(),
         skin_matrices.begin() + bone_count);
+    ++skin_palette_revision_;
     bool draws_changed = false;
     const std::int32_t new_offset = static_cast<std::int32_t>(new_slot.vertex_offset);
     for (EditorModelDraw& draw : editor_model_draws_) {
@@ -1769,19 +1833,19 @@ void Renderer::remove_skinned_model_pose(const SceneNodeId node_id) noexcept {
     if (!node_id || skinned_node_slots_.empty()) {
         return;
     }
-    for (std::size_t i = 0U; i < skinned_node_slots_.size(); ++i) {
-        if (skinned_node_slots_[i].node_id == node_id) {
-            skinned_node_slots_.erase(skinned_node_slots_.begin() + static_cast<std::ptrdiff_t>(i));
-            compact_skinned_node_slots();
-            return;
-        }
+    if (const auto idx = find_skinned_slot_index(node_id); idx.has_value()) {
+        skinned_node_slots_.erase(
+            skinned_node_slots_.begin() + static_cast<std::ptrdiff_t>(*idx));
+        compact_skinned_node_slots();
     }
 }
 
 void Renderer::clear_skinned_model_poses() noexcept {
     skinned_node_slots_.clear();
+    std::fill(skinned_slot_by_node_index_.begin(), skinned_slot_by_node_index_.end(), 0U);
     skinned_bone_matrices_.clear();
     skinned_pool_vertex_cursor_ = 0U;
+    ++skin_palette_revision_;
     bool draws_changed = false;
     for (EditorModelDraw& draw : editor_model_draws_) {
         if (draw.uses_skinned_pool || draw.vertex_offset != 0) {
@@ -1858,141 +1922,186 @@ bool Renderer::update_skinning_asset_descriptor(EditorModelAsset& asset) noexcep
     return true;
 }
 
-bool Renderer::ensure_skinning_pipeline_and_pools(
-    const std::uint32_t required_vertices,
-    [[maybe_unused]] const std::uint32_t required_bones) {
-    if (context_ == nullptr || context_->device() == VK_NULL_HANDLE) {
-        return false;
+void Renderer::create_skinning_resources() {
+    if (!authored_scene_enabled_ || context_ == nullptr ||
+        context_->device() == VK_NULL_HANDLE || skinning_resources_ready_) {
+        return;
     }
-    if (!skinning_resources_ready_) {
-        const std::array asset_bindings{
-            VkDescriptorSetLayoutBinding{
-                .binding = 0U,
-                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                .descriptorCount = 1U,
-                .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-            },
-            VkDescriptorSetLayoutBinding{
-                .binding = 1U,
-                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                .descriptorCount = 1U,
-                .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-            },
-        };
-        const VkDescriptorSetLayoutCreateInfo asset_layout_info{
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-            .bindingCount = static_cast<std::uint32_t>(asset_bindings.size()),
-            .pBindings = asset_bindings.data(),
-        };
-        VK_CHECK(vkCreateDescriptorSetLayout(
-            context_->device(),
-            &asset_layout_info,
-            nullptr,
-            skin_asset_set_layout_.put(context_->device(), vkDestroyDescriptorSetLayout)));
-
-        const std::array frame_bindings{
-            VkDescriptorSetLayoutBinding{
-                .binding = 0U,
-                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                .descriptorCount = 1U,
-                .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-            },
-            VkDescriptorSetLayoutBinding{
-                .binding = 1U,
-                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                .descriptorCount = 1U,
-                .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-            },
-            VkDescriptorSetLayoutBinding{
-                .binding = 2U,
-                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                .descriptorCount = 1U,
-                .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-            },
-        };
-        const VkDescriptorSetLayoutCreateInfo frame_layout_info{
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-            .bindingCount = static_cast<std::uint32_t>(frame_bindings.size()),
-            .pBindings = frame_bindings.data(),
-        };
-        VK_CHECK(vkCreateDescriptorSetLayout(
-            context_->device(),
-            &frame_layout_info,
-            nullptr,
-            skin_frame_set_layout_.put(context_->device(), vkDestroyDescriptorSetLayout)));
-
-        constexpr std::uint32_t total_sets =
-            maximum_editor_model_assets + static_cast<std::uint32_t>(max_frames_in_flight);
-        const VkDescriptorPoolSize pool_size{
-            .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .descriptorCount =
-                maximum_editor_model_assets * 2U +
-                static_cast<std::uint32_t>(max_frames_in_flight) * 3U,
-        };
-        const VkDescriptorPoolCreateInfo pool_info{
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-            .maxSets = total_sets,
-            .poolSizeCount = 1U,
-            .pPoolSizes = &pool_size,
-        };
-        VK_CHECK(vkCreateDescriptorPool(
-            context_->device(),
-            &pool_info,
-            nullptr,
-            skin_descriptor_pool_.put(context_->device(), vkDestroyDescriptorPool)));
-
-        const std::array set_layouts{
-            skin_asset_set_layout_.get(),
-            skin_frame_set_layout_.get(),
-        };
-        const VkPushConstantRange push_range{
+    const std::array asset_bindings{
+        VkDescriptorSetLayoutBinding{
+            .binding = 0U,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1U,
             .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-            .offset = 0U,
-            .size = sizeof(SkinPushConstants),
-        };
-        const VkPipelineLayoutCreateInfo pipeline_layout_info{
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-            .setLayoutCount = static_cast<std::uint32_t>(set_layouts.size()),
-            .pSetLayouts = set_layouts.data(),
-            .pushConstantRangeCount = 1U,
-            .pPushConstantRanges = &push_range,
-        };
-        VK_CHECK(vkCreatePipelineLayout(
-            context_->device(),
-            &pipeline_layout_info,
-            nullptr,
-            skin_pipeline_layout_.put(context_->device(), vkDestroyPipelineLayout)));
+        },
+        VkDescriptorSetLayoutBinding{
+            .binding = 1U,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1U,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        },
+    };
+    const VkDescriptorSetLayoutCreateInfo asset_layout_info{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = static_cast<std::uint32_t>(asset_bindings.size()),
+        .pBindings = asset_bindings.data(),
+    };
+    VK_CHECK(vkCreateDescriptorSetLayout(
+        context_->device(),
+        &asset_layout_info,
+        nullptr,
+        skin_asset_set_layout_.put(context_->device(), vkDestroyDescriptorSetLayout)));
+    context_->set_debug_name(
+        VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT,
+        handle_value(skin_asset_set_layout_.get()),
+        "skinning asset set layout");
 
-        const ShaderModule compute_module = load_shader("model_skinning.comp.spv");
-        const VkComputePipelineCreateInfo compute_info{
-            .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-            .stage = VkPipelineShaderStageCreateInfo{
-                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                .module = compute_module.get(),
-                .pName = "main",
-            },
-            .layout = skin_pipeline_layout_.get(),
-        };
-        VK_CHECK(vkCreateComputePipelines(
-            context_->device(),
-            pipeline_cache_,
-            1U,
-            &compute_info,
-            nullptr,
-            skin_compute_pipeline_.put(context_->device(), vkDestroyPipeline)));
-        skinning_resources_ready_ = true;
+    const std::array frame_bindings{
+        VkDescriptorSetLayoutBinding{
+            .binding = 0U,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1U,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        },
+        VkDescriptorSetLayoutBinding{
+            .binding = 1U,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1U,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        },
+        VkDescriptorSetLayoutBinding{
+            .binding = 2U,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1U,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        },
+    };
+    const VkDescriptorSetLayoutCreateInfo frame_layout_info{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = static_cast<std::uint32_t>(frame_bindings.size()),
+        .pBindings = frame_bindings.data(),
+    };
+    VK_CHECK(vkCreateDescriptorSetLayout(
+        context_->device(),
+        &frame_layout_info,
+        nullptr,
+        skin_frame_set_layout_.put(context_->device(), vkDestroyDescriptorSetLayout)));
+    context_->set_debug_name(
+        VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT,
+        handle_value(skin_frame_set_layout_.get()),
+        "skinning frame set layout");
+
+    constexpr std::uint32_t total_sets =
+        maximum_editor_model_assets + static_cast<std::uint32_t>(max_frames_in_flight);
+    const VkDescriptorPoolSize pool_size{
+        .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount =
+            maximum_editor_model_assets * 2U +
+            static_cast<std::uint32_t>(max_frames_in_flight) * 3U,
+    };
+    const VkDescriptorPoolCreateInfo pool_info{
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = total_sets,
+        .poolSizeCount = 1U,
+        .pPoolSizes = &pool_size,
+    };
+    VK_CHECK(vkCreateDescriptorPool(
+        context_->device(),
+        &pool_info,
+        nullptr,
+        skin_descriptor_pool_.put(context_->device(), vkDestroyDescriptorPool)));
+    context_->set_debug_name(
+        VK_OBJECT_TYPE_DESCRIPTOR_POOL,
+        handle_value(skin_descriptor_pool_.get()),
+        "skinning descriptor pool");
+
+    const std::array set_layouts{
+        skin_asset_set_layout_.get(),
+        skin_frame_set_layout_.get(),
+    };
+    const VkPushConstantRange push_range{
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0U,
+        .size = sizeof(SkinPushConstants),
+    };
+    const VkPipelineLayoutCreateInfo pipeline_layout_info{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = static_cast<std::uint32_t>(set_layouts.size()),
+        .pSetLayouts = set_layouts.data(),
+        .pushConstantRangeCount = 1U,
+        .pPushConstantRanges = &push_range,
+    };
+    VK_CHECK(vkCreatePipelineLayout(
+        context_->device(),
+        &pipeline_layout_info,
+        nullptr,
+        skin_pipeline_layout_.put(context_->device(), vkDestroyPipelineLayout)));
+    context_->set_debug_name(
+        VK_OBJECT_TYPE_PIPELINE_LAYOUT,
+        handle_value(skin_pipeline_layout_.get()),
+        "skinning pipeline layout");
+
+    const ShaderModule compute_module = load_shader("model_skinning.comp.spv");
+    const VkComputePipelineCreateInfo compute_info{
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = VkPipelineShaderStageCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = compute_module.get(),
+            .pName = "main",
+        },
+        .layout = skin_pipeline_layout_.get(),
+    };
+    VK_CHECK(vkCreateComputePipelines(
+        context_->device(),
+        pipeline_cache_,
+        1U,
+        &compute_info,
+        nullptr,
+        skin_compute_pipeline_.put(context_->device(), vkDestroyPipeline)));
+    context_->set_debug_name(
+        VK_OBJECT_TYPE_PIPELINE,
+        handle_value(skin_compute_pipeline_.get()),
+        "model skinning compute pipeline");
+    skinning_resources_ready_ = true;
+}
+
+void Renderer::prepare_skinning_resources_for_frame(FrameContext& frame) {
+    if (!skinning_resources_ready_ ||
+        context_ == nullptr ||
+        context_->device() == VK_NULL_HANDLE ||
+        skinned_node_slots_.empty() ||
+        skinned_pool_vertex_cursor_ == 0U ||
+        skinned_bone_matrices_.empty()) {
+        return;
     }
 
-    const std::uint32_t target_vertices = std::max<std::uint32_t>(
-        required_vertices, 262'144U);
+    const std::uint32_t target_vertices = std::min<std::uint32_t>(
+        std::max<std::uint32_t>(skinned_pool_vertex_cursor_, 262'144U),
+        max_skinned_pool_vertices);
     if (skinned_vertex_pool_[0].handle() == VK_NULL_HANDLE ||
         skinned_pool_vertex_capacity_ < target_vertices) {
-        const std::uint32_t next_capacity = skinned_pool_vertex_capacity_ == 0U
-            ? target_vertices
-            : std::max(target_vertices, skinned_pool_vertex_capacity_ * 2U);
+        const std::uint32_t next_capacity = std::min<std::uint32_t>(
+            skinned_pool_vertex_capacity_ == 0U
+                ? target_vertices
+                : std::max(target_vertices, skinned_pool_vertex_capacity_ * 2U),
+            max_skinned_pool_vertices);
         if (skinned_vertex_pool_[0].handle() != VK_NULL_HANDLE) {
-            VK_CHECK(vkDeviceWaitIdle(context_->device()));
+            std::array<VkFence, max_frames_in_flight> in_flight_fences{};
+            std::uint32_t fence_count = 0U;
+            for (const FrameContext& f : frames_) {
+                if (f.fence != VK_NULL_HANDLE) {
+                    in_flight_fences[fence_count++] = f.fence;
+                }
+            }
+            if (fence_count > 0U) {
+                VK_CHECK(vkWaitForFences(
+                    context_->device(),
+                    fence_count,
+                    in_flight_fences.data(),
+                    VK_TRUE,
+                    UINT64_MAX));
+            }
         }
         const VkDeviceSize pool_bytes =
             static_cast<VkDeviceSize>(next_capacity) * model_vertex_stride_;
@@ -2009,53 +2118,16 @@ bool Renderer::ensure_skinning_pipeline_and_pools(
         skinned_pool_vertex_capacity_ = next_capacity;
         for (SkinnedNodeSlot& slot : skinned_node_slots_) {
             slot.initialized_prev_pool = false;
+            slot.dirty_pools_remaining = 2U;
         }
-        for (FrameContext& frame : frames_) {
-            frame.skin_bound_curr_pool = VK_NULL_HANDLE;
-            frame.skin_bound_prev_pool = VK_NULL_HANDLE;
+        for (FrameContext& f : frames_) {
+            f.skin_bound_curr_pool = VK_NULL_HANDLE;
+            f.skin_bound_prev_pool = VK_NULL_HANDLE;
         }
-    }
-    return true;
-}
-
-void Renderer::destroy_skinning_resources() noexcept {
-    skin_compute_pipeline_.reset();
-    skin_pipeline_layout_.reset();
-    skin_descriptor_pool_.reset();
-    skin_asset_set_layout_.reset();
-    skin_frame_set_layout_.reset();
-    skinned_vertex_pool_[0].destroy();
-    skinned_vertex_pool_[1].destroy();
-    skinned_pool_vertex_capacity_ = 0U;
-    skinning_resources_ready_ = false;
-    for (EditorModelAsset& asset : editor_model_assets_) {
-        asset.skin_asset_set = VK_NULL_HANDLE;
-    }
-    for (FrameContext& frame : frames_) {
-        frame.skin_palette_buffer.destroy();
-        frame.skin_palette_capacity_bytes = 0U;
-        frame.skin_frame_set = VK_NULL_HANDLE;
-        frame.skin_bound_palette = VK_NULL_HANDLE;
-        frame.skin_bound_curr_pool = VK_NULL_HANDLE;
-        frame.skin_bound_prev_pool = VK_NULL_HANDLE;
-    }
-}
-
-void Renderer::record_model_skinning(
-    const VkCommandBuffer command_buffer,
-    FrameContext& frame) {
-    if (skinned_node_slots_.empty() || skinned_pool_vertex_cursor_ == 0U) {
-        return;
-    }
-    const std::uint32_t bone_count_total =
-        static_cast<std::uint32_t>(skinned_bone_matrices_.size());
-    if (bone_count_total == 0U ||
-        !ensure_skinning_pipeline_and_pools(skinned_pool_vertex_cursor_, bone_count_total)) {
-        return;
     }
 
     const VkDeviceSize required_palette_bytes = std::max<VkDeviceSize>(
-        static_cast<VkDeviceSize>(bone_count_total) * sizeof(glm::mat4),
+        static_cast<VkDeviceSize>(skinned_bone_matrices_.size()) * sizeof(glm::mat4),
         256U * sizeof(glm::mat4));
     if (frame.skin_palette_buffer.handle() == VK_NULL_HANDLE ||
         frame.skin_palette_capacity_bytes < required_palette_bytes) {
@@ -2072,9 +2144,13 @@ void Renderer::record_model_skinning(
             "editor skin bone palette");
         frame.skin_palette_capacity_bytes = alloc_bytes;
         frame.skin_bound_palette = VK_NULL_HANDLE;
+        frame.skin_uploaded_palette_revision = 0U;
     }
-    frame.skin_palette_buffer.write(
-        std::as_bytes(std::span<const glm::mat4>{skinned_bone_matrices_}));
+    if (frame.skin_uploaded_palette_revision != skin_palette_revision_) {
+        frame.skin_palette_buffer.write(
+            std::as_bytes(std::span<const glm::mat4>{skinned_bone_matrices_}));
+        frame.skin_uploaded_palette_revision = skin_palette_revision_;
+    }
 
     if (frame.skin_frame_set == VK_NULL_HANDLE) {
         const VkDescriptorSetLayout layout = skin_frame_set_layout_.get();
@@ -2150,6 +2226,73 @@ void Renderer::record_model_skinning(
         frame.skin_bound_prev_pool = pool1_handle;
     }
 
+    for (const SkinnedNodeSlot& slot : skinned_node_slots_) {
+        if (slot.asset_index < editor_model_assets_.size() &&
+            slot.vertex_count > 0U &&
+            slot.bone_count > 0U) {
+            EditorModelAsset& asset = editor_model_assets_[slot.asset_index];
+            if (asset.is_skinned() && asset.ready) {
+                (void)update_skinning_asset_descriptor(asset);
+            }
+        }
+    }
+}
+
+void Renderer::destroy_skinning_resources() noexcept {
+    skin_compute_pipeline_.reset();
+    skin_pipeline_layout_.reset();
+    skin_descriptor_pool_.reset();
+    skin_asset_set_layout_.reset();
+    skin_frame_set_layout_.reset();
+    skinned_vertex_pool_[0].destroy();
+    skinned_vertex_pool_[1].destroy();
+    skinned_pool_vertex_capacity_ = 0U;
+    skinning_resources_ready_ = false;
+    for (EditorModelAsset& asset : editor_model_assets_) {
+        asset.skin_asset_set = VK_NULL_HANDLE;
+    }
+    for (FrameContext& frame : frames_) {
+        frame.skin_palette_buffer.destroy();
+        frame.skin_palette_capacity_bytes = 0U;
+        frame.skin_uploaded_palette_revision = 0U;
+        frame.skin_frame_set = VK_NULL_HANDLE;
+        frame.skin_bound_palette = VK_NULL_HANDLE;
+        frame.skin_bound_curr_pool = VK_NULL_HANDLE;
+        frame.skin_bound_prev_pool = VK_NULL_HANDLE;
+    }
+}
+
+void Renderer::record_model_skinning(
+    const VkCommandBuffer command_buffer,
+    FrameContext& frame) {
+    if (!skinning_resources_ready_ ||
+        skin_compute_pipeline_.get() == VK_NULL_HANDLE ||
+        frame.skin_frame_set == VK_NULL_HANDLE ||
+        skinned_vertex_pool_[0].handle() == VK_NULL_HANDLE ||
+        skinned_node_slots_.empty() ||
+        skinned_pool_vertex_cursor_ == 0U ||
+        skinned_bone_matrices_.empty()) {
+        return;
+    }
+
+    bool any_dirty = false;
+    for (const SkinnedNodeSlot& slot : skinned_node_slots_) {
+        if (slot.dirty_pools_remaining == 0U ||
+            slot.asset_index >= editor_model_assets_.size() ||
+            slot.vertex_count == 0U ||
+            slot.bone_count == 0U) {
+            continue;
+        }
+        const EditorModelAsset& asset = editor_model_assets_[slot.asset_index];
+        if (asset.is_skinned() && asset.ready && asset.skin_asset_set != VK_NULL_HANDLE) {
+            any_dirty = true;
+            break;
+        }
+    }
+    if (!any_dirty) {
+        return;
+    }
+
     skinning_pool_parity_ = 1U - skinning_pool_parity_;
 
     const VkMemoryBarrier2 pre_skin_barrier{
@@ -2186,14 +2329,14 @@ void Renderer::record_model_skinning(
     const std::uint32_t words_per_vertex =
         static_cast<std::uint32_t>(model_vertex_stride_ / sizeof(std::uint32_t));
     for (SkinnedNodeSlot& slot : skinned_node_slots_) {
-        if (slot.asset_index >= editor_model_assets_.size() ||
-            slot.vertex_count == 0U || slot.bone_count == 0U) {
+        if (slot.dirty_pools_remaining == 0U ||
+            slot.asset_index >= editor_model_assets_.size() ||
+            slot.vertex_count == 0U ||
+            slot.bone_count == 0U) {
             continue;
         }
-        EditorModelAsset& asset = editor_model_assets_[slot.asset_index];
-        if (!asset.is_skinned() || !asset.ready ||
-            !update_skinning_asset_descriptor(asset) ||
-            asset.skin_asset_set == VK_NULL_HANDLE) {
+        const EditorModelAsset& asset = editor_model_assets_[slot.asset_index];
+        if (!asset.is_skinned() || !asset.ready || asset.skin_asset_set == VK_NULL_HANDLE) {
             continue;
         }
         vkCmdBindDescriptorSets(
@@ -2205,13 +2348,14 @@ void Renderer::record_model_skinning(
             &asset.skin_asset_set,
             0U,
             nullptr);
+        const bool write_both = !slot.initialized_prev_pool;
         const SkinPushConstants pc{
             .vertex_count = slot.vertex_count,
             .words_per_vertex = words_per_vertex,
             .dst_vertex_offset = slot.vertex_offset,
             .bone_offset = slot.bone_offset,
             .bone_count = slot.bone_count,
-            .flags = skinning_pool_parity_ | (slot.initialized_prev_pool ? 0U : 2U),
+            .flags = skinning_pool_parity_ | (write_both ? 2U : 0U),
         };
         vkCmdPushConstants(
             command_buffer,
@@ -2221,7 +2365,12 @@ void Renderer::record_model_skinning(
             sizeof(pc),
             &pc);
         vkCmdDispatch(command_buffer, (slot.vertex_count + 63U) / 64U, 1U, 1U);
-        slot.initialized_prev_pool = true;
+        if (write_both) {
+            slot.initialized_prev_pool = true;
+            slot.dirty_pools_remaining = 0U;
+        } else {
+            --slot.dirty_pools_remaining;
+        }
     }
 
     const VkMemoryBarrier2 post_skin_barrier{
@@ -2518,7 +2667,7 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
             }
         }
         std::uint32_t gi_first = 0, gi_count = 0;
-        if (gi_provisioned_ && (coverage & material_coverage_transparent_mask) == 0U) {
+        if (gi_provisioned_) {
             std::vector<GiTriangle> triangles;
             triangles.reserve(static_cast<std::size_t>(source.index_count / 3));
             for (std::uint64_t i = source.first_index; i < source.first_index + source.index_count;
@@ -3096,12 +3245,25 @@ bool Renderer::apply_editor_material(
                 submesh.material = material;
                 submesh.tessellation = tessellation;
                 if (coverage.has_value() && submesh.coverage != *coverage) {
+                    const std::uint32_t diff = submesh.coverage ^ *coverage;
                     const bool transparency_changed =
-                        ((submesh.coverage ^ *coverage) &
-                         material_coverage_transparent_mask) != 0U;
+                        (diff & material_coverage_transparent_mask) != 0U;
+                    const bool alpha_mask_changed =
+                        (diff & material_coverage_alpha_mask_bit) != 0U;
                     submesh.coverage = *coverage;
                     shadow_dirty_ = true;
-                    if (transparency_changed && rt_provisioned_) {
+                    if (transparency_changed) {
+                        gi_scene_revision_ = 0U;
+                    }
+                    if ((transparency_changed || alpha_mask_changed) && rt_provisioned_) {
+                        if ((*coverage & material_coverage_transparent_mask) == 0U &&
+                            (!submesh.blas || alpha_mask_changed)) {
+                            submesh.blas_dirty = true;
+                            rt_blas_refresh_pending_ = true;
+                        }
+                        for (FrameContext& frame_ctx : frames_) {
+                            frame_ctx.tlas_built_once = false;
+                        }
                         rt_tlas_build_due_ = true;
                     }
                 }
@@ -8036,6 +8198,11 @@ void Renderer::create_pipeline() {
                         attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
                         attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
                         attachment.alphaBlendOp = VK_BLEND_OP_ADD;
+                        attachment.colorWriteMask =
+                            VK_COLOR_COMPONENT_R_BIT |
+                            VK_COLOR_COMPONENT_G_BIT |
+                            VK_COLOR_COMPONENT_B_BIT |
+                            VK_COLOR_COMPONENT_A_BIT;
                     }
                 }
                 blend.pAttachments = attachments.data();
@@ -9005,6 +9172,12 @@ bool Renderer::draw_frame(
     prepare_msaa_targets_for_frame(frame_index_);
     if (subsurface_provision_pending_) provision_subsurface_resources();
     if (rt_provision_pending_) provision_ray_tracing_resources();
+#if VCR_EDITOR_ENABLED
+    if (rt_blas_refresh_pending_) {
+        refresh_dirty_model_blas();
+    }
+    prepare_skinning_resources_for_frame(frame);
+#endif
 
     std::uint32_t image_index = 0;
     begin = Clock::now();
@@ -10102,7 +10275,7 @@ void Renderer::record_commands(
                         world_center = {
                             glm::dot(t.x, c), glm::dot(t.y, c), glm::dot(t.z, c)};
                     }
-                    const glm::vec3 delta = world_center - lod_camera_position_;
+                    const glm::vec3 delta = world_center - frame.rendered_camera_position;
                     transparent_draw_order_.push_back(TransparentDrawOrderEntry{
                         .draw_index = static_cast<std::uint32_t>(draw_index),
                         .distance_sq = glm::dot(delta, delta),
@@ -10415,8 +10588,20 @@ void Renderer::record_commands(
                 VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         };
     const auto draw_hud =
-        [this, command_buffer, display_extent]() {
-            if (!game_ui_pending_vertices_.empty()) return;
+        [this, command_buffer, display_extent
+#if VCR_EDITOR_ENABLED
+         ,
+         &frame
+#endif
+        ]() {
+#if VCR_EDITOR_ENABLED
+            if (frame.game_ui_vertex_count > 0U || !game_ui_pending_vertices_.empty()) {
+                return;
+            }
+#endif
+            if (display_extent.width <= 12U || display_extent.height <= 12U) {
+                return;
+            }
             struct HudPushConstants {
                 std::uint32_t method;
                 std::uint32_t quality;

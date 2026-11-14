@@ -1009,6 +1009,8 @@ void EditorApplication::synchronize_gameplay_state() {
                 ? std::optional<double>(options_.camera_z)
                 : std::nullopt);
         loaded_game_module_.unload(&gameplay_);
+        loaded_module_project_root_.clear();
+        loaded_module_asset_root_.clear();
         std::string error;
         const std::filesystem::path project_dir = ui_.asset_root().parent_path();
         if (!project_dir.empty() &&
@@ -1016,9 +1018,11 @@ void EditorApplication::synchronize_gameplay_state() {
             const ProjectInspection proj_insp =
                 inspect_project_directory(project_dir);
             if (!proj_insp.game_module_path.empty()) {
+                loaded_module_project_root_ = proj_insp.project_directory;
+                loaded_module_asset_root_ = ui_.asset_root();
                 const GameModuleHostContext host{
-                    .project_root = &proj_insp.project_directory,
-                    .asset_root = &ui_.asset_root(),
+                    .project_root = &loaded_module_project_root_,
+                    .asset_root = &loaded_module_asset_root_,
                     .scene = &scene_,
                     .session = &gameplay_,
                     .audio_engine = audio_engine_.initialized()
@@ -3026,7 +3030,9 @@ void EditorApplication::shutdown() noexcept {
     edit_animator_preview_.clear(nullptr);
     gameplay_.stop(
         audio_engine_.initialized() ? &audio_engine_ : nullptr,
-        &gameplay_renderer_bridge_);
+        gameplay_renderer_bridge_.context != nullptr
+            ? &gameplay_renderer_bridge_
+            : nullptr);
     loaded_game_module_.unload(&gameplay_);
     ui_.shutdown();
     audio_engine_.shutdown();

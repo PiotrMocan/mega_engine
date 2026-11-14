@@ -2,6 +2,7 @@
 
 #include "gameplay_session.hpp"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <system_error>
@@ -76,6 +77,29 @@ public:
 private:
     HMODULE handle_ = nullptr;
 };
+
+class ScopedDllDirectoryCookie final {
+public:
+    ScopedDllDirectoryCookie() noexcept = default;
+    explicit ScopedDllDirectoryCookie(const wchar_t* const directory) noexcept
+        : cookie_(directory != nullptr ? AddDllDirectory(directory) : nullptr) {}
+    ~ScopedDllDirectoryCookie() noexcept {
+        reset();
+    }
+
+    ScopedDllDirectoryCookie(const ScopedDllDirectoryCookie&) = delete;
+    ScopedDllDirectoryCookie& operator=(const ScopedDllDirectoryCookie&) = delete;
+
+    void reset() noexcept {
+        if (cookie_ != nullptr) {
+            static_cast<void>(RemoveDllDirectory(cookie_));
+            cookie_ = nullptr;
+        }
+    }
+
+private:
+    DLL_DIRECTORY_COOKIE cookie_ = nullptr;
+};
 #endif
 
 } // namespace
@@ -88,6 +112,7 @@ LoadedGameModule::LoadedGameModule(LoadedGameModule&& other) noexcept
     : library_handle_(std::exchange(other.library_handle_, nullptr)),
       api_(std::exchange(other.api_, nullptr)),
       instance_id_(std::exchange(other.instance_id_, 0U)),
+      bound_session_(std::exchange(other.bound_session_, nullptr)),
       module_name_(std::move(other.module_name_)),
       source_path_(std::move(other.source_path_)),
       shadow_copy_path_(std::move(other.shadow_copy_path_)) {}
@@ -99,6 +124,7 @@ LoadedGameModule& LoadedGameModule::operator=(
         library_handle_ = std::exchange(other.library_handle_, nullptr);
         api_ = std::exchange(other.api_, nullptr);
         instance_id_ = std::exchange(other.instance_id_, 0U);
+        bound_session_ = std::exchange(other.bound_session_, nullptr);
         module_name_ = std::move(other.module_name_);
         source_path_ = std::move(other.source_path_);
         shadow_copy_path_ = std::move(other.shadow_copy_path_);
@@ -156,10 +182,24 @@ bool LoadedGameModule::load(
                     ec.message();
             return false;
         }
+        const auto root_status = std::filesystem::symlink_status(temp_root, ec);
+        if (!ec && std::filesystem::is_symlink(root_status)) {
+            error = "Refusing shadow copy through symbolic link directory: " +
+                    path_to_utf8_local(temp_root);
+            return false;
+        }
+        ec.clear();
         std::filesystem::create_directories(temp_root, ec);
         if (ec) {
             error = "Unable to create module shadow-copy directory: " +
                     ec.message();
+            return false;
+        }
+        const auto post_status = std::filesystem::symlink_status(temp_root, ec);
+        if (ec || !std::filesystem::is_directory(post_status) ||
+            std::filesystem::is_symlink(post_status)) {
+            error = "Shadow-copy directory is invalid or is a symbolic link: " +
+                    path_to_utf8_local(temp_root);
             return false;
         }
         const std::uint64_t serial =
@@ -184,9 +224,15 @@ bool LoadedGameModule::load(
         load_target = created_shadow;
     }
 
-    const DWORD flags = shadow_copy_dll ? 0U : LOAD_WITH_ALTERED_SEARCH_PATH;
+    const std::filesystem::path source_dir = resolved_source.parent_path();
+    ScopedDllDirectoryCookie dll_dir_cookie(
+        (shadow_copy_dll && !source_dir.empty()) ? source_dir.c_str() : nullptr);
+    const DWORD flags = shadow_copy_dll
+        ? LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
+        : (LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     ScopedNativeLibrary lib(
         LoadLibraryExW(load_target.c_str(), nullptr, flags));
+    dll_dir_cookie.reset();
     if (lib.get() == nullptr) {
         const DWORD last_err = GetLastError();
         if (!created_shadow.empty()) {
@@ -222,8 +268,20 @@ bool LoadedGameModule::load(
             std::error_code rm_ec;
             std::filesystem::remove(created_shadow, rm_ec);
         }
-        error = "Project game module ABI mismatch in '" +
-                path_to_utf8_local(resolved_source) + "'.";
+        error = "Project game module API version mismatch in '" +
+                path_to_utf8_local(resolved_source) +
+                "'. Rebuild the project's game module against the current engine SDK.";
+        return false;
+    }
+    if (api->abi_stamp != vcr_current_module_abi_stamp()) {
+        lib.reset();
+        if (!created_shadow.empty()) {
+            std::error_code rm_ec;
+            std::filesystem::remove(created_shadow, rm_ec);
+        }
+        error = "Project game module CRT/ABI mismatch in '" +
+                path_to_utf8_local(resolved_source) +
+                "' (Debug/Release CRT or STL layout mismatch with engine).";
         return false;
     }
 
@@ -238,10 +296,12 @@ bool LoadedGameModule::load(
         return false;
     }
 
-    if (!api->configure_session(id, host, error)) {
-        if (error.empty()) {
-            error = "Project game module configure_session returned false.";
-        }
+    std::array<char, 512> cfg_error_buf{};
+    if (!api->configure_session(id, host, cfg_error_buf.data(), cfg_error_buf.size())) {
+        cfg_error_buf.back() = '\0';
+        error = cfg_error_buf[0] != '\0'
+            ? std::string(cfg_error_buf.data())
+            : std::string("Project game module configure_session returned false.");
         host.session->set_extension_callbacks({});
         api->destroy_instance(id);
         lib.reset();
@@ -255,6 +315,7 @@ bool LoadedGameModule::load(
     library_handle_ = lib.release();
     api_ = api;
     instance_id_ = id;
+    bound_session_ = host.session;
     module_name_ = api->module_name != nullptr ? api->module_name : "";
     source_path_ = std::move(resolved_source);
     shadow_copy_path_ = std::move(created_shadow);
@@ -263,9 +324,12 @@ bool LoadedGameModule::load(
 }
 
 void LoadedGameModule::unload(GameplaySession* const session) noexcept {
-    if (session != nullptr) {
-        session->set_extension_callbacks({});
+    GameplaySession* const target_session =
+        session != nullptr ? session : bound_session_;
+    if (target_session != nullptr) {
+        target_session->set_extension_callbacks({});
     }
+    bound_session_ = nullptr;
     if (api_ != nullptr && instance_id_ != 0U && api_->destroy_instance != nullptr) {
         api_->destroy_instance(instance_id_);
     }

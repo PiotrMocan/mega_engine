@@ -24,7 +24,14 @@ using ScopedSdlSurface = std::unique_ptr<SDL_Surface, SdlSurfaceDeleter>;
 void apply_window_icon_rgba(
     SDL_Window* const window,
     const IconRgbaImage& image) noexcept {
-    if (window == nullptr || !image.valid()) {
+    if (window == nullptr || !image.valid() ||
+        image.width > 4096U || image.height > 4096U) {
+        return;
+    }
+    const std::size_t expected_bytes =
+        static_cast<std::size_t>(image.width) *
+        static_cast<std::size_t>(image.height) * 4U;
+    if (image.pixels.size() < expected_bytes) {
         return;
     }
     const int pitch = static_cast<int>(image.width * 4U);
@@ -45,8 +52,11 @@ void apply_window_builtin_icon(
     if (window == nullptr) {
         return;
     }
-    const IconRgbaImage icon = generate_builtin_icon_rgba(kind, 64U);
-    apply_window_icon_rgba(window, icon);
+    try {
+        const IconRgbaImage icon = generate_builtin_icon_rgba(kind, 64U);
+        apply_window_icon_rgba(window, icon);
+    } catch (...) {
+    }
 }
 
 void apply_window_icon_from_file_or_builtin(
@@ -56,16 +66,20 @@ void apply_window_icon_from_file_or_builtin(
     if (window == nullptr) {
         return;
     }
-    if (!icon_path.empty()) {
-        IconRgbaImage loaded;
-        std::string ignore_error;
-        if (load_icon_source_image(icon_path, loaded, ignore_error)) {
-            const IconRgbaImage resized = resize_rgba_square_icon(loaded, 64U);
-            if (resized.valid()) {
-                apply_window_icon_rgba(window, resized);
-                return;
+    try {
+        if (!icon_path.empty()) {
+            IconRgbaImage loaded;
+            std::string ignore_error;
+            if (load_icon_source_image(icon_path, loaded, ignore_error)) {
+                const IconRgbaImage resized =
+                    resize_rgba_square_icon(loaded, 64U);
+                if (resized.valid()) {
+                    apply_window_icon_rgba(window, resized);
+                    return;
+                }
             }
         }
+    } catch (...) {
     }
     apply_window_builtin_icon(window, fallback);
 }

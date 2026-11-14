@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <fstream>
+#include <limits>
 #include <unordered_set>
 
 namespace vcr {
@@ -13,6 +15,9 @@ namespace vcr {
 namespace {
 
 using Json = nlohmann::json;
+
+inline constexpr std::uintmax_t max_manifest_file_bytes =
+    16ULL * 1024ULL * 1024ULL;
 
 [[nodiscard]] ContentManifestResult make_error(
     std::string message,
@@ -41,6 +46,92 @@ using Json = nlohmann::json;
             return false;
         }
     }
+    return true;
+}
+
+[[nodiscard]] bool is_canonical_descendant_or_same(
+    const std::filesystem::path& candidate,
+    const std::filesystem::path& root) noexcept {
+    auto c_it = candidate.begin();
+    auto r_it = root.begin();
+    for (; r_it != root.end(); ++r_it, ++c_it) {
+        if (c_it == candidate.end() || *c_it != *r_it) {
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] bool validate_contained_regular_file(
+    const std::filesystem::path& canonical_root,
+    const std::filesystem::path& target,
+    const std::uintmax_t max_bytes,
+    std::string& err) {
+    std::error_code ec;
+    const auto sym = std::filesystem::symlink_status(target, ec);
+    if (ec || std::filesystem::is_symlink(sym) ||
+        !std::filesystem::is_regular_file(sym)) {
+        err = "File does not exist, is not a regular file, or is a symbolic link";
+        return false;
+    }
+    const auto canonical_target = std::filesystem::canonical(target, ec);
+    if (ec || !is_canonical_descendant_or_same(canonical_target, canonical_root)) {
+        err = "Path escapes export directory via link or traversal";
+        return false;
+    }
+    if (max_bytes > 0U) {
+        const auto sz = std::filesystem::file_size(canonical_target, ec);
+        if (ec || sz > max_bytes) {
+            err = "Manifest file exceeds maximum allowed size (16 MiB)";
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] bool parse_u32(
+    const Json& j,
+    std::uint32_t& out,
+    std::string& err) {
+    if (!j.is_number_integer()) {
+        err = "Expected integer value";
+        return false;
+    }
+    if (j.is_number_unsigned()) {
+        const auto val = j.get<std::uint64_t>();
+        if (val > std::numeric_limits<std::uint32_t>::max()) {
+            err = "Unsigned integer exceeds 32-bit range";
+            return false;
+        }
+        out = static_cast<std::uint32_t>(val);
+        return true;
+    }
+    const auto sval = j.get<std::int64_t>();
+    if (sval < 0 ||
+        sval > static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max())) {
+        err = "Integer must be non-negative and fit in uint32";
+        return false;
+    }
+    out = static_cast<std::uint32_t>(sval);
+    return true;
+}
+
+[[nodiscard]] bool parse_finite_float(
+    const Json& j,
+    float& out,
+    std::string& err) {
+    if (!j.is_number()) {
+        err = "Expected numeric value";
+        return false;
+    }
+    const double val = j.get<double>();
+    if (!std::isfinite(val) ||
+        val < -static_cast<double>(std::numeric_limits<float>::max()) ||
+        val > static_cast<double>(std::numeric_limits<float>::max())) {
+        err = "Number is non-finite or outside float range";
+        return false;
+    }
+    out = static_cast<float>(val);
     return true;
 }
 
@@ -134,9 +225,19 @@ ContentManifestResult load_content_manifests(
     const std::filesystem::path& export_dir,
     const bool validate_referenced_files) {
     std::error_code ec;
-    if (!std::filesystem::is_directory(export_dir, ec) || ec) {
+    const auto export_sym = std::filesystem::symlink_status(export_dir, ec);
+    if (ec || std::filesystem::is_symlink(export_sym) ||
+        !std::filesystem::is_directory(export_sym)) {
         return make_error(
-            "Export directory does not exist or is not a directory",
+            "Export directory does not exist, is not a directory, or is a symbolic link",
+            export_dir,
+            "");
+    }
+    const std::filesystem::path canonical_export_dir =
+        std::filesystem::canonical(export_dir, ec);
+    if (ec) {
+        return make_error(
+            "Unable to canonicalize export directory",
             export_dir,
             "");
     }
@@ -148,23 +249,29 @@ ContentManifestResult load_content_manifests(
     const std::filesystem::path animation_manifest_path =
         export_dir / "animation_manifest.json";
 
-    if (!std::filesystem::is_regular_file(asset_manifest_path, ec) || ec) {
-        return make_error(
-            "Missing required asset_manifest.json",
-            asset_manifest_path,
-            "");
-    }
-    if (!std::filesystem::is_regular_file(scene_layout_path, ec) || ec) {
-        return make_error(
-            "Missing required scene_layout.json",
-            scene_layout_path,
-            "");
-    }
-    if (!std::filesystem::is_regular_file(animation_manifest_path, ec) || ec) {
-        return make_error(
-            "Missing required animation_manifest.json",
-            animation_manifest_path,
-            "");
+    {
+        std::string file_err;
+        if (!validate_contained_regular_file(
+                canonical_export_dir, asset_manifest_path, max_manifest_file_bytes, file_err)) {
+            return make_error(
+                "Invalid asset_manifest.json: " + file_err,
+                asset_manifest_path,
+                "");
+        }
+        if (!validate_contained_regular_file(
+                canonical_export_dir, scene_layout_path, max_manifest_file_bytes, file_err)) {
+            return make_error(
+                "Invalid scene_layout.json: " + file_err,
+                scene_layout_path,
+                "");
+        }
+        if (!validate_contained_regular_file(
+                canonical_export_dir, animation_manifest_path, max_manifest_file_bytes, file_err)) {
+            return make_error(
+                "Invalid animation_manifest.json: " + file_err,
+                animation_manifest_path,
+                "");
+        }
     }
 
     Json j_assets;
@@ -229,17 +336,22 @@ ContentManifestResult load_content_manifests(
             asset_manifest_path,
             "/");
     }
-    if (!j_assets.contains("version") || !j_assets["version"].is_number_integer()) {
-        return make_error(
-            "asset_manifest.json missing integer 'version'",
-            asset_manifest_path,
-            "/version");
-    }
-    if (j_assets["version"].get<std::uint32_t>() != 1U) {
-        return make_error(
-            "asset_manifest.json unsupported version (must be 1)",
-            asset_manifest_path,
-            "/version");
+    {
+        std::uint32_t ver = 0U;
+        std::string err;
+        if (!j_assets.contains("version") ||
+            !parse_u32(j_assets["version"], ver, err)) {
+            return make_error(
+                "asset_manifest.json invalid 'version': " + err,
+                asset_manifest_path,
+                "/version");
+        }
+        if (ver != 1U) {
+            return make_error(
+                "asset_manifest.json unsupported version (must be 1)",
+                asset_manifest_path,
+                "/version");
+        }
     }
     manifests.asset_manifest.version = 1U;
 
@@ -305,9 +417,12 @@ ContentManifestResult load_content_manifests(
         }
         if (validate_referenced_files) {
             const auto target = export_dir / asset.file;
-            if (!std::filesystem::is_regular_file(target, ec) || ec) {
+            std::string file_err;
+            if (!validate_contained_regular_file(
+                    canonical_export_dir, target, 0U, file_err)) {
                 return make_error(
-                    "Referenced asset file does not exist: " + asset.file,
+                    "Referenced asset file invalid (" + file_err + "): " +
+                        asset.file,
                     asset_manifest_path,
                     ptr + "/file");
             }
@@ -332,14 +447,14 @@ ContentManifestResult load_content_manifests(
                         lptr);
                 }
                 ManifestLod lod{};
+                std::string err;
                 if (!litem.contains("level") ||
-                    !litem["level"].is_number_integer()) {
+                    !parse_u32(litem["level"], lod.level, err)) {
                     return make_error(
-                        "LOD missing integer 'level'",
+                        "LOD invalid 'level': " + err,
                         asset_manifest_path,
                         lptr + "/level");
                 }
-                lod.level = litem["level"].get<std::uint32_t>();
                 if (!litem.contains("file") || !litem["file"].is_string()) {
                     return make_error(
                         "LOD missing 'file' string",
@@ -355,9 +470,12 @@ ContentManifestResult load_content_manifests(
                 }
                 if (validate_referenced_files) {
                     const auto target = export_dir / lod.file;
-                    if (!std::filesystem::is_regular_file(target, ec) || ec) {
+                    std::string file_err;
+                    if (!validate_contained_regular_file(
+                            canonical_export_dir, target, 0U, file_err)) {
                         return make_error(
-                            "Referenced LOD file does not exist: " + lod.file,
+                            "Referenced LOD file invalid (" + file_err + "): " +
+                                lod.file,
                             asset_manifest_path,
                             lptr + "/file");
                     }
@@ -609,23 +727,23 @@ ContentManifestResult load_content_manifests(
                             cptr + "/half_extents");
                     }
                 } else if (citem.contains("radius")) {
-                    if (!citem["radius"].is_number()) {
-                        return make_error(
-                            "Collider radius must be a number",
-                            asset_manifest_path,
-                            cptr + "/radius");
-                    }
-                    const float rad = citem["radius"].get<float>();
-                    if (rad <= 0.0F || !std::isfinite(rad)) {
+                    float rad = 0.0F;
+                    if (!parse_finite_float(citem["radius"], rad, err) ||
+                        rad <= 0.0F) {
                         return make_error(
                             "Collider radius must be positive and finite",
                             asset_manifest_path,
                             cptr + "/radius");
                     }
                     float height = rad * 2.0F;
-                    if (citem.contains("height") &&
-                        citem["height"].is_number()) {
-                        height = citem["height"].get<float>();
+                    if (citem.contains("height")) {
+                        if (!parse_finite_float(citem["height"], height, err) ||
+                            height <= 0.0F) {
+                            return make_error(
+                                "Collider height must be positive and finite",
+                                asset_manifest_path,
+                                cptr + "/height");
+                        }
                     }
                     collider.size = glm::vec3(rad, height, rad);
                 }
@@ -648,9 +766,13 @@ ContentManifestResult load_content_manifests(
                     }
                 }
 
-                if (citem.contains("layer") &&
-                    citem["layer"].is_number_integer()) {
-                    collider.layer = citem["layer"].get<std::uint32_t>();
+                if (citem.contains("layer")) {
+                    if (!parse_u32(citem["layer"], collider.layer, err)) {
+                        return make_error(
+                            "Collider layer error: " + err,
+                            asset_manifest_path,
+                            cptr + "/layer");
+                    }
                 }
                 if (citem.contains("is_trigger") &&
                     citem["is_trigger"].is_boolean()) {
@@ -674,17 +796,22 @@ ContentManifestResult load_content_manifests(
             scene_layout_path,
             "/");
     }
-    if (!j_layout.contains("version") || !j_layout["version"].is_number_integer()) {
-        return make_error(
-            "scene_layout.json missing integer 'version'",
-            scene_layout_path,
-            "/version");
-    }
-    if (j_layout["version"].get<std::uint32_t>() != 1U) {
-        return make_error(
-            "scene_layout.json unsupported version (must be 1)",
-            scene_layout_path,
-            "/version");
+    {
+        std::uint32_t ver = 0U;
+        std::string err;
+        if (!j_layout.contains("version") ||
+            !parse_u32(j_layout["version"], ver, err)) {
+            return make_error(
+                "scene_layout.json invalid 'version': " + err,
+                scene_layout_path,
+                "/version");
+        }
+        if (ver != 1U) {
+            return make_error(
+                "scene_layout.json unsupported version (must be 1)",
+                scene_layout_path,
+                "/version");
+        }
     }
     manifests.scene_layout.version = 1U;
 
@@ -861,17 +988,22 @@ ContentManifestResult load_content_manifests(
             animation_manifest_path,
             "/");
     }
-    if (!j_anims.contains("version") || !j_anims["version"].is_number_integer()) {
-        return make_error(
-            "animation_manifest.json missing integer 'version'",
-            animation_manifest_path,
-            "/version");
-    }
-    if (j_anims["version"].get<std::uint32_t>() != 1U) {
-        return make_error(
-            "animation_manifest.json unsupported version (must be 1)",
-            animation_manifest_path,
-            "/version");
+    {
+        std::uint32_t ver = 0U;
+        std::string err;
+        if (!j_anims.contains("version") ||
+            !parse_u32(j_anims["version"], ver, err)) {
+            return make_error(
+                "animation_manifest.json invalid 'version': " + err,
+                animation_manifest_path,
+                "/version");
+        }
+        if (ver != 1U) {
+            return make_error(
+                "animation_manifest.json unsupported version (must be 1)",
+                animation_manifest_path,
+                "/version");
+        }
     }
     manifests.animation_manifest.version = 1U;
 

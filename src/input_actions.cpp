@@ -863,8 +863,23 @@ void InputActionSystem::begin_frame(const float delta_seconds) noexcept {
         action_released_[i] = !now_down && was_down;
     }
 
+    const auto is_analog_trigger = [](const GamepadButton btn) noexcept -> bool {
+        return btn == GamepadButton::left_trigger || btn == GamepadButton::right_trigger;
+    };
+    const auto analog_trigger_value = [&](const GamepadButton btn) noexcept -> float {
+        if (!filtered_gamepad_.connected) {
+            return 0.0F;
+        }
+        if (btn == GamepadButton::left_trigger) {
+            return filtered_gamepad_.left_trigger;
+        }
+        if (btn == GamepadButton::right_trigger) {
+            return filtered_gamepad_.right_trigger;
+        }
+        return 0.0F;
+    };
     const auto non_trigger_action_down =
-        [&](const InputAction act, const GamepadButton analog_trigger) noexcept {
+        [&](const InputAction act) noexcept {
             if (!action_active_in_context(act, context_)) {
                 return false;
             }
@@ -873,15 +888,15 @@ void InputActionSystem::begin_frame(const float delta_seconds) noexcept {
                 return true;
             }
             return filtered_gamepad_.connected &&
-                   bind.gamepad_button != analog_trigger &&
+                   !is_analog_trigger(bind.gamepad_button) &&
                    filtered_gamepad_.button_down(bind.gamepad_button);
         };
     const float digital_throttle_down =
-        non_trigger_action_down(InputAction::vehicle_throttle, GamepadButton::right_trigger)
+        non_trigger_action_down(InputAction::vehicle_throttle)
             ? 1.0F
             : 0.0F;
     const float digital_brake_down =
-        non_trigger_action_down(InputAction::vehicle_brake, GamepadButton::left_trigger)
+        non_trigger_action_down(InputAction::vehicle_brake)
             ? 1.0F
             : 0.0F;
 
@@ -908,9 +923,17 @@ void InputActionSystem::begin_frame(const float delta_seconds) noexcept {
     } else if (context_ == InputContext::vehicle) {
         move_axis_ = {0.0F, 0.0F};
         const float trigger_throttle =
-            filtered_gamepad_.connected ? filtered_gamepad_.right_trigger : 0.0F;
+            action_active_in_context(InputAction::vehicle_throttle, context_)
+                ? analog_trigger_value(
+                      bindings_[static_cast<std::size_t>(InputAction::vehicle_throttle)]
+                          .gamepad_button)
+                : 0.0F;
         const float trigger_brake =
-            filtered_gamepad_.connected ? filtered_gamepad_.left_trigger : 0.0F;
+            action_active_in_context(InputAction::vehicle_brake, context_)
+                ? analog_trigger_value(
+                      bindings_[static_cast<std::size_t>(InputAction::vehicle_brake)]
+                          .gamepad_button)
+                : 0.0F;
         vehicle_throttle_value_ = std::clamp(
             std::max(digital_throttle_down, trigger_throttle), 0.0F, 1.0F);
         vehicle_brake_value_ = std::clamp(

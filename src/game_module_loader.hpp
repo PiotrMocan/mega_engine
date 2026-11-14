@@ -44,6 +44,7 @@ private:
     void* library_handle_ = nullptr;
     const VcrGameModuleApi* api_ = nullptr;
     GameModuleInstanceId instance_id_ = 0U;
+    GameplaySession* bound_session_ = nullptr; // non-owning observer
     std::string module_name_{};
     std::filesystem::path source_path_{};
     std::filesystem::path shadow_copy_path_{};

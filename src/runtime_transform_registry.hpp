@@ -134,8 +134,12 @@ private:
         glm::mat4 world_matrix{1.0F};
         std::vector<LocalSocket> sockets{};
         std::uint32_t depth = 0U;
+        std::uint32_t cached_socket_index = UINT32_MAX;
         bool is_attached = false;
         bool collision_dirty = true;
+        bool local_dirty = true;
+        bool world_dirty = true;
+        bool renderer_dirty = true;
     };
 
     [[nodiscard]] NodeRecord* find_node(SceneNodeId id) noexcept;
@@ -152,6 +156,8 @@ private:
     std::vector<NodeRecord> nodes_{};
     std::vector<std::uint32_t> slot_to_node_{};
     std::vector<std::uint32_t> topological_order_{};
+    std::vector<std::uint8_t> depth_visit_state_{};
+    std::vector<std::uint32_t> depth_chain_scratch_{};
     bool hierarchy_dirty_ = false;
 };
 

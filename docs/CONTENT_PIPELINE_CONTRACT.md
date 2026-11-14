@@ -235,9 +235,10 @@ vcr_content_cooker --export-dir <path> --cooked-dir <path> [--dry-run] [--help]
 ```
 
 ### Operational Invariants
-- **Source Non-Mutation**: The cooker **NEVER** modifies or writes any file inside `--export-dir`.
+- **Source Non-Mutation**: The cooker **NEVER** modifies or writes any file inside `--export-dir`. It rejects overlapping or mutually contained `--export-dir` / `--cooked-dir` paths before writing.
+- **Path & Manifest Hardening**: Symlinks on input/output files and directories are rejected, and manifest/layout JSON inputs are capped at `16 MiB` before parsing.
 - **Deduplication**: Source mesh files (`.glb`, `.gltf`) shared across assets or LODs are imported and processed exactly once.
-- **Atomicity**: The output catalog `cooked_catalog.json` is staged to a temporary file (`.tmp`) and atomically renamed upon successful completion.
+- **Atomicity**: Outputs verify explicit `file.flush()` before closing, and `cooked_catalog.json` is staged to a temporary file (`.tmp`) and atomically committed via `MoveFileExW(..., MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` on Windows.
 - **Idempotency**: Existing cooked asset directories are cleanly purged and re-staged on repeat executions.
 
 ### Cooked Catalog Structure (`cooked_catalog.json`)

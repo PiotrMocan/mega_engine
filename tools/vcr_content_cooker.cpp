@@ -3,8 +3,16 @@
 
 #include <nlohmann/json.hpp>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <cctype>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -100,17 +108,72 @@ void print_usage(const char* const program_name) {
     return lower_ext == ".glb" || lower_ext == ".gltf";
 }
 
-[[nodiscard]] std::string sanitize_slug(const std::string& name) {
-    std::string slug;
-    slug.reserve(name.size());
-    for (const char c : name) {
-        if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-') {
-            slug.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-        } else {
-            slug.push_back('_');
+[[nodiscard]] std::filesystem::path normalize_for_overlap_check(const std::filesystem::path& path, std::error_code& ec) {
+    std::filesystem::path canonical = std::filesystem::weakly_canonical(path, ec);
+    if (ec) {
+        return {};
+    }
+    canonical = canonical.lexically_normal();
+    while (canonical.has_relative_path() && canonical.filename().empty()) {
+        canonical = canonical.parent_path();
+    }
+    return canonical;
+}
+
+[[nodiscard]] bool path_components_equal(
+    const std::filesystem::path& a,
+    const std::filesystem::path& b) {
+#ifdef _WIN32
+    const auto& as = a.native();
+    const auto& bs = b.native();
+    if (as.size() != bs.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < as.size(); ++i) {
+        if (std::towlower(static_cast<wint_t>(as[i])) != std::towlower(static_cast<wint_t>(bs[i]))) {
+            return false;
         }
     }
-    return slug.empty() ? "asset" : slug;
+    return true;
+#else
+    return a == b;
+#endif
+}
+
+[[nodiscard]] bool is_ancestor_or_same_path(
+    const std::filesystem::path& candidate_ancestor,
+    const std::filesystem::path& candidate_descendant) {
+    auto it_a = candidate_ancestor.begin();
+    auto it_d = candidate_descendant.begin();
+    for (; it_a != candidate_ancestor.end() && it_d != candidate_descendant.end(); ++it_a, ++it_d) {
+        if (!path_components_equal(*it_a, *it_d)) {
+            return false;
+        }
+    }
+    return it_a == candidate_ancestor.end();
+}
+
+[[nodiscard]] bool validate_cook_directories(
+    const std::filesystem::path& export_dir,
+    const std::filesystem::path& cooked_dir) {
+    std::error_code ec;
+    const std::filesystem::path canon_export = normalize_for_overlap_check(export_dir, ec);
+    if (ec || canon_export.empty()) {
+        std::cerr << "Error: failed to resolve --export-dir path " << export_dir << "\n";
+        return false;
+    }
+    const std::filesystem::path canon_cooked = normalize_for_overlap_check(cooked_dir, ec);
+    if (ec || canon_cooked.empty()) {
+        std::cerr << "Error: failed to resolve --cooked-dir path " << cooked_dir << "\n";
+        return false;
+    }
+    if (is_ancestor_or_same_path(canon_export, canon_cooked) ||
+        is_ancestor_or_same_path(canon_cooked, canon_export)) {
+        std::cerr << "Error: --export-dir and --cooked-dir must not overlap or be identical ("
+                  << canon_export << " vs " << canon_cooked << ")\n";
+        return false;
+    }
+    return true;
 }
 
 [[nodiscard]] Json serialize_vec3(const glm::vec3& v) {
@@ -132,6 +195,10 @@ int main(int argc, char* argv[]) {
     if (options.show_help) {
         print_usage(argv[0]);
         return 0;
+    }
+
+    if (!validate_cook_directories(options.export_dir, options.cooked_dir)) {
+        return 1;
     }
 
     std::cout << "[vcr_content_cooker] Validating content manifests in "
@@ -212,7 +279,7 @@ int main(int argc, char* argv[]) {
         }
 
         // Handle re-cooking cleanly: if target slug directory exists, clear it
-        const std::string slug = sanitize_slug(source_path.stem().string());
+        const std::string slug = vcr::sanitize_imported_asset_slug(source_path.stem().string());
         const std::filesystem::path final_target_dir = dest_full / slug;
         if (std::filesystem::exists(final_target_dir, ec)) {
             std::filesystem::remove_all(final_target_dir, ec);
@@ -381,14 +448,32 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         file << catalog.dump(2) << "\n";
+        file.flush();
+        if (!file) {
+            std::cerr << "Error: failed while writing temporary catalog file: "
+                      << catalog_tmp << "\n";
+            return 1;
+        }
     }
 
+#ifdef _WIN32
+    if (MoveFileExW(
+            catalog_tmp.c_str(),
+            catalog_path.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) {
+        const DWORD last_error = GetLastError();
+        std::cerr << "Error: MoveFileExW failed renaming catalog file to "
+                  << catalog_path << " (error " << last_error << ")\n";
+        return 1;
+    }
+#else
     std::filesystem::rename(catalog_tmp, catalog_path, ec);
     if (ec) {
         std::cerr << "Error: failed to rename catalog file to "
                   << catalog_path << ": " << ec.message() << "\n";
         return 1;
     }
+#endif
 
     std::cout << "\n========================================\n"
               << "VCR Content Cooker - Cooking Succeeded\n"

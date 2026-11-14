@@ -9,6 +9,7 @@ namespace vcr {
 
 [[nodiscard]] inline SkeletalAssetProvider make_renderer_skeletal_provider(
     Renderer* const renderer) noexcept {
+#if VCR_EDITOR_ENABLED
     if (renderer == nullptr) {
         return {};
     }
@@ -37,10 +38,15 @@ namespace vcr {
             static_cast<Renderer*>(ctx)->remove_skinned_model_pose(id);
         },
     };
+#else
+    (void)renderer;
+    return {};
+#endif
 }
 
 [[nodiscard]] inline GameplayRendererBridge make_gameplay_renderer_bridge(
     Renderer& renderer) noexcept {
+#if VCR_EDITOR_ENABLED
     return GameplayRendererBridge{
         .context = &renderer,
         .bounds_provider = ModelBoundsProvider{
@@ -88,6 +94,10 @@ namespace vcr {
             static_cast<Renderer*>(ctx)->clear_skinned_model_poses();
         },
     };
+#else
+    (void)renderer;
+    return {};
+#endif
 }
 
 } // namespace vcr

@@ -293,6 +293,30 @@ private:
         bool enabled = true;
     };
 
+    enum class ColliderStorageKind : std::uint8_t {
+        none = 0U,
+        box = 1U,
+        sphere = 2U,
+        capsule = 3U,
+        convex_hull = 4U,
+        triangle_mesh = 5U,
+    };
+
+    struct NodeColliderRef {
+        SceneNodeId id{};
+        ColliderStorageKind kind = ColliderStorageKind::none;
+        std::uint32_t first = 0U;
+        std::uint32_t count = 0U;
+    };
+
+    void register_node_collider(
+        SceneNodeId id,
+        ColliderStorageKind kind,
+        std::uint32_t first,
+        std::uint32_t count);
+    [[nodiscard]] const NodeColliderRef* find_node_collider(
+        SceneNodeId id) const noexcept;
+
     [[nodiscard]] std::optional<std::uint32_t> intern_triangle_mesh(
         std::string_view key,
         const CookedModelCollision& collision);
@@ -303,6 +327,7 @@ private:
     std::vector<ConvexHullCollider> convex_hulls_{};
     std::vector<SharedTriangleMesh> shared_meshes_{};
     std::vector<TriangleMeshCollider> triangle_meshes_{};
+    std::vector<NodeColliderRef> node_collider_lookup_{};
     std::vector<SceneWorldNode> world_nodes_scratch_{};
     std::vector<std::uint32_t> ancestor_scratch_{};
     SceneNodeId terrain_node_id_{};

@@ -15,10 +15,13 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace vcr {
@@ -32,6 +35,7 @@ struct ProjectManagerCliOptions {
     bool cli_scan = false;
     bool cli_init_manifest = false;
     bool cli_build_game = false;
+    bool cli_ship = false;
     bool cli_build_all_games = false;
     bool cli_set_icon = false;
 
@@ -42,6 +46,7 @@ struct ProjectManagerCliOptions {
     std::string create_description{};
     ProjectTemplateKind create_template = ProjectTemplateKind::standard;
     std::string target_directory{};
+    std::string ship_output_directory{};
     std::string icon_source_path{};
 
     std::uint32_t width = 1380U;
@@ -87,6 +92,7 @@ private:
         create_parent,
         add_existing,
         scan_root,
+        ship_output,
     };
 
     struct CachedProjectItem {
@@ -124,6 +130,8 @@ private:
     void apply_icon_to_selected_project(const std::filesystem::path& source_file);
     void bundle_selected_project_runtime();
     void compile_selected_project_game_module();
+    void ship_selected_project(const std::filesystem::path& parent_directory);
+    void poll_shipping_result();
     void reset_selected_project_icon();
     void launch_icon_tool_for_selected_project();
 
@@ -234,6 +242,25 @@ private:
     std::vector<std::filesystem::path> icon_picker_subdirs_{};
     std::vector<std::filesystem::path> icon_picker_files_{};
     std::string icon_picker_error_{};
+
+    struct ShippingRequest {
+        std::filesystem::path project{};
+        std::filesystem::path destination{};
+    };
+    struct ShippingCompletion {
+        ShipProjectResult result{};
+        std::string error{};
+        bool success = false;
+    };
+    bool shipping_in_progress_ = false; // Main/UI thread only.
+    std::filesystem::path ship_project_directory_{};
+    // One persistent, bounded worker; it owns its request while packaging and
+    // never accesses the GUI, registry, GPU, or cached project items.
+    std::mutex shipping_mutex_{};
+    std::condition_variable_any shipping_wake_{};
+    std::optional<ShippingRequest> shipping_request_{};
+    std::optional<ShippingCompletion> shipping_completion_{};
+    std::jthread shipping_worker_{};
 };
 
 } // namespace vcr

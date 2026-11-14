@@ -15,8 +15,10 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <numbers>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -550,8 +552,17 @@ struct AudioEngineState {
     std::uint32_t sample_rate = default_audio_sample_rate;
 
     // Resident immutable clip pool & main-thread lookup table.
+    struct TransparentStringHash {
+        using is_transparent = void;
+
+        [[nodiscard]] std::size_t operator()(
+            const std::string_view sv) const noexcept {
+            return std::hash<std::string_view>{}(sv);
+        }
+    };
+
     std::array<ResidentClipSlot, max_resident_clips> resident_clips{};
-    std::unordered_map<std::string, std::uint32_t> clip_index_by_key{};
+    std::unordered_map<std::string, std::uint32_t, TransparentStringHash, std::equal_to<>> clip_index_by_key{};
     std::size_t resident_pcm_bytes = 0U;
     std::size_t resident_pcm_high_water = 0U;
 
@@ -561,7 +572,7 @@ struct AudioEngineState {
         double next_allowed_time = 0.0;
         std::optional<std::size_t> previous_index{};
     };
-    std::unordered_map<std::string, CueCacheItem> cue_cache{};
+    std::unordered_map<std::string, CueCacheItem, TransparentStringHash, std::equal_to<>> cue_cache{};
     std::uint64_t rng_state = 0x517CC1B727220A95ULL;
     double engine_time_seconds = 0.0;
 
@@ -1391,12 +1402,12 @@ struct AudioEngineState {
         bool& out_prefer_stream,
         std::string& error) {
         out_prefer_stream = false;
-        const std::string key(relative_path);
-        if (const auto it = clip_index_by_key.find(key);
+        if (const auto it = clip_index_by_key.find(relative_path);
             it != clip_index_by_key.end()) {
             out_index = it->second;
             return true;
         }
+        const std::string key(relative_path);
 
         CookedAudioAsset decoded{};
         if (!load_cooked_audio_asset(
@@ -1737,13 +1748,12 @@ AudioVoiceHandle AudioEngine::play_asset(
         return {};
     }
 
-    std::string resolved_clip_path(relative_asset_path);
+    std::string_view resolved_clip_path = relative_asset_path;
     AudioPlayParams effective = params;
 
     // Resolve Sound Cue (.vcrcue.json) into a randomized clip entry + parameters.
     if (relative_asset_path.ends_with(".vcrcue.json")) {
-        const std::string cue_key(relative_asset_path);
-        auto it = state_->cue_cache.find(cue_key);
+        auto it = state_->cue_cache.find(relative_asset_path);
         if (it == state_->cue_cache.end()) {
             SoundCueAsset loaded{};
             if (!load_sound_cue_file(
@@ -1751,7 +1761,7 @@ AudioVoiceHandle AudioEngine::play_asset(
                 return {};
             }
             it = state_->cue_cache.emplace(
-                cue_key,
+                std::string(relative_asset_path),
                 AudioEngineState::CueCacheItem{.cue = std::move(loaded)}).first;
         }
         AudioEngineState::CueCacheItem& cue_item = it->second;

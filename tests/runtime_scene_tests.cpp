@@ -542,8 +542,8 @@ int main() {
     }
     for (unsigned y = 0; y < side; ++y) {
         for (unsigned x = 0; x < side; ++x) {
-            const unsigned a = y * (side + 1) + x, b = a + 1, c = a + side + 1, d = c + 1;
-            for (auto i : {a, c, b, b, c, d}) {
+            const unsigned v0 = y * (side + 1) + x, v1 = v0 + 1, c = v0 + side + 1, d = c + 1;
+            for (auto i : {v0, c, v1, v1, c, d}) {
                 model.indices.push_back(i);
             }
         }

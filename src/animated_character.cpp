@@ -66,6 +66,8 @@ void AnimatedCharacterController::initialize(
     override_clip_name_.reserve(128U);
     active_clip_name_.clear();
     active_clip_name_.reserve(128U);
+    fallback_binding_.clip_name.clear();
+    fallback_binding_.clip_name.reserve(128U);
     active_clip_name_ = config_.animation.idle.clip_name;
 }
 

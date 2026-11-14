@@ -73,6 +73,7 @@ struct FrameContext {
     GpuVisibilityFrame visibility{};
     GpuBuffer skin_palette_buffer{};
     VkDeviceSize skin_palette_capacity_bytes = 0U;
+    std::uint64_t skin_uploaded_palette_revision = 0U;
     VkDescriptorSet skin_frame_set = VK_NULL_HANDLE;
     VkBuffer skin_bound_palette = VK_NULL_HANDLE;
     VkBuffer skin_bound_curr_pool = VK_NULL_HANDLE;

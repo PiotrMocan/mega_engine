@@ -1981,7 +1981,15 @@ bool initialize_manifest_for_existing_directory(
         resolved_name = "Imported Project";
     }
     if (resolved_name.size() > maximum_project_name_bytes) {
-        resolved_name.resize(maximum_project_name_bytes);
+        std::size_t cut = maximum_project_name_bytes;
+        while (cut > 0U &&
+               (static_cast<unsigned char>(resolved_name[cut]) & 0xC0U) == 0x80U) {
+            --cut;
+        }
+        resolved_name.resize(cut);
+        if (resolved_name.empty()) {
+            resolved_name = "Imported Project";
+        }
     }
 
     const ProjectManifest manifest{
@@ -2720,18 +2728,41 @@ bool compile_project_game_module(
         return false;
     }
 
+    const auto has_unsafe_cmd_chars = [](const std::string_view text) noexcept {
+        for (const unsigned char ch : text) {
+            if (ch < 0x20U || ch == '"' || ch == '%' || ch == '&' ||
+                ch == '|' || ch == '<' || ch == '>' || ch == '^' ||
+                ch == '!') {
+                return true;
+            }
+        }
+        return false;
+    };
+    const std::string vcvars_utf8 = path_to_utf8(vcvars_bat);
+    const std::string cmake_utf8 = path_to_utf8(cmake_exe);
+    const std::string ninja_utf8 = path_to_utf8(ninja_exe);
+    const std::string proj_utf8 = path_to_utf8(inspection.project_directory);
+    const std::string build_utf8 = path_to_utf8(build_dir);
+    if (has_unsafe_cmd_chars(vcvars_utf8) || has_unsafe_cmd_chars(cmake_utf8) ||
+        has_unsafe_cmd_chars(ninja_utf8) || has_unsafe_cmd_chars(proj_utf8) ||
+        has_unsafe_cmd_chars(build_utf8) ||
+        (workspace && has_unsafe_cmd_chars(path_to_utf8(*workspace)))) {
+        error = "Build paths contain characters not permitted in build_module.cmd.";
+        return false;
+    }
+
     std::string script =
         "@echo off\r\n"
-        "call \"" + path_to_utf8(vcvars_bat) + "\" amd64\r\n"
+        "call \"" + vcvars_utf8 + "\" amd64\r\n"
         "if errorlevel 1 exit /b %errorlevel%\r\n"
-        "\"" + path_to_utf8(cmake_exe) + "\" -S \"" +
-        path_to_utf8(inspection.project_directory) + "\" -B \"" +
-        path_to_utf8(build_dir) + "\" -G Ninja -DCMAKE_MAKE_PROGRAM=\"" +
-        path_to_utf8(ninja_exe) + "\" -DCMAKE_BUILD_TYPE=" +
+        "\"" + cmake_utf8 + "\" -S \"" +
+        proj_utf8 + "\" -B \"" +
+        build_utf8 + "\" -G Ninja -DCMAKE_MAKE_PROGRAM=\"" +
+        ninja_utf8 + "\" -DCMAKE_BUILD_TYPE=" +
         normalized_config;
     if (workspace) {
         script += " -DVCR_ENGINE_ROOT=\"" + path_to_utf8(*workspace) + "\"";
-        if (folder_tag != "release") {
+        {
             ec.clear();
             const std::filesystem::path sdk_build_dir =
                 *workspace / "build" / ("windows-" + folder_tag);

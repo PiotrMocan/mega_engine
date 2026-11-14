@@ -1,7 +1,9 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <memory>
@@ -16,9 +18,25 @@ class GameplaySession;
 class InputActionSystem;
 class SceneDocument;
 
-inline constexpr std::uint32_t vcr_game_module_api_version = 1U;
+inline constexpr std::uint32_t vcr_game_module_api_version = 2U;
 inline constexpr const char* vcr_game_module_entry_symbol =
     "vcr_get_game_module_api";
+
+[[nodiscard]] constexpr std::uint32_t vcr_current_module_abi_stamp() noexcept {
+    std::uint32_t stamp = 0U;
+#if defined(_DEBUG)
+    stamp |= 1U << 0U;
+#endif
+#if defined(_DLL)
+    stamp |= 1U << 1U;
+#endif
+#if defined(_ITERATOR_DEBUG_LEVEL)
+    stamp |= (static_cast<std::uint32_t>(_ITERATOR_DEBUG_LEVEL) & 0xFU) << 4U;
+#endif
+    stamp |= (static_cast<std::uint32_t>(sizeof(std::string)) & 0xFFU) << 8U;
+    stamp |= (static_cast<std::uint32_t>(sizeof(std::filesystem::path)) & 0xFFU) << 16U;
+    return stamp;
+}
 
 using GameModuleInstanceId = std::uint64_t;
 
@@ -33,13 +51,15 @@ struct GameModuleHostContext {
 
 struct VcrGameModuleApi {
     std::uint32_t api_version = vcr_game_module_api_version;
+    std::uint32_t abi_stamp = vcr_current_module_abi_stamp();
     const char* module_name = "";
     GameModuleInstanceId (*create_instance)() noexcept = nullptr;
     void (*destroy_instance)(GameModuleInstanceId instance) noexcept = nullptr;
     bool (*configure_session)(
         GameModuleInstanceId instance,
         const GameModuleHostContext& host,
-        std::string& out_error) = nullptr;
+        char* error_buf,
+        std::size_t error_buf_cap) noexcept = nullptr;
 };
 
 using VcrGetGameModuleApiFn = const VcrGameModuleApi* (*)() noexcept;
@@ -108,6 +128,7 @@ private:
     vcr_get_game_module_api() noexcept {                                      \
         static const ::vcr::VcrGameModuleApi api{                             \
             .api_version = ::vcr::vcr_game_module_api_version,                \
+            .abi_stamp = ::vcr::vcr_current_module_abi_stamp(),               \
             .module_name = (ModuleNameLiteral),                               \
             .create_instance = +[]() noexcept -> ::vcr::GameModuleInstanceId { \
                 return vcr_game_module_registry().create();                   \
@@ -118,20 +139,43 @@ private:
             },                                                                \
             .configure_session = +[](const ::vcr::GameModuleInstanceId id,    \
                                      const ::vcr::GameModuleHostContext& host, \
-                                     std::string& out_error) -> bool {        \
+                                     char* const error_buf,                   \
+                                     const ::std::size_t error_buf_cap)       \
+                                     noexcept -> bool {                       \
+                const auto write_err =                                        \
+                    [error_buf, error_buf_cap](const char* const msg) noexcept { \
+                        if (error_buf == nullptr || error_buf_cap == 0U) {    \
+                            return;                                           \
+                        }                                                     \
+                        const ::std::size_t len =                             \
+                            msg != nullptr ? ::std::strlen(msg) : 0U;         \
+                        const ::std::size_t copy_len =                        \
+                            ::std::min(len, error_buf_cap - 1U);              \
+                        if (copy_len > 0U) {                                  \
+                            ::std::memcpy(error_buf, msg, copy_len);          \
+                        }                                                     \
+                        error_buf[copy_len] = '\0';                           \
+                    };                                                        \
+                write_err("");                                                \
                 GameClass* const instance =                                   \
                     vcr_game_module_registry().find(id);                      \
                 if (instance == nullptr) {                                    \
-                    out_error = "Invalid project game module instance.";      \
+                    write_err("Invalid project game module instance.");       \
                     return false;                                             \
                 }                                                             \
                 try {                                                         \
-                    return instance->configure_module(host, out_error);       \
-                } catch (const std::exception& ex) {                          \
-                    out_error = ex.what();                                    \
+                    ::std::string local_err;                                  \
+                    if (!instance->configure_module(host, local_err)) {       \
+                        write_err(local_err.c_str());                         \
+                        return false;                                         \
+                    }                                                         \
+                    return true;                                              \
+                } catch (const ::std::exception& ex) {                        \
+                    write_err(ex.what());                                     \
                     return false;                                             \
                 } catch (...) {                                               \
-                    out_error = "Unknown exception while configuring game module."; \
+                    write_err(                                                \
+                        "Unknown exception while configuring game module.");  \
                     return false;                                             \
                 }                                                             \
             },                                                                \

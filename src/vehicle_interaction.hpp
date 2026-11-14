@@ -137,7 +137,7 @@ private:
     glm::vec3 exit_target_position_{0.0F};
     float exit_target_yaw_ = 0.0F;
 
-    std::string last_status_message_{"Ready"};
+    std::string_view last_status_message_{"Ready"};
 };
 
 } // namespace vcr

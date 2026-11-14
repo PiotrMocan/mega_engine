@@ -81,6 +81,8 @@ private:
     FlyCamera camera_{};
     FlyCamera edit_camera_before_play_{};
     GameplayRendererBridge gameplay_renderer_bridge_{};
+    std::filesystem::path loaded_module_project_root_{};
+    std::filesystem::path loaded_module_asset_root_{};
     LoadedGameModule loaded_game_module_{};
     GameplaySession gameplay_{};
     AnimatorRuntimeSystem edit_animator_preview_{};

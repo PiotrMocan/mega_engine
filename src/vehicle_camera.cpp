@@ -18,6 +18,33 @@ constexpr float two_pi = 6.28318530718F;
     return t * t * (3.0F - 2.0F * t);
 }
 
+[[nodiscard]] bool is_finite_vec3(const glm::vec3& v) noexcept {
+    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+}
+
+[[nodiscard]] glm::vec3 sanitize_vec3(
+    const glm::vec3& v,
+    const glm::vec3& fallback) noexcept {
+    return is_finite_vec3(v) ? v : fallback;
+}
+
+[[nodiscard]] glm::mat4 safe_look_at(
+    const glm::vec3& eye,
+    const glm::vec3& target) noexcept {
+    const glm::vec3 safe_eye = sanitize_vec3(eye, glm::vec3(0.0F));
+    const glm::vec3 diff = sanitize_vec3(
+        target - safe_eye,
+        glm::vec3(0.0F, 0.0F, 1.0F));
+    const float len = glm::length(diff);
+    const glm::vec3 dir = (std::isfinite(len) && len > 1.0e-4F)
+        ? (diff / len)
+        : glm::vec3(0.0F, 0.0F, 1.0F);
+    const glm::vec3 up = (std::abs(dir.y) > 0.999F)
+        ? glm::vec3(0.0F, 0.0F, (dir.y > 0.0F ? -1.0F : 1.0F))
+        : glm::vec3(0.0F, 1.0F, 0.0F);
+    return glm::lookAt(safe_eye, safe_eye + dir, up);
+}
+
 } // namespace
 
 VehicleCamera::VehicleCamera(const VehicleCameraConfig& config) noexcept
@@ -28,15 +55,20 @@ void VehicleCamera::reset(
     const glm::vec3& vehicle_pos,
     const glm::vec3& vehicle_forward,
     const glm::vec3& vehicle_up) noexcept {
-    const float v_yaw = std::atan2(vehicle_forward.x, vehicle_forward.z);
+    const glm::vec3 safe_pos = sanitize_vec3(vehicle_pos, glm::vec3(0.0F));
+    const glm::vec3 safe_fwd = sanitize_vec3(vehicle_forward, glm::vec3(0.0F, 0.0F, 1.0F));
+    const glm::vec3 safe_up = sanitize_vec3(vehicle_up, glm::vec3(0.0F, 1.0F, 0.0F));
+    const float v_yaw = (std::hypot(safe_fwd.x, safe_fwd.z) > 1.0e-4F)
+        ? std::atan2(safe_fwd.x, safe_fwd.z)
+        : 0.0F;
     current_yaw_ = v_yaw;
     orbit_yaw_offset_ = 0.0F;
     orbit_pitch_ = 0.12F;
     recenter_timer_ = 0.0F;
-    smoothed_pivot_y_ = (vehicle_pos + vehicle_up * config_.height).y;
+    smoothed_pivot_y_ = (safe_pos + safe_up * config_.height).y;
     smoothed_look_ahead_ = glm::vec3(0.0F);
     current_follow_distance_ = config_.follow_distance;
-    const glm::vec3 pivot{vehicle_pos.x, smoothed_pivot_y_, vehicle_pos.z};
+    const glm::vec3 pivot{safe_pos.x, smoothed_pivot_y_, safe_pos.z};
     current_look_target_ = pivot;
 
     const float cos_p = std::cos(orbit_pitch_);
@@ -55,14 +87,13 @@ void VehicleCamera::reset(
 glm::vec3 VehicleCamera::forward() const noexcept {
     const glm::vec3 diff = current_look_target_ - current_position_;
     const float len = glm::length(diff);
-    return len > 1.0e-5F ? diff / len : glm::vec3(0.0F, 0.0F, 1.0F);
+    return (is_finite_vec3(diff) && std::isfinite(len) && len > 1.0e-5F)
+        ? diff / len
+        : glm::vec3(0.0F, 0.0F, 1.0F);
 }
 
 glm::mat4 VehicleCamera::view_matrix() const noexcept {
-    return glm::lookAt(
-        current_position_,
-        current_look_target_,
-        glm::vec3(0.0F, 1.0F, 0.0F));
+    return safe_look_at(current_position_, current_look_target_);
 }
 
 void VehicleCamera::update(
@@ -82,29 +113,37 @@ void VehicleCamera::update(
     if (!std::isfinite(delta_seconds) || delta_seconds <= 0.0F) {
         return;
     }
+    const glm::vec3 safe_pos = sanitize_vec3(vehicle_pos, current_look_target_);
+    const glm::vec3 safe_fwd = sanitize_vec3(
+        vehicle_forward,
+        glm::vec3(std::sin(current_yaw_), 0.0F, std::cos(current_yaw_)));
+    const glm::vec3 safe_up = sanitize_vec3(vehicle_up, glm::vec3(0.0F, 1.0F, 0.0F));
+    const glm::vec3 safe_vel = sanitize_vec3(vehicle_velocity, glm::vec3(0.0F));
+    const float safe_dx = std::isfinite(look_delta_x) ? look_delta_x : 0.0F;
+    const float safe_dy = std::isfinite(look_delta_y) ? look_delta_y : 0.0F;
     const float delta = std::min(delta_seconds, 0.05F);
 
     // Anchor horizontal pivot to the interpolated car position so high/variable
     // FPS never introduces longitudinal car-to-camera rubber-band jitter, while
     // smoothing vertical suspension bounce and look-ahead separately.
-    const float target_pivot_y = vehicle_pos.y + vehicle_up.y * config_.height;
+    const float target_pivot_y = safe_pos.y + safe_up.y * config_.height;
     const float look_alpha =
         1.0F - std::exp(-config_.look_spring_stiffness * delta);
     smoothed_pivot_y_ = glm::mix(smoothed_pivot_y_, target_pivot_y, look_alpha);
     const glm::vec3 desired_look_ahead{
-        vehicle_velocity.x * config_.look_ahead_seconds,
-        vehicle_velocity.y * (0.25F * config_.look_ahead_seconds),
-        vehicle_velocity.z * config_.look_ahead_seconds,
+        safe_vel.x * config_.look_ahead_seconds,
+        safe_vel.y * (0.25F * config_.look_ahead_seconds),
+        safe_vel.z * config_.look_ahead_seconds,
     };
     smoothed_look_ahead_ =
         glm::mix(smoothed_look_ahead_, desired_look_ahead, look_alpha);
-    const glm::vec3 pivot{vehicle_pos.x, smoothed_pivot_y_, vehicle_pos.z};
+    const glm::vec3 pivot{safe_pos.x, smoothed_pivot_y_, safe_pos.z};
     current_look_target_ = pivot + smoothed_look_ahead_;
 
     // Orbit control and auto-recenter timer
-    if (std::abs(look_delta_x) > 0.001F || std::abs(look_delta_y) > 0.001F) {
-        orbit_yaw_offset_ += look_delta_x * config_.mouse_sensitivity;
-        orbit_pitch_ -= look_delta_y * config_.mouse_sensitivity;
+    if (std::abs(safe_dx) > 0.001F || std::abs(safe_dy) > 0.001F) {
+        orbit_yaw_offset_ += safe_dx * config_.mouse_sensitivity;
+        orbit_pitch_ -= safe_dy * config_.mouse_sensitivity;
         orbit_pitch_ = std::clamp(
             orbit_pitch_,
             config_.min_pitch_radians,
@@ -120,7 +159,9 @@ void VehicleCamera::update(
     }
 
     // Vehicle base yaw
-    const float v_yaw = std::atan2(vehicle_forward.x, vehicle_forward.z);
+    const float v_yaw = (std::hypot(safe_fwd.x, safe_fwd.z) > 1.0e-4F)
+        ? std::atan2(safe_fwd.x, safe_fwd.z)
+        : current_yaw_;
     const float target_yaw = v_yaw + orbit_yaw_offset_;
     const float yaw_diff = std::remainder(target_yaw - current_yaw_, two_pi);
     const float yaw_alpha = 1.0F - std::exp(-config_.position_spring_stiffness * delta);
@@ -145,8 +186,10 @@ void VehicleCamera::update(
             false,
             ignored_vehicle);
         if (hit) {
+            const float pull_back =
+                config_.collision_pull_in_offset + std::max(0.0F, config_.collision_sphere_radius);
             desired_dist = std::clamp(
-                hit->distance - config_.collision_pull_in_offset,
+                hit->distance - pull_back,
                 config_.min_follow_distance,
                 config_.follow_distance);
         }
@@ -161,7 +204,7 @@ void VehicleCamera::update(
     current_position_ = pivot + to_cam * current_follow_distance_;
 
     // Speed-based dynamic FOV boost
-    const float speed = glm::length(vehicle_velocity);
+    const float speed = glm::length(safe_vel);
     const float speed_ratio = std::clamp(
         speed / std::max(1.0F, config_.max_speed_for_fov_boost),
         0.0F,
@@ -298,10 +341,7 @@ void GameplayCameraRig::update(
 }
 
 glm::mat4 GameplayCameraRig::view_matrix() const noexcept {
-    return glm::lookAt(
-        current_position_,
-        current_position_ + current_forward_,
-        glm::vec3(0.0F, 1.0F, 0.0F));
+    return safe_look_at(current_position_, current_position_ + current_forward_);
 }
 
 } // namespace vcr

@@ -494,12 +494,16 @@ void Application::initialize_gameplay(const SceneRenderView& initial_view) {
             : std::nullopt);
     gameplay_renderer_bridge_ = make_gameplay_renderer_bridge(renderer_);
     loaded_game_module_.unload(&gameplay_);
+    loaded_module_project_root_.clear();
+    loaded_module_asset_root_.clear();
     std::string error;
     if (const auto root = find_runtime_asset_root(options_.project_path);
         root && !root->game_module_path.empty()) {
+        loaded_module_project_root_ = root->project_root;
+        loaded_module_asset_root_ = root->path;
         const GameModuleHostContext host{
-            .project_root = &root->project_root,
-            .asset_root = &root->path,
+            .project_root = &loaded_module_project_root_,
+            .asset_root = &loaded_module_asset_root_,
             .scene = &scene_,
             .session = &gameplay_,
             .audio_engine = audio_engine_.initialized() ? &audio_engine_ : nullptr,

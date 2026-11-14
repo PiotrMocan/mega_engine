@@ -1,4 +1,5 @@
 #include "physics_world.hpp"
+#include "collision_math.hpp"
 
 #include <glm/geometric.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -21,89 +22,13 @@ constexpr float baumgarte_slop = 0.003F;
 constexpr float baumgarte_beta = 0.20F;
 constexpr float restitution_velocity_threshold = 1.0F;
 constexpr std::uint32_t static_body_index = UINT32_MAX;
-
-struct RightHandedFrame {
-    glm::vec3 origin{0.0F};
-    glm::mat3 axes{1.0F};
-    glm::vec3 signed_scale{1.0F};
-    glm::vec3 abs_scale{1.0F};
-};
+constexpr std::uint32_t invalid_body_index = UINT32_MAX;
 
 struct PenetrationHit {
     glm::vec3 point{0.0F};
     glm::vec3 normal_b_to_a{0.0F, 1.0F, 0.0F};
     float depth = 0.0F;
 };
-
-[[nodiscard]] bool finite_vec3(const glm::vec3 v) noexcept {
-    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
-}
-
-[[nodiscard]] bool finite_quat(const glm::quat q) noexcept {
-    return std::isfinite(q.w) &&
-           std::isfinite(q.x) &&
-           std::isfinite(q.y) &&
-           std::isfinite(q.z);
-}
-
-[[nodiscard]] bool aabb_overlaps(
-    const Bounds& a,
-    const Bounds& b) noexcept {
-    return std::abs(a.center.x - b.center.x) <= (a.extent.x + b.extent.x) &&
-           std::abs(a.center.y - b.center.y) <= (a.extent.y + b.extent.y) &&
-           std::abs(a.center.z - b.center.z) <= (a.extent.z + b.extent.z);
-}
-
-[[nodiscard]] std::optional<RightHandedFrame> decompose_right_handed_frame(
-    const glm::mat4& world) noexcept {
-    const glm::vec3 c0(world[0]);
-    const glm::vec3 c1(world[1]);
-    const glm::vec3 c2(world[2]);
-    const glm::vec3 origin(world[3]);
-    if (!finite_vec3(c0) ||
-        !finite_vec3(c1) ||
-        !finite_vec3(c2) ||
-        !finite_vec3(origin)) {
-        return std::nullopt;
-    }
-    const glm::vec3 abs_scale{
-        glm::length(c0),
-        glm::length(c1),
-        glm::length(c2),
-    };
-    constexpr float min_scale = 1.0e-4F;
-    if (!finite_vec3(abs_scale) ||
-        abs_scale.x < min_scale ||
-        abs_scale.y < min_scale ||
-        abs_scale.z < min_scale) {
-        return std::nullopt;
-    }
-    const glm::vec3 ax0 = c0 / abs_scale.x;
-    const glm::vec3 raw_y = c1 / abs_scale.y;
-    const glm::vec3 orth_y = raw_y - ax0 * glm::dot(ax0, raw_y);
-    const float orth_y_len = glm::length(orth_y);
-    if (!std::isfinite(orth_y_len) || orth_y_len <= min_scale) {
-        return std::nullopt;
-    }
-    const glm::vec3 ax1 = orth_y / orth_y_len;
-    glm::vec3 ax2 = glm::cross(ax0, ax1);
-    const float ax2_len = glm::length(ax2);
-    if (!std::isfinite(ax2_len) || ax2_len <= min_scale) {
-        return std::nullopt;
-    }
-    ax2 /= ax2_len;
-
-    glm::vec3 signed_scale = abs_scale;
-    if (glm::dot(ax2, c2) < 0.0F) {
-        signed_scale.z = -signed_scale.z;
-    }
-    return RightHandedFrame{
-        .origin = origin,
-        .axes = glm::mat3(ax0, ax1, ax2),
-        .signed_scale = signed_scale,
-        .abs_scale = abs_scale,
-    };
-}
 
 void build_tangent_basis(
     const glm::vec3 normal,
@@ -528,6 +453,7 @@ void closest_points_segments(
 
 PhysicsWorld::PhysicsWorld() {
     bodies_.reserve(128U);
+    node_slot_to_body_.reserve(256U);
     contacts_.reserve(512U);
     sphere_contacts_scratch_.reserve(64U);
     world_nodes_scratch_.reserve(256U);
@@ -536,10 +462,35 @@ PhysicsWorld::PhysicsWorld() {
 
 void PhysicsWorld::clear() noexcept {
     bodies_.clear();
+    std::fill(node_slot_to_body_.begin(), node_slot_to_body_.end(), invalid_body_index);
     contacts_.clear();
     sphere_contacts_scratch_.clear();
     accumulator_ = 0.0F;
     interpolation_alpha_ = 0.0F;
+}
+
+PhysicsWorld::Body* PhysicsWorld::find_body_mut(
+    const SceneNodeId id) noexcept {
+    if (!id || id.index >= node_slot_to_body_.size()) {
+        return nullptr;
+    }
+    const std::uint32_t body_idx = node_slot_to_body_[id.index];
+    if (body_idx >= bodies_.size() || bodies_[body_idx].node_id != id) {
+        return nullptr;
+    }
+    return &bodies_[body_idx];
+}
+
+const PhysicsWorld::Body* PhysicsWorld::find_body(
+    const SceneNodeId id) const noexcept {
+    if (!id || id.index >= node_slot_to_body_.size()) {
+        return nullptr;
+    }
+    const std::uint32_t body_idx = node_slot_to_body_[id.index];
+    if (body_idx >= bodies_.size() || bodies_[body_idx].node_id != id) {
+        return nullptr;
+    }
+    return &bodies_[body_idx];
 }
 
 void PhysicsWorld::update_derived_body_state(Body& body) noexcept {
@@ -618,7 +569,7 @@ void PhysicsWorld::rebuild_from_scene(
             }
         }
 
-        const auto frame = decompose_right_handed_frame(entry.world_matrix);
+        const auto frame = decompose_affine_frame(entry.world_matrix, true);
         if (!frame) {
             continue;
         }
@@ -627,7 +578,9 @@ void PhysicsWorld::rebuild_from_scene(
         body.node_id = entry.id;
         body.node_uuid = entry.uuid;
         body.motion_type = rb.motion_type;
-        body.node_scale = frame->signed_scale;
+        body.authored_mass = std::clamp(
+            rb.mass, minimum_rigid_body_mass, maximum_rigid_body_mass);
+        body.node_scale = frame->signed_scale();
         body.orientation = glm::normalize(glm::quat_cast(frame->axes));
         body.linear_damping = rb.linear_damping;
         body.angular_damping = rb.angular_damping;
@@ -668,7 +621,7 @@ void PhysicsWorld::rebuild_from_scene(
         } else {
             body.shape = PhysicsShapeKind::box;
             if (entry.kind == SceneNodeKind::ground) {
-                total_local_offset.y -= 0.25F / frame->signed_scale.y;
+                total_local_offset.y -= 0.25F / body.node_scale.y;
                 body.half_extents = glm::vec3(
                     std::max(frame->abs_scale.x, minimum_collider_dimension),
                     0.25F,
@@ -740,7 +693,7 @@ void PhysicsWorld::rebuild_from_scene(
             body.inv_mass = 0.0F;
             body.local_inv_inertia = glm::vec3(0.0F);
         } else {
-            const float mass = std::max(rb.mass, minimum_rigid_body_mass);
+            const float mass = body.authored_mass;
             body.inv_mass = 1.0F / mass;
             if (rb.lock_rotation) {
                 body.local_inv_inertia = glm::vec3(0.0F);
@@ -758,7 +711,9 @@ void PhysicsWorld::rebuild_from_scene(
                 body.local_inv_inertia =
                     glm::vec3(1.0F / ixz, 1.0F / iy, 1.0F / ixz);
             } else {
-                const glm::vec3 h2 = body.half_extents * body.half_extents;
+                const glm::vec3 safe_h =
+                    glm::max(body.half_extents, glm::vec3(0.05F));
+                const glm::vec3 h2 = safe_h * safe_h;
                 const float ix =
                     std::max((1.0F / 3.0F) * mass * (h2.y + h2.z), 1.0e-5F);
                 const float iy =
@@ -771,8 +726,21 @@ void PhysicsWorld::rebuild_from_scene(
         }
 
         update_derived_body_state(body);
+        const auto body_idx = static_cast<std::uint32_t>(bodies_.size());
         bodies_.push_back(body);
+        if (entry.id.index < max_scene_nodes) {
+            if (entry.id.index >= node_slot_to_body_.size()) {
+                const std::size_t target = std::min(
+                    std::max(
+                        static_cast<std::size_t>(entry.id.index) + 1U,
+                        node_slot_to_body_.size() * 2U),
+                    static_cast<std::size_t>(max_scene_nodes));
+                node_slot_to_body_.resize(target, invalid_body_index);
+            }
+            node_slot_to_body_[entry.id.index] = body_idx;
+        }
     }
+    contacts_.reserve(std::max<std::size_t>(512U, bodies_.size() * 8U));
 }
 
 void PhysicsWorld::push_contact(
@@ -1332,7 +1300,18 @@ void PhysicsWorld::substep(
         }
     }
     for (std::uint32_t i = 0U; i < count; ++i) {
+        const Body& bi = bodies_[i];
+        if (!bi.enabled) {
+            continue;
+        }
+        const bool i_static = bi.inv_mass <= 0.0F;
         for (std::uint32_t j = i + 1U; j < count; ++j) {
+            const Body& bj = bodies_[j];
+            if (!bj.enabled ||
+                (i_static && bj.inv_mass <= 0.0F) ||
+                (bi.sleeping && bj.sleeping)) {
+                continue;
+            }
             gather_pair_contacts(i, j);
         }
     }
@@ -1526,6 +1505,11 @@ void PhysicsWorld::step(
         float max_cfl_ratio = 0.0F;
         for (Body& body : bodies_) {
             if (!body.enabled || body.inv_mass <= 0.0F) {
+                if (body.motion_type == RigidBodyMotionType::kinematic &&
+                    !body.kinematic_moved_this_step) {
+                    body.linear_velocity = glm::vec3(0.0F);
+                    body.angular_velocity = glm::vec3(0.0F);
+                }
                 body.pending_linear_impulse = glm::vec3(0.0F);
                 body.pending_angular_impulse = glm::vec3(0.0F);
                 body.step_linear_impulse = glm::vec3(0.0F);
@@ -1575,6 +1559,11 @@ void PhysicsWorld::step(
         }
         accumulator_ = std::max(0.0F, accumulator_ - fixed_dt);
         ++steps;
+    }
+    if (steps > 0) {
+        for (Body& body : bodies_) {
+            body.kinematic_moved_this_step = false;
+        }
     }
     if (accumulator_ <= 1.0e-6F) {
         accumulator_ = 0.0F;
@@ -1927,32 +1916,28 @@ TransformRows PhysicsWorld::body_transform_rows(
 
 std::optional<PhysicsBodyState> PhysicsWorld::body_state(
     const SceneNodeId id) const noexcept {
-    if (!id) {
+    const Body* const b = find_body(id);
+    if (b == nullptr) {
         return std::nullopt;
     }
-    for (const Body& b : bodies_) {
-        if (b.node_id == id) {
-            return PhysicsBodyState{
-                .node_id = b.node_id,
-                .node_uuid = b.node_uuid,
-                .shape = b.shape,
-                .motion_type = b.motion_type,
-                .position = b.position,
-                .orientation = b.orientation,
-                .linear_velocity = b.linear_velocity,
-                .angular_velocity = b.angular_velocity,
-                .half_extents = b.half_extents,
-                .radius = b.radius,
-                .half_segment = b.half_segment,
-                .sleeping = b.sleeping,
-                .world_aabb = b.world_aabb,
-                .inv_mass = b.inv_mass,
-                .had_contact = b.had_contact,
-                .enabled = b.enabled,
-            };
-        }
-    }
-    return std::nullopt;
+    return PhysicsBodyState{
+        .node_id = b->node_id,
+        .node_uuid = b->node_uuid,
+        .shape = b->shape,
+        .motion_type = b->motion_type,
+        .position = b->position,
+        .orientation = b->orientation,
+        .linear_velocity = b->linear_velocity,
+        .angular_velocity = b->angular_velocity,
+        .half_extents = b->half_extents,
+        .radius = b->radius,
+        .half_segment = b->half_segment,
+        .sleeping = b->sleeping,
+        .world_aabb = b->world_aabb,
+        .inv_mass = b->inv_mass,
+        .had_contact = b->had_contact,
+        .enabled = b->enabled,
+    };
 }
 
 bool PhysicsWorld::set_linear_velocity(
@@ -1961,15 +1946,14 @@ bool PhysicsWorld::set_linear_velocity(
     if (!id || !finite_vec3(velocity)) {
         return false;
     }
-    for (Body& b : bodies_) {
-        if (b.node_id == id) {
-            b.linear_velocity = velocity;
-            b.sleeping = false;
-            b.sleep_timer = 0.0F;
-            return true;
-        }
+    Body* const b = find_body_mut(id);
+    if (b == nullptr) {
+        return false;
     }
-    return false;
+    b->linear_velocity = velocity;
+    b->sleeping = false;
+    b->sleep_timer = 0.0F;
+    return true;
 }
 
 bool PhysicsWorld::set_angular_velocity(
@@ -1978,16 +1962,15 @@ bool PhysicsWorld::set_angular_velocity(
     if (!id || !finite_vec3(angular_velocity)) {
         return false;
     }
-    for (Body& b : bodies_) {
-        if (b.node_id == id) {
-            b.angular_velocity =
-                b.lock_rotation ? glm::vec3(0.0F) : angular_velocity;
-            b.sleeping = false;
-            b.sleep_timer = 0.0F;
-            return true;
-        }
+    Body* const b = find_body_mut(id);
+    if (b == nullptr) {
+        return false;
     }
-    return false;
+    b->angular_velocity =
+        b->lock_rotation ? glm::vec3(0.0F) : angular_velocity;
+    b->sleeping = false;
+    b->sleep_timer = 0.0F;
+    return true;
 }
 
 bool PhysicsWorld::set_kinematic_pose(
@@ -1998,27 +1981,32 @@ bool PhysicsWorld::set_kinematic_pose(
     if (!id || !finite_vec3(position) || !finite_quat(orientation)) {
         return false;
     }
-    for (Body& b : bodies_) {
-        if (b.node_id == id) {
-            if (std::isfinite(delta_seconds) && delta_seconds > 1.0e-5F) {
-                b.linear_velocity = (position - b.position) / delta_seconds;
-            } else {
-                b.linear_velocity = glm::vec3(0.0F);
-            }
-            b.angular_velocity = glm::vec3(0.0F);
-            b.position = position;
-            b.prev_position = position;
-            b.orientation = orientation;
-            b.prev_orientation = orientation;
-            b.pending_linear_impulse = glm::vec3(0.0F);
-            b.pending_angular_impulse = glm::vec3(0.0F);
-            b.sleeping = false;
-            b.sleep_timer = 0.0F;
-            update_derived_body_state(b);
-            return true;
-        }
+    const float qlen2 = glm::dot(orientation, orientation);
+    if (qlen2 <= 1.0e-8F) {
+        return false;
     }
-    return false;
+    const glm::quat normalized_q = glm::normalize(orientation);
+    Body* const b = find_body_mut(id);
+    if (b == nullptr) {
+        return false;
+    }
+    if (std::isfinite(delta_seconds) && delta_seconds > 1.0e-5F) {
+        b->linear_velocity = (position - b->position) / delta_seconds;
+    } else {
+        b->linear_velocity = glm::vec3(0.0F);
+    }
+    b->angular_velocity = glm::vec3(0.0F);
+    b->position = position;
+    b->prev_position = position;
+    b->orientation = normalized_q;
+    b->prev_orientation = normalized_q;
+    b->pending_linear_impulse = glm::vec3(0.0F);
+    b->pending_angular_impulse = glm::vec3(0.0F);
+    b->sleeping = false;
+    b->sleep_timer = 0.0F;
+    b->kinematic_moved_this_step = true;
+    update_derived_body_state(*b);
+    return true;
 }
 
 bool PhysicsWorld::set_body_state(
@@ -2036,102 +2024,107 @@ bool PhysicsWorld::set_body_state(
         return false;
     }
     const glm::quat normalized_q = glm::normalize(orientation);
-    for (Body& b : bodies_) {
-        if (b.node_id == id) {
-            b.position = position;
-            b.prev_position = position;
-            b.orientation = normalized_q;
-            b.prev_orientation = normalized_q;
-            b.linear_velocity = linear_velocity;
-            b.angular_velocity = b.lock_rotation ? glm::vec3(0.0F) : angular_velocity;
-            b.pending_linear_impulse = glm::vec3(0.0F);
-            b.pending_angular_impulse = glm::vec3(0.0F);
-            b.sleeping = false;
-            b.sleep_timer = 0.0F;
-            update_derived_body_state(b);
-            return true;
-        }
+    Body* const b = find_body_mut(id);
+    if (b == nullptr) {
+        return false;
     }
-    return false;
+    b->position = position;
+    b->prev_position = position;
+    b->orientation = normalized_q;
+    b->prev_orientation = normalized_q;
+    b->linear_velocity = linear_velocity;
+    b->angular_velocity = b->lock_rotation ? glm::vec3(0.0F) : angular_velocity;
+    b->pending_linear_impulse = glm::vec3(0.0F);
+    b->pending_angular_impulse = glm::vec3(0.0F);
+    b->sleeping = false;
+    b->sleep_timer = 0.0F;
+    update_derived_body_state(*b);
+    return true;
 }
 
 bool PhysicsWorld::set_body_motion_type(
     const SceneNodeId id, const RigidBodyMotionType type, const float mass) noexcept {
-    if (!std::isfinite(mass) || mass < minimum_rigid_body_mass || mass > maximum_rigid_body_mass ||
+    if (!id || !std::isfinite(mass) ||
         (type != RigidBodyMotionType::dynamic && type != RigidBodyMotionType::kinematic)) return false;
-    for (Body& body : bodies_) {
-        if (body.node_id != id) continue;
-        body.motion_type = type;
-        body.inv_mass = type == RigidBodyMotionType::dynamic ? 1.0F / mass : 0.0F;
-        body.local_inv_inertia = glm::vec3(0.0F);
-        if (body.inv_mass > 0.0F && !body.lock_rotation) {
-            if (body.shape == PhysicsShapeKind::sphere) {
-                body.local_inv_inertia = glm::vec3(1.0F / std::max(.4F * mass * body.radius * body.radius, 1.0e-5F));
-            } else if (body.shape == PhysicsShapeKind::capsule) {
-                const float r2 = body.radius * body.radius;
-                const float h = body.half_segment + .5F * body.radius;
-                const float iy = std::max(.5F * mass * r2, 1.0e-5F);
-                const float ix = std::max(mass * (.25F * r2 + h * h / 3.0F), 1.0e-5F);
-                body.local_inv_inertia = {1.0F / ix, 1.0F / iy, 1.0F / ix};
-            } else {
-                const auto h = body.half_extents * body.half_extents;
-                body.local_inv_inertia = {3.0F / (mass * (h.y + h.z)),
-                    3.0F / (mass * (h.x + h.z)), 3.0F / (mass * (h.x + h.y))};
-            }
-        }
-        body.prev_position = body.position;
-        body.prev_orientation = body.orientation;
-        body.pending_linear_impulse = glm::vec3(0.0F);
-        body.pending_angular_impulse = glm::vec3(0.0F);
-        body.sleeping = false;
-        body.sleep_timer = 0;
-        update_derived_body_state(body);
-        return true;
+    if (mass > 0.0F && (mass < minimum_rigid_body_mass || mass > maximum_rigid_body_mass)) {
+        return false;
     }
-    return false;
+    Body* const body = find_body_mut(id);
+    if (body == nullptr) {
+        return false;
+    }
+    const float effective_mass = mass > 0.0F
+        ? mass
+        : std::clamp(body->authored_mass, minimum_rigid_body_mass, maximum_rigid_body_mass);
+    if (mass > 0.0F) {
+        body->authored_mass = effective_mass;
+    }
+    body->motion_type = type;
+    body->inv_mass = type == RigidBodyMotionType::dynamic ? 1.0F / effective_mass : 0.0F;
+    body->local_inv_inertia = glm::vec3(0.0F);
+    if (body->inv_mass > 0.0F && !body->lock_rotation) {
+        if (body->shape == PhysicsShapeKind::sphere) {
+            body->local_inv_inertia = glm::vec3(
+                1.0F / std::max(0.4F * effective_mass * body->radius * body->radius, 1.0e-5F));
+        } else if (body->shape == PhysicsShapeKind::capsule) {
+            const float r2 = body->radius * body->radius;
+            const float h = body->half_segment + 0.5F * body->radius;
+            const float iy = std::max(0.5F * effective_mass * r2, 1.0e-5F);
+            const float ix = std::max(effective_mass * (0.25F * r2 + h * h / 3.0F), 1.0e-5F);
+            body->local_inv_inertia = {1.0F / ix, 1.0F / iy, 1.0F / ix};
+        } else {
+            const glm::vec3 safe_h = glm::max(body->half_extents, glm::vec3(0.05F));
+            const glm::vec3 h = safe_h * safe_h;
+            const float ix = std::max((1.0F / 3.0F) * effective_mass * (h.y + h.z), 1.0e-5F);
+            const float iy = std::max((1.0F / 3.0F) * effective_mass * (h.x + h.z), 1.0e-5F);
+            const float iz = std::max((1.0F / 3.0F) * effective_mass * (h.x + h.y), 1.0e-5F);
+            body->local_inv_inertia = {1.0F / ix, 1.0F / iy, 1.0F / iz};
+        }
+    }
+    body->prev_position = body->position;
+    body->pending_linear_impulse = glm::vec3(0.0F);
+    body->pending_angular_impulse = glm::vec3(0.0F);
+    body->sleeping = false;
+    body->sleep_timer = 0.0F;
+    body->kinematic_moved_this_step = false;
+    update_derived_body_state(*body);
+    body->prev_orientation = body->orientation;
+    return true;
 }
 
 bool PhysicsWorld::set_body_enabled(
     const SceneNodeId id,
     const bool enabled) noexcept {
-    if (!id) {
+    Body* const b = find_body_mut(id);
+    if (b == nullptr) {
         return false;
     }
-    for (Body& b : bodies_) {
-        if (b.node_id == id) {
-            b.enabled = enabled;
-            if (!enabled) {
-                b.linear_velocity = glm::vec3(0.0F);
-                b.angular_velocity = glm::vec3(0.0F);
-                b.prev_position = b.position;
-                b.prev_orientation = b.orientation;
-                b.pending_linear_impulse = glm::vec3(0.0F);
-                b.pending_angular_impulse = glm::vec3(0.0F);
-                b.sleeping = true;
-            } else {
-                b.prev_position = b.position;
-                b.prev_orientation = b.orientation;
-                b.sleeping = false;
-                b.sleep_timer = 0.0F;
-            }
-            return true;
-        }
+    b->enabled = enabled;
+    if (!enabled) {
+        b->linear_velocity = glm::vec3(0.0F);
+        b->angular_velocity = glm::vec3(0.0F);
+        b->prev_position = b->position;
+        b->prev_orientation = b->orientation;
+        b->pending_linear_impulse = glm::vec3(0.0F);
+        b->pending_angular_impulse = glm::vec3(0.0F);
+        b->sleeping = true;
+    } else {
+        b->prev_position = b->position;
+        b->prev_orientation = b->orientation;
+        b->sleeping = false;
+        b->sleep_timer = 0.0F;
     }
-    return false;
+    return true;
 }
 
 bool PhysicsWorld::wake_body(const SceneNodeId id) noexcept {
-    if (!id) {
+    Body* const b = find_body_mut(id);
+    if (b == nullptr) {
         return false;
     }
-    for (Body& b : bodies_) {
-        if (b.node_id == id) {
-            b.sleeping = false;
-            b.sleep_timer = 0.0F;
-            return true;
-        }
-    }
-    return false;
+    b->sleeping = false;
+    b->sleep_timer = 0.0F;
+    return true;
 }
 
 bool PhysicsWorld::apply_central_force(
@@ -2141,20 +2134,16 @@ bool PhysicsWorld::apply_central_force(
     if (!id || !finite_vec3(force) || !std::isfinite(dt) || dt <= 0.0F) {
         return false;
     }
+    Body* const b = find_body_mut(id);
+    if (b == nullptr || !b->enabled || b->inv_mass <= 0.0F) {
+        return false;
+    }
     const float eff_dt =
         std::min(dt, fixed_dt * static_cast<float>(max_substeps));
-    for (Body& b : bodies_) {
-        if (b.node_id == id) {
-            if (!b.enabled || b.inv_mass <= 0.0F) {
-                return false;
-            }
-            b.pending_linear_impulse += force * eff_dt;
-            b.sleeping = false;
-            b.sleep_timer = 0.0F;
-            return true;
-        }
-    }
-    return false;
+    b->pending_linear_impulse += force * eff_dt;
+    b->sleeping = false;
+    b->sleep_timer = 0.0F;
+    return true;
 }
 
 bool PhysicsWorld::apply_force_at_point(
@@ -2169,25 +2158,21 @@ bool PhysicsWorld::apply_force_at_point(
         dt <= 0.0F) {
         return false;
     }
+    Body* const b = find_body_mut(id);
+    if (b == nullptr || !b->enabled || b->inv_mass <= 0.0F) {
+        return false;
+    }
     const float eff_dt =
         std::min(dt, fixed_dt * static_cast<float>(max_substeps));
-    for (Body& b : bodies_) {
-        if (b.node_id == id) {
-            if (!b.enabled || b.inv_mass <= 0.0F) {
-                return false;
-            }
-            const glm::vec3 impulse = force * eff_dt;
-            b.pending_linear_impulse += impulse;
-            if (!b.lock_rotation) {
-                const glm::vec3 r = world_point - b.position;
-                b.pending_angular_impulse += glm::cross(r, impulse);
-            }
-            b.sleeping = false;
-            b.sleep_timer = 0.0F;
-            return true;
-        }
+    const glm::vec3 impulse = force * eff_dt;
+    b->pending_linear_impulse += impulse;
+    if (!b->lock_rotation) {
+        const glm::vec3 r = world_point - b->position;
+        b->pending_angular_impulse += glm::cross(r, impulse);
     }
-    return false;
+    b->sleeping = false;
+    b->sleep_timer = 0.0F;
+    return true;
 }
 
 bool PhysicsWorld::apply_torque(
@@ -2197,22 +2182,18 @@ bool PhysicsWorld::apply_torque(
     if (!id || !finite_vec3(torque) || !std::isfinite(dt) || dt <= 0.0F) {
         return false;
     }
+    Body* const b = find_body_mut(id);
+    if (b == nullptr || !b->enabled || b->inv_mass <= 0.0F) {
+        return false;
+    }
     const float eff_dt =
         std::min(dt, fixed_dt * static_cast<float>(max_substeps));
-    for (Body& b : bodies_) {
-        if (b.node_id == id) {
-            if (!b.enabled || b.inv_mass <= 0.0F) {
-                return false;
-            }
-            if (!b.lock_rotation) {
-                b.pending_angular_impulse += torque * eff_dt;
-            }
-            b.sleeping = false;
-            b.sleep_timer = 0.0F;
-            return true;
-        }
+    if (!b->lock_rotation) {
+        b->pending_angular_impulse += torque * eff_dt;
     }
-    return false;
+    b->sleeping = false;
+    b->sleep_timer = 0.0F;
+    return true;
 }
 
 bool PhysicsWorld::apply_impulse_at_point(
@@ -2222,22 +2203,18 @@ bool PhysicsWorld::apply_impulse_at_point(
     if (!id || !finite_vec3(impulse) || !finite_vec3(world_point)) {
         return false;
     }
-    for (Body& b : bodies_) {
-        if (b.node_id == id) {
-            if (!b.enabled || b.inv_mass <= 0.0F) {
-                return false;
-            }
-            b.linear_velocity += impulse * b.inv_mass;
-            if (!b.lock_rotation) {
-                const glm::vec3 r = world_point - b.position;
-                b.angular_velocity += b.world_inv_inertia * glm::cross(r, impulse);
-            }
-            b.sleeping = false;
-            b.sleep_timer = 0.0F;
-            return true;
-        }
+    Body* const b = find_body_mut(id);
+    if (b == nullptr || !b->enabled || b->inv_mass <= 0.0F) {
+        return false;
     }
-    return false;
+    b->linear_velocity += impulse * b->inv_mass;
+    if (!b->lock_rotation) {
+        const glm::vec3 r = world_point - b->position;
+        b->angular_velocity += b->world_inv_inertia * glm::cross(r, impulse);
+    }
+    b->sleeping = false;
+    b->sleep_timer = 0.0F;
+    return true;
 }
 
 glm::vec3 PhysicsWorld::point_velocity(
@@ -2246,16 +2223,12 @@ glm::vec3 PhysicsWorld::point_velocity(
     if (!id || !finite_vec3(world_point)) {
         return glm::vec3(0.0F);
     }
-    for (const Body& b : bodies_) {
-        if (b.node_id == id) {
-            if (!b.enabled) {
-                return glm::vec3(0.0F);
-            }
-            return b.linear_velocity +
-                   glm::cross(b.angular_velocity, world_point - b.position);
-        }
+    const Body* const b = find_body(id);
+    if (b == nullptr || !b->enabled) {
+        return glm::vec3(0.0F);
     }
-    return glm::vec3(0.0F);
+    return b->linear_velocity +
+           glm::cross(b->angular_velocity, world_point - b->position);
 }
 
 } // namespace vcr

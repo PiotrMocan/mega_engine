@@ -1427,6 +1427,291 @@ void test_smoothness_and_collider_offset_regressions() {
         "Vehicle visual pose & VehicleCamera advance monotonically every 1000-FPS frame without staircase jumps");
 }
 
+void test_stage3_stability_and_input_regressions() {
+    // 1. LaneGraph 0-length segment, multi-hop advancement, and node-width obstacle corridor.
+    {
+        vcr::LaneGraph lanes;
+        const std::uint32_t n0 = lanes.add_node({.position = {0.0F, 0.0F, 0.0F}, .forward = {0.0F, 0.0F, 1.0F}, .width = 3.5F});
+        const std::uint32_t n1 = lanes.add_node({.position = {0.0F, 0.0F, 0.0F}, .forward = {0.0F, 0.0F, 1.0F}, .width = 3.5F});
+        const std::uint32_t n2 = lanes.add_node({.position = {0.0F, 0.0F, 15.0F}, .forward = {0.0F, 0.0F, 1.0F}, .width = 3.5F});
+        const std::uint32_t n3 = lanes.add_node({.position = {0.0F, 0.0F, 15.1F}, .forward = {0.0F, 0.0F, 1.0F}, .width = 3.5F});
+        const std::uint32_t n4 = lanes.add_node({.position = {0.0F, 0.0F, 15.2F}, .forward = {0.0F, 0.0F, 1.0F}, .width = 3.5F});
+        const std::uint32_t n5 = lanes.add_node({.position = {0.0F, 0.0F, 15.3F}, .forward = {0.0F, 0.0F, 1.0F}, .width = 3.5F});
+        const std::uint32_t n6 = lanes.add_node({.position = {0.0F, 0.0F, 65.0F}, .forward = {0.0F, 0.0F, 1.0F}, .width = 3.5F});
+        const std::uint32_t s0 = lanes.add_segment({
+            .start_node = n0, .end_node = n1, .speed_limit_mps = 12.0F,
+            .next_segments = {1U, 0U, 0U, 0U}, .next_count = 1U,
+        });
+        const std::uint32_t s1 = lanes.add_segment({
+            .start_node = n1, .end_node = n2, .speed_limit_mps = 12.0F,
+            .next_segments = {2U, 0U, 0U, 0U}, .next_count = 1U,
+        });
+        const std::uint32_t s2 = lanes.add_segment({
+            .start_node = n2, .end_node = n3, .speed_limit_mps = 12.0F,
+            .next_segments = {3U, 0U, 0U, 0U}, .next_count = 1U,
+        });
+        const std::uint32_t s3 = lanes.add_segment({
+            .start_node = n3, .end_node = n4, .speed_limit_mps = 12.0F,
+            .next_segments = {4U, 0U, 0U, 0U}, .next_count = 1U,
+        });
+        const std::uint32_t s4 = lanes.add_segment({
+            .start_node = n4, .end_node = n5, .speed_limit_mps = 12.0F,
+            .next_segments = {5U, 0U, 0U, 0U}, .next_count = 1U,
+        });
+        const std::uint32_t s5 = lanes.add_segment({
+            .start_node = n5, .end_node = n6, .speed_limit_mps = 12.0F,
+            .next_segments = {0U, 0U, 0U, 0U}, .next_count = 0U,
+        });
+        static_cast<void>(s2);
+        static_cast<void>(s3);
+        static_cast<void>(s4);
+        expect(lanes.build(), "LaneGraph::build accepts 0-length segment without divide-by-zero");
+
+        const glm::vec3 dir0 = lanes.segment_direction(s0);
+        expect(
+            std::isfinite(dir0.x) && std::isfinite(dir0.y) && std::isfinite(dir0.z) &&
+                close_to(glm::length(dir0), 1.0F, 1.0e-3F),
+            "Zero-length segment preserves finite unit direction from start node");
+
+        vcr::TrafficConfig tcfg{};
+        tcfg.max_vehicles = 2U;
+        tcfg.idm_max_accel_mps2 = 60.0F;
+        vcr::TrafficSystem traffic;
+        traffic.initialize(tcfg, lanes);
+        const auto tv = traffic.spawn_vehicle(s0, 0.0F, vcr::SceneNodeId{});
+        expect(tv.has_value(), "Spawn traffic vehicle on 0-length segment");
+
+        traffic.update(1.0F / 30.0F, lanes, nullptr);
+        expect(
+            traffic.vehicles()[0].segment_id == s1 &&
+                std::isfinite(traffic.vehicles()[0].position.z) &&
+                std::isfinite(traffic.vehicles()[0].yaw_radians),
+            "TrafficSystem exits 0-length segment onto next segment cleanly");
+
+        bool crossed_multi_hop = false;
+        for (int step = 0; step < 120; ++step) {
+            const std::uint32_t prev_seg = traffic.vehicles()[0].segment_id;
+            traffic.update(1.0F / 30.0F, lanes, nullptr);
+            if (prev_seg == s1 && traffic.vehicles()[0].segment_id == s5) {
+                crossed_multi_hop = true;
+                break;
+            }
+        }
+        const auto& snap = traffic.vehicles()[0];
+        expect(
+            crossed_multi_hop &&
+                std::isfinite(snap.position.x) && std::isfinite(snap.position.y) &&
+                std::isfinite(snap.position.z) && std::isfinite(snap.yaw_radians) &&
+                snap.segment_id == s5 && snap.position.z > 15.3F,
+            "TrafficSystem hops past 0-length and multiple short segments cleanly in one update");
+
+        // LaneNode::width scales obstacle avoidance corridor.
+        auto run_corridor = [](const float lane_width) -> float {
+            vcr::LaneGraph lg;
+            const auto a = lg.add_node({.position = {0.0F, 0.0F, 0.0F}, .forward = {0.0F, 0.0F, 1.0F}, .width = lane_width});
+            const auto b = lg.add_node({.position = {0.0F, 0.0F, 80.0F}, .forward = {0.0F, 0.0F, 1.0F}, .width = lane_width});
+            const auto seg = lg.add_segment({.start_node = a, .end_node = b, .speed_limit_mps = 12.0F});
+            if (!lg.build()) {
+                return -1.0F;
+            }
+            vcr::TrafficConfig cfg{};
+            cfg.max_vehicles = 1U;
+            vcr::TrafficSystem ts;
+            ts.initialize(cfg, lg);
+            static_cast<void>(ts.spawn_vehicle(seg, 0.0F, vcr::SceneNodeId{}));
+            for (int f = 0; f < 15; ++f) {
+                ts.update(1.0F / 30.0F, lg, nullptr);
+            }
+            const std::array<vcr::TrafficObstacle, 1U> obs{{
+                vcr::TrafficObstacle{
+                    .position = ts.vehicles()[0].position + glm::vec3{2.6F, 0.0F, 4.0F},
+                    .radius = 0.4F,
+                },
+            }};
+            ts.update(1.0F / 30.0F, lg, nullptr, obs);
+            return ts.vehicles()[0].brake;
+        };
+        const float narrow_brake = run_corridor(1.6F);
+        const float wide_brake = run_corridor(6.0F);
+        expect(
+            narrow_brake >= 0.0F && narrow_brake < 0.05F && wide_brake > 0.1F,
+            "TrafficSystem obstacle lateral corridor scales with LaneNode::width");
+    }
+
+    // 2. CrowdSystem non-finite/negative delta_seconds and zero-distance threat resilience.
+    {
+        vcr::NavigationGraph nav;
+        const auto n0 = nav.add_node({.position = {0.0F, 0.0F, 0.0F}});
+        const auto n1 = nav.add_node({.position = {0.0F, 0.0F, 10.0F}});
+        nav.add_edge({.from_node = n0, .to_node = n1, .speed_limit_mps = 1.5F});
+        expect(nav.build(), "NavigationGraph builds for CrowdSystem NaN regression test");
+
+        vcr::CrowdConfig cfg{};
+        cfg.max_agents = 4U;
+        vcr::CrowdSystem crowd;
+        crowd.initialize(cfg, nav);
+        const auto agent_id = crowd.spawn_agent(n0);
+        expect(agent_id.has_value(), "Spawn crowd agent for resilience test");
+
+        crowd.update(std::numeric_limits<float>::quiet_NaN(), nav, {});
+        crowd.update(-0.25F, nav, {});
+        const std::array<vcr::CrowdThreat, 1U> co_located_threat{{
+            vcr::CrowdThreat{
+                .position = crowd.agents()[0].position,
+                .velocity = {0.0F, 0.0F, 0.0F},
+                .radius = 2.0F,
+            },
+        }};
+        crowd.update(1.0F / 30.0F, nav, co_located_threat);
+        const auto& agent = crowd.agents()[0];
+        expect(
+            std::isfinite(agent.position.x) && std::isfinite(agent.position.y) &&
+                std::isfinite(agent.position.z) && std::isfinite(agent.yaw_radians),
+            "CrowdSystem ignores NaN/negative dt and handles zero-distance threats without NaN");
+    }
+
+    // 3. VehicleCamera sphere-radius pull-in and degenerate view_matrix safety.
+    {
+        vcr::CollisionWorld wall_world;
+        wall_world.upsert_box_collider(
+            vcr::SceneNodeId{1U, 1U},
+            {0.0F, 1.5F, -3.2F},
+            glm::mat3(1.0F),
+            {10.0F, 2.0F, 0.5F});
+
+        vcr::VehicleCameraConfig cfg_zero{};
+        cfg_zero.follow_distance = 5.0F;
+        cfg_zero.collision_sphere_radius = 0.0F;
+        cfg_zero.collision_pull_in_offset = 0.1F;
+        vcr::VehicleCameraConfig cfg_sphere = cfg_zero;
+        cfg_sphere.collision_sphere_radius = 0.45F;
+
+        vcr::VehicleCamera cam_zero(cfg_zero);
+        vcr::VehicleCamera cam_sphere(cfg_sphere);
+        cam_zero.reset({0.0F, 0.5F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 1.0F, 0.0F});
+        cam_sphere.reset({0.0F, 0.5F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 1.0F, 0.0F});
+        for (int i = 0; i < 60; ++i) {
+            cam_zero.update(
+                {0.0F, 0.5F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 1.0F, 0.0F},
+                {0.0F, 0.0F, 0.0F}, 0.0F, 0.0F, 1.0F / 60.0F, &wall_world);
+            cam_sphere.update(
+                {0.0F, 0.5F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 1.0F, 0.0F},
+                {0.0F, 0.0F, 0.0F}, 0.0F, 0.0F, 1.0F / 60.0F, &wall_world);
+        }
+        expect(
+            cam_sphere.position().z > cam_zero.position().z + 0.35F,
+            "VehicleCamera accounts for collision_sphere_radius when pulling in from walls");
+
+        vcr::VehicleCamera deg_cam(cfg_sphere);
+        const float nan_f = std::numeric_limits<float>::quiet_NaN();
+        deg_cam.reset({nan_f, nan_f, nan_f}, {0.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 0.0F});
+        const glm::mat4 vm = deg_cam.view_matrix();
+        bool vm_finite = true;
+        for (int c = 0; c < 4; ++c) {
+            for (int r = 0; r < 4; ++r) {
+                vm_finite = vm_finite && std::isfinite(vm[c][r]);
+            }
+        }
+        expect(vm_finite, "VehicleCamera::view_matrix remains finite after NaN/zero reset inputs");
+    }
+
+    // 4. VehicleController Ackermann steering geometry and combined friction ellipse stability.
+    {
+        vcr::SceneDocument scene;
+        const vcr::SceneNodeId road_id = scene.create_node("Road", vcr::SceneNodeKind::cube);
+        scene.node(road_id)->get().transform.translation = {0.0F, -0.5F, 0.0F};
+        scene.node(road_id)->get().transform.scale = {80.0F, 0.5F, 80.0F};
+        static_cast<void>(scene.set_collider(road_id, vcr::ColliderComponent{}));
+
+        const vcr::SceneNodeId car_id = scene.create_node("AckermannCar", vcr::SceneNodeKind::cube);
+        scene.node(car_id)->get().transform.translation = {0.0F, 0.65F, 0.0F};
+        scene.node(car_id)->get().transform.scale = {0.95F, 0.35F, 2.2F};
+        vcr::RigidBodyComponent rb{};
+        rb.motion_type = vcr::RigidBodyMotionType::dynamic;
+        rb.mass = 1450.0F;
+        static_cast<void>(scene.set_rigid_body(car_id, rb));
+        static_cast<void>(scene.set_collider(car_id, vcr::ColliderComponent{}));
+
+        vcr::CollisionWorld collision;
+        collision.rebuild_from_scene(scene, {}, {}, {}, true);
+        vcr::PhysicsWorld physics;
+        physics.rebuild_from_scene(scene, {}, {}, {});
+
+        vcr::VehicleController vehicle(vcr::VehicleController::make_default_sedan(car_id));
+        vehicle.reset(physics, {0.0F, 0.65F, 0.0F}, {1.0F, 0.0F, 0.0F, 0.0F});
+        const float dt = 1.0F / 60.0F;
+        for (int i = 0; i < 30; ++i) {
+            vehicle.update(vcr::VehicleControlInput{}, dt, physics, &collision);
+            physics.step(dt, collision);
+        }
+        for (int i = 0; i < 60; ++i) {
+            vehicle.update(
+                vcr::VehicleControlInput{.throttle = 1.0F, .steer = 0.8F, .handbrake = true},
+                dt, physics, &collision);
+            physics.step(dt, collision);
+        }
+        const auto& tel = vehicle.telemetry();
+        bool finite_tel = std::isfinite(tel.world_position.x) &&
+            std::isfinite(tel.world_position.y) &&
+            std::isfinite(tel.world_position.z) &&
+            std::isfinite(tel.world_rotation.w) &&
+            std::isfinite(tel.forward_speed_mps);
+        for (const auto& w : tel.wheels) {
+            finite_tel = finite_tel &&
+                std::isfinite(w.steer_angle_radians) &&
+                std::isfinite(w.world_hub_position.x) &&
+                std::isfinite(w.world_hub_position.y) &&
+                std::isfinite(w.world_hub_position.z);
+        }
+        const float w0_right = tel.wheels[0].steer_angle_radians;
+        const float w1_right = tel.wheels[1].steer_angle_radians;
+
+        // Flip steer direction to verify opposite inner/outer wheel asymmetry.
+        vehicle.reset(physics, {0.0F, 0.65F, 0.0F}, {1.0F, 0.0F, 0.0F, 0.0F});
+        for (int i = 0; i < 45; ++i) {
+            vehicle.update(
+                vcr::VehicleControlInput{.throttle = 0.4F, .steer = -0.8F},
+                dt, physics, &collision);
+            physics.step(dt, collision);
+        }
+        const float w0_left = vehicle.telemetry().wheels[0].steer_angle_radians;
+        const float w1_left = vehicle.telemetry().wheels[1].steer_angle_radians;
+        const bool same_sign_right = w0_right * w1_right > 0.0F;
+        const bool same_sign_left = w0_left * w1_left > 0.0F;
+        const bool opposite_inner =
+            (std::abs(w0_right) > std::abs(w1_right) + 0.02F &&
+             std::abs(w1_left) > std::abs(w0_left) + 0.02F) ||
+            (std::abs(w1_right) > std::abs(w0_right) + 0.02F &&
+             std::abs(w0_left) > std::abs(w1_left) + 0.02F);
+        expect(
+            finite_tel && same_sign_right && same_sign_left && opposite_inner,
+            "VehicleController applies Ackermann inner/outer steering and stays finite under throttle+steer+handbrake");
+    }
+
+    // 5. InputActionSystem derives vehicle throttle/brake dynamically from bound gamepad triggers.
+    {
+        vcr::InputActionSystem actions;
+        actions.set_hardware_polling_enabled(false);
+        actions.set_context(vcr::InputContext::vehicle);
+        actions.set_binding(
+            vcr::InputAction::vehicle_throttle,
+            vcr::ActionBinding{.gamepad_button = vcr::GamepadButton::left_trigger});
+        actions.set_binding(
+            vcr::InputAction::vehicle_brake,
+            vcr::ActionBinding{.gamepad_button = vcr::GamepadButton::right_trigger});
+        actions.set_synthetic_gamepad(vcr::GamepadState{
+            .left_trigger = 0.8F,
+            .right_trigger = 0.25F,
+            .connected = true,
+        });
+        actions.begin_frame(1.0F / 60.0F);
+        expect(
+            close_to(actions.vehicle_throttle_value(), 0.8F, 0.02F) &&
+                close_to(actions.vehicle_brake_value(), 0.25F, 0.02F),
+            "InputActionSystem honors rebound left/right gamepad triggers for vehicle throttle and brake");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1444,6 +1729,7 @@ int main() {
     test_game_overlay_canvas();
     test_gameplay_session_hooks_and_lifecycle(scratch.path());
     test_smoothness_and_collider_offset_regressions();
+    test_stage3_stability_and_input_regressions();
 
     if (g_failures != 0) {
         std::cerr << g_failures << " engine gameplay API test(s) failed\n";

@@ -111,3 +111,14 @@ build/windows-release/bin/vcr_content_cooker.exe `
 ```
 
 Validates `version == 1` schemas (`asset_manifest.json`, `scene_layout.json`, `animation_manifest.json`), imports deduplicated `.glb`/`.gltf` assets into `--cooked-dir`, and writes `cooked_catalog.json` atomically without mutating `--export-dir`.
+
+---
+
+## 9. C++ Game Module ABI v2 & SDK
+
+Headers/CMake: [`src/game_module_api.hpp`](../src/game_module_api.hpp), [`src/game_module_loader.hpp`](../src/game_module_loader.hpp), [`cmake/VcrEngineSdk.cmake`](../cmake/VcrEngineSdk.cmake)
+
+- **ABI v2 Contract**: Game DLLs export `vcr_get_game_module_api_v2` with `api_version == VCR_GAME_MODULE_API_VERSION` (`2U`) and `abi_stamp == vcr_current_module_abi_stamp()`, verifying pointer size, iterator debug level, and MSVC Debug/Release CRT compatibility across the DLL boundary.
+- **Cross-DLL Error Reporting**: `configure_session(id, host, error_buf, error_buf_size)` writes UTF-8 diagnostics into caller-owned storage instead of returning heap-allocated `std::string` across CRT heaps.
+- **Configuration-Matched SDK Linking**: `vcr_engine` uses `DEBUG_POSTFIX "d"` (`vcr_engined.dll` / `vcr_engined.lib` in Debug, `vcr_engine.dll` / `vcr_engine.lib` in Release/ASan), and `VcrEngineSdk.cmake` selects the configuration-matched binaries strictly while setting `DEBUG_POSTFIX ""` on game module targets.
+- **Shadow-Copy Hardening**: `LoadedGameModule::load` rejects non-regular files and symlinks on both the source DLL and temporary shadow-copy directories, and binds `bound_session_` cleanup to unload/failure paths before `FreeLibrary`.

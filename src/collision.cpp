@@ -1,4 +1,5 @@
 #include "collision.hpp"
+#include "collision_math.hpp"
 #include "terrain_height.hpp"
 
 #include <glm/geometric.hpp>
@@ -9,6 +10,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <numeric>
 
 namespace vcr {
 namespace {
@@ -39,84 +41,6 @@ constexpr std::array<glm::vec3, 21U> canonical_dop_axes{{
     {0.40824829F, 0.81649658F, 0.40824829F},
 }};
 
-struct WorldFrame {
-    glm::vec3 origin{0.0F};
-    glm::mat3 axes{1.0F};
-    glm::vec3 scale{1.0F};
-};
-
-[[nodiscard]] bool finite_vec3(const glm::vec3 v) noexcept {
-    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
-}
-
-[[nodiscard]] bool aabb_overlaps(
-    const Bounds& a,
-    const Bounds& b) noexcept {
-    return std::abs(a.center.x - b.center.x) <= (a.extent.x + b.extent.x) &&
-           std::abs(a.center.y - b.center.y) <= (a.extent.y + b.extent.y) &&
-           std::abs(a.center.z - b.center.z) <= (a.extent.z + b.extent.z);
-}
-
-[[nodiscard]] std::optional<WorldFrame> decompose_world_frame(
-    const glm::mat4& world) noexcept {
-    const glm::vec3 c0(world[0]);
-    const glm::vec3 c1(world[1]);
-    const glm::vec3 c2(world[2]);
-    const glm::vec3 origin(world[3]);
-    if (!finite_vec3(c0) || !finite_vec3(c1) ||
-        !finite_vec3(c2) || !finite_vec3(origin)) {
-        return std::nullopt;
-    }
-    const glm::vec3 scale{
-        glm::length(c0),
-        glm::length(c1),
-        glm::length(c2),
-    };
-    constexpr float min_scale = 1.0e-4F;
-    if (!finite_vec3(scale) ||
-        scale.x < min_scale ||
-        scale.y < min_scale ||
-        scale.z < min_scale) {
-        return std::nullopt;
-    }
-    const glm::vec3 ax0 = c0 / scale.x;
-    const glm::vec3 raw_y = c1 / scale.y;
-    const glm::vec3 orth_y = raw_y - ax0 * glm::dot(ax0, raw_y);
-    const float orth_y_len = glm::length(orth_y);
-    if (!std::isfinite(orth_y_len) || orth_y_len <= min_scale) {
-        return std::nullopt;
-    }
-    const glm::vec3 ax1 = orth_y / orth_y_len;
-    glm::vec3 ax2 = glm::cross(ax0, ax1);
-    const float ax2_len = glm::length(ax2);
-    if (!std::isfinite(ax2_len) || ax2_len <= min_scale) {
-        return std::nullopt;
-    }
-    ax2 /= ax2_len;
-    if (glm::dot(ax2, c2) < 0.0F) {
-        ax2 = -ax2;
-    }
-    return WorldFrame{
-        .origin = origin,
-        .axes = glm::mat3(ax0, ax1, ax2),
-        .scale = scale,
-    };
-}
-
-[[nodiscard]] Bounds compute_obb_aabb(
-    const glm::vec3 center,
-    const glm::mat3& axes,
-    const glm::vec3 half_extents) noexcept {
-    glm::vec3 world_extent{0.0F};
-    for (int row = 0; row < 3; ++row) {
-        world_extent[row] =
-            std::abs(axes[0][row]) * half_extents.x +
-            std::abs(axes[1][row]) * half_extents.y +
-            std::abs(axes[2][row]) * half_extents.z;
-    }
-    return Bounds{.center = center, .extent = world_extent};
-}
-
 [[nodiscard]] Bounds transform_aabb_matrix(
     const Bounds& local,
     const glm::mat4& m) noexcept {
@@ -130,37 +54,6 @@ struct WorldFrame {
             std::abs(m[2][row]) * local.extent.z;
     }
     return Bounds{.center = world_center, .extent = world_extent};
-}
-
-[[nodiscard]] bool ray_intersects_aabb(
-    const glm::vec3 origin,
-    const glm::vec3 dir,
-    const float max_dist,
-    const Bounds& aabb) noexcept {
-    const glm::vec3 bmin = aabb.center - aabb.extent;
-    const glm::vec3 bmax = aabb.center + aabb.extent;
-    float t_min = 0.0F;
-    float t_max = max_dist;
-    for (int axis = 0; axis < 3; ++axis) {
-        if (std::abs(dir[axis]) <= epsilon) {
-            if (origin[axis] < bmin[axis] || origin[axis] > bmax[axis]) {
-                return false;
-            }
-            continue;
-        }
-        const float inv = 1.0F / dir[axis];
-        float t1 = (bmin[axis] - origin[axis]) * inv;
-        float t2 = (bmax[axis] - origin[axis]) * inv;
-        if (t1 > t2) {
-            std::swap(t1, t2);
-        }
-        t_min = std::max(t_min, t1);
-        t_max = std::min(t_max, t2);
-        if (t_min > t_max) {
-            return false;
-        }
-    }
-    return true;
 }
 
 [[nodiscard]] bool segment_aabb_interval(
@@ -1083,6 +976,7 @@ CollisionWorld::CollisionWorld() {
     convex_hulls_.reserve(32U);
     shared_meshes_.reserve(16U);
     triangle_meshes_.reserve(32U);
+    node_collider_lookup_.reserve(256U);
     world_nodes_scratch_.reserve(256U);
     ancestor_scratch_.reserve(256U);
 }
@@ -1094,11 +988,46 @@ void CollisionWorld::clear() noexcept {
     convex_hulls_.clear();
     shared_meshes_.clear();
     triangle_meshes_.clear();
+    std::fill(node_collider_lookup_.begin(), node_collider_lookup_.end(), NodeColliderRef{});
     terrain_node_id_ = {};
     terrain_node_uuid_ = {};
     solid_count_ = 0U;
     trigger_count_ = 0U;
     terrain_enabled_ = false;
+}
+
+void CollisionWorld::register_node_collider(
+    const SceneNodeId id,
+    const ColliderStorageKind kind,
+    const std::uint32_t first,
+    const std::uint32_t count) {
+    if (!id || id.index >= max_scene_nodes || count == 0U) {
+        return;
+    }
+    if (id.index >= node_collider_lookup_.size()) {
+        const std::size_t target = std::min(
+            std::max(static_cast<std::size_t>(id.index) + 1U, node_collider_lookup_.size() * 2U),
+            static_cast<std::size_t>(max_scene_nodes));
+        node_collider_lookup_.resize(target, NodeColliderRef{});
+    }
+    node_collider_lookup_[id.index] = NodeColliderRef{
+        .id = id,
+        .kind = kind,
+        .first = first,
+        .count = count,
+    };
+}
+
+const CollisionWorld::NodeColliderRef* CollisionWorld::find_node_collider(
+    const SceneNodeId id) const noexcept {
+    if (!id || id.index >= node_collider_lookup_.size()) {
+        return nullptr;
+    }
+    const NodeColliderRef& ref = node_collider_lookup_[id.index];
+    if (ref.id != id || ref.kind == ColliderStorageKind::none || ref.count == 0U) {
+        return nullptr;
+    }
+    return &ref;
 }
 
 std::optional<std::uint32_t> CollisionWorld::intern_triangle_mesh(
@@ -1134,7 +1063,8 @@ std::optional<std::uint32_t> CollisionWorld::intern_triangle_mesh(
     };
 
     const std::size_t tri_count = collision.triangle_indices.size() / 3U;
-    mesh.indices.reserve(tri_count * 3U);
+    std::vector<glm::vec3> tri_centroids;
+    tri_centroids.reserve(tri_count);
     for (std::size_t t = 0U; t < tri_count; ++t) {
         const std::uint32_t i0 = collision.triangle_indices[t * 3U + 0U];
         const std::uint32_t i1 = collision.triangle_indices[t * 3U + 1U];
@@ -1144,37 +1074,80 @@ std::optional<std::uint32_t> CollisionWorld::intern_triangle_mesh(
             i2 >= mesh.positions.size()) {
             return std::nullopt;
         }
-        mesh.indices.push_back(i0);
-        mesh.indices.push_back(i1);
-        mesh.indices.push_back(i2);
+        tri_centroids.push_back(
+            (mesh.positions[i0] + mesh.positions[i1] + mesh.positions[i2]) *
+            (1.0F / 3.0F));
     }
 
-    constexpr std::uint32_t triangles_per_chunk = 32U;
+    // Spatially partition triangles via longest-axis median split so chunk
+    // AABBs stay tight instead of grouping arbitrary source index runs.
     const auto total_tris = static_cast<std::uint32_t>(tri_count);
+    std::vector<std::uint32_t> tri_order(total_tris);
+    std::iota(tri_order.begin(), tri_order.end(), 0U);
+
+    constexpr std::uint32_t triangles_per_chunk = 32U;
+    mesh.indices.reserve(tri_count * 3U);
     mesh.chunks.reserve((total_tris + triangles_per_chunk - 1U) /
                         triangles_per_chunk);
-    for (std::uint32_t first = 0U; first < total_tris;
-         first += triangles_per_chunk) {
-        const std::uint32_t count =
-            std::min(triangles_per_chunk, total_tris - first);
-        glm::vec3 cmin(std::numeric_limits<float>::max());
-        glm::vec3 cmax(std::numeric_limits<float>::lowest());
-        for (std::uint32_t t = first; t < first + count; ++t) {
-            for (std::uint32_t corner = 0U; corner < 3U; ++corner) {
-                const glm::vec3 v = mesh.positions[mesh.indices[t * 3U + corner]];
-                cmin = glm::min(cmin, v);
-                cmax = glm::max(cmax, v);
-            }
+
+    const auto build_chunks = [&](auto& self,
+                                  const std::uint32_t begin,
+                                  const std::uint32_t end) -> void {
+        const std::uint32_t count = end - begin;
+        if (count == 0U) {
+            return;
         }
-        mesh.chunks.push_back(TriangleChunk{
-            .local_aabb = Bounds{
-                .center = 0.5F * (cmin + cmax),
-                .extent = glm::max(0.5F * (cmax - cmin), glm::vec3(0.001F)),
-            },
-            .first_triangle = first,
-            .triangle_count = count,
-        });
-    }
+        if (count <= triangles_per_chunk) {
+            const auto first_out = static_cast<std::uint32_t>(mesh.indices.size() / 3U);
+            glm::vec3 cmin(std::numeric_limits<float>::max());
+            glm::vec3 cmax(std::numeric_limits<float>::lowest());
+            for (std::uint32_t idx = begin; idx < end; ++idx) {
+                const std::uint32_t src_t = tri_order[idx];
+                for (std::uint32_t corner = 0U; corner < 3U; ++corner) {
+                    const std::uint32_t vi = collision.triangle_indices[src_t * 3U + corner];
+                    mesh.indices.push_back(vi);
+                    const glm::vec3& v = mesh.positions[vi];
+                    cmin = glm::min(cmin, v);
+                    cmax = glm::max(cmax, v);
+                }
+            }
+            mesh.chunks.push_back(TriangleChunk{
+                .local_aabb = Bounds{
+                    .center = 0.5F * (cmin + cmax),
+                    .extent = glm::max(0.5F * (cmax - cmin), glm::vec3(0.001F)),
+                },
+                .first_triangle = first_out,
+                .triangle_count = count,
+            });
+            return;
+        }
+
+        glm::vec3 cent_min(std::numeric_limits<float>::max());
+        glm::vec3 cent_max(std::numeric_limits<float>::lowest());
+        for (std::uint32_t idx = begin; idx < end; ++idx) {
+            const glm::vec3& c = tri_centroids[tri_order[idx]];
+            cent_min = glm::min(cent_min, c);
+            cent_max = glm::max(cent_max, c);
+        }
+        const glm::vec3 span = cent_max - cent_min;
+        int axis = 0;
+        if (span.y > span.x && span.y >= span.z) {
+            axis = 1;
+        } else if (span.z > span.x && span.z > span.y) {
+            axis = 2;
+        }
+        const std::uint32_t mid = begin + count / 2U;
+        std::nth_element(
+            tri_order.begin() + static_cast<std::ptrdiff_t>(begin),
+            tri_order.begin() + static_cast<std::ptrdiff_t>(mid),
+            tri_order.begin() + static_cast<std::ptrdiff_t>(end),
+            [&tri_centroids, axis](const std::uint32_t a, const std::uint32_t b) noexcept {
+                return tri_centroids[a][axis] < tri_centroids[b][axis];
+            });
+        self(self, begin, mid);
+        self(self, mid, end);
+    };
+    build_chunks(build_chunks, 0U, total_tris);
 
     const auto out_idx = static_cast<std::uint32_t>(shared_meshes_.size());
     shared_meshes_.push_back(std::move(mesh));
@@ -1236,7 +1209,7 @@ void CollisionWorld::rebuild_from_scene(
             continue;
         }
 
-        const auto frame = decompose_world_frame(entry.world_matrix);
+        const auto frame = decompose_affine_frame(entry.world_matrix, false);
         if (!frame) {
             continue;
         }
@@ -1267,7 +1240,7 @@ void CollisionWorld::rebuild_from_scene(
 
         if (resolved.shape == ColliderShape::sphere) {
             const float max_scale = std::max(
-                {frame->scale.x, frame->scale.y, frame->scale.z});
+                {frame->abs_scale.x, frame->abs_scale.y, frame->abs_scale.z});
             const float world_radius = std::max(
                 resolved.radius * max_scale, minimum_collider_dimension);
             spheres_.push_back(SphereCollider{
@@ -1285,17 +1258,22 @@ void CollisionWorld::rebuild_from_scene(
                 .mask = resolved.collision_mask,
                 .is_trigger = resolved.is_trigger,
             });
+            register_node_collider(
+                entry.id,
+                ColliderStorageKind::sphere,
+                static_cast<std::uint32_t>(spheres_.size() - 1U),
+                1U);
             record_counts(resolved.is_trigger);
             continue;
         }
 
         if (resolved.shape == ColliderShape::capsule) {
             const float radial_scale =
-                std::max(frame->scale.x, frame->scale.z);
+                std::max(frame->abs_scale.x, frame->abs_scale.z);
             const float world_radius = std::max(
                 resolved.radius * radial_scale, minimum_collider_dimension);
             const float half_segment =
-                std::max(resolved.half_height * frame->scale.y, 0.0F);
+                std::max(resolved.half_height * frame->abs_scale.y, 0.0F);
             const glm::vec3 up_vec = frame->axes[1] * half_segment;
             const glm::vec3 pa = base_center - up_vec;
             const glm::vec3 pb = base_center + up_vec;
@@ -1318,13 +1296,18 @@ void CollisionWorld::rebuild_from_scene(
                 .mask = resolved.collision_mask,
                 .is_trigger = resolved.is_trigger,
             });
+            register_node_collider(
+                entry.id,
+                ColliderStorageKind::capsule,
+                static_cast<std::uint32_t>(capsules_.size() - 1U),
+                1U);
             record_counts(resolved.is_trigger);
             continue;
         }
 
         if (resolved.shape == ColliderShape::box) {
             const glm::vec3 world_extents = glm::max(
-                resolved.half_extents * frame->scale,
+                resolved.half_extents * frame->abs_scale,
                 glm::vec3(minimum_collider_dimension));
             boxes_.push_back(OrientedBox{
                 .center = base_center,
@@ -1340,6 +1323,11 @@ void CollisionWorld::rebuild_from_scene(
                 .mask = resolved.collision_mask,
                 .is_trigger = resolved.is_trigger,
             });
+            register_node_collider(
+                entry.id,
+                ColliderStorageKind::box,
+                static_cast<std::uint32_t>(boxes_.size() - 1U),
+                1U);
             record_counts(resolved.is_trigger);
             continue;
         }
@@ -1385,6 +1373,11 @@ void CollisionWorld::rebuild_from_scene(
                             glm::vec3(minimum_collider_dimension)),
                     };
                     convex_hulls_.push_back(hull);
+                    register_node_collider(
+                        entry.id,
+                        ColliderStorageKind::convex_hull,
+                        static_cast<std::uint32_t>(convex_hulls_.size() - 1U),
+                        1U);
                     record_counts(resolved.is_trigger);
                     continue;
                 }
@@ -1394,7 +1387,7 @@ void CollisionWorld::rebuild_from_scene(
                 ? glm::vec3(1.0F)
                 : resolved.half_extents;
             const glm::vec3 world_extents = glm::max(
-                local_ext * frame->scale, glm::vec3(minimum_collider_dimension));
+                local_ext * frame->abs_scale, glm::vec3(minimum_collider_dimension));
             boxes_.push_back(OrientedBox{
                 .center = base_center,
                 .axes = frame->axes,
@@ -1409,6 +1402,11 @@ void CollisionWorld::rebuild_from_scene(
                 .mask = resolved.collision_mask,
                 .is_trigger = resolved.is_trigger,
             });
+            register_node_collider(
+                entry.id,
+                ColliderStorageKind::box,
+                static_cast<std::uint32_t>(boxes_.size() - 1U),
+                1U);
             record_counts(resolved.is_trigger);
             continue;
         }
@@ -1438,6 +1436,11 @@ void CollisionWorld::rebuild_from_scene(
                             .mask = resolved.collision_mask,
                             .is_trigger = resolved.is_trigger,
                         });
+                        register_node_collider(
+                            entry.id,
+                            ColliderStorageKind::triangle_mesh,
+                            static_cast<std::uint32_t>(triangle_meshes_.size() - 1U),
+                            1U);
                         record_counts(resolved.is_trigger);
                         continue;
                     }
@@ -1449,9 +1452,9 @@ void CollisionWorld::rebuild_from_scene(
         if (entry.kind == SceneNodeKind::ground) {
             constexpr float slab_half_thickness = 0.25F;
             const glm::vec3 world_extents{
-                std::max(frame->scale.x, minimum_collider_dimension),
+                std::max(frame->abs_scale.x, minimum_collider_dimension),
                 slab_half_thickness,
-                std::max(frame->scale.z, minimum_collider_dimension),
+                std::max(frame->abs_scale.z, minimum_collider_dimension),
             };
             const glm::vec3 slab_center =
                 base_center - frame->axes[1] * slab_half_thickness;
@@ -1470,9 +1473,15 @@ void CollisionWorld::rebuild_from_scene(
                 .fixed_ground_slab = true,
                 .is_trigger = resolved.is_trigger,
             });
+            register_node_collider(
+                entry.id,
+                ColliderStorageKind::box,
+                static_cast<std::uint32_t>(boxes_.size() - 1U),
+                1U);
             record_counts(resolved.is_trigger);
         } else if (entry.kind == SceneNodeKind::model) {
             if (cooked != nullptr && !cooked->submesh_boxes.empty()) {
+                const auto box_first = static_cast<std::uint32_t>(boxes_.size());
                 for (const CookedCollisionBox& sbox : cooked->submesh_boxes) {
                     const glm::vec3 local_c =
                         glm::vec3(sbox.center[0], sbox.center[1], sbox.center[2]) +
@@ -1485,7 +1494,7 @@ void CollisionWorld::rebuild_from_scene(
                         sbox.half_extents[2],
                     };
                     const glm::vec3 world_e = glm::max(
-                        local_e * frame->scale,
+                        local_e * frame->abs_scale,
                         glm::vec3(minimum_collider_dimension));
                     boxes_.push_back(OrientedBox{
                         .center = world_c,
@@ -1502,6 +1511,11 @@ void CollisionWorld::rebuild_from_scene(
                         .is_trigger = resolved.is_trigger,
                     });
                 }
+                register_node_collider(
+                    entry.id,
+                    ColliderStorageKind::box,
+                    box_first,
+                    static_cast<std::uint32_t>(boxes_.size()) - box_first);
                 record_counts(resolved.is_trigger);
             } else if (const auto bounds = model_bounds(entry.id)) {
                 const glm::vec3 world_extents = glm::max(
@@ -1516,7 +1530,7 @@ void CollisionWorld::rebuild_from_scene(
                         glm::vec4(center, 1.0F));
                 }
                 const glm::vec3 local_e =
-                    world_extents / glm::max(frame->scale, glm::vec3(1.0e-4F));
+                    world_extents / glm::max(frame->abs_scale, glm::vec3(1.0e-4F));
                 boxes_.push_back(OrientedBox{
                     .center = center,
                     .axes = glm::mat3(1.0F),
@@ -1534,10 +1548,15 @@ void CollisionWorld::rebuild_from_scene(
                     .world_bounds_authored = true,
                     .is_trigger = resolved.is_trigger,
                 });
+                register_node_collider(
+                    entry.id,
+                    ColliderStorageKind::box,
+                    static_cast<std::uint32_t>(boxes_.size() - 1U),
+                    1U);
                 record_counts(resolved.is_trigger);
             } else if (explicit_collider) {
                 const glm::vec3 world_extents = glm::max(
-                    resolved.half_extents * frame->scale,
+                    resolved.half_extents * frame->abs_scale,
                     glm::vec3(minimum_collider_dimension));
                 boxes_.push_back(OrientedBox{
                     .center = base_center,
@@ -1553,6 +1572,11 @@ void CollisionWorld::rebuild_from_scene(
                     .mask = resolved.collision_mask,
                     .is_trigger = resolved.is_trigger,
                 });
+                register_node_collider(
+                    entry.id,
+                    ColliderStorageKind::box,
+                    static_cast<std::uint32_t>(boxes_.size() - 1U),
+                    1U);
                 record_counts(resolved.is_trigger);
             }
         } else {
@@ -1561,7 +1585,7 @@ void CollisionWorld::rebuild_from_scene(
                     ? glm::vec3(1.0F)
                     : resolved.half_extents;
             const glm::vec3 world_extents = glm::max(
-                local_extents * frame->scale,
+                local_extents * frame->abs_scale,
                 glm::vec3(minimum_collider_dimension));
             boxes_.push_back(OrientedBox{
                 .center = base_center,
@@ -1577,6 +1601,11 @@ void CollisionWorld::rebuild_from_scene(
                 .mask = resolved.collision_mask,
                 .is_trigger = resolved.is_trigger,
             });
+            register_node_collider(
+                entry.id,
+                ColliderStorageKind::box,
+                static_cast<std::uint32_t>(boxes_.size() - 1U),
+                1U);
             record_counts(resolved.is_trigger);
         }
     }
@@ -1608,7 +1637,8 @@ std::optional<RaycastHit> CollisionWorld::raycast(
         if (!box.enabled ||
             (ignored_node && box.node_id == ignored_node) ||
             (box.layer & layer_mask) == 0U ||
-            (box.is_trigger && !include_triggers)) {
+            (box.is_trigger && !include_triggers) ||
+            !ray_intersects_aabb(origin, unit_dir, best_dist, box.world_aabb)) {
             continue;
         }
         if (auto hit = raycast_obb(
@@ -1631,7 +1661,8 @@ std::optional<RaycastHit> CollisionWorld::raycast(
         if (!sphere.enabled ||
             (ignored_node && sphere.node_id == ignored_node) ||
             (sphere.layer & layer_mask) == 0U ||
-            (sphere.is_trigger && !include_triggers)) {
+            (sphere.is_trigger && !include_triggers) ||
+            !ray_intersects_aabb(origin, unit_dir, best_dist, sphere.world_aabb)) {
             continue;
         }
         if (auto hit = raycast_sphere(
@@ -1653,7 +1684,8 @@ std::optional<RaycastHit> CollisionWorld::raycast(
         if (!cap.enabled ||
             (ignored_node && cap.node_id == ignored_node) ||
             (cap.layer & layer_mask) == 0U ||
-            (cap.is_trigger && !include_triggers)) {
+            (cap.is_trigger && !include_triggers) ||
+            !ray_intersects_aabb(origin, unit_dir, best_dist, cap.world_aabb)) {
             continue;
         }
         if (auto hit = raycast_capsule(
@@ -2222,33 +2254,44 @@ bool CollisionWorld::upsert_box_collider(
     }
     const glm::vec3 safe_extents =
         glm::max(half_extents, glm::vec3(minimum_collider_dimension));
-    glm::mat3 clean_axes = axes;
-    for (int i = 0; i < 3; ++i) {
-        const float len = glm::length(clean_axes[i]);
-        if (!std::isfinite(len) || len <= epsilon) {
-            clean_axes = glm::mat3(1.0F);
-            break;
-        }
-        clean_axes[i] /= len;
-    }
+    const glm::mat3 clean_axes = orthonormalize_axes(axes, true);
     const Bounds world_aabb = compute_obb_aabb(center, clean_axes, safe_extents);
+
+    const auto apply_box = [&](OrientedBox& box) noexcept {
+        box.center = center;
+        box.axes = clean_axes;
+        box.half_extents = safe_extents;
+        box.local_center = glm::vec3(0.0F);
+        box.local_half_extents = safe_extents;
+        box.world_aabb = world_aabb;
+        box.layer = layer;
+        box.mask = mask;
+        box.fixed_ground_slab = false;
+        box.world_bounds_authored = false;
+        box.is_trigger = is_trigger;
+        box.enabled = true;
+    };
+
+    if (const NodeColliderRef* const ref = find_node_collider(id);
+        ref != nullptr && ref->kind == ColliderStorageKind::box) {
+        const std::uint32_t end = std::min<std::uint32_t>(
+            ref->first + ref->count, static_cast<std::uint32_t>(boxes_.size()));
+        for (std::uint32_t i = ref->first; i < end; ++i) {
+            if (boxes_[i].node_id == id) {
+                apply_box(boxes_[i]);
+                return true;
+            }
+        }
+    }
+
     for (OrientedBox& box : boxes_) {
         if (box.node_id == id) {
-            box.center = center;
-            box.axes = clean_axes;
-            box.half_extents = safe_extents;
-            box.local_center = glm::vec3(0.0F);
-            box.local_half_extents = safe_extents;
-            box.world_aabb = world_aabb;
-            box.layer = layer;
-            box.mask = mask;
-            box.fixed_ground_slab = false;
-            box.world_bounds_authored = false;
-            box.is_trigger = is_trigger;
-            box.enabled = true;
+            apply_box(box);
             return true;
         }
     }
+
+    const auto new_idx = static_cast<std::uint32_t>(boxes_.size());
     boxes_.push_back(OrientedBox{
         .center = center,
         .axes = clean_axes,
@@ -2265,6 +2308,7 @@ bool CollisionWorld::upsert_box_collider(
         .is_trigger = is_trigger,
         .enabled = true,
     });
+    register_node_collider(id, ColliderStorageKind::box, new_idx, 1U);
     if (is_trigger) {
         ++trigger_count_;
     } else {
@@ -2279,22 +2323,19 @@ bool CollisionWorld::update_collider_transform(
     if (!id) {
         return false;
     }
-    const auto frame = decompose_world_frame(world_matrix);
+    const auto frame = decompose_affine_frame(world_matrix, false);
     if (!frame) {
         return false;
     }
-    bool updated = false;
-    for (OrientedBox& box : boxes_) {
-        if (box.node_id != id) {
-            continue;
-        }
+
+    const auto update_box = [&](OrientedBox& box) noexcept {
         const glm::vec3 base_center =
             glm::vec3(world_matrix * glm::vec4(box.local_center, 1.0F));
         if (box.world_bounds_authored) {
             box.center = base_center;
             box.axes = glm::mat3(1.0F);
             box.half_extents = glm::max(
-                box.local_half_extents * frame->scale,
+                box.local_half_extents * frame->abs_scale,
                 glm::vec3(minimum_collider_dimension));
             box.world_aabb = Bounds{
                 .center = box.center,
@@ -2302,9 +2343,9 @@ bool CollisionWorld::update_collider_transform(
             };
         } else if (box.fixed_ground_slab) {
             box.half_extents = glm::vec3(
-                std::max(frame->scale.x, minimum_collider_dimension),
+                std::max(frame->abs_scale.x, minimum_collider_dimension),
                 box.local_half_extents.y,
-                std::max(frame->scale.z, minimum_collider_dimension));
+                std::max(frame->abs_scale.z, minimum_collider_dimension));
             box.center =
                 base_center - frame->axes[1] * box.local_half_extents.y;
             box.axes = frame->axes;
@@ -2314,19 +2355,15 @@ bool CollisionWorld::update_collider_transform(
             box.center = base_center;
             box.axes = frame->axes;
             box.half_extents = glm::max(
-                box.local_half_extents * frame->scale,
+                box.local_half_extents * frame->abs_scale,
                 glm::vec3(minimum_collider_dimension));
             box.world_aabb =
                 compute_obb_aabb(box.center, box.axes, box.half_extents);
         }
-        updated = true;
-    }
-    for (SphereCollider& sphere : spheres_) {
-        if (sphere.node_id != id) {
-            continue;
-        }
+    };
+    const auto update_sphere = [&](SphereCollider& sphere) noexcept {
         const float max_scale = std::max(
-            {frame->scale.x, frame->scale.y, frame->scale.z});
+            {frame->abs_scale.x, frame->abs_scale.y, frame->abs_scale.z});
         sphere.center =
             glm::vec3(world_matrix * glm::vec4(sphere.local_center, 1.0F));
         sphere.radius = std::max(
@@ -2335,19 +2372,15 @@ bool CollisionWorld::update_collider_transform(
             .center = sphere.center,
             .extent = glm::vec3(sphere.radius),
         };
-        updated = true;
-    }
-    for (CapsuleCollider& cap : capsules_) {
-        if (cap.node_id != id) {
-            continue;
-        }
+    };
+    const auto update_capsule = [&](CapsuleCollider& cap) noexcept {
         const glm::vec3 base_center =
             glm::vec3(world_matrix * glm::vec4(cap.local_center, 1.0F));
-        const float radial_scale = std::max(frame->scale.x, frame->scale.z);
+        const float radial_scale = std::max(frame->abs_scale.x, frame->abs_scale.z);
         cap.radius = std::max(
             cap.local_radius * radial_scale, minimum_collider_dimension);
         const float half_seg =
-            std::max(cap.local_half_height * frame->scale.y, 0.0F);
+            std::max(cap.local_half_height * frame->abs_scale.y, 0.0F);
         const glm::vec3 up = frame->axes[1] * half_seg;
         cap.point_a = base_center - up;
         cap.point_b = base_center + up;
@@ -2359,11 +2392,10 @@ bool CollisionWorld::update_collider_transform(
             .center = 0.5F * (min_pt + max_pt),
             .extent = 0.5F * (max_pt - min_pt),
         };
-        updated = true;
-    }
-    for (ConvexHullCollider& hull : convex_hulls_) {
-        if (hull.node_id != id || hull.vertex_count == 0U) {
-            continue;
+    };
+    const auto update_hull = [&](ConvexHullCollider& hull) noexcept {
+        if (hull.vertex_count == 0U) {
+            return false;
         }
         glm::vec3 hmin(std::numeric_limits<float>::max());
         glm::vec3 hmax(std::numeric_limits<float>::lowest());
@@ -2381,27 +2413,25 @@ bool CollisionWorld::update_collider_transform(
             sum += wp;
             ++valid_count;
         }
-        if (valid_count >= 1U) {
-            hull.centroid = sum / static_cast<float>(valid_count);
-            hull.axes = frame->axes;
-            hull.world_aabb = Bounds{
-                .center = 0.5F * (hmin + hmax),
-                .extent = glm::max(
-                    0.5F * (hmax - hmin),
-                    glm::vec3(minimum_collider_dimension)),
-            };
-            updated = true;
+        if (valid_count == 0U) {
+            return false;
         }
-    }
-    for (TriangleMeshCollider& tmesh : triangle_meshes_) {
-        if (tmesh.node_id != id) {
-            continue;
-        }
+        hull.centroid = sum / static_cast<float>(valid_count);
+        hull.axes = frame->axes;
+        hull.world_aabb = Bounds{
+            .center = 0.5F * (hmin + hmax),
+            .extent = glm::max(
+                0.5F * (hmax - hmin),
+                glm::vec3(minimum_collider_dimension)),
+        };
+        return true;
+    };
+    const auto update_tmesh = [&](TriangleMeshCollider& tmesh) noexcept {
         const glm::mat4 world_from_local =
             glm::translate(world_matrix, tmesh.local_center_offset);
         const float det = glm::determinant(world_from_local);
         if (!std::isfinite(det) || std::abs(det) <= 1.0e-8F) {
-            continue;
+            return false;
         }
         tmesh.world_from_local = world_from_local;
         tmesh.local_from_world = glm::inverse(world_from_local);
@@ -2411,7 +2441,107 @@ bool CollisionWorld::update_collider_transform(
             shared_meshes_[tmesh.shared_mesh_index];
         tmesh.world_aabb =
             transform_aabb_matrix(shared.local_aabb, world_from_local);
-        updated = true;
+        return true;
+    };
+
+    if (const NodeColliderRef* const ref = find_node_collider(id)) {
+        bool updated = false;
+        const std::uint32_t first = ref->first;
+        const std::uint32_t count = ref->count;
+        switch (ref->kind) {
+        case ColliderStorageKind::box: {
+            const std::uint32_t end = std::min<std::uint32_t>(
+                first + count, static_cast<std::uint32_t>(boxes_.size()));
+            for (std::uint32_t i = first; i < end; ++i) {
+                if (boxes_[i].node_id == id) {
+                    update_box(boxes_[i]);
+                    updated = true;
+                }
+            }
+            break;
+        }
+        case ColliderStorageKind::sphere: {
+            const std::uint32_t end = std::min<std::uint32_t>(
+                first + count, static_cast<std::uint32_t>(spheres_.size()));
+            for (std::uint32_t i = first; i < end; ++i) {
+                if (spheres_[i].node_id == id) {
+                    update_sphere(spheres_[i]);
+                    updated = true;
+                }
+            }
+            break;
+        }
+        case ColliderStorageKind::capsule: {
+            const std::uint32_t end = std::min<std::uint32_t>(
+                first + count, static_cast<std::uint32_t>(capsules_.size()));
+            for (std::uint32_t i = first; i < end; ++i) {
+                if (capsules_[i].node_id == id) {
+                    update_capsule(capsules_[i]);
+                    updated = true;
+                }
+            }
+            break;
+        }
+        case ColliderStorageKind::convex_hull: {
+            const std::uint32_t end = std::min<std::uint32_t>(
+                first + count, static_cast<std::uint32_t>(convex_hulls_.size()));
+            for (std::uint32_t i = first; i < end; ++i) {
+                if (convex_hulls_[i].node_id == id && update_hull(convex_hulls_[i])) {
+                    updated = true;
+                }
+            }
+            break;
+        }
+        case ColliderStorageKind::triangle_mesh: {
+            const std::uint32_t end = std::min<std::uint32_t>(
+                first + count, static_cast<std::uint32_t>(triangle_meshes_.size()));
+            for (std::uint32_t i = first; i < end; ++i) {
+                if (triangle_meshes_[i].node_id == id &&
+                    update_tmesh(triangle_meshes_[i])) {
+                    updated = true;
+                }
+            }
+            break;
+        }
+        case ColliderStorageKind::none:
+        default:
+            break;
+        }
+        return updated;
+    }
+
+    if (id.index < max_scene_nodes) {
+        return false;
+    }
+
+    bool updated = false;
+    for (OrientedBox& box : boxes_) {
+        if (box.node_id == id) {
+            update_box(box);
+            updated = true;
+        }
+    }
+    for (SphereCollider& sphere : spheres_) {
+        if (sphere.node_id == id) {
+            update_sphere(sphere);
+            updated = true;
+        }
+    }
+    for (CapsuleCollider& cap : capsules_) {
+        if (cap.node_id == id) {
+            update_capsule(cap);
+            updated = true;
+        }
+    }
+    for (ConvexHullCollider& hull : convex_hulls_) {
+        if (hull.node_id == id && update_hull(hull)) {
+            updated = true;
+        }
+    }
+    for (TriangleMeshCollider& tmesh : triangle_meshes_) {
+        if (tmesh.node_id == id && update_tmesh(tmesh)) {
+            updated = true;
+        }
     }
     return updated;
 }
@@ -2420,6 +2550,69 @@ void CollisionWorld::set_collider_enabled(
     const SceneNodeId id,
     const bool enabled) noexcept {
     if (!id) {
+        return;
+    }
+    if (const NodeColliderRef* const ref = find_node_collider(id)) {
+        const std::uint32_t first = ref->first;
+        const std::uint32_t count = ref->count;
+        switch (ref->kind) {
+        case ColliderStorageKind::box: {
+            const std::uint32_t end = std::min<std::uint32_t>(
+                first + count, static_cast<std::uint32_t>(boxes_.size()));
+            for (std::uint32_t i = first; i < end; ++i) {
+                if (boxes_[i].node_id == id) {
+                    boxes_[i].enabled = enabled;
+                }
+            }
+            return;
+        }
+        case ColliderStorageKind::sphere: {
+            const std::uint32_t end = std::min<std::uint32_t>(
+                first + count, static_cast<std::uint32_t>(spheres_.size()));
+            for (std::uint32_t i = first; i < end; ++i) {
+                if (spheres_[i].node_id == id) {
+                    spheres_[i].enabled = enabled;
+                }
+            }
+            return;
+        }
+        case ColliderStorageKind::capsule: {
+            const std::uint32_t end = std::min<std::uint32_t>(
+                first + count, static_cast<std::uint32_t>(capsules_.size()));
+            for (std::uint32_t i = first; i < end; ++i) {
+                if (capsules_[i].node_id == id) {
+                    capsules_[i].enabled = enabled;
+                }
+            }
+            return;
+        }
+        case ColliderStorageKind::convex_hull: {
+            const std::uint32_t end = std::min<std::uint32_t>(
+                first + count, static_cast<std::uint32_t>(convex_hulls_.size()));
+            for (std::uint32_t i = first; i < end; ++i) {
+                if (convex_hulls_[i].node_id == id) {
+                    convex_hulls_[i].enabled = enabled;
+                }
+            }
+            return;
+        }
+        case ColliderStorageKind::triangle_mesh: {
+            const std::uint32_t end = std::min<std::uint32_t>(
+                first + count, static_cast<std::uint32_t>(triangle_meshes_.size()));
+            for (std::uint32_t i = first; i < end; ++i) {
+                if (triangle_meshes_[i].node_id == id) {
+                    triangle_meshes_[i].enabled = enabled;
+                }
+            }
+            return;
+        }
+        case ColliderStorageKind::none:
+        default:
+            return;
+        }
+    }
+
+    if (id.index < max_scene_nodes) {
         return;
     }
     for (OrientedBox& box : boxes_) {

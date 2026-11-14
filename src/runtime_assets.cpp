@@ -119,8 +119,28 @@ namespace {
     if (inspection.manifest.game_module.empty()) {
         return {};
     }
-    return inspection.project_directory /
-           path_from_utf8_view(inspection.manifest.game_module);
+    const std::filesystem::path rel =
+        path_from_utf8_view(inspection.manifest.game_module);
+#if defined(_DEBUG) || defined(__SANITIZE_ADDRESS__)
+#if defined(_DEBUG)
+    constexpr std::string_view build_dir_name = "windows-debug";
+#else
+    constexpr std::string_view build_dir_name = "windows-asan";
+#endif
+    const std::filesystem::path cfg_root =
+        inspection.project_directory / "build" / build_dir_name;
+    const std::array<std::filesystem::path, 2U> candidates{
+        cfg_root / rel,
+        cfg_root / "bin" / rel.filename(),
+    };
+    for (const auto& candidate : candidates) {
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(candidate, ec) && !ec) {
+            return candidate;
+        }
+    }
+#endif
+    return inspection.project_directory / rel;
 }
 
 [[nodiscard]] std::optional<RuntimeAssetRoot> resolve_explicit_project(
@@ -202,9 +222,13 @@ namespace {
         const bool has_cmake =
             std::filesystem::is_regular_file(candidate / "CMakeLists.txt", ec);
         ec.clear();
+        const bool has_sdk =
+            std::filesystem::is_regular_file(
+                candidate / "cmake" / "VcrEngineSdk.cmake", ec);
+        ec.clear();
         const bool has_assets =
             std::filesystem::is_directory(candidate / "assets", ec);
-        if (has_cmake && has_assets && !ec) {
+        if (has_cmake && has_sdk && has_assets && !ec) {
             auto canonical_dir = std::filesystem::weakly_canonical(candidate, ec);
             return ec ? std::optional<std::filesystem::path>(candidate)
                       : std::optional<std::filesystem::path>(std::move(canonical_dir));

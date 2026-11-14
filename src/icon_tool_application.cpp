@@ -1012,7 +1012,7 @@ void IconToolApplication::draw_frame() {
     const VkSemaphoreSubmitInfo signal_info{
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
         .semaphore = render_finished,
-        .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
     };
     const VkSubmitInfo2 submit_info{
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
