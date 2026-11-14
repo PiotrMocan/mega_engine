@@ -121,6 +121,7 @@ bool RuntimeTransformRegistry::register_node(
     record.local_pose = record.world_pose;
     record.depth = 0U;
     record.is_attached = false;
+    record.collision_dirty = true;
 
     nodes_.push_back(std::move(record));
     slot_to_node_[id.index] = node_idx;
@@ -145,6 +146,7 @@ bool RuntimeTransformRegistry::register_node_pose(
     if (NodeRecord* const node = find_node(id)) {
         node->world_pose = pose;
         node->local_pose = pose;
+        node->collision_dirty = true;
     }
     return true;
 }
@@ -212,6 +214,7 @@ bool RuntimeTransformRegistry::set_world_pose(
     if (auto ref = live_world_nodes_.get_mut(id)) {
         ref->get() = node->world_matrix;
     }
+    node->collision_dirty = true;
     return true;
 }
 
@@ -242,6 +245,7 @@ bool RuntimeTransformRegistry::set_world_matrix(
     if (auto ref = live_world_nodes_.get_mut(id)) {
         ref->get() = world_matrix;
     }
+    node->collision_dirty = true;
     return true;
 }
 
@@ -267,6 +271,7 @@ bool RuntimeTransformRegistry::set_local_pose(
     if (auto ref = live_world_nodes_.get_mut(id)) {
         ref->get() = node->world_matrix;
     }
+    node->collision_dirty = true;
     return true;
 }
 
@@ -296,6 +301,7 @@ bool RuntimeTransformRegistry::attach_child(
     child_node->world_matrix =
         parent_node->world_matrix * local_offset.to_matrix();
     child_node->world_pose = matrix_to_pose(child_node->world_matrix);
+    child_node->collision_dirty = true;
 
     if (auto ref = live_world_nodes_.get_mut(child)) {
         ref->get() = child_node->world_matrix;
@@ -345,6 +351,7 @@ bool RuntimeTransformRegistry::attach_child_to_socket(
     const glm::mat4 socket_world = parent_node->world_matrix * socket_local;
     child_node->world_matrix = socket_world * extra_offset.to_matrix();
     child_node->world_pose = matrix_to_pose(child_node->world_matrix);
+    child_node->collision_dirty = true;
 
     if (auto ref = live_world_nodes_.get_mut(child)) {
         ref->get() = child_node->world_matrix;
@@ -380,6 +387,7 @@ bool RuntimeTransformRegistry::detach_child(
     child_node->parent_id = SceneNodeId{};
     child_node->socket_name.clear();
     child_node->depth = 0U;
+    child_node->collision_dirty = true;
 
     hierarchy_dirty_ = true;
     return true;
@@ -504,9 +512,17 @@ void RuntimeTransformRegistry::propagate_hierarchy() noexcept {
     for (const std::uint32_t idx : topological_order_) {
         NodeRecord& node = nodes_[idx];
         if (node.is_attached) {
+            const NodeRecord* const parent = find_node(node.parent_id);
+            if (parent != nullptr && parent->collision_dirty) {
+                node.collision_dirty = true;
+            }
+            const glm::mat4 prev_world = node.world_matrix;
             const glm::mat4 parent_frame = compute_parent_frame(node);
             node.world_matrix = parent_frame * node.local_pose.to_matrix();
             node.world_pose = matrix_to_pose(node.world_matrix);
+            if (node.world_matrix != prev_world) {
+                node.collision_dirty = true;
+            }
         }
         if (auto ref = live_world_nodes_.get_mut(node.id)) {
             ref->get() = node.world_matrix;
@@ -521,9 +537,12 @@ void RuntimeTransformRegistry::sync_outputs(
 
     if (collision_world != nullptr) {
         for (const std::uint32_t idx : topological_order_) {
-            const NodeRecord& node = nodes_[idx];
-            collision_world->update_collider_transform(
-                node.id, node.world_matrix);
+            NodeRecord& node = nodes_[idx];
+            if (node.collision_dirty) {
+                collision_world->update_collider_transform(
+                    node.id, node.world_matrix);
+                node.collision_dirty = false;
+            }
         }
     }
 

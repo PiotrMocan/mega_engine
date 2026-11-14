@@ -84,6 +84,7 @@ void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExt
     }
     const bool data_changed = packet_runtime_revision_ != runtime_transforms_.revision() ||
                               packet_document_revision_ != editor_scene_revision_;
+    const bool skin_draws_changed = packet_skinned_draw_revision_ != skinned_draw_revision_;
     const bool fade_enabled = lod_fade_pattern_ != LodFadePattern::off && visibility_settings_.lod;
     const bool reset_fade = reset_lod_fades_ || packet_document_revision_ != editor_scene_revision_;
     // Without camera-dependent membership/LOD, only clip.w can change the
@@ -91,13 +92,13 @@ void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExt
     // to reuse the packet when that row remains bit-for-bit unchanged.
     const bool depth_order_unchanged = !visibility_settings_.coarse_front_to_back ||
         glm::row(vp, 3) == glm::row(packet_view_projection_, 3);
-    if (!data_changed && !lod_fades_active_ && !reset_fade && depth_order_unchanged && !visibility_settings_.frustum &&
+    if (!data_changed && !skin_draws_changed && !lod_fades_active_ && !reset_fade && depth_order_unchanged && !visibility_settings_.frustum &&
         (!visibility_settings_.occlusion ||
          scene_metadata_.size() < visibility_settings_.occlusion_threshold) &&
         (!visibility_settings_.lod || (editor_model_draws_.empty() && !editor_terrain_visible_))) {
         return;
     }
-    if (!data_changed && !lod_fades_active_ && !reset_fade && extent.width == packet_extent_.width &&
+    if (!data_changed && !skin_draws_changed && !lod_fades_active_ && !reset_fade && extent.width == packet_extent_.width &&
         extent.height == packet_extent_.height && vp == packet_view_projection_) {
         return;
     }
@@ -310,7 +311,7 @@ void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExt
         }
         ++source_packet_revision_;
     }
-    if (data_changed || lod_changed || visible_indices_ != visibility_scratch_) {
+    if (data_changed || skin_draws_changed || lod_changed || visible_indices_ != visibility_scratch_) {
         // Camera/LOD changes only rebuild indices. Original records retain
         // their transforms and material data for both camera and shadow draws.
         visible_indices_.assign(visibility_scratch_.begin(), visibility_scratch_.end());
@@ -319,6 +320,7 @@ void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExt
     visibility_statistics_.packet_revision = packet_revision_;
     packet_runtime_revision_ = runtime_transforms_.revision();
     packet_document_revision_ = editor_scene_revision_;
+    packet_skinned_draw_revision_ = skinned_draw_revision_;
     packet_view_projection_ = vp;
     packet_extent_ = extent;
 }

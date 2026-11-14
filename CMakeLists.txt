@@ -1141,4 +1141,16 @@ if(BUILD_TESTING)
         endif()
     endif()
     add_test(NAME vcr_engine_gameplay_api_tests COMMAND vcr_engine_gameplay_api_tests)
+
+    add_executable(vcr_renderer_skinning_tests
+        tests/renderer_skinning_tests.cpp
+        ${VCR_VULKAN_RENDERER_SOURCES}
+    )
+    vcr_configure_executable(vcr_renderer_skinning_tests 1)
+    target_link_libraries(vcr_renderer_skinning_tests PRIVATE
+        vcr_imgui
+        vcr_window_icon
+    )
+    add_dependencies(vcr_renderer_skinning_tests vcr_runtime_assets)
+    add_test(NAME vcr_renderer_skinning_tests COMMAND vcr_renderer_skinning_tests)
 endif()

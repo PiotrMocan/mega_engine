@@ -74,6 +74,9 @@ private:
     VehicleCameraConfig config_{};
     glm::vec3 current_position_{0.0F};
     glm::vec3 current_look_target_{0.0F};
+    glm::vec3 smoothed_look_ahead_{0.0F};
+    float smoothed_pivot_y_ = 0.0F;
+    float current_follow_distance_ = 6.20F;
     float current_yaw_ = 0.0F;
     float orbit_yaw_offset_ = 0.0F;
     float orbit_pitch_ = 0.12F;

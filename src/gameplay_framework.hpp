@@ -112,6 +112,7 @@ struct AnimatorNodeRuntime {
     bool preview_override = false;
     std::string preview_clip_name{};
     bool preview_playing = false;
+    std::optional<bool> preview_looping_override{};
     bool param_override_active = false;
     float override_param_x = 0.0F;
     float override_param_y = 0.0F;
@@ -153,7 +154,8 @@ public:
         SceneNodeId id,
         std::string_view clip_name,
         bool playing,
-        float time_seconds = -1.0F);
+        float time_seconds = -1.0F,
+        std::optional<bool> looping_override = std::nullopt);
     void clear_preview(SceneNodeId id) noexcept;
     [[nodiscard]] bool has_active_preview(SceneNodeId id) const noexcept;
 

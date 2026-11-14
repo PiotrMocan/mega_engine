@@ -1273,6 +1273,8 @@ void CollisionWorld::rebuild_from_scene(
             spheres_.push_back(SphereCollider{
                 .center = base_center,
                 .radius = world_radius,
+                .local_center = resolved.center_offset,
+                .local_radius = resolved.radius,
                 .world_aabb = Bounds{
                     .center = base_center,
                     .extent = glm::vec3(world_radius),
@@ -1303,6 +1305,9 @@ void CollisionWorld::rebuild_from_scene(
                 .point_a = pa,
                 .point_b = pb,
                 .radius = world_radius,
+                .local_center = resolved.center_offset,
+                .local_radius = resolved.radius,
+                .local_half_height = resolved.half_height,
                 .world_aabb = Bounds{
                     .center = 0.5F * (min_pt + max_pt),
                     .extent = 0.5F * (max_pt - min_pt),
@@ -1325,6 +1330,8 @@ void CollisionWorld::rebuild_from_scene(
                 .center = base_center,
                 .axes = frame->axes,
                 .half_extents = world_extents,
+                .local_center = resolved.center_offset,
+                .local_half_extents = resolved.half_extents,
                 .world_aabb = compute_obb_aabb(
                     base_center, frame->axes, world_extents),
                 .node_id = entry.id,
@@ -1362,7 +1369,9 @@ void CollisionWorld::rebuild_from_scene(
                     if (!finite_vec3(wp)) {
                         continue;
                     }
-                    hull.vertices[hull.vertex_count++] = wp;
+                    hull.local_vertices[hull.vertex_count] = local_pt;
+                    hull.vertices[hull.vertex_count] = wp;
+                    ++hull.vertex_count;
                     hmin = glm::min(hmin, wp);
                     hmax = glm::max(hmax, wp);
                     sum += wp;
@@ -1390,6 +1399,8 @@ void CollisionWorld::rebuild_from_scene(
                 .center = base_center,
                 .axes = frame->axes,
                 .half_extents = world_extents,
+                .local_center = resolved.center_offset,
+                .local_half_extents = local_ext,
                 .world_aabb = compute_obb_aabb(
                     base_center, frame->axes, world_extents),
                 .node_id = entry.id,
@@ -1414,6 +1425,7 @@ void CollisionWorld::rebuild_from_scene(
                             shared_meshes_[*mesh_idx];
                         triangle_meshes_.push_back(TriangleMeshCollider{
                             .shared_mesh_index = *mesh_idx,
+                            .local_center_offset = resolved.center_offset,
                             .world_from_local = world_from_local,
                             .local_from_world = glm::inverse(world_from_local),
                             .normal_matrix = glm::inverseTranspose(
@@ -1447,12 +1459,15 @@ void CollisionWorld::rebuild_from_scene(
                 .center = slab_center,
                 .axes = frame->axes,
                 .half_extents = world_extents,
+                .local_center = resolved.center_offset,
+                .local_half_extents = glm::vec3(1.0F, slab_half_thickness, 1.0F),
                 .world_aabb = compute_obb_aabb(
                     slab_center, frame->axes, world_extents),
                 .node_id = entry.id,
                 .node_uuid = entry.uuid,
                 .layer = resolved.collision_layer,
                 .mask = resolved.collision_mask,
+                .fixed_ground_slab = true,
                 .is_trigger = resolved.is_trigger,
             });
             record_counts(resolved.is_trigger);
@@ -1476,6 +1491,8 @@ void CollisionWorld::rebuild_from_scene(
                         .center = world_c,
                         .axes = frame->axes,
                         .half_extents = world_e,
+                        .local_center = local_c,
+                        .local_half_extents = local_e,
                         .world_aabb = compute_obb_aabb(
                             world_c, frame->axes, world_e),
                         .node_id = entry.id,
@@ -1491,10 +1508,21 @@ void CollisionWorld::rebuild_from_scene(
                     bounds->extent,
                     glm::vec3(minimum_collider_dimension));
                 const glm::vec3 center = bounds->center + world_offset;
+                glm::vec3 local_c = resolved.center_offset;
+                const float det = glm::determinant(entry.world_matrix);
+                if (std::isfinite(det) && std::abs(det) > 1.0e-8F) {
+                    local_c = glm::vec3(
+                        glm::inverse(entry.world_matrix) *
+                        glm::vec4(center, 1.0F));
+                }
+                const glm::vec3 local_e =
+                    world_extents / glm::max(frame->scale, glm::vec3(1.0e-4F));
                 boxes_.push_back(OrientedBox{
                     .center = center,
                     .axes = glm::mat3(1.0F),
                     .half_extents = world_extents,
+                    .local_center = local_c,
+                    .local_half_extents = local_e,
                     .world_aabb = Bounds{
                         .center = center,
                         .extent = world_extents,
@@ -1503,6 +1531,7 @@ void CollisionWorld::rebuild_from_scene(
                     .node_uuid = entry.uuid,
                     .layer = resolved.collision_layer,
                     .mask = resolved.collision_mask,
+                    .world_bounds_authored = true,
                     .is_trigger = resolved.is_trigger,
                 });
                 record_counts(resolved.is_trigger);
@@ -1514,6 +1543,8 @@ void CollisionWorld::rebuild_from_scene(
                     .center = base_center,
                     .axes = frame->axes,
                     .half_extents = world_extents,
+                    .local_center = resolved.center_offset,
+                    .local_half_extents = resolved.half_extents,
                     .world_aabb = compute_obb_aabb(
                         base_center, frame->axes, world_extents),
                     .node_id = entry.id,
@@ -1536,6 +1567,8 @@ void CollisionWorld::rebuild_from_scene(
                 .center = base_center,
                 .axes = frame->axes,
                 .half_extents = world_extents,
+                .local_center = resolved.center_offset,
+                .local_half_extents = local_extents,
                 .world_aabb = compute_obb_aabb(
                     base_center, frame->axes, world_extents),
                 .node_id = entry.id,
@@ -2204,9 +2237,13 @@ bool CollisionWorld::upsert_box_collider(
             box.center = center;
             box.axes = clean_axes;
             box.half_extents = safe_extents;
+            box.local_center = glm::vec3(0.0F);
+            box.local_half_extents = safe_extents;
             box.world_aabb = world_aabb;
             box.layer = layer;
             box.mask = mask;
+            box.fixed_ground_slab = false;
+            box.world_bounds_authored = false;
             box.is_trigger = is_trigger;
             box.enabled = true;
             return true;
@@ -2216,11 +2253,15 @@ bool CollisionWorld::upsert_box_collider(
         .center = center,
         .axes = clean_axes,
         .half_extents = safe_extents,
+        .local_center = glm::vec3(0.0F),
+        .local_half_extents = safe_extents,
         .world_aabb = world_aabb,
         .node_id = id,
         .node_uuid = {},
         .layer = layer,
         .mask = mask,
+        .fixed_ground_slab = false,
+        .world_bounds_authored = false,
         .is_trigger = is_trigger,
         .enabled = true,
     });
@@ -2247,17 +2288,49 @@ bool CollisionWorld::update_collider_transform(
         if (box.node_id != id) {
             continue;
         }
-        box.center = frame->origin;
-        box.axes = frame->axes;
-        box.world_aabb =
-            compute_obb_aabb(box.center, box.axes, box.half_extents);
+        const glm::vec3 base_center =
+            glm::vec3(world_matrix * glm::vec4(box.local_center, 1.0F));
+        if (box.world_bounds_authored) {
+            box.center = base_center;
+            box.axes = glm::mat3(1.0F);
+            box.half_extents = glm::max(
+                box.local_half_extents * frame->scale,
+                glm::vec3(minimum_collider_dimension));
+            box.world_aabb = Bounds{
+                .center = box.center,
+                .extent = box.half_extents,
+            };
+        } else if (box.fixed_ground_slab) {
+            box.half_extents = glm::vec3(
+                std::max(frame->scale.x, minimum_collider_dimension),
+                box.local_half_extents.y,
+                std::max(frame->scale.z, minimum_collider_dimension));
+            box.center =
+                base_center - frame->axes[1] * box.local_half_extents.y;
+            box.axes = frame->axes;
+            box.world_aabb =
+                compute_obb_aabb(box.center, box.axes, box.half_extents);
+        } else {
+            box.center = base_center;
+            box.axes = frame->axes;
+            box.half_extents = glm::max(
+                box.local_half_extents * frame->scale,
+                glm::vec3(minimum_collider_dimension));
+            box.world_aabb =
+                compute_obb_aabb(box.center, box.axes, box.half_extents);
+        }
         updated = true;
     }
     for (SphereCollider& sphere : spheres_) {
         if (sphere.node_id != id) {
             continue;
         }
-        sphere.center = frame->origin;
+        const float max_scale = std::max(
+            {frame->scale.x, frame->scale.y, frame->scale.z});
+        sphere.center =
+            glm::vec3(world_matrix * glm::vec4(sphere.local_center, 1.0F));
+        sphere.radius = std::max(
+            sphere.local_radius * max_scale, minimum_collider_dimension);
         sphere.world_aabb = Bounds{
             .center = sphere.center,
             .extent = glm::vec3(sphere.radius),
@@ -2268,10 +2341,16 @@ bool CollisionWorld::update_collider_transform(
         if (cap.node_id != id) {
             continue;
         }
-        const float half_seg = 0.5F * glm::length(cap.point_b - cap.point_a);
+        const glm::vec3 base_center =
+            glm::vec3(world_matrix * glm::vec4(cap.local_center, 1.0F));
+        const float radial_scale = std::max(frame->scale.x, frame->scale.z);
+        cap.radius = std::max(
+            cap.local_radius * radial_scale, minimum_collider_dimension);
+        const float half_seg =
+            std::max(cap.local_half_height * frame->scale.y, 0.0F);
         const glm::vec3 up = frame->axes[1] * half_seg;
-        cap.point_a = frame->origin - up;
-        cap.point_b = frame->origin + up;
+        cap.point_a = base_center - up;
+        cap.point_b = base_center + up;
         const glm::vec3 min_pt =
             glm::min(cap.point_a, cap.point_b) - glm::vec3(cap.radius);
         const glm::vec3 max_pt =
@@ -2282,22 +2361,56 @@ bool CollisionWorld::update_collider_transform(
         };
         updated = true;
     }
+    for (ConvexHullCollider& hull : convex_hulls_) {
+        if (hull.node_id != id || hull.vertex_count == 0U) {
+            continue;
+        }
+        glm::vec3 hmin(std::numeric_limits<float>::max());
+        glm::vec3 hmax(std::numeric_limits<float>::lowest());
+        glm::vec3 sum{0.0F};
+        std::uint32_t valid_count = 0U;
+        for (std::uint32_t idx = 0U; idx < hull.vertex_count; ++idx) {
+            const glm::vec3 wp =
+                glm::vec3(world_matrix * glm::vec4(hull.local_vertices[idx], 1.0F));
+            hull.vertices[idx] = wp;
+            if (!finite_vec3(wp)) {
+                continue;
+            }
+            hmin = glm::min(hmin, wp);
+            hmax = glm::max(hmax, wp);
+            sum += wp;
+            ++valid_count;
+        }
+        if (valid_count >= 1U) {
+            hull.centroid = sum / static_cast<float>(valid_count);
+            hull.axes = frame->axes;
+            hull.world_aabb = Bounds{
+                .center = 0.5F * (hmin + hmax),
+                .extent = glm::max(
+                    0.5F * (hmax - hmin),
+                    glm::vec3(minimum_collider_dimension)),
+            };
+            updated = true;
+        }
+    }
     for (TriangleMeshCollider& tmesh : triangle_meshes_) {
         if (tmesh.node_id != id) {
             continue;
         }
-        const float det = glm::determinant(world_matrix);
-        if (std::abs(det) <= 1.0e-8F) {
+        const glm::mat4 world_from_local =
+            glm::translate(world_matrix, tmesh.local_center_offset);
+        const float det = glm::determinant(world_from_local);
+        if (!std::isfinite(det) || std::abs(det) <= 1.0e-8F) {
             continue;
         }
-        tmesh.world_from_local = world_matrix;
-        tmesh.local_from_world = glm::inverse(world_matrix);
+        tmesh.world_from_local = world_from_local;
+        tmesh.local_from_world = glm::inverse(world_from_local);
         tmesh.normal_matrix =
-            glm::transpose(glm::inverse(glm::mat3(world_matrix)));
+            glm::transpose(glm::inverse(glm::mat3(world_from_local)));
         const SharedTriangleMesh& shared =
             shared_meshes_[tmesh.shared_mesh_index];
         tmesh.world_aabb =
-            transform_aabb_matrix(shared.local_aabb, world_matrix);
+            transform_aabb_matrix(shared.local_aabb, world_from_local);
         updated = true;
     }
     return updated;

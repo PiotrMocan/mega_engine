@@ -206,11 +206,15 @@ private:
         glm::vec3 center{0.0F};
         glm::mat3 axes{1.0F};
         glm::vec3 half_extents{1.0F};
+        glm::vec3 local_center{0.0F};
+        glm::vec3 local_half_extents{1.0F};
         Bounds world_aabb{};
         SceneNodeId node_id{};
         SceneUuid node_uuid{};
         std::uint32_t layer = 1U;
         std::uint32_t mask = 0xFFFFFFFFU;
+        bool fixed_ground_slab = false;
+        bool world_bounds_authored = false;
         bool is_trigger = false;
         bool enabled = true;
     };
@@ -218,6 +222,8 @@ private:
     struct SphereCollider {
         glm::vec3 center{0.0F};
         float radius = 0.5F;
+        glm::vec3 local_center{0.0F};
+        float local_radius = 0.5F;
         Bounds world_aabb{};
         SceneNodeId node_id{};
         SceneUuid node_uuid{};
@@ -231,6 +237,9 @@ private:
         glm::vec3 point_a{0.0F, -0.5F, 0.0F};
         glm::vec3 point_b{0.0F, 0.5F, 0.0F};
         float radius = 0.5F;
+        glm::vec3 local_center{0.0F};
+        float local_radius = 0.5F;
+        float local_half_height = 0.5F;
         Bounds world_aabb{};
         SceneNodeId node_id{};
         SceneUuid node_uuid{};
@@ -242,6 +251,7 @@ private:
 
     struct ConvexHullCollider {
         std::array<glm::vec3, maximum_cooked_convex_hull_vertices> vertices{};
+        std::array<glm::vec3, maximum_cooked_convex_hull_vertices> local_vertices{};
         std::uint32_t vertex_count = 0U;
         glm::vec3 centroid{0.0F};
         glm::mat3 axes{1.0F};
@@ -270,6 +280,7 @@ private:
 
     struct TriangleMeshCollider {
         std::uint32_t shared_mesh_index = 0U;
+        glm::vec3 local_center_offset{0.0F};
         glm::mat4 world_from_local{1.0F};
         glm::mat4 local_from_world{1.0F};
         glm::mat3 normal_matrix{1.0F};

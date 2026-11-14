@@ -1543,6 +1543,80 @@ const std::vector<AnimationClip>* Renderer::find_model_animations(
     return nullptr;
 }
 
+void Renderer::invalidate_skinned_draws() noexcept {
+    ++skinned_draw_revision_;
+    if (skinned_draw_revision_ == 0U) {
+        ++skinned_draw_revision_;
+    }
+    shadow_dirty_ = true;
+    sync_gpu_visibility_skinned_draws();
+}
+
+Renderer::RenderedNodeDiagnostics Renderer::inspect_rendered_node(
+    const SceneNodeId id) const noexcept {
+    RenderedNodeDiagnostics diag{};
+    if (!id) {
+        return diag;
+    }
+    if (runtime_transforms_.contains(id)) {
+        diag.in_runtime_transforms = true;
+        diag.runtime_current = runtime_transforms_.current(id);
+        diag.runtime_previous = runtime_transforms_.previous(id);
+    }
+    std::uint32_t instance_index = 0U;
+    bool found_instance = false;
+    for (std::size_t i = 0U; i < scene_metadata_.size(); ++i) {
+        if (scene_metadata_[i].id == id) {
+            instance_index = static_cast<std::uint32_t>(i);
+            found_instance = true;
+            if (i < scene_packet_.size()) {
+                diag.in_scene_packet = true;
+                diag.packet_current = TransformRows{
+                    scene_packet_[i].current.model_row_0,
+                    scene_packet_[i].current.model_row_1,
+                    scene_packet_[i].current.model_row_2,
+                };
+                diag.packet_previous = scene_packet_[i].previous;
+            }
+            break;
+        }
+    }
+    std::size_t draw_index = 0U;
+    for (std::size_t d = 0U; d < editor_model_draws_.size(); ++d) {
+        const EditorModelDraw& draw = editor_model_draws_[d];
+        const bool match_node = draw.node_id == id;
+        const bool match_instance =
+            found_instance &&
+            instance_index >= draw.first_instance &&
+            instance_index < draw.first_instance + draw.instance_count;
+        if (match_node || match_instance) {
+            diag.has_model_draw = true;
+            diag.uses_skinned_pool = draw.uses_skinned_pool;
+            diag.draw_vertex_offset = draw.vertex_offset;
+            draw_index = d;
+            break;
+        }
+    }
+    if (diag.has_model_draw) {
+        const std::size_t group_idx = 2U + draw_index;
+        if (group_idx < visibility_groups_.size() &&
+            group_idx * 4U + 3U < visibility_commands_.size()) {
+            const VisibilityGroup& grp = visibility_groups_[group_idx];
+            diag.has_visibility_group = true;
+            diag.group_vertex_offset = static_cast<std::int32_t>(grp.range.z);
+            diag.group_force_lod0 = grp.range.w;
+            diag.group_lod_counts = grp.counts;
+            for (std::size_t lod = 0U; lod < 4U; ++lod) {
+                const VkDrawIndexedIndirectCommand& cmd =
+                    visibility_commands_[group_idx * 4U + lod];
+                diag.indirect_vertex_offsets[lod] = cmd.vertexOffset;
+                diag.indirect_index_counts[lod] = cmd.indexCount;
+            }
+        }
+    }
+    return diag;
+}
+
 void Renderer::compact_skinned_node_slots() noexcept {
     std::uint32_t vertex_cursor = 0U;
     std::uint32_t bone_cursor = 0U;
@@ -1596,7 +1670,7 @@ void Renderer::compact_skinned_node_slots() noexcept {
         }
     }
     if (draws_changed) {
-        invalidate_editor_scene();
+        invalidate_skinned_draws();
     }
 }
 
@@ -1636,10 +1710,13 @@ void Renderer::set_skinned_model_pose(
                 slot.bone_count == bone_count &&
                 static_cast<std::size_t>(slot.bone_offset) + bone_count <=
                     skinned_bone_matrices_.size()) {
-                std::copy_n(
-                    skin_matrices.data(),
-                    bone_count,
-                    skinned_bone_matrices_.data() + slot.bone_offset);
+                const std::size_t copy_bytes =
+                    static_cast<std::size_t>(bone_count) * sizeof(glm::mat4);
+                glm::mat4* const dst = skinned_bone_matrices_.data() + slot.bone_offset;
+                if (std::memcmp(dst, skin_matrices.data(), copy_bytes) != 0) {
+                    std::copy_n(skin_matrices.data(), bone_count, dst);
+                    shadow_dirty_ = true;
+                }
                 return;
             }
             slot.asset_index = *found_asset_index;
@@ -1651,6 +1728,7 @@ void Renderer::set_skinned_model_pose(
                 skin_matrices.data(),
                 bone_count,
                 skinned_bone_matrices_.data() + slot.bone_offset);
+            shadow_dirty_ = true;
             return;
         }
     }
@@ -1669,12 +1747,20 @@ void Renderer::set_skinned_model_pose(
         skinned_bone_matrices_.end(),
         skin_matrices.begin(),
         skin_matrices.begin() + bone_count);
+    bool draws_changed = false;
+    const std::int32_t new_offset = static_cast<std::int32_t>(new_slot.vertex_offset);
     for (EditorModelDraw& draw : editor_model_draws_) {
         if (draw.node_id == node_id && draw.asset_index == *found_asset_index) {
-            draw.uses_skinned_pool = true;
-            draw.vertex_offset = static_cast<std::int32_t>(new_slot.vertex_offset);
-            invalidate_editor_scene();
+            if (!draw.uses_skinned_pool || draw.vertex_offset != new_offset) {
+                draw.uses_skinned_pool = true;
+                draw.vertex_offset = new_offset;
+                draws_changed = true;
+            }
         }
+    }
+    shadow_dirty_ = true;
+    if (draws_changed) {
+        invalidate_skinned_draws();
     }
 }
 
@@ -1704,7 +1790,7 @@ void Renderer::clear_skinned_model_poses() noexcept {
         }
     }
     if (draws_changed) {
-        invalidate_editor_scene();
+        invalidate_skinned_draws();
     }
 }
 
@@ -2521,6 +2607,15 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
         }
     }
     gpu_asset.bounds.extent += glm::vec3(maximum_displacement);
+    if (model.is_skinned()) {
+        const float max_extent = std::max({
+            gpu_asset.bounds.extent.x,
+            gpu_asset.bounds.extent.y,
+            gpu_asset.bounds.extent.z,
+            0.5F,
+        });
+        gpu_asset.bounds.extent += glm::vec3(0.35F * max_extent);
+    }
     if (std::ranges::any_of(gpu_asset.submeshes, [](const auto& mesh) {
             return mesh.material.model == MaterialModel::gpu_grass;
         })) {
@@ -4941,6 +5036,7 @@ void Renderer::render_static_shadow_map() {
     FrameUniforms uniforms{};
     uniforms.light_view_projection = light_view_projection_;
     frames_[0].uniform_buffer.write(std::as_bytes(std::span{&uniforms, std::size_t{1}}));
+    frames_[0].shadow_gpu_visibility = false;
 
     ImmediateSubmission submission(*context_);
     record_shadow_map(submission.command_buffer(), frames_[0]);
@@ -5160,7 +5256,7 @@ void Renderer::record_shadow_map(VkCommandBuffer command_buffer, FrameContext &f
                             cascade_indirect_base +
                             (draw_index + 2U) * model_lod_count *
                                 sizeof(VkDrawIndexedIndirectCommand);
-                        if (tessellated_draw) {
+                        if (tessellated_draw || draw.uses_skinned_pool) {
                             vkCmdDrawIndexedIndirect(
                                 command_buffer, frame.visibility.shadow_indirect.handle(),
                                 group_base, 1U, sizeof(VkDrawIndexedIndirectCommand));
@@ -9141,7 +9237,8 @@ void Renderer::record_commands(
     record_editor_scene_upload(command_buffer, frame);
     record_model_skinning(command_buffer, frame);
     frame.visibility_was_updated = gpu_visibility_active() && !gpu_visibility_bypassed_ &&
-                                   frame.visibility.view_revision != gpu_visibility_revision_;
+                                   (frame.visibility.scene_revision != gpu_scene_revision_ ||
+                                    frame.visibility.view_revision != gpu_visibility_revision_);
     if (frame.visibility_was_updated && frame.timestamp_queries != VK_NULL_HANDLE) {
         vkCmdWriteTimestamp2(command_buffer, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                              frame.timestamp_queries, timestamp_visibility_begin);
@@ -11181,6 +11278,9 @@ void Renderer::invalidate_temporal_history() noexcept {
     fsr3_upscaler_.request_reset();
 #if VCR_EDITOR_ENABLED
     runtime_transforms_.snap_history();
+    for (SkinnedNodeSlot& slot : skinned_node_slots_) {
+        slot.initialized_prev_pool = false;
+    }
     hiz_valid_ = false;
 #endif
 }

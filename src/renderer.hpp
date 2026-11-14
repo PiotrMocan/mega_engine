@@ -474,6 +474,36 @@ public:
     [[nodiscard]] std::uint32_t skinning_active_node_count() const noexcept {
         return static_cast<std::uint32_t>(skinned_node_slots_.size());
     }
+    struct RenderedNodeDiagnostics {
+        bool in_runtime_transforms = false;
+        bool in_scene_packet = false;
+        TransformRows runtime_current{};
+        TransformRows runtime_previous{};
+        TransformRows packet_current{};
+        TransformRows packet_previous{};
+        bool has_model_draw = false;
+        bool uses_skinned_pool = false;
+        std::int32_t draw_vertex_offset = 0;
+        bool has_visibility_group = false;
+        std::int32_t group_vertex_offset = 0;
+        std::uint32_t group_force_lod0 = 0U;
+        glm::uvec4 group_lod_counts{};
+        std::array<std::int32_t, 4> indirect_vertex_offsets{};
+        std::array<std::uint32_t, 4> indirect_index_counts{};
+    };
+    [[nodiscard]] RenderedNodeDiagnostics inspect_rendered_node(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::uint64_t runtime_transform_revision() const noexcept {
+        return runtime_transforms_.revision();
+    }
+    [[nodiscard]] std::uint64_t skinned_draw_revision() const noexcept {
+        return skinned_draw_revision_;
+    }
+    [[nodiscard]] std::uint64_t gpu_scene_revision() const noexcept {
+        return gpu_scene_revision_;
+    }
+    void snap_runtime_transforms() noexcept {
+        runtime_transforms_.snap_history();
+    }
     [[nodiscard]] bool editor_scene_needs_sync() const noexcept {
         return editor_scene_revision_ == 0U;
     }
@@ -787,6 +817,8 @@ private:
     [[nodiscard]] bool update_skinning_asset_descriptor(
         EditorModelAsset& asset) noexcept;
     void compact_skinned_node_slots() noexcept;
+    void invalidate_skinned_draws() noexcept;
+    void sync_gpu_visibility_skinned_draws() noexcept;
 #endif
     [[nodiscard]] VkExtent2D scene_output_extent() const noexcept;
 
@@ -1129,6 +1161,8 @@ private:
     std::uint32_t skinned_pool_vertex_cursor_ = 0U;
     std::uint32_t skinning_pool_parity_ = 0U;
     bool skinning_resources_ready_ = false;
+    std::uint64_t skinned_draw_revision_ = 1U;
+    std::uint64_t packet_skinned_draw_revision_ = 0U;
     std::vector<EditorTextureAsset> editor_texture_assets_{};
     std::vector<std::uint32_t> editor_model_sort_scratch_{};
     GpuTexture editor_default_base_color_texture_{};

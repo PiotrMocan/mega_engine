@@ -33,7 +33,11 @@ void VehicleCamera::reset(
     orbit_yaw_offset_ = 0.0F;
     orbit_pitch_ = 0.12F;
     recenter_timer_ = 0.0F;
-    current_look_target_ = vehicle_pos + vehicle_up * config_.height;
+    smoothed_pivot_y_ = (vehicle_pos + vehicle_up * config_.height).y;
+    smoothed_look_ahead_ = glm::vec3(0.0F);
+    current_follow_distance_ = config_.follow_distance;
+    const glm::vec3 pivot{vehicle_pos.x, smoothed_pivot_y_, vehicle_pos.z};
+    current_look_target_ = pivot;
 
     const float cos_p = std::cos(orbit_pitch_);
     const float sin_p = std::sin(orbit_pitch_);
@@ -43,7 +47,7 @@ void VehicleCamera::reset(
         -std::cos(current_yaw_) * cos_p,
     };
 
-    current_position_ = current_look_target_ + to_cam * config_.follow_distance;
+    current_position_ = pivot + to_cam * current_follow_distance_;
     recommended_fov_degrees_ = config_.fov_base_degrees;
     initialized_ = true;
 }
@@ -75,13 +79,27 @@ void VehicleCamera::update(
         reset(vehicle_pos, vehicle_forward, vehicle_up);
         return;
     }
-    const float delta = std::clamp(delta_seconds, 0.001F, 0.05F);
+    if (!std::isfinite(delta_seconds) || delta_seconds <= 0.0F) {
+        return;
+    }
+    const float delta = std::min(delta_seconds, 0.05F);
 
-    // Filter look target with velocity look-ahead
-    const glm::vec3 target_pos = vehicle_pos + vehicle_up * config_.height +
-        vehicle_velocity * config_.look_ahead_seconds;
-    const float look_alpha = 1.0F - std::exp(-config_.look_spring_stiffness * delta);
-    current_look_target_ = glm::mix(current_look_target_, target_pos, look_alpha);
+    // Anchor horizontal pivot to the interpolated car position so high/variable
+    // FPS never introduces longitudinal car-to-camera rubber-band jitter, while
+    // smoothing vertical suspension bounce and look-ahead separately.
+    const float target_pivot_y = vehicle_pos.y + vehicle_up.y * config_.height;
+    const float look_alpha =
+        1.0F - std::exp(-config_.look_spring_stiffness * delta);
+    smoothed_pivot_y_ = glm::mix(smoothed_pivot_y_, target_pivot_y, look_alpha);
+    const glm::vec3 desired_look_ahead{
+        vehicle_velocity.x * config_.look_ahead_seconds,
+        vehicle_velocity.y * (0.25F * config_.look_ahead_seconds),
+        vehicle_velocity.z * config_.look_ahead_seconds,
+    };
+    smoothed_look_ahead_ =
+        glm::mix(smoothed_look_ahead_, desired_look_ahead, look_alpha);
+    const glm::vec3 pivot{vehicle_pos.x, smoothed_pivot_y_, vehicle_pos.z};
+    current_look_target_ = pivot + smoothed_look_ahead_;
 
     // Orbit control and auto-recenter timer
     if (std::abs(look_delta_x) > 0.001F || std::abs(look_delta_y) > 0.001F) {
@@ -108,7 +126,7 @@ void VehicleCamera::update(
     const float yaw_alpha = 1.0F - std::exp(-config_.position_spring_stiffness * delta);
     current_yaw_ = std::remainder(current_yaw_ + yaw_diff * yaw_alpha, two_pi);
 
-    // Compute camera ray from target to desired position
+    // Compute camera ray from pivot to desired position
     const float cos_p = std::cos(orbit_pitch_);
     const float sin_p = std::sin(orbit_pitch_);
     const glm::vec3 to_cam{
@@ -120,7 +138,7 @@ void VehicleCamera::update(
     float desired_dist = config_.follow_distance;
     if (collision != nullptr && !collision->empty()) {
         const auto hit = collision->raycast(
-            current_look_target_,
+            pivot,
             to_cam,
             config_.follow_distance,
             0xFFFFFFFFU,
@@ -134,9 +152,13 @@ void VehicleCamera::update(
         }
     }
 
-    const glm::vec3 desired_pos = current_look_target_ + to_cam * desired_dist;
-    const float pos_alpha = 1.0F - std::exp(-config_.position_spring_stiffness * delta);
-    current_position_ = glm::mix(current_position_, desired_pos, pos_alpha);
+    const float dist_rate = desired_dist < current_follow_distance_
+        ? (config_.position_spring_stiffness * 2.5F)
+        : (config_.position_spring_stiffness * 0.65F);
+    const float dist_alpha = 1.0F - std::exp(-dist_rate * delta);
+    current_follow_distance_ =
+        glm::mix(current_follow_distance_, desired_dist, dist_alpha);
+    current_position_ = pivot + to_cam * current_follow_distance_;
 
     // Speed-based dynamic FOV boost
     const float speed = glm::length(vehicle_velocity);

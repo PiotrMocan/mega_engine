@@ -138,7 +138,9 @@ private:
         PhysicsShapeKind shape = PhysicsShapeKind::box;
         RigidBodyMotionType motion_type = RigidBodyMotionType::dynamic;
         glm::vec3 position{0.0F};
+        glm::vec3 prev_position{0.0F};
         glm::quat orientation{1.0F, 0.0F, 0.0F, 0.0F};
+        glm::quat prev_orientation{1.0F, 0.0F, 0.0F, 0.0F};
         glm::mat3 axes{1.0F};
         glm::mat3 world_inv_inertia{0.0F};
         glm::vec3 local_inv_inertia{0.0F};
@@ -146,6 +148,10 @@ private:
         glm::vec3 rot_frame_offset{0.0F};
         glm::vec3 linear_velocity{0.0F};
         glm::vec3 angular_velocity{0.0F};
+        glm::vec3 pending_linear_impulse{0.0F};
+        glm::vec3 pending_angular_impulse{0.0F};
+        glm::vec3 step_linear_impulse{0.0F};
+        glm::vec3 step_angular_impulse{0.0F};
         glm::vec3 half_extents{0.5F};
         float radius = 0.5F;
         float half_segment = 0.5F;
@@ -207,6 +213,7 @@ private:
     std::vector<SceneWorldNode> world_nodes_scratch_{};
     std::vector<std::uint32_t> ancestor_scratch_{};
     float accumulator_ = 0.0F;
+    float interpolation_alpha_ = 0.0F;
 };
 
 } // namespace vcr

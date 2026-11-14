@@ -851,11 +851,11 @@ void Renderer::build_gpu_visibility_scene(std::uint32_t plane_count, std::uint32
         return std::isfinite(err) ? err : (lod_indices > 0U ? 0.0F : -1.0F);
     };
     const auto group = [&](std::uint32_t first, std::uint32_t instances,
-                           std::int32_t vertex_offset, bool tessellated, glm::uvec4 counts,
+                           std::int32_t vertex_offset, bool force_lod0, glm::uvec4 counts,
                            glm::uvec4 firsts, glm::vec4 errors) {
         const auto g = static_cast<std::uint32_t>(visibility_groups_.size());
         visibility_groups_.push_back(
-            {{first, instances, static_cast<std::uint32_t>(vertex_offset), tessellated ? 1U : 0U},
+            {{first, instances, static_cast<std::uint32_t>(vertex_offset), force_lod0 ? 1U : 0U},
              counts,
              firsts,
              errors});
@@ -876,7 +876,7 @@ void Renderer::build_gpu_visibility_scene(std::uint32_t plane_count, std::uint32
         const auto &mesh = editor_model_assets_[draw.asset_index].submeshes[draw.submesh_index];
         const bool tessellated = model_tessellation_enabled_ && draw.tessellation.enabled();
         const bool skinned = draw.uses_skinned_pool;
-        group(draw.first_instance, draw.instance_count, draw.vertex_offset, tessellated,
+        group(draw.first_instance, draw.instance_count, draw.vertex_offset, tessellated || skinned,
               skinned
                   ? glm::uvec4{mesh.lod_count[0], 0U, 0U, 0U}
                   : glm::uvec4{
@@ -923,6 +923,56 @@ void Renderer::build_gpu_visibility_scene(std::uint32_t plane_count, std::uint32
     }
     ++gpu_scene_revision_;
     gpu_packet_revision_ = 0;
+    reset_lod_history_ = true;
+    hiz_valid_ = false;
+    packet_used_hiz_ = false;
+}
+
+void Renderer::sync_gpu_visibility_skinned_draws() noexcept {
+    if (visibility_pipeline_.get() == VK_NULL_HANDLE ||
+        visibility_groups_.size() != 2U + editor_model_draws_.size() ||
+        visibility_commands_.size() != visibility_groups_.size() * 4U) {
+        return;
+    }
+    const auto sanitize_error = [](std::uint32_t lod_indices, float err) {
+        return std::isfinite(err) ? err : (lod_indices > 0U ? 0.0F : -1.0F);
+    };
+    const auto count = static_cast<std::uint32_t>(scene_metadata_.size());
+    for (std::size_t d = 0U; d < editor_model_draws_.size(); ++d) {
+        const auto &draw = editor_model_draws_[d];
+        const auto &mesh = editor_model_assets_[draw.asset_index].submeshes[draw.submesh_index];
+        const bool tessellated = model_tessellation_enabled_ && draw.tessellation.enabled();
+        const bool skinned = draw.uses_skinned_pool;
+        VisibilityGroup &grp = visibility_groups_[2U + d];
+        grp.range = {draw.first_instance, draw.instance_count,
+                     static_cast<std::uint32_t>(draw.vertex_offset),
+                     (tessellated || skinned) ? 1U : 0U};
+        grp.counts =
+            skinned
+                ? glm::uvec4{mesh.lod_count[0], 0U, 0U, 0U}
+                : glm::uvec4{mesh.lod_count[0], mesh.lod_count[1], mesh.lod_count[2],
+                             mesh.lod_count[3]};
+        grp.firsts =
+            skinned
+                ? glm::uvec4{mesh.lod_first[0], 0U, 0U, 0U}
+                : glm::uvec4{mesh.lod_first[0], mesh.lod_first[1], mesh.lod_first[2],
+                             mesh.lod_first[3]};
+        grp.errors =
+            skinned
+                ? glm::vec4{sanitize_error(mesh.lod_count[0], mesh.lod_error[0]), -1.0F, -1.0F,
+                            -1.0F}
+                : glm::vec4{sanitize_error(mesh.lod_count[0], mesh.lod_error[0]),
+                            sanitize_error(mesh.lod_count[1], mesh.lod_error[1]),
+                            sanitize_error(mesh.lod_count[2], mesh.lod_error[2]),
+                            sanitize_error(mesh.lod_count[3], mesh.lod_error[3])};
+        const std::size_t cmd_base = (2U + d) * 4U;
+        for (glm::length_t lod = 0; lod < 4; ++lod) {
+            visibility_commands_[cmd_base + static_cast<std::size_t>(lod)] = {
+                grp.counts[lod], 0U, grp.firsts[lod], draw.vertex_offset,
+                draw.first_instance + static_cast<unsigned>(lod) * count};
+        }
+    }
+    ++gpu_scene_revision_;
     reset_lod_history_ = true;
     hiz_valid_ = false;
     packet_used_hiz_ = false;
@@ -1183,6 +1233,7 @@ void Renderer::record_gpu_visibility(VkCommandBuffer command, FrameContext &fram
                     VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
         }
         f.scene_revision = gpu_scene_revision_;
+        f.view_revision = 0;
     }
     if (f.view_revision == gpu_visibility_revision_) {
         return;

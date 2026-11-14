@@ -1277,6 +1277,8 @@ void Application::execute_mcp_command(const McpCommand& command) {
                             renderer_.lighting_statistics().opacity_micromap_bytes}}},
                      {"assets_pending", renderer_.assets_pending()},
                      {"visibility_backend", renderer_.visibility_backend()},
+                     {"skinning_active_nodes", renderer_.skinning_active_node_count()},
+                     {"runtime_transform_revision", renderer_.runtime_transform_revision()},
                      {"gpu_grass_instances", renderer_.gpu_grass_instances()},
                      {"gpu_grass_wind_seconds", renderer_.gpu_grass_wind_seconds()},
                      {"upload_high_water_bytes", renderer_.upload_high_water()},

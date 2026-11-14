@@ -1147,6 +1147,286 @@ void test_gameplay_session_hooks_and_lifecycle(const std::filesystem::path& root
     session.stop();
 }
 
+// -----------------------------------------------------------------------------
+// 11. Smoothness, Collider Offset Preservation, and Sub-Tick Interpolation
+// -----------------------------------------------------------------------------
+void test_smoothness_and_collider_offset_regressions() {
+    // 1. ColliderWorld::update_collider_transform preserves center_offset and ground slab offset.
+    vcr::SceneDocument scene;
+    const vcr::SceneNodeId ground_id =
+        scene.create_node("CityGround", vcr::SceneNodeKind::ground);
+    scene.node(ground_id)->get().transform.translation = {0.0F, 0.0F, 0.0F};
+    scene.node(ground_id)->get().transform.scale = {40.0F, 1.0F, 40.0F};
+    static_cast<void>(scene.set_collider(
+        ground_id,
+        vcr::ColliderComponent{.center_offset = {0.0F, -0.08F, 0.0F}}));
+
+    const vcr::SceneNodeId sidewalk_id =
+        scene.create_node("Sidewalk", vcr::SceneNodeKind::cube);
+    scene.node(sidewalk_id)->get().transform.translation = {0.0F, 0.0F, 0.0F};
+    scene.node(sidewalk_id)->get().transform.scale = {3.0F, 1.0F, 4.0F};
+    static_cast<void>(scene.set_collider(
+        sidewalk_id,
+        vcr::ColliderComponent{
+            .center_offset = {0.0F, 0.075F, 0.0F},
+            .half_extents = {1.0F, 0.075F, 1.0F},
+            .shape = vcr::ColliderShape::box,
+        }));
+
+    vcr::CollisionWorld collision;
+    collision.rebuild_from_scene(scene, {}, {}, {}, true);
+
+    std::vector<vcr::SceneWorldNode> world_nodes;
+    std::vector<std::uint32_t> ancestors;
+    scene.build_world_nodes(world_nodes, ancestors);
+
+    vcr::RuntimeTransformRegistry registry;
+    registry.reserve(world_nodes.size());
+    for (const vcr::SceneWorldNode& wn : world_nodes) {
+        expect(
+            registry.register_node(wn.id, wn.world_matrix),
+            "Register scene node in RuntimeTransformRegistry");
+    }
+    registry.sync_outputs(&collision, nullptr);
+
+    // Move sidewalk by +0.5 in X to force dirty collider transform update too.
+    expect(
+        registry.set_world_pose(
+            sidewalk_id,
+            vcr::RuntimePose{.position = {0.5F, 0.0F, 0.0F}, .scale = {3.0F, 1.0F, 4.0F}}),
+        "Update sidewalk world pose in RuntimeTransformRegistry");
+    registry.sync_outputs(&collision, nullptr);
+
+    const auto ground_hit = collision.raycast(
+        {8.0F, 2.0F, 0.0F}, {0.0F, -1.0F, 0.0F}, 10.0F, 0xFFFFFFFFU, false);
+    const auto sidewalk_hit = collision.raycast(
+        {0.5F, 2.0F, 0.0F}, {0.0F, -1.0F, 0.0F}, 10.0F, 0xFFFFFFFFU, false);
+    expect(
+        ground_hit.has_value() && close_to(ground_hit->point.y, -0.08F, 2.0e-3F),
+        "CollisionWorld::update_collider_transform preserves ground center_offset and slab offset");
+    expect(
+        sidewalk_hit.has_value() && close_to(sidewalk_hit->point.y, 0.15F, 2.0e-3F),
+        "CollisionWorld::update_collider_transform preserves box center_offset and scale");
+
+    // 2. High-FPS AnimatedCharacterController idle & walk stability (zero fall flicker).
+    vcr::AnimatedCharacterConfig ccfg{};
+    ccfg.spawn_position = {0.5F, 0.15F, 0.0F};
+    ccfg.movement.capsule_radius = 0.35F;
+    ccfg.movement.capsule_height = 1.75F;
+    ccfg.movement.walk_speed = 2.0F;
+    ccfg.movement.run_speed = 6.0F;
+    ccfg.animation.idle.clip_name = "hero_idle";
+    ccfg.animation.walk.clip_name = "hero_walk";
+    ccfg.animation.run.clip_name = "hero_run";
+    ccfg.animation.jump.clip_name = "hero_jump";
+    ccfg.animation.fall.clip_name = "hero_fall";
+    ccfg.animation.land.clip_name = "hero_land";
+
+    vcr::AnimatedCharacterController ctrl(ccfg);
+    vcr::AnimatorComponent anim{};
+    std::vector<vcr::AnimationClip> char_clips{
+        vcr::AnimationClip{.name = "hero_idle", .duration_seconds = 2.4F, .looping = true},
+        vcr::AnimationClip{.name = "hero_walk", .duration_seconds = 0.93F, .looping = true},
+        vcr::AnimationClip{.name = "hero_fall", .duration_seconds = 0.6F, .looping = true},
+        vcr::AnimationClip{.name = "enter_car", .duration_seconds = 0.5F, .looping = false},
+    };
+
+    bool idle_all_grounded = true;
+    bool idle_all_idle = true;
+    bool idle_monotonic_time = true;
+    float prev_anim_time = 0.0F;
+    for (int i = 0; i < 120; ++i) {
+        ctrl.update(
+            vcr::CharacterInput{},
+            0.0F,
+            1.0F / 1000.0F,
+            &collision,
+            &anim,
+            nullptr,
+            char_clips);
+        idle_all_grounded = idle_all_grounded && ctrl.grounded();
+        idle_all_idle =
+            idle_all_idle &&
+            ctrl.locomotion_state() == vcr::CharacterLocomotionState::idle &&
+            close_to(ctrl.world_position().y, 0.15F, 2.0e-3F);
+        idle_monotonic_time =
+            idle_monotonic_time && ctrl.current_animation_time() > prev_anim_time;
+        prev_anim_time = ctrl.current_animation_time();
+    }
+    expect(
+        idle_all_grounded && idle_all_idle && idle_monotonic_time,
+        "AnimatedCharacter stays grounded in monotonic idle at 1000 FPS with zero fall flicker");
+
+    vcr::CharacterInput walk_in{};
+    walk_in.forward = true;
+    bool walk_never_fell = true;
+    for (int i = 0; i < 240; ++i) {
+        ctrl.update(
+            walk_in,
+            0.0F,
+            1.0F / 240.0F,
+            &collision,
+            &anim,
+            nullptr,
+            char_clips);
+        walk_never_fell = walk_never_fell &&
+            ctrl.grounded() &&
+            ctrl.locomotion_state() == vcr::CharacterLocomotionState::walk &&
+            close_to(ctrl.world_position().y, 0.15F, 3.0e-3F);
+    }
+    expect(
+        walk_never_fell && ctrl.world_position().z > 1.5F,
+        "AnimatedCharacter stays grounded in walk state at 240 FPS without jump_loop flicker");
+
+    // Non-looping preview clip clamps to clip.duration_seconds instead of wrapping.
+    vcr::SceneDocument anim_scene;
+    const vcr::SceneNodeId npc_id =
+        anim_scene.create_node("PreviewNpc", vcr::SceneNodeKind::model);
+    anim_scene.node(npc_id)->get().asset_path = "mock/preview.vcrmodel";
+    vcr::AnimatorComponent npc_anim{};
+    static_cast<void>(npc_anim.set_clip_name("hero_idle"));
+    npc_anim.looping = true;
+    static_cast<void>(anim_scene.set_animator(npc_id, npc_anim));
+
+    vcr::CookedSkeletonAsset skel;
+    vcr::SkeletonBone bone;
+    bone.name = "Root";
+    skel.bones.push_back(bone);
+    struct PreviewMock {
+        const vcr::CookedSkeletonAsset* skel;
+        const std::vector<vcr::AnimationClip>* clips;
+    } mock{&skel, &char_clips};
+    vcr::SkeletalAssetProvider anim_provider{
+        .asset_context = &mock,
+        .pose_context = &mock,
+        .find_skeleton = +[](const void* ctx, std::string_view) noexcept
+            -> const vcr::CookedSkeletonAsset* {
+            return static_cast<const PreviewMock*>(ctx)->skel;
+        },
+        .find_animations = +[](const void* ctx, std::string_view) noexcept
+            -> const std::vector<vcr::AnimationClip>* {
+            return static_cast<const PreviewMock*>(ctx)->clips;
+        },
+        .submit_pose = +[](void*, vcr::SceneNodeId, std::string_view, std::span<const glm::mat4>) {},
+        .remove_pose = +[](void*, vcr::SceneNodeId) noexcept {},
+    };
+    vcr::AnimatorRuntimeSystem anim_runtime;
+    anim_runtime.set_preview(npc_id, "enter_car", false, 0.75F);
+    anim_runtime.update(0.0F, anim_scene, &collision, nullptr, anim_provider);
+    const auto* preview_rt = anim_runtime.node_runtime(npc_id);
+    expect(
+        preview_rt != nullptr && close_to(preview_rt->current_time, 0.5F, 1.0e-3F),
+        "AnimatorRuntimeSystem::set_preview honors non-looping clip duration");
+
+    // 3. High-FPS Vehicle & VehicleCamera sub-tick interpolation smoothness (1000 FPS).
+    vcr::SceneDocument vscene;
+    const vcr::SceneNodeId vroad =
+        vscene.create_node("SmoothRoad", vcr::SceneNodeKind::cube);
+    vscene.node(vroad)->get().transform.translation = {0.0F, -0.5F, 0.0F};
+    vscene.node(vroad)->get().transform.scale = {80.0F, 0.5F, 200.0F};
+    static_cast<void>(vscene.set_collider(vroad, vcr::ColliderComponent{}));
+
+    const vcr::SceneNodeId vcar =
+        vscene.create_node("SmoothSedan", vcr::SceneNodeKind::cube);
+    vscene.node(vcar)->get().transform.translation = {0.0F, 0.65F, 0.0F};
+    vscene.node(vcar)->get().transform.scale = {0.95F, 0.35F, 2.2F};
+    vcr::RigidBodyComponent vrb{};
+    vrb.motion_type = vcr::RigidBodyMotionType::dynamic;
+    vrb.mass = 1350.0F;
+    static_cast<void>(vscene.set_rigid_body(vcar, vrb));
+    static_cast<void>(vscene.set_collider(vcar, vcr::ColliderComponent{}));
+
+    vcr::CollisionWorld vcollision;
+    vcollision.rebuild_from_scene(vscene, {}, {}, {}, true);
+    vcr::PhysicsWorld vphysics;
+    vphysics.rebuild_from_scene(vscene, {}, {}, {});
+    vcr::VehicleController vehicle(vcr::VehicleController::make_default_sedan(vcar));
+    vehicle.reset(vphysics, {0.0F, 0.65F, 0.0F}, {1.0F, 0.0F, 0.0F, 0.0F});
+
+    vcr::RuntimeTransformRegistry vreg;
+    expect(vreg.register_node(vcar, glm::mat4(1.0F)), "Register vehicle transform node");
+    vcr::VehicleCamera vcam;
+    vcam.reset({0.0F, 0.65F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 1.0F, 0.0F});
+
+    const float hf_dt = 1.0F / 1000.0F;
+    for (int i = 0; i < 400; ++i) {
+        vehicle.update(vcr::VehicleControlInput{}, hf_dt, vphysics, &vcollision);
+        vphysics.step(hf_dt, vcollision);
+    }
+    for (int i = 0; i < 1500; ++i) {
+        vehicle.update(
+            vcr::VehicleControlInput{.throttle = 1.0F},
+            hf_dt,
+            vphysics,
+            &vcollision);
+        vphysics.step(hf_dt, vcollision);
+    }
+
+    float prev_car_z = 0.0F;
+    float prev_cam_dist = 0.0F;
+    float min_dz = 1.0e9F;
+    float max_dz = 0.0F;
+    float max_cam_dist_step = 0.0F;
+    bool sample_initialized = false;
+    bool strictly_advancing = true;
+
+    for (int i = 0; i < 120; ++i) {
+        vehicle.update(
+            vcr::VehicleControlInput{.throttle = 1.0F},
+            hf_dt,
+            vphysics,
+            &vcollision);
+        vphysics.step(hf_dt, vcollision);
+
+        const vcr::TransformRows rows = vphysics.body_transform_rows(0U);
+        const glm::mat4 wm(
+            glm::vec4(rows.x.x, rows.y.x, rows.z.x, 0.0F),
+            glm::vec4(rows.x.y, rows.y.y, rows.z.y, 0.0F),
+            glm::vec4(rows.x.z, rows.y.z, rows.z.z, 0.0F),
+            glm::vec4(rows.x.w, rows.y.w, rows.z.w, 1.0F));
+        static_cast<void>(vreg.set_world_matrix(vcar, wm));
+        vreg.sync_outputs(&vcollision, nullptr);
+        const auto body = vphysics.body_state(vcar);
+        const glm::vec3 vel = body ? body->linear_velocity : glm::vec3(0.0F);
+        vcam.update(
+            glm::vec3(wm[3]),
+            glm::vec3(wm[2]),
+            glm::vec3(wm[1]),
+            vel,
+            0.0F,
+            0.0F,
+            hf_dt,
+            &vcollision,
+            vcar);
+
+        const float car_z = wm[3].z;
+        const float cam_dist = glm::length(glm::vec2(
+            vcam.position().x - wm[3].x,
+            vcam.position().z - wm[3].z));
+        if (sample_initialized) {
+            const float dz = car_z - prev_car_z;
+            if (dz <= 1.0e-4F) {
+                strictly_advancing = false;
+            }
+            min_dz = std::min(min_dz, dz);
+            max_dz = std::max(max_dz, dz);
+            max_cam_dist_step =
+                std::max(max_cam_dist_step, std::abs(cam_dist - prev_cam_dist));
+        } else {
+            sample_initialized = true;
+        }
+        prev_car_z = car_z;
+        prev_cam_dist = cam_dist;
+    }
+
+    expect(
+        strictly_advancing &&
+            min_dz > 1.0e-4F &&
+            max_dz < min_dz * 2.5F &&
+            max_cam_dist_step < 0.01F,
+        "Vehicle visual pose & VehicleCamera advance monotonically every 1000-FPS frame without staircase jumps");
+}
+
 } // namespace
 
 int main() {
@@ -1163,6 +1443,7 @@ int main() {
     test_traffic_and_signals();
     test_game_overlay_canvas();
     test_gameplay_session_hooks_and_lifecycle(scratch.path());
+    test_smoothness_and_collider_offset_regressions();
 
     if (g_failures != 0) {
         std::cerr << g_failures << " engine gameplay API test(s) failed\n";

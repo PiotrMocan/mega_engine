@@ -539,6 +539,7 @@ void PhysicsWorld::clear() noexcept {
     contacts_.clear();
     sphere_contacts_scratch_.clear();
     accumulator_ = 0.0F;
+    interpolation_alpha_ = 0.0F;
 }
 
 void PhysicsWorld::update_derived_body_state(Body& body) noexcept {
@@ -732,6 +733,8 @@ void PhysicsWorld::rebuild_from_scene(
             body.position =
                 frame->origin + frame->axes * body.rot_frame_offset;
         }
+        body.prev_position = body.position;
+        body.prev_orientation = body.orientation;
 
         if (rb.motion_type == RigidBodyMotionType::kinematic) {
             body.inv_mass = 0.0F;
@@ -1304,6 +1307,7 @@ void PhysicsWorld::substep(
         if (!body.enabled || body.inv_mass <= 0.0F || body.sleeping) {
             continue;
         }
+        body.linear_velocity += body.step_linear_impulse * body.inv_mass;
         body.linear_velocity.y += gravity_accel * body.gravity_scale * dt;
         const float lin_damp = std::exp(-body.linear_damping * dt);
         const float ang_damp = std::exp(-body.angular_damping * dt);
@@ -1311,6 +1315,8 @@ void PhysicsWorld::substep(
         if (body.lock_rotation) {
             body.angular_velocity = glm::vec3(0.0F);
         } else {
+            body.angular_velocity +=
+                body.world_inv_inertia * body.step_angular_impulse;
             body.angular_velocity *= ang_damp;
         }
     }
@@ -1436,8 +1442,12 @@ void PhysicsWorld::substep(
         }
         if (body.position.y < abyss_floor) {
             body.position.y = abyss_floor;
+            body.prev_position = body.position;
+            body.prev_orientation = body.orientation;
             body.linear_velocity = glm::vec3(0.0F);
             body.angular_velocity = glm::vec3(0.0F);
+            body.pending_linear_impulse = glm::vec3(0.0F);
+            body.pending_angular_impulse = glm::vec3(0.0F);
             body.sleeping = true;
         }
         update_derived_body_state(body);
@@ -1453,6 +1463,10 @@ void PhysicsWorld::substep(
             if (body.sleep_timer >= sleep_time_threshold) {
                 body.linear_velocity = glm::vec3(0.0F);
                 body.angular_velocity = glm::vec3(0.0F);
+                body.prev_position = body.position;
+                body.prev_orientation = body.orientation;
+                body.pending_linear_impulse = glm::vec3(0.0F);
+                body.pending_angular_impulse = glm::vec3(0.0F);
                 body.sleeping = true;
             }
         } else {
@@ -1507,12 +1521,32 @@ void PhysicsWorld::step(
 
     int steps = 0;
     while (accumulator_ + 1.0e-6F >= fixed_dt && steps < max_substeps) {
+        const float consume_fraction =
+            std::clamp(fixed_dt / std::max(accumulator_, fixed_dt), 0.0F, 1.0F);
         float max_cfl_ratio = 0.0F;
-        for (const Body& body : bodies_) {
-            if (!body.enabled || body.sleeping || body.inv_mass <= 0.0F) {
+        for (Body& body : bodies_) {
+            if (!body.enabled || body.inv_mass <= 0.0F) {
+                body.pending_linear_impulse = glm::vec3(0.0F);
+                body.pending_angular_impulse = glm::vec3(0.0F);
+                body.step_linear_impulse = glm::vec3(0.0F);
+                body.step_angular_impulse = glm::vec3(0.0F);
                 continue;
             }
-            const float speed = glm::length(body.linear_velocity);
+            body.prev_position = body.position;
+            body.prev_orientation = body.orientation;
+            const glm::vec3 step_lin =
+                body.pending_linear_impulse * consume_fraction;
+            const glm::vec3 step_ang =
+                body.pending_angular_impulse * consume_fraction;
+            body.pending_linear_impulse -= step_lin;
+            body.pending_angular_impulse -= step_ang;
+            body.step_linear_impulse = step_lin;
+            body.step_angular_impulse = step_ang;
+            if (body.sleeping) {
+                continue;
+            }
+            const float speed = glm::length(
+                body.linear_velocity + step_lin * body.inv_mass);
             const float min_dim = body.shape == PhysicsShapeKind::box
                 ? std::min({
                       body.half_extents.x,
@@ -1527,12 +1561,29 @@ void PhysicsWorld::step(
         const int adaptive_substeps = std::clamp(
             static_cast<int>(std::ceil(max_cfl_ratio / 0.45F)), 1, 6);
         const float sub_dt = fixed_dt / static_cast<float>(adaptive_substeps);
+        const float inv_substeps = 1.0F / static_cast<float>(adaptive_substeps);
+        for (Body& body : bodies_) {
+            body.step_linear_impulse *= inv_substeps;
+            body.step_angular_impulse *= inv_substeps;
+        }
         for (int sub = 0; sub < adaptive_substeps; ++sub) {
             substep(sub_dt, static_world);
+        }
+        for (Body& body : bodies_) {
+            body.step_linear_impulse = glm::vec3(0.0F);
+            body.step_angular_impulse = glm::vec3(0.0F);
         }
         accumulator_ = std::max(0.0F, accumulator_ - fixed_dt);
         ++steps;
     }
+    if (accumulator_ <= 1.0e-6F) {
+        accumulator_ = 0.0F;
+        for (Body& body : bodies_) {
+            body.pending_linear_impulse = glm::vec3(0.0F);
+            body.pending_angular_impulse = glm::vec3(0.0F);
+        }
+    }
+    interpolation_alpha_ = std::clamp(accumulator_ / fixed_dt, 0.0F, 1.0F);
 }
 
 void PhysicsWorld::apply_character_push(
@@ -1850,10 +1901,23 @@ TransformRows PhysicsWorld::body_transform_rows(
         return {};
     }
     const Body& b = bodies_[index];
-    const glm::vec3 c0 = b.axes[0] * b.node_scale.x;
-    const glm::vec3 c1 = b.axes[1] * b.node_scale.y;
-    const glm::vec3 c2 = b.axes[2] * b.node_scale.z;
-    const glm::vec3 node_origin = b.position - (b.axes * b.rot_frame_offset);
+    glm::vec3 vis_pos = b.position;
+    glm::mat3 vis_axes = b.axes;
+    if (b.enabled && b.inv_mass > 0.0F && !b.sleeping) {
+        vis_pos = glm::mix(b.prev_position, b.position, interpolation_alpha_);
+        glm::quat q0 = b.prev_orientation;
+        glm::quat q1 = b.orientation;
+        if (glm::dot(q0, q1) < 0.0F) {
+            q1 = -q1;
+        }
+        const glm::quat vis_rot =
+            glm::normalize(glm::slerp(q0, q1, interpolation_alpha_));
+        vis_axes = glm::mat3_cast(vis_rot);
+    }
+    const glm::vec3 c0 = vis_axes[0] * b.node_scale.x;
+    const glm::vec3 c1 = vis_axes[1] * b.node_scale.y;
+    const glm::vec3 c2 = vis_axes[2] * b.node_scale.z;
+    const glm::vec3 node_origin = vis_pos - (vis_axes * b.rot_frame_offset);
     return TransformRows{
         .x = glm::vec4(c0.x, c1.x, c2.x, node_origin.x),
         .y = glm::vec4(c0.y, c1.y, c2.y, node_origin.y),
@@ -1943,7 +2007,11 @@ bool PhysicsWorld::set_kinematic_pose(
             }
             b.angular_velocity = glm::vec3(0.0F);
             b.position = position;
+            b.prev_position = position;
             b.orientation = orientation;
+            b.prev_orientation = orientation;
+            b.pending_linear_impulse = glm::vec3(0.0F);
+            b.pending_angular_impulse = glm::vec3(0.0F);
             b.sleeping = false;
             b.sleep_timer = 0.0F;
             update_derived_body_state(b);
@@ -1971,9 +2039,13 @@ bool PhysicsWorld::set_body_state(
     for (Body& b : bodies_) {
         if (b.node_id == id) {
             b.position = position;
+            b.prev_position = position;
             b.orientation = normalized_q;
+            b.prev_orientation = normalized_q;
             b.linear_velocity = linear_velocity;
             b.angular_velocity = b.lock_rotation ? glm::vec3(0.0F) : angular_velocity;
+            b.pending_linear_impulse = glm::vec3(0.0F);
+            b.pending_angular_impulse = glm::vec3(0.0F);
             b.sleeping = false;
             b.sleep_timer = 0.0F;
             update_derived_body_state(b);
@@ -2007,6 +2079,10 @@ bool PhysicsWorld::set_body_motion_type(
                     3.0F / (mass * (h.x + h.z)), 3.0F / (mass * (h.x + h.y))};
             }
         }
+        body.prev_position = body.position;
+        body.prev_orientation = body.orientation;
+        body.pending_linear_impulse = glm::vec3(0.0F);
+        body.pending_angular_impulse = glm::vec3(0.0F);
         body.sleeping = false;
         body.sleep_timer = 0;
         update_derived_body_state(body);
@@ -2027,8 +2103,14 @@ bool PhysicsWorld::set_body_enabled(
             if (!enabled) {
                 b.linear_velocity = glm::vec3(0.0F);
                 b.angular_velocity = glm::vec3(0.0F);
+                b.prev_position = b.position;
+                b.prev_orientation = b.orientation;
+                b.pending_linear_impulse = glm::vec3(0.0F);
+                b.pending_angular_impulse = glm::vec3(0.0F);
                 b.sleeping = true;
             } else {
+                b.prev_position = b.position;
+                b.prev_orientation = b.orientation;
                 b.sleeping = false;
                 b.sleep_timer = 0.0F;
             }
@@ -2059,12 +2141,14 @@ bool PhysicsWorld::apply_central_force(
     if (!id || !finite_vec3(force) || !std::isfinite(dt) || dt <= 0.0F) {
         return false;
     }
+    const float eff_dt =
+        std::min(dt, fixed_dt * static_cast<float>(max_substeps));
     for (Body& b : bodies_) {
         if (b.node_id == id) {
             if (!b.enabled || b.inv_mass <= 0.0F) {
                 return false;
             }
-            b.linear_velocity += force * (b.inv_mass * dt);
+            b.pending_linear_impulse += force * eff_dt;
             b.sleeping = false;
             b.sleep_timer = 0.0F;
             return true;
@@ -2085,16 +2169,18 @@ bool PhysicsWorld::apply_force_at_point(
         dt <= 0.0F) {
         return false;
     }
+    const float eff_dt =
+        std::min(dt, fixed_dt * static_cast<float>(max_substeps));
     for (Body& b : bodies_) {
         if (b.node_id == id) {
             if (!b.enabled || b.inv_mass <= 0.0F) {
                 return false;
             }
-            const glm::vec3 impulse = force * dt;
-            b.linear_velocity += impulse * b.inv_mass;
+            const glm::vec3 impulse = force * eff_dt;
+            b.pending_linear_impulse += impulse;
             if (!b.lock_rotation) {
                 const glm::vec3 r = world_point - b.position;
-                b.angular_velocity += b.world_inv_inertia * glm::cross(r, impulse);
+                b.pending_angular_impulse += glm::cross(r, impulse);
             }
             b.sleeping = false;
             b.sleep_timer = 0.0F;
@@ -2111,13 +2197,15 @@ bool PhysicsWorld::apply_torque(
     if (!id || !finite_vec3(torque) || !std::isfinite(dt) || dt <= 0.0F) {
         return false;
     }
+    const float eff_dt =
+        std::min(dt, fixed_dt * static_cast<float>(max_substeps));
     for (Body& b : bodies_) {
         if (b.node_id == id) {
             if (!b.enabled || b.inv_mass <= 0.0F) {
                 return false;
             }
             if (!b.lock_rotation) {
-                b.angular_velocity += b.world_inv_inertia * (torque * dt);
+                b.pending_angular_impulse += torque * eff_dt;
             }
             b.sleeping = false;
             b.sleep_timer = 0.0F;

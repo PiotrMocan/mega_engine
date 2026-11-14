@@ -557,7 +557,8 @@ bool GameplaySession::update_internal(
                     player_node_,
                     player_anim_scratch_.clip_name_view(),
                     false,
-                    animated_player_.current_animation_time());
+                    animated_player_.current_animation_time(),
+                    player_anim_scratch_.looping);
             }
         }
     } else if (player_node_) {

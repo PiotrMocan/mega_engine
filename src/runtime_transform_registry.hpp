@@ -135,6 +135,7 @@ private:
         std::vector<LocalSocket> sockets{};
         std::uint32_t depth = 0U;
         bool is_attached = false;
+        bool collision_dirty = true;
     };
 
     [[nodiscard]] NodeRecord* find_node(SceneNodeId id) noexcept;

@@ -999,6 +999,7 @@ void EditorApplication::synchronize_gameplay_state() {
         edit_animator_preview_.clear(&skeletal_provider);
         renderer_.clear_skinned_model_poses();
         edit_camera_before_play_ = camera_;
+        update_scene_snapshot();
         const SceneRenderView initial_view = scene_.build_render_view(
             scene_instances_, scene_models_, scene_lights_);
         const FlyCamera startup_camera = scene_startup_camera(
@@ -1055,6 +1056,10 @@ void EditorApplication::synchronize_gameplay_state() {
             return;
         }
         submitted_scene_revision_ = 0U;
+        update_scene_snapshot();
+        gameplay_.transform_registry().sync_outputs(
+            nullptr, &gameplay_renderer_bridge_.transform_sink);
+        renderer_.snap_runtime_transforms();
     } else if (requested_state == EditorPlayState::edit) {
         gameplay_.stop(
             audio_engine_.initialized() ? &audio_engine_ : nullptr,

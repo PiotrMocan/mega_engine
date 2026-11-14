@@ -756,7 +756,8 @@ void AnimatorRuntimeSystem::set_preview(
     const SceneNodeId id,
     const std::string_view clip_name,
     const bool playing,
-    const float time_seconds) {
+    const float time_seconds,
+    const std::optional<bool> looping_override) {
     if (!id) {
         return;
     }
@@ -764,6 +765,7 @@ void AnimatorRuntimeSystem::set_preview(
     rt.preview_override = true;
     rt.preview_clip_name.assign(clip_name);
     rt.preview_playing = playing;
+    rt.preview_looping_override = looping_override;
     if (std::isfinite(time_seconds) && time_seconds >= 0.0F) {
         rt.current_time = time_seconds;
         if (rt.last_clip_duration > 1.0e-5F) {
@@ -778,6 +780,7 @@ void AnimatorRuntimeSystem::clear_preview(const SceneNodeId id) noexcept {
         rt->preview_override = false;
         rt->preview_clip_name.clear();
         rt->preview_playing = false;
+        rt->preview_looping_override.reset();
     }
 }
 
@@ -905,23 +908,25 @@ void AnimatorRuntimeSystem::update(
                     : std::string_view(rt.preview_clip_name);
             const std::uint32_t clip_idx = resolve_clip_index(clips, preview_name);
             const AnimationClip& clip = clips[clip_idx];
+            const bool preview_loop =
+                rt.preview_looping_override.value_or(clip.looping);
             const float prev_t = rt.current_time;
             const float step_dt =
                 rt.preview_playing ? dt * comp.playback_speed : 0.0F;
             rt.current_time = wrap_clip_time(
-                rt.current_time + step_dt, clip.duration_seconds, comp.looping);
+                rt.current_time + step_dt, clip.duration_seconds, preview_loop);
             rt.last_clip_duration = clip.duration_seconds;
             rt.normalized_phase = clip.duration_seconds > 1.0e-5F
                 ? std::clamp(rt.current_time / clip.duration_seconds, 0.0F, 1.0F)
                 : 0.0F;
             sample_animation_clip(
-                *skeleton, clip, rt.current_time, comp.looping, rt.base_pose);
+                *skeleton, clip, rt.current_time, preview_loop, rt.base_pose);
             if (rt.preview_playing && step_dt > 0.0F) {
                 collect_fired_animation_events(
                     clip,
                     prev_t,
                     rt.current_time,
-                    comp.looping,
+                    preview_loop,
                     fired_events_scratch_,
                     fired_count);
             }
