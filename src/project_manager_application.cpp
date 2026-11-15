@@ -2113,6 +2113,32 @@ void ProjectManagerApplication::build_inspector_panel() {
     }
 
     ImGui::Spacing();
+    ui_kit_.section_header(EditorIcon::cube, "Character Creation Suite");
+    if (ui_kit_.action_button(
+            "InspectorCharGen",
+            EditorIcon::cube,
+            "1. Char Gen",
+            EditorButtonStyle::secondary)) {
+        launch_character_suite_tool_for_selected_project("vulkan_char_gen", "Char Gen Studio");
+    }
+    ImGui::SameLine();
+    if (ui_kit_.action_button(
+            "InspectorCharOutfit",
+            EditorIcon::material,
+            "2. Outfit",
+            EditorButtonStyle::secondary)) {
+        launch_character_suite_tool_for_selected_project("vulkan_char_outfit", "Char Outfit Studio");
+    }
+    ImGui::SameLine();
+    if (ui_kit_.action_button(
+            "InspectorCharAct",
+            EditorIcon::play,
+            "3. Act & Dlg",
+            EditorButtonStyle::secondary)) {
+        launch_character_suite_tool_for_selected_project("vulkan_char_act", "Char Act Studio");
+    }
+
+    ImGui::Spacing();
     ui_kit_.section_header(EditorIcon::play, "Launch Options");
     if (ui_kit_.begin_property_grid("##LaunchOptsGrid")) {
         ui_kit_.property_row("Resolution");
@@ -3105,6 +3131,42 @@ void ProjectManagerApplication::launch_icon_tool_for_selected_project() {
     }
     status_message_ =
         "Opened Icon Utility for '" + selected.entry.name + "'.";
+    status_tone_ = EditorTone::info;
+}
+
+void ProjectManagerApplication::launch_character_suite_tool_for_selected_project(
+    const std::string_view exe_base_name,
+    const std::string_view display_title) {
+    if (!selected_index_ || *selected_index_ >= items_.size()) {
+        return;
+    }
+    const CachedProjectItem& selected = items_[*selected_index_];
+#ifdef _WIN32
+    const std::string exe_name = std::string(exe_base_name) + ".exe";
+#else
+    const std::string exe_name = std::string(exe_base_name);
+#endif
+    const auto tool_exe = find_sibling_executable(exe_name);
+    if (!tool_exe) {
+        status_message_ =
+            "Could not find " + exe_name + " next to Project Manager.";
+        status_tone_ = EditorTone::danger;
+        return;
+    }
+    const std::vector<std::string> args{
+        "--project",
+        selected.directory_utf8,
+    };
+    std::string launch_err;
+    if (!launch_detached_executable(
+            *tool_exe, args, selected.entry.project_directory, launch_err)) {
+        status_message_ =
+            std::string(display_title) + " launch failed: " + launch_err;
+        status_tone_ = EditorTone::danger;
+        return;
+    }
+    status_message_ =
+        "Opened " + std::string(display_title) + " for '" + selected.entry.name + "'.";
     status_tone_ = EditorTone::info;
 }
 

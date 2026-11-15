@@ -134,6 +134,9 @@ private:
     void poll_shipping_result();
     void reset_selected_project_icon();
     void launch_icon_tool_for_selected_project();
+    void launch_character_suite_tool_for_selected_project(
+        std::string_view exe_base_name,
+        std::string_view display_title);
 
     void build_ui();
     void build_header_bar();

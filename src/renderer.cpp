@@ -3350,6 +3350,140 @@ void Renderer::invalidate_editor_scene() noexcept {
     }
 }
 
+void Renderer::reset_editor_asset_cache() {
+#if VCR_EDITOR_ENABLED
+    if (!authored_scene_enabled_ || context_ == nullptr ||
+        context_->device() == VK_NULL_HANDLE) {
+        return;
+    }
+    const VkResult idle = vkDeviceWaitIdle(context_->device());
+    if (idle != VK_SUCCESS) {
+        fatal(
+            "Renderer failed while waiting to reset the editor asset cache: " +
+            std::to_string(static_cast<int>(idle)));
+    }
+    if (async_assets_) {
+        asset_preparation_.stop();
+        asset_upload_.stop();
+    }
+    asset_requests_.clear();
+    asset_requests_pending_ = 0U;
+    uploading_model_.reset();
+    uploading_request_.reset();
+    clear_skinned_model_poses();
+    destroy_skinning_resources();
+    skinned_pool_vertex_cursor_ = 0U;
+    skinning_pool_parity_ = 0U;
+    editor_model_draws_.clear();
+    visible_model_draws_.clear();
+    editor_scene_instances_.clear();
+    rt_alpha_maps_.clear();
+    editor_model_assets_.clear();
+    editor_texture_assets_.clear();
+    editor_model_gpu_bytes_ = 0U;
+    editor_texture_gpu_bytes_ = 0U;
+    editor_material_descriptor_count_ = 0U;
+    tessellated_material_count_ = 0U;
+    model_tessellation_enabled_ = false;
+    if (editor_material_descriptor_pool_ != VK_NULL_HANDLE) {
+        VK_CHECK(vkResetDescriptorPool(
+            context_->device(),
+            editor_material_descriptor_pool_,
+            0U));
+    }
+    destroy_gpu_visibility();
+    visibility_sources_.clear();
+    visibility_groups_.clear();
+    visibility_commands_.clear();
+    record_copies_.clear();
+    node_record_next_.clear();
+    std::fill(node_record_heads_.begin(), node_record_heads_.end(), UINT32_MAX);
+    for (FrameContext& frame : frames_) {
+        frame.visibility.dirty_records.clear();
+        std::fill(
+            frame.visibility.dirty_flags.begin(),
+            frame.visibility.dirty_flags.end(),
+            std::uint8_t{0});
+        frame.visibility.view_revision = 0U;
+        frame.visibility.scene_revision = 0U;
+    }
+    gpu_packet_revision_ = 0U;
+    reset_lod_history_ = true;
+    create_gpu_visibility();
+    for (const FrameContext& frame : frames_) {
+        const auto& visible = frame.visibility.visible ? frame.visibility.visible
+                                                       : frame.workload_buffer;
+        if (!visible) {
+            continue;
+        }
+        const VkDescriptorBufferInfo visibility_info{visible.handle(), 0, visible.size()};
+        for (const VkDescriptorSet set : {frame.descriptor_set, frame.scene_descriptor_set}) {
+            if (set == VK_NULL_HANDLE) {
+                continue;
+            }
+            const VkWriteDescriptorSet write{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = set,
+                .dstBinding = 5U,
+                .descriptorCount = 1U,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .pBufferInfo = &visibility_info,
+            };
+            vkUpdateDescriptorSets(context_->device(), 1U, &write, 0U, nullptr);
+        }
+    }
+    const bool had_rt = rt_provisioned_;
+    destroy_ray_tracing();
+    if (had_rt) {
+        rt_provisioned_ = true;
+        create_ray_tracing_resources();
+        const VkDescriptorBufferInfo micromap_info{
+            rt_opacity_micromaps_.handle(), 0, rt_opacity_micromaps_.size()};
+        const VkDescriptorBufferInfo alpha_info{
+            rt_alpha_texels_.handle(), 0, rt_alpha_texels_.size()};
+        for (const auto& frame : frames_) {
+            if (frame.lighting_descriptor_set == VK_NULL_HANDLE || !lighting_layout_has_rt_) {
+                continue;
+            }
+            const std::array<VkWriteDescriptorSet, 2> writes{{
+                VkWriteDescriptorSet{
+                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                    .dstSet = frame.lighting_descriptor_set,
+                    .dstBinding = 9U,
+                    .descriptorCount = 1U,
+                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                    .pBufferInfo = &micromap_info,
+                },
+                VkWriteDescriptorSet{
+                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                    .dstSet = frame.lighting_descriptor_set,
+                    .dstBinding = 11U,
+                    .descriptorCount = 1U,
+                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                    .pBufferInfo = &alpha_info,
+                },
+            }};
+            vkUpdateDescriptorSets(context_->device(), 2U, writes.data(), 0U, nullptr);
+        }
+    }
+    if (gi_provisioned_) {
+        voxel_triangle_count_ = gi_terrain_first_ + gi_terrain_count_;
+        voxel_job_active_ = false;
+        voxel_job_start_ = false;
+        voxel_job_finishes_ = false;
+        voxel_ready_ = false;
+        voxel_scene_.clear();
+        gi_scene_revision_ = 0U;
+        lighting_statistics_.mesh_bytes = sizeof(GiTriangle) * voxel_triangle_count_;
+    }
+    create_skinning_resources();
+    invalidate_editor_scene();
+    if (async_assets_) {
+        asset_preparation_.start();
+    }
+#endif
+}
+
 void Renderer::record_editor_scene_upload(
     const VkCommandBuffer command_buffer,
     FrameContext& frame) {

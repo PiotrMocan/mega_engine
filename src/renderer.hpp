@@ -474,6 +474,7 @@ public:
         MaterialTessellation tessellation,
         std::optional<std::uint32_t> coverage = std::nullopt) noexcept;
     void invalidate_editor_scene() noexcept;
+    void reset_editor_asset_cache();
     [[nodiscard]] bool prepare_editor_viewport(VkExtent2D extent);
     [[nodiscard]] VkImageView editor_viewport_image_view() const noexcept {
         return editor_viewport_.color.view();
@@ -506,6 +507,18 @@ public:
     void clear_skinned_model_poses() noexcept;
     [[nodiscard]] std::uint32_t skinning_active_node_count() const noexcept {
         return static_cast<std::uint32_t>(skinned_node_slots_.size());
+    }
+    [[nodiscard]] std::size_t resident_editor_model_count() const noexcept {
+        return editor_model_assets_.size();
+    }
+    [[nodiscard]] std::size_t resident_editor_texture_count() const noexcept {
+        return editor_texture_assets_.size();
+    }
+    [[nodiscard]] VkDeviceSize editor_model_gpu_bytes() const noexcept {
+        return editor_model_gpu_bytes_;
+    }
+    [[nodiscard]] VkDeviceSize editor_texture_gpu_bytes() const noexcept {
+        return editor_texture_gpu_bytes_;
     }
     struct RenderedNodeDiagnostics {
         bool in_runtime_transforms = false;

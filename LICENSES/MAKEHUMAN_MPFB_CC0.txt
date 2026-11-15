@@ -1,0 +1,26 @@
+MakeHuman / MPFB2 Base Assets — Creative Commons CC0 1.0 Universal
+
+Source repository:
+  https://github.com/makehumancommunity/mpfb2
+
+Applicable files derived into assets/character_templates/:
+  - src/mpfb/data/3dobjs/base.obj
+  - src/mpfb/data/targets/macrodetails/*.target.gz
+  - src/mpfb/data/targets/macrodetails/proportions/*.target.gz
+  - src/mpfb/data/targets/{torso,hip,chin,cheek,eyebrows,forehead,nose,eyes,mouth,breast}/*.target.gz
+  - src/mpfb/data/rigs/standard/weights.game_engine.json
+  - src/mpfb/data/rigs/standard/weights.default.json
+  - src/mpfb/data/uv_layers/lips_solid.json.gz
+  - src/mpfb/data/uv_layers/eyelids_solid.json.gz
+
+License Summary (verbatim from upstream LICENSE.md Part C & LICENSE.ASSETS.md):
+  The MakeHuman / MPFB2 bundled graphical assets (base mesh and proxies,
+  targets and modifiers, rigs, skinning weights, and JSON mesh metadata) are
+  dedicated to the public domain under Creative Commons CC0 1.0 Universal:
+  https://creativecommons.org/publicdomain/zero/1.0/
+
+Note:
+  Only CC0 asset data from src/mpfb/data/ is used to generate the binary
+  assets/character_templates/human_female.vcrcharbase and
+  assets/character_templates/human_male.vcrcharbase template files. No GPLv3
+  Python addon code from MPFB2 is included in this repository.

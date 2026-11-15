@@ -1,5 +1,9 @@
 # MCP control plane
 
+## Vegetation Studio authoring profile
+
+`vulkan_vegetation_studio.exe --mcp-stdio` exposes a dedicated standalone MCP server (`2025-11-25` over stdio) for procedural vegetation authoring, optimization profiling, and project publishing without altering `vulkan_editor`'s scene control plane. It redirects internal `std::cout` logs to `stderr`, provides 15 tools (`veg.list_presets`, `veg.get_state`, `veg.apply_preset`, `veg.set_recipe`, `veg.randomize_seed`, `veg.paint_foliage`, `veg.clear_paint`, `veg.set_arena`, `veg.set_camera`, `veg.export_to_project`, `veg.open_from_project`, `veg.list_project_vegetation`, `render.get_metrics`, `capture.screenshot`, `engine.quit`), and can be verified end-to-end with `scripts\vegetation_studio_mcp_smoke.ps1` (see `docs/VEGETATION_STUDIO.md`).
+
 ## Editor authoring profile
 
 `vulkan_editor` использует тот же bounded stdio transport, но публикует отдельный

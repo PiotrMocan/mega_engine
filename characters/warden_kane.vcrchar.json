@@ -1,0 +1,193 @@
+{
+  "acting": {
+    "arm_swing": 1.0,
+    "blink_interval_seconds": 3.200000047683716,
+    "default_brow_raise": 0.05000000074505806,
+    "default_frown": 0.0,
+    "default_idle_clip": "idle",
+    "default_smile": 0.10000000149011612,
+    "idle_breath_amplitude": 1.0,
+    "run_speed_mps": 4.900000095367432,
+    "stride_energy": 1.0,
+    "temperament": "neutral",
+    "walk_speed_mps": 1.850000023841858
+  },
+  "body": {
+    "age_wear": 0.18409478664398193,
+    "archetype": "stylized_hero",
+    "arm_length": 0.5,
+    "body_fat": 0.07999999821186066,
+    "chest_depth": 0.5,
+    "face": {
+      "brow_ridge": 0.44999998807907104,
+      "cheekbone_prominence": 0.75,
+      "chin_length": 0.5,
+      "eye_color": [
+        0.20000000298023224,
+        0.46000000834465027,
+        0.7200000286102295
+      ],
+      "eye_size": 0.550000011920929,
+      "eye_spacing": 0.5,
+      "head_scale": 1.0,
+      "jaw_width": 0.5,
+      "lip_fullness": 0.5,
+      "mouth_width": 0.5,
+      "nose_length": 0.5,
+      "nose_width": 0.44999998807907104
+    },
+    "freckles": 0.07999999821186066,
+    "gender": "male",
+    "height_meters": 1.7972688674926758,
+    "hip_width": 0.4802955687046051,
+    "leg_length": 0.5,
+    "lip_tint": 0.30000001192092896,
+    "musculature": 0.4000000059604645,
+    "shoulder_width": 0.41999998688697815,
+    "skin_color": [
+      0.8199999928474426,
+      0.6299999952316284,
+      0.5099999904632568
+    ],
+    "skin_roughness": 0.5400000214576721,
+    "skin_subsurface_strength": 0.6499999761581421,
+    "waist_width": 0.3400000035762787
+  },
+  "dialogue": {
+    "dialogue_id": "warden_kane_dialogue",
+    "entry_node_id": "greeting",
+    "nodes": [
+      {
+        "brow_raise": 0.18000000715255737,
+        "choices": [
+          {
+            "closes_dialogue": false,
+            "next_node_id": "relay_briefing",
+            "set_value": 1.0,
+            "set_var": "asked_relay",
+            "text": "What happened at the relay?",
+            "text_ru": "Что случилось на ретрансляторе?"
+          },
+          {
+            "closes_dialogue": false,
+            "next_node_id": "farewell",
+            "set_value": 1.0,
+            "set_var": "scout_accepted",
+            "text": "Stay sharp. I will scout ahead.",
+            "text_ru": "Держись начеку. Я пойду в разведку."
+          }
+        ],
+        "expression_clip": "talk",
+        "frown": 0.05000000074505806,
+        "id": "greeting",
+        "smile": 0.07999999821186066,
+        "speaker": "Warden Kane",
+        "text": "Hold there, traveler. The perimeter relay went silent an hour ago.",
+        "text_ru": "Стой, путник. Реле периметра замолчало час назад.",
+        "voice_clip_id": "greeting"
+      },
+      {
+        "brow_raise": 0.11999999731779099,
+        "choices": [
+          {
+            "closes_dialogue": true,
+            "next_node_id": "",
+            "set_value": 1.0,
+            "set_var": "mission_active",
+            "text": "Understood. Moving out now.",
+            "text_ru": "Понял. Выдвигаюсь сейчас же."
+          }
+        ],
+        "expression_clip": "talk",
+        "frown": 0.2199999988079071,
+        "id": "relay_briefing",
+        "smile": 0.0,
+        "speaker": "Warden Kane",
+        "text": "Thermal sensors tripped along the northern ridge before communications cut out.",
+        "text_ru": "Термодатчики сработали на северном хребте перед самой потерей связи.",
+        "voice_clip_id": "relay_briefing"
+      },
+      {
+        "brow_raise": 0.20000000298023224,
+        "choices": [
+          {
+            "closes_dialogue": true,
+            "next_node_id": "",
+            "set_value": 1.0,
+            "set_var": "",
+            "text": "Leave",
+            "text_ru": "Уйти"
+          }
+        ],
+        "expression_clip": "wave",
+        "frown": 0.0,
+        "id": "farewell",
+        "smile": 0.3499999940395355,
+        "speaker": "Warden Kane",
+        "text": "Good hunting. Signal once you reach the ridge beacon.",
+        "text_ru": "Удачной охоты. Подай сигнал, как доберёшься до маяка на хребте.",
+        "voice_clip_id": "farewell"
+      }
+    ]
+  },
+  "identity": {
+    "display_name": "Warden Kane",
+    "prompt": "athletic ranger with sharp jaw and weathered skin",
+    "role": "npc",
+    "seed": 1337,
+    "slug": "warden_kane"
+  },
+  "paint_strokes": [],
+  "schema": "vcr.character_package",
+  "sculpt_strokes": [],
+  "version": 1,
+  "voice": {
+    "breathiness": 0.11999999731779099,
+    "cadence_variance": 0.3499999940395355,
+    "pitch_hz": 122.0,
+    "speech_rate": 1.0,
+    "warmth": 0.550000011920929
+  },
+  "wardrobe": {
+    "accent_color": [
+      0.8199999928474426,
+      0.6399999856948853,
+      0.2800000011920929
+    ],
+    "bottom_style": "skirt",
+    "bottom_thickness": 0.014000000432133675,
+    "footwear_color": [
+      0.14000000059604645,
+      0.11999999731779099,
+      0.10999999940395355
+    ],
+    "footwear_style": "combat_boots",
+    "hair_color": [
+      0.1599999964237213,
+      0.10999999940395355,
+      0.07999999821186066
+    ],
+    "hair_style": "short_crop",
+    "has_beard": false,
+    "has_belt": true,
+    "has_cape": true,
+    "has_gloves": false,
+    "has_pauldrons": true,
+    "occlude_covered_body": true,
+    "primary_color": [
+      0.18000000715255737,
+      0.28999999165534973,
+      0.41999998688697815
+    ],
+    "primary_material": "tactical_weave",
+    "secondary_color": [
+      0.20000000298023224,
+      0.1899999976158142,
+      0.20999999344348907
+    ],
+    "secondary_material": "leather",
+    "top_style": "none",
+    "top_thickness": 0.01600000075995922,
+    "wear_and_tear": 0.15000000596046448
+  }
+}

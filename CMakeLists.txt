@@ -428,6 +428,9 @@ set(VCR_ENGINE_CORE_SOURCES
     src/render_fixture_scene.cpp
     src/navigation.cpp
     src/npc_ai.cpp
+    src/character_package.cpp
+    src/character_ai_bridge.cpp
+    src/vegetation_generator.cpp
 )
 
 add_library(vcr_engine SHARED ${VCR_ENGINE_CORE_SOURCES})
@@ -473,7 +476,7 @@ target_link_libraries(vcr_engine
         meshoptimizer
 )
 if(WIN32)
-    target_link_libraries(vcr_engine PRIVATE shell32)
+    target_link_libraries(vcr_engine PRIVATE shell32 winhttp)
 elseif(UNIX AND NOT APPLE)
     target_link_libraries(vcr_engine PRIVATE m dl)
 endif()
@@ -592,6 +595,27 @@ else()
     endif()
 endif()
 
+add_executable(vcr_char_cooker
+    tools/vcr_char_cooker.cpp
+)
+target_link_libraries(vcr_char_cooker PRIVATE
+    vcr_engine
+    glm::glm
+    nlohmann_json::nlohmann_json
+    Threads::Threads
+)
+if(WIN32)
+    target_link_libraries(vcr_char_cooker PRIVATE shell32)
+endif()
+target_compile_definitions(vcr_char_cooker PRIVATE
+    GLM_FORCE_DEPTH_ZERO_TO_ONE
+    GLM_FORCE_RADIANS
+)
+set_target_properties(vcr_char_cooker PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+vcr_apply_cxx_warning_flags(vcr_char_cooker)
+
 set(VCR_VULKAN_RENDERER_SOURCES
     src/fsr3_upscaler.cpp
     src/gpu_buffer.cpp
@@ -646,6 +670,68 @@ add_executable(vulkan_icon_tool
     src/gpu_buffer.cpp
     src/gpu_texture.cpp
     src/ui_texture_preview.cpp
+)
+
+add_executable(vulkan_vegetation_studio
+    src/vegetation_studio_main.cpp
+    src/vegetation_studio_application.cpp
+    src/vegetation_studio_mcp.cpp
+    src/editor_ui_kit.cpp
+    src/ui_texture_preview.cpp
+    ${VCR_VULKAN_RENDERER_SOURCES}
+)
+
+add_library(vcr_character_studio_shell STATIC
+    src/character_studio_shell.cpp
+    src/editor_ui_kit.cpp
+    ${VCR_VULKAN_RENDERER_SOURCES}
+)
+target_include_directories(vcr_character_studio_shell PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${vulkanmemoryallocator_SOURCE_DIR}/include"
+    "${vulkanheaders_SOURCE_DIR}/include"
+)
+if(VCR_HAS_FSR3)
+    target_include_directories(vcr_character_studio_shell PUBLIC
+        "${fidelityfxsdk_SOURCE_DIR}/ffx-api/include"
+    )
+    add_dependencies(vcr_character_studio_shell vcr_fidelityfx_runtime)
+endif()
+target_link_libraries(vcr_character_studio_shell PUBLIC
+    vcr_engine
+    vcr_imgui
+    vcr_window_icon
+    SDL3::SDL3-static
+    volk::volk
+    glm::glm
+    nlohmann_json::nlohmann_json
+    Threads::Threads
+    meshoptimizer
+)
+if(WIN32)
+    target_link_libraries(vcr_character_studio_shell PUBLIC shell32)
+endif()
+target_compile_definitions(vcr_character_studio_shell PUBLIC
+    VK_NO_PROTOTYPES
+    VMA_STATIC_VULKAN_FUNCTIONS=0
+    VMA_DYNAMIC_VULKAN_FUNCTIONS=1
+    GLM_FORCE_DEPTH_ZERO_TO_ONE
+    GLM_FORCE_RADIANS
+    VCR_EDITOR_ENABLED=1
+    "VCR_BUILD_TYPE=\"$<CONFIG>\""
+    "VCR_VALIDATION_DEFAULT=$<IF:$<OR:$<BOOL:${VCR_ENABLE_VALIDATION}>,$<CONFIG:Debug>>,1,0>"
+    "VCR_HAS_FSR3=$<IF:$<BOOL:${VCR_HAS_FSR3}>,1,0>"
+)
+vcr_apply_cxx_warning_flags(vcr_character_studio_shell)
+
+add_executable(vulkan_char_gen
+    src/char_gen_main.cpp
+)
+add_executable(vulkan_char_outfit
+    src/char_outfit_main.cpp
+)
+add_executable(vulkan_char_act
+    src/char_act_main.cpp
 )
 
 function(vcr_configure_executable target editor_enabled)
@@ -719,11 +805,19 @@ vcr_configure_executable(vulkan_cube 1)
 vcr_configure_executable(vulkan_editor 1)
 vcr_configure_executable(vulkan_project_manager 1)
 vcr_configure_executable(vulkan_icon_tool 1)
+vcr_configure_executable(vulkan_vegetation_studio 1)
+vcr_configure_executable(vulkan_char_gen 1)
+vcr_configure_executable(vulkan_char_outfit 1)
+vcr_configure_executable(vulkan_char_act 1)
 if(WIN32)
     target_sources(vulkan_cube PRIVATE resources/vulkan_cube.rc)
     target_sources(vulkan_editor PRIVATE resources/vulkan_editor.rc)
     target_sources(vulkan_project_manager PRIVATE resources/vulkan_project_manager.rc)
     target_sources(vulkan_icon_tool PRIVATE resources/vulkan_icon_tool.rc)
+    target_sources(vulkan_vegetation_studio PRIVATE resources/vulkan_vegetation_studio.rc)
+    target_sources(vulkan_char_gen PRIVATE resources/vulkan_char_suite.rc)
+    target_sources(vulkan_char_outfit PRIVATE resources/vulkan_char_suite.rc)
+    target_sources(vulkan_char_act PRIVATE resources/vulkan_char_suite.rc)
 endif()
 
 # Explicit GPU numerical gate; ordinary CPU CTest does not silently require a GPU.
@@ -791,6 +885,23 @@ target_link_libraries(
     vcr_imgui
     vcr_window_icon
 )
+target_link_libraries(
+    vulkan_vegetation_studio PRIVATE
+    vcr_imgui
+    vcr_window_icon
+)
+target_link_libraries(
+    vulkan_char_gen PRIVATE
+    vcr_character_studio_shell
+)
+target_link_libraries(
+    vulkan_char_outfit PRIVATE
+    vcr_character_studio_shell
+)
+target_link_libraries(
+    vulkan_char_act PRIVATE
+    vcr_character_studio_shell
+)
 
 # Both executables share one output directory. A single dependency target
 # prevents parallel post-build copy_directory commands from racing over the
@@ -827,6 +938,11 @@ add_dependencies(vulkan_cube vcr_runtime_assets)
 add_dependencies(vulkan_editor vcr_runtime_assets)
 add_dependencies(vulkan_project_manager vcr_runtime_assets)
 add_dependencies(vulkan_icon_tool vcr_runtime_assets)
+add_dependencies(vulkan_vegetation_studio vcr_runtime_assets)
+add_dependencies(vulkan_char_gen vcr_runtime_assets)
+add_dependencies(vulkan_char_outfit vcr_runtime_assets)
+add_dependencies(vulkan_char_act vcr_runtime_assets)
+add_dependencies(vcr_char_cooker vcr_runtime_assets)
 
 include(CTest)
 if(BUILD_TESTING)
@@ -1119,4 +1235,64 @@ if(BUILD_TESTING)
     add_dependencies(vcr_game_ui_localization_tests vulkan_cube vcr_runtime_assets)
     vcr_apply_cxx_warning_flags(vcr_game_ui_localization_tests)
     add_test(NAME vcr_game_ui_localization_tests COMMAND vcr_game_ui_localization_tests)
+
+    add_executable(vcr_character_suite_tests
+        tests/character_suite_tests.cpp
+    )
+    target_compile_definitions(vcr_character_suite_tests PRIVATE
+        GLM_FORCE_DEPTH_ZERO_TO_ONE
+        GLM_FORCE_RADIANS
+    )
+    target_link_libraries(
+        vcr_character_suite_tests PRIVATE
+        vcr_engine
+        glm::glm
+        nlohmann_json::nlohmann_json
+        Threads::Threads
+    )
+    set_target_properties(vcr_character_suite_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+    if(WIN32)
+        target_link_libraries(vcr_character_suite_tests PRIVATE shell32)
+    endif()
+    add_dependencies(
+        vcr_character_suite_tests
+        vulkan_char_gen
+        vulkan_char_outfit
+        vulkan_char_act
+        vcr_char_cooker
+        vcr_runtime_assets
+    )
+    vcr_apply_cxx_warning_flags(vcr_character_suite_tests)
+    add_test(NAME vcr_character_suite_tests COMMAND vcr_character_suite_tests)
+
+    add_executable(vcr_vegetation_studio_tests
+        tests/vegetation_studio_tests.cpp
+    )
+    target_compile_definitions(vcr_vegetation_studio_tests PRIVATE
+        GLM_FORCE_DEPTH_ZERO_TO_ONE
+        GLM_FORCE_RADIANS
+    )
+    target_link_libraries(
+        vcr_vegetation_studio_tests PRIVATE
+        vcr_engine
+        glm::glm
+        meshoptimizer
+        nlohmann_json::nlohmann_json
+        Threads::Threads
+    )
+    set_target_properties(vcr_vegetation_studio_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+    if(WIN32)
+        target_link_libraries(vcr_vegetation_studio_tests PRIVATE shell32)
+    endif()
+    add_dependencies(
+        vcr_vegetation_studio_tests
+        vulkan_vegetation_studio
+        vcr_runtime_assets
+    )
+    vcr_apply_cxx_warning_flags(vcr_vegetation_studio_tests)
+    add_test(NAME vcr_vegetation_studio_tests COMMAND vcr_vegetation_studio_tests)
 endif()
