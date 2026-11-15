@@ -1356,8 +1356,8 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_texture(const Prepare
     gpu_texture.average_linear = prepared.average_linear;
     gpu_texture.color_space = texture.color_space;
     gpu_texture.gpu_bytes = gpu_bytes;
+    std::uint32_t mip_levels = 1U;
     if (mipmaps_supported) {
-        std::uint32_t mip_levels = 1U;
         for (std::uint32_t extent =
                  std::max(texture.width, texture.height);
              extent > 1U;
@@ -1379,11 +1379,23 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_texture(const Prepare
             format,
             "editor imported material texture");
     }
+    const bool use_precomputed_mips =
+        mipmaps_supported &&
+        mip_levels > 1U &&
+        !prepared.mip_chain_rgba.empty() &&
+        prepared.mip_byte_offsets.size() == mip_levels;
+    const std::span<const std::uint8_t> upload_pixels = use_precomputed_mips
+        ? std::span<const std::uint8_t>{prepared.mip_chain_rgba}
+        : std::span<const std::uint8_t>{texture.pixels};
+    const std::span<const std::size_t> precomputed_mips = use_precomputed_mips
+        ? std::span<const std::size_t>{prepared.mip_byte_offsets}
+        : std::span<const std::size_t>{};
     upload_to_device_texture(
         gpu_texture.texture,
-        std::as_bytes(std::span{texture.pixels}),
+        std::as_bytes(upload_pixels),
         4U,
-        cache_key);
+        cache_key,
+        precomputed_mips);
 
     editor_texture_assets_.push_back(std::move(gpu_texture));
     editor_texture_gpu_bytes_ += gpu_bytes;
@@ -5767,15 +5779,39 @@ void Renderer::upload_to_device_texture(
     GpuTexture& destination,
     const std::span<const std::byte> pixels,
     const std::uint32_t bytes_per_pixel,
-    const std::string_view debug_name) {
+    const std::string_view debug_name,
+    const std::span<const std::size_t> precomputed_mip_offsets) {
     if (bytes_per_pixel == 0U) {
         fatal("Texture upload bytes-per-pixel must be non-zero.");
     }
-    const std::uint64_t expected_bytes =
+    const bool has_precomputed_mips =
+        !precomputed_mip_offsets.empty() &&
+        precomputed_mip_offsets.size() == destination.mip_levels() &&
+        destination.mip_levels() > 1U &&
+        destination.depth() == 1U;
+    std::uint64_t expected_bytes =
         static_cast<std::uint64_t>(destination.width()) *
         static_cast<std::uint64_t>(destination.height()) *
         static_cast<std::uint64_t>(destination.depth()) *
         bytes_per_pixel;
+    if (has_precomputed_mips) {
+        expected_bytes = 0ULL;
+        std::uint32_t lw = destination.width();
+        std::uint32_t lh = destination.height();
+        for (std::uint32_t level = 0U; level < destination.mip_levels(); ++level) {
+            const std::uint64_t level_bytes =
+                static_cast<std::uint64_t>(lw) *
+                static_cast<std::uint64_t>(lh) *
+                bytes_per_pixel;
+            if (precomputed_mip_offsets[level] > pixels.size_bytes() ||
+                level_bytes > pixels.size_bytes() - precomputed_mip_offsets[level]) {
+                fatal("Precomputed mipmap offset exceeds uploaded pixel buffer.");
+            }
+            expected_bytes += level_bytes;
+            lw = std::max(lw / 2U, 1U);
+            lh = std::max(lh / 2U, 1U);
+        }
+    }
     if (expected_bytes != pixels.size_bytes() ||
         expected_bytes > std::numeric_limits<VkDeviceSize>::max()) {
         std::cerr << "Texture upload mismatch for " << debug_name << '\n';
@@ -5812,6 +5848,51 @@ void Renderer::upload_to_device_texture(
         VK_ACCESS_2_TRANSFER_WRITE_BIT,
         0U,
         destination.mip_levels());
+    if (has_precomputed_mips) {
+        std::vector<VkBufferImageCopy> copy_regions;
+        copy_regions.reserve(destination.mip_levels());
+        std::uint32_t lw = destination.width();
+        std::uint32_t lh = destination.height();
+        for (std::uint32_t level = 0U; level < destination.mip_levels(); ++level) {
+            copy_regions.push_back(VkBufferImageCopy{
+                .bufferOffset = source_offset +
+                    static_cast<VkDeviceSize>(precomputed_mip_offsets[level]),
+                .bufferRowLength = 0U,
+                .bufferImageHeight = 0U,
+                .imageSubresource =
+                    VkImageSubresourceLayers{
+                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .mipLevel = level,
+                        .baseArrayLayer = 0U,
+                        .layerCount = 1U,
+                    },
+                .imageOffset = VkOffset3D{0, 0, 0},
+                .imageExtent = VkExtent3D{lw, lh, 1U},
+            });
+            lw = std::max(lw / 2U, 1U);
+            lh = std::max(lh / 2U, 1U);
+        }
+        vkCmdCopyBufferToImage(
+            command_buffer,
+            source,
+            destination.image(),
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            static_cast<std::uint32_t>(copy_regions.size()),
+            copy_regions.data());
+        transition_image(
+            command_buffer,
+            destination.image(),
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            0U,
+            destination.mip_levels());
+    } else {
     const VkBufferImageCopy copy_region{
         .bufferOffset = source_offset,
         .bufferRowLength = 0,
@@ -5931,6 +6012,7 @@ void Renderer::upload_to_device_texture(
         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
         final_level,
         1U);
+    }
     if (submission) {
         submission->submit_and_wait();
     }

@@ -1593,7 +1593,13 @@ void VegetationStudioApplication::execute_mcp_command(const VegMcpCommand& cmd) 
         }
         Json merged = serialize_vegetation_recipe_json(recipe_);
         for (const auto& [k, v] : patch.items()) {
-            merged[k] = v;
+            if (v.is_object() && merged.contains(k) && merged[k].is_object()) {
+                for (const auto& [sk, sv] : v.items()) {
+                    merged[k][sk] = sv;
+                }
+            } else {
+                merged[k] = v;
+            }
         }
         VegetationRecipe next{};
         std::string parse_err;
@@ -2394,6 +2400,29 @@ void VegetationStudioApplication::draw_left_panel() {
         changed |= ImGui::SliderFloat("Root Flare", &recipe_.trunk_flare, 0.0F, 1.0F, "%.2f");
         changed |= ImGui::SliderFloat("Bark Roughness", &recipe_.bark_roughness, 0.25F, 1.0F, "%.2f");
         changed |= ImGui::ColorEdit3("Bark Color", &recipe_.bark_color_srgb.x);
+
+        constexpr std::array<const char*, 6U> kBarkStyleLabels{
+            "Auto (Species)",
+            "Birch Paper",
+            "Fissured Oak",
+            "Scaly Pine",
+            "Fibrous Palm",
+            "Smooth Shrub",
+        };
+        const std::size_t bark_idx = std::min<std::size_t>(recipe_.bark_style, kBarkStyleLabels.size() - 1U);
+        if (ImGui::BeginCombo("Bark Texture", kBarkStyleLabels[bark_idx])) {
+            for (std::size_t i = 0U; i < kBarkStyleLabels.size(); ++i) {
+                const bool selected = (bark_idx == i);
+                if (ImGui::Selectable(kBarkStyleLabels[i], selected) && !selected) {
+                    recipe_.bark_style = static_cast<std::uint32_t>(i);
+                    changed = true;
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
     }
 
     if (recipe_.archetype == VegetationArchetype::broadleaf_tree ||
@@ -2434,9 +2463,34 @@ void VegetationStudioApplication::draw_left_panel() {
     }
 
     ui_kit_.section_header(EditorIcon::material, "Foliage & Seasonality");
+    if (recipe_.archetype != VegetationArchetype::grass_patch_gpu) {
+        constexpr std::array<const char*, 6U> kFoliageStyleLabels{
+            "Auto (Species)",
+            "Birch / Beech",
+            "Oak / Maple",
+            "Woodland Shrub",
+            "Conifer Needle",
+            "Palm Frond",
+        };
+        const std::size_t fol_idx = std::min<std::size_t>(recipe_.foliage_style, kFoliageStyleLabels.size() - 1U);
+        if (ImGui::BeginCombo("Foliage Texture", kFoliageStyleLabels[fol_idx])) {
+            for (std::size_t i = 0U; i < kFoliageStyleLabels.size(); ++i) {
+                const bool selected = (fol_idx == i);
+                if (ImGui::Selectable(kFoliageStyleLabels[i], selected) && !selected) {
+                    recipe_.foliage_style = static_cast<std::uint32_t>(i);
+                    changed = true;
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+    }
     changed |= ImGui::SliderFloat("Foliage Density", &recipe_.foliage_density, 0.2F, 2.0F, "%.2f");
     changed |= ImGui::SliderFloat("Cluster Scale", &recipe_.cluster_scale, 0.40F, 2.0F, "%.2f");
     changed |= ImGui::SliderFloat("Alpha Cutoff", &recipe_.alpha_cutoff, 0.10F, 0.90F, "%.2f");
+    changed |= ImGui::SliderFloat("Foliage Gloss", &recipe_.foliage_gloss, 0.0F, 1.0F, "%.2f");
     changed |= ImGui::ColorEdit3("Leaf Base", &recipe_.leaf_base_srgb.x);
     changed |= ImGui::ColorEdit3("Leaf Tip", &recipe_.leaf_tip_srgb.x);
     changed |= ImGui::ColorEdit3("Leaf Autumn", &recipe_.leaf_autumn_srgb.x);

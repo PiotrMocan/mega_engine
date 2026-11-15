@@ -424,6 +424,34 @@ bool CharacterStudioShell::parse_cli_args(
             }
             continue;
         }
+        if (arg == "--width") {
+            const auto val = require_value(i, arg);
+            if (!val) {
+                return false;
+            }
+            try {
+                out_args.width = std::clamp(
+                    static_cast<std::uint32_t>(std::stoul(*val)), 320U, 3840U);
+            } catch (...) {
+                out_error = "Invalid integer for --width: " + *val;
+                return false;
+            }
+            continue;
+        }
+        if (arg == "--height") {
+            const auto val = require_value(i, arg);
+            if (!val) {
+                return false;
+            }
+            try {
+                out_args.height = std::clamp(
+                    static_cast<std::uint32_t>(std::stoul(*val)), 240U, 2160U);
+            } catch (...) {
+                out_error = "Invalid integer for --height: " + *val;
+                return false;
+            }
+            continue;
+        }
         if (arg == "--ollama-host") {
             const auto val = require_value(i, arg);
             if (!val) {
@@ -720,10 +748,13 @@ void CharacterStudioShell::initialize_gui(
 
     LightingSettings studio_lighting{};
     studio_lighting.dynamic = true;
-    studio_lighting.voxel_gi = true;
+    studio_lighting.voxel_gi = false;
     studio_lighting.cycle = false;
-    studio_lighting.hour = 15.2;
-    studio_lighting.sky_intensity = 0.68F;
+    studio_lighting.hour = 13.0;
+    studio_lighting.sky_intensity = 0.48F;
+
+    AntiAliasingSettings studio_aa{};
+    studio_aa.method = AntiAliasingMethod::smaa;
 
     renderer_.initialize(
         context_,
@@ -732,7 +763,7 @@ void CharacterStudioShell::initialize_gui(
         RunMode::scene,
         1U,
         0U,
-        AntiAliasingSettings{},
+        studio_aa,
         !args.screenshot_path.empty(),
         true,
         true,
@@ -740,9 +771,10 @@ void CharacterStudioShell::initialize_gui(
         RenderFixture::none,
         ModelVertexFormat::automatic);
     static_cast<void>(renderer_.set_subsurface_mode(SubsurfaceMode::full_resolution));
+    static_cast<void>(renderer_.set_tone_mapper(ToneMapper::gt7));
     ExposureSettings studio_exposure{};
     studio_exposure.mode = ExposureMode::fixed;
-    studio_exposure.compensation_ev = -0.35F;
+    studio_exposure.compensation_ev = 0.15F;
     static_cast<void>(renderer_.set_exposure_settings(studio_exposure));
 
     // Audio failure in headless/no-speaker test environments stays non-fatal.
@@ -774,14 +806,10 @@ void CharacterStudioShell::initialize_gui(
     scene_models_.reserve(8U);
     scene_lights_.reserve(8U);
 
-    // Build clean 3-point studio lighting scene on a slate turntable plinth.
+    // Build clean 3-point front portrait studio lighting scene on a slate turntable plinth.
     preview_scene_ = SceneDocument{};
     const SceneNodeId env_id = preview_scene_.create_node("StudioSky", SceneNodeKind::environment);
     static_cast<void>(env_id);
-    const SceneNodeId sun_id = preview_scene_.create_node("KeySun", SceneNodeKind::directional_light);
-    if (auto n = preview_scene_.node(sun_id)) {
-        n->get().transform.rotation_degrees = glm::vec3(-38.0F, 38.0F, 0.0F);
-    }
     const SceneNodeId floor_id = preview_scene_.create_node("StudioPlinth", SceneNodeKind::ground);
     if (auto n = preview_scene_.node(floor_id)) {
         n->get().transform.translation = glm::vec3(0.0F, -0.025F, 0.0F);
@@ -790,19 +818,26 @@ void CharacterStudioShell::initialize_gui(
         n->get().material.roughness = 0.72F;
         n->get().material.metallic = 0.08F;
     }
+    const SceneNodeId key_id = preview_scene_.create_node("StudioKey", SceneNodeKind::point_light);
+    if (auto n = preview_scene_.node(key_id)) {
+        n->get().transform.translation = glm::vec3(1.55F, 1.92F, 2.35F);
+        n->get().light.color = glm::vec3(1.00F, 0.96F, 0.92F);
+        n->get().light.intensity_candela = 18.0F;
+        n->get().light.range = 10.0F;
+    }
     const SceneNodeId fill_id = preview_scene_.create_node("StudioFill", SceneNodeKind::point_light);
     if (auto n = preview_scene_.node(fill_id)) {
-        n->get().transform.translation = glm::vec3(-1.9F, 1.65F, 2.2F);
-        n->get().light.color = glm::vec3(1.0F, 0.94F, 0.88F);
-        n->get().light.intensity_candela = 65.0F;
-        n->get().light.range = 8.0F;
+        n->get().transform.translation = glm::vec3(-1.95F, 1.48F, 2.30F);
+        n->get().light.color = glm::vec3(0.90F, 0.95F, 1.00F);
+        n->get().light.intensity_candela = 7.5F;
+        n->get().light.range = 10.0F;
     }
     const SceneNodeId rim_id = preview_scene_.create_node("StudioRim", SceneNodeKind::point_light);
     if (auto n = preview_scene_.node(rim_id)) {
-        n->get().transform.translation = glm::vec3(-1.5F, 2.05F, -1.8F);
-        n->get().light.color = glm::vec3(0.68F, 0.82F, 1.0F);
-        n->get().light.intensity_candela = 135.0F;
-        n->get().light.range = 8.0F;
+        n->get().transform.translation = glm::vec3(-1.15F, 2.25F, -1.45F);
+        n->get().light.color = glm::vec3(0.88F, 0.93F, 1.00F);
+        n->get().light.intensity_candela = 4.2F;
+        n->get().light.range = 7.5F;
     }
     preview_node_id_ = preview_scene_.create_node("CharacterPreview", SceneNodeKind::model);
 
@@ -959,7 +994,7 @@ void CharacterStudioShell::rebuild_preview_assets(bool full_gpu_reload) {
     renderer_.reset_editor_asset_cache();
 
     CharacterCookOptions opts{};
-    opts.texture_resolution = 512U;
+    opts.texture_resolution = 1024U;
     opts.bake_voice_lines = false;
     opts.generate_prefabs = false;
     opts.generate_localization = false;
@@ -983,7 +1018,7 @@ void CharacterStudioShell::rebuild_preview_assets(bool full_gpu_reload) {
 }
 
 void CharacterStudioShell::update_orbit_camera() noexcept {
-    orbit_distance_ = std::clamp(orbit_distance_, 0.45F, 6.5F);
+    orbit_distance_ = std::clamp(orbit_distance_, 0.35F, 6.5F);
     orbit_elevation_ = std::clamp(orbit_elevation_, -1.25F, 1.35F);
 
     const float cos_el = std::cos(orbit_elevation_);
@@ -999,29 +1034,33 @@ void CharacterStudioShell::update_orbit_camera() noexcept {
 }
 
 void CharacterStudioShell::focus_camera_full_body() noexcept {
+    static_cast<void>(renderer_.set_vertical_fov_degrees(40.0F));
     const float h = std::clamp(package_.body.height_meters, 1.2F, 2.5F);
     orbit_target_ = glm::vec3(0.0F, h * 0.50F, 0.0F);
-    orbit_distance_ = std::max(1.85F, h * 1.32F);
+    orbit_distance_ = std::max(2.15F, h * 1.48F);
     orbit_azimuth_ = 0.20F;
-    orbit_elevation_ = 0.10F;
+    orbit_elevation_ = 0.08F;
     update_orbit_camera();
 }
 
 void CharacterStudioShell::focus_camera_face() noexcept {
+    static_cast<void>(renderer_.set_vertical_fov_degrees(34.0F));
     const float h = std::clamp(package_.body.height_meters, 1.2F, 2.5F);
     glm::vec3 target(0.0F, h * 0.905F, 0.03F);
     if (preview_mesh_.skeleton.bones.size() > 44U) {
-        const glm::vec3 eye_l = -glm::vec3(preview_mesh_.skeleton.bones[43].inverse_bind_matrix[3]);
-        const glm::vec3 eye_r = -glm::vec3(preview_mesh_.skeleton.bones[44].inverse_bind_matrix[3]);
+        const glm::vec3 eye_l = glm::vec3(
+            glm::inverse(preview_mesh_.skeleton.bones[43].inverse_bind_matrix)[3]);
+        const glm::vec3 eye_r = glm::vec3(
+            glm::inverse(preview_mesh_.skeleton.bones[44].inverse_bind_matrix)[3]);
         const glm::vec3 eye_mid = 0.5F * (eye_l + eye_r);
         if (std::isfinite(eye_mid.y) && eye_mid.y > 0.5F) {
-            target = eye_mid + glm::vec3(0.0F, -0.018F, 0.012F);
+            target = eye_mid + glm::vec3(0.0F, -0.015F, 0.010F);
         }
     }
     orbit_target_ = target;
-    orbit_distance_ = 0.48F;
-    orbit_azimuth_ = 0.10F;
-    orbit_elevation_ = 0.03F;
+    orbit_distance_ = 0.56F;
+    orbit_azimuth_ = 0.16F;
+    orbit_elevation_ = 0.04F;
     update_orbit_camera();
 }
 

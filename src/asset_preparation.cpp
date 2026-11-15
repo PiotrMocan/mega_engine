@@ -8,6 +8,187 @@
 #include <exception>
 
 namespace vcr {
+namespace {
+void build_coverage_preserving_mips(
+    const CookedTextureAsset &base,
+    const float alpha_cutoff,
+    PreparedTexture &entry,
+    std::size_t &in_out_upload_bytes) {
+    if (base.width <= 1U && base.height <= 1U) {
+        return;
+    }
+    const std::size_t mip0_texels =
+        static_cast<std::size_t>(base.width) * static_cast<std::size_t>(base.height);
+    if (mip0_texels == 0U ||
+        base.pixels.size() != mip0_texels * 4U ||
+        !(alpha_cutoff > 0.0F && alpha_cutoff < 1.0F)) {
+        return;
+    }
+
+    std::uint32_t mip_levels = 1U;
+    for (std::uint32_t extent = std::max(base.width, base.height); extent > 1U; extent >>= 1U) {
+        ++mip_levels;
+    }
+    if (mip_levels < 2U) {
+        return;
+    }
+
+    std::size_t c0_count = 0U;
+    for (std::size_t i = 0U; i < mip0_texels; ++i) {
+        const float alpha = static_cast<float>(base.pixels[i * 4U + 3U]) / 255.0F;
+        if (alpha >= alpha_cutoff) {
+            ++c0_count;
+        }
+    }
+    const double c0 = static_cast<double>(c0_count) / static_cast<double>(mip0_texels);
+    if (c0 <= 0.001 || c0 >= 0.999) {
+        return;
+    }
+
+    std::size_t total_bytes = 0U;
+    std::uint32_t lw = base.width;
+    std::uint32_t lh = base.height;
+    for (std::uint32_t lvl = 0U; lvl < mip_levels; ++lvl) {
+        const std::size_t level_bytes =
+            static_cast<std::size_t>(lw) * static_cast<std::size_t>(lh) * 4U;
+        if (level_bytes > maximum_prepared_asset_bytes - total_bytes) {
+            return;
+        }
+        total_bytes += level_bytes;
+        lw = std::max(1U, lw >> 1U);
+        lh = std::max(1U, lh >> 1U);
+    }
+
+    const std::size_t extra_bytes = total_bytes - base.pixels.size();
+    if (extra_bytes > maximum_prepared_asset_bytes - in_out_upload_bytes) {
+        return;
+    }
+    in_out_upload_bytes += extra_bytes;
+
+    entry.mip_chain_rgba.resize(total_bytes);
+    entry.mip_byte_offsets.clear();
+    entry.mip_byte_offsets.reserve(mip_levels);
+    entry.mip_byte_offsets.push_back(0U);
+    std::copy(base.pixels.begin(), base.pixels.end(), entry.mip_chain_rgba.begin());
+
+    std::vector<float> prev_raw_alpha(mip0_texels);
+    for (std::size_t i = 0U; i < mip0_texels; ++i) {
+        prev_raw_alpha[i] = static_cast<float>(base.pixels[i * 4U + 3U]) / 255.0F;
+    }
+
+    std::uint32_t prev_w = base.width;
+    std::uint32_t prev_h = base.height;
+    std::size_t prev_offset = 0U;
+    std::size_t write_offset = base.pixels.size();
+
+    for (std::uint32_t lvl = 1U; lvl < mip_levels; ++lvl) {
+        const std::uint32_t cur_w = std::max(1U, prev_w >> 1U);
+        const std::uint32_t cur_h = std::max(1U, prev_h >> 1U);
+        const std::size_t cur_texels =
+            static_cast<std::size_t>(cur_w) * static_cast<std::size_t>(cur_h);
+        entry.mip_byte_offsets.push_back(write_offset);
+
+        std::vector<float> cur_raw_alpha(cur_texels, 0.0F);
+        for (std::uint32_t y = 0U; y < cur_h; ++y) {
+            const std::uint32_t sy0 = std::min(prev_h - 1U, y * 2U);
+            const std::uint32_t sy1 = std::min(prev_h - 1U, y * 2U + 1U);
+            for (std::uint32_t x = 0U; x < cur_w; ++x) {
+                const std::uint32_t sx0 = std::min(prev_w - 1U, x * 2U);
+                const std::uint32_t sx1 = std::min(prev_w - 1U, x * 2U + 1U);
+
+                const std::size_t idx00 =
+                    static_cast<std::size_t>(sy0) * prev_w + sx0;
+                const std::size_t idx10 =
+                    static_cast<std::size_t>(sy0) * prev_w + sx1;
+                const std::size_t idx01 =
+                    static_cast<std::size_t>(sy1) * prev_w + sx0;
+                const std::size_t idx11 =
+                    static_cast<std::size_t>(sy1) * prev_w + sx1;
+
+                const std::size_t ids[4] = {idx00, idx10, idx01, idx11};
+                float sum_a = 0.0F;
+                float sum_r = 0.0F;
+                float sum_g = 0.0F;
+                float sum_b = 0.0F;
+                float raw_r = 0.0F;
+                float raw_g = 0.0F;
+                float raw_b = 0.0F;
+                for (const std::size_t sidx : ids) {
+                    const float pa = prev_raw_alpha[sidx];
+                    const std::size_t b = prev_offset + sidx * 4U;
+                    const float pr = static_cast<float>(entry.mip_chain_rgba[b + 0U]);
+                    const float pg = static_cast<float>(entry.mip_chain_rgba[b + 1U]);
+                    const float pb = static_cast<float>(entry.mip_chain_rgba[b + 2U]);
+                    sum_a += pa;
+                    sum_r += pr * pa;
+                    sum_g += pg * pa;
+                    sum_b += pb * pa;
+                    raw_r += pr;
+                    raw_g += pg;
+                    raw_b += pb;
+                }
+
+                const std::size_t dst_idx = static_cast<std::size_t>(y) * cur_w + x;
+                cur_raw_alpha[dst_idx] = 0.25F * sum_a;
+
+                float out_r = 0.0F;
+                float out_g = 0.0F;
+                float out_b = 0.0F;
+                if (sum_a > 1.0e-4F) {
+                    const float inv_a = 1.0F / sum_a;
+                    out_r = sum_r * inv_a;
+                    out_g = sum_g * inv_a;
+                    out_b = sum_b * inv_a;
+                } else {
+                    out_r = 0.25F * raw_r;
+                    out_g = 0.25F * raw_g;
+                    out_b = 0.25F * raw_b;
+                }
+                const std::size_t out_b_idx = write_offset + dst_idx * 4U;
+                entry.mip_chain_rgba[out_b_idx + 0U] =
+                    static_cast<std::uint8_t>(std::clamp(std::lround(out_r), 0L, 255L));
+                entry.mip_chain_rgba[out_b_idx + 1U] =
+                    static_cast<std::uint8_t>(std::clamp(std::lround(out_g), 0L, 255L));
+                entry.mip_chain_rgba[out_b_idx + 2U] =
+                    static_cast<std::uint8_t>(std::clamp(std::lround(out_b), 0L, 255L));
+            }
+        }
+
+        const double target_cov = (lvl >= 3U) ? std::min(0.98, c0 * 1.03) : c0;
+        float lo = 0.5F;
+        float hi = 4.0F;
+        for (int iter = 0; iter < 14; ++iter) {
+            const float mid = 0.5F * (lo + hi);
+            std::size_t pass_count = 0U;
+            for (const float a : cur_raw_alpha) {
+                if (std::clamp(a * mid, 0.0F, 1.0F) >= alpha_cutoff) {
+                    ++pass_count;
+                }
+            }
+            const double cov =
+                static_cast<double>(pass_count) / static_cast<double>(cur_texels);
+            if (cov < target_cov) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        const float scale = 0.5F * (lo + hi);
+        for (std::size_t i = 0U; i < cur_texels; ++i) {
+            const float scaled_a = std::clamp(cur_raw_alpha[i] * scale, 0.0F, 1.0F);
+            entry.mip_chain_rgba[write_offset + i * 4U + 3U] =
+                static_cast<std::uint8_t>(std::clamp(std::lround(scaled_a * 255.0F), 0L, 255L));
+        }
+
+        prev_w = cur_w;
+        prev_h = cur_h;
+        prev_offset = write_offset;
+        write_offset += cur_texels * 4U;
+        prev_raw_alpha = std::move(cur_raw_alpha);
+    }
+}
+} // namespace
+
 PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,
     const std::span<const std::string> resident_textures) {
     PreparedModel result{.root = std::move(root), .path = std::move(path)};
@@ -72,16 +253,27 @@ PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,
             return result;
         }
         const auto texture = [&](const std::optional<std::filesystem::path> &reference,
-                                 const bool needs_opacity_pixels = false) {
+                                 const bool needs_opacity_pixels = false,
+                                 const float alpha_cutoff = 0.0F) {
             if (!reference) {
                 return;
             }
             const auto key = reference->lexically_normal().generic_string();
-            if (!needs_opacity_pixels && std::ranges::find(resident_textures, key) != resident_textures.end()) {
+            const bool is_resident =
+                std::ranges::find(resident_textures, key) != resident_textures.end();
+            if (!needs_opacity_pixels && is_resident) {
                 return;
             }
-            if (std::ranges::any_of(result.textures,
-                                    [&](const auto &t) { return t.path == key; })) {
+            const auto existing = std::ranges::find_if(
+                result.textures, [&](const auto &t) { return t.path == key; });
+            if (existing != result.textures.end()) {
+                if (!is_resident &&
+                    existing->texture.has_value() &&
+                    existing->mip_chain_rgba.empty() &&
+                    alpha_cutoff > 0.0F && alpha_cutoff < 1.0F) {
+                    build_coverage_preserving_mips(
+                        *existing->texture, alpha_cutoff, *existing, result.upload_bytes);
+                }
                 return;
             }
             PreparedTexture entry{.path = key};
@@ -97,6 +289,10 @@ PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,
             } else {
                 result.upload_bytes += decoded->pixels.size() + 256;
                 entry.texture = std::move(decoded).value();
+                if (!is_resident && alpha_cutoff > 0.0F && alpha_cutoff < 1.0F) {
+                    build_coverage_preserving_mips(
+                        *entry.texture, alpha_cutoff, entry, result.upload_bytes);
+                }
                 const auto &pixels = entry.texture->pixels;
                 if (!pixels.empty()) {
                     glm::vec3 sum(0);
@@ -118,7 +314,15 @@ PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,
             result.textures.push_back(std::move(entry));
         };
         for (const auto &material : model.materials) {
-            texture(material.base_color_texture, (material.coverage & 1U) != 0U);
+            const bool is_alpha_masked =
+                (material.coverage & material_coverage_alpha_mask_bit) != 0U;
+            const std::uint32_t packed_cutoff = material.coverage >> 16U;
+            const float alpha_cutoff = is_alpha_masked
+                ? ((packed_cutoff > 0U)
+                       ? (static_cast<float>(packed_cutoff) / 65535.0F)
+                       : 0.5F)
+                : 0.0F;
+            texture(material.base_color_texture, is_alpha_masked, alpha_cutoff);
             texture(material.normal_texture);
             texture(material.metallic_roughness_texture);
             texture(material.displacement_texture);

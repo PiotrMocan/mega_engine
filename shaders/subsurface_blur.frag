@@ -19,7 +19,7 @@ const int maximumKernelRadius = 24;
 uint decodeProfile(float control)
 {
     if (isnan(control) || isinf(control) || control < 256.0) return 0u;
-    return min(uint(round(control)) / 256u, 4u);
+    return min(uint(round(control)) / 256u, 5u);
 }
 
 vec3 profileSigma(uint profile)
@@ -28,6 +28,7 @@ vec3 profileSigma(uint profile)
     if (profile == 2u) return vec3(0.06, 0.028, 0.012);
     if (profile == 3u) return vec3(0.15, 0.075, 0.032);
     if (profile == 4u) return vec3(0.035, 0.060, 0.014);
+    if (profile == 5u) return vec3(0.0028, 0.0011, 0.00055);
     return vec3(0.0);
 }
 
@@ -74,6 +75,48 @@ void main()
         centerDistance / pushConstants.depthParameters.z, 1.0e-6);
     const vec3 sigma = profileSigma(profile);
     const float maximumSigma = max(sigma.x, max(sigma.y, sigma.z));
+    if (profile == 5u)
+    {
+        const float stepF = clamp((2.6 * maximumSigma / worldPerPixel) / 5.0, 0.0, 1.5);
+        if (stepF < 0.35)
+        {
+#ifdef VCR_SSS_VERTICAL
+            outColor = vec4(base.rgb + centerSource.rgb, base.a);
+#else
+            outColor = centerSource;
+#endif
+            return;
+        }
+        const float depthThreshold = max(
+            pushConstants.depthParameters.w * maximumSigma, 2.0 * worldPerPixel);
+        vec3 weighted = vec3(0.0);
+        vec3 weightSum = vec3(0.0);
+        for (int tap = -5; tap <= 5; ++tap)
+        {
+            const int offset = int(round(float(tap) * stepF));
+            const ivec2 samplePixel = clamp(
+                pixel + axis * offset, ivec2(0), extent - 1);
+            const vec4 sampleValue = texelFetch(subsurfaceDiffuse, samplePixel, 0);
+            if (decodeProfile(sampleValue.a) != profile) continue;
+            const float sampleDepth = texelFetch(sceneDepth, samplePixel, 0).r;
+            const float sampleDistance = linearViewDistance(sampleDepth);
+            if (abs(sampleDistance - centerDistance) > depthThreshold) continue;
+
+            const float distanceAlongAxis = abs(float(tap) * stepF) * worldPerPixel;
+            const vec3 normalizedDistance = distanceAlongAxis / max(sigma, vec3(1.0e-6));
+            const vec3 weight = exp(-0.5 * normalizedDistance * normalizedDistance);
+            weighted += sampleValue.rgb * weight;
+            weightSum += weight;
+        }
+        const vec3 filtered = weighted / max(weightSum, vec3(1.0e-6));
+#ifdef VCR_SSS_VERTICAL
+        outColor = vec4(min(base.rgb + filtered, vec3(65504.0)), base.a);
+#else
+        outColor = vec4(min(filtered, vec3(65504.0)), centerOriginal.a);
+#endif
+        return;
+    }
+
     const int pixelStep = clamp(
         int(round(maximumSigma / worldPerPixel)),
         0,

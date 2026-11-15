@@ -24,7 +24,7 @@ inline constexpr std::uint32_t character_package_version = 1U;
 inline constexpr std::uint32_t character_body_bone_count = 38U;
 inline constexpr std::uint32_t character_face_bone_count = 12U;
 inline constexpr std::uint32_t character_total_bone_count = 50U;
-inline constexpr std::uint32_t character_default_texture_size = 512U;
+inline constexpr std::uint32_t character_default_texture_size = 1024U;
 
 enum class CharacterRole : std::uint8_t {
     npc = 0U,
@@ -226,18 +226,19 @@ struct CharacterPaintStroke {
 };
 
 struct CharacterWardrobeSpec {
-    TopGarmentStyle top_style = TopGarmentStyle::jacket;
-    BottomGarmentStyle bottom_style = BottomGarmentStyle::cargo_pants;
-    FootwearStyle footwear_style = FootwearStyle::combat_boots;
+    TopGarmentStyle top_style = TopGarmentStyle::none;
+    BottomGarmentStyle bottom_style = BottomGarmentStyle::none;
+    FootwearStyle footwear_style = FootwearStyle::barefoot;
     HairStyle hair_style = HairStyle::short_crop;
     OutfitMaterialPreset primary_material = OutfitMaterialPreset::tactical_weave;
     OutfitMaterialPreset secondary_material = OutfitMaterialPreset::leather;
-    bool has_belt = true;
+    bool has_belt = false;
     bool has_pauldrons = false;
     bool has_gloves = false;
     bool has_cape = false;
     bool has_beard = false;
     bool occlude_covered_body = true;
+    bool studio_underwear = true;
     glm::vec3 primary_color{0.18F, 0.29F, 0.42F};
     glm::vec3 secondary_color{0.20F, 0.19F, 0.21F};
     glm::vec3 accent_color{0.82F, 0.64F, 0.28F};

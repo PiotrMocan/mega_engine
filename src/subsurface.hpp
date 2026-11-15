@@ -20,10 +20,11 @@ enum class SubsurfaceProfile : std::uint32_t {
     medium = 2,
     wide = 3,
     foliage = 4,
+    skin = 5,
 };
 
 inline constexpr std::uint32_t maximum_subsurface_profile =
-    static_cast<std::uint32_t>(SubsurfaceProfile::foliage);
+    static_cast<std::uint32_t>(SubsurfaceProfile::skin);
 
 [[nodiscard]] constexpr std::string_view to_token(
     const SubsurfaceMode mode) noexcept {
@@ -45,6 +46,7 @@ inline constexpr std::uint32_t maximum_subsurface_profile =
     case SubsurfaceProfile::medium: return "medium";
     case SubsurfaceProfile::wide: return "wide";
     case SubsurfaceProfile::foliage: return "foliage";
+    case SubsurfaceProfile::skin: return "skin";
     }
     return "none";
 }
@@ -56,6 +58,7 @@ parse_subsurface_profile(const std::string_view token) noexcept {
     if (token == "medium") return SubsurfaceProfile::medium;
     if (token == "wide") return SubsurfaceProfile::wide;
     if (token == "foliage") return SubsurfaceProfile::foliage;
+    if (token == "skin") return SubsurfaceProfile::skin;
     return std::nullopt;
 }
 
@@ -71,6 +74,7 @@ struct SubsurfaceProfileParameters {
     case SubsurfaceProfile::medium: return {{0.06F, 0.028F, 0.012F}};
     case SubsurfaceProfile::wide: return {{0.15F, 0.075F, 0.032F}};
     case SubsurfaceProfile::foliage: return {{0.035F, 0.060F, 0.014F}};
+    case SubsurfaceProfile::skin: return {{0.034F, 0.014F, 0.007F}};
     case SubsurfaceProfile::none: break;
     }
     return {{0.0F, 0.0F, 0.0F}};

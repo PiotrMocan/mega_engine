@@ -112,7 +112,16 @@ void main()
 {
     // Derivatives after nonuniform discard are undefined. All material maps
     // share authored UVs, so compute their gradients before applying coverage.
-    const vec2 uvDx = dFdx(inUv), uvDy = dFdy(inUv);
+    const vec2 rawUvDx = dFdx(inUv);
+    const vec2 rawUvDy = dFdy(inUv);
+    const bool seamX = dot(rawUvDx, rawUvDx) > 0.0036;
+    const bool seamY = dot(rawUvDy, rawUvDy) > 0.0036;
+    const vec2 uvDx = seamX
+        ? (seamY ? vec2(0.0008, 0.0) : clamp(vec2(-rawUvDy.y, rawUvDy.x), vec2(-0.0025), vec2(0.0025)))
+        : rawUvDx;
+    const vec2 uvDy = seamY
+        ? (seamX ? vec2(0.0, 0.0008) : clamp(vec2(rawUvDx.y, -rawUvDx.x), vec2(-0.0025), vec2(0.0025)))
+        : rawUvDy;
 #if !defined(VCR_OPAQUE_EARLY_Z) && !defined(VCR_TRANSPARENT_PASS)
     if (!lodKeep(inLodToken, uvec2(gl_FragCoord.xy))) discard;
 #endif
@@ -142,16 +151,27 @@ void main()
             inMaterialParameters.y * sampledMetallicRoughness.g,
             inMaterialParameters.z * ((pushConstants.padding & 4u) != 0u
                 ? sampledMetallicRoughness.r : 1.0));
-        lightingComponents = evaluateLitSurfaceComponents(
-            clampedBaseColor,
-            surfaceMaterialParameters,
-            surfaceNormal,
-            geomNormal,
-            inWorldPosition,
-            inDielectricF0,
-            inMaterialModel,
-            inSubsurfaceProfile,
-            inSubsurfaceStrength);
+        if (inMaterialModel == 4u) {
+            lightingComponents = evaluateHairSurfaceComponents(
+                clampedBaseColor,
+                surfaceMaterialParameters,
+                geomNormal,
+                geomNormal,
+                inWorldTangent,
+                inWorldPosition,
+                inDielectricF0);
+        } else {
+            lightingComponents = evaluateLitSurfaceComponents(
+                clampedBaseColor,
+                surfaceMaterialParameters,
+                surfaceNormal,
+                geomNormal,
+                inWorldPosition,
+                inDielectricF0,
+                inMaterialModel,
+                inSubsurfaceProfile,
+                inSubsurfaceStrength);
+        }
         shadedColor = lightingComponents.diffuse + lightingComponents.specular;
     }
 

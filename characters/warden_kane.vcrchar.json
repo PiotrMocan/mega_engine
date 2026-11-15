@@ -14,44 +14,44 @@
   },
   "body": {
     "age_wear": 0.18409478664398193,
-    "archetype": "stylized_hero",
-    "arm_length": 0.5,
-    "body_fat": 0.07999999821186066,
-    "chest_depth": 0.5,
+    "archetype": "human_athletic",
+    "arm_length": 0.10000000149011612,
+    "body_fat": 0.0,
+    "chest_depth": 0.10000000149011612,
     "face": {
-      "brow_ridge": 0.44999998807907104,
+      "brow_ridge": 1.0,
       "cheekbone_prominence": 0.75,
-      "chin_length": 0.5,
+      "chin_length": 1.0,
       "eye_color": [
-        0.20000000298023224,
-        0.46000000834465027,
-        0.7200000286102295
+        0.23999999463558197,
+        0.4399999976158142,
+        0.5799999833106995
       ],
-      "eye_size": 0.550000011920929,
+      "eye_size": 0.5,
       "eye_spacing": 0.5,
       "head_scale": 1.0,
       "jaw_width": 0.5,
-      "lip_fullness": 0.5,
-      "mouth_width": 0.5,
-      "nose_length": 0.5,
-      "nose_width": 0.44999998807907104
+      "lip_fullness": 1.0,
+      "mouth_width": 1.0,
+      "nose_length": 0.28999999165534973,
+      "nose_width": 0.2800000011920929
     },
     "freckles": 0.07999999821186066,
     "gender": "male",
-    "height_meters": 1.7972688674926758,
-    "hip_width": 0.4802955687046051,
-    "leg_length": 0.5,
-    "lip_tint": 0.30000001192092896,
-    "musculature": 0.4000000059604645,
-    "shoulder_width": 0.41999998688697815,
+    "height_meters": 2.2100000381469727,
+    "hip_width": 0.10000000149011612,
+    "leg_length": 1.0,
+    "lip_tint": 0.3799999952316284,
+    "musculature": 0.0,
+    "shoulder_width": 0.10000000149011612,
     "skin_color": [
-      0.8199999928474426,
-      0.6299999952316284,
+      0.800000011920929,
+      0.6200000047683716,
       0.5099999904632568
     ],
-    "skin_roughness": 0.5400000214576721,
-    "skin_subsurface_strength": 0.6499999761581421,
-    "waist_width": 0.3400000035762787
+    "skin_roughness": 0.550000011920929,
+    "skin_subsurface_strength": 0.7799999713897705,
+    "waist_width": 0.10000000149011612
   },
   "dialogue": {
     "dialogue_id": "warden_kane_dialogue",
@@ -154,25 +154,25 @@
       0.6399999856948853,
       0.2800000011920929
     ],
-    "bottom_style": "skirt",
+    "bottom_style": "none",
     "bottom_thickness": 0.014000000432133675,
     "footwear_color": [
       0.14000000059604645,
       0.11999999731779099,
       0.10999999940395355
     ],
-    "footwear_style": "combat_boots",
+    "footwear_style": "barefoot",
     "hair_color": [
-      0.1599999964237213,
-      0.10999999940395355,
-      0.07999999821186066
+      0.12999999523162842,
+      0.09000000357627869,
+      0.05999999865889549
     ],
     "hair_style": "short_crop",
-    "has_beard": false,
-    "has_belt": true,
-    "has_cape": true,
+    "has_beard": true,
+    "has_belt": false,
+    "has_cape": false,
     "has_gloves": false,
-    "has_pauldrons": true,
+    "has_pauldrons": false,
     "occlude_covered_body": true,
     "primary_color": [
       0.18000000715255737,
@@ -186,8 +186,9 @@
       0.20999999344348907
     ],
     "secondary_material": "leather",
+    "studio_underwear": true,
     "top_style": "none",
     "top_thickness": 0.01600000075995922,
-    "wear_and_tear": 0.15000000596046448
+    "wear_and_tear": 0.0
   }
 }

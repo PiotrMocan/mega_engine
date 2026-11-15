@@ -92,7 +92,7 @@ float sunSubsurfaceTransmittanceAt(
     float subsurfaceStrength)
 {
     if (materialModel != 2u || subsurfaceProfile == 0u ||
-        subsurfaceProfile > 4u || subsurfaceStrength <= 0.0)
+        subsurfaceProfile > 5u || subsurfaceStrength <= 0.0)
     {
         return directVis;
     }
@@ -242,6 +242,8 @@ PbrLightingComponents evaluateLitSurfaceComponents(
     lightingComponents.specular += punctual.specular;
     return lightingComponents;
 }
+
+#include "hair_lighting.glsl"
 
 void applySurfaceWorkloadModulation(
     uint instanceIndex,

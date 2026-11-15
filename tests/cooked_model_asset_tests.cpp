@@ -410,9 +410,21 @@ int main() {
                        vcr::SubsurfaceProfile::foliage &&
                    foliage_subsurface->materials[0].factors.subsurface_strength == 0.78F,
                "cooked foliage subsurface profile loads cleanly");
+
+        subsurface.material["pbr"]["subsurface_profile"] = "skin";
+        subsurface.material["pbr"]["subsurface_strength"] = 0.62F;
+        expect(write_json(subsurface.material_absolute, subsurface.material),
+               "skin subsurface material written");
+        const auto skin_subsurface = vcr::load_cooked_model_asset(
+            asset_root, subsurface.metadata_relative);
+        expect(skin_subsurface &&
+                   skin_subsurface->materials[0].factors.subsurface_profile ==
+                       vcr::SubsurfaceProfile::skin &&
+                   skin_subsurface->materials[0].factors.subsurface_strength == 0.62F,
+               "cooked skin subsurface profile loads cleanly");
     }
     const std::array invalid_profiles{
-        Json(""), Json("Medium"), Json("medium "), Json("skin"),
+        Json(""), Json("Medium"), Json("medium "), Json("wax"),
         Json(nullptr), Json(true), Json(1), Json::array({"medium"}),
         Json::object()};
     for (const auto& profile : invalid_profiles) {

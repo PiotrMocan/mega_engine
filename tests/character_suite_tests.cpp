@@ -13,6 +13,7 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -374,6 +375,127 @@ bool test_female_and_male_templates_morphs_and_ai() {
     return true;
 }
 
+bool test_production_skin_eyes_and_strand_groom() {
+    vcr::CharacterPackage pkg = vcr::make_default_character_package("prod_check", "Prod");
+    VCR_EXPECT(pkg.wardrobe.top_style == vcr::TopGarmentStyle::none,
+               "Default character must defer top clothing");
+    VCR_EXPECT(pkg.wardrobe.bottom_style == vcr::BottomGarmentStyle::none,
+               "Default character must defer bottom clothing");
+    VCR_EXPECT(pkg.wardrobe.footwear_style == vcr::FootwearStyle::barefoot,
+               "Default character must default to barefoot");
+    VCR_EXPECT(!pkg.wardrobe.has_belt, "Default character must have no belt");
+    VCR_EXPECT(pkg.wardrobe.studio_underwear, "Default character must enable studio_underwear");
+
+    pkg.wardrobe.has_beard = false;
+    const auto mesh_no_beard = vcr::build_character_mesh(pkg);
+    VCR_EXPECT(mesh_no_beard.indices.size() / 3U >= 80000U,
+               "Curved body subdivision must produce >= 80k triangles");
+    for (const auto& sv : mesh_no_beard.skin_vertices) {
+        float sum = 0.0F;
+        for (std::size_t k = 0U; k < 4U; ++k) {
+            VCR_EXPECT(sv.joints[k] < vcr::character_total_bone_count,
+                       "All skin joint indices including hair must be < 50");
+            sum += sv.weights[k];
+        }
+        VCR_EXPECT(sum >= 0.99F && sum <= 1.01F,
+                   "All skin weights including strand hair must be normalized");
+    }
+
+    auto find_sub = [](const vcr::CharacterMeshBuildResult& m, std::string_view name)
+        -> const vcr::CharacterSubmeshBuild* {
+        for (const auto& sub : m.submeshes) {
+            if (sub.name == name) {
+                return &sub;
+            }
+        }
+        return nullptr;
+    };
+
+    const auto* skin_sub = find_sub(mesh_no_beard, "skin");
+    const auto* eyes_sub = find_sub(mesh_no_beard, "eyes");
+    const auto* cornea_sub = find_sub(mesh_no_beard, "cornea");
+    const auto* hair_sub = find_sub(mesh_no_beard, "hair");
+    VCR_EXPECT(skin_sub != nullptr, "Missing skin submesh");
+    VCR_EXPECT(eyes_sub != nullptr, "Missing eyes submesh");
+    VCR_EXPECT(cornea_sub != nullptr, "Missing cornea submesh");
+    VCR_EXPECT(hair_sub != nullptr, "Missing hair submesh");
+
+    VCR_EXPECT(skin_sub->material.subsurface_profile == vcr::SubsurfaceProfile::skin,
+               "Skin submesh must use SubsurfaceProfile::skin");
+    VCR_EXPECT(std::abs(skin_sub->material.ior - 1.38F) < 0.02F,
+               "Skin IOR must be ~1.38");
+    VCR_EXPECT(cornea_sub->material.roughness <= 0.05F && cornea_sub->material.ior >= 1.37F,
+               "Cornea must use glossy wet ocular properties");
+    VCR_EXPECT(hair_sub->material.model == vcr::MaterialModel::strand_hair,
+               "Hair submesh must use MaterialModel::strand_hair");
+
+    for (std::uint32_t i = 0U; i < hair_sub->index_count; ++i) {
+        const std::uint32_t idx = mesh_no_beard.indices[hair_sub->first_index + i];
+        VCR_EXPECT(idx < mesh_no_beard.vertices.size(), "Hair index out of bounds");
+        const auto& t = mesh_no_beard.vertices[idx].tangent;
+        const float len = std::hypot(t[0], t[1], t[2]);
+        VCR_EXPECT(std::abs(len - 1.0F) < 0.02F,
+                   "Hair vertex tangent must be unit fiber direction");
+    }
+
+    vcr::CharacterPackage pkg_beard = pkg;
+    pkg_beard.wardrobe.has_beard = true;
+    const auto mesh_beard = vcr::build_character_mesh(pkg_beard);
+    const auto* hair_beard_sub = find_sub(mesh_beard, "hair");
+    VCR_EXPECT(hair_beard_sub != nullptr, "Missing beard hair submesh");
+    VCR_EXPECT(hair_beard_sub->index_count > hair_sub->index_count,
+               "Enabling 3D beard must increase hair submesh index count");
+
+    ScopedTempDir tmp("vcr_char_prod_cook");
+    vcr::CharacterCookOptions opts{};
+    opts.texture_resolution = 128U;
+    vcr::CharacterCookReport report{};
+    std::string err;
+    VCR_EXPECT(vcr::cook_character_package_to_project(pkg_beard, tmp.dir, opts, report, err), err);
+    const auto reloaded = vcr::load_cooked_model_asset(tmp.dir / "assets", report.model_asset_relative);
+    VCR_EXPECT(static_cast<bool>(reloaded), reloaded.error().message);
+
+    auto find_cooked_mat = [&](std::string_view name) -> const vcr::CookedModelMaterial* {
+        for (const auto& mat : reloaded.value().materials) {
+            if (mat.name == name) {
+                return &mat;
+            }
+        }
+        return nullptr;
+    };
+    const auto* c_skin = find_cooked_mat("skin");
+    const auto* c_cornea = find_cooked_mat("cornea");
+    const auto* c_hair = find_cooked_mat("hair");
+    VCR_EXPECT(c_skin != nullptr && c_cornea != nullptr && c_hair != nullptr,
+               "Cooked model must contain skin, cornea, and hair materials");
+    VCR_EXPECT(c_skin->factors.subsurface_profile == vcr::SubsurfaceProfile::skin,
+               "Cooked skin material must retain SubsurfaceProfile::skin");
+    VCR_EXPECT((c_skin->coverage & vcr::material_coverage_packed_ao_bit) != 0U,
+               "Cooked skin material must enable packed AO in metallic_roughness.r");
+    VCR_EXPECT((c_cornea->coverage & vcr::material_coverage_glass_bit) != 0U,
+               "Cooked cornea material must enable glass flag");
+    VCR_EXPECT((c_cornea->coverage & vcr::material_coverage_two_sided_bit) == 0U,
+               "Cooked cornea material must keep single-sided dome rendering");
+    VCR_EXPECT(c_hair->factors.model == vcr::MaterialModel::strand_hair,
+               "Cooked hair material must retain MaterialModel::strand_hair");
+    VCR_EXPECT((c_hair->coverage & vcr::material_coverage_two_sided_bit) != 0U,
+               "Cooked hair material must be double-sided");
+    VCR_EXPECT((c_hair->coverage & vcr::material_coverage_packed_ao_bit) != 0U,
+               "Cooked hair material must enable packed AO in metallic_roughness.r");
+
+    const std::filesystem::path repo_root =
+        std::filesystem::path(__FILE__).parent_path().parent_path();
+    for (const char* rel : {"characters/lyra_vance.vcrchar.json", "characters/warden_kane.vcrchar.json"}) {
+        std::filesystem::path p = std::filesystem::exists(rel)
+            ? std::filesystem::path(rel)
+            : (repo_root / rel);
+        vcr::CharacterPackage showcase{};
+        VCR_EXPECT(vcr::load_character_package_file(p, showcase, err), err);
+    }
+
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -391,6 +513,9 @@ int main() {
     }
     if (!test_female_and_male_templates_morphs_and_ai()) {
         return 5;
+    }
+    if (!test_production_skin_eyes_and_strand_groom()) {
+        return 6;
     }
     std::cout << "[PASS] vcr_character_suite_tests passed all checks.\n";
     return 0;

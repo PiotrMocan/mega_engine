@@ -59,8 +59,8 @@ struct CharacterStudioCliArgs {
         true;
 #endif
     std::uint32_t smoke_frames = 0U;
-    std::uint32_t width = 1480U;
-    std::uint32_t height = 900U;
+    std::uint32_t width = 1600U;
+    std::uint32_t height = 1000U;
     std::filesystem::path screenshot_path{};
     OllamaBridgeConfig ollama{};
     std::unordered_map<std::string, std::string> options{};

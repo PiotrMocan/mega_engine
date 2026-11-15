@@ -17,6 +17,8 @@ struct PreparedTexture {
     std::string path, error;
     std::optional<CookedTextureAsset> texture;
     glm::vec3 average_linear{1};
+    std::vector<std::uint8_t> mip_chain_rgba{};
+    std::vector<std::size_t> mip_byte_offsets{};
 };
 struct PreparedAlphaMap {
     std::string path;

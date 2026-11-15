@@ -810,7 +810,8 @@ private:
         GpuTexture& destination,
         std::span<const std::byte> pixels,
         std::uint32_t bytes_per_pixel,
-        std::string_view debug_name);
+        std::string_view debug_name,
+        std::span<const std::size_t> precomputed_mip_offsets = {});
     void update_frame_uniform(
         FrameContext& frame,
         const glm::mat4& view_matrix);

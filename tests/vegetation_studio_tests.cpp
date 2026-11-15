@@ -1,3 +1,4 @@
+#include "asset_preparation.hpp"
 #include "cooked_model_asset.hpp"
 #include "cooked_texture_asset.hpp"
 #include "gpu_grass.hpp"
@@ -75,6 +76,7 @@ bool materials_equal(
         if (a[i].name != b[i].name ||
             a[i].factors.base_color != b[i].factors.base_color ||
             a[i].factors.roughness != b[i].factors.roughness ||
+            std::abs(a[i].factors.ior - b[i].factors.ior) > 1.0e-4F ||
             a[i].coverage != b[i].coverage) {
             return false;
         }
@@ -187,6 +189,7 @@ bool test_all_presets_and_lods() {
         }
 
         // Verify geometry attributes across LOD0..LOD3
+        std::array<double, 4U> foliage_areas{};
         for (std::size_t lod = 0U; lod < 4U; ++lod) {
             const CookedModelAsset& m = asset.lod_models[lod];
             for (const CookedModelMaterial& mat : m.materials) {
@@ -215,8 +218,17 @@ bool test_all_presets_and_lods() {
                     return false;
                 }
             }
+            double lod_foliage_area = 0.0;
+            bool found_foliage_submesh = false;
             for (const CookedModelSubmesh& sm : m.submeshes) {
                 if (sm.name == "foliage_canopy") {
+                    found_foliage_submesh = true;
+                    if (!expect(
+                            sm.index_count >= 6U,
+                            "Preset '" + preset.id + "' LOD" + std::to_string(lod) +
+                            " foliage_canopy has too few indices.")) {
+                        return false;
+                    }
                     const std::size_t end_idx = static_cast<std::size_t>(sm.first_index + sm.index_count);
                     for (std::size_t ii = static_cast<std::size_t>(sm.first_index); ii < end_idx; ++ii) {
                         const CookedModelVertex& v = m.vertices[m.indices[ii]];
@@ -228,7 +240,36 @@ bool test_all_presets_and_lods() {
                             return false;
                         }
                     }
+                    for (std::size_t ii = static_cast<std::size_t>(sm.first_index); ii + 2U < end_idx; ii += 3U) {
+                        const auto& pa = m.vertices[m.indices[ii + 0U]].position;
+                        const auto& pb = m.vertices[m.indices[ii + 1U]].position;
+                        const auto& pc = m.vertices[m.indices[ii + 2U]].position;
+                        const glm::vec3 va(pa[0], pa[1], pa[2]);
+                        const glm::vec3 vb(pb[0], pb[1], pb[2]);
+                        const glm::vec3 vc(pc[0], pc[1], pc[2]);
+                        lod_foliage_area += 0.5 * static_cast<double>(glm::length(glm::cross(vb - va, vc - va)));
+                    }
                 }
+            }
+            if (preset.recipe.archetype != VegetationArchetype::grass_patch_gpu &&
+                preset.recipe.foliage_mode != VegetationFoliageMode::bare) {
+                if (!expect(
+                        found_foliage_submesh && lod_foliage_area > 0.01,
+                        "Preset '" + preset.id + "' LOD" + std::to_string(lod) +
+                        " must retain visible foliage_canopy geometry.")) {
+                    return false;
+                }
+                foliage_areas[lod] = lod_foliage_area;
+            }
+        }
+        if (preset.recipe.archetype != VegetationArchetype::grass_patch_gpu &&
+            preset.recipe.foliage_mode != VegetationFoliageMode::bare) {
+            if (!expect(
+                    foliage_areas[1U] >= 0.65 * foliage_areas[0U] &&
+                    foliage_areas[2U] >= 0.60 * foliage_areas[0U] &&
+                    foliage_areas[3U] >= 0.50 * foliage_areas[0U],
+                    "Preset '" + preset.id + "' foliage surface area dropped too sharply across LOD1..LOD3.")) {
+                return false;
             }
         }
     }
@@ -580,6 +621,146 @@ bool test_export_import_and_preview_round_trip() {
     return expect(found_palm && found_grass, "Did not find both exported packages in scan.");
 }
 
+bool test_gloss_styles_and_mip_coverage() {
+    const auto hazel = find_vegetation_preset("forest_hazel_bush");
+    if (!expect(hazel.has_value(), "Missing forest_hazel_bush preset.")) {
+        return false;
+    }
+
+    std::string error;
+    VegetationRecipe matte_r = hazel->recipe;
+    matte_r.foliage_gloss = 0.05F;
+    matte_r.atlas_resolution = 512U;
+    matte_r.bark_resolution = 256U;
+    VegetationRecipe glossy_r = matte_r;
+    glossy_r.foliage_gloss = 0.90F;
+
+    GeneratedVegetationAsset matte_asset{};
+    GeneratedVegetationAsset glossy_asset{};
+    if (!expect(generate_vegetation_asset(matte_r, matte_asset, error), error) ||
+        !expect(generate_vegetation_asset(glossy_r, glossy_asset, error), error)) {
+        return false;
+    }
+
+    const auto find_foliage_mat = [](const CookedModelAsset& model) -> const CookedModelMaterial* {
+        for (const auto& mat : model.materials) {
+            if (mat.name == "foliage") {
+                return &mat;
+            }
+        }
+        return nullptr;
+    };
+    const CookedModelMaterial* matte_mat = find_foliage_mat(matte_asset.lod_models[0]);
+    const CookedModelMaterial* glossy_mat = find_foliage_mat(glossy_asset.lod_models[0]);
+    if (!expect(matte_mat != nullptr && glossy_mat != nullptr, "Missing foliage material for gloss test.")) {
+        return false;
+    }
+    if (!expect(
+            glossy_mat->factors.ior > matte_mat->factors.ior + 0.25F,
+            "Expected higher foliage_gloss to increase dielectric IOR.")) {
+        return false;
+    }
+
+    const auto mean_orm_roughness = [](const IconRgbaImage& orm) {
+        double sum = 0.0;
+        const std::size_t n = static_cast<std::size_t>(orm.width) * orm.height;
+        for (std::size_t i = 0U; i < n; ++i) {
+            sum += static_cast<double>(orm.pixels[i * 4U + 1U]) / 255.0;
+        }
+        return n > 0U ? (sum / static_cast<double>(n)) : 1.0;
+    };
+    const double matte_rough = mean_orm_roughness(matte_asset.foliage_orm);
+    const double glossy_rough = mean_orm_roughness(glossy_asset.foliage_orm);
+    if (!expect(
+            matte_rough > glossy_rough + 0.35,
+            "Expected matte foliage ORM roughness to significantly exceed glossy ORM roughness.")) {
+        return false;
+    }
+
+    // Verify bark_style and foliage_style round-trip through JSON serialization and affect pixel output.
+    VegetationRecipe styled_a = matte_r;
+    styled_a.bark_style = 1U;
+    styled_a.foliage_style = 2U;
+    VegetationRecipe styled_b = matte_r;
+    styled_b.bark_style = 3U;
+    styled_b.foliage_style = 4U;
+
+    const nlohmann::json styled_json = serialize_vegetation_recipe_json(styled_b);
+    VegetationRecipe styled_b_parsed{};
+    if (!expect(deserialize_vegetation_recipe_json(styled_json, styled_b_parsed, error), error) ||
+        !expect(styled_b_parsed == sanitize_vegetation_recipe(styled_b),
+                "bark_style / foliage_style / foliage_gloss did not round-trip cleanly.")) {
+        return false;
+    }
+
+    GeneratedVegetationAsset styled_asset_a{};
+    GeneratedVegetationAsset styled_asset_b{};
+    if (!expect(generate_vegetation_asset(styled_a, styled_asset_a, error), error) ||
+        !expect(generate_vegetation_asset(styled_b, styled_asset_b, error), error)) {
+        return false;
+    }
+    if (!expect(
+            styled_asset_a.bark_albedo.pixels != styled_asset_b.bark_albedo.pixels &&
+            styled_asset_a.foliage_atlas.pixels != styled_asset_b.foliage_atlas.pixels,
+            "Distinct bark_style / foliage_style overrides must produce distinct texture pixels.")) {
+        return false;
+    }
+
+    // Verify coverage-preserving mipmap chain generation on an exported foliage asset.
+    ScopedTempDir temp_dir("vcr_veg_mip_test");
+    const std::filesystem::path asset_root = temp_dir.path / "assets";
+    VegetationExportSummary summary{};
+    if (!expect(
+            export_vegetation_package(matte_asset, asset_root, "models/vegetation", summary, error),
+            "Failed to export package for mip coverage test: " + error)) {
+        return false;
+    }
+
+    const PreparedModel prepared = prepare_model_asset(asset_root, summary.lod0_relative_path);
+    if (!expect(
+            prepared.error.empty() && prepared.model.has_value(),
+            "prepare_model_asset failed for vegetation package: " + prepared.error)) {
+        return false;
+    }
+
+    const PreparedTexture* foliage_tex = nullptr;
+    for (const PreparedTexture& t : prepared.textures) {
+        if (t.path.find("foliage_atlas") != std::string::npos) {
+            foliage_tex = &t;
+            break;
+        }
+    }
+    if (!expect(
+            foliage_tex != nullptr && foliage_tex->texture.has_value() &&
+            !foliage_tex->mip_chain_rgba.empty() && foliage_tex->mip_byte_offsets.size() >= 4U,
+            "Expected coverage-preserving mip chain on prepared foliage_atlas texture.")) {
+        return false;
+    }
+
+    const std::uint32_t cutoff_u8 = static_cast<std::uint32_t>(std::lround(matte_r.alpha_cutoff * 255.0F));
+    const auto compute_cov = [&](const std::size_t byte_off, const std::uint32_t w, const std::uint32_t h) {
+        const std::size_t n = static_cast<std::size_t>(w) * h;
+        std::size_t pass = 0U;
+        for (std::size_t i = 0U; i < n; ++i) {
+            if (foliage_tex->mip_chain_rgba[byte_off + i * 4U + 3U] >= cutoff_u8) {
+                ++pass;
+            }
+        }
+        return static_cast<double>(pass) / static_cast<double>(std::max<std::size_t>(1U, n));
+    };
+
+    const std::uint32_t w0 = foliage_tex->texture->width;
+    const std::uint32_t h0 = foliage_tex->texture->height;
+    const std::uint32_t w3 = std::max(1U, w0 >> 3U);
+    const std::uint32_t h3 = std::max(1U, h0 >> 3U);
+    const double cov0 = compute_cov(foliage_tex->mip_byte_offsets[0U], w0, h0);
+    const double cov3 = compute_cov(foliage_tex->mip_byte_offsets[3U], w3, h3);
+    return expect(
+        cov0 > 0.05 && std::abs(cov3 - cov0) <= 0.12,
+        "Mip 3 alpha coverage drifted too far from mip 0 (cov0=" + std::to_string(cov0) +
+        ", cov3=" + std::to_string(cov3) + ").");
+}
+
 } // namespace
 
 int main() {
@@ -596,6 +777,9 @@ int main() {
         return 1;
     }
     if (!test_export_import_and_preview_round_trip()) {
+        return 1;
+    }
+    if (!test_gloss_styles_and_mip_coverage()) {
         return 1;
     }
     std::cout << "All vcr_vegetation_studio_tests passed.\n";

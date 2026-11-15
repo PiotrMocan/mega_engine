@@ -676,9 +676,10 @@ void prepare_model_lods(CookedModelAsset &model) {
         const auto first = static_cast<std::uint32_t>(mesh.first_index);
         const auto count = static_cast<std::uint32_t>(mesh.index_count);
         const float epsilon = 1.0e-6F * std::max(scale, 1.0F);
-        // Generic triangle simplification cannot preserve procedural blade encoding.
+        // Generic triangle simplification cannot preserve procedural blade or strand fiber encoding.
         if (count < 96 || (mesh.material_index < model.materials.size() &&
-            model.materials[mesh.material_index].factors.model == MaterialModel::gpu_grass)) {
+            (model.materials[mesh.material_index].factors.model == MaterialModel::gpu_grass ||
+             model.materials[mesh.material_index].factors.model == MaterialModel::strand_hair))) {
             mesh.lod_count.fill(count);
             mesh.lod_error = {0, epsilon, 2 * epsilon, 3 * epsilon};
             continue;

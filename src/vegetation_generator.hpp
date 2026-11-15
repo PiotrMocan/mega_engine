@@ -91,7 +91,10 @@ struct VegetationRecipe {
     VegetationFoliageMode foliage_mode = VegetationFoliageMode::full;
     float foliage_density = 1.0F;
     float cluster_scale = 1.0F;
-    float alpha_cutoff = 0.35F;
+    float alpha_cutoff = 0.30F;
+    float foliage_gloss = 0.18F;
+    std::uint32_t bark_style = 0U;
+    std::uint32_t foliage_style = 0U;
     glm::vec3 leaf_base_srgb{0.20F, 0.44F, 0.14F};
     glm::vec3 leaf_tip_srgb{0.44F, 0.70F, 0.22F};
     glm::vec3 leaf_autumn_srgb{0.84F, 0.42F, 0.10F};
@@ -180,6 +183,10 @@ struct ProjectVegetationEntry {
     std::filesystem::path recipe_absolute_path{};
 };
 
+[[nodiscard]] std::string_view bark_style_to_token(std::uint32_t style) noexcept;
+[[nodiscard]] std::optional<std::uint32_t> parse_bark_style(std::string_view token) noexcept;
+[[nodiscard]] std::string_view foliage_style_to_token(std::uint32_t style) noexcept;
+[[nodiscard]] std::optional<std::uint32_t> parse_foliage_style(std::string_view token) noexcept;
 [[nodiscard]] std::string_view to_token(VegetationArchetype archetype) noexcept;
 [[nodiscard]] std::optional<VegetationArchetype> parse_vegetation_archetype(
     std::string_view token) noexcept;

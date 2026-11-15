@@ -1894,7 +1894,7 @@ private:
         const auto token = get_string(arguments, "subsurface_profile");
         const auto profile = token ? parse_subsurface_profile(*token) : std::nullopt;
         if (!profile) {
-            error = "subsurface_profile must be none, narrow, medium, wide or foliage";
+            error = "subsurface_profile must be none, narrow, medium, wide, foliage or skin";
             return false;
         }
         command.material.subsurface_profile = *profile;

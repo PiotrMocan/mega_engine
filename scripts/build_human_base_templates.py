@@ -17,18 +17,20 @@ import os
 import struct
 import tempfile
 import urllib.request
+import zlib
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 MPFB_DATA_URL = "https://raw.githubusercontent.com/makehumancommunity/mpfb2/master/src/mpfb/data"
 CACHE_ROOT = Path(tempfile.gettempdir()) / "vcr_mpfb2_cc0_cache"
-MASK_SIZE = 256
+MASK_SIZE = 512
 BONE_COUNT = 50
+LANDMARK_CHAIN_COUNT = 6
 MIN_MORPH_DELTA_M = 0.00015
 
-# Binary format: "VCRCBAS1", version 1
-MAGIC = b"VCRCBAS1"
-VERSION = 1
+# Binary format: "VCRCBAS2", version 2
+MAGIC = b"VCRCBAS2"
+VERSION = 2
 
 # Region IDs shared with src/character_package.cpp
 REGION_NONE = 0
@@ -92,6 +94,99 @@ def load_json_asset(rel_path: str):
     if rel_path.endswith(".gz"):
         raw = gzip.decompress(raw)
     return json.loads(raw.decode("utf-8"))
+
+
+def fetch_bytes_optional(rel_path: str) -> Optional[bytes]:
+    try:
+        return fetch_bytes(rel_path)
+    except Exception as exc:
+        print(f"  [warn] optional asset unavailable ({rel_path}): {exc}")
+        return None
+
+
+def load_json_asset_optional(rel_path: str):
+    raw = fetch_bytes_optional(rel_path)
+    if raw is None:
+        return None
+    if rel_path.endswith(".gz"):
+        raw = gzip.decompress(raw)
+    return json.loads(raw.decode("utf-8"))
+
+
+def decode_png_rgba(raw: bytes) -> Tuple[int, int, bytearray]:
+    """Decode an 8-bit non-interlaced PNG (RGB, Gray, Gray+A, or RGBA) in pure stdlib."""
+    if len(raw) < 8 or raw[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("Invalid PNG header")
+    pos = 8
+    w = h = bit_depth = color_type = 0
+    idat = bytearray()
+    while pos + 8 <= len(raw):
+        length, ctype = struct.unpack(">I4s", raw[pos:pos + 8])
+        chunk = raw[pos + 8:pos + 8 + length]
+        if ctype == b"IHDR":
+            w, h, bit_depth, color_type = struct.unpack(">IIBB", chunk[:10])
+        elif ctype == b"IDAT":
+            idat.extend(chunk)
+        elif ctype == b"IEND":
+            break
+        pos += 12 + length
+    if w <= 0 or h <= 0 or bit_depth != 8:
+        raise ValueError(f"Unsupported PNG format w={w} h={h} bd={bit_depth}")
+    channels = {0: 1, 2: 3, 4: 2, 6: 4}.get(color_type)
+    if channels is None:
+        raise ValueError(f"Unsupported PNG color_type={color_type}")
+    decomp = zlib.decompress(bytes(idat))
+    stride = w * channels
+    rows = bytearray(h * stride)
+    for y in range(h):
+        flt = decomp[y * (stride + 1)]
+        src = decomp[y * (stride + 1) + 1:(y + 1) * (stride + 1)]
+        d_off = y * stride
+        p_off = (y - 1) * stride
+        if flt == 0:
+            rows[d_off:d_off + stride] = src
+        elif flt == 1:
+            for i in range(stride):
+                a = rows[d_off + i - channels] if i >= channels else 0
+                rows[d_off + i] = (src[i] + a) & 0xFF
+        elif flt == 2:
+            for i in range(stride):
+                b = rows[p_off + i] if y > 0 else 0
+                rows[d_off + i] = (src[i] + b) & 0xFF
+        elif flt == 3:
+            for i in range(stride):
+                a = rows[d_off + i - channels] if i >= channels else 0
+                b = rows[p_off + i] if y > 0 else 0
+                rows[d_off + i] = (src[i] + ((a + b) >> 1)) & 0xFF
+        elif flt == 4:
+            for i in range(stride):
+                a = rows[d_off + i - channels] if i >= channels else 0
+                b = rows[p_off + i] if y > 0 else 0
+                c = rows[p_off + i - channels] if (y > 0 and i >= channels) else 0
+                pa = abs(b - c)
+                pb = abs(a - c)
+                pc = abs(a + b - 2 * c)
+                p = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                rows[d_off + i] = (src[i] + p) & 0xFF
+        else:
+            raise ValueError(f"Unknown PNG scanline filter {flt}")
+    if channels == 4:
+        return w, h, rows
+    rgba = bytearray(w * h * 4)
+    if channels == 3:
+        for i in range(w * h):
+            rgba[i * 4:i * 4 + 3] = rows[i * 3:i * 3 + 3]
+            rgba[i * 4 + 3] = 255
+    elif channels == 2:
+        for i in range(w * h):
+            g = rows[i * 2]
+            rgba[i * 4] = g; rgba[i * 4 + 1] = g; rgba[i * 4 + 2] = g
+            rgba[i * 4 + 3] = rows[i * 2 + 1]
+    else:
+        for i in range(w * h):
+            g = rows[i]
+            rgba[i * 4] = g; rgba[i * 4 + 1] = g; rgba[i * 4 + 2] = g; rgba[i * 4 + 3] = 255
+    return w, h, rgba
 
 
 def load_target(rel_path: str) -> Dict[int, Tuple[float, float, float]]:
@@ -380,100 +475,451 @@ def triangulate_face(corners: List[Tuple[int, int]]) -> List[Tuple[Tuple[int, in
     return tris
 
 
-def build_uv_mask_256(
+def compute_body_ao_and_curvature(
+    base_positions_m: List[Tuple[float, float, float]],
+    faces,
+) -> Tuple[List[float], List[float]]:
+    """Compute per-vertex cosine hemisphere AO [0..1] and discrete mean curvature [-1..1] for 'body'."""
+    vcount = len(base_positions_m)
+    body_tris_raw: List[Tuple[int, int, int]] = []
+    body_verts_set: set = set()
+    neighbors: List[set] = [set() for _ in range(vcount)]
+
+    for _, gname, corners in faces:
+        if gname != "body":
+            continue
+        for tri in triangulate_face(corners):
+            v0, v1, v2 = tri[0][0], tri[1][0], tri[2][0]
+            if v0 == v1 or v1 == v2 or v2 == v0:
+                continue
+            body_tris_raw.append((v0, v1, v2))
+            body_verts_set.add(v0)
+            body_verts_set.add(v1)
+            body_verts_set.add(v2)
+            neighbors[v0].add(v1); neighbors[v0].add(v2)
+            neighbors[v1].add(v0); neighbors[v1].add(v2)
+            neighbors[v2].add(v0); neighbors[v2].add(v1)
+
+    # Area-weighted smooth vertex normals
+    normals = [[0.0, 0.0, 0.0] for _ in range(vcount)]
+    tri_data = []
+    CELL = 0.055
+    INV_CELL = 1.0 / CELL
+    grid: Dict[Tuple[int, int, int], List[int]] = {}
+
+    for ti, (v0, v1, v2) in enumerate(body_tris_raw):
+        p0 = base_positions_m[v0]
+        p1 = base_positions_m[v1]
+        p2 = base_positions_m[v2]
+        e1x, e1y, e1z = p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]
+        e2x, e2y, e2z = p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]
+        nx = e1y * e2z - e1z * e2y
+        ny = e1z * e2x - e1x * e2z
+        nz = e1x * e2y - e1y * e2x
+        for vi in (v0, v1, v2):
+            normals[vi][0] += nx
+            normals[vi][1] += ny
+            normals[vi][2] += nz
+        tri_data.append((p0[0], p0[1], p0[2], e1x, e1y, e1z, e2x, e2y, e2z))
+        ix0 = int(math.floor(min(p0[0], p1[0], p2[0]) * INV_CELL))
+        ix1 = int(math.floor(max(p0[0], p1[0], p2[0]) * INV_CELL))
+        iy0 = int(math.floor(min(p0[1], p1[1], p2[1]) * INV_CELL))
+        iy1 = int(math.floor(max(p0[1], p1[1], p2[1]) * INV_CELL))
+        iz0 = int(math.floor(min(p0[2], p1[2], p2[2]) * INV_CELL))
+        iz1 = int(math.floor(max(p0[2], p1[2], p2[2]) * INV_CELL))
+        for ix in range(ix0, ix1 + 1):
+            for iy in range(iy0, iy1 + 1):
+                for iz in range(iz0, iz1 + 1):
+                    grid.setdefault((ix, iy, iz), []).append(ti)
+
+    unit_normals: List[Tuple[float, float, float]] = [(0.0, 1.0, 0.0)] * vcount
+    curvature = [0.0] * vcount
+    for vi in body_verts_set:
+        nx, ny, nz = normals[vi]
+        ln = math.sqrt(nx * nx + ny * ny + nz * nz)
+        if ln > 1e-8:
+            nx /= ln; ny /= ln; nz /= ln
+        else:
+            nx, ny, nz = 0.0, 1.0, 0.0
+        unit_normals[vi] = (nx, ny, nz)
+
+        nbrs = neighbors[vi]
+        if nbrs:
+            px, py, pz = base_positions_m[vi]
+            lx = ly = lz = el_sum = 0.0
+            for nj in nbrs:
+                qx, qy, qz = base_positions_m[nj]
+                dx, dy, dz = qx - px, qy - py, qz - pz
+                el_sum += math.sqrt(dx * dx + dy * dy + dz * dz)
+                lx += dx; ly += dy; lz += dz
+            avg_el = el_sum / len(nbrs)
+            if avg_el > 1e-5:
+                inv_n = 1.0 / len(nbrs)
+                # Positive = convex ridge, negative = concave crevice
+                k = -((lx * inv_n) * nx + (ly * inv_n) * ny + (lz * inv_n) * nz) / avg_el
+                curvature[vi] = max(-1.0, min(1.0, k * 2.4))
+
+    # Precomputed 16 cosine-weighted Fibonacci hemisphere directions in local +Z tangent frame
+    RAYS = 16
+    local_dirs: List[Tuple[float, float, float]] = []
+    golden_angle = 2.399963229728653
+    for i in range(RAYS):
+        z = math.sqrt((i + 0.5) / RAYS)
+        r = math.sqrt(max(0.0, 1.0 - z * z))
+        phi = i * golden_angle
+        local_dirs.append((r * math.cos(phi), r * math.sin(phi), z))
+
+    MAX_T = 0.14
+    INV_MAX_T = 1.0 / MAX_T
+    EPS_N = 0.0014
+    EPS_DET = 1e-7
+    ao = [1.0] * vcount
+    visited = [0] * len(tri_data)
+    stamp = 0
+    step_ts = (0.0, 0.042, 0.088, 0.132)
+
+    for vi in body_verts_set:
+        nx, ny, nz = unit_normals[vi]
+        px, py, pz = base_positions_m[vi]
+        ox = px + nx * EPS_N
+        oy = py + ny * EPS_N
+        oz = pz + nz * EPS_N
+        # Build tangent frame rotated pseudo-randomly per vertex to avoid banding
+        ang = ((vi * 1103515245 + 12345) & 0xFFFF) * (6.2831853 / 65536.0)
+        up = (1.0, 0.0, 0.0) if abs(ny) > 0.85 else (0.0, 1.0, 0.0)
+        tx = up[1] * nz - up[2] * ny
+        ty = up[2] * nx - up[0] * nz
+        tz = up[0] * ny - up[1] * nx
+        tl = math.sqrt(tx * tx + ty * ty + tz * tz)
+        if tl > 1e-6:
+            tx /= tl; ty /= tl; tz /= tl
+        else:
+            tx, ty, tz = 1.0, 0.0, 0.0
+        bx = ny * tz - nz * ty
+        by = nz * tx - nx * tz
+        bz = nx * ty - ny * tx
+        ca, sa = math.cos(ang), math.sin(ang)
+        rx = tx * ca + bx * sa; ry = ty * ca + by * sa; rz = tz * ca + bz * sa
+        ux = bx * ca - tx * sa; uy = by * ca - ty * sa; uz = bz * ca - tz * sa
+
+        occ_sum = 0.0
+        for lx, ly, lz in local_dirs:
+            dx = rx * lx + ux * ly + nx * lz
+            dy = ry * lx + uy * ly + ny * lz
+            dz = rz * lx + uz * ly + nz * lz
+            stamp += 1
+            best_t = MAX_T
+            prev_cell = None
+            for st in step_ts:
+                if st >= best_t:
+                    break
+                cell = (
+                    int(math.floor((ox + dx * st) * INV_CELL)),
+                    int(math.floor((oy + dy * st) * INV_CELL)),
+                    int(math.floor((oz + dz * st) * INV_CELL)),
+                )
+                if cell == prev_cell:
+                    continue
+                prev_cell = cell
+                cand = grid.get(cell)
+                if not cand:
+                    continue
+                for ti in cand:
+                    if visited[ti] == stamp:
+                        continue
+                    visited[ti] = stamp
+                    t0x, t0y, t0z, e1x, e1y, e1z, e2x, e2y, e2z = tri_data[ti]
+                    pxv = dy * e2z - dz * e2y
+                    pyv = dz * e2x - dx * e2z
+                    pzv = dx * e2y - dy * e2x
+                    det = e1x * pxv + e1y * pyv + e1z * pzv
+                    if -EPS_DET < det < EPS_DET:
+                        continue
+                    inv_det = 1.0 / det
+                    txv = ox - t0x; tyv = oy - t0y; tzv = oz - t0z
+                    u = (txv * pxv + tyv * pyv + tzv * pzv) * inv_det
+                    if u < 0.0 or u > 1.0:
+                        continue
+                    qxv = tyv * e1z - tzv * e1y
+                    qyv = tzv * e1x - txv * e1z
+                    qzv = txv * e1y - tyv * e1x
+                    v = (dx * qxv + dy * qyv + dz * qzv) * inv_det
+                    if v < 0.0 or u + v > 1.0:
+                        continue
+                    t = (e2x * qxv + e2y * qyv + e2z * qzv) * inv_det
+                    if 0.002 < t < best_t:
+                        best_t = t
+            if best_t < MAX_T:
+                occ_sum += 1.0 - best_t * INV_MAX_T
+
+        raw_ao = max(0.08, min(1.0, 1.0 - (occ_sum / RAYS) * 0.92))
+        crease_ao = 1.0 - max(0.0, -curvature[vi]) * 0.22
+        ao[vi] = max(0.06, min(1.0, raw_ao * crease_ao))
+
+    return ao, curvature
+
+
+def compute_nail_segments(joint_centers_m: Dict[str, Tuple[float, float, float]]):
+    """Build 20 anatomical distal nail descriptors from MakeHuman finger/toe tip joints."""
+    specs = []
+    # Hands: fingers 1..5 on left/right
+    for side in ("l", "r"):
+        finger_widths = [0.0068, 0.0056, 0.0058, 0.0054, 0.0046]
+        for idx in range(1, 6):
+            j_dip = f"joint-{side}-finger-{idx}-3"
+            j_tip = f"joint-{side}-finger-{idx}-4"
+            if j_dip in joint_centers_m and j_tip in joint_centers_m:
+                up = (0.0, 0.86, 0.51) if idx == 1 else (0.0, 1.0, 0.0)
+                specs.append((joint_centers_m[j_dip], joint_centers_m[j_tip], up, finger_widths[idx - 1], False))
+        # Toes: hallux uses 1-2..1-3, lesser toes use k-3..k-4
+        toe_specs = [
+            (f"joint-{side}-toe-1-2", f"joint-{side}-toe-1-3", 0.0085),
+            (f"joint-{side}-toe-2-3", f"joint-{side}-toe-2-4", 0.0045),
+            (f"joint-{side}-toe-3-3", f"joint-{side}-toe-3-4", 0.0042),
+            (f"joint-{side}-toe-4-3", f"joint-{side}-toe-4-4", 0.0038),
+            (f"joint-{side}-toe-5-3", f"joint-{side}-toe-5-4", 0.0035),
+        ]
+        for j_dip, j_tip, hw in toe_specs:
+            if j_dip in joint_centers_m and j_tip in joint_centers_m:
+                specs.append((joint_centers_m[j_dip], joint_centers_m[j_tip], (0.0, 1.0, 0.0), hw, True))
+    return specs
+
+
+def extract_landmark_chains(
+    base_positions_m: List[Tuple[float, float, float]],
+    faces,
+    joint_centers_m: Dict[str, Tuple[float, float, float]],
+) -> List[List[int]]:
+    """Extract 6 ordered welded 'body' vertex chains: l_upper_lid, r_upper_lid, l_lower_lid, r_lower_lid, l_brow, r_brow."""
+    body_head_verts = []
+    lash_groups: Dict[str, set] = {
+        "helper-l-eyelashes-2": set(),
+        "helper-r-eyelashes-2": set(),
+        "helper-l-eyelashes-1": set(),
+        "helper-r-eyelashes-1": set(),
+    }
+    l_eye = joint_centers_m["joint-l-eye"]
+    r_eye = joint_centers_m["joint-r-eye"]
+    eye_y_min = min(l_eye[1], r_eye[1]) - 0.045
+    eye_z_min = min(l_eye[2], r_eye[2]) - 0.035
+
+    body_verts_all = set()
+    for _, gname, corners in faces:
+        if gname == "body":
+            for vi, _ in corners:
+                body_verts_all.add(vi)
+        elif gname in lash_groups:
+            for vi, _ in corners:
+                lash_groups[gname].add(vi)
+
+    for vi in body_verts_all:
+        p = base_positions_m[vi]
+        if p[1] >= eye_y_min and p[2] >= eye_z_min:
+            body_head_verts.append(vi)
+
+    def lid_chain(group_name: str, eye_c: Tuple[float, float, float], is_upper: bool) -> List[int]:
+        lverts = lash_groups.get(group_name, set())
+        best_map: Dict[int, float] = {}
+        # Match anterior root lash vertices to nearest body eyelid rim vertex
+        max_z = max((base_positions_m[v][2] for v in lverts), default=eye_c[2])
+        for lv in lverts:
+            lp = base_positions_m[lv]
+            if lp[2] > max_z - 0.0025:
+                continue  # ignore distal lash tips, keep lid root
+            best_v = -1
+            best_d2 = 0.015 * 0.015
+            for bv in body_head_verts:
+                bp = base_positions_m[bv]
+                if (bp[0] >= 0.0) != (lp[0] >= 0.0):
+                    continue
+                if is_upper and bp[1] < eye_c[1] - 0.006:
+                    continue
+                if not is_upper and bp[1] > eye_c[1] + 0.005:
+                    continue
+                dx = bp[0] - lp[0]; dy = bp[1] - lp[1]; dz = bp[2] - lp[2]
+                d2 = dx * dx + dy * dy + dz * dz
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_v = bv
+            if best_v >= 0:
+                score = base_positions_m[best_v][1] if is_upper else -base_positions_m[best_v][1]
+                if best_v not in best_map or score > best_map[best_v]:
+                    best_map[best_v] = score
+        pts = sorted(best_map.keys(), key=lambda vi: abs(base_positions_m[vi][0]))
+        if not pts:
+            return []
+        # Resample along |x| bins to 18 smooth, deduplicated vertices
+        xs = [abs(base_positions_m[v][0]) for v in pts]
+        x0, x1 = min(xs), max(xs)
+        out: List[int] = []
+        bins = 18
+        for bi in range(bins):
+            t = bi / float(bins - 1)
+            tx = x0 + (x1 - x0) * t
+            cand = min(pts, key=lambda v: abs(abs(base_positions_m[v][0]) - tx))
+            if not out or out[-1] != cand:
+                out.append(cand)
+        return out
+
+    def brow_chain(eye_c: Tuple[float, float, float], is_left: bool) -> List[int]:
+        out: List[int] = []
+        bins = 18
+        for bi in range(bins):
+            brow_u = bi / float(bins - 1)
+            target_ax = 0.0155 + (0.0565 - 0.0155) * brow_u
+            arch_y = eye_c[1] + 0.0205 + 0.0068 * math.sin(min(1.0, brow_u * 1.15) * math.pi * 0.82) - 0.002 * (brow_u ** 2)
+            best_v = -1
+            best_score = 1e9
+            for bv in body_head_verts:
+                bp = base_positions_m[bv]
+                if (bp[0] >= 0.0) != is_left:
+                    continue
+                if bp[2] < eye_c[2] - 0.008:
+                    continue
+                d2 = ((abs(bp[0]) - target_ax) ** 2) + ((bp[1] - arch_y) * 1.35) ** 2
+                if d2 < best_score:
+                    best_score = d2
+                    best_v = bv
+            if best_v >= 0 and (not out or out[-1] != best_v):
+                out.append(best_v)
+        return out
+
+    return [
+        lid_chain("helper-l-eyelashes-2", l_eye, True),
+        lid_chain("helper-r-eyelashes-2", r_eye, True),
+        lid_chain("helper-l-eyelashes-1", l_eye, False),
+        lid_chain("helper-r-eyelashes-1", r_eye, False),
+        brow_chain(l_eye, True),
+        brow_chain(r_eye, False),
+    ]
+
+
+def build_uv_maps_512(
     faces,
     vts: List[Tuple[float, float]],
     base_positions_m: List[Tuple[float, float, float]],
     lip_face_ids: set,
     eyelid_face_ids: set,
+    scalp_face_ids: set,
     joint_centers_m: Dict[str, Tuple[float, float, float]],
-) -> bytes:
-    """Rasterize 256x256 supersampled RGBA8 skin feature mask (R=lips, G=brows, B=lash/nostril/mouth_ao, A=blush/ear/nail)."""
-    SS = 512
-    buf = bytearray(SS * SS * 4)
+    ao_per_v: List[float],
+    curv_per_v: List[float],
+    sss_tex: Optional[Tuple[int, int, bytearray]],
+) -> Tuple[bytes, bytes]:
+    """Rasterize 512x512 skin_mask (lips/brows/creases/blush) and 512x512 skin_detail (AO/curv/SSS/nail+scalp)."""
+    SS = MASK_SIZE
+    mask_buf = bytearray(SS * SS * 4)
+    det_buf = bytearray(SS * SS * 4)
     coverage = bytearray(SS * SS)
 
     l_eye = joint_centers_m["joint-l-eye"]
     r_eye = joint_centers_m["joint-r-eye"]
-    nose_z_ref = max(l_eye[2], r_eye[2])
-    mouth_c = joint_centers_m["joint-mouth"]
-    jaw_c = joint_centers_m["joint-jaw"]
-    lip_y = 0.52 * mouth_c[1] + 0.48 * (l_eye[1] - 0.068)
     head_c = joint_centers_m["joint-head"]
+    nail_segs = compute_nail_segments(joint_centers_m)
 
-    # Precompute vertex adjacency ring around lip_face_ids for soft vermilion feathering
     lip_core_verts = set()
     lip_halo_verts = set()
-    inner_mouth_verts = set()
     body_tris = []
 
     for fid, gname, corners in faces:
         if gname == "body":
             in_lip = fid in lip_face_ids
             in_lid = fid in eyelid_face_ids
+            in_scalp = fid in scalp_face_ids
             if in_lip:
                 for vi, _ in corners:
                     lip_core_verts.add(vi)
             for tri in triangulate_face(corners):
-                body_tris.append((tri, in_lip, in_lid))
-        elif gname in ("helper-tongue", "helper-upper-teeth", "helper-lower-teeth"):
-            for vi, _ in corners:
-                inner_mouth_verts.add(vi)
+                body_tris.append((tri, in_lip, in_lid, in_scalp))
 
-    for tri, in_lip, _ in body_tris:
+    for tri, in_lip, _, _ in body_tris:
         vis = [tri[0][0], tri[1][0], tri[2][0]]
         if any(v in lip_core_verts for v in vis):
             for v in vis:
                 if v not in lip_core_verts:
                     lip_halo_verts.add(v)
 
+    def sample_sss_norm(u: float, v: float) -> float:
+        if sss_tex is None:
+            return 0.45
+        sw, sh, sbytes = sss_tex
+        px = max(0, min(sw - 1, int(u * sw)))
+        py = max(0, min(sh - 1, int(v * sh)))
+        raw_val = sbytes[(py * sw + px) * 4]
+        return max(0.0, min(1.0, (raw_val - 70.0) / 56.0))
+
+    def eval_nail_weight(p: Tuple[float, float, float]) -> float:
+        px, py, pz = p
+        best = 0.0
+        for dip, tip, up, half_w, is_toe in nail_segs:
+            vx = tip[0] - dip[0]; vy = tip[1] - dip[1]; vz = tip[2] - dip[2]
+            seg_len2 = vx * vx + vy * vy + vz * vz
+            if seg_len2 < 1e-7:
+                continue
+            seg_len = math.sqrt(seg_len2)
+            # Only consider vertices reasonably close to this distal digit
+            if abs(px - tip[0]) > 0.032 or abs(py - tip[1]) > 0.032 or abs(pz - tip[2]) > 0.032:
+                continue
+            t = ((px - dip[0]) * vx + (py - dip[1]) * vy + (pz - dip[2]) * vz) / seg_len2
+            if t < 0.22 or t > 0.98:
+                continue
+            cx = dip[0] + vx * t; cy = dip[1] + vy * t; cz = dip[2] + vz * t
+            rx = px - cx; ry = py - cy; rz = pz - cz
+            dor = rx * up[0] + ry * up[1] + rz * up[2]
+            if dor <= 0.0012:
+                continue
+            # Lateral distance perpendicular to axis and dorsal up
+            ax, ay, az = vx / seg_len, vy / seg_len, vz / seg_len
+            lx = up[1] * az - up[2] * ay
+            ly = up[2] * ax - up[0] * az
+            lz = up[0] * ay - up[1] * ax
+            lat = abs(rx * lx + ry * ly + rz * lz)
+            if lat > half_w * 1.15:
+                continue
+            u_n = (t - 0.60) / 0.38
+            v_n = lat / half_w
+            ell = math.sqrt(u_n * u_n + v_n * v_n)
+            if ell < 1.0:
+                score = 1.0 - ell * ell * 0.45
+                if is_toe:
+                    score *= 0.90
+                best = max(best, score)
+        return best
+
     def eval_point_mask(p: Tuple[float, float, float], lip_w: float, lid_w: float) -> Tuple[int, int, int, int]:
         px, py, pz = p
-        # R: Smooth lip vermilion (zeroed deep inside oral cavity)
         lip_depth_fade = max(0.0, min(1.0, (pz - (l_eye[2] + 0.002)) / 0.014))
         lip_val = max(0.0, min(1.0, lip_w * lip_depth_fade))
 
-        # G: Crisp symmetric supraorbital eyebrow arch relative to eye center
-        ex_c = l_eye[0] if px >= 0.0 else r_eye[0]
         ey_c = l_eye[1] if px >= 0.0 else r_eye[1]
         dx_abs = abs(px)
-        # Span horizontally from 0.0155m (inner brow) to 0.056m (outer tail)
         brow_u = (dx_abs - 0.0155) / (0.056 - 0.0155)
         brow_val = 0.0
         if 0.0 <= brow_u <= 1.0 and pz > l_eye[2] - 0.004:
-            # Classic gentle arch rising toward u=0.62 then tapering slightly
             arch_y = ey_c + 0.0205 + 0.0068 * math.sin(min(1.0, brow_u * 1.15) * math.pi * 0.82) - 0.002 * (brow_u ** 2)
             half_h = 0.0048 * (1.0 - 0.55 * (brow_u ** 1.6)) * (0.45 + 0.55 * math.sin(min(1.0, brow_u) * math.pi) ** 0.35)
             dy_b = abs(py - arch_y) / max(0.0018, half_h)
             end_fade = min(1.0, min(brow_u / 0.14, (1.0 - brow_u) / 0.18))
             if dy_b < 1.25:
-                profile = max(0.0, 1.0 - (dy_b / 1.25) ** 2)
-                brow_val = profile * end_fade
+                brow_val = max(0.0, 1.0 - (dy_b / 1.25) ** 2) * end_fade
 
-        # B: Eyelid lash crease + nostril shadows + lip parting crease
         crease = 0.0
         if lid_w > 0.05 and pz > l_eye[2] - 0.008:
-            # Stronger along upper eyelid edge just above eye center
             upper_bias = 1.0 if py >= ey_c - 0.004 else 0.55
             crease = max(crease, lid_w * 0.72 * upper_bias)
-        # Nostrils
         nostril_y = l_eye[1] - 0.0375
         if abs(py - nostril_y) < 0.0075 and 0.0045 < dx_abs < 0.0155 and pz > l_eye[2] + 0.006:
             d_n = math.hypot((dx_abs - 0.0095) / 0.0048, (py - nostril_y) / 0.0052)
             if d_n < 1.0:
                 crease = max(crease, (1.0 - d_n ** 2) * 0.65)
 
-        # A: Warm subsurface cheek, nose tip, ear & fingertip tint
         blush = 0.0
-        # Cheekbone blush
         d_ch = math.hypot((dx_abs - 0.041) / 0.026, (py - (ey_c - 0.026)) / 0.020)
         if d_ch < 1.0 and pz > l_eye[2] - 0.025:
             blush = max(blush, (1.0 - d_ch * d_ch) * 0.75)
-        # Nose tip & bridge warmth
         d_nt = math.hypot(dx_abs / 0.014, (py - (ey_c - 0.028)) / 0.018)
         if d_nt < 1.0 and pz > l_eye[2] + 0.015:
             blush = max(blush, (1.0 - d_nt * d_nt) * 0.50)
-        # Ears
         if dx_abs > 0.068 and abs(py - ey_c) < 0.036 and pz < head_c[2] + 0.025:
             blush = max(blush, 0.55)
 
@@ -487,7 +933,7 @@ def build_uv_mask_256(
     def edge(ax, ay, bx, by, cx, cy):
         return (cx - ax) * (by - ay) - (cy - ay) * (bx - ax)
 
-    for (c0, c1, c2), in_lip, in_lid in body_tris:
+    for (c0, c1, c2), in_lip, in_lid, in_scalp in body_tris:
         v0, t0 = c0
         v1, t1 = c1
         v2, t2 = c2
@@ -515,6 +961,8 @@ def build_uv_mask_256(
             return 0.0
 
         lw0, lw1, lw2 = vert_lip_w(v0), vert_lip_w(v1), vert_lip_w(v2)
+        ao0, ao1, ao2 = ao_per_v[v0], ao_per_v[v1], ao_per_v[v2]
+        cu0, cu1, cu2 = curv_per_v[v0], curv_per_v[v1], curv_per_v[v2]
         ld = 1.0 if in_lid else 0.0
         p0, p1, p2 = base_positions_m[v0], base_positions_m[v1], base_positions_m[v2]
         inv_area = 1.0 / area
@@ -524,7 +972,7 @@ def build_uv_mask_256(
                 w0 = edge(x1, y1, x2, y2, px_i, py_i) * inv_area
                 w1 = edge(x2, y2, x0, y0, px_i, py_i) * inv_area
                 w2 = edge(x0, y0, x1, y1, px_i, py_i) * inv_area
-                if w0 < -0.02 or w1 < -0.02 or w2 < -0.02:
+                if w0 < -0.025 or w1 < -0.025 or w2 < -0.025:
                     continue
                 ws = w0 + w1 + w2
                 if abs(ws) < 1e-6:
@@ -536,20 +984,48 @@ def build_uv_mask_256(
                     p0[2] * w0 + p1[2] * w1 + p2[2] * w2,
                 )
                 lw_i = lw0 * w0 + lw1 * w1 + lw2 * w2
-                rgba = eval_point_mask(p_interp, lw_i, ld)
                 idx4 = (py_i * SS + px_i) * 4
-                buf[idx4:idx4 + 4] = bytes(rgba)
+                mask_buf[idx4:idx4 + 4] = bytes(eval_point_mask(p_interp, lw_i, ld))
+
+                ao_i = max(0.0, min(1.0, ao0 * w0 + ao1 * w1 + ao2 * w2))
+                curv_i = max(-1.0, min(1.0, cu0 * w0 + cu1 * w1 + cu2 * w2))
+                u_i = max(0.0, min(1.0, uv0[0] * w0 + uv1[0] * w1 + uv2[0] * w2))
+                v_i = max(0.0, min(1.0, uv0[1] * w0 + uv1[1] * w1 + uv2[1] * w2))
+                sss_i = sample_sss_norm(u_i, v_i)
+                # Boost SSS scatter on geometric ears, nostril alae, and distal digits
+                px, py, pz = p_interp
+                dx_abs = abs(px)
+                if dx_abs > 0.068 and abs(py - l_eye[1]) < 0.036 and pz < head_c[2] + 0.022:
+                    sss_i = max(sss_i, 0.88)
+                elif abs(py - (l_eye[1] - 0.037)) < 0.009 and dx_abs < 0.017 and pz > l_eye[2] + 0.008:
+                    sss_i = max(sss_i, 0.72)
+
+                # Alpha detail tag: 1..127 fingernail/toenail, 128..255 scalp follicle zone
+                tag_a = 0
+                if in_scalp and py >= l_eye[1] + 0.015:
+                    scalp_fade = max(0.0, min(1.0, (py - (l_eye[1] + 0.015)) / 0.025))
+                    tag_a = 128 + int(round(scalp_fade * 127.0))
+                else:
+                    nw = eval_nail_weight(p_interp)
+                    if nw > 0.02:
+                        tag_a = max(1, min(127, int(round(nw * 127.0))))
+
+                det_buf[idx4] = int(max(0, min(255, round(ao_i * 255.0))))
+                det_buf[idx4 + 1] = int(max(0, min(255, round(128.0 + curv_i * 127.0))))
+                det_buf[idx4 + 2] = int(max(0, min(255, round(sss_i * 255.0))))
+                det_buf[idx4 + 3] = tag_a
                 coverage[py_i * SS + px_i] = 1
 
-    # 3-pass UV island edge dilation to kill black seam bleeding
-    for _ in range(3):
+    # 5-pass UV island edge dilation across both 512x512 buffers
+    for _ in range(5):
         new_cov = bytearray(coverage)
         for y in range(SS):
             row = y * SS
             for x in range(SS):
                 if coverage[row + x]:
                     continue
-                rs = gs = bs = a_s = cnt = 0
+                mrs = mgs = mbs = mas = 0
+                drs = dgs = dbs = das = cnt = 0
                 for dy in (-1, 0, 1):
                     yy = y + dy
                     if 0 <= yy < SS:
@@ -557,33 +1033,25 @@ def build_uv_mask_256(
                             xx = x + dx
                             if 0 <= xx < SS and coverage[yy * SS + xx]:
                                 idx4 = (yy * SS + xx) * 4
-                                rs += buf[idx4]; gs += buf[idx4 + 1]
-                                bs += buf[idx4 + 2]; a_s += buf[idx4 + 3]
+                                mrs += mask_buf[idx4]; mgs += mask_buf[idx4 + 1]
+                                mbs += mask_buf[idx4 + 2]; mas += mask_buf[idx4 + 3]
+                                drs += det_buf[idx4]; dgs += det_buf[idx4 + 1]
+                                dbs += det_buf[idx4 + 2]; das += det_buf[idx4 + 3]
                                 cnt += 1
                 if cnt > 0:
                     idx4 = (row + x) * 4
-                    buf[idx4] = rs // cnt
-                    buf[idx4 + 1] = gs // cnt
-                    buf[idx4 + 2] = bs // cnt
-                    buf[idx4 + 3] = a_s // cnt
+                    mask_buf[idx4] = mrs // cnt
+                    mask_buf[idx4 + 1] = mgs // cnt
+                    mask_buf[idx4 + 2] = mbs // cnt
+                    mask_buf[idx4 + 3] = mas // cnt
+                    det_buf[idx4] = drs // cnt
+                    det_buf[idx4 + 1] = dgs // cnt
+                    det_buf[idx4 + 2] = dbs // cnt
+                    det_buf[idx4 + 3] = das // cnt
                     new_cov[row + x] = 1
         coverage = new_cov
 
-    # Box downsample 512x512 -> 256x256
-    out = bytearray(MASK_SIZE * MASK_SIZE * 4)
-    for y in range(MASK_SIZE):
-        for x in range(MASK_SIZE):
-            r = g = b = a = 0
-            for sy in (0, 1):
-                for sx in (0, 1):
-                    idx4 = ((y * 2 + sy) * SS + (x * 2 + sx)) * 4
-                    r += buf[idx4]; g += buf[idx4 + 1]; b += buf[idx4 + 2]; a += buf[idx4 + 3]
-            oidx = (y * MASK_SIZE + x) * 4
-            out[oidx] = r // 4
-            out[oidx + 1] = g // 4
-            out[oidx + 2] = b // 4
-            out[oidx + 3] = a // 4
-    return bytes(out)
+    return bytes(mask_buf), bytes(det_buf)
 
 
 def unwrap_seam_uvs(corners: List[Tuple[int, Tuple[float, float], int, int]]) -> List[Tuple[int, float, float, int, int]]:
@@ -606,8 +1074,12 @@ def build_template_for_gender(gender: str, out_path: Path):
     weights_def = load_json_asset("rigs/standard/weights.default.json")
     lips_json = load_json_asset("uv_layers/lips_solid.json.gz")
     eyelids_json = load_json_asset("uv_layers/eyelids_solid.json.gz")
+    scalp_json = load_json_asset_optional("uv_layers/scalp_solid.json.gz")
     lip_face_ids = {int(k) for k in lips_json.keys()}
     eyelid_face_ids = {int(k) for k in eyelids_json.keys()}
+    scalp_face_ids = {int(k) for k in scalp_json.keys()} if scalp_json else set()
+    sss_raw = fetch_bytes_optional("textures/sss.png")
+    sss_tex = decode_png_rgba(sss_raw) if sss_raw is not None else None
 
     # 1. Canonical gender base shape (average of African/Asian/Caucasian young + 0.5 idealproportions)
     base_targets = combine_weighted_targets([
@@ -983,10 +1455,16 @@ def build_template_for_gender(gender: str, out_path: Path):
         parts_data[pname] = (corners_list, indices_list)
         print(f"  part '{pname}': {len(corners_list)} corners, {len(indices_list)//3} tris")
 
-    # 6. Rasterize 256x256 RGBA8 skin feature mask
-    mask_rgba = build_uv_mask_256(faces, vts, base_positions_m, lip_face_ids, eyelid_face_ids, joint_centers_m)
+    # 6. Compute body hemisphere AO + mean curvature, landmark chains, and 512x512 RGBA8 UV maps
+    ao_per_v, curv_per_v = compute_body_ao_and_curvature(base_positions_m, faces)
+    landmark_chains = extract_landmark_chains(base_positions_m, faces, joint_centers_m)
+    print(f"  landmarks: {[len(c) for c in landmark_chains]}")
+    mask_rgba, detail_rgba = build_uv_maps_512(
+        faces, vts, base_positions_m, lip_face_ids, eyelid_face_ids, scalp_face_ids,
+        joint_centers_m, ao_per_v, curv_per_v, sss_tex,
+    )
 
-    # 7. Serialize binary .vcrcharbase file
+    # 7. Serialize binary .vcrcharbase v2 file
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_out = out_path.with_suffix(".vcrcharbase.tmp")
     gender_id = 0 if gender == "female" else 1
@@ -995,7 +1473,7 @@ def build_template_for_gender(gender: str, out_path: Path):
         f.write(struct.pack(
             "<8sIIIIIIIIII",
             MAGIC, VERSION, gender_id, vcount, len(morph_channels),
-            len(PART_ORDER), MASK_SIZE, BONE_COUNT, 0, 0, 0,
+            len(PART_ORDER), MASK_SIZE, BONE_COUNT, len(landmark_chains), 1, 0,
         ))
         # Base welded positions (float3)
         for x, y, z in base_positions_m:
@@ -1021,9 +1499,16 @@ def build_template_for_gender(gender: str, out_path: Path):
                 f.write(struct.pack("<HBBff", vi, reg, flg, u, v))
             if indices:
                 f.write(struct.pack(f"<{len(indices)}I", *indices))
-        # 256x256 RGBA8 mask
+        # 512x512 RGBA8 skin feature mask & 512x512 RGBA8 skin detail map (AO/Curv/SSS/Nail+Scalp)
         assert len(mask_rgba) == MASK_SIZE * MASK_SIZE * 4
+        assert len(detail_rgba) == MASK_SIZE * MASK_SIZE * 4
         f.write(mask_rgba)
+        f.write(detail_rgba)
+        # 6 landmark welded vertex chains
+        for chain in landmark_chains:
+            f.write(struct.pack("<H", len(chain)))
+            if chain:
+                f.write(struct.pack(f"<{len(chain)}H", *chain))
 
     os.replace(tmp_out, out_path)
     print(f"  wrote {out_path} ({out_path.stat().st_size:,} bytes)")

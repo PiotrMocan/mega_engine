@@ -323,6 +323,40 @@ public:
         face_slider("Freckles", &pkg.body.freckles, 0.0F, 1.0F);
         face_slider("Age / Weather", &pkg.body.age_wear, 0.0F, 1.0F);
         face_slider("Lip Tint", &pkg.body.lip_tint, 0.0F, 1.0F);
+
+        ImGui::SeparatorText("3D Strand Groom & Studio");
+        static constexpr std::array<const char*, 7U> kHairLabels = {
+            "Bald (Brows/Lashes Only)",
+            "Short Crop",
+            "Spiky",
+            "Bob",
+            "Ponytail",
+            "Mohawk",
+            "Hooded Crop",
+        };
+        int hair_idx = std::clamp(
+            static_cast<int>(pkg.wardrobe.hair_style),
+            0,
+            static_cast<int>(kHairLabels.size() - 1U));
+        if (ImGui::Combo("Hair Groom", &hair_idx, kHairLabels.data(), static_cast<int>(kHairLabels.size()))) {
+            pkg.wardrobe.hair_style = static_cast<HairStyle>(hair_idx);
+            actions.mark_dirty = true;
+            actions.rebuild_preview = true;
+        }
+        if (ImGui::ColorEdit3("Hair Melanin", &pkg.wardrobe.hair_color.x)) {
+            actions.mark_dirty = true;
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            actions.rebuild_preview = true;
+        }
+        if (ImGui::Checkbox("3D Beard Groom", &pkg.wardrobe.has_beard)) {
+            actions.mark_dirty = true;
+            actions.rebuild_preview = true;
+        }
+        if (ImGui::Checkbox("Studio Underwear", &pkg.wardrobe.studio_underwear)) {
+            actions.mark_dirty = true;
+            actions.rebuild_preview = true;
+        }
     }
 
     void draw_bottom_panel(

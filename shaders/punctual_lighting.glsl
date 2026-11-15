@@ -201,7 +201,8 @@ PbrLightingComponents evaluatePunctualLightFast(
         const vec3 incident =
             light.colorIntensity.rgb * (light.colorIntensity.w * attenuation * angular * normalDotLight);
         direct.diffuse = (vec3(1.0) - fresnel) * surface.diffuseBrdf * incident;
-        direct.specular = (distribution * visibility) * fresnel * incident;
+        direct.specular = (distribution * visibility) * fresnel * incident
+            * smoothstep(0.02, 0.18, viewDotHalf);
     }
     return direct;
 }
@@ -262,12 +263,14 @@ struct PunctualSubsurfacePrecomputed
 {
     bool enabled;
     bool thinFoliage;
+    bool isSkin;
     vec3 baseColor;
     vec3 sssTint;
     vec3 sssDiffuseWeight;
     float strength;
     float wrap;
     float invWrapNorm;
+    float ambientOcclusion;
 };
 
 PunctualSubsurfacePrecomputed makePunctualSubsurface(
@@ -282,12 +285,14 @@ PunctualSubsurfacePrecomputed makePunctualSubsurface(
     const float strength = clamp(subsurfaceStrength, 0.0, 1.0);
     sss.enabled =
         materialModel == 2u && subsurfaceProfile != 0u &&
-        subsurfaceProfile <= 4u && strength > 0.0;
+        subsurfaceProfile <= 5u && strength > 0.0;
     sss.thinFoliage = sss.enabled && subsurfaceProfile == 4u;
+    sss.isSkin = sss.enabled && subsurfaceProfile == 5u;
     sss.baseColor = baseColor;
     sss.strength = strength;
     sss.wrap = 0.0;
     sss.invWrapNorm = 1.0;
+    sss.ambientOcclusion = clamp(materialParameters.z, 0.0, 1.0);
     sss.sssTint = vec3(0.0);
     sss.sssDiffuseWeight = vec3(0.0);
     if (sss.enabled)
@@ -298,9 +303,10 @@ PunctualSubsurfacePrecomputed makePunctualSubsurface(
         sss.sssDiffuseWeight =
             (vec3(1.0) - fresnelView) * (1.0 - metallic) * pbrInversePi;
         sss.sssTint = evaluateSubsurfaceTint(baseColor, subsurfaceProfile);
-        sss.wrap =
-            (sss.thinFoliage ? 0.45 : (0.18 + 0.10 * float(subsurfaceProfile)))
-            * strength;
+        const float baseWrap =
+            (subsurfaceProfile == 5u ? 0.24 * mix(0.38, 1.0, clamp(materialParameters.z, 0.0, 1.0))
+                : (sss.thinFoliage ? 0.45 : (0.18 + 0.10 * float(subsurfaceProfile))));
+        sss.wrap = baseWrap * strength;
         sss.invWrapNorm = 1.0 / ((1.0 + sss.wrap) * (1.0 + sss.wrap));
     }
     return sss;
@@ -398,6 +404,19 @@ PbrLightingComponents evaluatePunctualLightUnified(
             const vec3 incident = radiance * clampedNdotL;
             direct.diffuse = (vec3(1.0) - fresnel) * surface.diffuseBrdf * incident;
             direct.specular = (distribution * visibility) * fresnel * incident;
+            if (sss.isSkin)
+            {
+                const float retroGrazingDamp = mix(0.06, 1.0, smoothstep(0.12, 0.55, viewDotHalf));
+                const float horizonDamp =
+                    mix(0.18, 1.0, smoothstep(0.06, 0.36, surface.normalDotView)) *
+                    smoothstep(0.0, 0.22, clampedNdotL);
+                const float specAo = clamp(sss.ambientOcclusion * sss.ambientOcclusion * 1.15, 0.12, 1.0);
+                direct.specular *= retroGrazingDamp * horizonDamp * specAo;
+            }
+            else
+            {
+                direct.specular *= smoothstep(0.02, 0.18, viewDotHalf);
+            }
         }
     }
 

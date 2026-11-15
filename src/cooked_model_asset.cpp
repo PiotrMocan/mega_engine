@@ -614,7 +614,7 @@ parse_material(
         if (!model) {
             return CookedModelLoadError{
                 .code = CookedModelLoadErrorCode::invalid_material,
-                .message = "Material model must be standard, unlit, subsurface or gpu_grass.",
+                .message = "Material model must be standard, unlit, subsurface, gpu_grass or strand_hair.",
                 .path = file.absolute,
             };
         }

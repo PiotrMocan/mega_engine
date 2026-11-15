@@ -1,0 +1,194 @@
+{
+  "acting": {
+    "arm_swing": 1.0,
+    "blink_interval_seconds": 3.4,
+    "default_brow_raise": 0.05,
+    "default_frown": 0.0,
+    "default_idle_clip": "idle",
+    "default_smile": 0.12,
+    "idle_breath_amplitude": 1.0,
+    "run_speed_mps": 4.8,
+    "stride_energy": 1.0,
+    "temperament": "warm",
+    "walk_speed_mps": 1.75
+  },
+  "body": {
+    "age_wear": 0.06,
+    "archetype": "human_athletic",
+    "arm_length": 0.5,
+    "body_fat": 0.14,
+    "chest_depth": 0.5,
+    "face": {
+      "brow_ridge": 0.40,
+      "cheekbone_prominence": 0.62,
+      "chin_length": 0.46,
+      "eye_color": [
+        0.22,
+        0.52,
+        0.38
+      ],
+      "eye_size": 0.52,
+      "eye_spacing": 0.5,
+      "head_scale": 1.0,
+      "jaw_width": 0.44,
+      "lip_fullness": 0.56,
+      "mouth_width": 0.48,
+      "nose_length": 0.48,
+      "nose_width": 0.44
+    },
+    "freckles": 0.10,
+    "gender": "female",
+    "height_meters": 1.70,
+    "hip_width": 0.54,
+    "leg_length": 0.52,
+    "lip_tint": 0.54,
+    "musculature": 0.34,
+    "shoulder_width": 0.44,
+    "skin_color": [
+      0.84,
+      0.66,
+      0.55
+    ],
+    "skin_roughness": 0.52,
+    "skin_subsurface_strength": 0.82,
+    "waist_width": 0.42
+  },
+  "dialogue": {
+    "dialogue_id": "lyra_vance_dialogue",
+    "entry_node_id": "greeting",
+    "nodes": [
+      {
+        "brow_raise": 0.16,
+        "choices": [
+          {
+            "closes_dialogue": false,
+            "next_node_id": "briefing",
+            "set_value": 1.0,
+            "set_var": "asked_diagnostics",
+            "text": "How does the calibration look?",
+            "text_ru": "Как проходит калибровка?"
+          },
+          {
+            "closes_dialogue": false,
+            "next_node_id": "farewell",
+            "set_value": 1.0,
+            "set_var": "ack_ready",
+            "text": "Ready when you are.",
+            "text_ru": "Готов, когда скажешь."
+          }
+        ],
+        "expression_clip": "talk",
+        "frown": 0.0,
+        "id": "greeting",
+        "smile": 0.18,
+        "speaker": "Lyra Vance",
+        "text": "Lighting rig and subsurface sensors are aligned. Ready for full scan.",
+        "text_ru": "Свет и подповерхностные датчики откалиброваны. Всё готово к полному сканированию.",
+        "voice_clip_id": "greeting"
+      },
+      {
+        "brow_raise": 0.10,
+        "choices": [
+          {
+            "closes_dialogue": true,
+            "next_node_id": "",
+            "set_value": 1.0,
+            "set_var": "scan_started",
+            "text": "Proceed with capture.",
+            "text_ru": "Начинай захват."
+          }
+        ],
+        "expression_clip": "talk",
+        "frown": 0.04,
+        "id": "briefing",
+        "smile": 0.10,
+        "speaker": "Lyra Vance",
+        "text": "Skin pore micro-detail, corneal reflection, and groom shading are all within target.",
+        "text_ru": "Микрорельеф кожи, отражение роговицы и объёмные пряди волос в пределах нормы.",
+        "voice_clip_id": "briefing"
+      },
+      {
+        "brow_raise": 0.14,
+        "choices": [
+          {
+            "closes_dialogue": true,
+            "next_node_id": "",
+            "set_value": 1.0,
+            "set_var": "",
+            "text": "Leave",
+            "text_ru": "Уйти"
+          }
+        ],
+        "expression_clip": "wave",
+        "frown": 0.0,
+        "id": "farewell",
+        "smile": 0.30,
+        "speaker": "Lyra Vance",
+        "text": "See you on the next pass.",
+        "text_ru": "До встречи на следующем проходе.",
+        "voice_clip_id": "farewell"
+      }
+    ]
+  },
+  "identity": {
+    "display_name": "Lyra Vance",
+    "prompt": "athletic woman with natural skin subsurface detail and dark chestnut bob",
+    "role": "companion",
+    "seed": 2048,
+    "slug": "lyra_vance"
+  },
+  "paint_strokes": [],
+  "schema": "vcr.character_package",
+  "sculpt_strokes": [],
+  "version": 1,
+  "voice": {
+    "breathiness": 0.16,
+    "cadence_variance": 0.40,
+    "pitch_hz": 205.0,
+    "speech_rate": 1.0,
+    "warmth": 0.65
+  },
+  "wardrobe": {
+    "accent_color": [
+      0.82,
+      0.64,
+      0.28
+    ],
+    "bottom_style": "none",
+    "bottom_thickness": 0.012,
+    "footwear_color": [
+      0.14,
+      0.12,
+      0.11
+    ],
+    "footwear_style": "barefoot",
+    "hair_color": [
+      0.16,
+      0.10,
+      0.065
+    ],
+    "hair_style": "bob",
+    "has_beard": false,
+    "has_belt": false,
+    "has_cape": false,
+    "has_gloves": false,
+    "has_pauldrons": false,
+    "occlude_covered_body": true,
+    "primary_color": [
+      0.18,
+      0.29,
+      0.42
+    ],
+    "primary_material": "tactical_weave",
+    "secondary_color": [
+      0.20,
+      0.19,
+      0.21
+    ],
+    "secondary_material": "leather",
+    "studio_underwear": true,
+    "top_style": "none",
+    "top_thickness": 0.014,
+    "wear_and_tear": 0.0
+  }
+}

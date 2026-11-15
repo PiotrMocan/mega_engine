@@ -3444,7 +3444,7 @@ void EditorUi::build_inspector(
                     for (const auto profile : {
                              SubsurfaceProfile::none, SubsurfaceProfile::narrow,
                              SubsurfaceProfile::medium, SubsurfaceProfile::wide,
-                             SubsurfaceProfile::foliage}) {
+                             SubsurfaceProfile::foliage, SubsurfaceProfile::skin}) {
                         if (ImGui::Selectable(
                                 to_token(profile).data(),
                                 node.material.subsurface_profile == profile)) {
@@ -8791,7 +8791,8 @@ void EditorUi::build_material_editor(Renderer& renderer) {
                                  SubsurfaceProfile::narrow,
                                  SubsurfaceProfile::medium,
                                  SubsurfaceProfile::wide,
-                                 SubsurfaceProfile::foliage}) {
+                                 SubsurfaceProfile::foliage,
+                                 SubsurfaceProfile::skin}) {
                             if (ImGui::Selectable(
                                     to_token(profile).data(),
                                     material_editor_->material.subsurface_profile == profile)) {

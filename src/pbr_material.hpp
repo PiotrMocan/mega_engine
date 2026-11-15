@@ -20,6 +20,7 @@ enum class MaterialModel : std::uint32_t {
     unlit = 1,
     subsurface = 2,
     gpu_grass = 3,
+    strand_hair = 4,
 };
 [[nodiscard]] constexpr std::string_view to_token(MaterialModel model) noexcept {
     switch (model) {
@@ -27,6 +28,7 @@ enum class MaterialModel : std::uint32_t {
     case MaterialModel::unlit: return "unlit";
     case MaterialModel::subsurface: return "subsurface";
     case MaterialModel::gpu_grass: return "gpu_grass";
+    case MaterialModel::strand_hair: return "strand_hair";
     }
     return "standard";
 }
@@ -35,6 +37,7 @@ enum class MaterialModel : std::uint32_t {
     if (token == "unlit") return MaterialModel::unlit;
     if (token == "subsurface") return MaterialModel::subsurface;
     if (token == "gpu_grass") return MaterialModel::gpu_grass;
+    if (token == "strand_hair") return MaterialModel::strand_hair;
     return std::nullopt;
 }
 [[nodiscard]] inline float dielectric_f0(float ior) noexcept {
@@ -94,7 +97,8 @@ static_assert(offsetof(PbrMaterial, subsurface_strength) == 44U);
     material.ior = std::isfinite(material.ior) && material.ior >= 1.0F ? material.ior : 1.5F;
     if (material.model != MaterialModel::standard && material.model != MaterialModel::unlit &&
         material.model != MaterialModel::subsurface &&
-        material.model != MaterialModel::gpu_grass) {
+        material.model != MaterialModel::gpu_grass &&
+        material.model != MaterialModel::strand_hair) {
         material.model = MaterialModel::standard;
     }
     if (static_cast<std::uint32_t>(material.subsurface_profile) >

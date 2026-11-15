@@ -254,6 +254,13 @@ vec3 evaluateSubsurfaceTint(vec3 baseColor, uint subsurfaceProfile)
             sqrt(safeColor) * vec3(0.96, 1.12, 0.54);
         return clamp(mix(baseColor, chlorophyllLift, 0.65), vec3(0.0), vec3(1.0));
     }
+    if (subsurfaceProfile == 5u)
+    {
+        // Dermal hemoglobin scatter shifts shadow terminators toward warm crimson.
+        const vec3 dermisScatter =
+            pow(safeColor, vec3(0.70, 1.04, 1.34)) * vec3(1.16, 0.80, 0.58);
+        return clamp(mix(baseColor, dermisScatter, 0.62), vec3(0.0), vec3(1.0));
+    }
     const vec3 warmSubdermal =
         pow(safeColor, vec3(0.76, 0.96, 1.16)) * vec3(1.08, 0.88, 0.72);
     return clamp(mix(baseColor, warmSubdermal, 0.55), vec3(0.0), vec3(1.0));
@@ -277,23 +284,54 @@ PbrLightingComponents evaluatePbrDirectSubsurfaceComponents(
         baseColor, materialParameters, normal, viewDirection, lightDirection,
         directRadiance, directVisibility, dielectricF0);
     const float strength = clamp(subsurfaceStrength, 0.0, 1.0);
-    if (materialModel != 2u || subsurfaceProfile == 0u || subsurfaceProfile > 4u || strength <= 0.0)
+    if (materialModel != 2u || subsurfaceProfile == 0u || subsurfaceProfile > 5u || strength <= 0.0)
     {
         return direct;
     }
 
     const float metallic = clamp(materialParameters.x, 0.0, 1.0);
+    const float ambientOcclusion = clamp(materialParameters.z, 0.0, 1.0);
     const float normalDotView = max(dot(normal, viewDirection), 1.0e-4);
     const vec3 reflectanceAtNormal = mix(vec3(dielectricF0), baseColor, metallic);
     const vec3 fresnelView = fresnelSchlick(normalDotView, reflectanceAtNormal);
     const vec3 diffuseWeight = (vec3(1.0) - fresnelView) * (1.0 - metallic) * pbrInversePi;
     const vec3 sssTint = evaluateSubsurfaceTint(baseColor, subsurfaceProfile);
 
-    // Energy-conserving Green wrap across the terminator with chromatic scatter.
+    // Dual-lobe micro-oil highlight for human skin so pores catch crisp specular glints.
     const float rawNdotL = dot(normal, lightDirection);
     const float clampedNdotL = max(rawNdotL, 0.0);
-    const float wrap =
-        (subsurfaceProfile == 4u ? 0.45 : (0.18 + 0.10 * float(subsurfaceProfile))) * strength;
+    if (subsurfaceProfile == 5u && clampedNdotL > 0.0 && directVisibility > 0.0)
+    {
+        const vec3 fineParams = vec3(
+            materialParameters.x,
+            clamp(materialParameters.y * 0.68, 0.30, 1.0),
+            materialParameters.z);
+        const PbrLightingComponents fineDirect = evaluatePbrDirectComponents(
+            baseColor, fineParams, normal, viewDirection, lightDirection,
+            directRadiance, directVisibility, dielectricF0 * 0.36);
+        direct.specular = mix(direct.specular, fineDirect.specular, 0.11);
+    }
+    if (subsurfaceProfile == 5u)
+    {
+        const vec3 halfUnnorm = viewDirection + lightDirection;
+        const float halfLenSq = dot(halfUnnorm, halfUnnorm);
+        const float vDotH = halfLenSq > 1.0e-6
+            ? clamp(dot(viewDirection, halfUnnorm * inversesqrt(halfLenSq)), 0.0, 1.0)
+            : 0.0;
+        const float retroGrazingDamp = mix(0.06, 1.0, smoothstep(0.12, 0.55, vDotH));
+        const float horizonDamp =
+            mix(0.18, 1.0, smoothstep(0.06, 0.36, normalDotView)) *
+            smoothstep(0.0, 0.22, clampedNdotL);
+        const float specAo = clamp(ambientOcclusion * ambientOcclusion * 1.15, 0.12, 1.0);
+        direct.specular *= retroGrazingDamp * horizonDamp * specAo;
+    }
+
+    // Energy-conserving Green wrap across the terminator with chromatic scatter.
+    const float cavityFactor = (subsurfaceProfile == 5u) ? mix(0.38, 1.0, ambientOcclusion) : 1.0;
+    const float baseWrap =
+        (subsurfaceProfile == 5u ? 0.24
+            : (subsurfaceProfile == 4u ? 0.45 : (0.18 + 0.10 * float(subsurfaceProfile))));
+    const float wrap = baseWrap * strength * cavityFactor;
     const float invWrapNorm = 1.0 / ((1.0 + wrap) * (1.0 + wrap));
     const float wrappedNdotL = clamp((rawNdotL + wrap) * invWrapNorm, 0.0, 1.0);
     const float frontVis = clamp(directVisibility, 0.0, 1.0);
@@ -306,6 +344,17 @@ PbrLightingComponents evaluatePbrDirectSubsurfaceComponents(
     const vec3 wrappedDiffuse =
         diffuseWeight * wrappedAlbedo * directRadiance * wrappedNdotL * wrapVis;
     direct.diffuse = mix(direct.diffuse, wrappedDiffuse, strength * 0.85);
+
+    // Thin-tissue crimson ear/nostril/finger back-scatter for skin when sunlit from behind.
+    if (subsurfaceProfile == 5u && transVis > 0.0)
+    {
+        const float backRaw = max(-rawNdotL, 0.0);
+        const float backCone = pow(clamp(dot(viewDirection, -lightDirection), 0.0, 1.0), 4.0);
+        const float rimWrap = clamp((backRaw * 0.65 + backCone * 0.55) * (1.0 - clampedNdotL), 0.0, 1.0);
+        const vec3 crimsonDermis = sssTint * vec3(1.18, 0.42, 0.22);
+        direct.diffuse +=
+            diffuseWeight * crimsonDermis * directRadiance * (rimWrap * 0.32 * strength * transVis);
+    }
 
     // Thin-slab foliage back-lit transmission + normal-distorted forward Mie lobe.
     if (subsurfaceProfile == 4u && transVis > 0.0)
@@ -368,12 +417,20 @@ PbrLightingComponents evaluatePbrLightingSubsurfaceComponents(
         fresnelSchlickRoughness(normalDotView, reflectanceAtNormal, roughness);
     const vec3 diffuseWeight = (vec3(1.0) - ambientFresnel) * (1.0 - metallic);
     const vec2 integratedBrdf = environmentBrdfApprox(normalDotView, roughness);
-    const vec3 ambientSpecular =
+    vec3 ambientSpecular =
         environmentRadiance * (reflectanceAtNormal * integratedBrdf.x + integratedBrdf.y);
+    if (materialModel == 2u && subsurfaceProfile == 5u)
+    {
+        const float skinHorizon = smoothstep(0.08, 0.42, normalDotView);
+        const float specAo = clamp(ambientOcclusion * ambientOcclusion * 1.15, 0.12, 1.0);
+        ambientSpecular = environmentRadiance *
+            (reflectanceAtNormal * integratedBrdf.x + integratedBrdf.y * skinHorizon) *
+            mix(0.28, 1.0, skinHorizon) * specAo;
+    }
     vec3 ambientDiffuse = diffuseWeight * baseColor * diffuseAmbient;
 
     const float strength = clamp(subsurfaceStrength, 0.0, 1.0);
-    if (materialModel == 2u && subsurfaceProfile != 0u && subsurfaceProfile <= 4u && strength > 0.0)
+    if (materialModel == 2u && subsurfaceProfile != 0u && subsurfaceProfile <= 5u && strength > 0.0)
     {
         const vec3 sssTint = evaluateSubsurfaceTint(baseColor, subsurfaceProfile);
         if (subsurfaceProfile == 4u)

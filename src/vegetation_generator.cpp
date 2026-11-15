@@ -5,12 +5,15 @@
 #include "model_lod.hpp"
 #include "pbr_material.hpp"
 #include "png_encoder.hpp"
+#include "runtime_assets.hpp"
 #include "subsurface.hpp"
 
 #include <glm/common.hpp>
 #include <glm/ext/scalar_constants.hpp>
 #include <glm/geometric.hpp>
 #include <glm/trigonometric.hpp>
+
+#include <stb_image.h>
 
 #include <algorithm>
 #include <array>
@@ -21,6 +24,7 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <system_error>
 #include <utility>
@@ -32,6 +36,229 @@ using Json = nlohmann::json;
 
 constexpr float kPi = glm::pi<float>();
 constexpr float kTwoPi = 2.0F * kPi;
+
+struct StbiPixelsDeleter final {
+    void operator()(stbi_uc* const ptr) const noexcept {
+        if (ptr != nullptr) {
+            stbi_image_free(ptr);
+        }
+    }
+};
+
+struct BotanicalPhotoSample final {
+    std::uint32_t width = 0U;
+    std::uint32_t height = 0U;
+    std::vector<std::uint8_t> rgba{};
+    glm::vec3 mean_rgb{0.5F, 0.5F, 0.5F};
+    glm::vec3 mean_leaf_rgb{0.22F, 0.44F, 0.14F};
+
+    [[nodiscard]] bool valid() const noexcept {
+        const std::size_t texels =
+            static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+        return width > 1U && height > 1U && rgba.size() == texels * 4U;
+    }
+};
+
+// Indices 0..4 correspond to styles 1..5 in bark_style_to_token / foliage_style_to_token.
+struct BotanicalTextureLibrary final {
+    std::array<BotanicalPhotoSample, 5U> barks{};
+    std::array<BotanicalPhotoSample, 5U> foliages{};
+};
+
+[[nodiscard]] std::filesystem::path find_vegetation_library_file(const std::string_view filename) {
+    std::error_code ec;
+    if (const auto runtime_root = find_runtime_asset_root()) {
+        const std::filesystem::path p1 = runtime_root->path / "vegetation" / filename;
+        if (std::filesystem::is_regular_file(p1, ec) && !ec) {
+            return p1;
+        }
+        ec.clear();
+        const std::filesystem::path p2 = runtime_root->path.parent_path() / "assets" / "vegetation" / filename;
+        if (std::filesystem::is_regular_file(p2, ec) && !ec) {
+            return p2;
+        }
+    }
+    ec.clear();
+    if (const auto ws = find_engine_workspace_root()) {
+        const std::filesystem::path p3 = *ws / "assets" / "vegetation" / filename;
+        if (std::filesystem::is_regular_file(p3, ec) && !ec) {
+            return p3;
+        }
+    }
+    ec.clear();
+    const std::filesystem::path p4 = std::filesystem::path("assets") / "vegetation" / filename;
+    if (std::filesystem::is_regular_file(p4, ec) && !ec) {
+        return p4;
+    }
+    return {};
+}
+
+[[nodiscard]] BotanicalPhotoSample load_botanical_png(
+    const std::string_view filename,
+    const bool compute_leaf_mean) {
+    BotanicalPhotoSample out{};
+    const std::filesystem::path path = find_vegetation_library_file(filename);
+    if (path.empty()) {
+        return out;
+    }
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) {
+        return out;
+    }
+    const std::streamoff size_off = file.tellg();
+    if (size_off <= 0 || size_off > 64LL * 1024LL * 1024LL) {
+        return out;
+    }
+    const auto file_size = static_cast<std::size_t>(size_off);
+    std::vector<stbi_uc> encoded(file_size);
+    file.seekg(0, std::ios::beg);
+    if (!file.read(reinterpret_cast<char*>(encoded.data()), static_cast<std::streamsize>(file_size))) {
+        return out;
+    }
+
+    int w = 0;
+    int h = 0;
+    int channels = 0;
+    std::unique_ptr<stbi_uc, StbiPixelsDeleter> decoded(
+        stbi_load_from_memory(
+            encoded.data(),
+            static_cast<int>(encoded.size()),
+            &w,
+            &h,
+            &channels,
+            4));
+    if (!decoded || w <= 1 || h <= 1 || w > 4096 || h > 4096) {
+        return out;
+    }
+    const std::size_t texels = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
+    if (texels > std::numeric_limits<std::size_t>::max() / 4U) {
+        return out;
+    }
+    out.width = static_cast<std::uint32_t>(w);
+    out.height = static_cast<std::uint32_t>(h);
+    out.rgba.resize(texels * 4U);
+    std::memcpy(out.rgba.data(), decoded.get(), texels * 4U);
+
+    double sum_r = 0.0;
+    double sum_g = 0.0;
+    double sum_b = 0.0;
+    double sum_w = 0.0;
+    double leaf_r = 0.0;
+    double leaf_g = 0.0;
+    double leaf_b = 0.0;
+    double leaf_w = 0.0;
+    for (std::size_t i = 0U; i < texels; ++i) {
+        const float r = static_cast<float>(out.rgba[i * 4U + 0U]) / 255.0F;
+        const float g = static_cast<float>(out.rgba[i * 4U + 1U]) / 255.0F;
+        const float b = static_cast<float>(out.rgba[i * 4U + 2U]) / 255.0F;
+        const float a = static_cast<float>(out.rgba[i * 4U + 3U]) / 255.0F;
+        if (a > 0.25F) {
+            sum_r += static_cast<double>(r) * a;
+            sum_g += static_cast<double>(g) * a;
+            sum_b += static_cast<double>(b) * a;
+            sum_w += static_cast<double>(a);
+            if (compute_leaf_mean && g > r * 0.96F && (g - b) > 0.03F) {
+                leaf_r += static_cast<double>(r) * a;
+                leaf_g += static_cast<double>(g) * a;
+                leaf_b += static_cast<double>(b) * a;
+                leaf_w += static_cast<double>(a);
+            }
+        }
+    }
+    if (sum_w > 1.0) {
+        out.mean_rgb = glm::vec3(
+            static_cast<float>(sum_r / sum_w),
+            static_cast<float>(sum_g / sum_w),
+            static_cast<float>(sum_b / sum_w));
+    }
+    if (leaf_w > 1.0) {
+        out.mean_leaf_rgb = glm::vec3(
+            static_cast<float>(leaf_r / leaf_w),
+            static_cast<float>(leaf_g / leaf_w),
+            static_cast<float>(leaf_b / leaf_w));
+    } else {
+        out.mean_leaf_rgb = out.mean_rgb;
+    }
+    return out;
+}
+
+[[nodiscard]] const BotanicalTextureLibrary& load_botanical_texture_library() {
+    static const BotanicalTextureLibrary kLibrary = []() {
+        BotanicalTextureLibrary lib{};
+        lib.barks[0] = load_botanical_png("bark_birch.png", false);
+        lib.barks[1] = load_botanical_png("bark_oak.png", false);
+        lib.barks[2] = load_botanical_png("bark_pine.png", false);
+        lib.barks[3] = load_botanical_png("bark_palm.png", false);
+        lib.barks[4] = load_botanical_png("bark_shrub.png", false);
+
+        lib.foliages[0] = load_botanical_png("foliage_birch.png", true);
+        lib.foliages[1] = load_botanical_png("foliage_oak.png", true);
+        lib.foliages[2] = load_botanical_png("foliage_shrub.png", true);
+        lib.foliages[3] = load_botanical_png("foliage_conifer.png", true);
+        lib.foliages[4] = load_botanical_png("foliage_palm.png", true);
+        return lib;
+    }();
+    return kLibrary;
+}
+
+[[nodiscard]] glm::vec4 sample_photo_rgba(
+    const BotanicalPhotoSample& img,
+    const float u,
+    const float v,
+    const bool wrap_uv) noexcept {
+    if (!img.valid()) {
+        return glm::vec4(0.0F);
+    }
+    float su = u;
+    float sv = v;
+    if (wrap_uv) {
+        su -= std::floor(su);
+        sv -= std::floor(sv);
+    } else {
+        if (su < 0.0F || su > 1.0F || sv < 0.0F || sv > 1.0F) {
+            return glm::vec4(0.0F);
+        }
+    }
+    const float fx = su * static_cast<float>(img.width) - 0.5F;
+    const float fy = sv * static_cast<float>(img.height) - 0.5F;
+    const int x0_raw = static_cast<int>(std::floor(fx));
+    const int y0_raw = static_cast<int>(std::floor(fy));
+    const float tx = fx - static_cast<float>(x0_raw);
+    const float ty = fy - static_cast<float>(y0_raw);
+
+    const auto fetch = [&](const int ix, const int iy) noexcept {
+        int px = ix;
+        int py = iy;
+        if (wrap_uv) {
+            const int iw = static_cast<int>(img.width);
+            const int ih = static_cast<int>(img.height);
+            px = ((px % iw) + iw) % iw;
+            py = ((py % ih) + ih) % ih;
+        } else {
+            px = std::clamp(px, 0, static_cast<int>(img.width) - 1);
+            py = std::clamp(py, 0, static_cast<int>(img.height) - 1);
+        }
+        const std::size_t off =
+            (static_cast<std::size_t>(py) * img.width + static_cast<std::size_t>(px)) * 4U;
+        return glm::vec4(
+            static_cast<float>(img.rgba[off + 0U]) / 255.0F,
+            static_cast<float>(img.rgba[off + 1U]) / 255.0F,
+            static_cast<float>(img.rgba[off + 2U]) / 255.0F,
+            static_cast<float>(img.rgba[off + 3U]) / 255.0F);
+    };
+
+    const glm::vec4 c00 = fetch(x0_raw, y0_raw);
+    const glm::vec4 c10 = fetch(x0_raw + 1, y0_raw);
+    const glm::vec4 c01 = fetch(x0_raw, y0_raw + 1);
+    const glm::vec4 c11 = fetch(x0_raw + 1, y0_raw + 1);
+    const glm::vec4 top = glm::mix(c00, c10, tx);
+    const glm::vec4 bot = glm::mix(c01, c11, tx);
+    glm::vec4 res = glm::mix(top, bot, ty);
+    if (!wrap_uv && res.a < 0.005F) {
+        res.a = 0.0F;
+    }
+    return res;
+}
 
 class Pcg32 final {
 public:
@@ -337,6 +564,65 @@ enum class BotanicalSpecies : std::uint8_t {
     return BotanicalSpecies::ancient_oak;
 }
 
+[[nodiscard]] std::size_t resolve_bark_style(
+    const VegetationRecipe& recipe,
+    const BotanicalSpecies species) noexcept {
+    if (recipe.bark_style >= 1U && recipe.bark_style <= 5U) {
+        return static_cast<std::size_t>(recipe.bark_style - 1U);
+    }
+    switch (species) {
+    case BotanicalSpecies::silver_birch:
+        return 0U;
+    case BotanicalSpecies::ancient_oak:
+    case BotanicalSpecies::sugar_maple:
+        return 1U;
+    case BotanicalSpecies::nordic_pine:
+    case BotanicalSpecies::alpine_spruce:
+        return 2U;
+    case BotanicalSpecies::coconut_palm:
+    case BotanicalSpecies::date_palm:
+        return 3U;
+    case BotanicalSpecies::hazel_shrub:
+    case BotanicalSpecies::arid_scrub:
+    case BotanicalSpecies::woodland_fern:
+    case BotanicalSpecies::wetland_reed:
+    case BotanicalSpecies::fescue_grass:
+    case BotanicalSpecies::steppe_grass:
+        return 4U;
+    }
+    return 1U;
+}
+
+[[nodiscard]] std::size_t resolve_foliage_style(
+    const VegetationRecipe& recipe,
+    const BotanicalSpecies species) noexcept {
+    if (recipe.foliage_style >= 1U && recipe.foliage_style <= 5U) {
+        return static_cast<std::size_t>(recipe.foliage_style - 1U);
+    }
+    switch (species) {
+    case BotanicalSpecies::silver_birch:
+        return 0U;
+    case BotanicalSpecies::ancient_oak:
+    case BotanicalSpecies::sugar_maple:
+        return 1U;
+    case BotanicalSpecies::hazel_shrub:
+    case BotanicalSpecies::arid_scrub:
+        return 2U;
+    case BotanicalSpecies::nordic_pine:
+    case BotanicalSpecies::alpine_spruce:
+        return 3U;
+    case BotanicalSpecies::coconut_palm:
+    case BotanicalSpecies::date_palm:
+        return 4U;
+    case BotanicalSpecies::woodland_fern:
+    case BotanicalSpecies::wetland_reed:
+    case BotanicalSpecies::fescue_grass:
+    case BotanicalSpecies::steppe_grass:
+        return 2U;
+    }
+    return 1U;
+}
+
 [[nodiscard]] float smooth_ridge_noise_periodic(
     const float u,
     const float v,
@@ -585,7 +871,7 @@ struct MeshAccumulator final {
         const std::uint32_t base_v = static_cast<std::uint32_t>(vertices.size());
         for (std::uint32_t j = 0U; j <= nr; ++j) {
             const float tv = static_cast<float>(j) / static_cast<float>(nr);
-            const float env_u = 1.0F - 0.14F * tv * tv;
+            const float env_u = 0.56F + 0.44F * std::sin(std::clamp(0.10F + 0.86F * tv, 0.0F, 1.0F) * kPi);
             const float camber = std::sin(tv * kPi) * arch_camber - (tv * tv) * gravity_droop;
             const float d_camber = (kPi * std::cos(tv * kPi) * arch_camber - 2.0F * tv * gravity_droop) /
                                    std::max(0.05F, length);
@@ -604,10 +890,15 @@ struct MeshAccumulator final {
                     axis_u + face_n * (-2.0F * su * lateral_cup / std::max(0.04F, half_width)),
                     axis_u);
                 const glm::vec3 sheet_n = safe_normalize(glm::cross(lateral_tan, spine_tan), face_n);
-                const glm::vec3 sph_n = safe_normalize(pos - lobe_center, glm::vec3(0.0F, 1.0F, 0.0F));
+                glm::vec3 sph_n = safe_normalize(pos - lobe_center, glm::vec3(0.0F, 1.0F, 0.0F));
+                // Keep spherical puff normals in the card's front hemisphere so two-sided shading never flips dark.
+                if (glm::dot(sph_n, sheet_n) < 0.0F) {
+                    sph_n = -sph_n;
+                }
+                const float safe_sph = std::min(std::clamp(spherize_weight, 0.0F, 1.0F), 0.50F);
                 const glm::vec3 final_n = safe_normalize(
-                    glm::mix(sheet_n, sph_n, std::clamp(spherize_weight, 0.0F, 1.0F)),
-                    sph_n);
+                    glm::mix(sheet_n, sph_n, safe_sph),
+                    sheet_n);
                 const glm::vec2 uv{
                     tile_uv.u0 + (tile_uv.u1 - tile_uv.u0) * tu,
                     tile_uv.v_base + (tile_uv.v_tip - tile_uv.v_base) * tv,
@@ -975,8 +1266,11 @@ void append_palm_frond_geometry(
     };
 
     const auto spherized_normal = [&](const glm::vec3 pos, const glm::vec3 local_n) noexcept {
-        const glm::vec3 out = safe_normalize(pos - spec.lobe_center, crown_up);
-        return safe_normalize(glm::mix(local_n, out, spec.spherize_weight), out);
+        glm::vec3 out = safe_normalize(pos - spec.lobe_center, crown_up);
+        if (glm::dot(out, local_n) < 0.0F) {
+            out = -out;
+        }
+        return safe_normalize(glm::mix(local_n, out, std::min(spec.spherize_weight, 0.50F)), local_n);
     };
 
     // Articulated V-dihedral pinnate wing surface
@@ -1139,7 +1433,7 @@ void append_foliage_cluster_geometry(
     const glm::vec3 up_h = safe_normalize(spec.up_hint, glm::vec3(0.0F, 1.0F, 0.0F));
 
     if (spec.is_ribbon_frond) {
-        const float len = spec.half_extent * 2.0F * spec.length_ratio * lod_size_boost;
+        const float len = spec.half_extent * 2.0F * spec.length_ratio * (1.0F + 0.05F * static_cast<float>(lod));
         const float hw = spec.half_extent * lod_size_boost;
         const std::uint32_t segs = std::max(1U, spec.ribbon_segs);
         glm::vec3 horiz = safe_normalize(glm::vec3(fwd.x, 0.0F, fwd.z), glm::vec3(1.0F, 0.0F, 0.0F));
@@ -1188,8 +1482,8 @@ void append_foliage_cluster_geometry(
 
     const float hw = spec.half_extent * lod_size_boost;
     const float length = spec.half_extent * 2.0F * spec.length_ratio * lod_size_boost;
-    const std::uint32_t cols = (lod <= 1U) ? spec.card_cols : 1U;
-    const std::uint32_t rows = (lod == 0U) ? spec.card_rows : ((lod == 1U) ? std::max(1U, spec.card_rows - 1U) : 1U);
+    const std::uint32_t cols = (lod == 0U) ? std::max(1U, spec.card_cols) : ((lod == 1U) ? 2U : 1U);
+    const std::uint32_t rows = (lod == 0U) ? std::max(1U, spec.card_rows) : ((lod <= 2U) ? 2U : 1U);
 
     foliage_mesh.append_draped_sprig_card(
         spec.center,
@@ -1920,12 +2214,23 @@ void generate_foliage_textures(
     out_orm.width = res;
     out_orm.height = res;
     out_orm.pixels.resize(static_cast<std::size_t>(res) * res * 4U);
+    const float gloss = std::clamp(recipe.foliage_gloss, 0.0F, 1.0F);
+    const float base_leaf_rough = glm::mix(0.92F, 0.28F, gloss);
+    const std::uint8_t default_rough_u8 = to_unorm8(base_leaf_rough);
     for (std::size_t i = 0U; i < static_cast<std::size_t>(res) * res; ++i) {
         out_orm.pixels[i * 4U + 0U] = 230U; // AO in R
-        out_orm.pixels[i * 4U + 1U] = 158U; // Roughness in G (~0.62)
+        out_orm.pixels[i * 4U + 1U] = default_rough_u8; // Roughness in G (driven by foliage_gloss)
         out_orm.pixels[i * 4U + 2U] = 0U;   // Non-metallic in B
         out_orm.pixels[i * 4U + 3U] = 255U;
     }
+
+    const BotanicalTextureLibrary& lib = load_botanical_texture_library();
+    const std::size_t fol_style_idx = resolve_foliage_style(recipe, species);
+    const std::size_t photo_idx = is_palm ? ((recipe.foliage_style == 0U) ? 4U : fol_style_idx) : fol_style_idx;
+    const BotanicalPhotoSample& photo = lib.foliages[photo_idx];
+    const bool use_specialized_shape =
+        (recipe.foliage_style == 0U) &&
+        (species == BotanicalSpecies::woodland_fern || species == BotanicalSpecies::wetland_reed);
 
     TileCanvas canvas{};
     std::vector<std::uint8_t> tile_albedo_u8(static_cast<std::size_t>(tile_w) * tile_h * 4U);
@@ -1944,6 +2249,7 @@ void generate_foliage_textures(
         Pcg32 trng(tile_seed);
 
         canvas.reset(tile_w, tile_h);
+        std::fill(canvas.rough.begin(), canvas.rough.end(), base_leaf_rough);
         const std::uint32_t gx0 = guard_x;
         const std::uint32_t gy0 = guard_y;
         const std::uint32_t gx1 = tile_w - guard_x - 1U;
@@ -1955,7 +2261,82 @@ void generate_foliage_textures(
             glm::mix(base_c, glm::max(recipe.leaf_tip_srgb, base_c * 1.18F), 0.35F));
         const glm::vec3 vein_c = glm::mix(base_c * 1.16F, glm::vec3(0.72F, 0.74F, 0.30F), 0.28F);
 
-        if (is_palm) {
+        const bool used_photo = (!use_specialized_shape && photo.valid());
+        if (used_photo) {
+            const glm::vec3 twig_c = glm::mix(recipe.bark_color_srgb, glm::vec3(0.30F, 0.22F, 0.15F), 0.50F);
+            const glm::vec3 dry_col = recipe.leaf_dry_srgb;
+            const bool flip_u = (t_idx % 2U) != 0U;
+            const float rot_rad = trng.range(-0.10F, 0.10F);
+            const float cos_r = std::cos(rot_rad);
+            const float sin_r = std::sin(rot_rad);
+            const float scale_uv = trng.range(0.93F, 1.04F);
+            const float u_shift = trng.range(-0.025F, 0.025F);
+            const float palm_lat_scale = trng.range(0.94F, 1.05F);
+            const float palm_len_scale = trng.range(0.96F, 1.02F);
+            const float inv_w_span = 1.0F / static_cast<float>(std::max(1U, gx1 - gx0));
+            const float inv_h_span = 1.0F / static_cast<float>(std::max(1U, gy1 - gy0));
+            const glm::vec3 safe_mean = glm::max(photo.mean_leaf_rgb, glm::vec3(0.08F));
+
+            for (std::uint32_t y = gy0; y <= gy1; ++y) {
+                const float tv_img = static_cast<float>(y - gy0) * inv_h_span;
+                for (std::uint32_t x = gx0; x <= gx1; ++x) {
+                    const float tu = static_cast<float>(x - gx0) * inv_w_span;
+                    float u_src = 0.0F;
+                    float v_src = 0.0F;
+                    if (is_palm) {
+                        const float lat = flip_u ? (1.0F - tv_img) : tv_img;
+                        u_src = 0.5F + (lat - 0.5F) * palm_lat_scale;
+                        v_src = 1.0F - tu * palm_len_scale;
+                    } else {
+                        const float rel_u = ((flip_u ? (1.0F - tu) : tu) - 0.5F) / scale_uv;
+                        const float rel_v = (tv_img - 0.98F) / scale_uv;
+                        u_src = 0.5F + rel_u * cos_r - rel_v * sin_r + u_shift * (1.0F - tv_img);
+                        v_src = 0.98F + rel_u * sin_r + rel_v * cos_r;
+                    }
+
+                    const glm::vec4 s = sample_photo_rgba(photo, u_src, v_src, false);
+                    if (s.a <= 0.01F) {
+                        continue;
+                    }
+
+                    const float green_excess = s.g - 0.5F * (s.r + s.b);
+                    const float twig_w = std::clamp((0.03F - green_excess) * 14.0F, 0.0F, 1.0F);
+                    const glm::vec3 detail_ratio = glm::clamp(
+                        glm::vec3(s) / safe_mean,
+                        glm::vec3(0.42F),
+                        glm::vec3(1.68F));
+                    const float t_tip = is_palm ? tu : (1.0F - tv_img);
+                    const glm::vec3 leaf_grad = glm::mix(base_c, tip_c, std::clamp(t_tip, 0.0F, 1.0F));
+                    glm::vec3 final_rgb = leaf_grad * detail_ratio;
+                    final_rgb = glm::mix(
+                        final_rgb,
+                        dry_col * detail_ratio,
+                        std::clamp(style.dryness * (0.35F + 0.65F * t_tip), 0.0F, 0.92F));
+                    if (style.dry_skirt) {
+                        final_rgb = glm::mix(final_rgb, dry_col * detail_ratio, 0.85F);
+                    }
+                    final_rgb = glm::mix(final_rgb, twig_c, twig_w);
+                    final_rgb = glm::clamp(final_rgb, glm::vec3(0.015F), glm::vec3(0.985F));
+
+                    const float lum = glm::dot(glm::vec3(s), glm::vec3(0.299F, 0.587F, 0.114F));
+                    const float z_h = 0.30F + 0.45F * lum;
+                    const float px_rough = style.dry_skirt
+                        ? std::max(base_leaf_rough, 0.86F)
+                        : glm::clamp(
+                              base_leaf_rough + 0.10F * twig_w + 0.18F * style.dryness -
+                              0.05F * (detail_ratio.g - 1.0F),
+                              0.12F,
+                              0.98F);
+                    const float px_ao = glm::clamp(0.72F + 0.28F * detail_ratio.g, 0.45F, 1.0F);
+                    const std::size_t p = static_cast<std::size_t>(y) * tile_w + x;
+                    canvas.color[p] = final_rgb;
+                    canvas.alpha[p] = s.a;
+                    canvas.height[p] = z_h;
+                    canvas.rough[p] = px_rough;
+                    canvas.ao[p] = px_ao;
+                }
+            }
+        } else if (is_palm) {
             draw_palm_frond_strip(canvas, gx0, gy0, gx1, gy1, species, style, t_idx, tile_seed);
         } else if (species == BotanicalSpecies::woodland_fern) {
             draw_fern_frond_on_tile(canvas, gx0, gy0, gx1, gy1, base_c, tip_c, style.dryness, tile_seed);
@@ -2031,8 +2412,14 @@ void generate_foliage_textures(
             }
         }
 
+        if (!used_photo) {
+            for (float& r : canvas.rough) {
+                r = glm::clamp(r + (base_leaf_rough - 0.56F), 0.12F, 0.98F);
+            }
+        }
+
         // Convert tile heightfield -> tangent normal map & pack tile buffers
-        constexpr float kNormalStrength = 3.2F;
+        constexpr float kNormalStrength = 1.25F;
         for (std::uint32_t y = 0U; y < tile_h; ++y) {
             const std::uint32_t ym = (y > 0U) ? (y - 1U) : 0U;
             const std::uint32_t yp = (y + 1U < tile_h) ? (y + 1U) : (tile_h - 1U);
@@ -2115,6 +2502,11 @@ void generate_bark_textures(
     out_orm.pixels.resize(static_cast<std::size_t>(res) * res * 4U);
 
     std::vector<float> height_field(static_cast<std::size_t>(res) * res, 0.5F);
+    const BotanicalTextureLibrary& lib = load_botanical_texture_library();
+    const BotanicalPhotoSample& bark_photo = lib.barks[resolve_bark_style(recipe, species)];
+    Pcg32 brng(recipe.seed ^ 0x517cc1b7U);
+    const float u_off = brng.next_01();
+    const float v_off = brng.next_01();
     const bool birch_style = (species == BotanicalSpecies::silver_birch) ||
                              (recipe.bark_color_srgb.r > 0.62F && recipe.bark_color_srgb.g > 0.60F);
     const bool pine_style = (species == BotanicalSpecies::nordic_pine);
@@ -2127,10 +2519,19 @@ void generate_bark_textures(
             const float u = static_cast<float>(x) / static_cast<float>(res);
             float h = 0.5F;
             float crevice_ao = 1.0F;
-            float rough_mod = 0.92F;
+            float rough_mod = recipe.bark_roughness;
             glm::vec3 col = recipe.bark_color_srgb;
 
-            if (birch_style) {
+            if (bark_photo.valid()) {
+                const glm::vec4 s = sample_photo_rgba(bark_photo, u + u_off, v + v_off, true);
+                const float lum = glm::dot(glm::vec3(s), glm::vec3(0.299F, 0.587F, 0.114F));
+                const glm::vec3 safe_mean = glm::max(bark_photo.mean_rgb, glm::vec3(0.08F));
+                const glm::vec3 ratio = glm::clamp(glm::vec3(s) / safe_mean, glm::vec3(0.25F), glm::vec3(1.85F));
+                col = glm::clamp(recipe.bark_color_srgb * ratio, glm::vec3(0.02F), glm::vec3(0.98F));
+                h = lum;
+                crevice_ao = glm::clamp(0.45F + 0.65F * lum, 0.35F, 1.0F);
+                rough_mod = glm::clamp(recipe.bark_roughness + (0.5F - lum) * 0.18F, minimum_pbr_roughness, 1.0F);
+            } else if (birch_style) {
                 const float paper = smooth_value_noise_periodic(u, v, 8, 32, recipe.seed + 11U);
                 const float lenticel = smooth_value_noise_periodic(u, v, 4, 64, recipe.seed + 37U);
                 const float diamond = worley_f2_minus_f1_periodic(u, v, 4, 8, recipe.seed + 91U);
@@ -2202,13 +2603,13 @@ void generate_bark_textures(
             out_albedo.pixels[idx + 3U] = 255U;
 
             out_orm.pixels[idx + 0U] = to_unorm8(std::clamp(crevice_ao, 0.32F, 1.0F));
-            out_orm.pixels[idx + 1U] = to_unorm8(std::clamp(rough_mod, 0.72F, 1.0F));
+            out_orm.pixels[idx + 1U] = to_unorm8(std::clamp(rough_mod, minimum_pbr_roughness, 1.0F));
             out_orm.pixels[idx + 2U] = 0U;
             out_orm.pixels[idx + 3U] = 255U;
         }
     }
 
-    constexpr float strength = 3.2F;
+    constexpr float strength = 2.8F;
     for (std::int32_t y = 0; y < static_cast<std::int32_t>(res); ++y) {
         const std::int32_t ym = (y == 0) ? static_cast<std::int32_t>(res) - 1 : y - 1;
         const std::int32_t yp = (y + 1 == static_cast<std::int32_t>(res)) ? 0 : y + 1;
@@ -2254,6 +2655,8 @@ void generate_grass_textures(
     const glm::vec3 tip_c = glm::mix(recipe.leaf_tip_srgb, tint_srgb * 1.15F, 0.30F);
     const float dry = std::clamp(recipe.dryness_amount, 0.0F, 1.0F);
     const float autumn = std::clamp(recipe.autumn_amount, 0.0F, 1.0F);
+    const float gloss = std::clamp(recipe.foliage_gloss, 0.0F, 1.0F);
+    const float base_blade_rough = glm::mix(0.88F, 0.30F, gloss);
     std::vector<float> height_field(static_cast<std::size_t>(res) * res, 0.5F);
 
     for (std::uint32_t y = 0U; y < res; ++y) {
@@ -2285,7 +2688,10 @@ void generate_grass_textures(
             out_albedo.pixels[idx + 3U] = 255U;
 
             const float blade_ao = 0.78F + 0.22F * std::min(1.0F, t_blade * 3.0F);
-            const float blade_rough = glm::mix(0.46F + 0.14F * ribs, 0.84F, dry_tip);
+            const float blade_rough = std::clamp(
+                glm::mix(base_blade_rough + 0.08F * ribs, 0.88F, dry_tip),
+                minimum_pbr_roughness,
+                1.0F);
             out_orm.pixels[idx + 0U] = to_unorm8(blade_ao);
             out_orm.pixels[idx + 1U] = to_unorm8(blade_rough);
             out_orm.pixels[idx + 2U] = 0U;
@@ -2354,7 +2760,7 @@ void generate_grass_textures(
         .roughness = 1.0F,
         .ambient_occlusion = 1.0F,
         .reserved = 0.0F,
-        .ior = 1.5F,
+        .ior = glm::mix(1.14F, 1.58F, std::clamp(recipe.foliage_gloss, 0.0F, 1.0F)),
         .model = MaterialModel::subsurface,
         .subsurface_profile = SubsurfaceProfile::foliage,
         .subsurface_strength = recipe.subsurface_strength,
@@ -2382,7 +2788,7 @@ void generate_grass_textures(
         .roughness = 1.0F,
         .ambient_occlusion = 1.0F,
         .reserved = 0.0F,
-        .ior = 1.5F,
+        .ior = glm::mix(1.14F, 1.58F, std::clamp(recipe.foliage_gloss, 0.0F, 1.0F)),
         .model = MaterialModel::gpu_grass,
         .subsurface_profile = SubsurfaceProfile::foliage,
         .subsurface_strength = recipe.subsurface_strength,
@@ -2459,7 +2865,7 @@ void add_canopy_cloud_cards(
         spec.arch_camber = hw * (downward_weep ? 0.14F : 0.22F);
         spec.gravity_droop = hw * (downward_weep ? 0.46F : 0.26F);
         spec.lateral_cup = hw * ((species == BotanicalSpecies::silver_birch) ? 0.16F : 0.14F);
-        spec.spherize_weight = (species == BotanicalSpecies::ancient_oak) ? 0.85F : 0.80F;
+        spec.spherize_weight = 0.50F;
         spec.roll_angle = rng.range(-0.75F, 0.75F);
         spec.color_srgb = app.color_srgb;
         spec.ao_factor = app.ao;
@@ -3081,15 +3487,15 @@ void build_palm_tree_lod(
     }
 
     const float spare_mul = (recipe.foliage_mode == VegetationFoliageMode::sparse) ? 0.58F : 1.0F;
-    const float lod_mul = (lod == 0U) ? 1.0F : ((lod == 1U) ? 0.78F : ((lod == 2U) ? 0.54F : 0.36F));
+    const float lod_mul = (lod == 0U) ? 1.0F : ((lod == 1U) ? 0.80F : ((lod == 2U) ? 0.62F : 0.46F));
     const std::uint32_t active_fronds = std::clamp(
         static_cast<std::uint32_t>(std::lround(static_cast<float>(recipe.frond_count) * spare_mul * lod_mul)),
-        4U,
+        6U,
         44U);
     const std::uint32_t skirt_count = static_cast<std::uint32_t>(std::lround(
         static_cast<float>(active_fronds) * std::clamp(recipe.dry_skirt_ratio, 0.0F, 0.65F)));
     const glm::vec3 lobe_c = crown_center + crown_up * 0.38F;
-    const float lod_boost = (lod == 0U) ? 1.0F : ((lod == 1U) ? 1.08F : ((lod == 2U) ? 1.20F : 1.38F));
+    const float lod_boost = (lod == 0U) ? 1.0F : ((lod == 1U) ? 1.12F : ((lod == 2U) ? 1.26F : 1.42F));
 
     // 5-tier golden-angle phyllotactic palm crown (dry skirt -> lower -> mid -> fountain -> central spear)
     for (std::uint32_t f = 0U; f < active_fronds; ++f) {
@@ -3280,9 +3686,9 @@ void build_grass_tuft_lod(
     const float mode_mul = (recipe.foliage_mode == VegetationFoliageMode::bare)
         ? 0.25F
         : ((recipe.foliage_mode == VegetationFoliageMode::sparse) ? 0.52F : 1.0F);
-    const float lod_mul = (lod == 0U) ? 1.0F : ((lod == 1U) ? 0.62F : ((lod == 2U) ? 0.36F : 0.18F));
+    const float lod_mul = (lod == 0U) ? 1.0F : ((lod == 1U) ? 0.68F : ((lod == 2U) ? 0.46F : 0.30F));
     const std::uint32_t lod_boost_segs = (lod == 0U) ? 5U : ((lod == 1U) ? 4U : ((lod == 2U) ? 2U : 1U));
-    const float lod_boost = (lod == 0U) ? 1.0F : ((lod == 1U) ? 1.12F : ((lod == 2U) ? 1.28F : 1.48F));
+    constexpr float lod_boost = 1.0F;
 
     if (species == BotanicalSpecies::woodland_fern) {
         // True 3-whorl arching woodland fern rosette (upright young inner tier + wide sweeping mature fronds)
@@ -3892,6 +4298,7 @@ void build_gpu_grass_patch_lod(
         r.grass_blade_count = 768U;
         r.leaf_base_srgb = {0.14F, 0.34F, 0.10F};
         r.leaf_tip_srgb = {0.36F, 0.64F, 0.19F};
+        r.foliage_gloss = 0.22F;
         r.lod_keep_ratios = {0.58F, 0.30F, 0.14F};
         r.collision_kind = VegetationCollisionKind::none;
         push("meadow_fescue_gpu", "Meadow Fescue (GPU Grass)", "Grass", std::move(r));
@@ -3906,6 +4313,7 @@ void build_gpu_grass_patch_lod(
         r.leaf_base_srgb = {0.40F, 0.36F, 0.15F};
         r.leaf_tip_srgb = {0.68F, 0.56F, 0.24F};
         r.dryness_amount = 0.55F;
+        r.foliage_gloss = 0.10F;
         r.lod_keep_ratios = {0.58F, 0.30F, 0.14F};
         r.collision_kind = VegetationCollisionKind::none;
         push("steppe_dry_grass_gpu", "Steppe Dry Grass (GPU)", "Grass", std::move(r));
@@ -3920,6 +4328,7 @@ void build_gpu_grass_patch_lod(
         r.leaf_base_srgb = {0.11F, 0.32F, 0.09F};
         r.leaf_tip_srgb = {0.30F, 0.60F, 0.18F};
         r.crown_ao = 0.48F;
+        r.foliage_gloss = 0.24F;
         r.atlas_resolution = 1024U;
         r.collision_kind = VegetationCollisionKind::none;
         push("wild_fern_tuft", "Wild Fern Clump", "Tuft", std::move(r));
@@ -3935,6 +4344,7 @@ void build_gpu_grass_patch_lod(
         r.leaf_base_srgb = {0.18F, 0.36F, 0.13F};
         r.leaf_tip_srgb = {0.54F, 0.52F, 0.20F};
         r.dryness_amount = 0.20F;
+        r.foliage_gloss = 0.20F;
         r.atlas_resolution = 1024U;
         r.bark_resolution = 512U;
         r.collision_kind = VegetationCollisionKind::none;
@@ -3954,6 +4364,7 @@ void build_gpu_grass_patch_lod(
         r.leaf_base_srgb = {0.13F, 0.32F, 0.10F};
         r.leaf_tip_srgb = {0.34F, 0.58F, 0.16F};
         r.crown_ao = 0.52F;
+        r.foliage_gloss = 0.18F;
         r.atlas_resolution = 1024U;
         r.bark_resolution = 512U;
         r.collision_kind = VegetationCollisionKind::bounds_box;
@@ -3975,6 +4386,7 @@ void build_gpu_grass_patch_lod(
         r.leaf_tip_srgb = {0.46F, 0.48F, 0.28F};
         r.dryness_amount = 0.40F;
         r.crown_ao = 0.44F;
+        r.foliage_gloss = 0.10F;
         r.atlas_resolution = 1024U;
         r.bark_resolution = 512U;
         r.collision_kind = VegetationCollisionKind::bounds_box;
@@ -3994,6 +4406,7 @@ void build_gpu_grass_patch_lod(
         r.branch_droop = 0.28F;
         r.leaf_base_srgb = {0.18F, 0.44F, 0.13F};
         r.leaf_tip_srgb = {0.42F, 0.68F, 0.20F};
+        r.foliage_gloss = 0.20F;
         r.atlas_resolution = 1024U;
         r.bark_resolution = 512U;
         r.collision_kind = VegetationCollisionKind::trunk_cylinder;
@@ -4014,6 +4427,7 @@ void build_gpu_grass_patch_lod(
         r.leaf_base_srgb = {0.10F, 0.29F, 0.09F};
         r.leaf_tip_srgb = {0.28F, 0.50F, 0.15F};
         r.crown_ao = 0.58F;
+        r.foliage_gloss = 0.18F;
         r.atlas_resolution = 1024U;
         r.bark_resolution = 512U;
         r.collision_kind = VegetationCollisionKind::trunk_cylinder;
@@ -4035,6 +4449,7 @@ void build_gpu_grass_patch_lod(
         r.leaf_autumn_srgb = {0.84F, 0.16F, 0.07F};
         r.autumn_amount = 0.78F;
         r.crown_ao = 0.48F;
+        r.foliage_gloss = 0.20F;
         r.atlas_resolution = 1024U;
         r.bark_resolution = 512U;
         r.collision_kind = VegetationCollisionKind::trunk_cylinder;
@@ -4070,6 +4485,7 @@ void build_gpu_grass_patch_lod(
         r.leaf_base_srgb = {0.09F, 0.24F, 0.10F};
         r.leaf_tip_srgb = {0.18F, 0.38F, 0.16F};
         r.crown_ao = 0.50F;
+        r.foliage_gloss = 0.22F;
         r.atlas_resolution = 1024U;
         r.bark_resolution = 512U;
         r.collision_kind = VegetationCollisionKind::trunk_cylinder;
@@ -4088,6 +4504,7 @@ void build_gpu_grass_patch_lod(
         r.leaf_base_srgb = {0.07F, 0.20F, 0.13F};
         r.leaf_tip_srgb = {0.16F, 0.34F, 0.22F};
         r.crown_ao = 0.54F;
+        r.foliage_gloss = 0.20F;
         r.atlas_resolution = 1024U;
         r.bark_resolution = 512U;
         r.collision_kind = VegetationCollisionKind::trunk_cylinder;
@@ -4109,6 +4526,7 @@ void build_gpu_grass_patch_lod(
         r.leaf_base_srgb = {0.14F, 0.40F, 0.11F};
         r.leaf_tip_srgb = {0.38F, 0.64F, 0.17F};
         r.crown_ao = 0.46F;
+        r.foliage_gloss = 0.42F;
         r.atlas_resolution = 1024U;
         r.bark_resolution = 512U;
         r.collision_kind = VegetationCollisionKind::trunk_cylinder;
@@ -4131,6 +4549,7 @@ void build_gpu_grass_patch_lod(
         r.leaf_tip_srgb = {0.42F, 0.56F, 0.24F};
         r.dryness_amount = 0.18F;
         r.crown_ao = 0.48F;
+        r.foliage_gloss = 0.32F;
         r.atlas_resolution = 1024U;
         r.bark_resolution = 512U;
         r.collision_kind = VegetationCollisionKind::trunk_cylinder;
@@ -4214,6 +4633,48 @@ std::optional<VegetationPaintMode> parse_vegetation_paint_mode(const std::string
     return std::nullopt;
 }
 
+std::string_view bark_style_to_token(const std::uint32_t style) noexcept {
+    switch (style) {
+    case 1U: return "birch";
+    case 2U: return "oak";
+    case 3U: return "pine";
+    case 4U: return "palm";
+    case 5U: return "shrub";
+    default: return "auto";
+    }
+}
+
+std::optional<std::uint32_t> parse_bark_style(const std::string_view token) noexcept {
+    if (token == "auto") return 0U;
+    if (token == "birch") return 1U;
+    if (token == "oak") return 2U;
+    if (token == "pine") return 3U;
+    if (token == "palm") return 4U;
+    if (token == "shrub") return 5U;
+    return std::nullopt;
+}
+
+std::string_view foliage_style_to_token(const std::uint32_t style) noexcept {
+    switch (style) {
+    case 1U: return "birch";
+    case 2U: return "oak";
+    case 3U: return "shrub";
+    case 4U: return "conifer";
+    case 5U: return "palm";
+    default: return "auto";
+    }
+}
+
+std::optional<std::uint32_t> parse_foliage_style(const std::string_view token) noexcept {
+    if (token == "auto") return 0U;
+    if (token == "birch") return 1U;
+    if (token == "oak") return 2U;
+    if (token == "shrub") return 3U;
+    if (token == "conifer") return 4U;
+    if (token == "palm") return 5U;
+    return std::nullopt;
+}
+
 std::string sanitize_vegetation_slug(const std::string_view input) {
     std::string out;
     out.reserve(input.size());
@@ -4256,6 +4717,7 @@ VegetationRecipe sanitize_vegetation_recipe(VegetationRecipe recipe) {
     recipe.trunk_flare = clamp_finite(recipe.trunk_flare, 0.0F, 1.2F, 0.35F);
     recipe.bark_roughness = clamp_finite(recipe.bark_roughness, minimum_pbr_roughness, 1.0F, 0.85F);
     recipe.bark_color_srgb = clamp_srgb(recipe.bark_color_srgb, glm::vec3(0.42F, 0.34F, 0.28F));
+    recipe.bark_style = std::min(recipe.bark_style, 5U);
 
     recipe.primary_branches = std::clamp(recipe.primary_branches, 2U, 16U);
     recipe.branch_levels = std::clamp(recipe.branch_levels, 1U, 4U);
@@ -4267,9 +4729,11 @@ VegetationRecipe sanitize_vegetation_recipe(VegetationRecipe recipe) {
     recipe.dry_skirt_ratio = clamp_finite(recipe.dry_skirt_ratio, 0.0F, 0.65F, 0.18F);
     recipe.grass_blade_count = std::clamp(recipe.grass_blade_count, 16U, max_gpu_grass_blades_per_patch);
 
+    recipe.foliage_style = std::min(recipe.foliage_style, 5U);
     recipe.foliage_density = clamp_finite(recipe.foliage_density, 0.2F, 2.0F, 1.0F);
     recipe.cluster_scale = clamp_finite(recipe.cluster_scale, 0.4F, 2.0F, 1.0F);
-    recipe.alpha_cutoff = clamp_finite(recipe.alpha_cutoff, 0.10F, 0.90F, 0.35F);
+    recipe.alpha_cutoff = clamp_finite(recipe.alpha_cutoff, 0.10F, 0.90F, 0.30F);
+    recipe.foliage_gloss = clamp_finite(recipe.foliage_gloss, 0.0F, 1.0F, 0.18F);
     recipe.leaf_base_srgb = clamp_srgb(recipe.leaf_base_srgb, glm::vec3(0.20F, 0.44F, 0.14F));
     recipe.leaf_tip_srgb = clamp_srgb(recipe.leaf_tip_srgb, glm::vec3(0.44F, 0.70F, 0.22F));
     recipe.leaf_autumn_srgb = clamp_srgb(recipe.leaf_autumn_srgb, glm::vec3(0.84F, 0.42F, 0.10F));
@@ -4360,6 +4824,7 @@ nlohmann::json serialize_vegetation_recipe_json(const VegetationRecipe& raw_reci
         {"trunk_flare", r.trunk_flare},
         {"bark_roughness", r.bark_roughness},
         {"bark_color_srgb", arr3(r.bark_color_srgb)},
+        {"bark_style", std::string(bark_style_to_token(r.bark_style))},
         {"primary_branches", r.primary_branches},
         {"branch_levels", r.branch_levels},
         {"branch_spread", r.branch_spread},
@@ -4373,9 +4838,11 @@ nlohmann::json serialize_vegetation_recipe_json(const VegetationRecipe& raw_reci
 
     root["foliage"] = Json{
         {"mode", std::string(to_token(r.foliage_mode))},
+        {"foliage_style", std::string(foliage_style_to_token(r.foliage_style))},
         {"density", r.foliage_density},
         {"cluster_scale", r.cluster_scale},
         {"alpha_cutoff", r.alpha_cutoff},
+        {"foliage_gloss", r.foliage_gloss},
         {"leaf_base_srgb", arr3(r.leaf_base_srgb)},
         {"leaf_tip_srgb", arr3(r.leaf_tip_srgb)},
         {"leaf_autumn_srgb", arr3(r.leaf_autumn_srgb)},
@@ -4461,6 +4928,28 @@ bool deserialize_vegetation_recipe_json(
             target = glm::vec3(it->at(0).get<float>(), it->at(1).get<float>(), it->at(2).get<float>());
         }
     };
+    const auto read_bark_style = [](const Json& obj, const char* key, std::uint32_t& target) {
+        if (const auto it = obj.find(key); it != obj.end()) {
+            if (it->is_string()) {
+                if (const auto parsed = parse_bark_style(it->get<std::string>())) {
+                    target = *parsed;
+                }
+            } else if (it->is_number_unsigned()) {
+                target = it->get<std::uint32_t>();
+            }
+        }
+    };
+    const auto read_foliage_style = [](const Json& obj, const char* key, std::uint32_t& target) {
+        if (const auto it = obj.find(key); it != obj.end()) {
+            if (it->is_string()) {
+                if (const auto parsed = parse_foliage_style(it->get<std::string>())) {
+                    target = *parsed;
+                }
+            } else if (it->is_number_unsigned()) {
+                target = it->get<std::uint32_t>();
+            }
+        }
+    };
 
     if (const auto g_it = root.find("growth"); g_it != root.end() && g_it->is_object()) {
         read_f(*g_it, "height_meters", r.height_meters);
@@ -4471,6 +4960,7 @@ bool deserialize_vegetation_recipe_json(
         read_f(*g_it, "trunk_flare", r.trunk_flare);
         read_f(*g_it, "bark_roughness", r.bark_roughness);
         read_v3(*g_it, "bark_color_srgb", r.bark_color_srgb);
+        read_bark_style(*g_it, "bark_style", r.bark_style);
         read_u(*g_it, "primary_branches", r.primary_branches);
         read_u(*g_it, "branch_levels", r.branch_levels);
         read_f(*g_it, "branch_spread", r.branch_spread);
@@ -4488,9 +4978,12 @@ bool deserialize_vegetation_recipe_json(
                 r.foliage_mode = *parsed;
             }
         }
+        read_foliage_style(*f_it, "foliage_style", r.foliage_style);
         read_f(*f_it, "density", r.foliage_density);
         read_f(*f_it, "cluster_scale", r.cluster_scale);
         read_f(*f_it, "alpha_cutoff", r.alpha_cutoff);
+        read_f(*f_it, "foliage_gloss", r.foliage_gloss);
+        read_f(*f_it, "gloss", r.foliage_gloss);
         read_v3(*f_it, "leaf_base_srgb", r.leaf_base_srgb);
         read_v3(*f_it, "leaf_tip_srgb", r.leaf_tip_srgb);
         read_v3(*f_it, "leaf_autumn_srgb", r.leaf_autumn_srgb);
@@ -4503,6 +4996,14 @@ bool deserialize_vegetation_recipe_json(
         read_u(*f_it, "atlas_resolution", r.atlas_resolution);
         read_u(*f_it, "bark_resolution", r.bark_resolution);
     }
+
+    // Convenience top-level aliases so flat MCP / JSON patches apply directly.
+    read_bark_style(root, "bark_style", r.bark_style);
+    read_foliage_style(root, "foliage_style", r.foliage_style);
+    read_f(root, "foliage_gloss", r.foliage_gloss);
+    read_f(root, "alpha_cutoff", r.alpha_cutoff);
+    read_f(root, "foliage_density", r.foliage_density);
+    read_f(root, "bark_roughness", r.bark_roughness);
 
     if (const auto o_it = root.find("optimization"); o_it != root.end() && o_it->is_object()) {
         if (const auto c_it = o_it->find("collision"); c_it != o_it->end() && c_it->is_string()) {
@@ -4609,25 +5110,63 @@ bool generate_vegetation_asset(
         std::array<std::vector<FoliageClusterSpec>, 4U> lod_clusters{};
         std::vector<FoliageClusterSpec> all_clusters{};
 
+        const bool canopy_card_archetype =
+            (recipe.archetype == VegetationArchetype::broadleaf_tree ||
+             recipe.archetype == VegetationArchetype::conifer_tree ||
+             recipe.archetype == VegetationArchetype::bush);
+        const float k1 = std::clamp(recipe.lod_keep_ratios[0], 0.45F, 0.85F);
+        const float k2 = std::clamp(std::max(0.32F, recipe.lod_keep_ratios[1]), 0.25F, k1 - 0.05F);
+        const float k3 = std::clamp(std::max(0.18F, recipe.lod_keep_ratios[2]), 0.14F, k2 - 0.05F);
+
         for (std::uint32_t lod = 0U; lod < 4U; ++lod) {
+            std::vector<FoliageClusterSpec> unused_bark_lod_clusters{};
+            std::vector<FoliageClusterSpec>& cluster_sink =
+                (canopy_card_archetype && lod > 0U) ? unused_bark_lod_clusters : lod_clusters[lod];
             switch (recipe.archetype) {
             case VegetationArchetype::broadleaf_tree:
-                build_broadleaf_tree_lod(recipe, lod, bark_meshes[lod], lod_clusters[lod]);
+                build_broadleaf_tree_lod(recipe, lod, bark_meshes[lod], cluster_sink);
                 break;
             case VegetationArchetype::conifer_tree:
-                build_conifer_tree_lod(recipe, lod, bark_meshes[lod], lod_clusters[lod]);
+                build_conifer_tree_lod(recipe, lod, bark_meshes[lod], cluster_sink);
                 break;
             case VegetationArchetype::palm_tree:
-                build_palm_tree_lod(recipe, lod, bark_meshes[lod], lod_clusters[lod]);
+                build_palm_tree_lod(recipe, lod, bark_meshes[lod], cluster_sink);
                 break;
             case VegetationArchetype::bush:
-                build_bush_lod(recipe, lod, bark_meshes[lod], lod_clusters[lod]);
+                build_bush_lod(recipe, lod, bark_meshes[lod], cluster_sink);
                 break;
             case VegetationArchetype::grass_tuft:
-                build_grass_tuft_lod(recipe, lod, bark_meshes[lod], lod_clusters[lod]);
+                build_grass_tuft_lod(recipe, lod, bark_meshes[lod], cluster_sink);
                 break;
             case VegetationArchetype::grass_patch_gpu:
                 break;
+            }
+            if (canopy_card_archetype) {
+                if (lod == 0U) {
+                    const std::size_t n0 = lod_clusters[0].size();
+                    const std::uint32_t c0_cols = (n0 <= 380U) ? 3U : 2U;
+                    const std::uint32_t c0_rows = (n0 <= 750U) ? 3U : 2U;
+                    for (auto& c : lod_clusters[0]) {
+                        c.card_cols = c0_cols;
+                        c.card_rows = c0_rows;
+                    }
+                } else if (!lod_clusters[0].empty()) {
+                    // Stratified sampling from LOD0 preserves 3D crown volume and quadrant coverage.
+                    const std::size_t n0 = lod_clusters[0].size();
+                    const float keep = (lod == 1U) ? k1 : ((lod == 2U) ? k2 : k3);
+                    const std::size_t lo_n = std::min<std::size_t>(n0, 4U);
+                    const std::size_t max_less = (n0 > lod) ? (n0 - lod) : 1U;
+                    const std::size_t hi_n = std::max<std::size_t>(lo_n, max_less);
+                    const std::size_t raw_target = static_cast<std::size_t>(
+                        std::lround(static_cast<float>(n0) * keep));
+                    const std::size_t target_n = std::clamp(raw_target, lo_n, hi_n);
+                    lod_clusters[lod].reserve(target_n);
+                    for (std::size_t k = 0U; k < target_n; ++k) {
+                        const std::size_t idx = static_cast<std::size_t>(
+                            (static_cast<std::uint64_t>(k) * n0 + n0 / 2U) / target_n);
+                        lod_clusters[lod].push_back(lod_clusters[0][std::min(idx, n0 - 1U)]);
+                    }
+                }
             }
             for (const auto& c : lod_clusters[lod]) {
                 all_clusters.push_back(c);
@@ -4717,7 +5256,21 @@ bool generate_vegetation_asset(
                 const std::uint32_t mat_idx = static_cast<std::uint32_t>(model.materials.size());
                 model.materials.push_back(make_foliage_material(recipe));
                 const std::uint64_t first_idx = combined.indices.size();
-                const float size_boost = (lod == 0U) ? 1.0F : ((lod == 1U) ? 1.18F : ((lod == 2U) ? 1.44F : 1.76F));
+                float size_boost = 1.0F;
+                if (lod > 0U) {
+                    if (canopy_card_archetype) {
+                        const float actual_keep =
+                            static_cast<float>(lod_clusters[lod].size()) /
+                            static_cast<float>(std::max<std::size_t>(1U, lod_clusters[0].size()));
+                        constexpr std::array<float, 4U> kTargetArea{1.0F, 0.96F, 0.90F, 0.82F};
+                        size_boost = std::clamp(
+                            std::sqrt(kTargetArea[lod] / std::max(0.08F, actual_keep)),
+                            1.12F,
+                            2.25F);
+                    } else {
+                        size_boost = (lod == 1U) ? 1.35F : ((lod == 2U) ? 1.75F : 2.20F);
+                    }
+                }
                 for (const auto& c : lod_clusters[lod]) {
                     append_foliage_cluster_geometry(
                         combined,

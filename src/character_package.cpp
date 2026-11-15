@@ -1,5 +1,6 @@
 #include "character_package.hpp"
 
+#include "character_strand_groom.hpp"
 #include "png_encoder.hpp"
 #include "prefab_io.hpp"
 #include "runtime_assets.hpp"
@@ -25,6 +26,7 @@
 #include <mutex>
 #include <sstream>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 
 #if defined(_WIN32)
@@ -66,7 +68,8 @@ enum class TemplateRegion : std::uint8_t {
 
 constexpr std::uint32_t template_morph_count = 18U;
 constexpr std::uint32_t template_part_count = 5U;
-constexpr std::uint32_t template_mask_size = 256U;
+constexpr std::uint32_t template_mask_size = 512U;
+constexpr std::uint32_t template_landmark_chain_count = 6U;
 
 [[nodiscard]] bool checked_mul_size(
     const std::size_t a,
@@ -488,12 +491,15 @@ enum TemplatePartId : std::size_t {
 struct HumanBaseTemplate {
     CharacterGender gender = CharacterGender::male;
     std::uint32_t vertex_count = 0U;
+    std::uint32_t mask_size = template_mask_size;
     std::vector<glm::vec3> base_positions{};
     std::vector<CookedSkinVertex> skin_weights{};
     std::array<TemplateBoneLocator, character_total_bone_count> bone_locators{};
     std::array<std::vector<TemplateMorphDelta>, template_morph_count> morph_channels{};
     std::array<TemplatePart, template_part_count> parts{};
     std::vector<std::uint8_t> skin_mask_rgba{};
+    std::vector<std::uint8_t> skin_detail_rgba{};
+    std::array<std::vector<std::uint16_t>, template_landmark_chain_count> landmark_chains{};
 };
 
 class BinarySpanReader final {
@@ -620,7 +626,7 @@ private:
     BinarySpanReader rd(raw);
     std::span<const std::uint8_t> magic{};
     if (!rd.read_exact(8U, magic)) return false;
-    constexpr std::array<char, 8U> expected_magic{'V', 'C', 'R', 'C', 'B', 'A', 'S', '1'};
+    constexpr std::array<char, 8U> expected_magic{'V', 'C', 'R', 'C', 'B', 'A', 'S', '2'};
     for (std::size_t i = 0U; i < 8U; ++i) {
         if (magic[i] != static_cast<std::uint8_t>(expected_magic[i])) {
             return false;
@@ -634,23 +640,26 @@ private:
     const std::uint32_t part_count = rd.read_u32();
     const std::uint32_t mask_size = rd.read_u32();
     const std::uint32_t bone_count = rd.read_u32();
-    static_cast<void>(rd.read_u32());
-    static_cast<void>(rd.read_u32());
+    const std::uint32_t landmark_chain_count = rd.read_u32();
+    const std::uint32_t flags = rd.read_u32();
     static_cast<void>(rd.read_u32());
 
-    if (!rd.ok() || version != 1U ||
+    if (!rd.ok() || version != 2U ||
         gender_id != static_cast<std::uint32_t>(expected_gender) ||
         vertex_count == 0U || vertex_count > 200'000U ||
         morph_count != template_morph_count ||
         part_count != template_part_count ||
         mask_size != template_mask_size ||
-        bone_count != character_total_bone_count) {
+        bone_count != character_total_bone_count ||
+        landmark_chain_count != template_landmark_chain_count ||
+        (flags & 1U) == 0U) {
         return false;
     }
 
     HumanBaseTemplate tpl{};
     tpl.gender = expected_gender;
     tpl.vertex_count = vertex_count;
+    tpl.mask_size = mask_size;
     tpl.base_positions.resize(vertex_count);
     for (std::uint32_t i = 0U; i < vertex_count; ++i) {
         const float x = rd.read_f32();
@@ -734,6 +743,22 @@ private:
     std::span<const std::uint8_t> mask_span{};
     if (!rd.read_exact(mask_bytes, mask_span)) return false;
     tpl.skin_mask_rgba.assign(mask_span.begin(), mask_span.end());
+
+    std::span<const std::uint8_t> detail_span{};
+    if (!rd.read_exact(mask_bytes, detail_span)) return false;
+    tpl.skin_detail_rgba.assign(detail_span.begin(), detail_span.end());
+
+    for (std::uint32_t li = 0U; li < template_landmark_chain_count; ++li) {
+        const std::uint16_t cnt = rd.read_u16();
+        if (!rd.ok() || cnt > 512U) return false;
+        auto& chain = tpl.landmark_chains[li];
+        chain.resize(cnt);
+        for (std::uint16_t k = 0U; k < cnt; ++k) {
+            const std::uint16_t vid = rd.read_u16();
+            if (!rd.ok() || vid >= vertex_count) return false;
+            chain[k] = vid;
+        }
+    }
     if (!rd.ok() || rd.remaining() != 0U) return false;
 
     out_tpl = std::move(tpl);
@@ -1177,50 +1202,51 @@ void emit_ellipsoid(
     return accum;
 }
 
-void recompute_tangents_from_normals(std::vector<CookedModelVertex>& vertices) {
-    for (CookedModelVertex& v : vertices) {
-        const glm::vec3 raw_n(v.normal[0], v.normal[1], v.normal[2]);
-        const glm::vec3 n = glm::length(raw_n) > 1.0e-6F
-            ? glm::normalize(raw_n)
-            : glm::vec3(0.0F, 1.0F, 0.0F);
-        v.normal = {n.x, n.y, n.z};
-        const glm::vec3 up = std::abs(n.y) < 0.95F
-            ? glm::vec3(0.0F, 1.0F, 0.0F)
-            : glm::vec3(1.0F, 0.0F, 0.0F);
-        const glm::vec3 t = glm::normalize(glm::cross(up, n));
-        v.tangent = {t.x, t.y, t.z, 1.0F};
+[[nodiscard]] glm::vec4 sample_rgba_buffer_bilinear(
+    const std::span<const std::uint8_t> buffer,
+    const std::uint32_t dim,
+    const float u,
+    const float v) noexcept {
+    if (dim == 0U ||
+        buffer.size() < static_cast<std::size_t>(dim) * static_cast<std::size_t>(dim) * 4U) {
+        return glm::vec4(0.0F);
     }
+    const std::uint32_t max_coord = dim - 1U;
+    const float fx = std::clamp(u, 0.0F, 1.0F) * static_cast<float>(max_coord);
+    const float fy = std::clamp(v, 0.0F, 1.0F) * static_cast<float>(max_coord);
+    const auto x0 = static_cast<std::uint32_t>(fx);
+    const auto y0 = static_cast<std::uint32_t>(fy);
+    const std::uint32_t x1 = (std::min)(x0 + 1U, max_coord);
+    const std::uint32_t y1 = (std::min)(y0 + 1U, max_coord);
+    const float tx = fx - static_cast<float>(x0);
+    const float ty = fy - static_cast<float>(y0);
+
+    const auto fetch = [&](const std::uint32_t x, const std::uint32_t y) noexcept {
+        const std::size_t off = (static_cast<std::size_t>(y) * dim + x) * 4U;
+        constexpr float inv255 = 1.0F / 255.0F;
+        return glm::vec4(
+            static_cast<float>(buffer[off + 0U]) * inv255,
+            static_cast<float>(buffer[off + 1U]) * inv255,
+            static_cast<float>(buffer[off + 2U]) * inv255,
+            static_cast<float>(buffer[off + 3U]) * inv255);
+    };
+    const glm::vec4 c0 = glm::mix(fetch(x0, y0), fetch(x1, y0), tx);
+    const glm::vec4 c1 = glm::mix(fetch(x0, y1), fetch(x1, y1), tx);
+    return glm::mix(c0, c1, ty);
 }
 
 [[nodiscard]] glm::vec4 sample_skin_mask_bilinear(
     const HumanBaseTemplate& tpl,
     const float u,
     const float v) noexcept {
-    if (tpl.skin_mask_rgba.size() <
-        static_cast<std::size_t>(template_mask_size) * template_mask_size * 4U) {
-        return glm::vec4(0.0F);
-    }
-    const float fx = std::clamp(u, 0.0F, 1.0F) * static_cast<float>(template_mask_size - 1U);
-    const float fy = std::clamp(v, 0.0F, 1.0F) * static_cast<float>(template_mask_size - 1U);
-    const auto x0 = static_cast<std::uint32_t>(fx);
-    const auto y0 = static_cast<std::uint32_t>(fy);
-    const std::uint32_t x1 = (std::min)(x0 + 1U, template_mask_size - 1U);
-    const std::uint32_t y1 = (std::min)(y0 + 1U, template_mask_size - 1U);
-    const float tx = fx - static_cast<float>(x0);
-    const float ty = fy - static_cast<float>(y0);
+    return sample_rgba_buffer_bilinear(tpl.skin_mask_rgba, tpl.mask_size, u, v);
+}
 
-    const auto fetch = [&](const std::uint32_t x, const std::uint32_t y) noexcept {
-        const std::size_t off = (static_cast<std::size_t>(y) * template_mask_size + x) * 4U;
-        constexpr float inv255 = 1.0F / 255.0F;
-        return glm::vec4(
-            static_cast<float>(tpl.skin_mask_rgba[off + 0U]) * inv255,
-            static_cast<float>(tpl.skin_mask_rgba[off + 1U]) * inv255,
-            static_cast<float>(tpl.skin_mask_rgba[off + 2U]) * inv255,
-            static_cast<float>(tpl.skin_mask_rgba[off + 3U]) * inv255);
-    };
-    const glm::vec4 c0 = glm::mix(fetch(x0, y0), fetch(x1, y0), tx);
-    const glm::vec4 c1 = glm::mix(fetch(x0, y1), fetch(x1, y1), tx);
-    return glm::mix(c0, c1, ty);
+[[nodiscard]] glm::vec4 sample_skin_detail_bilinear(
+    const HumanBaseTemplate& tpl,
+    const float u,
+    const float v) noexcept {
+    return sample_rgba_buffer_bilinear(tpl.skin_detail_rgba, tpl.mask_size, u, v);
 }
 
 void apply_sculpt_strokes_to_mesh(
@@ -2129,16 +2155,16 @@ bool load_character_package_file(
             {"top_style", "bottom_style", "footwear_style", "hair_style",
              "primary_material", "secondary_material", "has_belt",
              "has_pauldrons", "has_gloves", "has_cape", "has_beard",
-             "occlude_covered_body", "primary_color", "secondary_color",
-             "accent_color", "footwear_color", "hair_color",
-             "top_thickness", "bottom_thickness", "wear_and_tear"});
-        if (const auto ts = parse_top_garment_style(w.value("top_style", "jacket"))) {
+             "occlude_covered_body", "studio_underwear", "primary_color",
+             "secondary_color", "accent_color", "footwear_color",
+             "hair_color", "top_thickness", "bottom_thickness", "wear_and_tear"});
+        if (const auto ts = parse_top_garment_style(w.value("top_style", "none"))) {
             pkg.wardrobe.top_style = *ts;
         }
-        if (const auto bs = parse_bottom_garment_style(w.value("bottom_style", "cargo_pants"))) {
+        if (const auto bs = parse_bottom_garment_style(w.value("bottom_style", "none"))) {
             pkg.wardrobe.bottom_style = *bs;
         }
-        if (const auto fs = parse_footwear_style(w.value("footwear_style", "combat_boots"))) {
+        if (const auto fs = parse_footwear_style(w.value("footwear_style", "barefoot"))) {
             pkg.wardrobe.footwear_style = *fs;
         }
         if (const auto hs = parse_hair_style(w.value("hair_style", "short_crop"))) {
@@ -2156,6 +2182,7 @@ bool load_character_package_file(
         pkg.wardrobe.has_cape = w.value("has_cape", pkg.wardrobe.has_cape);
         pkg.wardrobe.has_beard = w.value("has_beard", pkg.wardrobe.has_beard);
         pkg.wardrobe.occlude_covered_body = w.value("occlude_covered_body", pkg.wardrobe.occlude_covered_body);
+        pkg.wardrobe.studio_underwear = w.value("studio_underwear", pkg.wardrobe.studio_underwear);
         if (w.contains("primary_color")) (void)read_vec3_json(w["primary_color"], pkg.wardrobe.primary_color);
         if (w.contains("secondary_color")) (void)read_vec3_json(w["secondary_color"], pkg.wardrobe.secondary_color);
         if (w.contains("accent_color")) (void)read_vec3_json(w["accent_color"], pkg.wardrobe.accent_color);
@@ -2330,6 +2357,7 @@ bool save_character_package_file(
         {"has_cape", p.wardrobe.has_cape},
         {"has_beard", p.wardrobe.has_beard},
         {"occlude_covered_body", p.wardrobe.occlude_covered_body},
+        {"studio_underwear", p.wardrobe.studio_underwear},
         {"primary_color", vec3_to_json(p.wardrobe.primary_color)},
         {"secondary_color", vec3_to_json(p.wardrobe.secondary_color)},
         {"accent_color", vec3_to_json(p.wardrobe.accent_color)},
@@ -3049,6 +3077,549 @@ void emit_clipped_template_part(
     }
 }
 
+[[nodiscard]] std::uint8_t sample_skin_detail_alpha_nearest(
+    const HumanBaseTemplate& tpl,
+    const float u,
+    const float v) noexcept {
+    if (tpl.mask_size == 0U ||
+        tpl.skin_detail_rgba.size() <
+            static_cast<std::size_t>(tpl.mask_size) * static_cast<std::size_t>(tpl.mask_size) * 4U) {
+        return 0U;
+    }
+    const std::uint32_t max_coord = tpl.mask_size - 1U;
+    const auto px = static_cast<std::uint32_t>(std::clamp(u, 0.0F, 1.0F) * static_cast<float>(max_coord));
+    const auto py = static_cast<std::uint32_t>(std::clamp(v, 0.0F, 1.0F) * static_cast<float>(max_coord));
+    const std::size_t off = (static_cast<std::size_t>(py) * tpl.mask_size + px) * 4U;
+    return tpl.skin_detail_rgba[off + 3U];
+}
+
+[[nodiscard]] float smoothstep_f(const float x, const float e0, const float e1) noexcept {
+    const float t = std::clamp((x - e0) / (std::max)(1.0e-5F, e1 - e0), 0.0F, 1.0F);
+    return t * t * (3.0F - 2.0F * t);
+}
+
+[[nodiscard]] float eval_anatomical_hairline_weight(
+    const glm::vec3& pos,
+    const CharacterGender gender,
+    const glm::vec3& head_c,
+    const float eye_y,
+    const float neck_y,
+    const float hs) noexcept {
+    const float abs_x = std::abs(pos.x - head_c.x);
+    // Exclude full outer ear pinna bounds
+    if (abs_x > 0.063F * hs &&
+        pos.y > eye_y - 0.052F * hs &&
+        pos.y < eye_y + 0.035F * hs &&
+        pos.z > head_c.z - 0.032F * hs &&
+        pos.z < head_c.z + 0.030F * hs) {
+        return 0.0F;
+    }
+    // Exclude lower cheek/jaw/neck below ear lobe
+    if (pos.y < eye_y - 0.052F * hs &&
+        (pos.z > head_c.z - 0.006F * hs || abs_x > 0.055F * hs)) {
+        return 0.0F;
+    }
+
+    const float front_z = head_c.z + 0.020F * hs;
+    const float nape_w = smoothstep_f(pos.y, neck_y + 0.038F * hs, neck_y + 0.056F * hs);
+
+    float cap_w = nape_w;
+    if (pos.z > front_z) {
+        const float blend_front = smoothstep_f(pos.z, front_z, front_z + 0.016F * hs);
+        float trichion_y = eye_y + 0.056F * hs;
+        if (gender == CharacterGender::female) {
+            const float x_norm = std::clamp(abs_x / (0.055F * hs), 0.0F, 1.2F);
+            trichion_y = eye_y + (0.054F + 0.004F * x_norm * x_norm) * hs;
+        } else {
+            const float temple_recess =
+                std::exp(-std::pow((abs_x - 0.036F * hs) / (0.015F * hs), 2.0F));
+            trichion_y = eye_y + (0.053F + 0.008F * temple_recess) * hs;
+        }
+        const float frontal_w = smoothstep_f(pos.y, trichion_y, trichion_y + 0.008F * hs);
+        const float temple_arch_y = glm::mix(
+            eye_y + 0.026F * hs,
+            eye_y - 0.002F * hs,
+            smoothstep_f(abs_x, 0.050F * hs, 0.064F * hs));
+        const float temple_w = smoothstep_f(pos.y, temple_arch_y, temple_arch_y + 0.009F * hs);
+        const float side_blend = smoothstep_f(abs_x, 0.047F * hs, 0.063F * hs);
+        const float front_profile = glm::mix(frontal_w, temple_w, side_blend);
+        cap_w = glm::mix(nape_w, front_profile, blend_front);
+    } else if (abs_x >= 0.054F * hs && pos.z > head_c.z - 0.012F * hs) {
+        const float temple_w = smoothstep_f(pos.y, eye_y - 0.002F * hs, eye_y + 0.008F * hs);
+        cap_w = (std::min)(cap_w, temple_w);
+    }
+    return std::clamp(cap_w, 0.0F, 1.0F);
+}
+
+[[nodiscard]] float eval_anatomical_beard_weight(
+    const glm::vec3& pos,
+    const glm::vec3& head_c,
+    const glm::vec3& mouth_c,
+    const float chin_y,
+    const float eye_y,
+    const float hs) noexcept {
+    const float dx = pos.x - mouth_c.x;
+    const float abs_x = std::abs(dx);
+    if (abs_x > 0.0665F * hs || pos.z < head_c.z + 0.026F * hs || pos.y < chin_y - 0.010F * hs) {
+        return 0.0F;
+    }
+    if (pos.y < chin_y - 0.002F * hs && pos.z < head_c.z + 0.034F * hs) {
+        return 0.0F;
+    }
+    const float lip_slit_y = mouth_c.y + 0.0023F * hs;
+    const float dy_slit = pos.y - lip_slit_y;
+    const float dz = pos.z - mouth_c.z;
+    // Exclusion ellipse matched to true oral slit (lip_slit_y)
+    const float lip_dist = std::hypot(dx / (0.0295F * hs), dy_slit / (0.0125F * hs));
+    if (lip_dist < 1.05F && dz > -0.025F * hs) {
+        return 0.0F;
+    }
+    // Keep clean skin hollows beside the central soul-patch connector below lower lip
+    if (abs_x > 0.0065F * hs && abs_x < 0.0215F * hs &&
+        pos.y > lip_slit_y - 0.019F * hs && pos.y < lip_slit_y - 0.009F * hs &&
+        dz > -0.020F * hs) {
+        return 0.0F;
+    }
+
+    // Mustache bar strictly below nostrils
+    const float must_top =
+        mouth_c.y + (0.0215F - 0.0030F * (std::min)(1.0F, abs_x / (0.029F * hs))) * hs;
+    if (abs_x <= 0.0295F * hs &&
+        pos.y >= mouth_c.y + 0.0132F * hs &&
+        pos.y <= must_top &&
+        dz > -0.014F * hs) {
+        return 1.0F;
+    }
+    // Oral corner connectors flanking the lip aperture
+    if (abs_x >= 0.0255F * hs && abs_x <= 0.0365F * hs &&
+        pos.y >= mouth_c.y - 0.012F * hs &&
+        pos.y <= mouth_c.y + 0.015F * hs &&
+        dz > -0.022F * hs) {
+        return 1.0F;
+    }
+    // Narrow pre-auricular sideburn strictly in front of ear pinna
+    if (abs_x >= 0.054F * hs &&
+        abs_x <= 0.0665F * hs &&
+        pos.z >= head_c.z + 0.028F * hs &&
+        pos.z <= head_c.z + 0.062F * hs &&
+        pos.y <= eye_y + 0.004F * hs &&
+        pos.y >= mouth_c.y - 0.015F * hs) {
+        return 1.0F;
+    }
+
+    const float cheek_upper_y =
+        mouth_c.y - 0.005F * hs +
+        0.022F * hs * smoothstep_f(abs_x, 0.030F * hs, 0.060F * hs);
+    if (pos.y <= cheek_upper_y) {
+        const float fade = smoothstep_f(cheek_upper_y - pos.y, 0.0F, 0.004F * hs);
+        return std::clamp(0.45F + 0.55F * fade, 0.0F, 1.0F);
+    }
+    return 0.0F;
+}
+
+[[nodiscard]] CharacterGroomInputs build_groom_inputs_from_template(
+    const CharacterPackage& pkg,
+    const HumanBaseTemplate& tpl,
+    const EvaluatedHumanTemplate& eval) {
+    CharacterGroomInputs in{};
+    in.gender = pkg.body.gender;
+    in.hair_style = pkg.wardrobe.hair_style;
+    in.has_beard = pkg.wardrobe.has_beard;
+    in.seed = pkg.identity.seed;
+    const float h = pkg.body.height_meters / 1.78F;
+    in.head_scale = pkg.body.face.head_scale * h;
+    in.head_center = eval.bones[6].model_pos;
+    in.neck_center = eval.bones[5].model_pos;
+    in.eye_l = eval.bones[43].model_pos;
+    in.eye_r = eval.bones[44].model_pos;
+    in.jaw_center = eval.bones[38].model_pos;
+    in.mouth_center = eval.bones[39].model_pos;
+    in.body_positions = eval.positions;
+    in.body_skin = tpl.skin_weights;
+    in.landmark_chains = tpl.landmark_chains;
+
+    const TemplatePart& body_part = tpl.parts[part_body];
+    float crown_y = -1.0e6F;
+    float chin_y = 1.0e6F;
+    float sole_y = 1.0e6F;
+    for (const TemplateCorner& c : body_part.corners) {
+        const glm::vec3& p = eval.positions[c.vid];
+        sole_y = (std::min)(sole_y, p.y);
+        if (static_cast<TemplateRegion>(c.region) == TemplateRegion::head) {
+            crown_y = (std::max)(crown_y, p.y);
+            chin_y = (std::min)(chin_y, p.y);
+        }
+    }
+    in.crown_y = (crown_y > -1.0e5F) ? crown_y : (in.head_center.y + 0.14F * in.head_scale);
+    in.chin_y = (chin_y < 1.0e5F) ? chin_y : (in.jaw_center.y - 0.04F * in.head_scale);
+    in.sole_y = (sole_y < 1.0e5F) ? sole_y : 0.0F;
+
+    const float eye_y = 0.5F * (in.eye_l.y + in.eye_r.y);
+    const float hs = in.head_scale;
+    const bool collect_scalp =
+        pkg.wardrobe.hair_style != HairStyle::bald &&
+        pkg.wardrobe.hair_style != HairStyle::hood;
+
+    in.scalp_triangles.reserve(1600U);
+    if (pkg.wardrobe.has_beard) {
+        in.beard_triangles.reserve(1200U);
+    }
+
+    for (std::size_t i = 0U; i + 2U < body_part.indices.size(); i += 3U) {
+        const std::uint32_t i0 = body_part.indices[i + 0U];
+        const std::uint32_t i1 = body_part.indices[i + 1U];
+        const std::uint32_t i2 = body_part.indices[i + 2U];
+        if (i0 >= body_part.corners.size() ||
+            i1 >= body_part.corners.size() ||
+            i2 >= body_part.corners.size()) {
+            continue;
+        }
+        const TemplateCorner& c0 = body_part.corners[i0];
+        const TemplateCorner& c1 = body_part.corners[i1];
+        const TemplateCorner& c2 = body_part.corners[i2];
+        const auto r0 = static_cast<TemplateRegion>(c0.region);
+        const auto r1 = static_cast<TemplateRegion>(c1.region);
+        const auto r2 = static_cast<TemplateRegion>(c2.region);
+
+        const glm::vec3 p_mid =
+            (eval.positions[c0.vid] + eval.positions[c1.vid] + eval.positions[c2.vid]) * (1.0F / 3.0F);
+
+        const bool all_head_or_neck =
+            (r0 == TemplateRegion::head || r0 == TemplateRegion::neck) &&
+            (r1 == TemplateRegion::head || r1 == TemplateRegion::neck) &&
+            (r2 == TemplateRegion::head || r2 == TemplateRegion::neck);
+        if (collect_scalp && all_head_or_neck) {
+            const float hl_mid = eval_anatomical_hairline_weight(
+                p_mid, pkg.body.gender, in.head_center, eye_y, in.neck_center.y, hs);
+            const float hl0 = eval_anatomical_hairline_weight(
+                eval.positions[c0.vid], pkg.body.gender, in.head_center, eye_y, in.neck_center.y, hs);
+            const float hl1 = eval_anatomical_hairline_weight(
+                eval.positions[c1.vid], pkg.body.gender, in.head_center, eye_y, in.neck_center.y, hs);
+            const float hl2 = eval_anatomical_hairline_weight(
+                eval.positions[c2.vid], pkg.body.gender, in.head_center, eye_y, in.neck_center.y, hs);
+            if (hl_mid >= 0.52F && (std::min)({hl0, hl1, hl2}) >= 0.24F) {
+                in.scalp_triangles.push_back({c0.vid, c1.vid, c2.vid});
+            }
+        }
+
+        if (pkg.wardrobe.has_beard &&
+            r0 == TemplateRegion::head &&
+            r1 == TemplateRegion::head &&
+            r2 == TemplateRegion::head) {
+            const float max_vy = (std::max)({eval.positions[c0.vid].y, eval.positions[c1.vid].y, eval.positions[c2.vid].y});
+            const float min_vy = (std::min)({eval.positions[c0.vid].y, eval.positions[c1.vid].y, eval.positions[c2.vid].y});
+            const float max_vz = (std::max)({eval.positions[c0.vid].z, eval.positions[c1.vid].z, eval.positions[c2.vid].z});
+            if (min_vy < eye_y - 0.016F * hs &&
+                max_vy > in.chin_y - 0.016F * hs &&
+                max_vz > in.head_center.z - 0.012F * hs) {
+                in.beard_triangles.push_back({c0.vid, c1.vid, c2.vid});
+            }
+        }
+    }
+
+    if (collect_scalp && in.scalp_triangles.empty()) {
+        for (std::size_t i = 0U; i + 2U < body_part.indices.size(); i += 3U) {
+            const std::uint32_t i0 = body_part.indices[i + 0U];
+            const std::uint32_t i1 = body_part.indices[i + 1U];
+            const std::uint32_t i2 = body_part.indices[i + 2U];
+            if (i0 >= body_part.corners.size() ||
+                i1 >= body_part.corners.size() ||
+                i2 >= body_part.corners.size()) {
+                continue;
+            }
+            const TemplateCorner& c0 = body_part.corners[i0];
+            const TemplateCorner& c1 = body_part.corners[i1];
+            const TemplateCorner& c2 = body_part.corners[i2];
+            const auto r0 = static_cast<TemplateRegion>(c0.region);
+            const auto r1 = static_cast<TemplateRegion>(c1.region);
+            const auto r2 = static_cast<TemplateRegion>(c2.region);
+            if ((r0 == TemplateRegion::head || r0 == TemplateRegion::neck) &&
+                (r1 == TemplateRegion::head || r1 == TemplateRegion::neck) &&
+                (r2 == TemplateRegion::head || r2 == TemplateRegion::neck)) {
+                const glm::vec3 p_mid =
+                    (eval.positions[c0.vid] + eval.positions[c1.vid] + eval.positions[c2.vid]) * (1.0F / 3.0F);
+                if (p_mid.y > eye_y + 0.042F * hs) {
+                    in.scalp_triangles.push_back({c0.vid, c1.vid, c2.vid});
+                }
+            }
+        }
+    }
+
+    return in;
+}
+
+[[nodiscard]] glm::vec2 remap_body_corner_uv(const TemplateCorner& c) noexcept {
+    if (static_cast<TemplateRegion>(c.region) == TemplateRegion::inner_mouth) {
+        const float u_remapped = std::clamp(0.82F + (c.u - 0.62F) * 1.25F, 0.81F, 0.985F);
+        const float v_remapped = std::clamp(0.015F + (c.v - 0.015F) * 0.70F, 0.012F, 0.098F);
+        return {u_remapped, v_remapped};
+    }
+    return {c.u, c.v};
+}
+
+template <typename TriPred>
+void emit_subdivided_body_part(
+    MeshBuilder& mb,
+    const TemplatePart& part,
+    const std::span<const glm::vec3> positions,
+    const std::span<const glm::vec3> welded_normals,
+    const std::span<const CookedSkinVertex> skin_weights,
+    const CharacterPaintTarget target,
+    const TriPred& tri_pred) {
+    if (part.corners.empty() || part.indices.size() < 3U) {
+        return;
+    }
+
+    std::vector<std::uint32_t> kept_corner_indices{};
+    kept_corner_indices.reserve(part.indices.size());
+    for (std::size_t i = 0U; i + 2U < part.indices.size(); i += 3U) {
+        const std::uint32_t i0 = part.indices[i + 0U];
+        const std::uint32_t i1 = part.indices[i + 1U];
+        const std::uint32_t i2 = part.indices[i + 2U];
+        if (i0 >= part.corners.size() || i1 >= part.corners.size() || i2 >= part.corners.size()) {
+            continue;
+        }
+        if (tri_pred(part.corners[i0], part.corners[i1], part.corners[i2])) {
+            kept_corner_indices.push_back(i0);
+            kept_corner_indices.push_back(i1);
+            kept_corner_indices.push_back(i2);
+        }
+    }
+    if (kept_corner_indices.empty()) {
+        return;
+    }
+
+    struct WeldedEdgeInfo {
+        glm::vec3 pos{0.0F};
+        glm::vec3 nrm{0.0F, 1.0F, 0.0F};
+        CookedSkinVertex skin{};
+        std::uint32_t weld_slot = 0U;
+    };
+
+    const std::uint32_t v_start = static_cast<std::uint32_t>(mb.vertices.size());
+    const std::uint32_t i_start = static_cast<std::uint32_t>(mb.indices.size());
+    const std::size_t kept_tris = kept_corner_indices.size() / 3U;
+
+    std::vector<std::uint32_t> corner_to_mesh(
+        part.corners.size(), (std::numeric_limits<std::uint32_t>::max)());
+    std::unordered_map<std::uint64_t, WeldedEdgeInfo> welded_edges;
+    welded_edges.reserve(kept_tris * 2U);
+    std::unordered_map<std::uint64_t, std::uint32_t> corner_mid_to_mesh;
+    corner_mid_to_mesh.reserve(kept_tris * 2U);
+    std::vector<std::uint32_t> mesh_v_weld_slot;
+    mesh_v_weld_slot.reserve(kept_tris * 2U + part.corners.size());
+
+    std::uint32_t next_weld_slot = static_cast<std::uint32_t>(positions.size());
+
+    const auto get_corner_vertex = [&](const std::uint32_t ic) -> std::uint32_t {
+        if (corner_to_mesh[ic] != (std::numeric_limits<std::uint32_t>::max)()) {
+            return corner_to_mesh[ic];
+        }
+        const TemplateCorner& c = part.corners[ic];
+        std::uint32_t out_v = 0U;
+        mb.add_triangle_vertex(
+            positions[c.vid], welded_normals[c.vid], remap_body_corner_uv(c),
+            skin_weights[c.vid], target, out_v);
+        corner_to_mesh[ic] = out_v;
+        mesh_v_weld_slot.push_back(static_cast<std::uint32_t>(c.vid));
+        return out_v;
+    };
+
+    const auto get_edge_midpoint_vertex = [&](const std::uint32_t ic_a,
+                                              const std::uint32_t ic_b) -> std::uint32_t {
+        const std::uint32_t ci_lo = (std::min)(ic_a, ic_b);
+        const std::uint32_t ci_hi = (std::max)(ic_a, ic_b);
+        const std::uint64_t corner_key =
+            (static_cast<std::uint64_t>(ci_lo) << 32U) | static_cast<std::uint64_t>(ci_hi);
+        if (const auto it = corner_mid_to_mesh.find(corner_key); it != corner_mid_to_mesh.end()) {
+            return it->second;
+        }
+
+        const TemplateCorner& ca = part.corners[ic_a];
+        const TemplateCorner& cb = part.corners[ic_b];
+        const std::uint16_t v_lo = (std::min)(ca.vid, cb.vid);
+        const std::uint16_t v_hi = (std::max)(ca.vid, cb.vid);
+        const std::uint64_t v_key =
+            (static_cast<std::uint64_t>(v_lo) << 16U) | static_cast<std::uint64_t>(v_hi);
+
+        auto w_it = welded_edges.find(v_key);
+        if (w_it == welded_edges.end()) {
+            const glm::vec3& pa = positions[v_lo];
+            const glm::vec3& pb = positions[v_hi];
+            const glm::vec3& na = welded_normals[v_lo];
+            const glm::vec3& nb = welded_normals[v_hi];
+            const glm::vec3 d = pb - pa;
+            const float crease_w = glm::smoothstep(0.25F, 0.75F, glm::dot(na, nb));
+            const float convex_t = glm::smoothstep(-0.004F, 0.004F, glm::dot(d, nb - na));
+            const float pn_strength = glm::mix(0.024F, 0.095F, convex_t);
+            const glm::vec3 p_mid = 0.5F * (pa + pb) -
+                (pn_strength * crease_w) * (glm::dot(d, na) * na - glm::dot(d, nb) * nb);
+            const glm::vec3 n_sum = na + nb;
+            const glm::vec3 n_mid = glm::length(n_sum) > 1.0e-6F ? glm::normalize(n_sum) : na;
+            const CookedSkinVertex sk_mid =
+                lerp_skin_vertex(skin_weights[v_lo], skin_weights[v_hi], 0.5F);
+            WeldedEdgeInfo info{p_mid, n_mid, sk_mid, next_weld_slot++};
+            w_it = welded_edges.emplace(v_key, info).first;
+        }
+
+        const glm::vec2 uv_mid = 0.5F * (remap_body_corner_uv(ca) + remap_body_corner_uv(cb));
+        std::uint32_t out_v = 0U;
+        mb.add_triangle_vertex(
+            w_it->second.pos, w_it->second.nrm, uv_mid,
+            w_it->second.skin, target, out_v);
+        corner_mid_to_mesh.emplace(corner_key, out_v);
+        mesh_v_weld_slot.push_back(w_it->second.weld_slot);
+        return out_v;
+    };
+
+    mb.vertices.reserve(mb.vertices.size() + kept_tris * 2U);
+    mb.skin_vertices.reserve(mb.skin_vertices.size() + kept_tris * 2U);
+    mb.vertex_paint_targets.reserve(mb.vertex_paint_targets.size() + kept_tris * 2U);
+    mb.indices.reserve(mb.indices.size() + kept_tris * 12U);
+
+    for (std::size_t i = 0U; i + 2U < kept_corner_indices.size(); i += 3U) {
+        const std::uint32_t c0 = kept_corner_indices[i + 0U];
+        const std::uint32_t c1 = kept_corner_indices[i + 1U];
+        const std::uint32_t c2 = kept_corner_indices[i + 2U];
+
+        const std::uint32_t v0 = get_corner_vertex(c0);
+        const std::uint32_t v1 = get_corner_vertex(c1);
+        const std::uint32_t v2 = get_corner_vertex(c2);
+        const std::uint32_t e01 = get_edge_midpoint_vertex(c0, c1);
+        const std::uint32_t e12 = get_edge_midpoint_vertex(c1, c2);
+        const std::uint32_t e20 = get_edge_midpoint_vertex(c2, c0);
+
+        mb.indices.push_back(v0);
+        mb.indices.push_back(e01);
+        mb.indices.push_back(e20);
+
+        mb.indices.push_back(v1);
+        mb.indices.push_back(e12);
+        mb.indices.push_back(e01);
+
+        mb.indices.push_back(v2);
+        mb.indices.push_back(e20);
+        mb.indices.push_back(e12);
+
+        mb.indices.push_back(e01);
+        mb.indices.push_back(e12);
+        mb.indices.push_back(e20);
+    }
+
+    // Recompute smooth area-weighted normals per welded 3D vertex slot (crack-free across UV seams)
+    std::vector<glm::vec3> weld_normals(next_weld_slot, glm::vec3(0.0F));
+    for (std::size_t ii = i_start; ii + 2U < mb.indices.size(); ii += 3U) {
+        const std::uint32_t ia = mb.indices[ii + 0U];
+        const std::uint32_t ib = mb.indices[ii + 1U];
+        const std::uint32_t ic = mb.indices[ii + 2U];
+        const glm::vec3 pa(mb.vertices[ia].position[0], mb.vertices[ia].position[1], mb.vertices[ia].position[2]);
+        const glm::vec3 pb(mb.vertices[ib].position[0], mb.vertices[ib].position[1], mb.vertices[ib].position[2]);
+        const glm::vec3 pc(mb.vertices[ic].position[0], mb.vertices[ic].position[1], mb.vertices[ic].position[2]);
+        const glm::vec3 fn = glm::cross(pb - pa, pc - pa);
+        weld_normals[mesh_v_weld_slot[ia - v_start]] += fn;
+        weld_normals[mesh_v_weld_slot[ib - v_start]] += fn;
+        weld_normals[mesh_v_weld_slot[ic - v_start]] += fn;
+    }
+    for (std::size_t k = 0U; k < mesh_v_weld_slot.size(); ++k) {
+        const glm::vec3& accum = weld_normals[mesh_v_weld_slot[k]];
+        const float len = glm::length(accum);
+        if (len > 1.0e-7F) {
+            const glm::vec3 nn = accum / len;
+            mb.vertices[v_start + k].normal = {nn.x, nn.y, nn.z};
+        }
+    }
+}
+
+void recompute_uv_derivative_tangents_for_submeshes(MeshBuilder& mb) {
+    const std::size_t vcount = mb.vertices.size();
+    if (vcount == 0U) {
+        return;
+    }
+    std::vector<glm::vec3> tan1(vcount, glm::vec3(0.0F));
+    std::vector<glm::vec3> tan2(vcount, glm::vec3(0.0F));
+    std::vector<std::uint8_t> touched(vcount, 0U);
+
+    for (const CharacterSubmeshBuild& sub : mb.submeshes) {
+        if (sub.name == "hair") {
+            continue;
+        }
+        const std::size_t i_end = (std::min)(
+            mb.indices.size(),
+            static_cast<std::size_t>(sub.first_index) + sub.index_count);
+        for (std::size_t ii = sub.first_index; ii + 2U < i_end; ii += 3U) {
+            const std::uint32_t ia = mb.indices[ii + 0U];
+            const std::uint32_t ib = mb.indices[ii + 1U];
+            const std::uint32_t ic = mb.indices[ii + 2U];
+            if (ia >= vcount || ib >= vcount || ic >= vcount) {
+                continue;
+            }
+            touched[ia] = 1U;
+            touched[ib] = 1U;
+            touched[ic] = 1U;
+
+            const CookedModelVertex& va = mb.vertices[ia];
+            const CookedModelVertex& vb = mb.vertices[ib];
+            const CookedModelVertex& vc = mb.vertices[ic];
+
+            const glm::vec3 pa(va.position[0], va.position[1], va.position[2]);
+            const glm::vec3 pb(vb.position[0], vb.position[1], vb.position[2]);
+            const glm::vec3 pc(vc.position[0], vc.position[1], vc.position[2]);
+            const glm::vec3 dp1 = pb - pa;
+            const glm::vec3 dp2 = pc - pa;
+
+            // Unflip texcoord.y back into PNG image UV space matching editor_model.vert
+            const float du1 = vb.texcoord[0] - va.texcoord[0];
+            const float dv1 = (1.0F - vb.texcoord[1]) - (1.0F - va.texcoord[1]);
+            const float du2 = vc.texcoord[0] - va.texcoord[0];
+            const float dv2 = (1.0F - vc.texcoord[1]) - (1.0F - va.texcoord[1]);
+
+            const float det = du1 * dv2 - du2 * dv1;
+            if (std::abs(det) <= 1.0e-10F) {
+                continue;
+            }
+            const float inv = 1.0F / det;
+            const glm::vec3 sdir = (dp1 * dv2 - dp2 * dv1) * inv;
+            const glm::vec3 tdir = (dp2 * du1 - dp1 * du2) * inv;
+            if (!std::isfinite(sdir.x) || !std::isfinite(tdir.x) ||
+                glm::length(sdir) > 1.0e5F || glm::length(tdir) > 1.0e5F) {
+                continue;
+            }
+            tan1[ia] += sdir;
+            tan1[ib] += sdir;
+            tan1[ic] += sdir;
+            tan2[ia] += tdir;
+            tan2[ib] += tdir;
+            tan2[ic] += tdir;
+        }
+    }
+
+    for (std::size_t vi = 0U; vi < vcount; ++vi) {
+        if (touched[vi] == 0U) {
+            continue;
+        }
+        CookedModelVertex& v = mb.vertices[vi];
+        const glm::vec3 raw_n(v.normal[0], v.normal[1], v.normal[2]);
+        const glm::vec3 n = glm::length(raw_n) > 1.0e-6F
+            ? glm::normalize(raw_n)
+            : glm::vec3(0.0F, 1.0F, 0.0F);
+        v.normal = {n.x, n.y, n.z};
+
+        const glm::vec3 t_raw = tan1[vi];
+        const glm::vec3 t_ortho = t_raw - n * glm::dot(n, t_raw);
+        if (glm::dot(t_ortho, t_ortho) > 1.0e-10F) {
+            const glm::vec3 t = glm::normalize(t_ortho);
+            const float w = (glm::dot(glm::cross(n, t), tan2[vi]) < 0.0F) ? -1.0F : 1.0F;
+            v.tangent = {t.x, t.y, t.z, w};
+        } else {
+            const glm::vec3 up = std::abs(n.y) < 0.95F
+                ? glm::vec3(0.0F, 1.0F, 0.0F)
+                : glm::vec3(1.0F, 0.0F, 0.0F);
+            const glm::vec3 t = glm::normalize(glm::cross(up, n));
+            v.tangent = {t.x, t.y, t.z, 1.0F};
+        }
+    }
+}
+
 }  // namespace
 
 CharacterMeshBuildResult build_character_mesh(const CharacterPackage& input_pkg) {
@@ -3100,9 +3671,10 @@ CharacterMeshBuildResult build_character_mesh(const CharacterPackage& input_pkg)
             skin_mat.base_color = glm::vec4(pkg.body.skin_color, 1.0F);
             skin_mat.metallic = 0.0F;
             skin_mat.roughness = pkg.body.skin_roughness;
+            skin_mat.ior = 1.38F;
             skin_mat.ambient_occlusion = 1.0F;
             skin_mat.model = MaterialModel::subsurface;
-            skin_mat.subsurface_profile = SubsurfaceProfile::medium;
+            skin_mat.subsurface_profile = SubsurfaceProfile::skin;
             skin_mat.subsurface_strength = pkg.body.skin_subsurface_strength;
             auto skin_sub = begin_submesh(
                 "skin", CharacterPaintTarget::skin, sanitize_pbr_material(skin_mat));
@@ -3136,26 +3708,17 @@ CharacterMeshBuildResult build_character_mesh(const CharacterPackage& input_pkg)
 
             const std::uint32_t skin_v_start = static_cast<std::uint32_t>(mb.vertices.size());
             const std::uint32_t skin_i_start = static_cast<std::uint32_t>(mb.indices.size());
-            emit_template_part_subset(
+            emit_subdivided_body_part(
                 mb,
                 body_part,
                 eval.positions,
                 skin_normals,
-                0.0F,
+                tpl->skin_weights,
                 CharacterPaintTarget::skin,
                 [&](const TemplateCorner& c0, const TemplateCorner& c1, const TemplateCorner& c2) noexcept {
                     return ring1_uncovered[c0.vid] != 0U ||
                            ring1_uncovered[c1.vid] != 0U ||
                            ring1_uncovered[c2.vid] != 0U;
-                },
-                [](const TemplateCorner&, const glm::vec3& p, const glm::vec3&) noexcept {
-                    return p;
-                },
-                [](const TemplateCorner& c, const glm::vec3&) noexcept {
-                    return glm::vec2(c.u, c.v);
-                },
-                [&](const TemplateCorner& c, const glm::vec3&) noexcept {
-                    return tpl->skin_weights[c.vid];
                 });
 
             if (!pkg.sculpt_strokes.empty() && mb.vertices.size() > skin_v_start) {
@@ -3166,17 +3729,19 @@ CharacterMeshBuildResult build_character_mesh(const CharacterPackage& input_pkg)
             end_submesh(std::move(skin_sub));
         }
 
-        // ---- Submesh 1: Glossy Eyes (MakeHuman Eye_L & Eye_R) ----
+        // ---- Submesh 1: Two-Shell Glossy Eyes (Inner Iris/Sclera + Outer Cornea Dome) ----
         {
             PbrMaterial eye_mat{};
             eye_mat.base_color = glm::vec4(1.0F);
             eye_mat.metallic = 0.0F;
-            eye_mat.roughness = 0.07F;
-            eye_mat.ior = 1.42F;
+            eye_mat.roughness = 0.22F;
+            eye_mat.ior = 1.40F;
             eye_mat.model = MaterialModel::standard;
             auto eye_sub = begin_submesh(
                 "eyes", CharacterPaintTarget::skin, sanitize_pbr_material(eye_mat));
 
+            const std::uint32_t eye_v_start = static_cast<std::uint32_t>(mb.vertices.size());
+            const std::uint32_t eye_i_start = static_cast<std::uint32_t>(mb.indices.size());
             emit_template_part_subset(
                 mb,
                 tpl->parts[part_eyes],
@@ -3187,7 +3752,13 @@ CharacterMeshBuildResult build_character_mesh(const CharacterPackage& input_pkg)
                 [](const TemplateCorner&, const TemplateCorner&, const TemplateCorner&) noexcept {
                     return true;
                 },
-                [](const TemplateCorner&, const glm::vec3& p, const glm::vec3&) noexcept {
+                [hs](const TemplateCorner& c, const glm::vec3& p, const glm::vec3& n) noexcept {
+                    const float rad = std::hypot((c.u - 0.5F) * 2.0F, (c.v - 0.5F) * 2.0F);
+                    if (rad < 0.465F) {
+                        const float k = rad / 0.465F;
+                        const float concave = 1.0F - k * k;
+                        return p - n * (0.00085F * hs * concave);
+                    }
                     return p;
                 },
                 [](const TemplateCorner& c, const glm::vec3&) noexcept {
@@ -3196,13 +3767,67 @@ CharacterMeshBuildResult build_character_mesh(const CharacterPackage& input_pkg)
                 [&](const TemplateCorner& c, const glm::vec3&) noexcept {
                     return tpl->skin_weights[c.vid];
                 });
+            recompute_vertex_normals_range(mb, eye_v_start, eye_i_start);
             end_submesh(std::move(eye_sub));
+
+            PbrMaterial cornea_mat{};
+            cornea_mat.base_color = glm::vec4(1.0F, 1.0F, 1.0F, 0.032F);
+            cornea_mat.metallic = 0.0F;
+            cornea_mat.roughness = 0.022F;
+            cornea_mat.ior = 1.376F;
+            cornea_mat.model = MaterialModel::standard;
+            auto cornea_sub = begin_submesh(
+                "cornea", CharacterPaintTarget::skin, sanitize_pbr_material(cornea_mat));
+
+            const std::uint32_t cornea_v_start = static_cast<std::uint32_t>(mb.vertices.size());
+            const std::uint32_t cornea_i_start = static_cast<std::uint32_t>(mb.indices.size());
+            emit_template_part_subset(
+                mb,
+                tpl->parts[part_eyes],
+                eval.positions,
+                eyes_normals,
+                0.0F,
+                CharacterPaintTarget::skin,
+                [&](const TemplateCorner& c0, const TemplateCorner& c1, const TemplateCorner& c2) noexcept {
+                    const auto front_eye = [&](const TemplateCorner& c) noexcept {
+                        const glm::vec3& p = eval.positions[c.vid];
+                        const glm::vec3& eye_c =
+                            (p.x >= 0.0F) ? bones[43].model_pos : bones[44].model_pos;
+                        return p.z > eye_c.z - 0.002F * hs;
+                    };
+                    return front_eye(c0) || front_eye(c1) || front_eye(c2);
+                },
+                [hs](const TemplateCorner& c, const glm::vec3& p, const glm::vec3& n) noexcept {
+                    const float rad = std::hypot((c.u - 0.5F) * 2.0F, (c.v - 0.5F) * 2.0F);
+                    const float dome = std::pow(std::clamp((0.48F - rad) / 0.48F, 0.0F, 1.0F), 1.4F);
+                    return p + n * ((0.00028F + 0.00095F * dome) * hs);
+                },
+                [](const TemplateCorner& c, const glm::vec3&) noexcept {
+                    return glm::vec2(c.u, c.v);
+                },
+                [&](const TemplateCorner& c, const glm::vec3&) noexcept {
+                    return tpl->skin_weights[c.vid];
+                });
+            recompute_vertex_normals_range(mb, cornea_v_start, cornea_i_start);
+            end_submesh(std::move(cornea_sub));
         }
 
         // ---- Submesh 2: Primary Outfit (Shirt / Jacket / Trench Coat / Hoodie / Armor + Hood + Pauldrons + Cape) ----
         {
-            const PbrMaterial primary_mat = preset_outfit_material(
+            const bool use_underwear_top =
+                pkg.wardrobe.studio_underwear &&
+                pkg.wardrobe.top_style == TopGarmentStyle::none &&
+                pkg.body.gender == CharacterGender::female;
+            PbrMaterial primary_mat = preset_outfit_material(
                 pkg.wardrobe.primary_material, pkg.wardrobe.primary_color);
+            if (use_underwear_top) {
+                primary_mat.base_color = glm::vec4(0.145F, 0.152F, 0.168F, 1.0F);
+                primary_mat.metallic = 0.0F;
+                primary_mat.roughness = 0.94F;
+                primary_mat.ambient_occlusion = 1.0F;
+                primary_mat.model = MaterialModel::standard;
+                primary_mat = sanitize_pbr_material(primary_mat);
+            }
             auto out1_sub = begin_submesh(
                 "outfit_primary", CharacterPaintTarget::outfit_primary, primary_mat);
 
@@ -3217,7 +3842,56 @@ CharacterMeshBuildResult build_character_mesh(const CharacterPackage& input_pkg)
             const std::uint32_t top_v_start = static_cast<std::uint32_t>(mb.vertices.size());
             const std::uint32_t top_i_start = static_cast<std::uint32_t>(mb.indices.size());
 
-            if (pkg.wardrobe.top_style != TopGarmentStyle::none) {
+            if (use_underwear_top) {
+                const float shoulder_x = (std::max)(0.10F * h, std::abs(bones[8].model_pos.x));
+                const float chest_y_band = bones[4].model_pos.y;
+                const float top_edge_max = chest_y_band + 0.058F * h;
+                const float bot_edge = chest_y_band - 0.068F * h;
+                const float band_span = (std::max)(0.06F, top_edge_max - bot_edge);
+                const float arm_limit_x = shoulder_x * 0.86F;
+                emit_clipped_template_part(
+                    mb,
+                    tpl->parts[part_body],
+                    eval.positions,
+                    skin_normals,
+                    tpl->skin_weights,
+                    0.0020F,
+                    CharacterPaintTarget::outfit_primary,
+                    [](const TemplateCorner& c0, const TemplateCorner& c1, const TemplateCorner& c2) noexcept {
+                        const auto allowed = [](const TemplateCorner& c) noexcept {
+                            const auto reg = static_cast<TemplateRegion>(c.region);
+                            return reg == TemplateRegion::torso_upper ||
+                                   reg == TemplateRegion::torso_lower;
+                        };
+                        return allowed(c0) && allowed(c1) && allowed(c2);
+                    },
+                    3U,
+                    [&](const std::size_t plane_idx, const ClipVert& v) noexcept -> float {
+                        if (plane_idx == 0U) {
+                            const float front_w = (v.base_p.z > 0.0F) ? 1.0F : 0.45F;
+                            const float scoop = 0.018F * h * front_w *
+                                std::exp(-(v.base_p.x * v.base_p.x) / (0.0020F * h * h));
+                            const float top_edge = top_edge_max - scoop;
+                            return top_edge - v.base_p.y;
+                        }
+                        if (plane_idx == 1U) {
+                            return v.base_p.y - bot_edge;
+                        }
+                        return arm_limit_x - std::abs(v.base_p.x);
+                    },
+                    [](const ClipVert& v, const float) noexcept {
+                        return v.base_p + v.nrm * 0.0036F;
+                    },
+                    [&](const ClipVert& v, const glm::vec3& p) noexcept {
+                        const float rad_xz = (std::max)(0.03F * h, std::hypot(v.base_p.x, v.base_p.z));
+                        const float u_fold = std::clamp(
+                            0.04F + 0.92F * (std::acos(std::clamp(v.base_p.z / rad_xz, -1.0F, 1.0F)) /
+                                             glm::pi<float>()),
+                            0.04F, 0.96F);
+                        const float v_norm = std::clamp((top_edge_max - p.y) / band_span, 0.04F, 0.64F);
+                        return glm::vec2(u_fold, v_norm);
+                    });
+            } else if (pkg.wardrobe.top_style != TopGarmentStyle::none) {
                 const bool long_sleeves =
                     pkg.wardrobe.top_style == TopGarmentStyle::jacket ||
                     pkg.wardrobe.top_style == TopGarmentStyle::trench_coat ||
@@ -3432,8 +4106,22 @@ CharacterMeshBuildResult build_character_mesh(const CharacterPackage& input_pkg)
 
         // ---- Submesh 3: Secondary Outfit (Pants / Skirt / Shorts + Belt + Gloves + Footwear) ----
         {
-            const PbrMaterial secondary_mat = preset_outfit_material(
+            const bool use_underwear_bottom =
+                pkg.wardrobe.studio_underwear &&
+                pkg.wardrobe.bottom_style == BottomGarmentStyle::none;
+            PbrMaterial secondary_mat = preset_outfit_material(
                 pkg.wardrobe.secondary_material, pkg.wardrobe.secondary_color);
+            if (use_underwear_bottom &&
+                pkg.wardrobe.footwear_style == FootwearStyle::barefoot &&
+                !pkg.wardrobe.has_belt &&
+                !pkg.wardrobe.has_gloves) {
+                secondary_mat.base_color = glm::vec4(0.145F, 0.152F, 0.168F, 1.0F);
+                secondary_mat.metallic = 0.0F;
+                secondary_mat.roughness = 0.94F;
+                secondary_mat.ambient_occlusion = 1.0F;
+                secondary_mat.model = MaterialModel::standard;
+                secondary_mat = sanitize_pbr_material(secondary_mat);
+            }
             auto out2_sub = begin_submesh(
                 "outfit_secondary", CharacterPaintTarget::outfit_secondary, secondary_mat);
 
@@ -3441,7 +4129,64 @@ CharacterMeshBuildResult build_character_mesh(const CharacterPackage& input_pkg)
             const float rim_bot = std::clamp(pkg.wardrobe.bottom_thickness * 0.22F, 0.002F, 0.004F);
             const float waist_belt_y = glm::mix(bones[3].model_pos.y, bones[4].model_pos.y, 0.14F);
 
-            if (pkg.wardrobe.bottom_style == BottomGarmentStyle::skirt) {
+            if (use_underwear_bottom) {
+                const float pelvis_y_u = bones[1].model_pos.y;
+                const float waist_top = pelvis_y_u + 0.032F * h;
+                const float crotch_drop =
+                    (pkg.body.gender == CharacterGender::female) ? (0.108F * h) : (0.136F * h);
+                const float hip_cut_gain =
+                    (pkg.body.gender == CharacterGender::female) ? (0.056F * h) : (0.020F * h);
+                const float x_start =
+                    (pkg.body.gender == CharacterGender::female) ? (0.032F * h) : (0.042F * h);
+                const float briefs_span = (std::max)(0.06F, waist_top - (pelvis_y_u - crotch_drop));
+
+                const std::uint32_t briefs_v_start = static_cast<std::uint32_t>(mb.vertices.size());
+                const std::uint32_t briefs_i_start = static_cast<std::uint32_t>(mb.indices.size());
+                emit_clipped_template_part(
+                    mb,
+                    tpl->parts[part_body],
+                    eval.positions,
+                    skin_normals,
+                    tpl->skin_weights,
+                    0.0020F,
+                    CharacterPaintTarget::outfit_secondary,
+                    [](const TemplateCorner& c0, const TemplateCorner& c1, const TemplateCorner& c2) noexcept {
+                        const auto allowed = [](const TemplateCorner& c) noexcept {
+                            const auto reg = static_cast<TemplateRegion>(c.region);
+                            return reg == TemplateRegion::pelvis ||
+                                   reg == TemplateRegion::torso_lower ||
+                                   reg == TemplateRegion::thigh_upper;
+                        };
+                        return allowed(c0) && allowed(c1) && allowed(c2);
+                    },
+                    2U,
+                    [&](const std::size_t plane_idx, const ClipVert& v) noexcept -> float {
+                        if (plane_idx == 0U) {
+                            return waist_top - v.base_p.y;
+                        }
+                        const float abs_x = std::abs(v.base_p.x);
+                        const float back_fullness = (v.base_p.z < -0.015F * h) ? 0.55F : 1.0F;
+                        const float hip_rise = hip_cut_gain * back_fullness *
+                            std::clamp((abs_x - x_start) / (0.105F * h), 0.0F, 1.0F);
+                        const float leg_cut = (pelvis_y_u - crotch_drop) + hip_rise;
+                        return v.base_p.y - leg_cut;
+                    },
+                    [](const ClipVert& v, const float) noexcept {
+                        return v.base_p + v.nrm * 0.0036F;
+                    },
+                    [&](const ClipVert& v, const glm::vec3& p) noexcept {
+                        const float rad_xz = (std::max)(0.03F * h, std::hypot(v.base_p.x, v.base_p.z));
+                        const float u_fold = std::clamp(
+                            0.04F + 0.92F * (std::acos(std::clamp(v.base_p.z / rad_xz, -1.0F, 1.0F)) /
+                                             glm::pi<float>()),
+                            0.04F, 0.96F);
+                        const float v_norm = std::clamp(
+                            0.04F + 0.60F * ((waist_top - p.y) / briefs_span),
+                            0.04F, 0.66F);
+                        return glm::vec2(u_fold, v_norm);
+                    });
+                recompute_vertex_normals_range(mb, briefs_v_start, briefs_i_start);
+            } else if (pkg.wardrobe.bottom_style == BottomGarmentStyle::skirt) {
                 emit_template_part_subset(
                     mb,
                     tpl->parts[part_skirt],
@@ -3683,222 +4428,39 @@ CharacterMeshBuildResult build_character_mesh(const CharacterPackage& input_pkg)
             end_submesh(std::move(out2_sub));
         }
 
-        // ---- Submesh 4: Anatomical Cranial Hair & Sculpted Beard (attached to Head 6 / Jaw 38) ----
-        const bool emit_scalp_hair =
-            pkg.wardrobe.hair_style != HairStyle::bald &&
-            pkg.wardrobe.hair_style != HairStyle::hood;
-        if (emit_scalp_hair || pkg.wardrobe.has_beard) {
-            PbrMaterial hair_mat{};
-            hair_mat.base_color = glm::vec4(pkg.wardrobe.hair_color, 1.0F);
-            hair_mat.metallic = 0.02F;
-            hair_mat.roughness = 0.62F;
-            auto hair_sub = begin_submesh(
-                "hair", CharacterPaintTarget::hair, sanitize_pbr_material(hair_mat));
+        // ---- Submesh 4: Vendor-Agnostic 3D Micro-Strand Hair, Eyebrows, Eyelashes & Beard ----
+        {
+            const CharacterGroomInputs groom_in =
+                build_groom_inputs_from_template(pkg, *tpl, eval);
+            const CharacterStrandGroomMesh groom =
+                build_character_strand_groom_mesh(groom_in);
+            if (!groom.indices.empty() && !groom.vertices.empty()) {
+                PbrMaterial hair_mat{};
+                hair_mat.base_color = glm::vec4(1.0F);
+                hair_mat.metallic = 0.0F;
+                hair_mat.roughness = 0.32F;
+                hair_mat.ior = 1.55F;
+                hair_mat.ambient_occlusion = 1.0F;
+                hair_mat.model = MaterialModel::strand_hair;
+                auto hair_sub = begin_submesh(
+                    "hair", CharacterPaintTarget::hair, sanitize_pbr_material(hair_mat));
 
-            const float eye_y = 0.5F * (bones[43].model_pos.y + bones[44].model_pos.y);
-            const glm::vec3 head_c = bones[6].model_pos;
-            const float head_z = head_c.z;
-            const TemplatePart& body_part = tpl->parts[part_body];
-
-            if (emit_scalp_hair) {
-                const bool is_bob = (pkg.wardrobe.hair_style == HairStyle::bob);
-                const bool is_mohawk = (pkg.wardrobe.hair_style == HairStyle::mohawk);
-                const bool is_spiky = (pkg.wardrobe.hair_style == HairStyle::spiky);
-
-                const auto eval_hairline_plane = [&](const glm::vec3& bp) noexcept -> float {
-                    const float z_start = is_bob ? (head_z - 0.012F * hs) : (head_z - 0.015F * hs);
-                    const float z_span = is_bob ? (0.052F * hs) : (0.065F * hs);
-                    const float front_t = std::clamp((bp.z - z_start) / z_span, 0.0F, 1.0F);
-                    const float temple_t = std::clamp(std::abs(bp.x) / (0.062F * hs), 0.0F, 1.0F);
-                    const float forehead_y = eye_y + (0.043F + 0.010F * temple_t) * hs;
-                    const float nape_y = is_bob
-                        ? (eye_y - 0.118F * hs)
-                        : (eye_y - 0.072F * hs);
-                    return bp.y - glm::mix(nape_y, forehead_y, front_t);
-                };
-                const auto eval_ear_clearance = [&](const glm::vec3& bp) noexcept -> float {
-                    const float dx = (std::max)(0.0F, 0.065F * hs - std::abs(bp.x)) / (0.011F * hs);
-                    const float dy = (bp.y - (eye_y + 0.006F * hs)) / (0.068F * hs);
-                    const float dz = (bp.z - (head_z - 0.002F * hs)) / (0.054F * hs);
-                    const float d = glm::length(glm::vec3(dx, dy, dz));
-                    return (d - 1.0F) * 0.032F * hs;
-                };
-
-                const std::uint32_t hair_v_start = static_cast<std::uint32_t>(mb.vertices.size());
-                const std::uint32_t hair_i_start = static_cast<std::uint32_t>(mb.indices.size());
-                emit_clipped_template_part(
-                    mb,
-                    body_part,
-                    eval.positions,
-                    skin_normals,
-                    tpl->skin_weights,
-                    0.0015F,
-                    CharacterPaintTarget::hair,
-                    [](const TemplateCorner& c0, const TemplateCorner& c1, const TemplateCorner& c2) noexcept {
-                        const auto allowed = [](const TemplateCorner& c) noexcept {
-                            const auto reg = static_cast<TemplateRegion>(c.region);
-                            return reg == TemplateRegion::head || reg == TemplateRegion::neck;
-                        };
-                        return allowed(c0) && allowed(c1) && allowed(c2);
-                    },
-                    is_mohawk ? 3U : 2U,
-                    [&](const std::size_t plane_idx, const ClipVert& v) noexcept -> float {
-                        if (plane_idx == 0U) {
-                            return eval_hairline_plane(v.base_p);
-                        }
-                        if (plane_idx == 1U) {
-                            return eval_ear_clearance(v.base_p);
-                        }
-                        return 0.034F * hs - std::abs(v.base_p.x);
-                    },
-                    [&](const ClipVert& v, const float min_plane_dist) noexcept {
-                        const float feather = std::clamp(min_plane_dist / (0.014F * hs), 0.0F, 1.0F);
-                        const float crown_w = std::clamp((v.base_p.y - eye_y) / (0.105F * hs), 0.0F, 1.0F);
-                        float out = (0.0010F + (0.0045F + 0.0085F * crown_w) * feather) * hs;
-                        glm::vec3 extra(0.0F);
-                        if (is_mohawk) {
-                            const float center_w = std::clamp(
-                                1.0F - std::abs(v.base_p.x) / (0.034F * hs),
-                                0.0F, 1.0F);
-                            out += 0.042F * hs * center_w * feather;
-                        } else if (is_spiky && v.base_p.y > eye_y + 0.048F * hs) {
-                            const float spike = 0.5F + 0.5F * std::sin(v.orig_u * 42.0F + v.orig_v * 29.0F);
-                            out += (0.006F + 0.022F * spike) * hs * crown_w * feather;
-                            extra.y += 0.011F * spike * hs * crown_w * feather;
-                        } else if (is_bob) {
-                            const float d_p0 = (std::max)(0.0F, eval_hairline_plane(v.base_p));
-                            const float d_ear = (std::max)(0.0F, eval_ear_clearance(v.base_p));
-                            const float ear_f = std::clamp(d_ear / (0.014F * hs), 0.0F, 1.0F);
-                            const float front_hairline_w = std::clamp(
-                                (v.base_p.z - (head_z - 0.020F * hs)) / (0.025F * hs),
-                                0.0F, 1.0F);
-                            const float p0_bob_f = glm::mix(
-                                std::clamp(d_p0 / (0.018F * hs), 0.16F, 1.0F),
-                                std::clamp(d_p0 / (0.014F * hs), 0.0F, 1.0F),
-                                front_hairline_w);
-                            const float bob_f = (std::min)(ear_f, p0_bob_f);
-                            const float back_w = std::clamp(
-                                ((head_z + 0.004F * hs) - v.base_p.z) / (0.040F * hs),
-                                0.0F, 1.0F);
-                            const float drop_w = std::clamp(
-                                (eye_y + 0.050F * hs - v.base_p.y) / (0.140F * hs),
-                                0.0F, 1.0F);
-                            const float side_w = std::clamp(
-                                std::abs(v.base_p.x) / (0.035F * hs),
-                                0.0F, 1.0F);
-                            out += (0.007F + 0.020F * drop_w * back_w) * bob_f * hs;
-                            extra.x += (v.base_p.x >= 0.0F ? 1.0F : -1.0F) *
-                                       (0.032F * drop_w * back_w * side_w * bob_f) * hs;
-                        }
-                        return v.base_p + v.nrm * out + extra;
-                    },
-                    [&](const ClipVert&, const glm::vec3& p) noexcept {
-                        return azimuthal_crown_uv(p, head_c);
-                    });
-                recompute_vertex_normals_range(mb, hair_v_start, hair_i_start);
-
-                if (pkg.wardrobe.hair_style == HairStyle::ponytail) {
-                    const glm::vec3 occiput =
-                        head_c + glm::vec3(0.0F, 0.045F * hs, -0.105F * hs);
-                    CookedSkinVertex tie_skin{};
-                    tie_skin.joints = {6U, 0U, 0U, 0U};
-                    tie_skin.weights = {1.0F, 0.0F, 0.0F, 0.0F};
-                    CookedSkinVertex tip_skin{};
-                    tip_skin.joints = {6U, 5U, 0U, 0U};
-                    tip_skin.weights = {0.70F, 0.30F, 0.0F, 0.0F};
-                    emit_ellipsoid(
-                        mb, occiput, {0.022F * hs, 0.022F * hs, 0.022F * hs},
-                        6U, 8U, {0.20F, 0.05F}, {0.80F, 0.20F},
-                        tie_skin, CharacterPaintTarget::hair);
-                    const std::array<LoftRing, 4U> tail_rings{{
-                        {occiput + glm::vec3(0.0F, -0.195F * hs, -0.026F * hs), {1,0,0}, {0,0,1},
-                         0.014F * hs, 0.016F * hs, 1.0F, tip_skin},
-                        {occiput + glm::vec3(0.0F, -0.125F * hs, -0.038F * hs), {1,0,0}, {0,0,1},
-                         0.028F * hs, 0.030F * hs, 0.68F, tip_skin},
-                        {occiput + glm::vec3(0.0F, -0.055F * hs, -0.032F * hs), {1,0,0}, {0,0,1},
-                         0.032F * hs, 0.034F * hs, 0.34F, tie_skin},
-                        {occiput + glm::vec3(0.0F, -0.005F * hs, -0.012F * hs), {1,0,0}, {0,0,1},
-                         0.018F * hs, 0.018F * hs, 0.0F, tie_skin},
-                    }};
-                    emit_loft_tube(
-                        mb, tail_rings, 10U, {0.10F, 0.25F}, {0.90F, 0.96F},
-                        CharacterPaintTarget::hair, true, true);
+                const auto hair_v_start = static_cast<std::uint32_t>(mb.vertices.size());
+                mb.vertices.insert(mb.vertices.end(), groom.vertices.begin(), groom.vertices.end());
+                mb.skin_vertices.insert(
+                    mb.skin_vertices.end(), groom.skin_vertices.begin(), groom.skin_vertices.end());
+                mb.vertex_paint_targets.resize(
+                    mb.vertices.size(), static_cast<std::uint8_t>(CharacterPaintTarget::hair));
+                mb.indices.reserve(mb.indices.size() + groom.indices.size());
+                for (const std::uint32_t idx : groom.indices) {
+                    mb.indices.push_back(hair_v_start + idx);
                 }
-            }
 
-            if (pkg.wardrobe.has_beard) {
-                const std::uint32_t beard_v_start = static_cast<std::uint32_t>(mb.vertices.size());
-                const std::uint32_t beard_i_start = static_cast<std::uint32_t>(mb.indices.size());
-                emit_clipped_template_part(
-                    mb,
-                    body_part,
-                    eval.positions,
-                    skin_normals,
-                    tpl->skin_weights,
-                    0.0004F,
-                    CharacterPaintTarget::hair,
-                    [&](const TemplateCorner& c0, const TemplateCorner& c1, const TemplateCorner& c2) noexcept {
-                        const auto outer_face = [&](const TemplateCorner& c) noexcept {
-                            if (static_cast<TemplateRegion>(c.region) != TemplateRegion::head) {
-                                return false;
-                            }
-                            const glm::vec3& p = eval.positions[c.vid];
-                            const float min_z = head_z +
-                                (std::abs(p.x) < 0.034F * hs ? 0.045F : 0.006F) * hs;
-                            return p.z > min_z;
-                        };
-                        return outer_face(c0) && outer_face(c1) && outer_face(c2);
-                    },
-                    4U,
-                    [&](const std::size_t plane_idx, const ClipVert& v) noexcept -> float {
-                        if (plane_idx == 0U) {
-                            const float abs_x = std::abs(v.base_p.x);
-                            const float cheek_dip = std::clamp(
-                                (abs_x - 0.020F * hs) / (0.025F * hs), 0.0F, 1.0F);
-                            const float sideburn_rise = std::clamp(
-                                (abs_x - 0.046F * hs) / (0.016F * hs), 0.0F, 1.0F);
-                            const float beard_top_y = eye_y -
-                                (0.049F + 0.016F * cheek_dip - 0.028F * sideburn_rise) * hs;
-                            return beard_top_y - v.base_p.y;
-                        }
-                        if (plane_idx == 1U) {
-                            return v.base_p.y - (eye_y - 0.130F * hs);
-                        }
-                        if (plane_idx == 2U) {
-                            return (std::min)(
-                                v.base_p.z - (head_z + 0.008F * hs),
-                                0.064F * hs - std::abs(v.base_p.x));
-                        }
-                        const float mouth_cy = eye_y - 0.072F * hs;
-                        const float oval_sdf =
-                            (std::hypot(
-                                v.base_p.x / (0.027F * hs),
-                                (v.base_p.y - mouth_cy) / (0.018F * hs)) -
-                             1.0F) *
-                            0.018F * hs;
-                        const float lip_r = sample_skin_mask_bilinear(*tpl, v.orig_u, v.orig_v).r;
-                        const float mask_sdf = (0.30F - lip_r) * 0.015F * hs;
-                        return (std::min)(oval_sdf, mask_sdf);
-                    },
-                    [&](const ClipVert& v, const float min_plane_dist) noexcept {
-                        const float feather = std::clamp(min_plane_dist / (0.006F * hs), 0.0F, 1.0F);
-                        const float chin_w = std::clamp(
-                            (eye_y - 0.065F * hs - v.base_p.y) / (0.055F * hs),
-                            0.0F, 1.0F);
-                        const float thick =
-                            (0.0004F + (0.0012F + 0.0024F * chin_w) * feather) * hs;
-                        return v.base_p + v.nrm * thick;
-                    },
-                    [&](const ClipVert&, const glm::vec3& p) noexcept {
-                        return azimuthal_crown_uv(glm::vec3(p.x, eye_y + 0.10F * hs, p.z), head_c);
-                    });
-                recompute_vertex_normals_range(mb, beard_v_start, beard_i_start);
+                end_submesh(std::move(hair_sub));
             }
-
-            end_submesh(std::move(hair_sub));
         }
 
-        recompute_tangents_from_normals(mb.vertices);
+        recompute_uv_derivative_tangents_for_submeshes(mb);
     } else {
         // Resilient minimal fallback when template files are absent outside engine root.
         const auto& bones = fallback_character_bone_layout(pkg.body);
@@ -3906,8 +4468,9 @@ CharacterMeshBuildResult build_character_mesh(const CharacterPackage& input_pkg)
         PbrMaterial skin_mat{};
         skin_mat.base_color = glm::vec4(pkg.body.skin_color, 1.0F);
         skin_mat.roughness = pkg.body.skin_roughness;
+        skin_mat.ior = 1.38F;
         skin_mat.model = MaterialModel::subsurface;
-        skin_mat.subsurface_profile = SubsurfaceProfile::medium;
+        skin_mat.subsurface_profile = SubsurfaceProfile::skin;
         skin_mat.subsurface_strength = pkg.body.skin_subsurface_strength;
         auto skin_sub = begin_submesh(
             "skin", CharacterPaintTarget::skin, sanitize_pbr_material(skin_mat));
@@ -3926,7 +4489,7 @@ CharacterMeshBuildResult build_character_mesh(const CharacterPackage& input_pkg)
             {0.10F, 0.10F}, {0.90F, 0.45F}, {{6U, 0U, 0U, 0U}, {1.0F, 0, 0, 0}},
             CharacterPaintTarget::skin);
         end_submesh(std::move(skin_sub));
-        recompute_tangents_from_normals(mb.vertices);
+        recompute_uv_derivative_tangents_for_submeshes(mb);
     }
 
     result.vertices = std::move(mb.vertices);
@@ -3960,6 +4523,158 @@ CharacterMeshBuildResult build_character_mesh(const CharacterPackage& input_pkg)
 // Layered PBR Texture Baker (sRGB BaseColor, Linear Normal & MetallicRoughness)
 // ============================================================================
 
+namespace {
+
+[[nodiscard]] float worley_pores_2d(
+    const float x,
+    const float y,
+    const std::uint32_t seed) noexcept {
+    const int gx = static_cast<int>(std::floor(x));
+    const int gy = static_cast<int>(std::floor(y));
+    float min_d2 = 4.0F;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            const auto cx = static_cast<std::uint32_t>(gx + dx + 4096);
+            const auto cy = static_cast<std::uint32_t>(gy + dy + 4096);
+            const float jx = static_cast<float>(gx + dx) + 0.18F +
+                0.64F * hash_float01(cx, cy, seed);
+            const float jy = static_cast<float>(gy + dy) + 0.18F +
+                0.64F * hash_float01(cx, cy, seed ^ 0x9e3779b9U);
+            const float ddx = jx - x;
+            const float ddy = jy - y;
+            min_d2 = (std::min)(min_d2, ddx * ddx + ddy * ddy);
+        }
+    }
+    return std::exp(-min_d2 * 14.0F);
+}
+
+struct SkinUvCell {
+    glm::vec3 pos{0.0F};
+    std::uint8_t region = 0U;
+    std::uint8_t valid = 0U;
+};
+
+[[nodiscard]] std::vector<SkinUvCell> rasterize_body_uv_grid(
+    const HumanBaseTemplate& tpl,
+    const EvaluatedHumanTemplate& eval,
+    const std::uint32_t res) {
+    const std::size_t total = static_cast<std::size_t>(res) * res;
+    std::vector<SkinUvCell> grid(total);
+    const TemplatePart& body_part = tpl.parts[part_body];
+    const float fres = static_cast<float>(res);
+
+    for (std::size_t i = 0U; i + 2U < body_part.indices.size(); i += 3U) {
+        const std::uint32_t i0 = body_part.indices[i + 0U];
+        const std::uint32_t i1 = body_part.indices[i + 1U];
+        const std::uint32_t i2 = body_part.indices[i + 2U];
+        if (i0 >= body_part.corners.size() ||
+            i1 >= body_part.corners.size() ||
+            i2 >= body_part.corners.size()) {
+            continue;
+        }
+        const TemplateCorner& c0 = body_part.corners[i0];
+        const TemplateCorner& c1 = body_part.corners[i1];
+        const TemplateCorner& c2 = body_part.corners[i2];
+        const glm::vec2 uv0 = remap_body_corner_uv(c0);
+        const glm::vec2 uv1 = remap_body_corner_uv(c1);
+        const glm::vec2 uv2 = remap_body_corner_uv(c2);
+
+        const float denom =
+            (uv1.y - uv2.y) * (uv0.x - uv2.x) + (uv2.x - uv1.x) * (uv0.y - uv2.y);
+        if (std::abs(denom) <= 1.0e-10F) {
+            continue;
+        }
+        const float inv_denom = 1.0F / denom;
+
+        const float min_u = (std::min)(uv0.x, (std::min)(uv1.x, uv2.x));
+        const float max_u = (std::max)(uv0.x, (std::max)(uv1.x, uv2.x));
+        const float min_v = (std::min)(uv0.y, (std::min)(uv1.y, uv2.y));
+        const float max_v = (std::max)(uv0.y, (std::max)(uv1.y, uv2.y));
+
+        const int x0 = std::clamp(static_cast<int>(std::floor(min_u * fres)) - 1, 0, static_cast<int>(res) - 1);
+        const int x1 = std::clamp(static_cast<int>(std::ceil(max_u * fres)), 0, static_cast<int>(res) - 1);
+        const int y0 = std::clamp(static_cast<int>(std::floor(min_v * fres)) - 1, 0, static_cast<int>(res) - 1);
+        const int y1 = std::clamp(static_cast<int>(std::ceil(max_v * fres)), 0, static_cast<int>(res) - 1);
+
+        const glm::vec3& p0 = eval.positions[c0.vid];
+        const glm::vec3& p1 = eval.positions[c1.vid];
+        const glm::vec3& p2 = eval.positions[c2.vid];
+        const float inv_res = 1.0F / fres;
+
+        for (int py = y0; py <= y1; ++py) {
+            const float pv = (static_cast<float>(py) + 0.5F) * inv_res;
+            for (int px = x0; px <= x1; ++px) {
+                const float pu = (static_cast<float>(px) + 0.5F) * inv_res;
+                const float w0 = ((uv1.y - uv2.y) * (pu - uv2.x) + (uv2.x - uv1.x) * (pv - uv2.y)) * inv_denom;
+                const float w1 = ((uv2.y - uv0.y) * (pu - uv2.x) + (uv0.x - uv2.x) * (pv - uv2.y)) * inv_denom;
+                const float w2 = 1.0F - w0 - w1;
+                if (w0 < -0.004F || w1 < -0.004F || w2 < -0.004F) {
+                    continue;
+                }
+                const float bw0 = (std::max)(0.0F, w0);
+                const float bw1 = (std::max)(0.0F, w1);
+                const float bw2 = (std::max)(0.0F, w2);
+                const float wsum = bw0 + bw1 + bw2;
+                const float inv_w = wsum > 1.0e-6F ? (1.0F / wsum) : 1.0F;
+                const glm::vec3 pos = (p0 * bw0 + p1 * bw1 + p2 * bw2) * inv_w;
+                const std::uint8_t reg = (bw0 >= bw1 && bw0 >= bw2)
+                    ? c0.region
+                    : ((bw1 >= bw2) ? c1.region : c2.region);
+                grid[static_cast<std::size_t>(py) * res + static_cast<std::size_t>(px)] =
+                    SkinUvCell{pos, reg, 1U};
+            }
+        }
+    }
+
+    // 3-pass UV gutter dilation so bilinear seam borders sample clean 3D coordinates/regions
+    std::vector<SkinUvCell> next_grid = grid;
+    for (int pass = 0; pass < 3; ++pass) {
+        bool any_filled = false;
+        for (int py = 0; py < static_cast<int>(res); ++py) {
+            for (int px = 0; px < static_cast<int>(res); ++px) {
+                const std::size_t idx =
+                    static_cast<std::size_t>(py) * res + static_cast<std::size_t>(px);
+                if (grid[idx].valid != 0U) {
+                    continue;
+                }
+                glm::vec3 sum_pos(0.0F);
+                int count = 0;
+                std::uint8_t first_reg = 0U;
+                for (int dy = -1; dy <= 1; ++dy) {
+                    const int ny = py + dy;
+                    if (ny < 0 || ny >= static_cast<int>(res)) continue;
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const int nx = px + dx;
+                        if ((dx == 0 && dy == 0) || nx < 0 || nx >= static_cast<int>(res)) continue;
+                        const SkinUvCell& nb =
+                            grid[static_cast<std::size_t>(ny) * res + static_cast<std::size_t>(nx)];
+                        if (nb.valid != 0U) {
+                            if (pass > 0 && nb.region == static_cast<std::uint8_t>(TemplateRegion::inner_mouth)) {
+                                continue;
+                            }
+                            sum_pos += nb.pos;
+                            if (count == 0) first_reg = nb.region;
+                            ++count;
+                        }
+                    }
+                }
+                if (count > 0) {
+                    next_grid[idx] = SkinUvCell{sum_pos / static_cast<float>(count), first_reg, 1U};
+                    any_filled = true;
+                }
+            }
+        }
+        grid.swap(next_grid);
+        next_grid = grid;
+        if (!any_filled) {
+            break;
+        }
+    }
+    return grid;
+}
+
+} // namespace
+
 std::vector<BakedPbrTextureSet> bake_character_textures(
     const CharacterPackage& input_pkg,
     const CharacterMeshBuildResult& mesh,
@@ -3975,10 +4690,103 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
     }
 
     const HumanBaseTemplate* const tpl = get_human_base_template(pkg.body.gender);
+    bool need_skin_raster = false;
+    bool need_groom_inputs = false;
+    for (const CharacterSubmeshBuild& sub : mesh.submeshes) {
+        if (sub.name == "skin") need_skin_raster = true;
+        if (sub.name == "hair") need_groom_inputs = true;
+    }
+
+    EvaluatedHumanTemplate eval{};
+    bool has_eval = false;
+    std::vector<SkinUvCell> skin_uv_grid{};
+    if (tpl != nullptr && (need_skin_raster || need_groom_inputs)) {
+        eval = evaluate_human_template(pkg.body, *tpl);
+        has_eval = true;
+        if (need_skin_raster) {
+            skin_uv_grid = rasterize_body_uv_grid(*tpl, eval, res);
+        }
+    }
+
+    const float h = pkg.body.height_meters / 1.78F;
+    const float hs = pkg.body.face.head_scale * h;
+    const glm::vec3 head_c = has_eval ? eval.bones[6].model_pos : glm::vec3(0.0F, 1.62F * h, 0.04F * h);
+    const float eye_y = has_eval
+        ? (0.5F * (eval.bones[43].model_pos.y + eval.bones[44].model_pos.y))
+        : (head_c.y + 0.04F * hs);
+    const float neck_y = has_eval ? eval.bones[5].model_pos.y : (head_c.y - 0.085F * hs);
+    const glm::vec3 mouth_c = has_eval
+        ? eval.bones[39].model_pos
+        : glm::vec3(0.0F, eye_y - 0.074F * hs, head_c.z + 0.115F * hs);
+    float chin_y = mouth_c.y - 0.050F * hs;
+    if (has_eval && tpl != nullptr) {
+        float min_head_y = 1.0e6F;
+        for (const TemplateCorner& c : tpl->parts[part_body].corners) {
+            if (static_cast<TemplateRegion>(c.region) == TemplateRegion::head) {
+                min_head_y = (std::min)(min_head_y, eval.positions[c.vid].y);
+            }
+        }
+        if (min_head_y < 1.0e5F) {
+            chin_y = min_head_y;
+        }
+    }
+
     std::vector<BakedPbrTextureSet> outputs;
     outputs.reserve(mesh.submeshes.size());
 
     for (const CharacterSubmeshBuild& sub : mesh.submeshes) {
+        if (sub.name == "hair" && tpl != nullptr && has_eval) {
+            const CharacterGroomInputs groom_in =
+                build_groom_inputs_from_template(pkg, *tpl, eval);
+            outputs.push_back(bake_character_strand_groom_textures(
+                groom_in,
+                pkg.wardrobe.hair_color,
+                pkg.wardrobe.wear_and_tear,
+                pkg.paint_strokes,
+                (std::min)(512U, res),
+                (std::min)(512U, res)));
+            continue;
+        }
+
+        if (sub.name == "cornea") {
+            BakedPbrTextureSet cset{};
+            cset.slot_name = sub.name;
+            cset.target = sub.paint_target;
+            constexpr std::uint32_t c_res = 64U;
+            cset.width = c_res;
+            cset.height = c_res;
+            const std::size_t c_bytes = static_cast<std::size_t>(c_res) * c_res * 4U;
+            cset.base_color_rgba.resize(c_bytes);
+            cset.normal_rgba.resize(c_bytes);
+            cset.metallic_roughness_rgba.resize(c_bytes);
+            for (std::size_t px = 0U; px < static_cast<std::size_t>(c_res) * c_res; ++px) {
+                const std::size_t off = px * 4U;
+                cset.base_color_rgba[off + 0U] = 255U;
+                cset.base_color_rgba[off + 1U] = 255U;
+                cset.base_color_rgba[off + 2U] = 255U;
+                cset.base_color_rgba[off + 3U] = 255U;
+                cset.normal_rgba[off + 0U] = 128U;
+                cset.normal_rgba[off + 1U] = 128U;
+                cset.normal_rgba[off + 2U] = 255U;
+                cset.normal_rgba[off + 3U] = 255U;
+                cset.metallic_roughness_rgba[off + 0U] = 255U;
+                cset.metallic_roughness_rgba[off + 1U] = 255U;
+                cset.metallic_roughness_rgba[off + 2U] = 0U;
+                cset.metallic_roughness_rgba[off + 3U] = 255U;
+            }
+            outputs.push_back(std::move(cset));
+            continue;
+        }
+
+        std::vector<CharacterPaintStroke> slot_strokes;
+        if (sub.name != "eyes") {
+            for (const CharacterPaintStroke& ps : pkg.paint_strokes) {
+                if (ps.target == sub.paint_target) {
+                    slot_strokes.push_back(ps);
+                }
+            }
+        }
+
         BakedPbrTextureSet set{};
         set.slot_name = sub.name;
         set.target = sub.paint_target;
@@ -3989,6 +4797,18 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
         set.metallic_roughness_rgba.resize(byte_count);
 
         const float inv_res = 1.0F / static_cast<float>(res);
+        const glm::vec3 base_skin_lin = glm::vec3(
+            srgb_to_linear_channel(pkg.body.skin_color.r),
+            srgb_to_linear_channel(pkg.body.skin_color.g),
+            srgb_to_linear_channel(pkg.body.skin_color.b)) * 0.96F;
+        const glm::vec3 hair_lin(
+            srgb_to_linear_channel(pkg.wardrobe.hair_color.r),
+            srgb_to_linear_channel(pkg.wardrobe.hair_color.g),
+            srgb_to_linear_channel(pkg.wardrobe.hair_color.b));
+        const glm::vec3 eye_lin(
+            srgb_to_linear_channel(pkg.body.face.eye_color.r),
+            srgb_to_linear_channel(pkg.body.face.eye_color.g),
+            srgb_to_linear_channel(pkg.body.face.eye_color.b));
 
         for (std::uint32_t y = 0U; y < res; ++y) {
             const float v = (static_cast<float>(y) + 0.5F) * inv_res;
@@ -3998,240 +4818,409 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
                 glm::vec3 nrm{0.0F, 0.0F, 1.0F};
                 float metallic = sub.material.metallic;
                 float roughness = sub.material.roughness;
+                float ao = 1.0F;
 
                 if (sub.name == "eyes") {
                     const float dx = (u - 0.5F) * 2.0F;
                     const float dy = (v - 0.5F) * 2.0F;
                     const float rad = std::hypot(dx, dy);
-                    if (rad < 0.175F) {
-                        col = {0.015F, 0.015F, 0.02F}; // Deep pupil
-                        roughness = 0.04F;
-                    } else if (rad < 0.465F) {
+                    if (rad < 0.152F) {
+                        const float edge = std::clamp((0.152F - rad) / 0.016F, 0.0F, 1.0F);
+                        col = glm::mix(eye_lin * 0.10F, glm::vec3(0.006F, 0.006F, 0.008F), edge);
+                        roughness = 0.08F;
+                    } else if (rad < 0.435F) {
                         const float ang = std::atan2(dy, dx);
-                        const float radial_t = (rad - 0.175F) / (0.465F - 0.175F);
-                        const float fiber = 0.78F + 0.22F * std::sin(ang * 32.0F + radial_t * 4.0F);
-                        const float limbal = std::clamp((0.465F - rad) / 0.085F, 0.16F, 1.0F);
-                        const float collarette = 0.85F + 0.25F * std::exp(-std::pow((radial_t - 0.35F) * 4.0F, 2.0F));
-                        const glm::vec3 eye_lin(
-                            srgb_to_linear_channel(pkg.body.face.eye_color.r),
-                            srgb_to_linear_channel(pkg.body.face.eye_color.g),
-                            srgb_to_linear_channel(pkg.body.face.eye_color.b));
-                        col = eye_lin * (fiber * limbal * collarette);
-                        roughness = 0.06F;
+                        const float radial_t = (rad - 0.152F) / (0.435F - 0.152F);
+                        const float n1 = value_noise_2d(std::cos(ang) * 7.0F + 4.0F, std::sin(ang) * 7.0F + radial_t * 3.0F, 31U);
+                        const float n2 = value_noise_2d(std::cos(ang) * 18.0F + 9.0F, std::sin(ang) * 18.0F + radial_t * 6.0F, 47U);
+                        const float fiber = 0.72F + 0.18F * std::sin(ang * 32.0F + (n1 - 0.5F) * 5.0F) +
+                                            0.12F * std::sin(ang * 74.0F + (n2 - 0.5F) * 4.0F);
+                        const float crypt = 0.86F + 0.22F * n2;
+                        const float collarette = 0.84F + 0.28F * std::exp(-std::pow((radial_t - 0.28F) * 4.2F, 2.0F));
+                        const float limbal = std::clamp((0.435F - rad) / 0.085F, 0.06F, 1.0F);
+                        const glm::vec3 inner_ochre = eye_lin * glm::vec3(1.22F, 0.94F, 0.68F);
+                        const glm::vec3 iris_base = glm::mix(
+                            inner_ochre, eye_lin * glm::vec3(0.95F, 1.00F, 1.05F),
+                            std::clamp(radial_t * 1.4F, 0.0F, 1.0F));
+                        col = iris_base * (fiber * crypt * collarette * limbal);
+                        // Concave conical iris stroma normal reaction
+                        const float dir_len = (std::max)(rad, 1.0e-4F);
+                        const float tilt = 0.18F * (1.0F - radial_t * 0.45F);
+                        nrm = glm::normalize(glm::vec3(
+                            -(dx / dir_len) * tilt,
+                            -(dy / dir_len) * tilt,
+                            1.0F));
+                        roughness = 0.18F + (1.0F - n2) * 0.08F;
                     } else {
-                        const float edge_ao = std::clamp(1.0F - (rad - 0.465F) * 0.28F, 0.68F, 1.0F);
-                        col = glm::vec3(0.62F, 0.59F, 0.56F) * edge_ao; // Natural shaded sclera
+                        const float edge_ao = std::clamp(1.0F - (rad - 0.435F) * 0.42F, 0.52F, 1.0F);
+                        const float v_ang = std::atan2(dy, dx);
+                        const float vein_n = value_noise_2d(u * 26.0F, v * 26.0F, 71U);
+                        const float vein = std::pow(
+                            std::clamp(std::abs(std::sin(v_ang * 14.0F + vein_n * 6.0F)), 0.0F, 1.0F),
+                            14.0F) * std::clamp((rad - 0.50F) / 0.24F, 0.0F, 1.0F);
+                        const float corner_caruncle =
+                            std::clamp((std::abs(dx) - 0.68F) / 0.24F, 0.0F, 1.0F) *
+                            std::clamp(1.0F - std::abs(dy) * 1.8F, 0.0F, 1.0F);
+                        glm::vec3 sclera = glm::vec3(0.68F, 0.65F, 0.63F) * edge_ao;
+                        sclera = glm::mix(sclera, glm::vec3(0.66F, 0.34F, 0.32F), vein * 0.26F);
+                        sclera = glm::mix(sclera, glm::vec3(0.60F, 0.28F, 0.26F), corner_caruncle * 0.42F);
+                        col = sclera;
                         roughness = 0.14F;
                     }
-                    const float lid_ao = std::clamp(0.62F + (dy + 0.32F) * 0.75F, 0.54F, 1.0F);
-                    col *= lid_ao;
+                    // Soft upper and lower eyelid ambient shadow
+                    const float upper_lid_ao = std::clamp(0.50F + (dy + 0.34F) * 0.78F, 0.40F, 1.0F);
+                    const float lower_lid_ao = std::clamp(1.0F - (std::max)(0.0F, dy - 0.32F) * 0.55F, 0.68F, 1.0F);
+                    col *= upper_lid_ao * lower_lid_ao;
                 } else if (sub.name == "skin") {
-                    const glm::vec3 base_lin = glm::vec3(
-                        srgb_to_linear_channel(pkg.body.skin_color.r),
-                        srgb_to_linear_channel(pkg.body.skin_color.g),
-                        srgb_to_linear_channel(pkg.body.skin_color.b)) * 0.86F;
-                    const float pores =
-                        value_noise_2d(u * 128.0F, v * 128.0F, 17U) - 0.5F;
-                    const float age =
-                        (value_noise_2d(u * 26.0F, v * 26.0F, 41U) - 0.5F) *
-                        pkg.body.age_wear;
-                    col = base_lin * (1.0F + pores * 0.032F + age * 0.10F);
-                    nrm = glm::normalize(glm::vec3(pores * 0.05F, pores * 0.05F, 1.0F));
-                    roughness = std::clamp(
-                        pkg.body.skin_roughness + 0.10F + pores * 0.03F,
-                        0.28F,
-                        0.95F);
+                    const std::size_t cell_idx = static_cast<std::size_t>(y) * res + x;
+                    const SkinUvCell cell = (!skin_uv_grid.empty())
+                        ? skin_uv_grid[cell_idx]
+                        : SkinUvCell{};
+                    const auto reg = static_cast<TemplateRegion>(cell.region);
+                    const bool is_head = (cell.valid != 0U) && (reg == TemplateRegion::head);
+                    const bool is_mouth = (cell.valid != 0U) && (reg == TemplateRegion::inner_mouth);
 
-                    // MakeHuman inner mouth islands: teeth & tongue
-                    if (u >= 0.674F && u <= 0.742F && v >= 0.872F && v <= 0.924F) {
-                        const float upper_bias = (v < 0.898F) ? 1.0F : 0.92F;
-                        col = glm::vec3(0.84F, 0.81F, 0.74F) * upper_bias;
-                        roughness = 0.24F;
-                    } else if (u >= 0.618F && u <= 0.654F && v >= 0.925F && v <= 0.988F) {
-                        col = glm::vec3(0.56F, 0.22F, 0.22F);
-                        roughness = 0.36F;
-                    } else if (tpl != nullptr) {
-                        const glm::vec4 mask = sample_skin_mask_bilinear(*tpl, u, v);
-                        // Preserve fine eyebrow strands across UV filtering via small texel neighbor blend.
-                        const float du1 = 1.0F / static_cast<float>(template_mask_size);
-                        const float du2 = 2.0F / static_cast<float>(template_mask_size);
-                        const float dv1 = 0.85F / static_cast<float>(template_mask_size);
-                        float brow_mask = mask.g;
-                        brow_mask = (std::max)(brow_mask, sample_skin_mask_bilinear(*tpl, u + du1, v).g * 0.92F);
-                        brow_mask = (std::max)(brow_mask, sample_skin_mask_bilinear(*tpl, u - du1, v).g * 0.92F);
-                        brow_mask = (std::max)(brow_mask, sample_skin_mask_bilinear(*tpl, u + du2, v).g * 0.78F);
-                        brow_mask = (std::max)(brow_mask, sample_skin_mask_bilinear(*tpl, u - du2, v).g * 0.78F);
-                        brow_mask = (std::max)(brow_mask, sample_skin_mask_bilinear(*tpl, u, v + dv1).g * 0.82F);
-                        brow_mask = (std::max)(brow_mask, sample_skin_mask_bilinear(*tpl, u, v - dv1).g * 0.82F);
+                    if (is_mouth) {
+                        if (u >= 0.8825F && v >= 0.0521F) {
+                            const float upper_bias = (v >= 0.0703F) ? 1.0F : 0.90F;
+                            col = glm::vec3(0.76F, 0.73F, 0.67F) * upper_bias;
+                            roughness = 0.24F;
+                        } else {
+                            col = glm::vec3(0.38F, 0.13F, 0.13F);
+                            roughness = 0.34F;
+                        }
+                    } else {
+                        // Worley cellular micro-pores + fine dermal micro-grain
+                        const float pore_scale = is_head ? 210.0F : 140.0F;
+                        const float p_c = worley_pores_2d(u * pore_scale, v * pore_scale, 17U);
+                        const float p_u = worley_pores_2d((u + 0.0008F) * pore_scale, v * pore_scale, 17U);
+                        const float p_v = worley_pores_2d(u * pore_scale, (v + 0.0008F) * pore_scale, 17U);
+                        const float grain = value_noise_2d(u * 380.0F, v * 380.0F, 59U) - 0.5F;
+                        const float age = (value_noise_2d(u * 26.0F, v * 26.0F, 41U) - 0.5F) * pkg.body.age_wear;
 
-                        if (mask.r > 0.01F) {
-                            const float lt = std::clamp(mask.r * (0.18F + pkg.body.lip_tint * 0.62F), 0.0F, 0.68F);
-                            const glm::vec3 lip_tint_col = base_lin * glm::vec3(0.92F, 0.58F, 0.55F);
-                            col = glm::mix(col, lip_tint_col, lt);
-                            if (mask.r > 0.82F) {
-                                col *= (1.0F - (mask.r - 0.82F) * 0.75F);
+                        const float t_zone = is_head
+                            ? (std::clamp(1.0F - std::abs(cell.pos.x) / (0.048F * hs), 0.0F, 1.0F) *
+                               std::clamp((cell.pos.z - (head_c.z + 0.045F * hs)) / (0.055F * hs), 0.0F, 1.0F))
+                            : 0.0F;
+                        const float pore_weight = is_head ? (0.45F + 0.55F * t_zone) : 0.35F;
+
+                        col = base_skin_lin * (1.0F - p_c * 0.032F * pore_weight + grain * 0.020F + age * 0.10F);
+                        const float dh_du = -(p_u - p_c) * pore_weight * 0.14F;
+                        const float dh_dv = -(p_v - p_c) * pore_weight * 0.14F;
+                        nrm = glm::normalize(glm::vec3(-dh_du, -dh_dv, 1.0F));
+                        roughness = std::clamp(
+                            pkg.body.skin_roughness + (is_head ? -0.025F * t_zone : 0.06F) + p_c * 0.05F,
+                            0.44F,
+                            0.92F);
+
+                        // 3D Anatomical Vascular / Melanin Color Zones
+                        if (is_head) {
+                            const float py_rel = cell.pos.y - eye_y;
+                            const float forehead_w = std::clamp((py_rel - 0.020F * hs) / (0.040F * hs), 0.0F, 1.0F);
+                            const float midface_w =
+                                std::clamp((py_rel + 0.055F * hs) / (0.040F * hs), 0.0F, 1.0F) *
+                                (1.0F - std::clamp((py_rel - 0.012F * hs) / (0.035F * hs), 0.0F, 1.0F));
+                            const float jaw_w = std::clamp((-py_rel - 0.045F * hs) / (0.045F * hs), 0.0F, 1.0F);
+                            const float ear_w = std::clamp((std::abs(cell.pos.x) - 0.064F * hs) / (0.014F * hs), 0.0F, 1.0F);
+                            const float nose_tip =
+                                std::clamp((cell.pos.z - (head_c.z + 0.088F * hs)) / (0.025F * hs), 0.0F, 1.0F) *
+                                std::clamp(1.0F - std::abs(py_rel + 0.024F * hs) / (0.028F * hs), 0.0F, 1.0F) *
+                                std::clamp(1.0F - std::abs(cell.pos.x) / (0.020F * hs), 0.0F, 1.0F);
+
+                            col = glm::mix(col, col * glm::vec3(1.03F, 1.00F, 0.94F), forehead_w * 0.45F);
+                            col = glm::mix(col, base_skin_lin * glm::vec3(1.10F, 0.84F, 0.80F),
+                                (std::min)(1.0F, midface_w * 0.22F + ear_w * 0.28F + nose_tip * 0.26F));
+                            col = glm::mix(col, col * glm::vec3(0.96F, 0.97F, 0.95F), jaw_w * 0.35F);
+                            if (pkg.body.gender == CharacterGender::male && jaw_w > 0.05F && !pkg.wardrobe.has_beard) {
+                                // Subtle sub-dermal hair follicle cool shadow on shaven lower face
+                                col = glm::mix(col, base_skin_lin * glm::vec3(0.88F, 0.91F, 0.95F), jaw_w * 0.14F);
                             }
-                            roughness = glm::mix(roughness, 0.38F, lt);
+                        } else if (cell.valid != 0U &&
+                                   (reg == TemplateRegion::hand || reg == TemplateRegion::foot)) {
+                            col = glm::mix(col, base_skin_lin * glm::vec3(1.06F, 0.89F, 0.85F), 0.18F);
                         }
-                        if (brow_mask > 0.01F) {
-                            const glm::vec3 hair_lin(
-                                srgb_to_linear_channel(pkg.wardrobe.hair_color.r),
-                                srgb_to_linear_channel(pkg.wardrobe.hair_color.g),
-                                srgb_to_linear_channel(pkg.wardrobe.hair_color.b));
-                            const glm::vec3 brow_col = (glm::min)(hair_lin * 0.55F, glm::vec3(0.12F, 0.09F, 0.07F));
-                            const float brow_hair = 0.78F + 0.20F * std::sin(u * 380.0F);
-                            const float bw = std::clamp(std::pow(brow_mask, 0.50F) * 0.92F, 0.0F, 0.90F);
-                            col = glm::mix(col, brow_col * brow_hair, bw);
-                            roughness = glm::mix(roughness, 0.68F, bw);
-                        }
-                        if (mask.b > 0.01F) {
-                            col *= (1.0F - mask.b * 0.52F);
-                            roughness = (std::min)(0.95F, roughness + mask.b * 0.08F);
-                        }
-                        if (mask.a > 0.01F) {
-                            const float blush = mask.a * 0.20F;
-                            col = glm::mix(col, base_lin * glm::vec3(1.12F, 0.72F, 0.66F), blush);
-                            if (pkg.body.freckles > 0.02F) {
-                                const float fdot = hash_float01(x / 2U, y / 2U, 99U);
-                                if (fdot > 1.0F - pkg.body.freckles * 0.14F * mask.a) {
-                                    col *= glm::vec3(0.66F, 0.54F, 0.46F);
+
+                        if (tpl != nullptr && !is_mouth) {
+                            const glm::vec4 mask = sample_skin_mask_bilinear(*tpl, u, v);
+                            const glm::vec4 detail = sample_skin_detail_bilinear(*tpl, u, v);
+                            const std::uint8_t detail_a = sample_skin_detail_alpha_nearest(*tpl, u, v);
+
+                            // Baked v2 16-ray AO & discrete mean curvature
+                            float detail_ao = detail.r;
+                            if (is_head && cell.valid != 0U) {
+                                const float py_ey = cell.pos.y - eye_y;
+                                const float under_eye_soft =
+                                    smoothstep_f(py_ey, -0.036F * hs, -0.020F * hs) *
+                                    (1.0F - smoothstep_f(py_ey, -0.007F * hs, -0.001F * hs)) *
+                                    (1.0F - smoothstep_f(std::abs(cell.pos.x), 0.036F * hs, 0.052F * hs)) *
+                                    smoothstep_f(cell.pos.z, head_c.z + 0.038F * hs, head_c.z + 0.062F * hs) *
+                                    (1.0F - std::clamp(pkg.body.age_wear * 2.2F, 0.0F, 0.85F));
+                                detail_ao = glm::mix(detail_ao, 1.0F, 0.62F * under_eye_soft);
+                            }
+                            ao = std::clamp(glm::mix(1.0F, detail_ao, 0.84F), 0.24F, 1.0F);
+                            const float crevice = std::clamp((0.68F - detail_ao) * 1.45F, 0.0F, 1.0F);
+                            col *= glm::mix(glm::vec3(1.0F), glm::vec3(0.96F, 0.78F, 0.72F), crevice * 0.55F);
+                            if (detail.g > 0.54F) {
+                                roughness = (std::max)(0.42F, roughness - (detail.g - 0.54F) * 0.10F);
+                            }
+
+                            // Vermilion lips with crisp 3D anatomical border + fine sulcus grooves
+                            if (is_head && cell.valid != 0U &&
+                                cell.pos.z > mouth_c.z - 0.015F * hs && mask.r > 0.30F) {
+                                const float lip_slit_y = mouth_c.y + 0.0023F * hs;
+                                const float abs_lx =
+                                    std::abs(cell.pos.x - mouth_c.x) / (std::max)(1.0e-4F, 0.0265F * hs);
+                                if (abs_lx < 1.06F) {
+                                    const float corner_env =
+                                        std::sqrt((std::max)(0.0F, 1.0F - (std::min)(1.0F, abs_lx * abs_lx)));
+                                    const float cupid =
+                                        1.0F +
+                                        0.14F * std::exp(-std::pow((abs_lx - 0.24F) / 0.16F, 2.0F)) -
+                                        0.12F * std::exp(-std::pow(abs_lx / 0.10F, 2.0F));
+                                    const float full_scale = 0.88F + 0.24F * pkg.body.face.lip_fullness;
+                                    const float upper_h = 0.0098F * hs * corner_env * cupid * full_scale;
+                                    const float lower_h =
+                                        0.0106F * hs * std::pow(corner_env, 0.85F) * full_scale;
+                                    const float dy_slit = cell.pos.y - lip_slit_y;
+                                    const float ly_norm = (dy_slit >= 0.0F)
+                                        ? (dy_slit / (std::max)(1.0e-4F, upper_h))
+                                        : (-dy_slit / (std::max)(1.0e-4F, lower_h));
+                                    const float vermilion =
+                                        (1.0F - smoothstep_f(ly_norm, 0.74F, 1.02F)) *
+                                        smoothstep_f(mask.r, 0.55F, 0.82F);
+                                    if (vermilion > 0.005F) {
+                                        const glm::vec3 lip_tint_col =
+                                            base_skin_lin * glm::vec3(0.92F, 0.49F, 0.47F) +
+                                            glm::vec3(0.030F, 0.007F, 0.009F) * pkg.body.lip_tint;
+                                        const float lt = std::clamp(
+                                            vermilion * (0.28F + pkg.body.lip_tint * 0.54F), 0.0F, 0.68F);
+                                        col = glm::mix(col, lip_tint_col, lt);
+                                        roughness = glm::mix(roughness, 0.34F, lt);
+                                        const float lip_wrinkle = std::sin(
+                                            u * 460.0F + value_noise_2d(u * 90.0F, v * 90.0F, 103U) * 4.0F);
+                                        nrm = glm::normalize(glm::vec3(
+                                            nrm.x + lip_wrinkle * lt * 0.13F, nrm.y, nrm.z));
+                                    }
+                                    if (std::abs(dy_slit) < 0.0018F * hs && abs_lx < 0.96F) {
+                                        const float slit_t =
+                                            (1.0F - std::abs(dy_slit) / (0.0018F * hs)) * corner_env;
+                                        col *= (1.0F - 0.42F * slit_t);
+                                        ao *= (1.0F - 0.25F * slit_t);
+                                    }
+                                }
+                            }
+
+                            // Under-3D-groom soft follicular brow shadow & moist lash tearline
+                            if (mask.g > 0.01F) {
+                                const glm::vec3 brow_col = glm::mix(
+                                    base_skin_lin * 0.46F,
+                                    hair_lin * 1.35F + glm::vec3(0.025F, 0.018F, 0.013F),
+                                    0.48F);
+                                const float bw = std::clamp(mask.g * 0.34F, 0.0F, 0.34F);
+                                col = glm::mix(col, brow_col, bw);
+                                roughness = glm::mix(roughness, 0.64F, bw);
+                            }
+                            if (mask.b > 0.01F) {
+                                col *= (1.0F - mask.b * 0.38F);
+                                roughness = glm::mix(roughness, 0.28F, mask.b * 0.65F);
+                            }
+                            if (mask.a > 0.01F) {
+                                const float blush = mask.a * 0.18F;
+                                col = glm::mix(col, base_skin_lin * glm::vec3(1.10F, 0.72F, 0.66F), blush);
+                                if (pkg.body.freckles > 0.02F) {
+                                    const float fdot = hash_float01(x / 2U, y / 2U, 99U);
+                                    if (fdot > 1.0F - pkg.body.freckles * 0.14F * mask.a) {
+                                        col *= glm::vec3(0.66F, 0.54F, 0.46F);
+                                    }
+                                }
+                            }
+
+                            // Keratin fingernails & toenails (raw alpha 1..127)
+                            if (detail_a >= 1U && detail_a <= 127U && cell.valid != 0U &&
+                                (reg == TemplateRegion::hand || reg == TemplateRegion::foot)) {
+                                const float nail_w = std::clamp(static_cast<float>(detail_a) / 90.0F, 0.0F, 1.0F);
+                                const glm::vec3 nail_pink = glm::mix(
+                                    base_skin_lin * glm::vec3(1.06F, 0.88F, 0.86F),
+                                    glm::vec3(0.76F, 0.58F, 0.54F),
+                                    0.45F);
+                                const float lunula = (detail_a < 72U) ? 0.18F : 0.0F;
+                                const glm::vec3 nail_col = glm::mix(nail_pink, glm::vec3(0.84F, 0.80F, 0.76F), lunula);
+                                col = glm::mix(col, nail_col, nail_w);
+                                roughness = glm::mix(roughness, 0.21F, nail_w);
+                            } else if (cell.valid != 0U &&
+                                       (reg == TemplateRegion::head || reg == TemplateRegion::neck) &&
+                                       pkg.wardrobe.hair_style != HairStyle::bald &&
+                                       pkg.wardrobe.hair_style != HairStyle::hood) {
+                                // Cranial scalp follicle root bed gated across complete hairline
+                                const float hl_w = eval_anatomical_hairline_weight(
+                                    cell.pos, pkg.body.gender, head_c, eye_y, neck_y, hs);
+                                const bool is_short_crop = (pkg.wardrobe.hair_style == HairStyle::short_crop);
+                                const float scalp_w = is_short_crop
+                                    ? (smoothstep_f(hl_w, 0.18F, 0.76F) * 0.68F)
+                                    : (smoothstep_f(hl_w, 0.10F, 0.60F) * 0.92F);
+                                if (scalp_w > 0.005F) {
+                                    const glm::vec3 root_tone = is_short_crop
+                                        ? glm::mix(col * 0.30F, hair_lin * 0.82F, 0.74F)
+                                        : glm::mix(col * 0.18F, hair_lin * 0.55F, 0.82F);
+                                    col = glm::mix(col, root_tone, scalp_w);
+                                    roughness = glm::mix(roughness, 0.78F, scalp_w);
+                                    if (!is_short_crop) {
+                                        ao = glm::mix(ao, 0.26F, scalp_w * 0.85F);
+                                    }
+                                }
+                            }
+
+                            // Subtle follicular shadow bed under 3D beard strands
+                            if (is_head && pkg.wardrobe.has_beard && cell.valid != 0U) {
+                                const float bw_3d = eval_anatomical_beard_weight(
+                                    cell.pos, head_c, mouth_c, chin_y, eye_y, hs);
+                                if (bw_3d > 0.05F) {
+                                    const float beard_shadow = bw_3d * 0.46F;
+                                    const glm::vec3 follicle_tone = glm::mix(
+                                        col * 0.54F,
+                                        hair_lin * 0.65F + glm::vec3(0.012F, 0.009F, 0.006F),
+                                        0.48F);
+                                    col = glm::mix(col, follicle_tone, beard_shadow);
+                                    roughness = glm::mix(roughness, 0.78F, beard_shadow);
                                 }
                             }
                         }
                     }
-                } else if (sub.paint_target == CharacterPaintTarget::hair) {
-                    const glm::vec3 hlin(
-                        srgb_to_linear_channel(pkg.wardrobe.hair_color.r),
-                        srgb_to_linear_channel(pkg.wardrobe.hair_color.g),
-                        srgb_to_linear_channel(pkg.wardrobe.hair_color.b));
-                    const float du = u - 0.5F;
-                    const float dv = v - 0.5F;
-                    const float rad = std::hypot(du, dv);
-                    const float ang = std::atan2(dv, du);
-                    const float swirl = value_noise_2d(du * 12.0F + 4.0F, dv * 12.0F + 4.0F, 5U) * 0.35F;
-                    const float strand = 0.55F * std::sin(ang * 42.0F + swirl * 10.0F) +
-                                         0.45F * std::sin(ang * 88.0F - rad * 16.0F);
-                    const float root_shade = 0.78F + 0.22F * std::clamp(rad * 2.2F, 0.0F, 1.0F);
-                    col = hlin * root_shade * (0.91F + 0.09F * strand);
-                    nrm = glm::normalize(glm::vec3(
-                        std::cos(ang) * strand * 0.07F,
-                        std::sin(ang) * strand * 0.07F,
-                        1.0F));
-                    roughness = 0.62F - 0.08F * (std::max)(0.0F, strand);
                 } else {
-                    const glm::vec3 c_main = (sub.paint_target == CharacterPaintTarget::outfit_primary)
-                        ? pkg.wardrobe.primary_color
-                        : pkg.wardrobe.secondary_color;
-                    const glm::vec3 main_lin(
-                        srgb_to_linear_channel(c_main.r),
-                        srgb_to_linear_channel(c_main.g),
-                        srgb_to_linear_channel(c_main.b));
-                    const glm::vec3 acc_lin(
-                        srgb_to_linear_channel(pkg.wardrobe.accent_color.r),
-                        srgb_to_linear_channel(pkg.wardrobe.accent_color.g),
-                        srgb_to_linear_channel(pkg.wardrobe.accent_color.b));
-                    const glm::vec3 boot_lin(
-                        srgb_to_linear_channel(pkg.wardrobe.footwear_color.r),
-                        srgb_to_linear_channel(pkg.wardrobe.footwear_color.g),
-                        srgb_to_linear_channel(pkg.wardrobe.footwear_color.b));
-
-                    // Smooth anti-aliased multi-scale cloth/leather micro-grain (no Nyquist moire rings)
-                    const float grain_coarse = value_noise_2d(u * 42.0F, v * 42.0F, 29U) - 0.5F;
-                    const float grain_fine = value_noise_2d(u * 112.0F, v * 112.0F, 53U) - 0.5F;
-                    const float grain = grain_coarse * 0.65F + grain_fine * 0.35F;
-                    const float nx_g = value_noise_2d((u + 0.004F) * 84.0F, v * 84.0F, 61U) -
-                                       value_noise_2d((u - 0.004F) * 84.0F, v * 84.0F, 61U);
-                    const float ny_g = value_noise_2d(u * 84.0F, (v + 0.004F) * 84.0F, 67U) -
-                                       value_noise_2d(u * 84.0F, (v - 0.004F) * 84.0F, 67U);
-
-                    if (sub.paint_target == CharacterPaintTarget::outfit_secondary && v >= 0.80F) {
-                        // Footwear zone (0.80..0.935 upper leather, 0.935..1.0 sole tread)
-                        if (v >= 0.935F) {
-                            col = boot_lin * 0.38F;
-                            metallic = 0.02F;
-                            roughness = 0.88F;
-                        } else {
-                            col = boot_lin * (0.95F + 0.07F * grain);
-                            metallic = 0.04F;
-                            roughness = 0.50F;
-                            nrm = glm::normalize(glm::vec3(nx_g * 0.08F, ny_g * 0.08F, 1.0F));
-                        }
-                    } else if (sub.paint_target == CharacterPaintTarget::outfit_secondary &&
-                               v >= 0.730F && v < 0.794F) {
-                        // Waist belt band + metallic buckle on exact front center (u >= 0.462)
-                        if (u >= 0.462F) {
-                            col = acc_lin;
-                            metallic = 0.88F;
-                            roughness = 0.28F;
-                        } else {
-                            col = boot_lin * (0.80F + 0.06F * grain);
-                            metallic = 0.05F;
-                            roughness = 0.50F;
-                        }
-                    } else if (sub.paint_target == CharacterPaintTarget::outfit_secondary &&
-                               v >= 0.700F && v < 0.725F && pkg.wardrobe.has_gloves) {
-                        // Gloves share dark leather trim blend with secondary garment
-                        col = glm::mix(boot_lin, main_lin, 0.30F) * (0.96F + 0.05F * grain);
-                        metallic = 0.05F;
-                        roughness = 0.52F;
+                    const bool is_underwear_primary =
+                        (sub.paint_target == CharacterPaintTarget::outfit_primary &&
+                         pkg.wardrobe.studio_underwear &&
+                         pkg.wardrobe.top_style == TopGarmentStyle::none);
+                    const bool is_underwear_secondary =
+                        (sub.paint_target == CharacterPaintTarget::outfit_secondary &&
+                         pkg.wardrobe.studio_underwear &&
+                         pkg.wardrobe.bottom_style == BottomGarmentStyle::none &&
+                         v < 0.695F);
+                    if (is_underwear_primary || is_underwear_secondary) {
+                        const glm::vec3 cloth_lin(0.020F, 0.022F, 0.026F);
+                        const glm::vec3 trim_lin(0.036F, 0.039F, 0.045F);
+                        const float fgrain_c = value_noise_2d(u * 48.0F, v * 48.0F, 137U) - 0.5F;
+                        const float fgrain_f = value_noise_2d(u * 130.0F, v * 130.0F, 139U) - 0.5F;
+                        const float rib = 0.965F + 0.035F * std::sin(v * 260.0F);
+                        const float waistband_trim = is_underwear_secondary
+                            ? std::clamp(1.0F - std::abs(v - 0.075F) / 0.038F, 0.0F, 1.0F)
+                            : std::clamp(1.0F - std::abs(v - 0.585F) / 0.038F, 0.0F, 1.0F);
+                        col = glm::mix(cloth_lin, trim_lin, waistband_trim) *
+                            (rib + (fgrain_c * 0.65F + fgrain_f * 0.35F) * 0.12F);
+                        metallic = 0.0F;
+                        roughness = 0.94F;
+                        ao = 1.0F;
+                        nrm = glm::normalize(glm::vec3(fgrain_f * 0.06F, std::cos(v * 260.0F) * 0.05F, 1.0F));
                     } else {
-                        col = main_lin * (0.97F + 0.06F * grain);
-                        nrm = glm::normalize(glm::vec3(nx_g * 0.10F, ny_g * 0.10F, 1.0F));
-                        // Subtle tonal center placket seam inside torso panel (avoids shoulder seam v < 0.10)
-                        if (sub.paint_target == CharacterPaintTarget::outfit_primary &&
-                            v >= 0.12F && v <= 0.64F && std::abs(u - 0.50F) < 0.005F) {
-                            col = main_lin * 0.84F;
-                        }
-                    }
+                        const glm::vec3 c_main = (sub.paint_target == CharacterPaintTarget::outfit_primary)
+                            ? pkg.wardrobe.primary_color
+                            : pkg.wardrobe.secondary_color;
+                        const glm::vec3 main_lin(
+                            srgb_to_linear_channel(c_main.r),
+                            srgb_to_linear_channel(c_main.g),
+                            srgb_to_linear_channel(c_main.b));
+                        const glm::vec3 acc_lin(
+                            srgb_to_linear_channel(pkg.wardrobe.accent_color.r),
+                            srgb_to_linear_channel(pkg.wardrobe.accent_color.g),
+                            srgb_to_linear_channel(pkg.wardrobe.accent_color.b));
+                        const glm::vec3 boot_lin(
+                            srgb_to_linear_channel(pkg.wardrobe.footwear_color.r),
+                            srgb_to_linear_channel(pkg.wardrobe.footwear_color.g),
+                            srgb_to_linear_channel(pkg.wardrobe.footwear_color.b));
 
-                    if (pkg.wardrobe.wear_and_tear > 0.02F) {
-                        const float grit = value_noise_2d(u * 18.0F, v * 18.0F, 77U);
-                        if (grit > 1.0F - pkg.wardrobe.wear_and_tear * 0.35F) {
-                            col *= 0.84F;
-                            roughness = (std::min)(0.95F, roughness + 0.14F);
+                        // Smooth anti-aliased multi-scale cloth/leather micro-grain (no Nyquist moire rings)
+                        const float grain_coarse = value_noise_2d(u * 42.0F, v * 42.0F, 29U) - 0.5F;
+                        const float grain_fine = value_noise_2d(u * 112.0F, v * 112.0F, 53U) - 0.5F;
+                        const float grain = grain_coarse * 0.65F + grain_fine * 0.35F;
+                        const float nx_g = value_noise_2d((u + 0.004F) * 84.0F, v * 84.0F, 61U) -
+                                           value_noise_2d((u - 0.004F) * 84.0F, v * 84.0F, 61U);
+                        const float ny_g = value_noise_2d(u * 84.0F, (v + 0.004F) * 84.0F, 67U) -
+                                           value_noise_2d(u * 84.0F, (v - 0.004F) * 84.0F, 67U);
+
+                        if (sub.paint_target == CharacterPaintTarget::outfit_secondary && v >= 0.80F) {
+                            // Footwear zone (0.80..0.935 upper leather, 0.935..1.0 sole tread)
+                            if (v >= 0.935F) {
+                                col = boot_lin * 0.38F;
+                                metallic = 0.02F;
+                                roughness = 0.88F;
+                            } else {
+                                col = boot_lin * (0.95F + 0.07F * grain);
+                                metallic = 0.04F;
+                                roughness = 0.50F;
+                                nrm = glm::normalize(glm::vec3(nx_g * 0.08F, ny_g * 0.08F, 1.0F));
+                            }
+                        } else if (sub.paint_target == CharacterPaintTarget::outfit_secondary &&
+                                   v >= 0.730F && v < 0.794F) {
+                            // Waist belt band + metallic buckle on exact front center (u >= 0.462)
+                            if (u >= 0.462F) {
+                                col = acc_lin;
+                                metallic = 0.88F;
+                                roughness = 0.28F;
+                            } else {
+                                col = boot_lin * (0.80F + 0.06F * grain);
+                                metallic = 0.05F;
+                                roughness = 0.50F;
+                            }
+                        } else if (sub.paint_target == CharacterPaintTarget::outfit_secondary &&
+                                   v >= 0.700F && v < 0.725F && pkg.wardrobe.has_gloves) {
+                            // Gloves share dark leather trim blend with secondary garment
+                            col = glm::mix(boot_lin, main_lin, 0.30F) * (0.96F + 0.05F * grain);
+                            metallic = 0.05F;
+                            roughness = 0.52F;
+                        } else {
+                            col = main_lin * (0.97F + 0.06F * grain);
+                            nrm = glm::normalize(glm::vec3(nx_g * 0.10F, ny_g * 0.10F, 1.0F));
+                            // Subtle tonal center placket seam inside torso panel (avoids shoulder seam v < 0.10)
+                            if (sub.paint_target == CharacterPaintTarget::outfit_primary &&
+                                v >= 0.12F && v <= 0.64F && std::abs(u - 0.50F) < 0.005F) {
+                                col = main_lin * 0.84F;
+                            }
+                        }
+
+                        if (pkg.wardrobe.wear_and_tear > 0.02F) {
+                            const float grit = value_noise_2d(u * 18.0F, v * 18.0F, 77U);
+                            if (grit > 1.0F - pkg.wardrobe.wear_and_tear * 0.35F) {
+                                col *= 0.84F;
+                                roughness = (std::min)(0.95F, roughness + 0.14F);
+                            }
                         }
                     }
                 }
 
                 // Apply user/AI paint strokes targeting this slot (painted decals, camo, scars, tattoos)
-                if (sub.name != "eyes") {
-                    for (const CharacterPaintStroke& ps : pkg.paint_strokes) {
-                        if (ps.target != sub.paint_target) {
+                for (const CharacterPaintStroke& ps : slot_strokes) {
+                    const int mirrors = ps.mirror_u ? 2 : 1;
+                    for (int m = 0; m < mirrors; ++m) {
+                        const float pu = (m == 1) ? (1.0F - ps.uv.x) : ps.uv.x;
+                        const float dist = std::hypot(u - pu, v - ps.uv.y);
+                        if (dist >= ps.radius) {
                             continue;
                         }
-                        const int mirrors = ps.mirror_u ? 2 : 1;
-                        for (int m = 0; m < mirrors; ++m) {
-                            const float pu = (m == 1) ? (1.0F - ps.uv.x) : ps.uv.x;
-                            const float dist = std::hypot(u - pu, v - ps.uv.y);
-                            if (dist >= ps.radius) {
-                                continue;
-                            }
-                            const float norm_d = dist / ps.radius;
-                            const float edge = 1.0F - std::pow(norm_d, 1.0F + ps.hardness * 3.0F);
-                            const float alpha = std::clamp(edge * ps.strength * ps.color.a, 0.0F, 1.0F);
-                            const glm::vec3 p_lin(
-                                srgb_to_linear_channel(ps.color.r),
-                                srgb_to_linear_channel(ps.color.g),
-                                srgb_to_linear_channel(ps.color.b));
-                            if (ps.mode == CharacterPaintMode::erase) {
-                                const glm::vec3 fallback_lin(
-                                    srgb_to_linear_channel(sub.material.base_color.r),
-                                    srgb_to_linear_channel(sub.material.base_color.g),
-                                    srgb_to_linear_channel(sub.material.base_color.b));
-                                col = glm::mix(col, fallback_lin, alpha);
-                            } else if (ps.mode == CharacterPaintMode::scar) {
-                                col = glm::mix(col, glm::vec3(0.45F, 0.16F, 0.14F), alpha * 0.85F);
-                                const glm::vec3 delta = glm::normalize(glm::vec3(
-                                    (u - pu) * 18.0F, (v - ps.uv.y) * 18.0F, 1.0F));
-                                nrm = glm::normalize(glm::mix(nrm, delta, alpha));
-                                roughness = glm::mix(roughness, 0.36F, alpha);
-                            } else if (ps.mode == CharacterPaintMode::metallic_accent) {
-                                col = glm::mix(col, p_lin, alpha);
-                                metallic = glm::mix(metallic, 0.92F, alpha);
-                                roughness = glm::mix(roughness, 0.22F, alpha);
-                            } else {
-                                col = glm::mix(col, p_lin, alpha);
-                            }
+                        const float norm_d = dist / ps.radius;
+                        const float edge = 1.0F - std::pow(norm_d, 1.0F + ps.hardness * 3.0F);
+                        const float alpha = std::clamp(edge * ps.strength * ps.color.a, 0.0F, 1.0F);
+                        const glm::vec3 p_lin(
+                            srgb_to_linear_channel(ps.color.r),
+                            srgb_to_linear_channel(ps.color.g),
+                            srgb_to_linear_channel(ps.color.b));
+                        if (ps.mode == CharacterPaintMode::erase) {
+                            const glm::vec3 fallback_lin(
+                                srgb_to_linear_channel(sub.material.base_color.r),
+                                srgb_to_linear_channel(sub.material.base_color.g),
+                                srgb_to_linear_channel(sub.material.base_color.b));
+                            col = glm::mix(col, fallback_lin, alpha);
+                        } else if (ps.mode == CharacterPaintMode::scar) {
+                            col = glm::mix(col, glm::vec3(0.45F, 0.16F, 0.14F), alpha * 0.85F);
+                            const glm::vec3 delta = glm::normalize(glm::vec3(
+                                (u - pu) * 18.0F, (v - ps.uv.y) * 18.0F, 1.0F));
+                            nrm = glm::normalize(glm::mix(nrm, delta, alpha));
+                            roughness = glm::mix(roughness, 0.36F, alpha);
+                        } else if (ps.mode == CharacterPaintMode::metallic_accent) {
+                            col = glm::mix(col, p_lin, alpha);
+                            metallic = glm::mix(metallic, 0.92F, alpha);
+                            roughness = glm::mix(roughness, 0.22F, alpha);
+                        } else {
+                            col = glm::mix(col, p_lin, alpha);
                         }
                     }
                 }
@@ -4248,7 +5237,7 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
                 set.normal_rgba[off + 2U] = float_to_unorm8(nn.z * 0.5F + 0.5F);
                 set.normal_rgba[off + 3U] = 255U;
 
-                set.metallic_roughness_rgba[off + 0U] = 255U;
+                set.metallic_roughness_rgba[off + 0U] = float_to_unorm8(std::clamp(ao, 0.0F, 1.0F));
                 set.metallic_roughness_rgba[off + 1U] = float_to_unorm8(std::clamp(roughness, minimum_pbr_roughness, 1.0F));
                 set.metallic_roughness_rgba[off + 2U] = float_to_unorm8(std::clamp(metallic, 0.0F, 1.0F));
                 set.metallic_roughness_rgba[off + 3U] = 255U;
@@ -5093,17 +6082,19 @@ bool cook_character_package_to_project(
         }
 
         const std::string mat_rel = "materials/" + slot + ".vcrmaterial.json";
+        const bool texture_driven_pbr =
+            (slot == "skin" || slot == "eyes" || slot == "hair");
         Json pbr_json{
-            {"base_color", {1.0F, 1.0F, 1.0F, 1.0F}},
-            {"metallic", sub.material.metallic},
-            {"roughness", sub.material.roughness},
+            {"base_color", {1.0F, 1.0F, 1.0F, sub.material.base_color.a}},
+            {"metallic", texture_driven_pbr ? 1.0F : sub.material.metallic},
+            {"roughness", texture_driven_pbr ? 1.0F : sub.material.roughness},
             {"ambient_occlusion", sub.material.ambient_occlusion},
             {"ior", sub.material.ior},
             {"model", to_token(sub.material.model)},
             {"subsurface_profile", to_token(sub.material.subsurface_profile)},
             {"subsurface_strength", sub.material.subsurface_strength},
         };
-        const Json mat_json{
+        Json mat_json{
             {"schema", "vcr.asset"},
             {"version", 1U},
             {"kind", "material"},
@@ -5116,6 +6107,15 @@ bool cook_character_package_to_project(
                  {"metallic_roughness", mr_tex_rel},
              }},
         };
+        if (slot == "skin" || slot == "hair") {
+            mat_json["occlusion_in_metallic_roughness"] = true;
+        }
+        if (slot == "hair") {
+            mat_json["double_sided"] = true;
+        } else if (slot == "cornea") {
+            mat_json["glass"] = true;
+            mat_json["double_sided"] = false;
+        }
         if (!write_text_file_atomic(
                 staging_dir / mat_rel, mat_json.dump(2) + "\n", error)) {
             std::filesystem::remove_all(staging_dir, ec);
