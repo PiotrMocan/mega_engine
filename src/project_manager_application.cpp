@@ -2113,29 +2113,13 @@ void ProjectManagerApplication::build_inspector_panel() {
     }
 
     ImGui::Spacing();
-    ui_kit_.section_header(EditorIcon::cube, "Character Creation Suite");
+    ui_kit_.section_header(EditorIcon::cube, "Character Studio");
     if (ui_kit_.action_button(
-            "InspectorCharGen",
+            "InspectorCharacterStudio",
             EditorIcon::cube,
-            "1. Char Gen",
+            "Open Character Studio...",
             EditorButtonStyle::secondary)) {
-        launch_character_suite_tool_for_selected_project("vulkan_char_gen", "Char Gen Studio");
-    }
-    ImGui::SameLine();
-    if (ui_kit_.action_button(
-            "InspectorCharOutfit",
-            EditorIcon::material,
-            "2. Outfit",
-            EditorButtonStyle::secondary)) {
-        launch_character_suite_tool_for_selected_project("vulkan_char_outfit", "Char Outfit Studio");
-    }
-    ImGui::SameLine();
-    if (ui_kit_.action_button(
-            "InspectorCharAct",
-            EditorIcon::play,
-            "3. Act & Dlg",
-            EditorButtonStyle::secondary)) {
-        launch_character_suite_tool_for_selected_project("vulkan_char_act", "Char Act Studio");
+        launch_character_studio_for_selected_project();
     }
 
     ImGui::Spacing();
@@ -3134,17 +3118,15 @@ void ProjectManagerApplication::launch_icon_tool_for_selected_project() {
     status_tone_ = EditorTone::info;
 }
 
-void ProjectManagerApplication::launch_character_suite_tool_for_selected_project(
-    const std::string_view exe_base_name,
-    const std::string_view display_title) {
+void ProjectManagerApplication::launch_character_studio_for_selected_project() {
     if (!selected_index_ || *selected_index_ >= items_.size()) {
         return;
     }
     const CachedProjectItem& selected = items_[*selected_index_];
 #ifdef _WIN32
-    const std::string exe_name = std::string(exe_base_name) + ".exe";
+    const std::string exe_name = "vulkan_character_studio.exe";
 #else
-    const std::string exe_name = std::string(exe_base_name);
+    const std::string exe_name = "vulkan_character_studio";
 #endif
     const auto tool_exe = find_sibling_executable(exe_name);
     if (!tool_exe) {
@@ -3161,12 +3143,12 @@ void ProjectManagerApplication::launch_character_suite_tool_for_selected_project
     if (!launch_detached_executable(
             *tool_exe, args, selected.entry.project_directory, launch_err)) {
         status_message_ =
-            std::string(display_title) + " launch failed: " + launch_err;
+            "Character Studio launch failed: " + launch_err;
         status_tone_ = EditorTone::danger;
         return;
     }
     status_message_ =
-        "Opened " + std::string(display_title) + " for '" + selected.entry.name + "'.";
+        "Opened Character Studio for '" + selected.entry.name + "'.";
     status_tone_ = EditorTone::info;
 }
 

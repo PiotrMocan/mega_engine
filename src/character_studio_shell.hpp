@@ -17,6 +17,7 @@
 #include <imgui.h>
 #include <imgui_impl_vulkan.h>
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -43,10 +44,22 @@ struct CharacterStudioToolMeta {
     std::string_view exe_base_name{};
 };
 
+enum class CharacterStudioWorkspace : std::uint8_t {
+    anatomy_groom = 0U,
+    wardrobe_paint = 1U,
+    acting_dialogue = 2U,
+    cook_export = 3U,
+};
+
+[[nodiscard]] std::string_view to_token(CharacterStudioWorkspace workspace) noexcept;
+[[nodiscard]] std::optional<CharacterStudioWorkspace> parse_character_studio_workspace(
+    std::string_view token) noexcept;
+
 struct CharacterStudioCliArgs {
     std::filesystem::path project_directory{};
     std::filesystem::path character_path{};
     std::string character_slug{"warden_kane"};
+    CharacterStudioWorkspace initial_workspace = CharacterStudioWorkspace::anatomy_groom;
     bool cli_mode = false;
     bool mcp_stdio = false;
     bool cook_after_cli = false;
@@ -108,6 +121,10 @@ public:
     [[nodiscard]] virtual CharacterStudioToolMeta meta() const noexcept = 0;
 
     virtual void on_package_loaded(const CharacterPackage& /*package*/) {}
+
+    virtual void on_workspace_changed(
+        CharacterStudioShell& /*shell*/,
+        CharacterStudioWorkspace /*workspace*/) {}
 
     virtual void on_frame_tick(
         CharacterStudioShell& /*shell*/,
@@ -224,6 +241,23 @@ public:
     void focus_camera_full_body() noexcept;
     void focus_camera_face() noexcept;
 
+    [[nodiscard]] CharacterStudioWorkspace workspace() const noexcept {
+        return active_workspace_;
+    }
+    void set_workspace(
+        CharacterStudioWorkspace ws,
+        ICharacterStudioTool* tool = nullptr) {
+        if (active_workspace_ != ws) {
+            active_workspace_ = ws;
+            if (tool != nullptr) {
+                tool->on_workspace_changed(*this, active_workspace_);
+            }
+        }
+    }
+
+    void set_bind_pose_override(bool enabled) noexcept { bind_pose_override_ = enabled; }
+    [[nodiscard]] bool bind_pose_override() const noexcept { return bind_pose_override_; }
+
     void mark_package_dirty() noexcept { package_dirty_ = true; }
     void request_preview_rebuild() noexcept { preview_rebuild_requested_ = true; }
     void reset_dock_layout() noexcept { dock_layout_initialized_ = false; }
@@ -233,10 +267,35 @@ public:
     [[nodiscard]] bool show_skeleton_overlay() const noexcept {
         return show_skeleton_overlay_;
     }
-    void set_preview_brush_radius(float radius) noexcept {
+    void set_preview_brush(float radius, bool visible) noexcept {
         preview_brush_radius_ = radius;
+        preview_brush_visible_ = visible;
+    }
+    void set_preview_brush_radius(float radius) noexcept {
+        set_preview_brush(radius, radius > 0.0F);
     }
     void set_status(std::string message, EditorTone tone = EditorTone::neutral);
+
+    struct DiscoveredCharacterEntry {
+        std::filesystem::path path{};
+        std::string label{};
+    };
+    void refresh_project_characters();
+    [[nodiscard]] const std::vector<DiscoveredCharacterEntry>& project_characters() const noexcept {
+        return project_characters_;
+    }
+    [[nodiscard]] bool load_character_file(
+        const std::filesystem::path& path,
+        ICharacterStudioTool& tool,
+        std::string& error);
+    void apply_new_character(
+        CharacterPackage pkg,
+        const std::filesystem::path& path,
+        ICharacterStudioTool& tool);
+    [[nodiscard]] bool save_character_as_slug(
+        std::string_view slug,
+        std::string& error);
+    void update_window_title() noexcept;
 
     using AiTaskCallback = std::function<bool(
         const OllamaBridgeConfig&,
@@ -249,14 +308,24 @@ public:
     void trigger_ollama_probe_async();
 
     [[nodiscard]] bool save_character(std::string& error);
+    [[nodiscard]] bool cook_to_project_with_options(
+        const CharacterCookOptions& opts,
+        bool verify_after_cook,
+        std::string& error);
     [[nodiscard]] bool cook_to_project(std::string& error);
-    void launch_sibling_tool(std::string_view exe_base_name);
+    [[nodiscard]] bool last_cook_verified() const noexcept { return last_cook_verified_; }
 
 private:
     enum class PendingAiKind : std::uint8_t {
         none = 0U,
         probe = 1U,
         generate = 2U,
+    };
+
+    enum class PendingUnsavedAction : std::uint8_t {
+        none = 0U,
+        switch_character = 1U,
+        create_new = 2U,
     };
 
     struct PendingMcpCommand {
@@ -276,7 +345,9 @@ private:
 
     void rebuild_preview_assets(bool full_gpu_reload);
     void update_orbit_camera() noexcept;
-    void handle_sdl_event(const SDL_Event& event);
+    void handle_sdl_event(
+        const SDL_Event& event,
+        ICharacterStudioTool& tool);
     void render_gui_frame(
         ICharacterStudioTool& tool,
         float dt_seconds);
@@ -284,6 +355,7 @@ private:
     void draw_top_toolbar(
         ICharacterStudioTool& tool,
         CharacterToolFrameActions& actions);
+    void draw_modals(ICharacterStudioTool& tool);
     void draw_viewport_panel(
         ICharacterStudioTool& tool,
         CharacterToolFrameActions& actions);
@@ -348,7 +420,24 @@ private:
 
     std::filesystem::path project_directory_{};
     std::filesystem::path character_path_{};
+    std::vector<DiscoveredCharacterEntry> project_characters_{};
     ScopedTempPreviewDir preview_temp_dir_{};
+    std::string window_title_base_{"VCR Character Studio"};
+    CharacterStudioWorkspace active_workspace_ = CharacterStudioWorkspace::anatomy_groom;
+    bool bind_pose_override_ = false;
+    bool last_cook_verified_ = false;
+    bool title_dirty_state_ = false;
+    std::string title_slug_state_{};
+
+    // Unsaved changes & Create New Character modal state
+    PendingUnsavedAction pending_unsaved_action_ = PendingUnsavedAction::none;
+    std::filesystem::path pending_switch_path_{};
+    bool open_unsaved_modal_ = false;
+    bool open_new_char_modal_ = false;
+    std::array<char, 96> new_char_name_buf_{"New Character"};
+    std::array<char, 64> new_char_slug_buf_{"new_character"};
+    int new_char_gender_ = 0;
+    int new_char_role_ = 0;
 
     CharacterPackage package_{};
     CharacterMeshBuildResult preview_mesh_{};
@@ -399,6 +488,7 @@ private:
     bool dock_layout_initialized_ = false;
     bool show_skeleton_overlay_ = false;
     float preview_brush_radius_ = 0.08F;
+    bool preview_brush_visible_ = false;
 
     // Background AI (Ollama) worker
     OllamaBridgeConfig ollama_{};

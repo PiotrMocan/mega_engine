@@ -2,7 +2,7 @@
 setlocal EnableExtensions
 
 for %%I in ("%~dp0..") do set "VCR_ROOT=%%~fI"
-set "VCR_EXE=%VCR_ROOT%\build\windows-release\bin\vulkan_char_outfit.exe"
+set "VCR_EXE=%VCR_ROOT%\build\windows-release\bin\vulkan_character_studio.exe"
 
 if not exist "%VCR_EXE%" (
     call "%VCR_ROOT%\scripts\build_windows.cmd" Release

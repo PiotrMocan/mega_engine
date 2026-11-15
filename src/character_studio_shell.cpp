@@ -11,15 +11,9 @@
 #include <imgui_internal.h>
 #include <nlohmann/json.hpp>
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
-
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -33,129 +27,53 @@ namespace {
 
 using Json = nlohmann::json;
 
-#ifdef _WIN32
-struct ScopedWinHandle final {
-    HANDLE handle = nullptr;
-    ScopedWinHandle() = default;
-    explicit ScopedWinHandle(HANDLE h) noexcept : handle(h) {}
-    ~ScopedWinHandle() noexcept {
-        if (handle != nullptr && handle != INVALID_HANDLE_VALUE) {
-            CloseHandle(handle);
-            handle = nullptr;
-        }
+[[nodiscard]] std::string ascii_lower(std::string_view text) {
+    std::string out;
+    out.reserve(text.size());
+    for (const char c : text) {
+        out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
     }
-    ScopedWinHandle(const ScopedWinHandle&) = delete;
-    ScopedWinHandle& operator=(const ScopedWinHandle&) = delete;
-    ScopedWinHandle(ScopedWinHandle&& other) noexcept
-        : handle(std::exchange(other.handle, nullptr)) {}
-    ScopedWinHandle& operator=(ScopedWinHandle&& other) noexcept {
-        if (this != &other) {
-            if (handle != nullptr && handle != INVALID_HANDLE_VALUE) {
-                CloseHandle(handle);
-            }
-            handle = std::exchange(other.handle, nullptr);
-        }
-        return *this;
-    }
-};
-
-[[nodiscard]] std::wstring utf8_to_wide(std::string_view text) {
-    if (text.empty()) {
-        return {};
-    }
-    const int needed = MultiByteToWideChar(
-        CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
-    if (needed <= 0) {
-        return {};
-    }
-    std::wstring out(static_cast<std::size_t>(needed), L'\0');
-    MultiByteToWideChar(
-        CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(), needed);
     return out;
 }
 
-[[nodiscard]] std::optional<std::filesystem::path> find_sibling_executable(
-    std::string_view base_name) {
-    std::wstring module_buf(1024U, L'\0');
-    const DWORD len = GetModuleFileNameW(
-        nullptr, module_buf.data(), static_cast<DWORD>(module_buf.size()));
-    if (len == 0U || len >= module_buf.size()) {
-        return std::nullopt;
+void copy_cstr(char* dst, const std::size_t dst_size, const std::string_view src) noexcept {
+    if (dst == nullptr || dst_size == 0U) {
+        return;
     }
-    module_buf.resize(len);
-    const std::filesystem::path self_dir =
-        std::filesystem::path(module_buf).parent_path();
-    const std::filesystem::path candidate =
-        self_dir / (std::string(base_name) + ".exe");
-    std::error_code ec;
-    if (std::filesystem::is_regular_file(candidate, ec)) {
-        return candidate;
+    const std::size_t n = std::min(src.size(), dst_size - 1U);
+    if (n > 0U) {
+        std::memcpy(dst, src.data(), n);
     }
-    return std::nullopt;
+    dst[n] = '\0';
 }
 
-[[nodiscard]] std::wstring quote_windows_arg(std::wstring_view arg) {
-    std::wstring out = L"\"";
-    for (std::size_t i = 0U; i < arg.size(); ++i) {
-        if (arg[i] == L'"') {
-            out += L"\\\"";
-        } else {
-            out += arg[i];
-        }
+[[nodiscard]] CharacterPackage make_studio_character_template(
+    const std::string_view slug,
+    const std::string_view display_name,
+    const CharacterGender gender,
+    const CharacterRole role) {
+    const std::string clean_slug = sanitize_character_slug(slug);
+    CharacterPackage pkg = make_default_character_package(
+        clean_slug.empty() ? "hero" : clean_slug,
+        display_name.empty() ? "New Character" : display_name);
+    pkg.identity.role = role;
+    pkg.body.gender = gender;
+    if (gender == CharacterGender::female) {
+        pkg.body.height_meters = 1.70F;
+        pkg.body.shoulder_width = 0.44F;
+        pkg.body.waist_width = 0.42F;
+        pkg.body.hip_width = 0.54F;
+        pkg.body.musculature = 0.34F;
+        pkg.body.lip_tint = 0.52F;
+        pkg.wardrobe.hair_style = HairStyle::bob;
+        pkg.wardrobe.has_beard = false;
+        pkg.voice.pitch_hz = 195.0F;
+    } else {
+        pkg.wardrobe.hair_style = HairStyle::short_crop;
     }
-    out += L'"';
-    return out;
+    sanitize_character_package(pkg);
+    return pkg;
 }
-
-[[nodiscard]] bool launch_sibling_process(
-    const std::filesystem::path& exe_path,
-    const std::vector<std::string>& args,
-    const std::filesystem::path& working_dir,
-    std::string& error) {
-    std::wstring cmdline = quote_windows_arg(exe_path.native());
-    for (const std::string& arg : args) {
-        cmdline += L' ';
-        cmdline += quote_windows_arg(utf8_to_wide(arg));
-    }
-
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    PROCESS_INFORMATION pi{};
-    const std::wstring cwd = working_dir.empty() ? std::wstring{} : working_dir.native();
-    const BOOL ok = CreateProcessW(
-        exe_path.c_str(),
-        cmdline.data(),
-        nullptr,
-        nullptr,
-        FALSE,
-        DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-        nullptr,
-        cwd.empty() ? nullptr : cwd.c_str(),
-        &si,
-        &pi);
-    const ScopedWinHandle h_proc(pi.hProcess);
-    const ScopedWinHandle h_thread(pi.hThread);
-    if (!ok) {
-        error = "CreateProcessW failed with code " + std::to_string(GetLastError());
-        return false;
-    }
-    return true;
-}
-#else
-[[nodiscard]] std::optional<std::filesystem::path> find_sibling_executable(
-    std::string_view /*base_name*/) {
-    return std::nullopt;
-}
-
-[[nodiscard]] bool launch_sibling_process(
-    const std::filesystem::path& /*exe_path*/,
-    const std::vector<std::string>& /*args*/,
-    const std::filesystem::path& /*working_dir*/,
-    std::string& error) {
-    error = "Detached sibling launch is only supported on Windows MVP.";
-    return false;
-}
-#endif
 
 [[nodiscard]] ImTextureID studio_imgui_texture_id(
     const VkDescriptorSet descriptor_set) noexcept {
@@ -254,7 +172,9 @@ void write_mcp_response(const Json& response) {
     const CharacterPackage& pkg,
     const std::filesystem::path& char_path,
     const std::filesystem::path& project_dir,
-    const CharacterMeshBuildResult& mesh) {
+    const CharacterMeshBuildResult& mesh,
+    const CharacterStudioWorkspace workspace,
+    const bool last_cook_verified) {
     Json clip_names = Json::array();
     clip_names.push_back("idle");
     clip_names.push_back("walk");
@@ -278,6 +198,8 @@ void write_mcp_response(const Json& response) {
         {"triangle_count", mesh.indices.size() / 3U},
         {"bone_count", mesh.skeleton.bones.size()},
         {"submesh_count", mesh.submeshes.size()},
+        {"workspace", std::string(to_token(workspace))},
+        {"last_cook_verified", last_cook_verified},
         {"character_path", char_path.generic_string()},
         {"project_directory", project_dir.generic_string()},
         {"default_clips", clip_names},
@@ -285,6 +207,38 @@ void write_mcp_response(const Json& response) {
 }
 
 } // namespace
+
+std::string_view to_token(const CharacterStudioWorkspace workspace) noexcept {
+    switch (workspace) {
+    case CharacterStudioWorkspace::anatomy_groom:
+        return "gen";
+    case CharacterStudioWorkspace::wardrobe_paint:
+        return "outfit";
+    case CharacterStudioWorkspace::acting_dialogue:
+        return "act";
+    case CharacterStudioWorkspace::cook_export:
+        return "cook";
+    }
+    return "gen";
+}
+
+std::optional<CharacterStudioWorkspace> parse_character_studio_workspace(
+    const std::string_view token) noexcept {
+    const std::string lower = ascii_lower(token);
+    if (lower == "gen" || lower == "anatomy" || lower == "1") {
+        return CharacterStudioWorkspace::anatomy_groom;
+    }
+    if (lower == "outfit" || lower == "wardrobe" || lower == "paint" || lower == "2") {
+        return CharacterStudioWorkspace::wardrobe_paint;
+    }
+    if (lower == "act" || lower == "acting" || lower == "dialogue" || lower == "3") {
+        return CharacterStudioWorkspace::acting_dialogue;
+    }
+    if (lower == "cook" || lower == "export" || lower == "verify" || lower == "4") {
+        return CharacterStudioWorkspace::cook_export;
+    }
+    return std::nullopt;
+}
 
 bool CharacterStudioShell::ScopedTempPreviewDir::create(
     std::string_view prefix,
@@ -374,6 +328,31 @@ bool CharacterStudioShell::parse_cli_args(
             out_args.focus_face = true;
             continue;
         }
+        if (arg == "--verify" || arg == "--dry-run" || arg == "--json" ||
+            arg == "--no-voice" || arg == "--no-prefabs" || arg == "--no-loc" ||
+            arg == "--cape" || arg == "--no-cape" ||
+            arg == "--pauldrons" || arg == "--no-pauldrons" ||
+            arg == "--gloves" || arg == "--no-gloves" ||
+            arg == "--belt" || arg == "--no-belt" ||
+            arg == "--beard" || arg == "--no-beard" ||
+            arg == "--studio-underwear" || arg == "--no-studio-underwear" ||
+            arg == "--occlude-body" || arg == "--no-occlude-body") {
+            out_args.options[std::string(arg.substr(2U))] = "true";
+            continue;
+        }
+        if (arg == "--tab" || arg == "--workspace") {
+            const auto val = require_value(i, arg);
+            if (!val) {
+                return false;
+            }
+            const auto parsed = parse_character_studio_workspace(*val);
+            if (!parsed) {
+                out_error = "Unknown workspace tab for " + std::string(arg) + ": " + *val;
+                return false;
+            }
+            out_args.initial_workspace = *parsed;
+            continue;
+        }
         if (arg == "--screenshot") {
             const auto val = require_value(i, arg);
             if (!val) {
@@ -390,7 +369,7 @@ bool CharacterStudioShell::parse_cli_args(
             out_args.project_directory = std::filesystem::path(*val);
             continue;
         }
-        if (arg == "--character") {
+        if (arg == "--character" || arg == "--input") {
             const auto val = require_value(i, arg);
             if (!val) {
                 return false;
@@ -513,8 +492,12 @@ bool CharacterStudioShell::parse_cli_args(
         out_args.character_path =
             default_character_package_path(out_args.project_directory, out_args.character_slug);
     } else if (out_args.project_directory.empty() && !out_args.character_path.empty()) {
+        std::filesystem::path parent = out_args.character_path.parent_path();
+        if (parent.filename() == "characters" && parent.has_parent_path()) {
+            parent = parent.parent_path();
+        }
         out_args.project_directory =
-            resolve_default_project_directory(out_args.character_path.parent_path());
+            resolve_default_project_directory(parent);
     }
     if (out_args.project_directory.empty()) {
         out_args.project_directory = resolve_default_project_directory({});
@@ -536,7 +519,7 @@ int CharacterStudioShell::run(
         tool.print_cli_help();
         return 0;
     }
-    if (args.cli_mode) {
+    if (args.cli_mode || args.has_flag("dry-run")) {
         return tool.run_cli(args);
     }
 
@@ -555,7 +538,7 @@ int CharacterStudioShell::run(
 
         SDL_Event event{};
         while (SDL_PollEvent(&event)) {
-            handle_sdl_event(event);
+            handle_sdl_event(event, tool);
         }
         if (!running_) {
             break;
@@ -619,13 +602,21 @@ int CharacterStudioShell::run(
                 effective_facial.upper_lip_raise =
                     std::max(effective_facial.upper_lip_raise, vk.upper_lip_raise);
             }
-            evaluate_character_preview_pose(
-                preview_mesh_.skeleton,
-                preview_clips_,
-                preview_clip_name_,
-                preview_time_,
-                effective_facial,
-                preview_pose_);
+            if (bind_pose_override_) {
+                set_bind_pose(preview_mesh_.skeleton, preview_pose_);
+                apply_facial_preview_pose(
+                    preview_mesh_.skeleton, effective_facial, preview_pose_);
+                recompute_skeleton_pose_matrices(
+                    preview_mesh_.skeleton, preview_pose_);
+            } else {
+                evaluate_character_preview_pose(
+                    preview_mesh_.skeleton,
+                    preview_clips_,
+                    preview_clip_name_,
+                    preview_time_,
+                    effective_facial,
+                    preview_pose_);
+            }
             renderer_.set_skinned_model_pose(
                 preview_node_id_,
                 preview_model_rel_,
@@ -705,6 +696,8 @@ void CharacterStudioShell::initialize_gui(
         ? default_character_package_path(project_directory_, args.character_slug)
         : args.character_path;
     ollama_ = args.ollama;
+    active_workspace_ = args.initial_workspace;
+    window_title_base_ = std::string(tool.meta().window_title);
     smoke_frames_remaining_ = args.smoke_frames;
     screenshot_output_path_ = args.screenshot_path;
     screenshot_requested_once_ = false;
@@ -724,23 +717,26 @@ void CharacterStudioShell::initialize_gui(
     } else {
         set_status("Loaded " + character_path_.filename().string(), EditorTone::success);
     }
+    package_dirty_ = false;
+    last_cook_verified_ = false;
+    refresh_project_characters();
     tool.on_package_loaded(package_);
+    tool.on_workspace_changed(*this, active_workspace_);
 
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
         throw std::runtime_error(std::string("SDL_Init failed: ") + SDL_GetError());
     }
     sdl_initialized_ = true;
 
-    const std::string title = std::string(tool.meta().window_title) + " - " +
-        package_.identity.display_name + " (" + package_.identity.slug + ")";
     window_.handle = SDL_CreateWindow(
-        title.c_str(),
+        window_title_base_.c_str(),
         static_cast<int>(args.width),
         static_cast<int>(args.height),
         SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (window_.handle == nullptr) {
         throw std::runtime_error(std::string("SDL_CreateWindow failed: ") + SDL_GetError());
     }
+    update_window_title();
     main_window_id_ = SDL_GetWindowID(window_.handle);
     apply_window_builtin_icon(window_.handle, BuiltinIconKind::editor);
 
@@ -1177,6 +1173,106 @@ void CharacterStudioShell::poll_ai_completion(ICharacterStudioTool& tool) {
         gen_res.used_ollama ? EditorTone::success : EditorTone::info);
 }
 
+void CharacterStudioShell::update_window_title() noexcept {
+    title_dirty_state_ = package_dirty_;
+    title_slug_state_ = package_.identity.slug;
+    if (window_.handle == nullptr) {
+        return;
+    }
+    const std::string title = window_title_base_ + " - " +
+        package_.identity.display_name + " (" + package_.identity.slug + ")" +
+        (package_dirty_ ? " *" : "");
+    SDL_SetWindowTitle(window_.handle, title.c_str());
+}
+
+void CharacterStudioShell::refresh_project_characters() {
+    project_characters_.clear();
+    const auto discovered = discover_project_character_packages(project_directory_);
+    auto make_label = [](const std::filesystem::path& p) {
+        std::string name = p.filename().string();
+        static constexpr std::string_view suffix = ".vcrchar.json";
+        if (name.size() > suffix.size() && name.ends_with(suffix)) {
+            name.resize(name.size() - suffix.size());
+        }
+        return name;
+    };
+    for (const auto& p : discovered) {
+        project_characters_.push_back(DiscoveredCharacterEntry{p, make_label(p)});
+    }
+    if (!character_path_.empty()) {
+        std::error_code ec;
+        const std::filesystem::path cur_norm =
+            std::filesystem::weakly_canonical(character_path_, ec);
+        const std::filesystem::path cur_cmp =
+            ec ? character_path_.lexically_normal() : cur_norm;
+        bool found = false;
+        for (const auto& e : project_characters_) {
+            std::error_code e_ec;
+            const std::filesystem::path e_norm =
+                std::filesystem::weakly_canonical(e.path, e_ec);
+            const std::filesystem::path e_cmp = e_ec ? e.path.lexically_normal() : e_norm;
+            if (e_cmp == cur_cmp) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            project_characters_.push_back(
+                DiscoveredCharacterEntry{character_path_, make_label(character_path_)});
+        }
+    }
+}
+
+bool CharacterStudioShell::load_character_file(
+    const std::filesystem::path& path,
+    ICharacterStudioTool& tool,
+    std::string& error) {
+    CharacterPackage loaded{};
+    if (!load_character_package_file(path, loaded, error)) {
+        set_status("Load failed: " + error, EditorTone::danger);
+        return false;
+    }
+    stop_speech_preview();
+    package_ = std::move(loaded);
+    character_path_ = path;
+    package_dirty_ = false;
+    last_cook_report_.reset();
+    last_cook_verified_ = false;
+    preview_rebuild_requested_ = true;
+    tool.on_package_loaded(package_);
+    refresh_project_characters();
+    update_window_title();
+    set_status("Loaded " + character_path_.filename().string(), EditorTone::success);
+    return true;
+}
+
+void CharacterStudioShell::apply_new_character(
+    CharacterPackage pkg,
+    const std::filesystem::path& path,
+    ICharacterStudioTool& tool) {
+    stop_speech_preview();
+    sanitize_character_package(pkg);
+    package_ = std::move(pkg);
+    character_path_ = path;
+    package_dirty_ = true;
+    last_cook_report_.reset();
+    last_cook_verified_ = false;
+    preview_rebuild_requested_ = true;
+    tool.on_package_loaded(package_);
+    refresh_project_characters();
+    update_window_title();
+    set_status("Created new character '" + package_.identity.display_name + "'.", EditorTone::info);
+}
+
+bool CharacterStudioShell::save_character_as_slug(
+    const std::string_view slug,
+    std::string& error) {
+    const std::string clean_slug = sanitize_character_slug(slug);
+    package_.identity.slug = clean_slug.empty() ? package_.identity.slug : clean_slug;
+    character_path_ = default_character_package_path(project_directory_, package_.identity.slug);
+    return save_character(error);
+}
+
 bool CharacterStudioShell::save_character(std::string& error) {
     if (character_path_.empty()) {
         character_path_ = default_character_package_path(
@@ -1187,64 +1283,60 @@ bool CharacterStudioShell::save_character(std::string& error) {
         return false;
     }
     package_dirty_ = false;
+    refresh_project_characters();
+    update_window_title();
     set_status("Saved " + character_path_.filename().string(), EditorTone::success);
     return true;
 }
 
-bool CharacterStudioShell::cook_to_project(std::string& error) {
+bool CharacterStudioShell::cook_to_project_with_options(
+    const CharacterCookOptions& opts,
+    const bool verify_after_cook,
+    std::string& error) {
     if (!save_character(error)) {
         return false;
     }
+
+    CharacterCookReport report{};
+    if (!cook_character_package_to_project(
+            package_, project_directory_, opts, report, error)) {
+        last_cook_verified_ = false;
+        set_status("Cook failed: " + error, EditorTone::danger);
+        return false;
+    }
+
+    if (verify_after_cook) {
+        if (!verify_cooked_character_outputs(project_directory_, report, error)) {
+            last_cook_report_ = report;
+            last_cook_verified_ = false;
+            set_status("Cook verify failed: " + error, EditorTone::danger);
+            return false;
+        }
+    }
+
+    last_cook_report_ = report;
+    last_cook_verified_ = verify_after_cook;
+    set_status(
+        std::string(verify_after_cook ? "Cooked & verified " : "Cooked ") +
+            std::to_string(report.cooked_file_count) +
+            " files into assets/characters/" + report.character_slug,
+        EditorTone::success);
+    return true;
+}
+
+bool CharacterStudioShell::cook_to_project(std::string& error) {
     CharacterCookOptions opts{};
     opts.texture_resolution = character_default_texture_size;
     opts.bake_voice_lines = true;
     opts.generate_prefabs = true;
     opts.generate_localization = true;
     opts.overwrite_existing = true;
-
-    CharacterCookReport report{};
-    if (!cook_character_package_to_project(
-            package_, project_directory_, opts, report, error)) {
-        set_status("Cook failed: " + error, EditorTone::danger);
-        return false;
-    }
-    last_cook_report_ = report;
-    set_status(
-        "Cooked " + std::to_string(report.cooked_file_count) + " files into assets/characters/" +
-            report.character_slug,
-        EditorTone::success);
-    return true;
+    return cook_to_project_with_options(opts, true, error);
 }
 
-void CharacterStudioShell::launch_sibling_tool(std::string_view exe_base_name) {
-    std::string err;
-    if (package_dirty_) {
-        static_cast<void>(save_character(err));
-    } else if (!std::filesystem::exists(character_path_)) {
-        static_cast<void>(save_character(err));
-    }
-
-    const auto exe = find_sibling_executable(exe_base_name);
-    if (!exe) {
-        set_status(
-            "Sibling utility not found: " + std::string(exe_base_name),
-            EditorTone::danger);
-        return;
-    }
-    const std::vector<std::string> args{
-        "--project",
-        project_directory_.string(),
-        "--character",
-        character_path_.string(),
-    };
-    if (!launch_sibling_process(*exe, args, project_directory_, err)) {
-        set_status("Launch failed: " + err, EditorTone::danger);
-        return;
-    }
-    set_status("Launched " + std::string(exe_base_name), EditorTone::success);
-}
-
-void CharacterStudioShell::handle_sdl_event(const SDL_Event& event) {
+void CharacterStudioShell::handle_sdl_event(
+    const SDL_Event& event,
+    ICharacterStudioTool& tool) {
     if (imgui_initialized_) {
         ImGui_ImplSDL3_ProcessEvent(&event);
     }
@@ -1267,11 +1359,32 @@ void CharacterStudioShell::handle_sdl_event(const SDL_Event& event) {
         imgui_initialized_ && !ImGui::GetIO().WantTextInput) {
         const SDL_Keymod mods = SDL_GetModState();
         const bool ctrl = (mods & SDL_KMOD_CTRL) != 0;
+        const bool alt = (mods & SDL_KMOD_ALT) != 0;
         if (ctrl && event.key.key == SDLK_S) {
             std::string err;
             static_cast<void>(save_character(err));
+        } else if (ctrl && event.key.key == SDLK_N) {
+            if (package_dirty_) {
+                pending_unsaved_action_ = PendingUnsavedAction::create_new;
+                pending_switch_path_.clear();
+                open_unsaved_modal_ = true;
+            } else {
+                copy_cstr(new_char_name_buf_.data(), new_char_name_buf_.size(), "New Character");
+                copy_cstr(new_char_slug_buf_.data(), new_char_slug_buf_.size(), "new_character");
+                open_new_char_modal_ = true;
+            }
+        } else if (!ctrl && !alt && event.key.key == SDLK_1) {
+            set_workspace(CharacterStudioWorkspace::anatomy_groom, &tool);
+        } else if (!ctrl && !alt && event.key.key == SDLK_2) {
+            set_workspace(CharacterStudioWorkspace::wardrobe_paint, &tool);
+        } else if (!ctrl && !alt && event.key.key == SDLK_3) {
+            set_workspace(CharacterStudioWorkspace::acting_dialogue, &tool);
+        } else if (!ctrl && !alt && event.key.key == SDLK_4) {
+            set_workspace(CharacterStudioWorkspace::cook_export, &tool);
         } else if (event.key.key == SDLK_F) {
             focus_camera_full_body();
+        } else if (event.key.key == SDLK_G) {
+            focus_camera_face();
         } else if (event.key.key == SDLK_SPACE) {
             preview_paused_ = !preview_paused_;
         }
@@ -1341,10 +1454,39 @@ void CharacterStudioShell::render_gui_frame(
     ImGui::End();
 
     ImGui::Begin("Timeline & Output");
+    if (ImGui::SmallButton(preview_paused_ ? "Play" : "Pause")) {
+        preview_paused_ = !preview_paused_;
+    }
+    ImGui::SameLine();
+    ImGui::Checkbox("Bind Pose", &bind_pose_override_);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(125.0F);
+    if (ImGui::BeginCombo("##SharedClipCombo", preview_clip_name_.c_str())) {
+        for (const AnimationClip& clip : preview_clips_) {
+            const bool sel = (clip.name == preview_clip_name_);
+            if (ImGui::Selectable(clip.name.c_str(), sel)) {
+                set_preview_clip(clip.name);
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Reset")) {
+        preview_time_ = 0.0F;
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled(
+        "| %zu verts / %zu tris / %zu submeshes",
+        preview_mesh_.vertices.size(),
+        preview_mesh_.indices.size() / 3U,
+        preview_mesh_.submeshes.size());
+    ImGui::SameLine();
     tool.draw_bottom_panel(*this, actions);
     ImGui::Separator();
     ui_kit_.status_text(status_message_.c_str(), status_tone_);
     ImGui::End();
+
+    draw_modals(tool);
 
     ImGui::Render();
     ImDrawData* const draw_data = ImGui::GetDrawData();
@@ -1373,6 +1515,9 @@ void CharacterStudioShell::render_gui_frame(
         std::string err;
         static_cast<void>(cook_to_project(err));
     }
+    if (title_dirty_state_ != package_dirty_ || title_slug_state_ != package_.identity.slug) {
+        update_window_title();
+    }
 
     if (renderer_.draw_frame(last_timings_, camera_.view_matrix(), draw_data)) {
         renderer_.record_metrics(last_timings_);
@@ -1389,48 +1534,105 @@ void CharacterStudioShell::draw_top_toolbar(
     const CharacterStudioToolMeta meta = tool.meta();
     ui_kit_.badge(meta.short_badge.data(), EditorTone::primary);
     ImGui::SameLine();
-    ImGui::Text("%s (%s)%s",
-        package_.identity.display_name.c_str(),
-        package_.identity.slug.c_str(),
-        package_dirty_ ? " *" : "");
-    ImGui::SameLine();
 
+    std::string active_label = package_.identity.slug;
+    if (package_dirty_) {
+        active_label += " *";
+    }
+    ImGui::SetNextItemWidth(165.0F);
+    if (ImGui::BeginCombo("##ProjectCharCombo", active_label.c_str())) {
+        std::error_code cur_ec;
+        const std::filesystem::path cur_canon =
+            std::filesystem::weakly_canonical(character_path_, cur_ec);
+        const std::filesystem::path cur_cmp =
+            cur_ec ? character_path_.lexically_normal() : cur_canon;
+        for (const DiscoveredCharacterEntry& entry : project_characters_) {
+            std::error_code e_ec;
+            const std::filesystem::path e_canon =
+                std::filesystem::weakly_canonical(entry.path, e_ec);
+            const std::filesystem::path e_cmp =
+                e_ec ? entry.path.lexically_normal() : e_canon;
+            const bool is_cur = (e_cmp == cur_cmp);
+            if (ImGui::Selectable(entry.label.c_str(), is_cur) && !is_cur) {
+                if (package_dirty_) {
+                    pending_unsaved_action_ = PendingUnsavedAction::switch_character;
+                    pending_switch_path_ = entry.path;
+                    open_unsaved_modal_ = true;
+                } else {
+                    std::string err;
+                    static_cast<void>(load_character_file(entry.path, tool, err));
+                }
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    if (ui_kit_.icon_button(
+            "RefreshChars", EditorIcon::refresh, "Refresh Characters",
+            EditorButtonStyle::quiet)) {
+        refresh_project_characters();
+        set_status(
+            "Found " + std::to_string(project_characters_.size()) + " character(s).",
+            EditorTone::info);
+    }
+    ImGui::SameLine();
     if (ui_kit_.action_button(
-            "BarSave", EditorIcon::save, "Save .vcrchar.json",
+            "BarNewChar", EditorIcon::add, "New",
+            EditorButtonStyle::secondary)) {
+        if (package_dirty_) {
+            pending_unsaved_action_ = PendingUnsavedAction::create_new;
+            pending_switch_path_.clear();
+            open_unsaved_modal_ = true;
+        } else {
+            copy_cstr(new_char_name_buf_.data(), new_char_name_buf_.size(), "New Character");
+            copy_cstr(new_char_slug_buf_.data(), new_char_slug_buf_.size(), "new_character");
+            open_new_char_modal_ = true;
+        }
+    }
+    ImGui::SameLine();
+    if (ui_kit_.action_button(
+            "BarSave", EditorIcon::save, package_dirty_ ? "Save *" : "Save",
             EditorButtonStyle::secondary)) {
         actions.save_package = true;
     }
     ImGui::SameLine();
     if (ui_kit_.action_button(
-            "BarCook", EditorIcon::import_asset, "Cook to Project",
+            "BarCook", EditorIcon::import_asset, "Cook & Verify",
             EditorButtonStyle::primary)) {
         actions.cook_to_project = true;
     }
 
     ImGui::SameLine();
-    ImGui::TextDisabled("| Pipeline:");
+    ImGui::TextDisabled("| Workspace:");
     ImGui::SameLine();
 
-    const bool is_gen = (meta.tool_id == "char_gen");
-    const bool is_outfit = (meta.tool_id == "char_outfit");
-    const bool is_act = (meta.tool_id == "char_act");
+    const bool is_gen = (active_workspace_ == CharacterStudioWorkspace::anatomy_groom);
+    const bool is_outfit = (active_workspace_ == CharacterStudioWorkspace::wardrobe_paint);
+    const bool is_act = (active_workspace_ == CharacterStudioWorkspace::acting_dialogue);
+    const bool is_cook = (active_workspace_ == CharacterStudioWorkspace::cook_export);
 
     if (ui_kit_.action_button(
-            "LaunchGen", EditorIcon::cube, "1. Gen",
-            EditorButtonStyle::quiet, !is_gen, is_gen)) {
-        launch_sibling_tool("vulkan_char_gen");
+            "TabGen", EditorIcon::cube, "1. Anatomy & Groom",
+            EditorButtonStyle::quiet, true, is_gen)) {
+        set_workspace(CharacterStudioWorkspace::anatomy_groom, &tool);
     }
     ImGui::SameLine();
     if (ui_kit_.action_button(
-            "LaunchOutfit", EditorIcon::material, "2. Outfit",
-            EditorButtonStyle::quiet, !is_outfit, is_outfit)) {
-        launch_sibling_tool("vulkan_char_outfit");
+            "TabOutfit", EditorIcon::material, "2. Wardrobe & Paint",
+            EditorButtonStyle::quiet, true, is_outfit)) {
+        set_workspace(CharacterStudioWorkspace::wardrobe_paint, &tool);
     }
     ImGui::SameLine();
     if (ui_kit_.action_button(
-            "LaunchAct", EditorIcon::play, "3. Act & Dlg",
-            EditorButtonStyle::quiet, !is_act, is_act)) {
-        launch_sibling_tool("vulkan_char_act");
+            "TabAct", EditorIcon::play, "3. Acting & Dialogue",
+            EditorButtonStyle::quiet, true, is_act)) {
+        set_workspace(CharacterStudioWorkspace::acting_dialogue, &tool);
+    }
+    ImGui::SameLine();
+    if (ui_kit_.action_button(
+            "TabCook", EditorIcon::import_asset, "4. Cook & Verify",
+            EditorButtonStyle::quiet, true, is_cook)) {
+        set_workspace(CharacterStudioWorkspace::cook_export, &tool);
     }
 
     ImGui::SameLine();
@@ -1446,9 +1648,117 @@ void CharacterStudioShell::draw_top_toolbar(
         focus_camera_face();
     }
     ImGui::SameLine();
-    ImGui::Checkbox("50-Bone Overlay", &show_skeleton_overlay_);
+    ImGui::Checkbox("50-Bone Rig", &show_skeleton_overlay_);
 
     ImGui::End();
+}
+
+void CharacterStudioShell::draw_modals(ICharacterStudioTool& tool) {
+    if (open_unsaved_modal_) {
+        ImGui::OpenPopup("Unsaved Character Changes");
+        open_unsaved_modal_ = false;
+    }
+    ImGui::SetNextWindowSize(ImVec2(440.0F, 0.0F), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal(
+            "Unsaved Character Changes", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped(
+            "Character '%s' (%s) has unsaved edits. Save before continuing?",
+            package_.identity.display_name.c_str(),
+            package_.identity.slug.c_str());
+        ImGui::Spacing();
+        auto perform_pending = [&]() {
+            if (pending_unsaved_action_ == PendingUnsavedAction::switch_character &&
+                !pending_switch_path_.empty()) {
+                std::string err;
+                static_cast<void>(load_character_file(pending_switch_path_, tool, err));
+            } else if (pending_unsaved_action_ == PendingUnsavedAction::create_new) {
+                copy_cstr(new_char_name_buf_.data(), new_char_name_buf_.size(), "New Character");
+                copy_cstr(new_char_slug_buf_.data(), new_char_slug_buf_.size(), "new_character");
+                open_new_char_modal_ = true;
+            }
+            pending_unsaved_action_ = PendingUnsavedAction::none;
+            pending_switch_path_.clear();
+        };
+        if (ui_kit_.action_button(
+                "UnsavedSaveContinue", EditorIcon::save, "Save & Continue",
+                EditorButtonStyle::primary)) {
+            std::string err;
+            if (save_character(err)) {
+                ImGui::CloseCurrentPopup();
+                perform_pending();
+            }
+        }
+        ImGui::SameLine();
+        if (ui_kit_.action_button(
+                "UnsavedDiscard", EditorIcon::revert, "Discard Changes",
+                EditorButtonStyle::danger)) {
+            package_dirty_ = false;
+            ImGui::CloseCurrentPopup();
+            perform_pending();
+        }
+        ImGui::SameLine();
+        if (ui_kit_.action_button(
+                "UnsavedCancel", EditorIcon::stop, "Cancel",
+                EditorButtonStyle::secondary)) {
+            pending_unsaved_action_ = PendingUnsavedAction::none;
+            pending_switch_path_.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    if (open_new_char_modal_) {
+        ImGui::OpenPopup("Create New Character");
+        open_new_char_modal_ = false;
+    }
+    ImGui::SetNextWindowSize(ImVec2(460.0F, 0.0F), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal(
+            "Create New Character", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (ImGui::InputText("Display Name", new_char_name_buf_.data(), new_char_name_buf_.size())) {
+            const std::string auto_slug = sanitize_character_slug(new_char_name_buf_.data());
+            if (!auto_slug.empty()) {
+                copy_cstr(new_char_slug_buf_.data(), new_char_slug_buf_.size(), auto_slug);
+            }
+        }
+        ImGui::InputText("Slug", new_char_slug_buf_.data(), new_char_slug_buf_.size());
+        static constexpr std::array<const char*, 2U> gender_items{"female", "male"};
+        ImGui::Combo("Gender", &new_char_gender_, gender_items.data(), 2);
+        static constexpr std::array<CharacterRole, 5U> roles{
+            CharacterRole::npc,
+            CharacterRole::player,
+            CharacterRole::companion,
+            CharacterRole::vendor,
+            CharacterRole::boss,
+        };
+        static constexpr std::array<const char*, 5U> role_items{
+            "npc", "player", "companion", "vendor", "boss"};
+        ImGui::Combo("Role", &new_char_role_, role_items.data(), 5);
+        ImGui::Spacing();
+        if (ui_kit_.action_button(
+                "CreateCharConfirm", EditorIcon::add, "Create",
+                EditorButtonStyle::primary)) {
+            const std::string clean_slug = sanitize_character_slug(new_char_slug_buf_.data());
+            const std::string final_slug = clean_slug.empty() ? "hero" : clean_slug;
+            const CharacterGender g = (new_char_gender_ == 0)
+                ? CharacterGender::female
+                : CharacterGender::male;
+            const CharacterRole r = roles[static_cast<std::size_t>(
+                std::clamp(new_char_role_, 0, static_cast<int>(roles.size()) - 1))];
+            CharacterPackage new_pkg = make_studio_character_template(
+                final_slug, new_char_name_buf_.data(), g, r);
+            const std::filesystem::path target_path =
+                default_character_package_path(project_directory_, final_slug);
+            apply_new_character(std::move(new_pkg), target_path, tool);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ui_kit_.action_button(
+                "CreateCharCancel", EditorIcon::stop, "Cancel",
+                EditorButtonStyle::secondary)) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
 }
 
 void CharacterStudioShell::draw_viewport_panel(
@@ -1539,7 +1849,8 @@ void CharacterStudioShell::draw_viewport_panel(
     }
 
     ImDrawList* const dl = ImGui::GetWindowDrawList();
-    if (last_hover_hit_ && last_hover_hit_->hit) {
+    if (last_hover_hit_ && last_hover_hit_->hit &&
+        preview_brush_visible_ && preview_brush_radius_ > 0.0F) {
         const glm::vec3 p = last_hover_hit_->position;
         const auto s_center = project_world_to_screen(
             p, camera_, renderer_.vertical_fov_degrees(), img_min, img_max);
@@ -1685,11 +1996,20 @@ void CharacterStudioShell::process_mcp_commands(
             }
         };
 
+        const bool is_tools_call = (method == "tools/call");
+        const std::string call_name = is_tools_call
+            ? params.value("name", std::string{})
+            : method;
+        const Json call_args =
+            (is_tools_call && params.contains("arguments") && params["arguments"].is_object())
+            ? params["arguments"]
+            : params;
+
         if (method == "initialize") {
             send_ok(Json{
                 {"protocolVersion", "2024-11-05"},
                 {"serverInfo", {
-                    {"name", std::string(tool.meta().cli_program_name)},
+                    {"name", "vulkan_character_studio"},
                     {"version", "1.0.0"},
                 }},
                 {"capabilities", {{"tools", Json::object()}}},
@@ -1697,55 +2017,129 @@ void CharacterStudioShell::process_mcp_commands(
         } else if (method == "tools/list") {
             send_ok(Json{{"tools", Json::array({
                 {{"name", "get_character_summary"}, {"description", "Inspect current character metadata & stats"}},
+                {{"name", "list_project_characters"}, {"description", "List .vcrchar.json packages in the project"}},
+                {{"name", "load_character"}, {"description", "Load a project character by path or slug"}},
+                {{"name", "new_character"}, {"description", "Create a new character template in memory"}},
+                {{"name", "set_workspace_tab"}, {"description", "Switch active workspace (gen|outfit|act|cook)"}},
                 {{"name", "save_character"}, {"description", "Save .vcrchar.json package"}},
-                {{"name", "cook_character"}, {"description", "Cook package to project assets/"}},
+                {{"name", "cook_character"}, {"description", "Cook and verify package into project assets/"}},
                 {{"name", "request_quit"}, {"description", "Close studio cleanly"}},
+                {{"name", "ai_generate_body"}, {"description", "Generate body proportions, face & skin via AI"}},
+                {{"name", "ai_generate_outfit"}, {"description", "Generate wardrobe & materials via AI"}},
+                {{"name", "ai_generate_acting"}, {"description", "Generate locomotion temperament, voice & dialogue via AI"}},
+                {{"name", "ai_generate_full_character"}, {"description", "Generate full character spec via AI"}},
             })}});
-        } else if (method == "get_character_summary" ||
-                   (method == "tools/call" &&
-                    params.value("name", std::string{}) == "get_character_summary")) {
+        } else if (call_name == "get_character_summary") {
             send_ok(character_summary_json(
-                package_, character_path_, project_directory_, preview_mesh_));
-        } else if (method == "save_character" ||
-                   (method == "tools/call" &&
-                    params.value("name", std::string{}) == "save_character")) {
+                package_,
+                character_path_,
+                project_directory_,
+                preview_mesh_,
+                active_workspace_,
+                last_cook_verified_));
+        } else if (call_name == "list_project_characters") {
+            refresh_project_characters();
+            Json chars_arr = Json::array();
+            for (const DiscoveredCharacterEntry& entry : project_characters_) {
+                chars_arr.push_back(Json{
+                    {"label", entry.label},
+                    {"path", entry.path.generic_string()},
+                });
+            }
+            send_ok(Json{
+                {"project_directory", project_directory_.generic_string()},
+                {"active_character", character_path_.generic_string()},
+                {"characters", chars_arr},
+            });
+        } else if (call_name == "load_character") {
+            const std::string path_str = call_args.value("path", std::string{});
+            const std::string slug_str = call_args.value("slug", std::string{});
+            std::filesystem::path target_path;
+            if (!path_str.empty()) {
+                target_path = std::filesystem::path(path_str);
+            } else if (!slug_str.empty()) {
+                target_path = default_character_package_path(project_directory_, slug_str);
+            } else {
+                send_err(-32602, "load_character requires 'path' or 'slug'.");
+                continue;
+            }
+            std::string err;
+            if (load_character_file(target_path, tool, err)) {
+                send_ok(Json{
+                    {"loaded", true},
+                    {"slug", package_.identity.slug},
+                    {"path", character_path_.generic_string()},
+                });
+            } else {
+                send_err(-32000, err);
+            }
+        } else if (call_name == "new_character") {
+            const std::string slug_str = call_args.value("slug", std::string{"new_character"});
+            const std::string name_str = call_args.value("name", std::string{"New Character"});
+            const std::string gender_str = call_args.value("gender", std::string{"female"});
+            const std::string role_str = call_args.value("role", std::string{"npc"});
+            const CharacterGender g = parse_character_gender(gender_str)
+                .value_or(CharacterGender::female);
+            const CharacterRole r = parse_character_role(role_str)
+                .value_or(CharacterRole::npc);
+            const std::string clean_slug = sanitize_character_slug(slug_str);
+            const std::string final_slug = clean_slug.empty() ? "hero" : clean_slug;
+            CharacterPackage new_pkg = make_studio_character_template(
+                final_slug, name_str, g, r);
+            const std::filesystem::path target_path =
+                default_character_package_path(project_directory_, final_slug);
+            apply_new_character(std::move(new_pkg), target_path, tool);
+            send_ok(Json{
+                {"created", true},
+                {"slug", package_.identity.slug},
+                {"path", character_path_.generic_string()},
+            });
+        } else if (call_name == "set_workspace_tab") {
+            const std::string tab_str = call_args.contains("workspace")
+                ? call_args.value("workspace", std::string{})
+                : call_args.value("tab", std::string{});
+            const auto parsed = parse_character_studio_workspace(tab_str);
+            if (!parsed) {
+                send_err(-32602, "Unknown workspace tab: " + tab_str);
+                continue;
+            }
+            set_workspace(*parsed, &tool);
+            send_ok(Json{
+                {"workspace", std::string(to_token(active_workspace_))},
+            });
+        } else if (call_name == "save_character") {
             std::string err;
             if (save_character(err)) {
                 send_ok(Json{{"saved", true}, {"path", character_path_.generic_string()}});
             } else {
                 send_err(-32000, err);
             }
-        } else if (method == "cook_character" ||
-                   (method == "tools/call" &&
-                    params.value("name", std::string{}) == "cook_character")) {
+        } else if (call_name == "cook_character") {
+            CharacterCookOptions opts{};
+            opts.texture_resolution = call_args.value(
+                "texture_resolution", character_default_texture_size);
+            const bool verify = call_args.value("verify", true);
             std::string err;
-            if (cook_to_project(err)) {
+            if (cook_to_project_with_options(opts, verify, err)) {
                 send_ok(Json{
                     {"cooked", true},
+                    {"verified", last_cook_verified_},
                     {"model_asset", last_cook_report_->model_asset_relative.generic_string()},
                     {"cooked_files", last_cook_report_->cooked_file_count},
                 });
             } else {
                 send_err(-32000, err);
             }
-        } else if (method == "request_quit" ||
-                   (method == "tools/call" &&
-                    params.value("name", std::string{}) == "request_quit")) {
+        } else if (call_name == "request_quit") {
             running_ = false;
             send_ok(Json{{"quitting", true}});
         } else {
-            const std::string custom_name = (method == "tools/call")
-                ? params.value("name", std::string{})
-                : method;
-            const Json custom_args = (method == "tools/call" && params.contains("arguments"))
-                ? params["arguments"]
-                : params;
             std::string custom_result_str;
             std::string custom_err;
             bool need_rebuild = false;
             if (tool.handle_mcp_custom_method(
-                    custom_name,
-                    custom_args.dump(),
+                    call_name,
+                    call_args.dump(),
                     package_,
                     ollama_,
                     custom_result_str,

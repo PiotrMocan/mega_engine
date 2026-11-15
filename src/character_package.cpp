@@ -1,6 +1,10 @@
 #include "character_package.hpp"
 
 #include "character_strand_groom.hpp"
+#include "cooked_audio_asset.hpp"
+#include "cooked_texture_asset.hpp"
+#include "game_ui_runtime.hpp"
+#include "localization.hpp"
 #include "png_encoder.hpp"
 #include "prefab_io.hpp"
 #include "runtime_assets.hpp"
@@ -2482,6 +2486,39 @@ std::filesystem::path default_character_package_path(
     const std::string_view slug) {
     return project_directory / "characters" /
            (sanitize_character_slug(slug) + ".vcrchar.json");
+}
+
+std::vector<std::filesystem::path> discover_project_character_packages(
+    const std::filesystem::path& project_directory) {
+    std::vector<std::filesystem::path> packages{};
+    if (project_directory.empty()) {
+        return packages;
+    }
+    const std::filesystem::path chars_dir = project_directory / "characters";
+    std::error_code ec;
+    if (!std::filesystem::is_directory(chars_dir, ec) || ec) {
+        return packages;
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(chars_dir, ec)) {
+        if (ec) {
+            break;
+        }
+        std::error_code file_ec;
+        if (!entry.is_regular_file(file_ec) || file_ec) {
+            continue;
+        }
+        const std::string fname = entry.path().filename().string();
+        if (fname.ends_with(".vcrchar.json")) {
+            packages.push_back(entry.path());
+        }
+    }
+    std::sort(
+        packages.begin(),
+        packages.end(),
+        [](const std::filesystem::path& a, const std::filesystem::path& b) {
+            return a.filename().generic_string() < b.filename().generic_string();
+        });
+    return packages;
 }
 
 // ============================================================================
@@ -6450,6 +6487,113 @@ bool cook_character_package_to_project(
         out_report.cooked_file_count += 2U;
     }
 
+    return true;
+}
+
+bool verify_cooked_character_outputs(
+    const std::filesystem::path& project_directory,
+    const CharacterCookReport& report,
+    std::string& error) {
+    error.clear();
+    const std::filesystem::path asset_root = project_directory / "assets";
+
+    const auto model_res = load_cooked_model_asset(
+        asset_root, report.model_asset_relative);
+    if (!model_res) {
+        error = "Model verification failed: " + model_res.error().message;
+        return false;
+    }
+    if (model_res.value().skeleton.bones.size() != character_total_bone_count) {
+        error = "Expected 50-bone skeleton, got " +
+            std::to_string(model_res.value().skeleton.bones.size());
+        return false;
+    }
+    if (model_res.value().animations.size() < 12U) {
+        error = "Expected at least 12 locomotion/gesture clips.";
+        return false;
+    }
+
+    const std::filesystem::path tex_dir =
+        asset_root / "characters" / report.character_slug / "textures";
+    std::error_code tex_ec;
+    std::size_t verified_textures = 0U;
+    if (std::filesystem::exists(tex_dir, tex_ec)) {
+        for (const auto& entry : std::filesystem::directory_iterator(tex_dir, tex_ec)) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+            const std::filesystem::path rel =
+                std::filesystem::relative(entry.path(), asset_root, tex_ec);
+            if (tex_ec) {
+                error = "Failed to compute relative texture path.";
+                return false;
+            }
+            const auto tex_res = load_cooked_texture_asset(asset_root, rel);
+            if (!tex_res) {
+                error = "Texture verification failed (" + rel.generic_string() + "): " +
+                    tex_res.error().message;
+                return false;
+            }
+            ++verified_textures;
+        }
+    }
+    if (verified_textures < 3U) {
+        error = "Expected at least 3 baked PBR textures for character '" +
+            report.character_slug + "'.";
+        return false;
+    }
+
+    if (!report.dialogue_relative.empty()) {
+        GameUiRuntime ui_runtime;
+        std::string dlg_err;
+        if (!ui_runtime.load_dialogue_file(asset_root / report.dialogue_relative, &dlg_err)) {
+            error = "Dialogue verification failed: " + dlg_err;
+            return false;
+        }
+    }
+
+    if (!report.loc_en_relative.empty()) {
+        LocalizationSystem loc;
+        std::string loc_err;
+        if (!loc.load_file(asset_root / report.loc_en_relative, &loc_err) ||
+            !loc.load_file(asset_root / report.loc_ru_relative, &loc_err)) {
+            error = "Localization verification failed: " + loc_err;
+            return false;
+        }
+    }
+
+    for (const auto& audio_rel : report.audio_assets_relative) {
+        CookedAudioAsset audio_asset{};
+        if (!load_cooked_audio_asset(
+                asset_root, audio_rel.generic_string(), audio_asset, error)) {
+            error = "Audio verification failed (" + audio_rel.generic_string() + "): " + error;
+            return false;
+        }
+    }
+
+    if (!report.npc_prefab_relative.empty()) {
+        SceneDocument scene;
+        PrefabInstantiateOptions popts{};
+        PrefabInstantiateResult pres{};
+        if (!instantiate_prefab_file(
+                scene, asset_root, report.npc_prefab_relative.generic_string(),
+                popts, pres, error)) {
+            error = "NPC prefab verification failed: " + error;
+            return false;
+        }
+    }
+
+    if (!report.player_prefab_relative.empty()) {
+        SceneDocument scene;
+        PrefabInstantiateOptions popts{};
+        PrefabInstantiateResult pres{};
+        if (!instantiate_prefab_file(
+                scene, asset_root, report.player_prefab_relative.generic_string(),
+                popts, pres, error)) {
+            error = "Player prefab verification failed: " + error;
+            return false;
+        }
+    }
     return true;
 }
 

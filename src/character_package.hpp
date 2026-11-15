@@ -513,4 +513,12 @@ void evaluate_character_preview_pose(
     CharacterCookReport& out_report,
     std::string& error);
 
+[[nodiscard]] std::vector<std::filesystem::path> discover_project_character_packages(
+    const std::filesystem::path& project_directory);
+
+[[nodiscard]] bool verify_cooked_character_outputs(
+    const std::filesystem::path& project_directory,
+    const CharacterCookReport& report,
+    std::string& error);
+
 } // namespace vcr

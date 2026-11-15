@@ -6,8 +6,19 @@
 #include "game_ui_runtime.hpp"
 #include "localization.hpp"
 #include "prefab_io.hpp"
+#include "project_system.hpp"
 #include "scene_document.hpp"
 #include "skeletal_animation.hpp"
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #include <glm/geometric.hpp>
 #include <nlohmann/json.hpp>
@@ -18,7 +29,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -496,6 +509,288 @@ bool test_production_skin_eyes_and_strand_groom() {
     return true;
 }
 
+[[nodiscard]] bool read_file_bytes(
+    const std::filesystem::path& path,
+    std::string& out_bytes) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    out_bytes.assign(
+        std::istreambuf_iterator<char>(in),
+        std::istreambuf_iterator<char>{});
+    return true;
+}
+
+#ifdef _WIN32
+struct ScopedWinHandle final {
+    HANDLE handle{INVALID_HANDLE_VALUE};
+    explicit ScopedWinHandle(const HANDLE h = INVALID_HANDLE_VALUE) noexcept
+        : handle(h) {}
+    ~ScopedWinHandle() { close(); }
+    void close() noexcept {
+        if (handle != nullptr && handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle);
+            handle = INVALID_HANDLE_VALUE;
+        }
+    }
+    ScopedWinHandle(const ScopedWinHandle&) = delete;
+    ScopedWinHandle& operator=(const ScopedWinHandle&) = delete;
+};
+
+[[nodiscard]] std::wstring quote_win32_arg(const std::wstring_view arg) {
+    std::wstring out = L"\"";
+    for (const wchar_t ch : arg) {
+        if (ch == L'"') {
+            out += L"\\\"";
+        } else {
+            out.push_back(ch);
+        }
+    }
+    out.push_back(L'"');
+    return out;
+}
+
+[[nodiscard]] bool run_studio_cli_capture(
+    const std::filesystem::path& exe_path,
+    const std::vector<std::wstring>& args,
+    const std::filesystem::path& stdout_log,
+    int& out_exit_code,
+    std::string& out_stdout) {
+    std::wstring cmdline = quote_win32_arg(exe_path.wstring());
+    for (const auto& a : args) {
+        cmdline.push_back(L' ');
+        cmdline += quote_win32_arg(a);
+    }
+
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    ScopedWinHandle h_stdout;
+    h_stdout.handle = CreateFileW(
+        stdout_log.c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        &sa,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (h_stdout.handle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = h_stdout.handle;
+    si.hStdError = h_stdout.handle;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(
+            exe_path.c_str(),
+            cmdline.data(),
+            nullptr,
+            nullptr,
+            TRUE,
+            CREATE_NO_WINDOW,
+            nullptr,
+            nullptr,
+            &si,
+            &pi)) {
+        return false;
+    }
+    ScopedWinHandle h_proc{pi.hProcess};
+    ScopedWinHandle h_thread{pi.hThread};
+    WaitForSingleObject(h_proc.handle, 120'000U);
+    DWORD exit_dw = 1U;
+    GetExitCodeProcess(h_proc.handle, &exit_dw);
+    out_exit_code = static_cast<int>(exit_dw);
+
+    h_stdout.close();
+    return read_file_bytes(stdout_log, out_stdout);
+}
+#endif
+
+bool test_unified_character_studio_cli_discover_and_verify() {
+    ScopedTempDir tmp("vcr_char_studio_cli");
+    const auto chars_dir = tmp.dir / "characters";
+    std::filesystem::create_directories(chars_dir);
+
+    std::string err;
+    {
+        auto p_z = vcr::make_default_character_package("zeta_scout", "Zeta Scout");
+        auto p_a = vcr::make_default_character_package("alpha_guard", "Alpha Guard");
+        if (!vcr::save_character_package_file(
+                vcr::default_character_package_path(tmp.dir, "zeta_scout"), p_z, err) ||
+            !vcr::save_character_package_file(
+                vcr::default_character_package_path(tmp.dir, "alpha_guard"), p_a, err)) {
+            std::cerr << "Failed to write discovery fixtures: " << err << "\n";
+            return false;
+        }
+        std::ofstream non_pkg(chars_dir / "notes.json");
+        non_pkg << "{\"note\": true}\n";
+    }
+
+    const auto discovered = vcr::discover_project_character_packages(tmp.dir);
+    if (discovered.size() != 2U ||
+        discovered[0].filename().string() != "alpha_guard.vcrchar.json" ||
+        discovered[1].filename().string() != "zeta_scout.vcrchar.json") {
+        std::cerr << "discover_project_character_packages ordering mismatch (count="
+                  << discovered.size() << ")\n";
+        return false;
+    }
+
+#ifdef _WIN32
+    const auto studio_exe = vcr::find_sibling_executable("vulkan_character_studio.exe");
+    if (!studio_exe) {
+        std::cerr << "Could not find sibling vulkan_character_studio.exe\n";
+        return false;
+    }
+
+    const std::filesystem::path cli_log = tmp.dir / "cli_cook_stdout.json";
+    int exit_code = -1;
+    std::string stdout_text;
+    const std::vector<std::wstring> cook_args{
+        L"--cli",
+        L"--project", tmp.dir.wstring(),
+        L"--character", L"hero_test",
+        L"--name", L"Hero Test",
+        L"--full-prompt", L"brave female scout crimson cloak",
+        L"--tex-res", L"256",
+        L"--cook",
+        L"--verify",
+        L"--json",
+        L"--offline",
+    };
+    if (!run_studio_cli_capture(*studio_exe, cook_args, cli_log, exit_code, stdout_text) ||
+        exit_code != 0) {
+        std::cerr << "Unified studio CLI cook/verify failed (exit=" << exit_code
+                  << "): " << stdout_text << "\n";
+        return false;
+    }
+
+    const Json cook_json = Json::parse(stdout_text, nullptr, false);
+    if (cook_json.is_discarded() ||
+        cook_json.value("status", "") != "ok" ||
+        !cook_json.value("verified", false) ||
+        !cook_json.value("cooked", false) ||
+        !cook_json.value("saved", false) ||
+        cook_json.value("slug", "") != "hero_test" ||
+        cook_json.value("bones", 0U) != 50U ||
+        cook_json.value("vertices", 0U) < 5000U ||
+        cook_json.value("audio_clips", 0U) < 1U ||
+        cook_json.value("animation_clips", 0U) < 1U) {
+        std::cerr << "Unexpected CLI JSON output: " << stdout_text << "\n";
+        return false;
+    }
+
+    // Re-load saved package & re-verify via verify_cooked_character_outputs,
+    // plus confirm detection when a cooked artifact is deleted.
+    vcr::CharacterPackage reloaded{};
+    if (!vcr::load_character_package_file(
+            vcr::default_character_package_path(tmp.dir, "hero_test"), reloaded, err)) {
+        std::cerr << "Failed to reload saved hero_test package: " << err << "\n";
+        return false;
+    }
+    vcr::CharacterCookOptions opts{};
+    opts.texture_resolution = 256U;
+    opts.overwrite_existing = true;
+    vcr::CharacterCookReport report{};
+    if (!vcr::cook_character_package_to_project(reloaded, tmp.dir, opts, report, err) ||
+        !vcr::verify_cooked_character_outputs(tmp.dir, report, err)) {
+        std::cerr << "verify_cooked_character_outputs failed: " << err << "\n";
+        return false;
+    }
+    const std::filesystem::path cooked_model =
+        tmp.dir / "assets" / report.model_asset_relative;
+    std::filesystem::remove(cooked_model);
+    if (vcr::verify_cooked_character_outputs(tmp.dir, report, err)) {
+        std::cerr << "Expected verify_cooked_character_outputs to fail on missing model\n";
+        return false;
+    }
+
+    // Dry-run against saved package must not modify it.
+    const std::filesystem::path dry_log = tmp.dir / "cli_dry_stdout.json";
+    const auto pkg_file = vcr::default_character_package_path(tmp.dir, "hero_test");
+    std::string pkg_before;
+    if (!read_file_bytes(pkg_file, pkg_before)) {
+        std::cerr << "Failed reading package before dry-run.\n";
+        return false;
+    }
+
+    const std::vector<std::wstring> dry_args{
+        L"--cli",
+        L"--character", pkg_file.wstring(),
+        L"--dry-run",
+        L"--json",
+        L"--offline",
+    };
+    if (!run_studio_cli_capture(*studio_exe, dry_args, dry_log, exit_code, stdout_text) ||
+        exit_code != 0) {
+        std::cerr << "Dry-run CLI failed (exit=" << exit_code << "): " << stdout_text << "\n";
+        return false;
+    }
+    const Json dry_json = Json::parse(stdout_text, nullptr, false);
+    if (dry_json.is_discarded() ||
+        dry_json.value("status", "") != "ok" ||
+        !dry_json.value("dry_run", false) ||
+        dry_json.value("slug", "") != "hero_test" ||
+        dry_json.value("bones", 0U) != 50U) {
+        std::cerr << "Unexpected dry-run JSON: " << stdout_text << "\n";
+        return false;
+    }
+    std::string pkg_after;
+    if (!read_file_bytes(pkg_file, pkg_after) || pkg_before != pkg_after) {
+        std::cerr << "--dry-run modified character package on disk\n";
+        return false;
+    }
+
+    // Locate showcase characters/lyra_vance.vcrchar.json if run inside repo tree
+    // and verify --dry-run --json leaves it untouched.
+    std::filesystem::path probe = studio_exe->parent_path();
+    for (int depth = 0; depth < 5 && !probe.empty(); ++depth) {
+        const auto lyra_path = probe / "characters" / "lyra_vance.vcrchar.json";
+        if (std::filesystem::is_regular_file(lyra_path)) {
+            std::string lyra_before;
+            if (!read_file_bytes(lyra_path, lyra_before)) {
+                std::cerr << "Failed reading showcase lyra_vance before dry-run.\n";
+                return false;
+            }
+
+            const std::filesystem::path lyra_log = tmp.dir / "cli_lyra_dry.json";
+            const std::vector<std::wstring> lyra_args{
+                L"--cli",
+                L"--character", lyra_path.wstring(),
+                L"--dry-run",
+                L"--json",
+                L"--offline",
+            };
+            if (!run_studio_cli_capture(*studio_exe, lyra_args, lyra_log, exit_code, stdout_text) ||
+                exit_code != 0) {
+                std::cerr << "Showcase lyra_vance dry-run failed: " << stdout_text << "\n";
+                return false;
+            }
+            const Json lyra_json = Json::parse(stdout_text, nullptr, false);
+            if (lyra_json.is_discarded() ||
+                !lyra_json.value("dry_run", false) ||
+                lyra_json.value("slug", "") != "lyra_vance") {
+                std::cerr << "Unexpected showcase dry-run JSON: " << stdout_text << "\n";
+                return false;
+            }
+            std::string lyra_after;
+            if (!read_file_bytes(lyra_path, lyra_after) || lyra_before != lyra_after) {
+                std::cerr << "Showcase lyra_vance.vcrchar.json was modified by dry-run!\n";
+                return false;
+            }
+            break;
+        }
+        probe = probe.parent_path();
+    }
+#endif
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -516,6 +811,9 @@ int main() {
     }
     if (!test_production_skin_eyes_and_strand_groom()) {
         return 6;
+    }
+    if (!test_unified_character_studio_cli_discover_and_verify()) {
+        return 7;
     }
     std::cout << "[PASS] vcr_character_suite_tests passed all checks.\n";
     return 0;

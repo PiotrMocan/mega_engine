@@ -2503,16 +2503,10 @@ void EditorUi::build_main_menu(
                     scene_file_status_ = "Game build failed: " + bundle_err;
                 }
             }
-            if (ImGui::MenuItem("Project Icon Utility...")) {
-#if defined(_WIN32)
-                constexpr std::string_view icon_tool_exe_name{
-                    "vulkan_icon_tool.exe"};
-#else
-                constexpr std::string_view icon_tool_exe_name{
-                    "vulkan_icon_tool"};
-#endif
-                if (const auto tool_exe =
-                        find_sibling_executable(icon_tool_exe_name)) {
+            auto launch_project_tool = [&](
+                const std::string_view exe_name,
+                const std::string_view label) {
+                if (const auto tool_exe = find_sibling_executable(exe_name)) {
                     const std::u8string u8_proj = project_root_.u8string();
                     std::string proj_utf8(u8_proj.size(), '\0');
                     std::transform(
@@ -2530,12 +2524,26 @@ void EditorUi::build_main_menu(
                     if (!launch_detached_executable(
                             *tool_exe, args, project_root_, launch_error)) {
                         scene_file_status_ =
-                            "Icon Utility launch failed: " + launch_error;
+                            std::string(label) + " launch failed: " + launch_error;
                     }
                 } else {
                     scene_file_status_ =
-                        "Icon Utility executable was not found next to editor.";
+                        std::string(label) + " executable was not found next to editor.";
                 }
+            };
+            if (ImGui::MenuItem("Project Icon Utility...")) {
+#if defined(_WIN32)
+                launch_project_tool("vulkan_icon_tool.exe", "Icon Utility");
+#else
+                launch_project_tool("vulkan_icon_tool", "Icon Utility");
+#endif
+            }
+            if (ImGui::MenuItem("Character Studio...")) {
+#if defined(_WIN32)
+                launch_project_tool("vulkan_character_studio.exe", "Character Studio");
+#else
+                launch_project_tool("vulkan_character_studio", "Character Studio");
+#endif
             }
             ImGui::Separator();
         }
