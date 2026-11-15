@@ -161,6 +161,31 @@ void restore_cutscene_node_overrides(
     return m;
 }
 
+struct NpcTransformDispatchContext {
+    RuntimeTransformRegistry* registry = nullptr;
+    RuntimeTransformSink caller_sink{};
+};
+
+bool dispatch_npc_transform(
+    void* const ctx_ptr,
+    const SceneNodeId id,
+    const TransformRows rows) noexcept {
+    auto* const ctx = static_cast<NpcTransformDispatchContext*>(ctx_ptr);
+    if (ctx == nullptr) {
+        return false;
+    }
+    if (ctx->registry != nullptr && ctx->registry->has_node(id)) {
+        if (!ctx->registry->is_attached(id)) {
+            return ctx->registry->set_world_matrix(id, rows_to_mat4(rows));
+        }
+        return true;
+    }
+    if (ctx->caller_sink.apply != nullptr) {
+        return ctx->caller_sink.apply(ctx->caller_sink.context, id, rows);
+    }
+    return true;
+}
+
 void forward_to_yaw_pitch(
     glm::vec3 forward,
     float& out_yaw_radians,
@@ -228,6 +253,29 @@ void GameplaySession::set_player_setup(const GameplayPlayerSetup& setup) {
 void GameplaySession::set_extension_callbacks(
     const GameplayExtensionCallbacks& callbacks) noexcept {
     extensions_ = callbacks;
+}
+
+void GameplaySession::set_startup_navmesh(NavMeshData navmesh) {
+    if (navmesh.empty()) {
+        startup_navmesh_.reset();
+    } else {
+        startup_navmesh_ = std::move(navmesh);
+    }
+}
+
+void GameplaySession::set_startup_navmesh_path(
+    const std::string_view relative_path) {
+    startup_navmesh_path_.assign(relative_path);
+}
+
+void GameplaySession::emit_ai_noise(
+    const glm::vec3 position,
+    const float loudness,
+    const float max_radius,
+    const SceneNodeId instigator_node,
+    const SceneUuid instigator_uuid) noexcept {
+    npc_ai_.perception_mut().emit_noise(
+        position, loudness, max_radius, instigator_node, instigator_uuid);
 }
 
 bool GameplaySession::start(
@@ -431,6 +479,43 @@ bool GameplaySession::start(
         &physics_world_,
         &animator_runtime_,
         audio_engine);
+
+    player_noise_cooldown_ = 0.0F;
+    npc_ai_.clear();
+    if (startup_navmesh_.has_value()) {
+        navigation_.set_navmesh(std::move(*startup_navmesh_));
+        startup_navmesh_.reset();
+    } else {
+        navigation_.clear();
+        if (!content_asset_root_.empty()) {
+            NavMeshData loaded_nav;
+            std::string nav_err;
+            const std::string candidate_rel = !startup_navmesh_path_.empty()
+                ? startup_navmesh_path_
+                : make_default_navmesh_relative_path("scene_navmesh");
+            if (load_navmesh_file(
+                    content_asset_root_, candidate_rel, loaded_nav, nav_err)) {
+                navigation_.set_navmesh(std::move(loaded_nav));
+            }
+        }
+        if (!navigation_.has_navmesh() &&
+            (!scene.npc_ais().empty() || !scene.off_mesh_links().empty() ||
+             !scene.nav_obstacles().empty())) {
+            NavMeshData auto_nav;
+            if (bake_navmesh_from_scene(
+                    scene,
+                    NavMeshBakeSettings{},
+                    auto_nav,
+                    nullptr,
+                    bounds_provider,
+                    collision_provider)) {
+                navigation_.set_navmesh(std::move(auto_nav));
+            }
+        }
+    }
+    navigation_.sync_dynamic_obstacles(scene, &physics_world_);
+    npc_ai_.preload_behavior_trees(scene, content_asset_root_);
+    npc_ai_.sync_agents_from_scene(scene, gameplay_world_);
 
     const glm::vec3 startup_forward = startup_camera.forward();
     camera_.reset(std::atan2(startup_forward.z, startup_forward.x));
@@ -960,6 +1045,52 @@ bool GameplaySession::update_internal(
         &animator_runtime_,
         audio_engine,
         transform_sink);
+
+    if (player_noise_cooldown_ > 0.0F) {
+        player_noise_cooldown_ = std::max(0.0F, player_noise_cooldown_ - dt);
+    }
+    if (player_node_ ||
+        !scene.npc_ais().empty()) {
+        if (character_.just_jumped()) {
+            emit_ai_noise(active_player_pos, 1.0F, 16.0F, player_node_);
+            player_noise_cooldown_ = 0.25F;
+        } else if (character_.landing_impact_speed() > 2.5F) {
+            emit_ai_noise(active_player_pos, 1.25F, 20.0F, player_node_);
+            player_noise_cooldown_ = 0.25F;
+        } else if (ctx.input.character.run &&
+                   player_noise_cooldown_ <= 0.0F &&
+                   (ctx.input.character.forward ||
+                    ctx.input.character.backward ||
+                    ctx.input.character.left ||
+                    ctx.input.character.right ||
+                    glm::dot(ctx.input.character.move_axis,
+                             ctx.input.character.move_axis) > 0.1F)) {
+            emit_ai_noise(active_player_pos, 0.85F, 14.0F, player_node_);
+            player_noise_cooldown_ = 0.35F;
+        }
+    }
+
+    navigation_.sync_dynamic_obstacles(scene, &physics_world_);
+    NpcTransformDispatchContext npc_sink_ctx{
+        .registry = &transform_registry_,
+        .caller_sink = transform_sink,
+    };
+    const RuntimeTransformSink npc_sink{
+        .context = &npc_sink_ctx,
+        .apply = &dispatch_npc_transform,
+    };
+    npc_ai_.update(
+        dt,
+        scene,
+        navigation_,
+        &collision_world_,
+        &physics_world_,
+        gameplay_world_,
+        &animator_runtime_,
+        audio_engine,
+        active_player_pos,
+        gameplay_world_.player_health() > 0.0F,
+        npc_sink);
 
     // Stage 3: Authoritative Runtime Transforms & Child Attachments.
     if (player_node_ && transform_registry_.has_node(player_node_) &&
@@ -1540,6 +1671,7 @@ bool GameplaySession::save_game_state(
         &physics_world_,
         &animator_runtime_,
         snap);
+    npc_ai_.capture_save_entries(snap.npc_agents);
     if (extensions_.on_save_project_state != nullptr) {
         extensions_.on_save_project_state(
             extensions_.user_data, *this, snap.custom_project_json);
@@ -1576,6 +1708,22 @@ bool GameplaySession::load_game_state_headless(
     camera_.set_angles(snap.camera_yaw, snap.camera_pitch);
     gameplay_world_.restore_snapshot(
         snap, scene, &physics_world_, &animator_runtime_, transform_sink);
+
+    navigation_.sync_dynamic_obstacles(scene, &physics_world_);
+    NpcTransformDispatchContext npc_restore_ctx{
+        .registry = &transform_registry_,
+        .caller_sink = transform_sink,
+    };
+    const RuntimeTransformSink npc_restore_sink{
+        .context = &npc_restore_ctx,
+        .apply = &dispatch_npc_transform,
+    };
+    npc_ai_.restore_save_entries(
+        scene, snap.npc_agents, npc_restore_sink, &collision_world_);
+    RuntimeTransformSink mutable_load_sink = transform_sink;
+    transform_registry_.sync_outputs(
+        &collision_world_,
+        mutable_load_sink.apply != nullptr ? &mutable_load_sink : nullptr);
 
     if (extensions_.on_load_project_state != nullptr) {
         extensions_.on_load_project_state(
@@ -1651,6 +1799,10 @@ void GameplaySession::stop(
         }
     }
     gameplay_world_.clear();
+    npc_ai_.clear();
+    navigation_.clear();
+    startup_navmesh_.reset();
+    player_noise_cooldown_ = 0.0F;
     transform_registry_.clear();
     overlay_canvas_.clear();
     runtime_audio_nodes_.clear();

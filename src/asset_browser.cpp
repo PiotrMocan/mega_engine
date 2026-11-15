@@ -302,6 +302,12 @@ AssetEntryKind AssetBrowser::classify(
     if (filename.ends_with(".vcrseq.json")) {
         return AssetEntryKind::cutscene;
     }
+    if (filename.ends_with(".vcrnav.json")) {
+        return AssetEntryKind::navmesh;
+    }
+    if (filename.ends_with(".vcrbt.json")) {
+        return AssetEntryKind::behavior_tree;
+    }
     if (filename.ends_with(".vcrsave.json")) {
         return AssetEntryKind::save_state;
     }
@@ -351,6 +357,8 @@ const char* asset_kind_name(const AssetEntryKind kind) noexcept {
     case AssetEntryKind::audio: return "Audio";
     case AssetEntryKind::sound_cue: return "Sound Cue";
     case AssetEntryKind::cutscene: return "Cutscene";
+    case AssetEntryKind::navmesh: return "NavMesh";
+    case AssetEntryKind::behavior_tree: return "Behavior Tree";
     case AssetEntryKind::animation: return "Animation";
     case AssetEntryKind::image: return "Image";
     case AssetEntryKind::shader: return "Shader";

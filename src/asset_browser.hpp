@@ -18,6 +18,8 @@ enum class AssetEntryKind : std::uint8_t {
     audio,
     sound_cue,
     cutscene,
+    navmesh,
+    behavior_tree,
     animation,
     image,
     shader,

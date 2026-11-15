@@ -75,7 +75,7 @@ constexpr std::array<std::string_view, 31> runtime_tool_names{
     "engine.quit",
 };
 
-constexpr std::array<std::string_view, 55> editor_tool_names{
+constexpr std::array<std::string_view, 62> editor_tool_names{
     "render.set_exposure",
     "render.set_color_grading",
     "render.set_subsurface",
@@ -116,6 +116,13 @@ constexpr std::array<std::string_view, 55> editor_tool_names{
     "editor.scene.set_spline",
     "editor.scene.remove_spline",
     "editor.sequencer.control",
+    "editor.scene.set_nav_obstacle",
+    "editor.scene.remove_nav_obstacle",
+    "editor.scene.set_off_mesh_link",
+    "editor.scene.remove_off_mesh_link",
+    "editor.scene.set_npc_ai",
+    "editor.scene.remove_npc_ai",
+    "editor.navigation.control",
     "editor.prefab.save",
     "editor.prefab.instantiate",
     "editor.prefab.unpack",
@@ -1383,6 +1390,117 @@ private:
             {"lock_camera", Json{{"type", "boolean"}}},
         }, Json::array({"action"})), false, false, false));
     tools.push_back(tool_definition(
+        "editor.scene.set_nav_obstacle",
+        "Attach or update NavObstacleComponent on a scene node",
+        "Configure a dynamic navigation obstacle (box or cylinder) with optional hard blocking or traversal cost penalty.",
+        object_schema(Json{
+            {"id", handle_schema},
+            {"enabled", Json{{"type", "boolean"}}},
+            {"block_navigation", Json{{"type", "boolean"}}},
+            {"shape", Json{{"type", "string"}, {"enum", Json::array({"box", "cylinder"})}}},
+            {"center_offset", vec3_schema},
+            {"half_extents", vec3_schema},
+            {"radius", Json{{"type", "number"}, {"minimum", minimum_collider_dimension}, {"maximum", maximum_collider_dimension}}},
+            {"height", Json{{"type", "number"}, {"minimum", minimum_collider_dimension}, {"maximum", maximum_collider_dimension}}},
+            {"margin", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 10.0}}},
+            {"cost_penalty", Json{{"type", "number"}, {"minimum", 1.0}, {"maximum", 100.0}}},
+        }, Json::array({"id"})), false, false, false));
+    tools.push_back(tool_definition(
+        "editor.scene.remove_nav_obstacle",
+        "Remove NavObstacleComponent from a scene node",
+        "Detach NavObstacleComponent from the specified scene node.",
+        object_schema(Json{{"id", handle_schema}}, Json::array({"id"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.set_off_mesh_link",
+        "Attach or update OffMeshLinkComponent on a scene node",
+        "Configure a jump/drop/climb/teleport Off-Mesh traversal link bridging disconnected NavMesh polygons.",
+        object_schema(Json{
+            {"id", handle_schema},
+            {"enabled", Json{{"type", "boolean"}}},
+            {"bidirectional", Json{{"type", "boolean"}}},
+            {"traversal_kind", Json{{"type", "string"}, {"enum", Json::array({"jump", "drop", "climb", "teleport"})}}},
+            {"start_offset", vec3_schema},
+            {"end_offset", vec3_schema},
+            {"target_node_uuid", Json{{"type", "string"}, {"maxLength", 64}}},
+            {"radius", Json{{"type", "number"}, {"minimum", 0.1}, {"maximum", 20.0}}},
+            {"cost_multiplier", Json{{"type", "number"}, {"minimum", 0.1}, {"maximum", 100.0}}},
+            {"jump_height", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 25.0}}},
+            {"traversal_speed", Json{{"type", "number"}, {"minimum", 0.25}, {"maximum", 50.0}}},
+        }, Json::array({"id"})), false, false, false));
+    tools.push_back(tool_definition(
+        "editor.scene.remove_off_mesh_link",
+        "Remove OffMeshLinkComponent from a scene node",
+        "Detach OffMeshLinkComponent from the specified scene node.",
+        object_schema(Json{{"id", handle_schema}}, Json::array({"id"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "editor.scene.set_npc_ai",
+        "Attach or update NpcAiComponent on a scene node",
+        "Configure an NPC autonomous AI agent (FSM or Behavior Tree, patrol spline/points, vision/hearing perception, combat stats, animation clips).",
+        object_schema(Json{
+            {"id", handle_schema},
+            {"enabled", Json{{"type", "boolean"}}},
+            {"mode", Json{{"type", "string"}, {"enum", Json::array({"fsm", "behavior_tree"})}}},
+            {"behavior_tree_path", Json{{"type", "string"}, {"maxLength", 255}}},
+            {"target_node_uuid", Json{{"type", "string"}, {"maxLength", 64}}},
+            {"patrol_spline_uuid", Json{{"type", "string"}, {"maxLength", 64}}},
+            {"patrol_enabled", Json{{"type", "boolean"}}},
+            {"can_traverse_off_mesh_links", Json{{"type", "boolean"}}},
+            {"patrol_point_a", vec3_schema},
+            {"patrol_point_b", vec3_schema},
+            {"walk_speed", Json{{"type", "number"}, {"minimum", 0.1}, {"maximum", 40.0}}},
+            {"run_speed", Json{{"type", "number"}, {"minimum", 0.1}, {"maximum", 60.0}}},
+            {"agent_radius", Json{{"type", "number"}, {"minimum", 0.1}, {"maximum", 5.0}}},
+            {"agent_height", Json{{"type", "number"}, {"minimum", 0.3}, {"maximum", 10.0}}},
+            {"stopping_distance", Json{{"type", "number"}, {"minimum", 0.1}, {"maximum", 25.0}}},
+            {"attack_range", Json{{"type", "number"}, {"minimum", 0.2}, {"maximum", 50.0}}},
+            {"attack_damage", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 10000.0}}},
+            {"attack_cooldown", Json{{"type", "number"}, {"minimum", 0.05}, {"maximum", 60.0}}},
+            {"sight_range", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 500.0}}},
+            {"sight_fov_degrees", Json{{"type", "number"}, {"minimum", 5.0}, {"maximum", 360.0}}},
+            {"eye_height", Json{{"type", "number"}, {"minimum", 0.1}, {"maximum", 8.0}}},
+            {"lose_sight_seconds", Json{{"type", "number"}, {"minimum", 0.1}, {"maximum", 120.0}}},
+            {"hearing_range", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 500.0}}},
+            {"hearing_threshold", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 10.0}}},
+            {"flee_health_fraction", Json{{"type", "number"}, {"minimum", 0.0}, {"maximum", 1.0}}},
+            {"idle_clip", Json{{"type", "string"}, {"maxLength", 63}}},
+            {"walk_clip", Json{{"type", "string"}, {"maxLength", 63}}},
+            {"run_clip", Json{{"type", "string"}, {"maxLength", 63}}},
+            {"jump_clip", Json{{"type", "string"}, {"maxLength", 63}}},
+            {"attack_clip", Json{{"type", "string"}, {"maxLength", 63}}},
+        }, Json::array({"id"})), false, false, false));
+    tools.push_back(tool_definition(
+        "editor.scene.remove_npc_ai",
+        "Remove NpcAiComponent from a scene node",
+        "Detach NpcAiComponent from the specified scene node.",
+        object_schema(Json{{"id", handle_schema}}, Json::array({"id"})),
+        false, false, true));
+    tools.push_back(tool_definition(
+        "editor.navigation.control",
+        "Bake, save, load, clear NavMesh, test pathfinding, create default Behavior Tree, or emit Play-mode AI noise",
+        "Control Navigation & AI tools in Edit mode and emit AI perception noise in Play mode.",
+        object_schema(Json{
+            {"action", Json{{"type", "string"}, {"enum", Json::array({"bake", "clear", "save", "load", "test_path", "create_default_bt", "emit_noise"})}}},
+            {"path", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", max_scene_asset_path_bytes}}},
+            {"id", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", 95}}},
+            {"title", Json{{"type", "string"}, {"minLength", 1}, {"maxLength", 127}}},
+            {"cell_size", Json{{"type", "number"}, {"minimum", 0.1}, {"maximum", 4.0}}},
+            {"agent_radius", Json{{"type", "number"}, {"minimum", 0.05}, {"maximum", 5.0}}},
+            {"agent_height", Json{{"type", "number"}, {"minimum", 0.2}, {"maximum", 10.0}}},
+            {"max_slope_degrees", Json{{"type", "number"}, {"minimum", 1.0}, {"maximum", 85.0}}},
+            {"max_step_height", Json{{"type", "number"}, {"minimum", 0.05}, {"maximum", 4.0}}},
+            {"include_terrain", Json{{"type", "boolean"}}},
+            {"use_custom_bounds", Json{{"type", "boolean"}}},
+            {"custom_bounds_min", vec3_schema},
+            {"custom_bounds_max", vec3_schema},
+            {"max_grid_cells_per_axis", Json{{"type", "integer"}, {"minimum", 8}, {"maximum", 1024}}},
+            {"start", vec3_schema},
+            {"goal", vec3_schema},
+            {"loudness", Json{{"type", "number"}, {"minimum", 0.05}, {"maximum", 20.0}}},
+            {"max_radius", Json{{"type", "number"}, {"minimum", 0.5}, {"maximum", 500.0}}},
+        }, Json::array({"action"})), false, false, false));
+    tools.push_back(tool_definition(
         "capture.screenshot", "Capture editor window",
         "Capture the next completed editor swapchain image as PNG image content.",
         object_schema(), true, false, false));
@@ -2246,6 +2364,375 @@ private:
     return true;
 }
 
+[[nodiscard]] bool parse_nav_obstacle_fields(
+    const Json& object,
+    const bool allow_id,
+    NavObstacleComponent& obs,
+    std::string& error) {
+    if (!object.is_object()) {
+        error = "nav_obstacle must be a JSON object";
+        return false;
+    }
+    const bool keys_ok = allow_id
+        ? only_keys(object, {
+              "id", "enabled", "block_navigation", "shape", "center_offset",
+              "half_extents", "radius", "height", "margin", "cost_penalty"})
+        : only_keys(object, {
+              "enabled", "block_navigation", "shape", "center_offset",
+              "half_extents", "radius", "height", "margin", "cost_penalty"});
+    if (!keys_ok) {
+        error = "nav_obstacle contains unknown fields";
+        return false;
+    }
+    const auto parse_flag = [&](const std::string_view key, bool& out) {
+        if (!object.contains(key)) {
+            return true;
+        }
+        const auto v = get_bool(object, key);
+        if (!v) {
+            error = std::string(key) + " must be a boolean";
+            return false;
+        }
+        out = *v;
+        return true;
+    };
+    const auto parse_num = [&](const std::string_view key,
+                               const float lo,
+                               const float hi,
+                               float& out) {
+        if (!object.contains(key)) {
+            return true;
+        }
+        const auto v = get_finite_float(object, key, lo, hi);
+        if (!v) {
+            error = std::string(key) + " is outside valid nav_obstacle range";
+            return false;
+        }
+        out = *v;
+        return true;
+    };
+    if (!parse_flag("enabled", obs.enabled) ||
+        !parse_flag("block_navigation", obs.block_navigation) ||
+        !parse_num("radius", minimum_collider_dimension, maximum_collider_dimension, obs.radius) ||
+        !parse_num("height", minimum_collider_dimension, maximum_collider_dimension, obs.height) ||
+        !parse_num("margin", 0.0F, 10.0F, obs.margin) ||
+        !parse_num("cost_penalty", 1.0F, 100.0F, obs.cost_penalty)) {
+        return false;
+    }
+    if (object.contains("shape")) {
+        const auto s = get_string(object, "shape");
+        const auto parsed = s ? parse_nav_obstacle_shape(*s) : std::nullopt;
+        if (!parsed) {
+            error = "shape must be box or cylinder";
+            return false;
+        }
+        obs.shape = *parsed;
+    }
+    if (object.contains("center_offset") &&
+        !parse_vec3(object, "center_offset", obs.center_offset)) {
+        error = "center_offset must contain three finite numbers";
+        return false;
+    }
+    if (object.contains("half_extents") &&
+        !parse_vec3(object, "half_extents", obs.half_extents)) {
+        error = "half_extents must contain three finite numbers";
+        return false;
+    }
+    if (!valid_nav_obstacle_component(obs)) {
+        error = "nav_obstacle dimensions or offsets are outside engine bounds";
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] bool parse_off_mesh_link_fields(
+    const Json& object,
+    const bool allow_id,
+    OffMeshLinkComponent& link,
+    std::string& error) {
+    if (!object.is_object()) {
+        error = "off_mesh_link must be a JSON object";
+        return false;
+    }
+    const bool keys_ok = allow_id
+        ? only_keys(object, {
+              "id", "enabled", "bidirectional", "traversal_kind",
+              "start_offset", "end_offset", "target_node_uuid",
+              "radius", "cost_multiplier", "jump_height", "traversal_speed"})
+        : only_keys(object, {
+              "enabled", "bidirectional", "traversal_kind",
+              "start_offset", "end_offset", "target_node_uuid",
+              "radius", "cost_multiplier", "jump_height", "traversal_speed"});
+    if (!keys_ok) {
+        error = "off_mesh_link contains unknown fields";
+        return false;
+    }
+    const auto parse_flag = [&](const std::string_view key, bool& out) {
+        if (!object.contains(key)) {
+            return true;
+        }
+        const auto v = get_bool(object, key);
+        if (!v) {
+            error = std::string(key) + " must be a boolean";
+            return false;
+        }
+        out = *v;
+        return true;
+    };
+    const auto parse_num = [&](const std::string_view key,
+                               const float lo,
+                               const float hi,
+                               float& out) {
+        if (!object.contains(key)) {
+            return true;
+        }
+        const auto v = get_finite_float(object, key, lo, hi);
+        if (!v) {
+            error = std::string(key) + " is outside valid off_mesh_link range";
+            return false;
+        }
+        out = *v;
+        return true;
+    };
+    if (!parse_flag("enabled", link.enabled) ||
+        !parse_flag("bidirectional", link.bidirectional) ||
+        !parse_num("radius", 0.1F, 20.0F, link.radius) ||
+        !parse_num("cost_multiplier", 0.1F, 100.0F, link.cost_multiplier) ||
+        !parse_num("jump_height", 0.0F, 25.0F, link.jump_height) ||
+        !parse_num("traversal_speed", 0.25F, 50.0F, link.traversal_speed)) {
+        return false;
+    }
+    if (object.contains("traversal_kind")) {
+        const auto s = get_string(object, "traversal_kind");
+        const auto parsed =
+            s ? parse_off_mesh_traversal_kind(*s) : std::nullopt;
+        if (!parsed) {
+            error = "traversal_kind must be jump, drop, climb, or teleport";
+            return false;
+        }
+        link.traversal_kind = *parsed;
+    }
+    if (object.contains("start_offset") &&
+        !parse_vec3(object, "start_offset", link.start_offset)) {
+        error = "start_offset must contain three finite numbers";
+        return false;
+    }
+    if (object.contains("end_offset") &&
+        !parse_vec3(object, "end_offset", link.end_offset)) {
+        error = "end_offset must contain three finite numbers";
+        return false;
+    }
+    if (object.contains("target_node_uuid")) {
+        const Json& u = object["target_node_uuid"];
+        if (u.is_null()) {
+            link.target_node_uuid = {};
+        } else if (u.is_string()) {
+            const std::string_view s = u.get<std::string_view>();
+            if (s.empty()) {
+                link.target_node_uuid = {};
+            } else {
+                const auto parsed = parse_scene_uuid(s);
+                if (!parsed) {
+                    error = "target_node_uuid must be a canonical non-zero UUID, empty string, or null";
+                    return false;
+                }
+                link.target_node_uuid = *parsed;
+            }
+        } else {
+            error = "target_node_uuid must be a UUID string or null";
+            return false;
+        }
+    }
+    if (!valid_off_mesh_link_component(link)) {
+        error = "off_mesh_link fields are outside engine bounds";
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] bool parse_npc_ai_fields(
+    const Json& object,
+    const bool allow_id,
+    NpcAiComponent& npc,
+    std::string& error) {
+    if (!object.is_object()) {
+        error = "npc_ai must be a JSON object";
+        return false;
+    }
+    const bool keys_ok = allow_id
+        ? only_keys(object, {
+              "id", "enabled", "mode", "behavior_tree_path",
+              "target_node_uuid", "patrol_spline_uuid", "patrol_enabled",
+              "can_traverse_off_mesh_links", "patrol_point_a", "patrol_point_b",
+              "walk_speed", "run_speed", "agent_radius", "agent_height",
+              "stopping_distance", "attack_range", "attack_damage",
+              "attack_cooldown", "sight_range", "sight_fov_degrees",
+              "eye_height", "lose_sight_seconds", "hearing_range",
+              "hearing_threshold", "flee_health_fraction", "idle_clip",
+              "walk_clip", "run_clip", "jump_clip", "attack_clip"})
+        : only_keys(object, {
+              "enabled", "mode", "behavior_tree_path",
+              "target_node_uuid", "patrol_spline_uuid", "patrol_enabled",
+              "can_traverse_off_mesh_links", "patrol_point_a", "patrol_point_b",
+              "walk_speed", "run_speed", "agent_radius", "agent_height",
+              "stopping_distance", "attack_range", "attack_damage",
+              "attack_cooldown", "sight_range", "sight_fov_degrees",
+              "eye_height", "lose_sight_seconds", "hearing_range",
+              "hearing_threshold", "flee_health_fraction", "idle_clip",
+              "walk_clip", "run_clip", "jump_clip", "attack_clip"});
+    if (!keys_ok) {
+        error = "npc_ai contains unknown fields";
+        return false;
+    }
+    const auto parse_flag = [&](const std::string_view key, bool& out) {
+        if (!object.contains(key)) {
+            return true;
+        }
+        const auto v = get_bool(object, key);
+        if (!v) {
+            error = std::string(key) + " must be a boolean";
+            return false;
+        }
+        out = *v;
+        return true;
+    };
+    const auto parse_num = [&](const std::string_view key,
+                               const float lo,
+                               const float hi,
+                               float& out) {
+        if (!object.contains(key)) {
+            return true;
+        }
+        const auto v = get_finite_float(object, key, lo, hi);
+        if (!v) {
+            error = std::string(key) + " is outside valid npc_ai range";
+            return false;
+        }
+        out = *v;
+        return true;
+    };
+    const auto parse_uuid_field = [&](const std::string_view key,
+                                      SceneUuid& out) {
+        if (!object.contains(key)) {
+            return true;
+        }
+        const Json& u = object[key];
+        if (u.is_null()) {
+            out = {};
+            return true;
+        }
+        if (u.is_string()) {
+            const std::string_view s = u.get<std::string_view>();
+            if (s.empty()) {
+                out = {};
+                return true;
+            }
+            const auto parsed = parse_scene_uuid(s);
+            if (!parsed) {
+                error = std::string(key) +
+                    " must be a canonical non-zero UUID, empty string, or null";
+                return false;
+            }
+            out = *parsed;
+            return true;
+        }
+        error = std::string(key) + " must be a UUID string or null";
+        return false;
+    };
+    if (!parse_flag("enabled", npc.enabled) ||
+        !parse_flag("patrol_enabled", npc.patrol_enabled) ||
+        !parse_flag("can_traverse_off_mesh_links", npc.can_traverse_off_mesh_links) ||
+        !parse_num("walk_speed", 0.1F, 40.0F, npc.walk_speed) ||
+        !parse_num("run_speed", 0.1F, 60.0F, npc.run_speed) ||
+        !parse_num("agent_radius", 0.1F, 5.0F, npc.agent_radius) ||
+        !parse_num("agent_height", 0.3F, 10.0F, npc.agent_height) ||
+        !parse_num("stopping_distance", 0.1F, 25.0F, npc.stopping_distance) ||
+        !parse_num("attack_range", 0.2F, 50.0F, npc.attack_range) ||
+        !parse_num("attack_damage", 0.0F, 10'000.0F, npc.attack_damage) ||
+        !parse_num("attack_cooldown", 0.05F, 60.0F, npc.attack_cooldown) ||
+        !parse_num("sight_range", 0.0F, 500.0F, npc.sight_range) ||
+        !parse_num("sight_fov_degrees", 5.0F, 360.0F, npc.sight_fov_degrees) ||
+        !parse_num("eye_height", 0.1F, 8.0F, npc.eye_height) ||
+        !parse_num("lose_sight_seconds", 0.1F, 120.0F, npc.lose_sight_seconds) ||
+        !parse_num("hearing_range", 0.0F, 500.0F, npc.hearing_range) ||
+        !parse_num("hearing_threshold", 0.0F, 10.0F, npc.hearing_threshold) ||
+        !parse_num("flee_health_fraction", 0.0F, 1.0F, npc.flee_health_fraction) ||
+        !parse_uuid_field("target_node_uuid", npc.target_node_uuid) ||
+        !parse_uuid_field("patrol_spline_uuid", npc.patrol_spline_uuid)) {
+        return false;
+    }
+    if (!object.contains("run_speed") && npc.run_speed < npc.walk_speed) {
+        npc.run_speed = npc.walk_speed;
+    }
+    if (object.contains("mode")) {
+        const auto s = get_string(object, "mode");
+        const auto parsed =
+            s ? parse_npc_ai_control_mode(*s) : std::nullopt;
+        if (!parsed) {
+            error = "mode must be fsm or behavior_tree";
+            return false;
+        }
+        npc.mode = *parsed;
+    }
+    if (object.contains("behavior_tree_path")) {
+        const auto s = get_string(object, "behavior_tree_path");
+        if (!s || !npc.set_behavior_tree_path(*s)) {
+            error = "behavior_tree_path must be empty or a valid relative '.vcrbt.json' path";
+            return false;
+        }
+    }
+    if (object.contains("patrol_point_a") &&
+        !parse_vec3(object, "patrol_point_a", npc.patrol_point_a)) {
+        error = "patrol_point_a must contain three finite numbers";
+        return false;
+    }
+    if (object.contains("patrol_point_b") &&
+        !parse_vec3(object, "patrol_point_b", npc.patrol_point_b)) {
+        error = "patrol_point_b must contain three finite numbers";
+        return false;
+    }
+    if (object.contains("idle_clip")) {
+        const auto s = get_string(object, "idle_clip");
+        if (!s || !npc.set_idle_clip(*s)) {
+            error = "idle_clip exceeds 63 bytes or contains invalid characters";
+            return false;
+        }
+    }
+    if (object.contains("walk_clip")) {
+        const auto s = get_string(object, "walk_clip");
+        if (!s || !npc.set_walk_clip(*s)) {
+            error = "walk_clip exceeds 63 bytes or contains invalid characters";
+            return false;
+        }
+    }
+    if (object.contains("run_clip")) {
+        const auto s = get_string(object, "run_clip");
+        if (!s || !npc.set_run_clip(*s)) {
+            error = "run_clip exceeds 63 bytes or contains invalid characters";
+            return false;
+        }
+    }
+    if (object.contains("jump_clip")) {
+        const auto s = get_string(object, "jump_clip");
+        if (!s || !npc.set_jump_clip(*s)) {
+            error = "jump_clip exceeds 63 bytes or contains invalid characters";
+            return false;
+        }
+    }
+    if (object.contains("attack_clip")) {
+        const auto s = get_string(object, "attack_clip");
+        if (!s || !npc.set_attack_clip(*s)) {
+            error = "attack_clip exceeds 63 bytes or contains invalid characters";
+            return false;
+        }
+    }
+    if (!valid_npc_ai_component(npc)) {
+        error = "npc_ai fields are outside engine bounds (ensure run_speed >= walk_speed)";
+        return false;
+    }
+    return true;
+}
+
 [[nodiscard]] bool validate_prefab_overrides(
     const Json& overrides_json,
     std::string& error) {
@@ -2260,7 +2747,8 @@ private:
                 "translation", "rotation_degrees", "scale",
                 "base_color", "metallic", "roughness", "ambient_occlusion",
                 "collider", "rigid_body",
-                "audio_source", "audio_listener", "reverb_zone"})) {
+                "audio_source", "audio_listener", "reverb_zone",
+                "nav_obstacle", "off_mesh_link", "npc_ai"})) {
             error = "each prefab override must be an object with known fields";
             return false;
         }
@@ -2359,6 +2847,24 @@ private:
         if (entry.contains("reverb_zone")) {
             AudioReverbZoneComponent zone{};
             if (!parse_reverb_zone_fields(entry["reverb_zone"], false, zone, error)) {
+                return false;
+            }
+        }
+        if (entry.contains("nav_obstacle")) {
+            NavObstacleComponent obstacle{};
+            if (!parse_nav_obstacle_fields(entry["nav_obstacle"], false, obstacle, error)) {
+                return false;
+            }
+        }
+        if (entry.contains("off_mesh_link")) {
+            OffMeshLinkComponent link{};
+            if (!parse_off_mesh_link_fields(entry["off_mesh_link"], false, link, error)) {
+                return false;
+            }
+        }
+        if (entry.contains("npc_ai")) {
+            NpcAiComponent npc_ai{};
+            if (!parse_npc_ai_fields(entry["npc_ai"], false, npc_ai, error)) {
                 return false;
             }
         }
@@ -3483,6 +3989,306 @@ private:
         }
         command.type = McpCommandType::editor_sequencer_control;
         command.sequencer = payload;
+        return true;
+    }
+    if (name == "editor.scene.remove_nav_obstacle") {
+        if (arguments.size() != 1U || !arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "id must be the only argument and contain index/generation";
+            return false;
+        }
+        command.type = McpCommandType::editor_remove_nav_obstacle;
+        return true;
+    }
+    if (name == "editor.scene.set_nav_obstacle") {
+        if (!arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "set_nav_obstacle requires a valid id";
+            return false;
+        }
+        NavObstacleComponent obs{};
+        if (!parse_nav_obstacle_fields(arguments, true, obs, error)) {
+            return false;
+        }
+        command.type = McpCommandType::editor_set_nav_obstacle;
+        command.nav_obstacle = obs;
+        return true;
+    }
+    if (name == "editor.scene.remove_off_mesh_link") {
+        if (arguments.size() != 1U || !arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "id must be the only argument and contain index/generation";
+            return false;
+        }
+        command.type = McpCommandType::editor_remove_off_mesh_link;
+        return true;
+    }
+    if (name == "editor.scene.set_off_mesh_link") {
+        if (!arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "set_off_mesh_link requires a valid id";
+            return false;
+        }
+        OffMeshLinkComponent link{};
+        if (!parse_off_mesh_link_fields(arguments, true, link, error)) {
+            return false;
+        }
+        command.type = McpCommandType::editor_set_off_mesh_link;
+        command.off_mesh_link = link;
+        return true;
+    }
+    if (name == "editor.scene.remove_npc_ai") {
+        if (arguments.size() != 1U || !arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "id must be the only argument and contain index/generation";
+            return false;
+        }
+        command.type = McpCommandType::editor_remove_npc_ai;
+        return true;
+    }
+    if (name == "editor.scene.set_npc_ai") {
+        if (!arguments.contains("id") ||
+            !parse_node_handle(arguments["id"], command.node_id)) {
+            error = "set_npc_ai requires a valid id";
+            return false;
+        }
+        NpcAiComponent npc{};
+        if (!parse_npc_ai_fields(arguments, true, npc, error)) {
+            return false;
+        }
+        command.type = McpCommandType::editor_set_npc_ai;
+        command.npc_ai = npc;
+        return true;
+    }
+    if (name == "editor.navigation.control") {
+        if (!only_keys(arguments, {
+                "action", "path", "cell_size", "agent_radius", "agent_height",
+                "max_slope_degrees", "max_step_height", "include_terrain",
+                "use_custom_bounds", "custom_bounds_min", "custom_bounds_max",
+                "max_grid_cells_per_axis", "start", "goal",
+                "id", "title", "loudness", "max_radius"})) {
+            error = "navigation.control contains unknown fields";
+            return false;
+        }
+        const auto action_str = get_string(arguments, "action");
+        if (!action_str) {
+            error = "navigation.control requires string action";
+            return false;
+        }
+        McpNavigationControlPayload payload{};
+        if (*action_str == "bake") {
+            payload.action = McpNavigationAction::bake;
+            if (arguments.contains("cell_size")) {
+                const auto v = get_finite_float(arguments, "cell_size", 0.1F, 4.0F);
+                if (!v) {
+                    error = "cell_size must be within [0.1, 4.0]";
+                    return false;
+                }
+                payload.bake_settings.cell_size = *v;
+                payload.flags |= McpNavigationControlPayload::flag_has_cell_size;
+            }
+            if (arguments.contains("agent_radius")) {
+                const auto v = get_finite_float(arguments, "agent_radius", 0.05F, 5.0F);
+                if (!v) {
+                    error = "agent_radius must be within [0.05, 5.0]";
+                    return false;
+                }
+                payload.bake_settings.agent_radius = *v;
+                payload.flags |= McpNavigationControlPayload::flag_has_agent_radius;
+            }
+            if (arguments.contains("agent_height")) {
+                const auto v = get_finite_float(arguments, "agent_height", 0.2F, 10.0F);
+                if (!v) {
+                    error = "agent_height must be within [0.2, 10.0]";
+                    return false;
+                }
+                payload.bake_settings.agent_height = *v;
+                payload.flags |= McpNavigationControlPayload::flag_has_agent_height;
+            }
+            if (arguments.contains("max_slope_degrees")) {
+                const auto v = get_finite_float(arguments, "max_slope_degrees", 1.0F, 85.0F);
+                if (!v) {
+                    error = "max_slope_degrees must be within [1.0, 85.0]";
+                    return false;
+                }
+                payload.bake_settings.max_slope_degrees = *v;
+                payload.flags |= McpNavigationControlPayload::flag_has_max_slope;
+            }
+            if (arguments.contains("max_step_height")) {
+                const auto v = get_finite_float(arguments, "max_step_height", 0.05F, 4.0F);
+                if (!v) {
+                    error = "max_step_height must be within [0.05, 4.0]";
+                    return false;
+                }
+                payload.bake_settings.max_step_height = *v;
+                payload.flags |= McpNavigationControlPayload::flag_has_max_step;
+            }
+            if (arguments.contains("include_terrain")) {
+                const auto b = get_bool(arguments, "include_terrain");
+                if (!b) {
+                    error = "include_terrain must be a boolean";
+                    return false;
+                }
+                payload.bake_settings.include_terrain = *b;
+                payload.flags |= McpNavigationControlPayload::flag_include_terrain_supplied;
+                if (*b) {
+                    payload.flags |= McpNavigationControlPayload::flag_include_terrain;
+                }
+            }
+            if (arguments.contains("use_custom_bounds")) {
+                const auto b = get_bool(arguments, "use_custom_bounds");
+                if (!b) {
+                    error = "use_custom_bounds must be a boolean";
+                    return false;
+                }
+                payload.bake_settings.use_custom_bounds = *b;
+                payload.flags |= McpNavigationControlPayload::flag_use_custom_bounds_supplied;
+                if (*b) {
+                    payload.flags |= McpNavigationControlPayload::flag_use_custom_bounds;
+                }
+            }
+            if (arguments.contains("custom_bounds_min")) {
+                if (!parse_vec3(arguments, "custom_bounds_min", payload.bake_settings.custom_bounds_min)) {
+                    error = "custom_bounds_min must contain three finite numbers";
+                    return false;
+                }
+                payload.flags |= McpNavigationControlPayload::flag_has_custom_bounds_min;
+            }
+            if (arguments.contains("custom_bounds_max")) {
+                if (!parse_vec3(arguments, "custom_bounds_max", payload.bake_settings.custom_bounds_max)) {
+                    error = "custom_bounds_max must contain three finite numbers";
+                    return false;
+                }
+                payload.flags |= McpNavigationControlPayload::flag_has_custom_bounds_max;
+            }
+            if ((payload.flags & McpNavigationControlPayload::flag_has_custom_bounds_min) != 0U &&
+                (payload.flags & McpNavigationControlPayload::flag_has_custom_bounds_max) != 0U) {
+                const glm::vec3& bmin = payload.bake_settings.custom_bounds_min;
+                const glm::vec3& bmax = payload.bake_settings.custom_bounds_max;
+                if (bmax.x <= bmin.x || bmax.z <= bmin.z || bmax.y < bmin.y) {
+                    error = "custom_bounds_max must exceed custom_bounds_min on X/Z and be >= on Y";
+                    return false;
+                }
+            }
+            if (arguments.contains("max_grid_cells_per_axis")) {
+                const auto g = get_u32(
+                    arguments, "max_grid_cells_per_axis", 8U, 1024U);
+                if (!g) {
+                    error = "max_grid_cells_per_axis must be an integer within [8, 1024]";
+                    return false;
+                }
+                payload.bake_settings.max_grid_cells_per_axis = *g;
+                payload.flags |= McpNavigationControlPayload::flag_has_max_grid_cells;
+            }
+        } else if (*action_str == "clear") {
+            payload.action = McpNavigationAction::clear;
+        } else if (*action_str == "save") {
+            payload.action = McpNavigationAction::save;
+            if (arguments.contains("path")) {
+                const auto p = get_string(arguments, "path");
+                if (!p || p->empty()) {
+                    error = "path must be a non-empty relative .vcrnav.json path";
+                    return false;
+                }
+                if (!copy_command_text(*p, command.text, error, "path")) {
+                    return false;
+                }
+            }
+        } else if (*action_str == "load") {
+            payload.action = McpNavigationAction::load;
+            const auto p = get_string(arguments, "path");
+            if (!p || p->empty()) {
+                error = "load requires non-empty path";
+                return false;
+            }
+            if (!copy_command_text(*p, command.text, error, "path")) {
+                return false;
+            }
+        } else if (*action_str == "test_path") {
+            payload.action = McpNavigationAction::test_path;
+            if (!arguments.contains("start") ||
+                !parse_vec3(arguments, "start", payload.start_pos)) {
+                error = "test_path requires finite start [x, y, z]";
+                return false;
+            }
+            if (!arguments.contains("goal") ||
+                !parse_vec3(arguments, "goal", payload.goal_pos)) {
+                error = "test_path requires finite goal [x, y, z]";
+                return false;
+            }
+            payload.flags |= McpNavigationControlPayload::flag_has_start |
+                             McpNavigationControlPayload::flag_has_goal;
+        } else if (*action_str == "create_default_bt") {
+            payload.action = McpNavigationAction::create_default_bt;
+            if (arguments.contains("path")) {
+                const auto p = get_string(arguments, "path");
+                if (!p || p->empty()) {
+                    error = "path must be a non-empty relative .vcrbt.json path";
+                    return false;
+                }
+                if (!copy_command_text(*p, command.text, error, "path")) {
+                    return false;
+                }
+            }
+            std::string_view bt_id = "default_tactical";
+            std::string_view bt_title = "Default Tactical NPC";
+            if (arguments.contains("id")) {
+                const auto id_s = get_string(arguments, "id");
+                if (!id_s || id_s->empty() || id_s->size() > 95U ||
+                    id_s->find('\n') != std::string_view::npos ||
+                    id_s->find('\r') != std::string_view::npos) {
+                    error = "id must be a non-empty single-line string (<= 95 chars)";
+                    return false;
+                }
+                bt_id = *id_s;
+            }
+            if (arguments.contains("title")) {
+                const auto title_s = get_string(arguments, "title");
+                if (!title_s || title_s->empty() || title_s->size() > 127U ||
+                    title_s->find('\n') != std::string_view::npos ||
+                    title_s->find('\r') != std::string_view::npos) {
+                    error = "title must be a non-empty single-line string (<= 127 chars)";
+                    return false;
+                }
+                bt_title = *title_s;
+            }
+            const std::string packed = std::string(bt_id) + "\n" + std::string(bt_title);
+            if (!copy_command_text(packed, command.secondary_text, error, "id/title")) {
+                return false;
+            }
+        } else if (*action_str == "emit_noise") {
+            payload.action = McpNavigationAction::emit_noise;
+            if (arguments.contains("start")) {
+                if (!parse_vec3(arguments, "start", payload.start_pos)) {
+                    error = "start must contain three finite numbers";
+                    return false;
+                }
+                payload.flags |= McpNavigationControlPayload::flag_has_start;
+            }
+            if (arguments.contains("loudness")) {
+                const auto v = get_finite_float(arguments, "loudness", 0.05F, 20.0F);
+                if (!v) {
+                    error = "loudness must be within [0.05, 20.0]";
+                    return false;
+                }
+                payload.loudness = *v;
+                payload.flags |= McpNavigationControlPayload::flag_has_loudness;
+            }
+            if (arguments.contains("max_radius")) {
+                const auto v = get_finite_float(arguments, "max_radius", 0.5F, 500.0F);
+                if (!v) {
+                    error = "max_radius must be within [0.5, 500.0]";
+                    return false;
+                }
+                payload.max_radius = *v;
+                payload.flags |= McpNavigationControlPayload::flag_has_max_radius;
+            }
+        } else {
+            error = "navigation.control action must be bake, clear, save, load, test_path, create_default_bt, or emit_noise";
+            return false;
+        }
+        command.type = McpCommandType::editor_navigation_control;
+        command.navigation = payload;
         return true;
     }
     if (name == "editor.audio.set_bus") {

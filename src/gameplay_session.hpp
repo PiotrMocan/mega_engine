@@ -12,6 +12,8 @@
 #include "gameplay_framework.hpp"
 #include "input_actions.hpp"
 #include "localization.hpp"
+#include "navigation.hpp"
+#include "npc_ai.hpp"
 #include "physics_world.hpp"
 #include "runtime_transform_registry.hpp"
 #include "scene_document.hpp"
@@ -215,6 +217,26 @@ public:
     [[nodiscard]] const GameplayWorld& gameplay_world() const noexcept {
         return gameplay_world_;
     }
+    [[nodiscard]] NavigationRuntime& navigation_mut() noexcept {
+        return navigation_;
+    }
+    [[nodiscard]] const NavigationRuntime& navigation() const noexcept {
+        return navigation_;
+    }
+    [[nodiscard]] NpcAiRuntimeSystem& npc_ai_mut() noexcept {
+        return npc_ai_;
+    }
+    [[nodiscard]] const NpcAiRuntimeSystem& npc_ai() const noexcept {
+        return npc_ai_;
+    }
+    void set_startup_navmesh(NavMeshData navmesh);
+    void set_startup_navmesh_path(std::string_view relative_path);
+    void emit_ai_noise(
+        glm::vec3 position,
+        float loudness = 1.0F,
+        float max_radius = 18.0F,
+        SceneNodeId instigator_node = {},
+        SceneUuid instigator_uuid = {}) noexcept;
     [[nodiscard]] AnimatorRuntimeSystem& animator_runtime() noexcept {
         return animator_runtime_;
     }
@@ -375,6 +397,11 @@ private:
     TriggerOverlapTracker trigger_tracker_{};
     GameplayWorld gameplay_world_{};
     AnimatorRuntimeSystem animator_runtime_{};
+    NavigationRuntime navigation_{};
+    NpcAiRuntimeSystem npc_ai_{};
+    std::optional<NavMeshData> startup_navmesh_{};
+    std::string startup_navmesh_path_{};
+    float player_noise_cooldown_ = 0.0F;
     RuntimeTransformRegistry transform_registry_{};
     GameOverlayCanvas overlay_canvas_{};
     LocalizationSystem localization_{};

@@ -1403,4 +1403,473 @@ static_assert(std::is_trivially_copyable_v<SplineComponent>);
     return spline;
 }
 
+enum class NavObstacleShape : std::uint8_t {
+    box = 0U,
+    cylinder = 1U,
+};
+
+[[nodiscard]] constexpr std::string_view to_token(
+    const NavObstacleShape shape) noexcept {
+    switch (shape) {
+    case NavObstacleShape::box: return "box";
+    case NavObstacleShape::cylinder: return "cylinder";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] constexpr std::optional<NavObstacleShape> parse_nav_obstacle_shape(
+    const std::string_view token) noexcept {
+    if (token == "box") return NavObstacleShape::box;
+    if (token == "cylinder") return NavObstacleShape::cylinder;
+    return std::nullopt;
+}
+
+struct NavObstacleComponent {
+    glm::vec3 center_offset{0.0F};
+    glm::vec3 half_extents{0.75F, 1.0F, 0.75F};
+    float radius = 0.75F;
+    float height = 2.0F;
+    float margin = 0.25F;
+    float cost_penalty = 8.0F;
+    NavObstacleShape shape = NavObstacleShape::box;
+    bool enabled = true;
+    bool block_navigation = true;
+
+    friend bool operator==(
+        const NavObstacleComponent&,
+        const NavObstacleComponent&) = default;
+};
+
+static_assert(std::is_trivially_copyable_v<NavObstacleComponent>);
+
+[[nodiscard]] inline bool valid_nav_obstacle_component(
+    const NavObstacleComponent& obs) noexcept {
+    if (to_token(obs.shape) == "unknown") {
+        return false;
+    }
+    const auto finite_abs = [](const float v, const float max_abs) noexcept {
+        return std::isfinite(v) && std::abs(v) <= max_abs;
+    };
+    return finite_abs(obs.center_offset.x, maximum_collider_offset) &&
+           finite_abs(obs.center_offset.y, maximum_collider_offset) &&
+           finite_abs(obs.center_offset.z, maximum_collider_offset) &&
+           std::isfinite(obs.half_extents.x) &&
+           obs.half_extents.x >= minimum_collider_dimension &&
+           obs.half_extents.x <= maximum_collider_dimension &&
+           std::isfinite(obs.half_extents.y) &&
+           obs.half_extents.y >= minimum_collider_dimension &&
+           obs.half_extents.y <= maximum_collider_dimension &&
+           std::isfinite(obs.half_extents.z) &&
+           obs.half_extents.z >= minimum_collider_dimension &&
+           obs.half_extents.z <= maximum_collider_dimension &&
+           std::isfinite(obs.radius) &&
+           obs.radius >= minimum_collider_dimension &&
+           obs.radius <= maximum_collider_dimension &&
+           std::isfinite(obs.height) &&
+           obs.height >= minimum_collider_dimension &&
+           obs.height <= maximum_collider_dimension &&
+           std::isfinite(obs.margin) &&
+           obs.margin >= 0.0F && obs.margin <= 10.0F &&
+           std::isfinite(obs.cost_penalty) &&
+           obs.cost_penalty >= 1.0F && obs.cost_penalty <= 100.0F;
+}
+
+[[nodiscard]] inline NavObstacleComponent sanitize_nav_obstacle_component(
+    NavObstacleComponent obs) noexcept {
+    if (to_token(obs.shape) == "unknown") {
+        obs.shape = NavObstacleShape::box;
+    }
+    const auto clamp_or = [](const float v,
+                             const float lo,
+                             const float hi,
+                             const float fallback) noexcept {
+        return std::isfinite(v) ? std::clamp(v, lo, hi) : fallback;
+    };
+    obs.center_offset.x = clamp_or(
+        obs.center_offset.x, -maximum_collider_offset, maximum_collider_offset, 0.0F);
+    obs.center_offset.y = clamp_or(
+        obs.center_offset.y, -maximum_collider_offset, maximum_collider_offset, 0.0F);
+    obs.center_offset.z = clamp_or(
+        obs.center_offset.z, -maximum_collider_offset, maximum_collider_offset, 0.0F);
+    obs.half_extents.x = clamp_or(
+        obs.half_extents.x, minimum_collider_dimension, maximum_collider_dimension, 0.75F);
+    obs.half_extents.y = clamp_or(
+        obs.half_extents.y, minimum_collider_dimension, maximum_collider_dimension, 1.0F);
+    obs.half_extents.z = clamp_or(
+        obs.half_extents.z, minimum_collider_dimension, maximum_collider_dimension, 0.75F);
+    obs.radius = clamp_or(
+        obs.radius, minimum_collider_dimension, maximum_collider_dimension, 0.75F);
+    obs.height = clamp_or(
+        obs.height, minimum_collider_dimension, maximum_collider_dimension, 2.0F);
+    obs.margin = clamp_or(obs.margin, 0.0F, 10.0F, 0.25F);
+    obs.cost_penalty = clamp_or(obs.cost_penalty, 1.0F, 100.0F, 8.0F);
+    return obs;
+}
+
+enum class OffMeshTraversalKind : std::uint8_t {
+    jump = 0U,
+    drop = 1U,
+    climb = 2U,
+    teleport = 3U,
+};
+
+[[nodiscard]] constexpr std::string_view to_token(
+    const OffMeshTraversalKind kind) noexcept {
+    switch (kind) {
+    case OffMeshTraversalKind::jump: return "jump";
+    case OffMeshTraversalKind::drop: return "drop";
+    case OffMeshTraversalKind::climb: return "climb";
+    case OffMeshTraversalKind::teleport: return "teleport";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] constexpr std::optional<OffMeshTraversalKind> parse_off_mesh_traversal_kind(
+    const std::string_view token) noexcept {
+    if (token == "jump") return OffMeshTraversalKind::jump;
+    if (token == "drop") return OffMeshTraversalKind::drop;
+    if (token == "climb") return OffMeshTraversalKind::climb;
+    if (token == "teleport") return OffMeshTraversalKind::teleport;
+    return std::nullopt;
+}
+
+struct OffMeshLinkComponent {
+    glm::vec3 start_offset{0.0F, 0.0F, 0.0F};
+    glm::vec3 end_offset{0.0F, 0.0F, 4.0F};
+    SceneUuid target_node_uuid{};
+    float radius = 0.75F;
+    float cost_multiplier = 1.25F;
+    float jump_height = 1.25F;
+    float traversal_speed = 4.5F;
+    OffMeshTraversalKind traversal_kind = OffMeshTraversalKind::jump;
+    bool enabled = true;
+    bool bidirectional = true;
+
+    friend bool operator==(
+        const OffMeshLinkComponent&,
+        const OffMeshLinkComponent&) = default;
+};
+
+static_assert(std::is_trivially_copyable_v<OffMeshLinkComponent>);
+
+[[nodiscard]] inline bool valid_off_mesh_link_component(
+    const OffMeshLinkComponent& link) noexcept {
+    if (to_token(link.traversal_kind) == "unknown") {
+        return false;
+    }
+    const auto finite_abs = [](const float v, const float max_abs) noexcept {
+        return std::isfinite(v) && std::abs(v) <= max_abs;
+    };
+    return finite_abs(link.start_offset.x, 100'000.0F) &&
+           finite_abs(link.start_offset.y, 100'000.0F) &&
+           finite_abs(link.start_offset.z, 100'000.0F) &&
+           finite_abs(link.end_offset.x, 100'000.0F) &&
+           finite_abs(link.end_offset.y, 100'000.0F) &&
+           finite_abs(link.end_offset.z, 100'000.0F) &&
+           std::isfinite(link.radius) &&
+           link.radius >= 0.1F && link.radius <= 20.0F &&
+           std::isfinite(link.cost_multiplier) &&
+           link.cost_multiplier >= 0.1F && link.cost_multiplier <= 100.0F &&
+           std::isfinite(link.jump_height) &&
+           link.jump_height >= 0.0F && link.jump_height <= 25.0F &&
+           std::isfinite(link.traversal_speed) &&
+           link.traversal_speed >= 0.25F && link.traversal_speed <= 50.0F;
+}
+
+[[nodiscard]] inline OffMeshLinkComponent sanitize_off_mesh_link_component(
+    OffMeshLinkComponent link) noexcept {
+    if (to_token(link.traversal_kind) == "unknown") {
+        link.traversal_kind = OffMeshTraversalKind::jump;
+    }
+    const auto clamp_or = [](const float v,
+                             const float lo,
+                             const float hi,
+                             const float fallback) noexcept {
+        return std::isfinite(v) ? std::clamp(v, lo, hi) : fallback;
+    };
+    for (int axis = 0; axis < 3; ++axis) {
+        link.start_offset[axis] = clamp_or(
+            link.start_offset[axis], -100'000.0F, 100'000.0F, 0.0F);
+        link.end_offset[axis] = clamp_or(
+            link.end_offset[axis],
+            -100'000.0F,
+            100'000.0F,
+            axis == 2 ? 4.0F : 0.0F);
+    }
+    link.radius = clamp_or(link.radius, 0.1F, 20.0F, 0.75F);
+    link.cost_multiplier = clamp_or(link.cost_multiplier, 0.1F, 100.0F, 1.25F);
+    link.jump_height = clamp_or(link.jump_height, 0.0F, 25.0F, 1.25F);
+    link.traversal_speed = clamp_or(link.traversal_speed, 0.25F, 50.0F, 4.5F);
+    return link;
+}
+
+enum class NpcAiControlMode : std::uint8_t {
+    fsm = 0U,
+    behavior_tree = 1U,
+};
+
+[[nodiscard]] constexpr std::string_view to_token(
+    const NpcAiControlMode mode) noexcept {
+    switch (mode) {
+    case NpcAiControlMode::fsm: return "fsm";
+    case NpcAiControlMode::behavior_tree: return "behavior_tree";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] constexpr std::optional<NpcAiControlMode> parse_npc_ai_control_mode(
+    const std::string_view token) noexcept {
+    if (token == "fsm") return NpcAiControlMode::fsm;
+    if (token == "behavior_tree") return NpcAiControlMode::behavior_tree;
+    return std::nullopt;
+}
+
+[[nodiscard]] inline bool valid_behavior_tree_relative_path(
+    const std::string_view path) noexcept {
+    constexpr std::string_view ext = ".vcrbt.json";
+    if (path.empty() || path.size() >= 256U ||
+        path.size() <= ext.size() || !path.ends_with(ext) ||
+        !component_detail::valid_utf8_text(path) ||
+        path.front() == '/' || path.front() == '\\') {
+        return false;
+    }
+    std::size_t segment_start = 0U;
+    for (std::size_t i = 0U; i <= path.size(); ++i) {
+        const bool at_end = (i == path.size());
+        if (!at_end) {
+            const unsigned char byte = static_cast<unsigned char>(path[i]);
+            if (byte < 0x20U || byte == ':' || byte == '\\' ||
+                byte == '"' || byte == '*' || byte == '?' ||
+                byte == '<' || byte == '>' || byte == '|') {
+                return false;
+            }
+        }
+        if (at_end || path[i] == '/') {
+            const std::string_view segment =
+                path.substr(segment_start, i - segment_start);
+            if (segment.empty() || segment == "." || segment == "..") {
+                return false;
+            }
+            segment_start = i + 1U;
+        }
+    }
+    return true;
+}
+
+struct NpcAiComponent {
+    static constexpr std::size_t bt_path_capacity = 256U;
+    static constexpr std::size_t clip_name_capacity = 64U;
+
+    std::array<char, bt_path_capacity> behavior_tree_path{};
+    SceneUuid target_node_uuid{};
+    SceneUuid patrol_spline_uuid{};
+    glm::vec3 patrol_point_a{0.0F, 0.0F, 0.0F};
+    glm::vec3 patrol_point_b{6.0F, 0.0F, 0.0F};
+    float walk_speed = 2.4F;
+    float run_speed = 4.8F;
+    float agent_radius = 0.4F;
+    float agent_height = 1.8F;
+    float stopping_distance = 1.1F;
+    float attack_range = 1.75F;
+    float attack_damage = 12.0F;
+    float attack_cooldown = 1.2F;
+    float sight_range = 18.0F;
+    float sight_fov_degrees = 110.0F;
+    float eye_height = 1.55F;
+    float lose_sight_seconds = 3.5F;
+    float hearing_range = 20.0F;
+    float hearing_threshold = 0.15F;
+    float flee_health_fraction = 0.2F;
+    std::array<char, clip_name_capacity> idle_clip{"idle"};
+    std::array<char, clip_name_capacity> walk_clip{"walk"};
+    std::array<char, clip_name_capacity> run_clip{"run"};
+    std::array<char, clip_name_capacity> jump_clip{"jump"};
+    std::array<char, clip_name_capacity> attack_clip{"attack"};
+    NpcAiControlMode mode = NpcAiControlMode::fsm;
+    bool enabled = true;
+    bool patrol_enabled = true;
+    bool can_traverse_off_mesh_links = true;
+
+    [[nodiscard]] std::string_view behavior_tree_path_view() const noexcept {
+        return component_detail::fixed_cstr_view(behavior_tree_path);
+    }
+    [[nodiscard]] bool set_behavior_tree_path(
+        const std::string_view v) noexcept {
+        if (!v.empty() && !valid_behavior_tree_relative_path(v)) {
+            return false;
+        }
+        return component_detail::set_fixed_cstr(behavior_tree_path, v);
+    }
+
+    [[nodiscard]] std::string_view idle_clip_view() const noexcept {
+        return component_detail::fixed_cstr_view(idle_clip);
+    }
+    [[nodiscard]] bool set_idle_clip(const std::string_view v) noexcept {
+        return component_detail::set_fixed_cstr(idle_clip, v);
+    }
+
+    [[nodiscard]] std::string_view walk_clip_view() const noexcept {
+        return component_detail::fixed_cstr_view(walk_clip);
+    }
+    [[nodiscard]] bool set_walk_clip(const std::string_view v) noexcept {
+        return component_detail::set_fixed_cstr(walk_clip, v);
+    }
+
+    [[nodiscard]] std::string_view run_clip_view() const noexcept {
+        return component_detail::fixed_cstr_view(run_clip);
+    }
+    [[nodiscard]] bool set_run_clip(const std::string_view v) noexcept {
+        return component_detail::set_fixed_cstr(run_clip, v);
+    }
+
+    [[nodiscard]] std::string_view jump_clip_view() const noexcept {
+        return component_detail::fixed_cstr_view(jump_clip);
+    }
+    [[nodiscard]] bool set_jump_clip(const std::string_view v) noexcept {
+        return component_detail::set_fixed_cstr(jump_clip, v);
+    }
+
+    [[nodiscard]] std::string_view attack_clip_view() const noexcept {
+        return component_detail::fixed_cstr_view(attack_clip);
+    }
+    [[nodiscard]] bool set_attack_clip(const std::string_view v) noexcept {
+        return component_detail::set_fixed_cstr(attack_clip, v);
+    }
+
+    friend bool operator==(
+        const NpcAiComponent&,
+        const NpcAiComponent&) = default;
+};
+
+static_assert(std::is_trivially_copyable_v<NpcAiComponent>);
+
+[[nodiscard]] inline bool valid_npc_ai_component(
+    const NpcAiComponent& npc) noexcept {
+    if (to_token(npc.mode) == "unknown") {
+        return false;
+    }
+    if (!component_detail::valid_fixed_cstr(npc.behavior_tree_path) ||
+        !component_detail::valid_fixed_cstr(npc.idle_clip) ||
+        !component_detail::valid_fixed_cstr(npc.walk_clip) ||
+        !component_detail::valid_fixed_cstr(npc.run_clip) ||
+        !component_detail::valid_fixed_cstr(npc.jump_clip) ||
+        !component_detail::valid_fixed_cstr(npc.attack_clip)) {
+        return false;
+    }
+    const std::string_view bt = npc.behavior_tree_path_view();
+    if (!bt.empty() && !valid_behavior_tree_relative_path(bt)) {
+        return false;
+    }
+    const auto finite_abs = [](const float v, const float max_abs) noexcept {
+        return std::isfinite(v) && std::abs(v) <= max_abs;
+    };
+    return finite_abs(npc.patrol_point_a.x, 100'000.0F) &&
+           finite_abs(npc.patrol_point_a.y, 100'000.0F) &&
+           finite_abs(npc.patrol_point_a.z, 100'000.0F) &&
+           finite_abs(npc.patrol_point_b.x, 100'000.0F) &&
+           finite_abs(npc.patrol_point_b.y, 100'000.0F) &&
+           finite_abs(npc.patrol_point_b.z, 100'000.0F) &&
+           std::isfinite(npc.walk_speed) &&
+           npc.walk_speed >= 0.1F && npc.walk_speed <= 40.0F &&
+           std::isfinite(npc.run_speed) &&
+           npc.run_speed >= npc.walk_speed && npc.run_speed <= 60.0F &&
+           std::isfinite(npc.agent_radius) &&
+           npc.agent_radius >= 0.1F && npc.agent_radius <= 5.0F &&
+           std::isfinite(npc.agent_height) &&
+           npc.agent_height >= 0.3F && npc.agent_height <= 10.0F &&
+           std::isfinite(npc.stopping_distance) &&
+           npc.stopping_distance >= 0.1F && npc.stopping_distance <= 25.0F &&
+           std::isfinite(npc.attack_range) &&
+           npc.attack_range >= 0.2F && npc.attack_range <= 50.0F &&
+           std::isfinite(npc.attack_damage) &&
+           npc.attack_damage >= 0.0F && npc.attack_damage <= 10'000.0F &&
+           std::isfinite(npc.attack_cooldown) &&
+           npc.attack_cooldown >= 0.05F && npc.attack_cooldown <= 60.0F &&
+           std::isfinite(npc.sight_range) &&
+           npc.sight_range >= 0.0F && npc.sight_range <= 500.0F &&
+           std::isfinite(npc.sight_fov_degrees) &&
+           npc.sight_fov_degrees >= 5.0F && npc.sight_fov_degrees <= 360.0F &&
+           std::isfinite(npc.eye_height) &&
+           npc.eye_height >= 0.1F && npc.eye_height <= 8.0F &&
+           std::isfinite(npc.lose_sight_seconds) &&
+           npc.lose_sight_seconds >= 0.1F && npc.lose_sight_seconds <= 120.0F &&
+           std::isfinite(npc.hearing_range) &&
+           npc.hearing_range >= 0.0F && npc.hearing_range <= 500.0F &&
+           std::isfinite(npc.hearing_threshold) &&
+           npc.hearing_threshold >= 0.0F && npc.hearing_threshold <= 10.0F &&
+           std::isfinite(npc.flee_health_fraction) &&
+           npc.flee_health_fraction >= 0.0F && npc.flee_health_fraction <= 1.0F;
+}
+
+[[nodiscard]] inline NpcAiComponent sanitize_npc_ai_component(
+    NpcAiComponent npc) noexcept {
+    if (to_token(npc.mode) == "unknown") {
+        npc.mode = NpcAiControlMode::fsm;
+    }
+    const auto sanitize_str = [](auto& arr, const std::string_view fallback) noexcept {
+        if (!component_detail::valid_fixed_cstr(arr)) {
+            static_cast<void>(component_detail::set_fixed_cstr(arr, fallback));
+            return;
+        }
+        const std::string_view v = component_detail::fixed_cstr_view(arr);
+        if (v.empty() && !fallback.empty()) {
+            static_cast<void>(component_detail::set_fixed_cstr(arr, fallback));
+            return;
+        }
+        for (std::size_t i = v.size(); i < arr.size(); ++i) {
+            arr[i] = '\0';
+        }
+    };
+    if (!component_detail::valid_fixed_cstr(npc.behavior_tree_path)) {
+        npc.behavior_tree_path.fill('\0');
+    } else {
+        const std::string_view bt = npc.behavior_tree_path_view();
+        if (!bt.empty() && !valid_behavior_tree_relative_path(bt)) {
+            npc.behavior_tree_path.fill('\0');
+        } else {
+            for (std::size_t i = bt.size(); i < npc.behavior_tree_path.size(); ++i) {
+                npc.behavior_tree_path[i] = '\0';
+            }
+        }
+    }
+    sanitize_str(npc.idle_clip, "idle");
+    sanitize_str(npc.walk_clip, "walk");
+    sanitize_str(npc.run_clip, "run");
+    sanitize_str(npc.jump_clip, "jump");
+    sanitize_str(npc.attack_clip, "attack");
+
+    const auto clamp_or = [](const float v,
+                             const float lo,
+                             const float hi,
+                             const float fallback) noexcept {
+        return std::isfinite(v) ? std::clamp(v, lo, hi) : fallback;
+    };
+    for (int axis = 0; axis < 3; ++axis) {
+        npc.patrol_point_a[axis] = clamp_or(
+            npc.patrol_point_a[axis], -100'000.0F, 100'000.0F, 0.0F);
+        npc.patrol_point_b[axis] = clamp_or(
+            npc.patrol_point_b[axis],
+            -100'000.0F,
+            100'000.0F,
+            axis == 0 ? 6.0F : 0.0F);
+    }
+    npc.walk_speed = clamp_or(npc.walk_speed, 0.1F, 40.0F, 2.4F);
+    npc.run_speed = clamp_or(
+        npc.run_speed, npc.walk_speed, 60.0F, std::max(4.8F, npc.walk_speed));
+    npc.agent_radius = clamp_or(npc.agent_radius, 0.1F, 5.0F, 0.4F);
+    npc.agent_height = clamp_or(npc.agent_height, 0.3F, 10.0F, 1.8F);
+    npc.stopping_distance = clamp_or(npc.stopping_distance, 0.1F, 25.0F, 1.1F);
+    npc.attack_range = clamp_or(npc.attack_range, 0.2F, 50.0F, 1.75F);
+    npc.attack_damage = clamp_or(npc.attack_damage, 0.0F, 10'000.0F, 12.0F);
+    npc.attack_cooldown = clamp_or(npc.attack_cooldown, 0.05F, 60.0F, 1.2F);
+    npc.sight_range = clamp_or(npc.sight_range, 0.0F, 500.0F, 18.0F);
+    npc.sight_fov_degrees = clamp_or(npc.sight_fov_degrees, 5.0F, 360.0F, 110.0F);
+    npc.eye_height = clamp_or(npc.eye_height, 0.1F, 8.0F, 1.55F);
+    npc.lose_sight_seconds = clamp_or(npc.lose_sight_seconds, 0.1F, 120.0F, 3.5F);
+    npc.hearing_range = clamp_or(npc.hearing_range, 0.0F, 500.0F, 20.0F);
+    npc.hearing_threshold = clamp_or(npc.hearing_threshold, 0.0F, 10.0F, 0.15F);
+    npc.flee_health_fraction = clamp_or(npc.flee_health_fraction, 0.0F, 1.0F, 0.2F);
+    return npc;
+}
+
 } // namespace vcr

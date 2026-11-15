@@ -540,4 +540,372 @@ using Json = nlohmann::json;
     return true;
 }
 
+[[nodiscard]] inline Json nav_obstacle_to_json(
+    const NavObstacleComponent& obs) {
+    return Json{
+        {"enabled", obs.enabled},
+        {"block_navigation", obs.block_navigation},
+        {"shape", to_token(obs.shape)},
+        {"center_offset", {obs.center_offset.x, obs.center_offset.y, obs.center_offset.z}},
+        {"half_extents", {obs.half_extents.x, obs.half_extents.y, obs.half_extents.z}},
+        {"radius", obs.radius},
+        {"height", obs.height},
+        {"margin", obs.margin},
+        {"cost_penalty", obs.cost_penalty},
+    };
+}
+
+[[nodiscard]] inline bool parse_nav_obstacle_json(
+    const Json& source,
+    NavObstacleComponent& out) {
+    if (!source.is_object()) {
+        return false;
+    }
+    for (const auto& [key, _] : source.items()) {
+        if (key != "enabled" &&
+            key != "block_navigation" &&
+            key != "shape" &&
+            key != "center_offset" &&
+            key != "half_extents" &&
+            key != "radius" &&
+            key != "height" &&
+            key != "margin" &&
+            key != "cost_penalty") {
+            return false;
+        }
+    }
+    NavObstacleComponent parsed{};
+    if (const auto it = source.find("enabled"); it != source.end()) {
+        if (!it->is_boolean()) return false;
+        parsed.enabled = it->get<bool>();
+    }
+    if (const auto it = source.find("block_navigation"); it != source.end()) {
+        if (!it->is_boolean()) return false;
+        parsed.block_navigation = it->get<bool>();
+    }
+    if (const auto it = source.find("shape"); it != source.end()) {
+        if (!it->is_string()) return false;
+        const auto shape = parse_nav_obstacle_shape(it->get<std::string_view>());
+        if (!shape) return false;
+        parsed.shape = *shape;
+    }
+    if (const auto it = source.find("center_offset"); it != source.end()) {
+        if (!read_vec3(*it, 0.0F, maximum_collider_offset, parsed.center_offset)) {
+            return false;
+        }
+    }
+    if (const auto it = source.find("half_extents"); it != source.end()) {
+        if (!read_vec3(
+                *it,
+                minimum_collider_dimension,
+                maximum_collider_dimension,
+                parsed.half_extents)) {
+            return false;
+        }
+    }
+    if ((source.contains("radius") &&
+         !read_bounded_float(
+             source["radius"],
+             minimum_collider_dimension,
+             maximum_collider_dimension,
+             parsed.radius)) ||
+        (source.contains("height") &&
+         !read_bounded_float(
+             source["height"],
+             minimum_collider_dimension,
+             maximum_collider_dimension,
+             parsed.height)) ||
+        (source.contains("margin") &&
+         !read_bounded_float(source["margin"], 0.0F, 10.0F, parsed.margin)) ||
+        (source.contains("cost_penalty") &&
+         !read_bounded_float(
+             source["cost_penalty"], 1.0F, 100.0F, parsed.cost_penalty))) {
+        return false;
+    }
+    if (!valid_nav_obstacle_component(parsed)) {
+        return false;
+    }
+    out = sanitize_nav_obstacle_component(parsed);
+    return true;
+}
+
+[[nodiscard]] inline Json off_mesh_link_to_json(
+    const OffMeshLinkComponent& link) {
+    return Json{
+        {"enabled", link.enabled},
+        {"bidirectional", link.bidirectional},
+        {"traversal_kind", to_token(link.traversal_kind)},
+        {"start_offset", {link.start_offset.x, link.start_offset.y, link.start_offset.z}},
+        {"end_offset", {link.end_offset.x, link.end_offset.y, link.end_offset.z}},
+        {"target_node_uuid",
+         link.target_node_uuid
+             ? format_scene_uuid(link.target_node_uuid)
+             : std::string{}},
+        {"radius", link.radius},
+        {"cost_multiplier", link.cost_multiplier},
+        {"jump_height", link.jump_height},
+        {"traversal_speed", link.traversal_speed},
+    };
+}
+
+[[nodiscard]] inline bool parse_off_mesh_link_json(
+    const Json& source,
+    OffMeshLinkComponent& out) {
+    if (!source.is_object()) {
+        return false;
+    }
+    for (const auto& [key, _] : source.items()) {
+        if (key != "enabled" &&
+            key != "bidirectional" &&
+            key != "traversal_kind" &&
+            key != "start_offset" &&
+            key != "end_offset" &&
+            key != "target_node_uuid" &&
+            key != "radius" &&
+            key != "cost_multiplier" &&
+            key != "jump_height" &&
+            key != "traversal_speed") {
+            return false;
+        }
+    }
+    OffMeshLinkComponent parsed{};
+    if (const auto it = source.find("enabled"); it != source.end()) {
+        if (!it->is_boolean()) return false;
+        parsed.enabled = it->get<bool>();
+    }
+    if (const auto it = source.find("bidirectional"); it != source.end()) {
+        if (!it->is_boolean()) return false;
+        parsed.bidirectional = it->get<bool>();
+    }
+    if (const auto it = source.find("traversal_kind"); it != source.end()) {
+        if (!it->is_string()) return false;
+        const auto kind =
+            parse_off_mesh_traversal_kind(it->get<std::string_view>());
+        if (!kind) return false;
+        parsed.traversal_kind = *kind;
+    }
+    if (const auto it = source.find("start_offset"); it != source.end()) {
+        if (!read_vec3(*it, 0.0F, 100'000.0F, parsed.start_offset)) {
+            return false;
+        }
+    }
+    if (const auto it = source.find("end_offset"); it != source.end()) {
+        if (!read_vec3(*it, 0.0F, 100'000.0F, parsed.end_offset)) {
+            return false;
+        }
+    }
+    if (const auto it = source.find("target_node_uuid"); it != source.end()) {
+        if (!it->is_string()) return false;
+        const std::string_view s = it->get<std::string_view>();
+        if (s.empty()) {
+            parsed.target_node_uuid = {};
+        } else {
+            const auto uuid = parse_scene_uuid(s);
+            if (!uuid) return false;
+            parsed.target_node_uuid = *uuid;
+        }
+    }
+    if ((source.contains("radius") &&
+         !read_bounded_float(source["radius"], 0.1F, 20.0F, parsed.radius)) ||
+        (source.contains("cost_multiplier") &&
+         !read_bounded_float(
+             source["cost_multiplier"], 0.1F, 100.0F, parsed.cost_multiplier)) ||
+        (source.contains("jump_height") &&
+         !read_bounded_float(
+             source["jump_height"], 0.0F, 25.0F, parsed.jump_height)) ||
+        (source.contains("traversal_speed") &&
+         !read_bounded_float(
+             source["traversal_speed"], 0.25F, 50.0F, parsed.traversal_speed))) {
+        return false;
+    }
+    if (!valid_off_mesh_link_component(parsed)) {
+        return false;
+    }
+    out = sanitize_off_mesh_link_component(parsed);
+    return true;
+}
+
+[[nodiscard]] inline Json npc_ai_to_json(const NpcAiComponent& npc) {
+    return Json{
+        {"enabled", npc.enabled},
+        {"mode", to_token(npc.mode)},
+        {"behavior_tree_path", std::string(npc.behavior_tree_path_view())},
+        {"target_node_uuid",
+         npc.target_node_uuid
+             ? format_scene_uuid(npc.target_node_uuid)
+             : std::string{}},
+        {"patrol_spline_uuid",
+         npc.patrol_spline_uuid
+             ? format_scene_uuid(npc.patrol_spline_uuid)
+             : std::string{}},
+        {"patrol_enabled", npc.patrol_enabled},
+        {"patrol_point_a", {npc.patrol_point_a.x, npc.patrol_point_a.y, npc.patrol_point_a.z}},
+        {"patrol_point_b", {npc.patrol_point_b.x, npc.patrol_point_b.y, npc.patrol_point_b.z}},
+        {"walk_speed", npc.walk_speed},
+        {"run_speed", npc.run_speed},
+        {"agent_radius", npc.agent_radius},
+        {"agent_height", npc.agent_height},
+        {"stopping_distance", npc.stopping_distance},
+        {"can_traverse_off_mesh_links", npc.can_traverse_off_mesh_links},
+        {"attack_range", npc.attack_range},
+        {"attack_damage", npc.attack_damage},
+        {"attack_cooldown", npc.attack_cooldown},
+        {"sight_range", npc.sight_range},
+        {"sight_fov_degrees", npc.sight_fov_degrees},
+        {"eye_height", npc.eye_height},
+        {"lose_sight_seconds", npc.lose_sight_seconds},
+        {"hearing_range", npc.hearing_range},
+        {"hearing_threshold", npc.hearing_threshold},
+        {"flee_health_fraction", npc.flee_health_fraction},
+        {"idle_clip", std::string(npc.idle_clip_view())},
+        {"walk_clip", std::string(npc.walk_clip_view())},
+        {"run_clip", std::string(npc.run_clip_view())},
+        {"jump_clip", std::string(npc.jump_clip_view())},
+        {"attack_clip", std::string(npc.attack_clip_view())},
+    };
+}
+
+[[nodiscard]] inline bool parse_npc_ai_json(
+    const Json& source,
+    NpcAiComponent& out) {
+    if (!source.is_object()) {
+        return false;
+    }
+    for (const auto& [key, _] : source.items()) {
+        if (key != "enabled" &&
+            key != "mode" &&
+            key != "behavior_tree_path" &&
+            key != "target_node_uuid" &&
+            key != "patrol_spline_uuid" &&
+            key != "patrol_enabled" &&
+            key != "patrol_point_a" &&
+            key != "patrol_point_b" &&
+            key != "walk_speed" &&
+            key != "run_speed" &&
+            key != "agent_radius" &&
+            key != "agent_height" &&
+            key != "stopping_distance" &&
+            key != "can_traverse_off_mesh_links" &&
+            key != "attack_range" &&
+            key != "attack_damage" &&
+            key != "attack_cooldown" &&
+            key != "sight_range" &&
+            key != "sight_fov_degrees" &&
+            key != "eye_height" &&
+            key != "lose_sight_seconds" &&
+            key != "hearing_range" &&
+            key != "hearing_threshold" &&
+            key != "flee_health_fraction" &&
+            key != "idle_clip" &&
+            key != "walk_clip" &&
+            key != "run_clip" &&
+            key != "jump_clip" &&
+            key != "attack_clip") {
+            return false;
+        }
+    }
+    NpcAiComponent parsed{};
+    const auto read_bool = [&](const char* k, bool& dst) {
+        if (!source.contains(k)) return true;
+        if (!source[k].is_boolean()) return false;
+        dst = source[k].get<bool>();
+        return true;
+    };
+    if (!read_bool("enabled", parsed.enabled) ||
+        !read_bool("patrol_enabled", parsed.patrol_enabled) ||
+        !read_bool("can_traverse_off_mesh_links", parsed.can_traverse_off_mesh_links)) {
+        return false;
+    }
+    if (const auto it = source.find("mode"); it != source.end()) {
+        if (!it->is_string()) return false;
+        const auto m = parse_npc_ai_control_mode(it->get<std::string_view>());
+        if (!m) return false;
+        parsed.mode = *m;
+    }
+    if (const auto it = source.find("behavior_tree_path"); it != source.end()) {
+        if (!it->is_string() ||
+            !parsed.set_behavior_tree_path(it->get<std::string_view>())) {
+            return false;
+        }
+    }
+    const auto read_uuid_field = [&](const char* k, SceneUuid& dst) {
+        const auto it = source.find(k);
+        if (it == source.end()) return true;
+        if (!it->is_string()) return false;
+        const std::string_view s = it->get<std::string_view>();
+        if (s.empty()) {
+            dst = {};
+            return true;
+        }
+        const auto parsed_uuid = parse_scene_uuid(s);
+        if (!parsed_uuid) return false;
+        dst = *parsed_uuid;
+        return true;
+    };
+    if (!read_uuid_field("target_node_uuid", parsed.target_node_uuid) ||
+        !read_uuid_field("patrol_spline_uuid", parsed.patrol_spline_uuid)) {
+        return false;
+    }
+    if (const auto it = source.find("patrol_point_a"); it != source.end()) {
+        if (!read_vec3(*it, 0.0F, 100'000.0F, parsed.patrol_point_a)) return false;
+    }
+    if (const auto it = source.find("patrol_point_b"); it != source.end()) {
+        if (!read_vec3(*it, 0.0F, 100'000.0F, parsed.patrol_point_b)) return false;
+    }
+    if ((source.contains("walk_speed") &&
+         !read_bounded_float(source["walk_speed"], 0.1F, 40.0F, parsed.walk_speed)) ||
+        (source.contains("run_speed") &&
+         !read_bounded_float(source["run_speed"], 0.1F, 60.0F, parsed.run_speed)) ||
+        (source.contains("agent_radius") &&
+         !read_bounded_float(source["agent_radius"], 0.1F, 5.0F, parsed.agent_radius)) ||
+        (source.contains("agent_height") &&
+         !read_bounded_float(source["agent_height"], 0.3F, 10.0F, parsed.agent_height)) ||
+        (source.contains("stopping_distance") &&
+         !read_bounded_float(source["stopping_distance"], 0.1F, 25.0F, parsed.stopping_distance)) ||
+        (source.contains("attack_range") &&
+         !read_bounded_float(source["attack_range"], 0.2F, 50.0F, parsed.attack_range)) ||
+        (source.contains("attack_damage") &&
+         !read_bounded_float(source["attack_damage"], 0.0F, 10'000.0F, parsed.attack_damage)) ||
+        (source.contains("attack_cooldown") &&
+         !read_bounded_float(source["attack_cooldown"], 0.05F, 60.0F, parsed.attack_cooldown)) ||
+        (source.contains("sight_range") &&
+         !read_bounded_float(source["sight_range"], 0.0F, 500.0F, parsed.sight_range)) ||
+        (source.contains("sight_fov_degrees") &&
+         !read_bounded_float(source["sight_fov_degrees"], 5.0F, 360.0F, parsed.sight_fov_degrees)) ||
+        (source.contains("eye_height") &&
+         !read_bounded_float(source["eye_height"], 0.1F, 8.0F, parsed.eye_height)) ||
+        (source.contains("lose_sight_seconds") &&
+         !read_bounded_float(source["lose_sight_seconds"], 0.1F, 120.0F, parsed.lose_sight_seconds)) ||
+        (source.contains("hearing_range") &&
+         !read_bounded_float(source["hearing_range"], 0.0F, 500.0F, parsed.hearing_range)) ||
+        (source.contains("hearing_threshold") &&
+         !read_bounded_float(source["hearing_threshold"], 0.0F, 10.0F, parsed.hearing_threshold)) ||
+        (source.contains("flee_health_fraction") &&
+         !read_bounded_float(source["flee_health_fraction"], 0.0F, 1.0F, parsed.flee_health_fraction))) {
+        return false;
+    }
+    if ((source.contains("idle_clip") &&
+         (!source["idle_clip"].is_string() ||
+          !parsed.set_idle_clip(source["idle_clip"].get<std::string_view>()))) ||
+        (source.contains("walk_clip") &&
+         (!source["walk_clip"].is_string() ||
+          !parsed.set_walk_clip(source["walk_clip"].get<std::string_view>()))) ||
+        (source.contains("run_clip") &&
+         (!source["run_clip"].is_string() ||
+          !parsed.set_run_clip(source["run_clip"].get<std::string_view>()))) ||
+        (source.contains("jump_clip") &&
+         (!source["jump_clip"].is_string() ||
+          !parsed.set_jump_clip(source["jump_clip"].get<std::string_view>()))) ||
+        (source.contains("attack_clip") &&
+         (!source["attack_clip"].is_string() ||
+          !parsed.set_attack_clip(source["attack_clip"].get<std::string_view>())))) {
+        return false;
+    }
+    if (!valid_npc_ai_component(parsed)) {
+        return false;
+    }
+    out = sanitize_npc_ai_component(parsed);
+    return true;
+}
+
 } // namespace vcr::component_json

@@ -36,6 +36,25 @@ struct ExternalAssetDropState;
 struct MaterialEditorUiState;
 struct AudioInputUiState;
 struct SequencerEditorUiState;
+struct NavigationEditorUiState;
+
+struct NavigationStatusSnapshot {
+    bool has_navmesh = false;
+    std::string relative_path{};
+    std::size_t polygon_count = 0U;
+    std::size_t portal_count = 0U;
+    std::size_t off_mesh_link_count = 0U;
+    std::size_t scene_obstacle_count = 0U;
+    std::size_t scene_off_mesh_count = 0U;
+    std::size_t scene_npc_count = 0U;
+    std::size_t runtime_agent_count = 0U;
+    std::size_t active_noise_count = 0U;
+    bool has_test_path = false;
+    std::uint32_t test_path_waypoints = 0U;
+    float test_path_cost = 0.0F;
+    bool test_path_complete = false;
+    bool test_path_used_off_mesh = false;
+};
 
 struct SequencerStatusSnapshot {
     bool has_sequence = false;
@@ -289,6 +308,40 @@ public:
         std::optional<float> scrub_time_seconds,
         std::optional<bool> lock_camera,
         std::string& error);
+    [[nodiscard]] const NavMeshData* editor_navmesh() const noexcept;
+    [[nodiscard]] std::string_view editor_navmesh_relative_path() const noexcept;
+    [[nodiscard]] NavigationStatusSnapshot navigation_status(
+        const SceneDocument& scene) const;
+    void open_navmesh_in_panel(std::string_view relative_path);
+    void open_behavior_tree_in_panel(
+        SceneDocument& scene,
+        std::string_view relative_path);
+    [[nodiscard]] bool mcp_navigation_bake(
+        const SceneDocument& scene,
+        Renderer& renderer,
+        const NavMeshBakeSettings* override_settings,
+        std::string& error);
+    void mcp_navigation_clear() noexcept;
+    [[nodiscard]] bool mcp_navigation_save(
+        const SceneDocument& scene,
+        std::string_view custom_relative_path,
+        std::string& out_saved_path,
+        std::string& error);
+    [[nodiscard]] bool mcp_navigation_load(
+        std::string_view relative_path,
+        std::string& error);
+    [[nodiscard]] bool mcp_navigation_test_path(
+        const SceneDocument& scene,
+        glm::vec3 start,
+        glm::vec3 goal,
+        NavPath& out_path,
+        std::string& error);
+    [[nodiscard]] bool mcp_navigation_create_default_bt(
+        std::string_view custom_relative_path,
+        std::string_view id,
+        std::string_view title,
+        std::string& out_saved_path,
+        std::string& error);
 
 private:
     void initialize_vulkan_backend(Renderer& renderer);
@@ -333,6 +386,10 @@ private:
         SceneDocument& scene,
         Renderer& renderer);
     void build_sequencer_panel(
+        SceneDocument& scene,
+        Renderer& renderer,
+        FlyCamera& camera);
+    void build_navigation_ai_panel(
         SceneDocument& scene,
         Renderer& renderer,
         FlyCamera& camera);
@@ -381,9 +438,11 @@ private:
     AnimatorRuntimeSystem* edit_animator_preview_ = nullptr;
     bool show_skeleton_wireframe_ = true;
     bool show_spline_wireframe_ = true;
+    bool show_navigation_debug_ = true;
     bool animation_gameplay_panel_open_ = true;
     bool ui_localization_panel_open_ = true;
     bool sequencer_panel_open_ = true;
+    bool navigation_ai_panel_open_ = true;
     std::array<char, 64U> ui_test_speaker_buf_{"Narrator"};
     std::array<char, 256U> ui_test_text_buf_{"ui.dialogue.greeting"};
     std::array<char, 64U> ui_test_dialogue_id_buf_{};
@@ -486,6 +545,7 @@ private:
     std::unique_ptr<MaterialEditorUiState> material_editor_;
     std::unique_ptr<AudioInputUiState> audio_input_ui_;
     std::unique_ptr<SequencerEditorUiState> sequencer_ui_;
+    std::unique_ptr<NavigationEditorUiState> navigation_ui_;
     std::string asset_error_{};
     std::string pending_model_path_{}, pending_model_name_{};
     SceneNodeId pending_model_parent_{};

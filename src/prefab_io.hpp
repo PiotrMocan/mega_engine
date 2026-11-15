@@ -42,6 +42,9 @@ struct PrefabNodeOverride {
     std::optional<GameplayComponent> gameplay{};
     std::optional<UiMarkerComponent> ui_marker{};
     std::optional<SplineComponent> spline{};
+    std::optional<NavObstacleComponent> nav_obstacle{};
+    std::optional<OffMeshLinkComponent> off_mesh_link{};
+    std::optional<NpcAiComponent> npc_ai{};
 };
 
 struct PrefabInstantiateOptions {

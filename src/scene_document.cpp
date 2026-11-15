@@ -298,6 +298,9 @@ bool SceneDocument::destroy_subtree(const SceneNodeId id) {
         gameplays_.remove_slot(*iterator);
         ui_markers_.remove_slot(*iterator);
         splines_.remove_slot(*iterator);
+        nav_obstacles_.remove_slot(*iterator);
+        off_mesh_links_.remove_slot(*iterator);
+        npc_ais_.remove_slot(*iterator);
         slot.uuid = {};
         slot.value = {};
         slot.world_matrix = glm::mat4(1.0F);
@@ -927,6 +930,147 @@ SceneDocument::spline_mut(const SceneNodeId id) noexcept {
     return splines_.get_mut(id);
 }
 
+bool SceneDocument::set_nav_obstacle(
+    const SceneNodeId id,
+    const NavObstacleComponent& obstacle) {
+    if (!valid(id) || !valid_nav_obstacle_component(obstacle)) {
+        return false;
+    }
+    const NavObstacleComponent sanitized =
+        sanitize_nav_obstacle_component(obstacle);
+    if (const auto existing = nav_obstacles_.get(id);
+        existing && existing->get() == sanitized) {
+        return true;
+    }
+    if (!nav_obstacles_.upsert(id, sanitized)) {
+        return false;
+    }
+    ++content_revision_;
+    return true;
+}
+
+bool SceneDocument::remove_nav_obstacle(const SceneNodeId id) noexcept {
+    if (!valid(id) || !nav_obstacles_.remove(id)) {
+        return false;
+    }
+    ++content_revision_;
+    return true;
+}
+
+bool SceneDocument::has_nav_obstacle(const SceneNodeId id) const noexcept {
+    return valid(id) && nav_obstacles_.contains(id);
+}
+
+std::optional<std::reference_wrapper<const NavObstacleComponent>>
+SceneDocument::nav_obstacle(const SceneNodeId id) const noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return nav_obstacles_.get(id);
+}
+
+std::optional<std::reference_wrapper<NavObstacleComponent>>
+SceneDocument::nav_obstacle_mut(const SceneNodeId id) noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return nav_obstacles_.get_mut(id);
+}
+
+bool SceneDocument::set_off_mesh_link(
+    const SceneNodeId id,
+    const OffMeshLinkComponent& link) {
+    if (!valid(id) || !valid_off_mesh_link_component(link)) {
+        return false;
+    }
+    const OffMeshLinkComponent sanitized =
+        sanitize_off_mesh_link_component(link);
+    if (const auto existing = off_mesh_links_.get(id);
+        existing && existing->get() == sanitized) {
+        return true;
+    }
+    if (!off_mesh_links_.upsert(id, sanitized)) {
+        return false;
+    }
+    ++content_revision_;
+    return true;
+}
+
+bool SceneDocument::remove_off_mesh_link(const SceneNodeId id) noexcept {
+    if (!valid(id) || !off_mesh_links_.remove(id)) {
+        return false;
+    }
+    ++content_revision_;
+    return true;
+}
+
+bool SceneDocument::has_off_mesh_link(const SceneNodeId id) const noexcept {
+    return valid(id) && off_mesh_links_.contains(id);
+}
+
+std::optional<std::reference_wrapper<const OffMeshLinkComponent>>
+SceneDocument::off_mesh_link(const SceneNodeId id) const noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return off_mesh_links_.get(id);
+}
+
+std::optional<std::reference_wrapper<OffMeshLinkComponent>>
+SceneDocument::off_mesh_link_mut(const SceneNodeId id) noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return off_mesh_links_.get_mut(id);
+}
+
+bool SceneDocument::set_npc_ai(
+    const SceneNodeId id,
+    const NpcAiComponent& npc_ai_value) {
+    if (!valid(id) || !valid_npc_ai_component(npc_ai_value)) {
+        return false;
+    }
+    const NpcAiComponent sanitized =
+        sanitize_npc_ai_component(npc_ai_value);
+    if (const auto existing = npc_ais_.get(id);
+        existing && existing->get() == sanitized) {
+        return true;
+    }
+    if (!npc_ais_.upsert(id, sanitized)) {
+        return false;
+    }
+    ++content_revision_;
+    return true;
+}
+
+bool SceneDocument::remove_npc_ai(const SceneNodeId id) noexcept {
+    if (!valid(id) || !npc_ais_.remove(id)) {
+        return false;
+    }
+    ++content_revision_;
+    return true;
+}
+
+bool SceneDocument::has_npc_ai(const SceneNodeId id) const noexcept {
+    return valid(id) && npc_ais_.contains(id);
+}
+
+std::optional<std::reference_wrapper<const NpcAiComponent>>
+SceneDocument::npc_ai(const SceneNodeId id) const noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return npc_ais_.get(id);
+}
+
+std::optional<std::reference_wrapper<NpcAiComponent>>
+SceneDocument::npc_ai_mut(const SceneNodeId id) noexcept {
+    if (!valid(id)) {
+        return std::nullopt;
+    }
+    return npc_ais_.get_mut(id);
+}
+
 void SceneDocument::mark_content_changed() noexcept {
     ++content_revision_;
 }
@@ -1025,6 +1169,18 @@ void SceneDocument::build_node_records(
         if (const auto attached_spline = splines_.get(current_id)) {
             node_spline = attached_spline->get();
         }
+        std::optional<NavObstacleComponent> node_nav_obstacle{};
+        if (const auto attached_obs = nav_obstacles_.get(current_id)) {
+            node_nav_obstacle = attached_obs->get();
+        }
+        std::optional<OffMeshLinkComponent> node_off_mesh_link{};
+        if (const auto attached_oml = off_mesh_links_.get(current_id)) {
+            node_off_mesh_link = attached_oml->get();
+        }
+        std::optional<NpcAiComponent> node_npc_ai{};
+        if (const auto attached_npc = npc_ais_.get(current_id)) {
+            node_npc_ai = attached_npc->get();
+        }
         output.push_back(SceneNodeRecord{
             .id = current_id,
             .uuid = slots_[index].uuid,
@@ -1039,6 +1195,9 @@ void SceneDocument::build_node_records(
             .gameplay = node_gameplay,
             .ui_marker = node_ui_marker,
             .spline = node_spline,
+            .nav_obstacle = node_nav_obstacle,
+            .off_mesh_link = node_off_mesh_link,
+            .npc_ai = node_npc_ai,
             .parent_record_index = parent_record,
         });
         if (ancestor_records.size() <= depth) {

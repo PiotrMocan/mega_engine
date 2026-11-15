@@ -147,3 +147,26 @@ Headers: [`src/cutscene_sequencer.hpp`](../src/cutscene_sequencer.hpp), [`src/ci
   - `ship_project` validates `.vcrseq.json` files and copies referenced runtime audio clips cleanly.
   - MCP tools: `editor.scene.set_spline`, `editor.scene.remove_spline`, and `editor.sequencer.control` (total 55 MCP tools, plus `"spline"` node telemetry and `"sequencer"` status in `editor.get_state`).
 
+---
+
+## 11. Navigation, Pathfinding & NPC AI (Stage 7)
+
+Headers: [`src/navigation.hpp`](../src/navigation.hpp), [`src/npc_ai.hpp`](../src/npc_ai.hpp), [`src/scene_components.hpp`](../src/scene_components.hpp)
+
+- **NavMesh Baking, `.vcrnav.json` & Pathfinding (`bake_navmesh_from_scene`, `NavMeshData`, `NavigationRuntime`)**:
+  - Bakes walkable navigation polygons and portal edges from static scene geometry (`ground`, `cube`, `model`, `ColliderComponent`) and procedural `terrain` heightfields respecting `NavMeshAgentParams` (`agent_radius`, `agent_height`, `max_climb_step`, `max_slope_degrees`, `cell_size`).
+  - Serializes cleanly to atomic `.vcrnav.json` assets with sandboxed asset-path validation.
+  - `NavigationRuntime` performs zero-allocation steady-state queries (`find_path` using A* + String-Pulling Funnel smoothing, `project_to_navmesh`, and `compute_local_steering` for obstacle/agent avoidance).
+- **Dynamic Obstacles & Off-Mesh Links (`NavObstacleComponent`, `OffMeshLinkComponent`)**:
+  - `NavObstacleComponent` and enabled dynamic/kinematic `RigidBodyComponent` entities dynamically block affected NavMesh polygons and steer nearby agents around obstacles at runtime.
+  - `OffMeshLinkComponent` connects disconnected navigation regions via directional or bidirectional `jump`, `drop`, `climb`, and `teleport` traversals with configurable cost/speed, persisted in `.vcrscene.json` and `.vcrprefab.json` (`PrefabNodeOverride`).
+- **NPC AI, Behavior Trees (`.vcrbt.json`) & Perception (`NpcAiComponent`, `BehaviorTreeAsset`, `AiPerceptionSystem`, `NpcAiRuntime`)**:
+  - `NpcAiComponent` drives autonomous agents via either the built-in tactical FSM (`Idle`, `Patrol`, `Investigate`, `Chase`, `Attack`, `Search`, `Return`) or cycle-validated `.vcrbt.json` Behavior Trees (`BehaviorTreeAsset` with 20 `BtNodeKind` composite/decorator/leaf node types, fixed-capacity `AiBlackboard`, and `make_default_tactical_behavior_tree`).
+  - `AiPerceptionSystem` evaluates FOV vision cones occluded via `CollisionWorld`/`PhysicsWorld` LOS raycasts alongside wall-attenuated hearing from `GameplaySession::emit_ai_noise` and automatic `AudioSource`/impact sound events.
+  - `GameplaySession` saves and restores full NPC AI runtime state (`npc_agents` array) in `.vcrsave.json` checkpoints.
+- **Editor Panel, Viewport Debug Overlay, Shipping & MCP**:
+  - `vulkan_editor` adds a docked `Navigation & AI` panel, Inspector sections (`Nav Obstacle`, `Off-Mesh Link`, `NPC AI`) with undo/redo, and a `"Nav & AI"` viewport debug overlay rendering walkable polygons, portal edges, off-mesh links, dynamic obstacle bounds, active agent paths, and perception cones.
+  - `ship_project` validates and packages referenced `.vcrnav.json` and `.vcrbt.json` assets alongside startup scene configurations.
+  - MCP tools: `editor.scene.set_nav_obstacle`, `editor.scene.remove_nav_obstacle`, `editor.scene.set_off_mesh_link`, `editor.scene.remove_off_mesh_link`, `editor.scene.set_npc_ai`, `editor.scene.remove_npc_ai`, and `editor.navigation.control` (total 62 MCP tools, plus `"nav_obstacle"`, `"off_mesh_link"`, and `"npc_ai"` node telemetry and `"navigation"` status in `editor.get_state`).
+
+

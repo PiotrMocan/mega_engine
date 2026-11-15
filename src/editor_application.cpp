@@ -285,6 +285,21 @@ using Json = nlohmann::json;
     } else {
         result["spline"] = nullptr;
     }
+    if (const auto obs = scene.nav_obstacle(id)) {
+        result["nav_obstacle"] = component_json::nav_obstacle_to_json(obs->get());
+    } else {
+        result["nav_obstacle"] = nullptr;
+    }
+    if (const auto oml = scene.off_mesh_link(id)) {
+        result["off_mesh_link"] = component_json::off_mesh_link_to_json(oml->get());
+    } else {
+        result["off_mesh_link"] = nullptr;
+    }
+    if (const auto npc = scene.npc_ai(id)) {
+        result["npc_ai"] = component_json::npc_ai_to_json(npc->get());
+    } else {
+        result["npc_ai"] = nullptr;
+    }
     if (renderer != nullptr &&
         value.kind == SceneNodeKind::model &&
         !value.asset_path.empty()) {
@@ -624,6 +639,30 @@ void apply_light_patch(
             }
             if (z.contains("damping")) zone.damping = z["damping"].get<float>();
             ov.reverb_zone = zone;
+        }
+        if (entry.contains("nav_obstacle")) {
+            NavObstacleComponent obs{};
+            if (!component_json::parse_nav_obstacle_json(entry["nav_obstacle"], obs)) {
+                error = "Prefab override nav_obstacle is invalid.";
+                return false;
+            }
+            ov.nav_obstacle = obs;
+        }
+        if (entry.contains("off_mesh_link")) {
+            OffMeshLinkComponent link{};
+            if (!component_json::parse_off_mesh_link_json(entry["off_mesh_link"], link)) {
+                error = "Prefab override off_mesh_link is invalid.";
+                return false;
+            }
+            ov.off_mesh_link = link;
+        }
+        if (entry.contains("npc_ai")) {
+            NpcAiComponent npc{};
+            if (!component_json::parse_npc_ai_json(entry["npc_ai"], npc)) {
+                error = "Prefab override npc_ai is invalid.";
+                return false;
+            }
+            ov.npc_ai = npc;
         }
         overrides.push_back(std::move(ov));
     }
@@ -1216,6 +1255,13 @@ void EditorApplication::synchronize_gameplay_state() {
             }
         }
         bind_game_ui_callbacks();
+        if (const NavMeshData* const ed_nav = ui_.editor_navmesh();
+            ed_nav != nullptr && !ed_nav->empty()) {
+            gameplay_.set_startup_navmesh(*ed_nav);
+        } else {
+            gameplay_.set_startup_navmesh(NavMeshData{});
+        }
+        gameplay_.set_startup_navmesh_path(ui_.editor_navmesh_relative_path());
         if (!gameplay_.start(
                 scene_,
                 initial_view,
@@ -1475,6 +1521,26 @@ namespace {
     };
 }
 
+[[nodiscard]] Json navigation_status_json(const NavigationStatusSnapshot& n) {
+    return Json{
+        {"has_navmesh", n.has_navmesh},
+        {"relative_path", n.relative_path},
+        {"polygon_count", n.polygon_count},
+        {"portal_count", n.portal_count},
+        {"off_mesh_link_count", n.off_mesh_link_count},
+        {"scene_obstacle_count", n.scene_obstacle_count},
+        {"scene_off_mesh_count", n.scene_off_mesh_count},
+        {"scene_npc_count", n.scene_npc_count},
+        {"runtime_agent_count", n.runtime_agent_count},
+        {"active_noise_count", n.active_noise_count},
+        {"has_test_path", n.has_test_path},
+        {"test_path_waypoints", n.test_path_waypoints},
+        {"test_path_cost", n.test_path_cost},
+        {"test_path_complete", n.test_path_complete},
+        {"test_path_used_off_mesh", n.test_path_used_off_mesh},
+    };
+}
+
 [[nodiscard]] bool is_scene_mutating_mcp_command(
     const McpCommandType type) noexcept {
     switch (type) {
@@ -1496,6 +1562,12 @@ namespace {
     case McpCommandType::editor_remove_ui_marker:
     case McpCommandType::editor_set_spline:
     case McpCommandType::editor_remove_spline:
+    case McpCommandType::editor_set_nav_obstacle:
+    case McpCommandType::editor_remove_nav_obstacle:
+    case McpCommandType::editor_set_off_mesh_link:
+    case McpCommandType::editor_remove_off_mesh_link:
+    case McpCommandType::editor_set_npc_ai:
+    case McpCommandType::editor_remove_npc_ai:
     case McpCommandType::editor_prefab_save:
     case McpCommandType::editor_prefab_instantiate:
     case McpCommandType::editor_prefab_unpack:
@@ -1576,9 +1648,13 @@ void EditorApplication::execute_mcp_command(
                 {"animator_count", scene_.animators().size()},
                 {"gameplay_count", scene_.gameplays().size()},
                 {"spline_count", scene_.splines().size()},
+                {"nav_obstacle_count", scene_.nav_obstacles().size()},
+                {"off_mesh_link_count", scene_.off_mesh_links().size()},
+                {"npc_ai_count", scene_.npc_ais().size()},
                 {"skinned_active_nodes", renderer_.skinning_active_node_count()},
                 {"prefab_instance_count", scene_.prefab_instances().size()},
                 {"sequencer", sequencer_status_json(ui_.sequencer_status())},
+                {"navigation", navigation_status_json(ui_.navigation_status(scene_))},
                 {"audio", audio_engine_state_json(audio_engine_)},
                 {"animation_gameplay", Json{
                     {"animator_count", scene_.animators().size()},
@@ -2683,6 +2759,329 @@ void EditorApplication::execute_mcp_command(
             out["saved_path"] = saved_path;
         }
         succeed("sequencer state updated", out);
+        return;
+    }
+    case McpCommandType::editor_set_nav_obstacle: {
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!valid_nav_obstacle_component(command.nav_obstacle)) {
+            fail("nav_obstacle component values are outside engine bounds");
+            return;
+        }
+        const NavObstacleComponent sanitized =
+            sanitize_nav_obstacle_component(command.nav_obstacle);
+        if (const auto existing = scene_.nav_obstacle(command.node_id);
+            existing && existing->get() == sanitized) {
+            succeed(
+                "nav_obstacle component already matches",
+                Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        if (!scene_.set_nav_obstacle(command.node_id, sanitized)) {
+            fail("unable to attach nav_obstacle component");
+            return;
+        }
+        succeed(
+            "nav_obstacle component updated",
+            Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                 {"changed", true}});
+        return;
+    }
+    case McpCommandType::editor_remove_nav_obstacle:
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!scene_.has_nav_obstacle(command.node_id)) {
+            succeed(
+                "node has no nav_obstacle component",
+                Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        static_cast<void>(scene_.remove_nav_obstacle(command.node_id));
+        succeed(
+            "nav_obstacle component removed",
+            Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                 {"changed", true}});
+        return;
+    case McpCommandType::editor_set_off_mesh_link: {
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!valid_off_mesh_link_component(command.off_mesh_link)) {
+            fail("off_mesh_link component values are outside engine bounds");
+            return;
+        }
+        const OffMeshLinkComponent sanitized =
+            sanitize_off_mesh_link_component(command.off_mesh_link);
+        if (const auto existing = scene_.off_mesh_link(command.node_id);
+            existing && existing->get() == sanitized) {
+            succeed(
+                "off_mesh_link component already matches",
+                Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        if (!scene_.set_off_mesh_link(command.node_id, sanitized)) {
+            fail("unable to attach off_mesh_link component");
+            return;
+        }
+        succeed(
+            "off_mesh_link component updated",
+            Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                 {"changed", true}});
+        return;
+    }
+    case McpCommandType::editor_remove_off_mesh_link:
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!scene_.has_off_mesh_link(command.node_id)) {
+            succeed(
+                "node has no off_mesh_link component",
+                Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        static_cast<void>(scene_.remove_off_mesh_link(command.node_id));
+        succeed(
+            "off_mesh_link component removed",
+            Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                 {"changed", true}});
+        return;
+    case McpCommandType::editor_set_npc_ai: {
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!valid_npc_ai_component(command.npc_ai)) {
+            fail("npc_ai component values are outside engine bounds");
+            return;
+        }
+        const NpcAiComponent sanitized =
+            sanitize_npc_ai_component(command.npc_ai);
+        if (const auto existing = scene_.npc_ai(command.node_id);
+            existing && existing->get() == sanitized) {
+            succeed(
+                "npc_ai component already matches",
+                Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        if (!scene_.set_npc_ai(command.node_id, sanitized)) {
+            fail("unable to attach npc_ai component");
+            return;
+        }
+        succeed(
+            "npc_ai component updated",
+            Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                 {"changed", true}});
+        return;
+    }
+    case McpCommandType::editor_remove_npc_ai:
+        if (ui_.play_state() != EditorPlayState::edit) {
+            fail("scene editing is locked during Play");
+            return;
+        }
+        if (!scene_.valid(command.node_id)) {
+            fail("scene node handle is stale or invalid");
+            return;
+        }
+        if (!scene_.has_npc_ai(command.node_id)) {
+            succeed(
+                "node has no npc_ai component",
+                Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                     {"changed", false}});
+            return;
+        }
+        ui_.checkpoint_scene(scene_);
+        static_cast<void>(scene_.remove_npc_ai(command.node_id));
+        succeed(
+            "npc_ai component removed",
+            Json{{"node", scene_node_json(scene_, command.node_id, std::nullopt, &renderer_)},
+                 {"changed", true}});
+        return;
+    case McpCommandType::editor_navigation_control: {
+        const McpNavigationControlPayload& nav = command.navigation;
+        std::string error;
+        std::string saved_path;
+        Json extra = Json::object();
+        switch (nav.action) {
+        case McpNavigationAction::bake: {
+            if (ui_.play_state() != EditorPlayState::edit) {
+                fail("NavMesh baking requires Edit mode");
+                return;
+            }
+            NavMeshBakeSettings merged =
+                ui_.editor_navmesh() != nullptr
+                    ? ui_.editor_navmesh()->settings
+                    : NavMeshBakeSettings{};
+            if ((nav.flags & McpNavigationControlPayload::flag_has_cell_size) != 0U) {
+                merged.cell_size = nav.bake_settings.cell_size;
+            }
+            if ((nav.flags & McpNavigationControlPayload::flag_has_agent_radius) != 0U) {
+                merged.agent_radius = nav.bake_settings.agent_radius;
+            }
+            if ((nav.flags & McpNavigationControlPayload::flag_has_agent_height) != 0U) {
+                merged.agent_height = nav.bake_settings.agent_height;
+            }
+            if ((nav.flags & McpNavigationControlPayload::flag_has_max_slope) != 0U) {
+                merged.max_slope_degrees = nav.bake_settings.max_slope_degrees;
+            }
+            if ((nav.flags & McpNavigationControlPayload::flag_has_max_step) != 0U) {
+                merged.max_step_height = nav.bake_settings.max_step_height;
+            }
+            if ((nav.flags & McpNavigationControlPayload::flag_include_terrain_supplied) != 0U) {
+                merged.include_terrain =
+                    (nav.flags & McpNavigationControlPayload::flag_include_terrain) != 0U;
+            }
+            if ((nav.flags & McpNavigationControlPayload::flag_use_custom_bounds_supplied) != 0U) {
+                merged.use_custom_bounds =
+                    (nav.flags & McpNavigationControlPayload::flag_use_custom_bounds) != 0U;
+            }
+            if ((nav.flags & McpNavigationControlPayload::flag_has_custom_bounds_min) != 0U) {
+                merged.custom_bounds_min = nav.bake_settings.custom_bounds_min;
+            }
+            if ((nav.flags & McpNavigationControlPayload::flag_has_custom_bounds_max) != 0U) {
+                merged.custom_bounds_max = nav.bake_settings.custom_bounds_max;
+            }
+            if ((nav.flags & McpNavigationControlPayload::flag_has_max_grid_cells) != 0U) {
+                merged.max_grid_cells_per_axis = nav.bake_settings.max_grid_cells_per_axis;
+            }
+            if (!ui_.mcp_navigation_bake(
+                    scene_,
+                    renderer_,
+                    nav.flags != 0U ? &merged : nullptr,
+                    error)) {
+                fail(std::move(error));
+                return;
+            }
+            break;
+        }
+        case McpNavigationAction::clear:
+            ui_.mcp_navigation_clear();
+            break;
+        case McpNavigationAction::save:
+            if (!ui_.mcp_navigation_save(
+                    scene_, command.text.data(), saved_path, error)) {
+                fail(std::move(error));
+                return;
+            }
+            extra["saved_path"] = saved_path;
+            break;
+        case McpNavigationAction::load:
+            if (ui_.play_state() != EditorPlayState::edit) {
+                fail("Loading editor NavMesh requires Edit mode");
+                return;
+            }
+            if (!ui_.mcp_navigation_load(command.text.data(), error)) {
+                fail(std::move(error));
+                return;
+            }
+            break;
+        case McpNavigationAction::test_path: {
+            if ((nav.flags & McpNavigationControlPayload::flag_has_start) == 0U ||
+                (nav.flags & McpNavigationControlPayload::flag_has_goal) == 0U) {
+                fail("test_path requires both start and goal vec3 positions");
+                return;
+            }
+            NavPath path{};
+            if (ui_.play_state() != EditorPlayState::edit &&
+                gameplay_.active() &&
+                gameplay_.navigation().has_navmesh()) {
+                gameplay_.navigation_mut().sync_dynamic_obstacles(
+                    scene_, &gameplay_.physics_world());
+                if (!gameplay_.navigation_mut().find_path(
+                        nav.start_pos, nav.goal_pos, path, NavPathQueryOptions{})) {
+                    fail("No navigable path found between start and goal.");
+                    return;
+                }
+            } else if (!ui_.mcp_navigation_test_path(
+                           scene_, nav.start_pos, nav.goal_pos, path, error)) {
+                fail(std::move(error));
+                return;
+            }
+            Json wp_arr = Json::array();
+            for (const NavPathWaypoint& wp : path.points()) {
+                wp_arr.push_back(Json{
+                    {"position", vec3_json(wp.position)},
+                    {"poly_id", wp.poly_id},
+                    {"is_off_mesh_traversal", wp.is_off_mesh_traversal},
+                    {"traversal_kind", to_token(wp.traversal_kind)},
+                });
+            }
+            extra["waypoints"] = std::move(wp_arr);
+            extra["waypoint_count"] = path.waypoint_count;
+            extra["total_cost"] = path.total_cost;
+            extra["complete"] = path.complete;
+            extra["partial"] = path.partial;
+            extra["used_off_mesh_link"] = path.used_off_mesh_link;
+            break;
+        }
+        case McpNavigationAction::create_default_bt: {
+            const std::string_view packed{command.secondary_text.data()};
+            const std::size_t nl = packed.find('\n');
+            const std::string_view bt_id =
+                nl == std::string_view::npos ? packed : packed.substr(0U, nl);
+            const std::string_view bt_title =
+                nl == std::string_view::npos ? std::string_view{} : packed.substr(nl + 1U);
+            if (!ui_.mcp_navigation_create_default_bt(
+                    command.text.data(), bt_id, bt_title, saved_path, error)) {
+                fail(std::move(error));
+                return;
+            }
+            extra["saved_path"] = saved_path;
+            break;
+        }
+        case McpNavigationAction::emit_noise: {
+            if (ui_.play_state() == EditorPlayState::edit || !gameplay_.active()) {
+                fail("emit_noise requires active Play mode");
+                return;
+            }
+            const glm::vec3 pos =
+                (nav.flags & McpNavigationControlPayload::flag_has_start) != 0U
+                    ? nav.start_pos
+                    : camera_.position();
+            gameplay_.emit_ai_noise(pos, nav.loudness, nav.max_radius);
+            extra["position"] = vec3_json(pos);
+            extra["loudness"] = nav.loudness;
+            extra["max_radius"] = nav.max_radius;
+            break;
+        }
+        }
+        extra["navigation"] = navigation_status_json(ui_.navigation_status(scene_));
+        succeed("navigation state updated", extra);
         return;
     }
     case McpCommandType::editor_prefab_save: {

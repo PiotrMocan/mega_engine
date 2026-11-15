@@ -105,6 +105,9 @@ struct SceneNodeRecord {
     std::optional<GameplayComponent> gameplay{};
     std::optional<UiMarkerComponent> ui_marker{};
     std::optional<SplineComponent> spline{};
+    std::optional<NavObstacleComponent> nav_obstacle{};
+    std::optional<OffMeshLinkComponent> off_mesh_link{};
+    std::optional<NpcAiComponent> npc_ai{};
     std::uint32_t parent_record_index =
         invalid_scene_node_index;
 };
@@ -386,6 +389,48 @@ public:
         return splines_;
     }
 
+    bool set_nav_obstacle(SceneNodeId id, const NavObstacleComponent& obstacle);
+    bool remove_nav_obstacle(SceneNodeId id) noexcept;
+    [[nodiscard]] bool has_nav_obstacle(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<std::reference_wrapper<const NavObstacleComponent>>
+    nav_obstacle(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<std::reference_wrapper<NavObstacleComponent>>
+    nav_obstacle_mut(SceneNodeId id) noexcept;
+    [[nodiscard]] const SparseComponentPool<
+        SceneNodeId,
+        NavObstacleComponent,
+        max_scene_nodes>& nav_obstacles() const noexcept {
+        return nav_obstacles_;
+    }
+
+    bool set_off_mesh_link(SceneNodeId id, const OffMeshLinkComponent& link);
+    bool remove_off_mesh_link(SceneNodeId id) noexcept;
+    [[nodiscard]] bool has_off_mesh_link(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<std::reference_wrapper<const OffMeshLinkComponent>>
+    off_mesh_link(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<std::reference_wrapper<OffMeshLinkComponent>>
+    off_mesh_link_mut(SceneNodeId id) noexcept;
+    [[nodiscard]] const SparseComponentPool<
+        SceneNodeId,
+        OffMeshLinkComponent,
+        max_scene_nodes>& off_mesh_links() const noexcept {
+        return off_mesh_links_;
+    }
+
+    bool set_npc_ai(SceneNodeId id, const NpcAiComponent& npc_ai);
+    bool remove_npc_ai(SceneNodeId id) noexcept;
+    [[nodiscard]] bool has_npc_ai(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<std::reference_wrapper<const NpcAiComponent>>
+    npc_ai(SceneNodeId id) const noexcept;
+    [[nodiscard]] std::optional<std::reference_wrapper<NpcAiComponent>>
+    npc_ai_mut(SceneNodeId id) noexcept;
+    [[nodiscard]] const SparseComponentPool<
+        SceneNodeId,
+        NpcAiComponent,
+        max_scene_nodes>& npc_ais() const noexcept {
+        return npc_ais_;
+    }
+
     void mark_content_changed() noexcept;
     [[nodiscard]] std::uint32_t last_transform_updates() const noexcept {
         return last_transform_updates_;
@@ -531,6 +576,18 @@ private:
         SceneNodeId,
         SplineComponent,
         max_scene_nodes> splines_{};
+    SparseComponentPool<
+        SceneNodeId,
+        NavObstacleComponent,
+        max_scene_nodes> nav_obstacles_{};
+    SparseComponentPool<
+        SceneNodeId,
+        OffMeshLinkComponent,
+        max_scene_nodes> off_mesh_links_{};
+    SparseComponentPool<
+        SceneNodeId,
+        NpcAiComponent,
+        max_scene_nodes> npc_ais_{};
     std::uint32_t first_root_ = invalid_scene_node_index;
     std::uint32_t last_root_ = invalid_scene_node_index;
     std::uint32_t live_count_ = 0U;

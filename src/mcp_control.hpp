@@ -2,6 +2,7 @@
 
 #include "cli_options.hpp"
 #include "cooked_model_asset.hpp"
+#include "navigation.hpp"
 #include "scene_document.hpp"
 
 #include <array>
@@ -93,6 +94,13 @@ enum class McpCommandType : std::uint8_t {
     editor_set_spline,
     editor_remove_spline,
     editor_sequencer_control,
+    editor_set_nav_obstacle,
+    editor_remove_nav_obstacle,
+    editor_set_off_mesh_link,
+    editor_remove_off_mesh_link,
+    editor_set_npc_ai,
+    editor_remove_npc_ai,
+    editor_navigation_control,
     engine_request_quit,
     engine_commit_quit,
 };
@@ -222,6 +230,45 @@ struct McpSequencerControlPayload {
 
 static_assert(std::is_trivially_copyable_v<McpSequencerControlPayload>);
 
+enum class McpNavigationAction : std::uint8_t {
+    bake = 0U,
+    clear = 1U,
+    save = 2U,
+    load = 3U,
+    test_path = 4U,
+    create_default_bt = 5U,
+    emit_noise = 6U,
+};
+
+struct McpNavigationControlPayload {
+    static constexpr std::uint32_t flag_has_cell_size = 1U << 0U;
+    static constexpr std::uint32_t flag_has_agent_radius = 1U << 1U;
+    static constexpr std::uint32_t flag_has_agent_height = 1U << 2U;
+    static constexpr std::uint32_t flag_has_max_slope = 1U << 3U;
+    static constexpr std::uint32_t flag_has_max_step = 1U << 4U;
+    static constexpr std::uint32_t flag_use_custom_bounds = 1U << 5U;
+    static constexpr std::uint32_t flag_use_custom_bounds_supplied = 1U << 6U;
+    static constexpr std::uint32_t flag_include_terrain = 1U << 7U;
+    static constexpr std::uint32_t flag_include_terrain_supplied = 1U << 8U;
+    static constexpr std::uint32_t flag_has_start = 1U << 9U;
+    static constexpr std::uint32_t flag_has_goal = 1U << 10U;
+    static constexpr std::uint32_t flag_has_loudness = 1U << 11U;
+    static constexpr std::uint32_t flag_has_max_radius = 1U << 12U;
+    static constexpr std::uint32_t flag_has_custom_bounds_min = 1U << 13U;
+    static constexpr std::uint32_t flag_has_custom_bounds_max = 1U << 14U;
+    static constexpr std::uint32_t flag_has_max_grid_cells = 1U << 15U;
+
+    McpNavigationAction action = McpNavigationAction::bake;
+    std::uint32_t flags = 0U;
+    NavMeshBakeSettings bake_settings{};
+    glm::vec3 start_pos{0.0F};
+    glm::vec3 goal_pos{0.0F};
+    float loudness = 1.0F;
+    float max_radius = 18.0F;
+};
+
+static_assert(std::is_trivially_copyable_v<McpNavigationControlPayload>);
+
 struct McpCommand {
     static constexpr std::size_t text_capacity =
         max_scene_asset_path_bytes + 1U;
@@ -287,6 +334,10 @@ struct McpCommand {
     McpUiConfigPayload ui_config{};
     SplineComponent spline{};
     McpSequencerControlPayload sequencer{};
+    NavObstacleComponent nav_obstacle{};
+    OffMeshLinkComponent off_mesh_link{};
+    NpcAiComponent npc_ai{};
+    McpNavigationControlPayload navigation{};
     float preview_time_seconds = -1.0F;
     bool preview_stop = false;
     bool preview_params_supplied = false;

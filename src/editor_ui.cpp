@@ -7,8 +7,11 @@
 #include "cutscene_sequencer.hpp"
 #include "editor_scene_tools.hpp"
 #include "gameplay_framework.hpp"
+#include "navigation.hpp"
+#include "npc_ai.hpp"
 #include "project_system.hpp"
 #include "renderer.hpp"
+#include "renderer_gameplay_bridge.hpp"
 #include "runtime_assets.hpp"
 #include "scene_io.hpp"
 #include "scene_uuid.hpp"
@@ -299,6 +302,42 @@ struct SequencerEditorUiState {
         title_buffer.fill('\0');
         const std::size_t title_copy = std::min(sequence.title.size(), title_buffer.size() - 1U);
         std::memcpy(title_buffer.data(), sequence.title.data(), title_copy);
+    }
+};
+
+struct NavigationEditorUiState {
+    NavMeshBakeSettings bake_settings{};
+    NavigationRuntime preview_runtime{};
+    std::string navmesh_relative_path{};
+    std::array<char, max_scene_asset_path_bytes + 1U> navmesh_path_buf{};
+    std::array<char, NpcAiComponent::bt_path_capacity> bt_path_buf{};
+    std::array<char, 96U> bt_id_buf{};
+    std::array<char, 128U> bt_title_buf{};
+    glm::vec3 test_start{-4.0F, 0.0F, -4.0F};
+    glm::vec3 test_goal{4.0F, 0.0F, 4.0F};
+    NavPath last_test_path{};
+    bool has_test_path = false;
+    float test_noise_loudness = 1.25F;
+    float test_noise_radius = 20.0F;
+    std::uint64_t synced_scene_instance_id = 0U;
+    std::uint64_t synced_content_revision = 0U;
+    std::uint64_t synced_structure_revision = 0U;
+    std::string status{};
+    std::string error{};
+    std::vector<SceneWorldNode> wireframe_world_nodes{};
+    std::vector<std::uint32_t> wireframe_ancestors{};
+
+    NavigationEditorUiState() {
+        wireframe_world_nodes.reserve(256U);
+        wireframe_ancestors.reserve(256U);
+        constexpr std::string_view kDefaultNavPath = "navmesh/main.vcrnav.json";
+        constexpr std::string_view kDefaultBtPath = "ai/default_tactical.vcrbt.json";
+        constexpr std::string_view kDefaultBtId = "default_tactical";
+        constexpr std::string_view kDefaultBtTitle = "Default Tactical NPC";
+        std::memcpy(navmesh_path_buf.data(), kDefaultNavPath.data(), kDefaultNavPath.size());
+        std::memcpy(bt_path_buf.data(), kDefaultBtPath.data(), kDefaultBtPath.size());
+        std::memcpy(bt_id_buf.data(), kDefaultBtId.data(), kDefaultBtId.size());
+        std::memcpy(bt_title_buf.data(), kDefaultBtTitle.data(), kDefaultBtTitle.size());
     }
 };
 
@@ -646,6 +685,8 @@ struct EditorViewportRay {
     case AssetEntryKind::sound_cue: return EditorIcon::play;
     case AssetEntryKind::animation: return EditorIcon::play;
     case AssetEntryKind::cutscene: return EditorIcon::camera;
+    case AssetEntryKind::navmesh: return EditorIcon::environment;
+    case AssetEntryKind::behavior_tree: return EditorIcon::cube;
     case AssetEntryKind::save_state: return EditorIcon::cube;
     case AssetEntryKind::binary: return EditorIcon::import_asset;
     case AssetEntryKind::other: return EditorIcon::import_asset;
@@ -1522,6 +1563,42 @@ write_exclusive_material_file(
     return static_cast<SDL_Window*>(viewport->PlatformHandle);
 }
 
+void draw_node_uuid_binder(
+    const char* const id_suffix,
+    const char* const label,
+    SceneUuid& uuid_field,
+    const SceneDocument& scene,
+    const SceneNodeId selected_node,
+    bool& modified) {
+    ImGui::PushID(id_suffix);
+    std::string desc = "(none)";
+    if (uuid_field) {
+        const SceneNodeId bound = scene.find_by_uuid(uuid_field);
+        if (const auto nr = scene.node(bound)) {
+            desc = nr->get().name + " [" +
+                format_scene_uuid(uuid_field).substr(0U, 8U) + "]";
+        } else {
+            desc = format_scene_uuid(uuid_field);
+        }
+    }
+    ImGui::Text("%s: %s", label, desc.c_str());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Bind Selected") && scene.valid(selected_node)) {
+        if (const auto u = scene.uuid(selected_node)) {
+            uuid_field = *u;
+            modified = true;
+        }
+    }
+    if (uuid_field) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear")) {
+            uuid_field = {};
+            modified = true;
+        }
+    }
+    ImGui::PopID();
+}
+
 } // namespace
 
 EditorUi::EditorUi() = default;
@@ -1550,9 +1627,11 @@ void EditorUi::initialize(
     edit_animator_preview_ = edit_animator_preview;
     show_skeleton_wireframe_ = true;
     show_spline_wireframe_ = true;
+    show_navigation_debug_ = true;
     animation_gameplay_panel_open_ = true;
     ui_localization_panel_open_ = true;
     sequencer_panel_open_ = true;
+    navigation_ai_panel_open_ = true;
     ui_loc_status_.clear();
     save_slot_path_buf_.fill('\0');
     constexpr std::string_view default_save_slot =
@@ -1575,6 +1654,8 @@ void EditorUi::initialize(
         std::make_unique<AudioInputUiState>();
     sequencer_ui_ =
         std::make_unique<SequencerEditorUiState>();
+    navigation_ui_ =
+        std::make_unique<NavigationEditorUiState>();
     constexpr std::string_view default_scatter_name{"Plant"};
     std::memcpy(
         scatter_name_prefix_.data(),
@@ -1703,6 +1784,7 @@ void EditorUi::shutdown() noexcept {
     saved_structure_revision_ = 0U;
     selected_asset_.reset();
     sequencer_ui_.reset();
+    navigation_ui_.reset();
     audio_input_ui_.reset();
     material_editor_.reset();
     external_drop_.reset();
@@ -2207,6 +2289,7 @@ void EditorUi::begin_frame(
             ImGui::DockBuilderDockWindow("Audio & Input", right);
             ImGui::DockBuilderDockWindow("Animation & Gameplay", right);
             ImGui::DockBuilderDockWindow("UI & Localization", right);
+            ImGui::DockBuilderDockWindow("Navigation & AI", right);
             ImGui::DockBuilderDockWindow("Assets", bottom);
             ImGui::DockBuilderDockWindow("Sequencer", bottom);
             ImGui::DockBuilderDockWindow("Scene View", center);
@@ -2233,6 +2316,7 @@ void EditorUi::begin_frame(
     build_animation_gameplay_panel(scene, renderer);
     build_ui_localization_panel(scene, renderer);
     build_sequencer_panel(scene, renderer, camera);
+    build_navigation_ai_panel(scene, renderer, camera);
     build_performance(scene, renderer, performance);
     build_external_game_window(now);
     process_file_commands(scene, renderer, camera);
@@ -2746,6 +2830,12 @@ void EditorUi::build_main_menu(
                 nullptr,
                 sequencer_panel_open_)) {
             sequencer_panel_open_ = !sequencer_panel_open_;
+        }
+        if (ImGui::MenuItem(
+                "Navigation & AI",
+                nullptr,
+                navigation_ai_panel_open_)) {
+            navigation_ai_panel_open_ = !navigation_ai_panel_open_;
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Reset editor layout")) {
@@ -4937,6 +5027,613 @@ void EditorUi::build_inspector(
         }
     }
     {
+        const auto draw_uuid_target_combo = [&](const char* const combo_id,
+                                                SceneUuid& target_uuid,
+                                                bool& changed) {
+            std::string preview = "(None / Default)";
+            if (target_uuid) {
+                const SceneNodeId found = scene.find_by_uuid(target_uuid);
+                if (const auto nr = scene.node(found)) {
+                    preview = nr->get().name + " [" +
+                        format_scene_uuid(target_uuid).substr(0U, 8U) + "]";
+                } else {
+                    preview = format_scene_uuid(target_uuid);
+                }
+            }
+            if (ImGui::BeginCombo(combo_id, preview.c_str())) {
+                if (ImGui::Selectable("(None / Default)", !target_uuid)) {
+                    target_uuid = {};
+                    changed = true;
+                }
+                for (const SceneHierarchyRow& row : hierarchy_rows_) {
+                    if (row.id == selected_node_) {
+                        continue;
+                    }
+                    const auto cand_node = scene.node(row.id);
+                    const auto cand_uuid = scene.uuid(row.id);
+                    if (!cand_node || !cand_uuid) {
+                        continue;
+                    }
+                    const std::string item_label = cand_node->get().name + " [" +
+                        format_scene_uuid(*cand_uuid).substr(0U, 8U) + "]";
+                    const bool is_sel = target_uuid == *cand_uuid;
+                    if (ImGui::Selectable(item_label.c_str(), is_sel)) {
+                        target_uuid = *cand_uuid;
+                        changed = true;
+                    }
+                }
+                ImGui::EndCombo();
+            }
+        };
+
+        ui_kit_.section_header(EditorIcon::cube, "Nav Obstacle");
+        if (const auto attached_obs = scene.nav_obstacle(selected_node_)) {
+            NavObstacleComponent edited_obs = attached_obs->get();
+            bool obs_changed = false;
+            bool remove_obs_requested = false;
+            using ShapeT = decltype(edited_obs.shape);
+            if (ui_kit_.begin_property_grid("NavObstacleProperties")) {
+                ui_kit_.property_row("Enabled");
+                obs_changed |= ImGui::Checkbox(
+                    "##NavObsEnabled", &edited_obs.enabled);
+
+                ui_kit_.property_row("Block Nav");
+                obs_changed |= ImGui::Checkbox(
+                    "##NavObsBlock", &edited_obs.block_navigation);
+
+                ui_kit_.property_row("Shape");
+                if (ImGui::BeginCombo(
+                        "##NavObsShapeCombo",
+                        to_token(edited_obs.shape).data())) {
+                    for (const ShapeT s : {ShapeT::box, ShapeT::cylinder}) {
+                        const bool is_sel = edited_obs.shape == s;
+                        if (ImGui::Selectable(to_token(s).data(), is_sel)) {
+                            edited_obs.shape = s;
+                            obs_changed = true;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+
+                ui_kit_.property_row("Center Offset");
+                obs_changed |= ImGui::DragFloat3(
+                    "##NavObsCenter",
+                    &edited_obs.center_offset.x,
+                    0.05F,
+                    -maximum_collider_offset,
+                    maximum_collider_offset,
+                    "%.2f");
+
+                if (edited_obs.shape == ShapeT::box) {
+                    ui_kit_.property_row("Half Extents");
+                    obs_changed |= ImGui::DragFloat3(
+                        "##NavObsExtents",
+                        &edited_obs.half_extents.x,
+                        0.05F,
+                        minimum_collider_dimension,
+                        maximum_collider_dimension,
+                        "%.2f");
+                } else {
+                    ui_kit_.property_row("Radius");
+                    obs_changed |= ImGui::DragFloat(
+                        "##NavObsRadius",
+                        &edited_obs.radius,
+                        0.05F,
+                        minimum_collider_dimension,
+                        maximum_collider_dimension,
+                        "%.2f");
+
+                    ui_kit_.property_row("Height");
+                    obs_changed |= ImGui::DragFloat(
+                        "##NavObsHeight",
+                        &edited_obs.height,
+                        0.05F,
+                        minimum_collider_dimension,
+                        maximum_collider_dimension,
+                        "%.2f");
+                }
+
+                ui_kit_.property_row("Margin");
+                obs_changed |= ImGui::DragFloat(
+                    "##NavObsMargin",
+                    &edited_obs.margin,
+                    0.02F,
+                    0.0F,
+                    10.0F,
+                    "%.2f");
+
+                ui_kit_.property_row("Cost Penalty");
+                obs_changed |= ImGui::DragFloat(
+                    "##NavObsPenalty",
+                    &edited_obs.cost_penalty,
+                    0.1F,
+                    1.0F,
+                    100.0F,
+                    "%.2f");
+
+                ui_kit_.property_row("Component");
+                if (ImGui::SmallButton("Remove Nav Obstacle")) {
+                    remove_obs_requested = true;
+                }
+                ui_kit_.end_property_grid();
+            }
+
+            if (remove_obs_requested) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                static_cast<void>(scene.remove_nav_obstacle(selected_node_));
+            } else if (obs_changed) {
+                edited_obs = sanitize_nav_obstacle_component(edited_obs);
+                if (!inspector_edit_snapshot_) {
+                    inspector_edit_snapshot_ = scene;
+                    if (auto previous =
+                            inspector_edit_snapshot_->node(selected_node_)) {
+                        previous->get() = node_before_edit;
+                    }
+                }
+                static_cast<void>(scene.set_nav_obstacle(selected_node_, edited_obs));
+            }
+        } else {
+            if (ui_kit_.action_button(
+                    "AddNavObstacleButton",
+                    EditorIcon::add,
+                    "Add Nav Obstacle",
+                    EditorButtonStyle::secondary,
+                    editable)) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                static_cast<void>(
+                    scene.set_nav_obstacle(selected_node_, NavObstacleComponent{}));
+            }
+        }
+
+        ui_kit_.section_header(EditorIcon::environment, "Off-Mesh Link");
+        if (const auto attached_link = scene.off_mesh_link(selected_node_)) {
+            OffMeshLinkComponent edited_link = attached_link->get();
+            bool link_changed = false;
+            bool remove_link_requested = false;
+            using TravT = decltype(edited_link.traversal_kind);
+            if (ui_kit_.begin_property_grid("OffMeshLinkProperties")) {
+                ui_kit_.property_row("Enabled");
+                link_changed |= ImGui::Checkbox(
+                    "##OffLinkEnabled", &edited_link.enabled);
+
+                ui_kit_.property_row("Bidirectional");
+                link_changed |= ImGui::Checkbox(
+                    "##OffLinkBidir", &edited_link.bidirectional);
+
+                ui_kit_.property_row("Traversal Kind");
+                if (ImGui::BeginCombo(
+                        "##OffLinkKindCombo",
+                        to_token(edited_link.traversal_kind).data())) {
+                    for (const TravT k : {
+                             TravT::jump,
+                             TravT::drop,
+                             TravT::climb,
+                             TravT::teleport}) {
+                        const bool is_sel = edited_link.traversal_kind == k;
+                        if (ImGui::Selectable(to_token(k).data(), is_sel)) {
+                            edited_link.traversal_kind = k;
+                            link_changed = true;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+
+                ui_kit_.property_row("Start Offset");
+                link_changed |= ImGui::DragFloat3(
+                    "##OffLinkStart",
+                    &edited_link.start_offset.x,
+                    0.05F,
+                    -1000.0F,
+                    1000.0F,
+                    "%.2f");
+
+                ui_kit_.property_row("End Offset");
+                link_changed |= ImGui::DragFloat3(
+                    "##OffLinkEnd",
+                    &edited_link.end_offset.x,
+                    0.05F,
+                    -1000.0F,
+                    1000.0F,
+                    "%.2f");
+
+                ui_kit_.property_row("Target Node");
+                draw_uuid_target_combo(
+                    "##OffLinkTargetCombo",
+                    edited_link.target_node_uuid,
+                    link_changed);
+
+                ui_kit_.property_row("Radius");
+                link_changed |= ImGui::DragFloat(
+                    "##OffLinkRadius",
+                    &edited_link.radius,
+                    0.05F,
+                    0.1F,
+                    20.0F,
+                    "%.2f");
+
+                ui_kit_.property_row("Cost Mult");
+                link_changed |= ImGui::DragFloat(
+                    "##OffLinkCost",
+                    &edited_link.cost_multiplier,
+                    0.05F,
+                    0.1F,
+                    100.0F,
+                    "%.2f");
+
+                ui_kit_.property_row("Jump Height");
+                link_changed |= ImGui::DragFloat(
+                    "##OffLinkJumpH",
+                    &edited_link.jump_height,
+                    0.05F,
+                    0.0F,
+                    25.0F,
+                    "%.2f");
+
+                ui_kit_.property_row("Speed");
+                link_changed |= ImGui::DragFloat(
+                    "##OffLinkSpeed",
+                    &edited_link.traversal_speed,
+                    0.1F,
+                    0.25F,
+                    50.0F,
+                    "%.2f");
+
+                ui_kit_.property_row("Component");
+                if (ImGui::SmallButton("Remove Off-Mesh Link")) {
+                    remove_link_requested = true;
+                }
+                ui_kit_.end_property_grid();
+            }
+
+            if (remove_link_requested) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                static_cast<void>(scene.remove_off_mesh_link(selected_node_));
+            } else if (link_changed) {
+                edited_link = sanitize_off_mesh_link_component(edited_link);
+                if (!inspector_edit_snapshot_) {
+                    inspector_edit_snapshot_ = scene;
+                    if (auto previous =
+                            inspector_edit_snapshot_->node(selected_node_)) {
+                        previous->get() = node_before_edit;
+                    }
+                }
+                static_cast<void>(scene.set_off_mesh_link(selected_node_, edited_link));
+            }
+        } else {
+            if (ui_kit_.action_button(
+                    "AddOffMeshLinkButton",
+                    EditorIcon::add,
+                    "Add Off-Mesh Link",
+                    EditorButtonStyle::secondary,
+                    editable)) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                static_cast<void>(
+                    scene.set_off_mesh_link(selected_node_, OffMeshLinkComponent{}));
+            }
+        }
+
+        ui_kit_.section_header(EditorIcon::eye, "NPC AI");
+        if (const auto attached_npc = scene.npc_ai(selected_node_)) {
+            NpcAiComponent edited_npc = attached_npc->get();
+            bool npc_changed = false;
+            bool remove_npc_requested = false;
+            using ModeT = decltype(edited_npc.mode);
+            if (ui_kit_.begin_property_grid("NpcAiProperties")) {
+                ui_kit_.property_row("Enabled");
+                npc_changed |= ImGui::Checkbox(
+                    "##NpcAiEnabled", &edited_npc.enabled);
+
+                ui_kit_.property_row("Mode");
+                if (ImGui::BeginCombo(
+                        "##NpcAiModeCombo",
+                        to_token(edited_npc.mode).data())) {
+                    for (const ModeT m : {ModeT::fsm, ModeT::behavior_tree}) {
+                        const bool is_sel = edited_npc.mode == m;
+                        if (ImGui::Selectable(to_token(m).data(), is_sel)) {
+                            edited_npc.mode = m;
+                            npc_changed = true;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+
+                ui_kit_.property_row("Behavior Tree");
+                std::array<char, 256U> bt_buf{};
+                const std::string_view bt_view =
+                    edited_npc.behavior_tree_path_view();
+                const std::size_t bt_copy =
+                    std::min(bt_view.size(), bt_buf.size() - 1U);
+                std::memcpy(bt_buf.data(), bt_view.data(), bt_copy);
+                if (ImGui::InputTextWithHint(
+                        "##NpcAiBtPath",
+                        "ai/tactical.vcrbt.json",
+                        bt_buf.data(),
+                        bt_buf.size())) {
+                    if (edited_npc.set_behavior_tree_path(
+                            std::string_view(bt_buf.data()))) {
+                        npc_changed = true;
+                    }
+                }
+                if (ImGui::BeginDragDropTarget()) {
+                    if (const ImGuiPayload* payload =
+                            ImGui::AcceptDragDropPayload("VCR_ASSET_PATH");
+                        payload != nullptr &&
+                        payload->Data != nullptr &&
+                        payload->DataSize > 1) {
+                        const auto* bytes =
+                            static_cast<const char*>(payload->Data);
+                        const std::size_t sz =
+                            static_cast<std::size_t>(payload->DataSize);
+                        if (bytes[sz - 1U] == '\0') {
+                            const std::string_view dropped{bytes, sz - 1U};
+                            if (edited_npc.set_behavior_tree_path(dropped)) {
+                                npc_changed = true;
+                            }
+                        }
+                    }
+                    ImGui::EndDragDropTarget();
+                }
+                if (selected_asset_ &&
+                    selected_asset_->kind == AssetEntryKind::behavior_tree &&
+                    valid_behavior_tree_relative_path(
+                        selected_asset_->relative_display)) {
+                    ui_kit_.property_row("Assign BT");
+                    if (ImGui::SmallButton("Use selected .vcrbt.json")) {
+                        if (edited_npc.set_behavior_tree_path(
+                                selected_asset_->relative_display)) {
+                            npc_changed = true;
+                        }
+                    }
+                }
+
+                ui_kit_.property_row("Target Node");
+                draw_uuid_target_combo(
+                    "##NpcAiTargetCombo",
+                    edited_npc.target_node_uuid,
+                    npc_changed);
+
+                ui_kit_.property_row("Patrol Enabled");
+                npc_changed |= ImGui::Checkbox(
+                    "##NpcAiPatrolEnabled", &edited_npc.patrol_enabled);
+
+                ui_kit_.property_row("Patrol Spline");
+                {
+                    std::string sp_preview = "(Point A/B)";
+                    if (edited_npc.patrol_spline_uuid) {
+                        const SceneNodeId sp_id =
+                            scene.find_by_uuid(edited_npc.patrol_spline_uuid);
+                        if (const auto nr = scene.node(sp_id)) {
+                            sp_preview = nr->get().name + " [" +
+                                format_scene_uuid(edited_npc.patrol_spline_uuid)
+                                    .substr(0U, 8U) +
+                                "]";
+                        } else {
+                            sp_preview = format_scene_uuid(
+                                edited_npc.patrol_spline_uuid);
+                        }
+                    }
+                    if (ImGui::BeginCombo(
+                            "##NpcAiPatrolSplineCombo", sp_preview.c_str())) {
+                        if (ImGui::Selectable(
+                                "(Point A/B)", !edited_npc.patrol_spline_uuid)) {
+                            edited_npc.patrol_spline_uuid = {};
+                            npc_changed = true;
+                        }
+                        for (const SceneNodeId sp_id :
+                             scene.splines().owners()) {
+                            const auto nr = scene.node(sp_id);
+                            const auto sp_uuid = scene.uuid(sp_id);
+                            if (!nr || !sp_uuid) {
+                                continue;
+                            }
+                            const std::string item_label = nr->get().name +
+                                " [" +
+                                format_scene_uuid(*sp_uuid).substr(0U, 8U) +
+                                "]";
+                            const bool is_sel =
+                                edited_npc.patrol_spline_uuid == *sp_uuid;
+                            if (ImGui::Selectable(item_label.c_str(), is_sel)) {
+                                edited_npc.patrol_spline_uuid = *sp_uuid;
+                                npc_changed = true;
+                            }
+                        }
+                        ImGui::EndCombo();
+                    }
+                }
+
+                ui_kit_.property_row("Patrol Point A");
+                npc_changed |= ImGui::DragFloat3(
+                    "##NpcAiPatrolA", &edited_npc.patrol_point_a.x, 0.1F, -5000.0F, 5000.0F, "%.2f");
+
+                ui_kit_.property_row("Patrol Point B");
+                npc_changed |= ImGui::DragFloat3(
+                    "##NpcAiPatrolB", &edited_npc.patrol_point_b.x, 0.1F, -5000.0F, 5000.0F, "%.2f");
+
+                ui_kit_.property_row("Walk Speed");
+                npc_changed |= ImGui::DragFloat(
+                    "##NpcAiWalkSpeed", &edited_npc.walk_speed, 0.05F, 0.1F, 30.0F, "%.2f");
+
+                ui_kit_.property_row("Run Speed");
+                npc_changed |= ImGui::DragFloat(
+                    "##NpcAiRunSpeed", &edited_npc.run_speed, 0.05F, edited_npc.walk_speed, 40.0F, "%.2f");
+
+                ui_kit_.property_row("Agent Radius");
+                npc_changed |= ImGui::DragFloat(
+                    "##NpcAiRadius", &edited_npc.agent_radius, 0.02F, 0.1F, 5.0F, "%.2f");
+
+                ui_kit_.property_row("Agent Height");
+                npc_changed |= ImGui::DragFloat(
+                    "##NpcAiHeight", &edited_npc.agent_height, 0.05F, 0.25F, 10.0F, "%.2f");
+
+                ui_kit_.property_row("Stopping Dist");
+                npc_changed |= ImGui::DragFloat(
+                    "##NpcAiStopDist", &edited_npc.stopping_distance, 0.05F, 0.1F, 20.0F, "%.2f");
+
+                ui_kit_.property_row("Off-Mesh Links");
+                npc_changed |= ImGui::Checkbox(
+                    "##NpcAiOffMesh", &edited_npc.can_traverse_off_mesh_links);
+
+                ui_kit_.property_row("Sight Range");
+                npc_changed |= ImGui::DragFloat(
+                    "##NpcAiSightRange", &edited_npc.sight_range, 0.25F, 0.5F, 500.0F, "%.1f m");
+
+                ui_kit_.property_row("Sight FOV (deg)");
+                npc_changed |= ImGui::DragFloat(
+                    "##NpcAiSightFov", &edited_npc.sight_fov_degrees, 1.0F, 5.0F, 360.0F, "%.0f deg");
+
+                ui_kit_.property_row("Eye Height");
+                npc_changed |= ImGui::DragFloat(
+                    "##NpcAiEyeHeight", &edited_npc.eye_height, 0.05F, 0.1F, 8.0F, "%.2f m");
+
+                ui_kit_.property_row("Lose Sight (s)");
+                npc_changed |= ImGui::DragFloat(
+                    "##NpcAiLoseSight", &edited_npc.lose_sight_seconds, 0.1F, 0.1F, 120.0F, "%.1f s");
+
+                ui_kit_.property_row("Hearing Range");
+                npc_changed |= ImGui::DragFloat(
+                    "##NpcAiHearRange", &edited_npc.hearing_range, 0.25F, 0.0F, 500.0F, "%.1f m");
+
+                ui_kit_.property_row("Hearing Thr");
+                npc_changed |= ImGui::DragFloat(
+                    "##NpcAiHearThr", &edited_npc.hearing_threshold, 0.02F, 0.0F, 10.0F, "%.2f");
+
+                ui_kit_.property_row("Attack Range");
+                npc_changed |= ImGui::DragFloat(
+                    "##NpcAiAtkRange", &edited_npc.attack_range, 0.05F, 0.2F, 100.0F, "%.2f m");
+
+                ui_kit_.property_row("Attack Damage");
+                npc_changed |= ImGui::DragFloat(
+                    "##NpcAiAtkDmg", &edited_npc.attack_damage, 0.5F, 0.0F, 1000.0F, "%.1f");
+
+                ui_kit_.property_row("Attack Cooldown");
+                npc_changed |= ImGui::DragFloat(
+                    "##NpcAiAtkCd", &edited_npc.attack_cooldown, 0.05F, 0.05F, 60.0F, "%.2f s");
+
+                ui_kit_.property_row("Flee HP Frac");
+                npc_changed |= ImGui::SliderFloat(
+                    "##NpcAiFleeFrac",
+                    &edited_npc.flee_health_fraction,
+                    0.0F,
+                    1.0F,
+                    "%.2f",
+                    ImGuiSliderFlags_AlwaysClamp);
+
+                const auto edit_clip = [&](const char* const row_label,
+                                           const char* const input_id,
+                                           const std::string_view current,
+                                           auto&& setter) {
+                    ui_kit_.property_row(row_label);
+                    std::array<char, 80U> buf{};
+                    const std::size_t n = std::min(current.size(), buf.size() - 1U);
+                    std::memcpy(buf.data(), current.data(), n);
+                    if (ImGui::InputText(input_id, buf.data(), buf.size())) {
+                        if (setter(std::string_view(buf.data()))) {
+                            npc_changed = true;
+                        }
+                    }
+                };
+                edit_clip("Idle Clip", "##NpcClipIdle", edited_npc.idle_clip_view(),
+                          [&](const std::string_view s) { return edited_npc.set_idle_clip(s); });
+                edit_clip("Walk Clip", "##NpcClipWalk", edited_npc.walk_clip_view(),
+                          [&](const std::string_view s) { return edited_npc.set_walk_clip(s); });
+                edit_clip("Run Clip", "##NpcClipRun", edited_npc.run_clip_view(),
+                          [&](const std::string_view s) { return edited_npc.set_run_clip(s); });
+                edit_clip("Jump Clip", "##NpcClipJump", edited_npc.jump_clip_view(),
+                          [&](const std::string_view s) { return edited_npc.set_jump_clip(s); });
+                edit_clip("Attack Clip", "##NpcClipAtk", edited_npc.attack_clip_view(),
+                          [&](const std::string_view s) { return edited_npc.set_attack_clip(s); });
+
+                if (play_state_ != EditorPlayState::edit &&
+                    gameplay_session_ != nullptr) {
+                    if (const auto* const agent =
+                            gameplay_session_->npc_ai().find_agent(selected_node_)) {
+                        const auto fsm_name = [](const NpcFsmState s) noexcept -> const char* {
+                            switch (s) {
+                            case NpcFsmState::idle: return "idle";
+                            case NpcFsmState::patrol: return "patrol";
+                            case NpcFsmState::investigate_noise: return "investigate_noise";
+                            case NpcFsmState::search_last_known: return "search_last_known";
+                            case NpcFsmState::chase: return "chase";
+                            case NpcFsmState::attack: return "attack";
+                            case NpcFsmState::flee: return "flee";
+                            case NpcFsmState::return_home: return "return_home";
+                            case NpcFsmState::traverse_off_mesh_link: return "traverse_off_mesh_link";
+                            case NpcFsmState::dead: return "dead";
+                            default: return "unknown";
+                            }
+                        };
+                        ui_kit_.property_row("Runtime State");
+                        ImGui::TextUnformatted(fsm_name(agent->state));
+                        ui_kit_.property_row("Runtime HP");
+                        ImGui::Text("%.1f / %.1f", agent->health, agent->max_health);
+                        ui_kit_.property_row("Perception");
+                        ImGui::Text(
+                            "%s | %u wps | %s",
+                            agent->perception.can_see_target ? "Sees target" : "Clear",
+                            agent->current_path.waypoint_count,
+                            agent->active_clip[0] != '\0' ? agent->active_clip.data() : "-");
+                    }
+                }
+
+                ui_kit_.property_row("Component");
+                if (ImGui::SmallButton("Remove NPC AI")) {
+                    remove_npc_requested = true;
+                }
+                ui_kit_.end_property_grid();
+            }
+
+            if (remove_npc_requested) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                static_cast<void>(scene.remove_npc_ai(selected_node_));
+            } else if (npc_changed) {
+                edited_npc = sanitize_npc_ai_component(edited_npc);
+                if (!inspector_edit_snapshot_) {
+                    inspector_edit_snapshot_ = scene;
+                    if (auto previous =
+                            inspector_edit_snapshot_->node(selected_node_)) {
+                        previous->get() = node_before_edit;
+                    }
+                }
+                static_cast<void>(scene.set_npc_ai(selected_node_, edited_npc));
+            }
+        } else {
+            if (ui_kit_.action_button(
+                    "AddNpcAiButton",
+                    EditorIcon::add,
+                    "Add NPC AI",
+                    EditorButtonStyle::secondary,
+                    editable)) {
+                if (inspector_edit_snapshot_) {
+                    push_undo_snapshot(std::move(*inspector_edit_snapshot_));
+                    inspector_edit_snapshot_.reset();
+                }
+                checkpoint_scene(scene);
+                static_cast<void>(
+                    scene.set_npc_ai(selected_node_, NpcAiComponent{}));
+            }
+        }
+    }
+    {
         ui_kit_.section_header(EditorIcon::model, "Prefab");
         const SceneNodeId enclosing_root =
             scene.enclosing_prefab_root(selected_node_);
@@ -5634,6 +6331,344 @@ void draw_spline_and_camera_wireframe(
     }
 }
 
+void draw_navigation_and_ai_debug(
+    ImDrawList* const draw_list,
+    const SceneDocument& scene,
+    const SceneNodeId selected_node,
+    const glm::mat4& view_proj,
+    const ImVec2 image_minimum,
+    const float image_width,
+    const float image_height,
+    const NavMeshData* const navmesh,
+    const NavigationRuntime* const nav_runtime,
+    const NpcAiRuntimeSystem* const npc_ai,
+    const NavPath* const preview_path,
+    const bool has_preview_path,
+    const glm::vec3 preview_start,
+    const glm::vec3 preview_goal) noexcept {
+    if (draw_list == nullptr || image_width <= 1.0F || image_height <= 1.0F) {
+        return;
+    }
+
+    const auto project_point = [&](const glm::vec3 world_pos,
+                                   ImVec2& out_screen) noexcept -> bool {
+        const glm::vec4 clip = view_proj * glm::vec4(world_pos, 1.0F);
+        if (clip.w <= 1.0e-4F) {
+            return false;
+        }
+        const glm::vec3 ndc = glm::vec3(clip) / clip.w;
+        out_screen = ImVec2(
+            image_minimum.x + (ndc.x * 0.5F + 0.5F) * image_width,
+            image_minimum.y + (0.5F - ndc.y * 0.5F) * image_height);
+        return std::isfinite(out_screen.x) && std::isfinite(out_screen.y);
+    };
+
+    const auto draw_segment = [&](const glm::vec3 a,
+                                  const glm::vec3 b,
+                                  const ImU32 color,
+                                  const float thickness = 1.4F) noexcept {
+        ImVec2 sa{};
+        ImVec2 sb{};
+        if (project_point(a, sa) && project_point(b, sb)) {
+            draw_list->AddLine(sa, sb, color, thickness);
+        }
+    };
+
+    const auto draw_wire_box = [&](const glm::vec3 center,
+                                   const glm::mat3& axes,
+                                   const glm::vec3 half,
+                                   const ImU32 color,
+                                   const float thickness) noexcept {
+        std::array<glm::vec3, 8U> c{};
+        std::size_t k = 0U;
+        for (int sx : {-1, 1}) {
+            for (int sy : {-1, 1}) {
+                for (int sz : {-1, 1}) {
+                    c[k++] = center +
+                        axes[0] * (static_cast<float>(sx) * half.x) +
+                        axes[1] * (static_cast<float>(sy) * half.y) +
+                        axes[2] * (static_cast<float>(sz) * half.z);
+                }
+            }
+        }
+        constexpr std::array<std::pair<std::size_t, std::size_t>, 12U> edges{{
+            {0U, 1U}, {2U, 3U}, {4U, 5U}, {6U, 7U},
+            {0U, 2U}, {1U, 3U}, {4U, 6U}, {5U, 7U},
+            {0U, 4U}, {1U, 5U}, {2U, 6U}, {3U, 7U},
+        }};
+        for (const auto& [i0, i1] : edges) {
+            draw_segment(c[i0], c[i1], color, thickness);
+        }
+    };
+
+    const auto draw_ground_circle = [&](const glm::vec3 center,
+                                        const float radius,
+                                        const ImU32 color,
+                                        const int segs,
+                                        const float thickness) noexcept {
+        if (radius <= 0.02F) {
+            return;
+        }
+        const float step = 6.2831853F / static_cast<float>(segs);
+        for (int s = 0; s < segs; ++s) {
+            const float a0 = static_cast<float>(s) * step;
+            const float a1 = static_cast<float>(s + 1) * step;
+            const glm::vec3 p0 = center +
+                glm::vec3(std::cos(a0) * radius, 0.0F, std::sin(a0) * radius);
+            const glm::vec3 p1 = center +
+                glm::vec3(std::cos(a1) * radius, 0.0F, std::sin(a1) * radius);
+            draw_segment(p0, p1, color, thickness);
+        }
+    };
+
+    const auto draw_parabolic_arc = [&](const glm::vec3 start,
+                                        const glm::vec3 end,
+                                        const float apex_boost,
+                                        const ImU32 color,
+                                        const float thickness) noexcept {
+        constexpr int arc_segs = 10;
+        glm::vec3 prev = start;
+        for (int s = 1; s <= arc_segs; ++s) {
+            const float t = static_cast<float>(s) / static_cast<float>(arc_segs);
+            glm::vec3 pt = glm::mix(start, end, t);
+            pt.y += 4.0F * apex_boost * t * (1.0F - t);
+            draw_segment(prev, pt, color, thickness);
+            prev = pt;
+        }
+        ImVec2 ss{};
+        ImVec2 se{};
+        if (project_point(start, ss)) {
+            draw_list->AddCircleFilled(ss, 4.0F, color, 10);
+        }
+        if (project_point(end, se)) {
+            draw_list->AddCircleFilled(se, 4.0F, color, 10);
+        }
+    };
+
+    // 1. Baked NavMesh polygons, portals, and off-mesh links.
+    if (navmesh != nullptr && !navmesh->polygons.empty()) {
+        const ImU32 poly_edge = IM_COL32(64, 212, 198, 175);
+        const ImU32 portal_col = IM_COL32(120, 238, 255, 95);
+        const std::size_t poly_step =
+            navmesh->polygons.size() > 1500U ? 2U : 1U;
+        for (std::size_t i = 0U; i < navmesh->polygons.size(); i += poly_step) {
+            const NavMeshPolygon& p = navmesh->polygons[i];
+            const glm::vec3 v0(p.min_xz.x, p.corner_y[0U] + 0.04F, p.min_xz.y);
+            const glm::vec3 v1(p.max_xz.x, p.corner_y[1U] + 0.04F, p.min_xz.y);
+            const glm::vec3 v2(p.max_xz.x, p.corner_y[2U] + 0.04F, p.max_xz.y);
+            const glm::vec3 v3(p.min_xz.x, p.corner_y[3U] + 0.04F, p.max_xz.y);
+            draw_segment(v0, v1, poly_edge, 1.15F);
+            draw_segment(v1, v2, poly_edge, 1.15F);
+            draw_segment(v2, v3, poly_edge, 1.15F);
+            draw_segment(v3, v0, poly_edge, 1.15F);
+        }
+        const std::size_t portal_step =
+            navmesh->portals.size() > 2500U ? 2U : 1U;
+        for (std::size_t i = 0U; i < navmesh->portals.size(); i += portal_step) {
+            const NavMeshPortalLink& link = navmesh->portals[i];
+            draw_segment(
+                link.portal_left + glm::vec3(0.0F, 0.05F, 0.0F),
+                link.portal_right + glm::vec3(0.0F, 0.05F, 0.0F),
+                portal_col,
+                1.0F);
+        }
+        for (const NavMeshOffMeshConnection& om : navmesh->off_mesh_links) {
+            const float boost =
+                om.traversal_kind == OffMeshTraversalKind::jump
+                    ? std::max(om.jump_height, 0.45F)
+                    : 0.25F;
+            draw_parabolic_arc(
+                om.start_pos + glm::vec3(0.0F, 0.08F, 0.0F),
+                om.end_pos + glm::vec3(0.0F, 0.08F, 0.0F),
+                boost,
+                IM_COL32(255, 192, 72, 230),
+                2.0F);
+        }
+    }
+
+    // 2. Dynamic obstacles (live blockers in Play, or scene NavObstacles in Edit).
+    if (nav_runtime != nullptr) {
+        for (const DynamicNavBlocker& b : nav_runtime->dynamic_blockers()) {
+            const ImU32 obs_col = b.block_navigation
+                ? IM_COL32(248, 92, 92, 225)
+                : IM_COL32(255, 168, 72, 210);
+            if (b.shape == NavObstacleShape::cylinder) {
+                const float r = b.radius + b.margin;
+                const float hh = b.height * 0.5F;
+                draw_ground_circle(
+                    b.center + glm::vec3(0.0F, hh, 0.0F), r, obs_col, 16, 1.5F);
+                draw_ground_circle(
+                    b.center - glm::vec3(0.0F, hh, 0.0F), r, obs_col, 16, 1.5F);
+            } else {
+                draw_wire_box(
+                    b.center,
+                    b.axes,
+                    b.half_extents + glm::vec3(b.margin, 0.0F, b.margin),
+                    obs_col,
+                    1.5F);
+            }
+        }
+    } else {
+        for (const SceneNodeId obs_id : scene.nav_obstacles().owners()) {
+            const auto obs_opt = scene.nav_obstacle(obs_id);
+            const auto w_opt = scene_world_matrix(scene, obs_id);
+            if (!obs_opt || !w_opt || !obs_opt->get().enabled) {
+                continue;
+            }
+            const NavObstacleComponent& obs = obs_opt->get();
+            const ImU32 obs_col = (obs_id == selected_node)
+                ? IM_COL32(255, 228, 96, 250)
+                : (obs.block_navigation ? IM_COL32(248, 92, 92, 210)
+                                        : IM_COL32(255, 168, 72, 195));
+            const glm::mat4& w = *w_opt;
+            const glm::vec3 sx = glm::vec3(w[0]);
+            const glm::vec3 sy = glm::vec3(w[1]);
+            const glm::vec3 sz = glm::vec3(w[2]);
+            const float lx = std::max(glm::length(sx), 1.0e-3F);
+            const float ly = std::max(glm::length(sy), 1.0e-3F);
+            const float lz = std::max(glm::length(sz), 1.0e-3F);
+            const glm::mat3 axes(sx / lx, sy / ly, sz / lz);
+            const glm::vec3 center = glm::vec3(w * glm::vec4(obs.center_offset, 1.0F));
+            if (obs.shape == NavObstacleShape::cylinder) {
+                const float r = obs.radius * std::max(lx, lz) + obs.margin;
+                const float hh = obs.height * ly * 0.5F;
+                draw_ground_circle(
+                    center + glm::vec3(0.0F, hh, 0.0F), r, obs_col, 16, 1.5F);
+                draw_ground_circle(
+                    center - glm::vec3(0.0F, hh, 0.0F), r, obs_col, 16, 1.5F);
+            } else {
+                const glm::vec3 half = obs.half_extents * glm::vec3(lx, ly, lz) +
+                    glm::vec3(obs.margin, 0.0F, obs.margin);
+                draw_wire_box(center, axes, half, obs_col, 1.5F);
+            }
+        }
+        for (const SceneNodeId lid : scene.off_mesh_links().owners()) {
+            const auto l_opt = scene.off_mesh_link(lid);
+            const auto w_opt = scene_world_matrix(scene, lid);
+            if (!l_opt || !w_opt || !l_opt->get().enabled) {
+                continue;
+            }
+            const OffMeshLinkComponent& link = l_opt->get();
+            const glm::vec3 start_w =
+                glm::vec3(*w_opt * glm::vec4(link.start_offset, 1.0F));
+            glm::vec3 end_w =
+                glm::vec3(*w_opt * glm::vec4(link.end_offset, 1.0F));
+            if (link.target_node_uuid) {
+                const SceneNodeId tid = scene.find_by_uuid(link.target_node_uuid);
+                if (const auto tw = scene_world_matrix(scene, tid)) {
+                    end_w = glm::vec3(*tw * glm::vec4(link.end_offset, 1.0F));
+                }
+            }
+            draw_parabolic_arc(
+                start_w + glm::vec3(0.0F, 0.08F, 0.0F),
+                end_w + glm::vec3(0.0F, 0.08F, 0.0F),
+                link.traversal_kind == OffMeshTraversalKind::jump
+                    ? std::max(link.jump_height, 0.45F)
+                    : 0.25F,
+                lid == selected_node
+                    ? IM_COL32(255, 240, 120, 255)
+                    : IM_COL32(255, 192, 72, 220),
+                2.0F);
+        }
+    }
+
+    // 3. Test path polyline in Edit mode.
+    if (has_preview_path && preview_path != nullptr &&
+        preview_path->waypoint_count > 0U) {
+        const ImU32 path_col = IM_COL32(108, 255, 128, 245);
+        for (std::uint32_t i = 0U; i < preview_path->waypoint_count; ++i) {
+            const NavPathWaypoint& wp = preview_path->waypoints[i];
+            const glm::vec3 p_up = wp.position + glm::vec3(0.0F, 0.14F, 0.0F);
+            ImVec2 sp{};
+            if (project_point(p_up, sp)) {
+                draw_list->AddCircleFilled(sp, 4.0F, path_col, 10);
+            }
+            if (i > 0U) {
+                const glm::vec3 prev_up =
+                    preview_path->waypoints[i - 1U].position +
+                    glm::vec3(0.0F, 0.14F, 0.0F);
+                draw_segment(prev_up, p_up, path_col, 2.5F);
+            }
+            if (wp.is_off_mesh_traversal) {
+                draw_parabolic_arc(
+                    wp.position + glm::vec3(0.0F, 0.14F, 0.0F),
+                    wp.off_mesh_end + glm::vec3(0.0F, 0.14F, 0.0F),
+                    std::max(wp.jump_height, 0.45F),
+                    IM_COL32(255, 232, 92, 250),
+                    2.6F);
+            }
+        }
+        ImVec2 ss{};
+        ImVec2 sg{};
+        if (project_point(preview_start + glm::vec3(0.0F, 0.15F, 0.0F), ss)) {
+            draw_list->AddCircle(ss, 7.0F, IM_COL32(100, 220, 255, 255), 14, 2.0F);
+        }
+        if (project_point(preview_goal + glm::vec3(0.0F, 0.15F, 0.0F), sg)) {
+            draw_list->AddCircle(sg, 7.0F, IM_COL32(255, 110, 110, 255), 14, 2.0F);
+        }
+    }
+
+    // 4. Live NPC paths, FOV vision cones, and heard noise indicators.
+    if (npc_ai != nullptr) {
+        for (const SceneNodeId npc_id : scene.npc_ais().owners()) {
+            const auto npc_opt = scene.npc_ai(npc_id);
+            const NpcRuntimeAgent* const agent = npc_ai->find_agent(npc_id);
+            if (!npc_opt || agent == nullptr || !npc_opt->get().enabled) {
+                continue;
+            }
+            const NpcAiComponent& npc = npc_opt->get();
+            const glm::vec3 eye =
+                agent->position + glm::vec3(0.0F, npc.eye_height, 0.0F);
+            const float yaw_rad = glm::radians(agent->facing_yaw_degrees);
+            const float half_fov = glm::radians(npc.sight_fov_degrees * 0.5F);
+            const float range = std::min(npc.sight_range, 28.0F);
+            const ImU32 cone_col = agent->perception.can_see_target
+                ? IM_COL32(255, 76, 76, 230)
+                : IM_COL32(255, 220, 96, 175);
+            const glm::vec3 left_dir(
+                std::sin(yaw_rad - half_fov), 0.0F, std::cos(yaw_rad - half_fov));
+            const glm::vec3 right_dir(
+                std::sin(yaw_rad + half_fov), 0.0F, std::cos(yaw_rad + half_fov));
+            draw_segment(eye, eye + left_dir * range, cone_col, 1.5F);
+            draw_segment(eye, eye + right_dir * range, cone_col, 1.5F);
+            constexpr int arc_steps = 8;
+            for (int k = 0; k < arc_steps; ++k) {
+                const float a0 = yaw_rad - half_fov +
+                    (2.0F * half_fov) * (static_cast<float>(k) / static_cast<float>(arc_steps));
+                const float a1 = yaw_rad - half_fov +
+                    (2.0F * half_fov) * (static_cast<float>(k + 1) / static_cast<float>(arc_steps));
+                draw_segment(
+                    eye + glm::vec3(std::sin(a0), 0.0F, std::cos(a0)) * range,
+                    eye + glm::vec3(std::sin(a1), 0.0F, std::cos(a1)) * range,
+                    cone_col,
+                    1.2F);
+            }
+
+            if (agent->has_active_path &&
+                agent->current_path.waypoint_count > 0U) {
+                glm::vec3 prev = agent->position + glm::vec3(0.0F, 0.14F, 0.0F);
+                for (std::uint32_t w = agent->current_waypoint_index;
+                     w < agent->current_path.waypoint_count;
+                     ++w) {
+                    const glm::vec3 cur =
+                        agent->current_path.waypoints[w].position +
+                        glm::vec3(0.0F, 0.14F, 0.0F);
+                    draw_segment(prev, cur, IM_COL32(96, 240, 255, 225), 2.1F);
+                    prev = cur;
+                }
+            }
+            if (agent->investigating_noise) {
+                draw_ground_circle(
+                    agent->latched_noise_pos + glm::vec3(0.0F, 0.12F, 0.0F),
+                    0.85F,
+                    IM_COL32(255, 140, 64, 235),
+                    16,
+                    2.0F);
+            }
+        }
+    }
+}
+
 } // namespace
 
 void EditorUi::build_viewport(
@@ -5750,6 +6785,8 @@ void EditorUi::build_viewport(
     static_cast<void>(ImGui::Checkbox("Skeleton", &show_skeleton_wireframe_));
     ImGui::SameLine(0.0F, 10.0F);
     static_cast<void>(ImGui::Checkbox("Splines", &show_spline_wireframe_));
+    ImGui::SameLine(0.0F, 10.0F);
+    static_cast<void>(ImGui::Checkbox("Nav & AI", &show_navigation_debug_));
 
     const ImVec2 available = ImGui::GetContentRegionAvail();
     const float dpi = std::max(
@@ -5941,6 +6978,43 @@ void EditorUi::build_viewport(
             image_width,
             image_height,
             *sequencer_ui_);
+    }
+
+    if (show_navigation_debug_) {
+        const bool is_edit_nav = play_state_ == EditorPlayState::edit;
+        const NavMeshData* nav_ptr = nullptr;
+        const NavigationRuntime* nav_rt = nullptr;
+        const NpcAiRuntimeSystem* ai_rt = nullptr;
+        if (is_edit_nav) {
+            if (navigation_ui_ != nullptr) {
+                nav_ptr = &navigation_ui_->preview_runtime.navmesh();
+                if (!navigation_ui_->preview_runtime.dynamic_blockers().empty()) {
+                    nav_rt = &navigation_ui_->preview_runtime;
+                }
+            }
+        } else if (gameplay_session_ != nullptr) {
+            nav_ptr = &gameplay_session_->navigation().navmesh();
+            nav_rt = &gameplay_session_->navigation();
+            ai_rt = &gameplay_session_->npc_ai();
+        }
+        ImDrawList* const nav_dl = ImGui::GetWindowDrawList();
+        nav_dl->PushClipRect(image_minimum, image_maximum, true);
+        draw_navigation_and_ai_debug(
+            nav_dl,
+            scene,
+            selected_node_,
+            projection * view,
+            image_minimum,
+            image_width,
+            image_height,
+            nav_ptr,
+            nav_rt,
+            ai_rt,
+            navigation_ui_ != nullptr ? &navigation_ui_->last_test_path : nullptr,
+            is_edit_nav && navigation_ui_ != nullptr && navigation_ui_->has_test_path,
+            navigation_ui_ != nullptr ? navigation_ui_->test_start : glm::vec3{},
+            navigation_ui_ != nullptr ? navigation_ui_->test_goal : glm::vec3{});
+        nav_dl->PopClipRect();
     }
 
     if (play_state_ == EditorPlayState::edit &&
@@ -6420,6 +7494,12 @@ void EditorUi::build_assets(
                            entry.kind == AssetEntryKind::cutscene) {
                     open_cutscene_in_sequencer(scene, entry.relative_display);
                 } else if (row_result.double_clicked &&
+                           entry.kind == AssetEntryKind::navmesh) {
+                    open_navmesh_in_panel(entry.relative_display);
+                } else if (row_result.double_clicked &&
+                           entry.kind == AssetEntryKind::behavior_tree) {
+                    open_behavior_tree_in_panel(scene, entry.relative_display);
+                } else if (row_result.double_clicked &&
                            (entry.kind == AssetEntryKind::audio ||
                             entry.kind == AssetEntryKind::sound_cue) &&
                            audio_engine_ != nullptr) {
@@ -6449,6 +7529,14 @@ void EditorUi::build_assets(
                 if (entry.kind == AssetEntryKind::cutscene &&
                     ImGui::MenuItem("Open in Sequencer")) {
                     open_cutscene_in_sequencer(scene, entry.relative_display);
+                }
+                if (entry.kind == AssetEntryKind::navmesh &&
+                    ImGui::MenuItem("Load in Navigation & AI")) {
+                    open_navmesh_in_panel(entry.relative_display);
+                }
+                if (entry.kind == AssetEntryKind::behavior_tree &&
+                    ImGui::MenuItem("Open in Navigation & AI")) {
+                    open_behavior_tree_in_panel(scene, entry.relative_display);
                 }
                 if ((entry.kind == AssetEntryKind::audio ||
                      entry.kind == AssetEntryKind::sound_cue) &&
@@ -8869,42 +9957,6 @@ void scan_cutscene_files(
     std::sort(out_files.begin(), out_files.end());
 }
 
-void draw_node_uuid_binder(
-    const char* const id_suffix,
-    const char* const label,
-    SceneUuid& uuid_field,
-    const SceneDocument& scene,
-    const SceneNodeId selected_node,
-    bool& modified) {
-    ImGui::PushID(id_suffix);
-    std::string desc = "(none)";
-    if (uuid_field) {
-        const SceneNodeId bound = scene.find_by_uuid(uuid_field);
-        if (const auto nr = scene.node(bound)) {
-            desc = nr->get().name + " [" +
-                format_scene_uuid(uuid_field).substr(0U, 8U) + "]";
-        } else {
-            desc = format_scene_uuid(uuid_field);
-        }
-    }
-    ImGui::Text("%s: %s", label, desc.c_str());
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Bind Selected") && scene.valid(selected_node)) {
-        if (const auto u = scene.uuid(selected_node)) {
-            uuid_field = *u;
-            modified = true;
-        }
-    }
-    if (uuid_field) {
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Clear")) {
-            uuid_field = {};
-            modified = true;
-        }
-    }
-    ImGui::PopID();
-}
-
 } // namespace
 
 bool EditorUi::sequencer_preview_active() const noexcept {
@@ -10260,6 +11312,531 @@ void EditorUi::build_sequencer_panel(
     if (seq_edited) {
         st.dirty = true;
         st.needs_preview_eval = st.preview_active;
+    }
+
+    ImGui::End();
+}
+
+const NavMeshData* EditorUi::editor_navmesh() const noexcept {
+    if (navigation_ui_ == nullptr ||
+        !navigation_ui_->preview_runtime.has_navmesh()) {
+        return nullptr;
+    }
+    return &navigation_ui_->preview_runtime.navmesh();
+}
+
+std::string_view EditorUi::editor_navmesh_relative_path() const noexcept {
+    if (navigation_ui_ == nullptr) {
+        return {};
+    }
+    return navigation_ui_->navmesh_relative_path;
+}
+
+NavigationStatusSnapshot EditorUi::navigation_status(
+    const SceneDocument& scene) const {
+    NavigationStatusSnapshot snap{};
+    const bool playing = play_state_ != EditorPlayState::edit &&
+        gameplay_session_ != nullptr && gameplay_session_->active();
+    const NavMeshData* nav = nullptr;
+    if (playing) {
+        nav = &gameplay_session_->navigation().navmesh();
+        snap.runtime_agent_count = gameplay_session_->npc_ai().agents().size();
+        snap.active_noise_count =
+            gameplay_session_->npc_ai().perception().active_noises().size();
+    } else if (navigation_ui_ != nullptr) {
+        nav = &navigation_ui_->preview_runtime.navmesh();
+    }
+    if (nav != nullptr && !nav->polygons.empty()) {
+        snap.has_navmesh = true;
+        snap.polygon_count = nav->polygons.size();
+        snap.portal_count = nav->portals.size();
+        snap.off_mesh_link_count = nav->off_mesh_links.size();
+    }
+    snap.scene_obstacle_count = scene.nav_obstacles().size();
+    snap.scene_off_mesh_count = scene.off_mesh_links().size();
+    snap.scene_npc_count = scene.npc_ais().size();
+    if (navigation_ui_ != nullptr) {
+        snap.relative_path = navigation_ui_->navmesh_relative_path;
+        snap.has_test_path = navigation_ui_->has_test_path;
+        snap.test_path_waypoints = navigation_ui_->last_test_path.waypoint_count;
+        snap.test_path_cost = navigation_ui_->last_test_path.total_cost;
+        snap.test_path_complete = navigation_ui_->last_test_path.complete;
+        snap.test_path_used_off_mesh =
+            navigation_ui_->last_test_path.used_off_mesh_link;
+    }
+    return snap;
+}
+
+void EditorUi::open_navmesh_in_panel(const std::string_view relative_path) {
+    navigation_ai_panel_open_ = true;
+    std::string err;
+    if (!mcp_navigation_load(relative_path, err) && navigation_ui_ != nullptr) {
+        navigation_ui_->error = std::move(err);
+    }
+}
+
+void EditorUi::open_behavior_tree_in_panel(
+    SceneDocument& scene,
+    const std::string_view relative_path) {
+    navigation_ai_panel_open_ = true;
+    if (navigation_ui_ == nullptr) {
+        return;
+    }
+    navigation_ui_->bt_path_buf.fill('\0');
+    const std::size_t n = std::min(
+        relative_path.size(), navigation_ui_->bt_path_buf.size() - 1U);
+    std::memcpy(navigation_ui_->bt_path_buf.data(), relative_path.data(), n);
+
+    BehaviorTreeAsset loaded{};
+    std::string err;
+    if (!load_behavior_tree_file(
+            asset_browser_.root(), relative_path, loaded, err)) {
+        navigation_ui_->error = std::move(err);
+        navigation_ui_->status.clear();
+        return;
+    }
+    navigation_ui_->bt_id_buf.fill('\0');
+    const std::size_t id_n =
+        std::min(loaded.id.size(), navigation_ui_->bt_id_buf.size() - 1U);
+    std::memcpy(navigation_ui_->bt_id_buf.data(), loaded.id.data(), id_n);
+
+    navigation_ui_->bt_title_buf.fill('\0');
+    const std::size_t t_n =
+        std::min(loaded.title.size(), navigation_ui_->bt_title_buf.size() - 1U);
+    std::memcpy(navigation_ui_->bt_title_buf.data(), loaded.title.data(), t_n);
+
+    static_cast<void>(scene);
+    navigation_ui_->error.clear();
+    navigation_ui_->status =
+        "Loaded Behavior Tree '" + std::string(relative_path) +
+        "' (" + std::to_string(loaded.nodes.size()) + " nodes).";
+}
+
+bool EditorUi::mcp_navigation_bake(
+    const SceneDocument& scene,
+    Renderer& renderer,
+    const NavMeshBakeSettings* const override_settings,
+    std::string& error) {
+    error.clear();
+    if (navigation_ui_ == nullptr) {
+        error = "Navigation UI state is unavailable.";
+        return false;
+    }
+    const NavMeshBakeSettings settings = override_settings != nullptr
+        ? sanitize_navmesh_bake_settings(*override_settings)
+        : sanitize_navmesh_bake_settings(navigation_ui_->bake_settings);
+    navigation_ui_->bake_settings = settings;
+
+    const GameplayRendererBridge bridge = make_gameplay_renderer_bridge(renderer);
+    NavMeshData baked{};
+    if (!bake_navmesh_from_scene(
+            scene,
+            settings,
+            baked,
+            &error,
+            bridge.bounds_provider,
+            bridge.collision_provider)) {
+        if (error.empty()) {
+            error = "Failed to bake NavMesh from scene geometry.";
+        }
+        navigation_ui_->error = error;
+        return false;
+    }
+    navigation_ui_->preview_runtime.set_navmesh(std::move(baked));
+    navigation_ui_->preview_runtime.sync_dynamic_obstacles(scene, nullptr);
+    navigation_ui_->synced_scene_instance_id = scene.instance_id();
+    navigation_ui_->synced_content_revision = scene.content_revision();
+    navigation_ui_->synced_structure_revision = scene.structure_revision();
+    navigation_ui_->has_test_path = false;
+    navigation_ui_->last_test_path = {};
+    if (gameplay_session_ != nullptr) {
+        gameplay_session_->set_startup_navmesh(
+            navigation_ui_->preview_runtime.navmesh());
+    }
+    navigation_ui_->error.clear();
+    const NavMeshData& nav = navigation_ui_->preview_runtime.navmesh();
+    navigation_ui_->status =
+        "Baked NavMesh: " + std::to_string(nav.polygons.size()) +
+        " polys, " + std::to_string(nav.portals.size()) +
+        " portals, " + std::to_string(nav.off_mesh_links.size()) +
+        " off-mesh links.";
+    return true;
+}
+
+void EditorUi::mcp_navigation_clear() noexcept {
+    if (navigation_ui_ == nullptr) {
+        return;
+    }
+    navigation_ui_->preview_runtime.clear();
+    navigation_ui_->navmesh_relative_path.clear();
+    navigation_ui_->has_test_path = false;
+    navigation_ui_->last_test_path = {};
+    if (gameplay_session_ != nullptr) {
+        gameplay_session_->set_startup_navmesh(NavMeshData{});
+        gameplay_session_->set_startup_navmesh_path({});
+    }
+    navigation_ui_->error.clear();
+    navigation_ui_->status.clear();
+}
+
+bool EditorUi::mcp_navigation_save(
+    const SceneDocument& scene,
+    const std::string_view custom_relative_path,
+    std::string& out_saved_path,
+    std::string& error) {
+    static_cast<void>(scene);
+    error.clear();
+    out_saved_path.clear();
+    if (navigation_ui_ == nullptr ||
+        !navigation_ui_->preview_runtime.has_navmesh()) {
+        error = "No baked or loaded NavMesh is available to save.";
+        return false;
+    }
+    std::string target(custom_relative_path);
+    if (target.empty()) {
+        target = navigation_ui_->navmesh_relative_path;
+    }
+    if (target.empty()) {
+        target = navigation_ui_->navmesh_path_buf.data();
+    }
+    if (target.empty()) {
+        target = "navmesh/main.vcrnav.json";
+    }
+    if (!save_navmesh_file(
+            navigation_ui_->preview_runtime.navmesh(),
+            asset_browser_.root(),
+            target,
+            error)) {
+        navigation_ui_->error = error;
+        return false;
+    }
+    navigation_ui_->navmesh_relative_path = target;
+    navigation_ui_->navmesh_path_buf.fill('\0');
+    const std::size_t n = std::min(
+        target.size(), navigation_ui_->navmesh_path_buf.size() - 1U);
+    std::memcpy(navigation_ui_->navmesh_path_buf.data(), target.data(), n);
+    if (gameplay_session_ != nullptr) {
+        gameplay_session_->set_startup_navmesh_path(target);
+    }
+    refresh_asset_browser();
+    out_saved_path = target;
+    navigation_ui_->error.clear();
+    navigation_ui_->status = "Saved NavMesh to '" + target + "'.";
+    return true;
+}
+
+bool EditorUi::mcp_navigation_load(
+    const std::string_view relative_path,
+    std::string& error) {
+    error.clear();
+    if (navigation_ui_ == nullptr) {
+        error = "Navigation UI state is unavailable.";
+        return false;
+    }
+    NavMeshData loaded{};
+    if (!load_navmesh_file(
+            asset_browser_.root(), relative_path, loaded, error)) {
+        navigation_ui_->error = error;
+        return false;
+    }
+    navigation_ui_->preview_runtime.set_navmesh(std::move(loaded));
+    navigation_ui_->navmesh_relative_path = std::string(relative_path);
+    navigation_ui_->navmesh_path_buf.fill('\0');
+    const std::size_t n = std::min(
+        relative_path.size(), navigation_ui_->navmesh_path_buf.size() - 1U);
+    std::memcpy(navigation_ui_->navmesh_path_buf.data(), relative_path.data(), n);
+    navigation_ui_->synced_scene_instance_id = 0U;
+    navigation_ui_->has_test_path = false;
+    navigation_ui_->last_test_path = {};
+    if (gameplay_session_ != nullptr) {
+        gameplay_session_->set_startup_navmesh_path(relative_path);
+    }
+    navigation_ui_->error.clear();
+    const NavMeshData& nav = navigation_ui_->preview_runtime.navmesh();
+    navigation_ui_->status =
+        "Loaded NavMesh '" + std::string(relative_path) + "' (" +
+        std::to_string(nav.polygons.size()) + " polys).";
+    return true;
+}
+
+bool EditorUi::mcp_navigation_test_path(
+    const SceneDocument& scene,
+    const glm::vec3 start,
+    const glm::vec3 goal,
+    NavPath& out_path,
+    std::string& error) {
+    error.clear();
+    out_path = {};
+    if (navigation_ui_ == nullptr ||
+        !navigation_ui_->preview_runtime.has_navmesh()) {
+        error = "Bake or load a NavMesh before testing paths.";
+        return false;
+    }
+    if (!std::isfinite(start.x) || !std::isfinite(start.y) ||
+        !std::isfinite(start.z) || !std::isfinite(goal.x) ||
+        !std::isfinite(goal.y) || !std::isfinite(goal.z)) {
+        error = "Start and goal coordinates must be finite.";
+        return false;
+    }
+    navigation_ui_->preview_runtime.sync_dynamic_obstacles(scene, nullptr);
+    navigation_ui_->synced_scene_instance_id = scene.instance_id();
+    navigation_ui_->synced_content_revision = scene.content_revision();
+    navigation_ui_->synced_structure_revision = scene.structure_revision();
+    navigation_ui_->test_start = start;
+    navigation_ui_->test_goal = goal;
+
+    NavPathQueryOptions q_opts{};
+    q_opts.agent_radius = navigation_ui_->bake_settings.agent_radius;
+    q_opts.agent_height = navigation_ui_->bake_settings.agent_height;
+    q_opts.allow_off_mesh_links = true;
+    q_opts.allow_partial_path = true;
+    const bool ok = navigation_ui_->preview_runtime.find_path(
+        start, goal, out_path, q_opts);
+    navigation_ui_->last_test_path = out_path;
+    navigation_ui_->has_test_path = ok;
+    if (!ok) {
+        error = "No valid path found between start and goal.";
+        navigation_ui_->error = error;
+        return false;
+    }
+    navigation_ui_->error.clear();
+    navigation_ui_->status =
+        "Test path: " + std::to_string(out_path.waypoint_count) +
+        " waypoints, cost=" + std::to_string(out_path.total_cost) +
+        (out_path.complete ? " (complete)" : " (partial)");
+    return true;
+}
+
+bool EditorUi::mcp_navigation_create_default_bt(
+    const std::string_view custom_relative_path,
+    const std::string_view id,
+    const std::string_view title,
+    std::string& out_saved_path,
+    std::string& error) {
+    error.clear();
+    out_saved_path.clear();
+    const std::string_view bt_id =
+        id.empty() ? std::string_view("default_tactical") : id;
+    const std::string_view bt_title =
+        title.empty() ? std::string_view("Default Tactical NPC") : title;
+    BehaviorTreeAsset bt = make_default_tactical_behavior_tree(bt_id, bt_title);
+
+    std::string target(custom_relative_path);
+    if (target.empty() && navigation_ui_ != nullptr) {
+        target = navigation_ui_->bt_path_buf.data();
+    }
+    if (target.empty()) {
+        target = "ai/default_tactical.vcrbt.json";
+    }
+    if (!save_behavior_tree_file(bt, asset_browser_.root(), target, error)) {
+        if (navigation_ui_ != nullptr) {
+            navigation_ui_->error = error;
+        }
+        return false;
+    }
+    if (navigation_ui_ != nullptr) {
+        navigation_ui_->bt_path_buf.fill('\0');
+        const std::size_t pn =
+            std::min(target.size(), navigation_ui_->bt_path_buf.size() - 1U);
+        std::memcpy(navigation_ui_->bt_path_buf.data(), target.data(), pn);
+        navigation_ui_->error.clear();
+        navigation_ui_->status = "Created Behavior Tree '" + target + "'.";
+    }
+    refresh_asset_browser();
+    out_saved_path = std::move(target);
+    return true;
+}
+
+void EditorUi::build_navigation_ai_panel(
+    SceneDocument& scene,
+    Renderer& renderer,
+    FlyCamera& camera) {
+    if (!navigation_ai_panel_open_ || navigation_ui_ == nullptr) {
+        return;
+    }
+    NavigationEditorUiState& st = *navigation_ui_;
+
+    if (play_state_ == EditorPlayState::edit &&
+        st.preview_runtime.has_navmesh() &&
+        (st.synced_scene_instance_id != scene.instance_id() ||
+         st.synced_content_revision != scene.content_revision() ||
+         st.synced_structure_revision != scene.structure_revision())) {
+        st.preview_runtime.sync_dynamic_obstacles(scene, nullptr);
+        st.synced_scene_instance_id = scene.instance_id();
+        st.synced_content_revision = scene.content_revision();
+        st.synced_structure_revision = scene.structure_revision();
+    }
+
+    ImGui::SetNextWindowSize(
+        ImVec2(420.0F, 520.0F), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Navigation & AI", &navigation_ai_panel_open_)) {
+        ImGui::End();
+        return;
+    }
+
+    const bool editable = play_state_ == EditorPlayState::edit;
+    const NavMeshData& active_nav =
+        (!editable && gameplay_session_ != nullptr && gameplay_session_->active())
+            ? gameplay_session_->navigation().navmesh()
+            : st.preview_runtime.navmesh();
+
+    ImGui::Text(
+        "NavMesh: %zu polys | %zu portals | %zu off-mesh | %zu NPCs | %zu obstacles",
+        active_nav.polygons.size(),
+        active_nav.portals.size(),
+        active_nav.off_mesh_links.size(),
+        scene.npc_ais().size(),
+        scene.nav_obstacles().size());
+
+    if (!st.error.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 110, 110, 255));
+        ImGui::TextWrapped("%s", st.error.c_str());
+        ImGui::PopStyleColor();
+    } else if (!st.status.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(140, 235, 175, 255));
+        ImGui::TextWrapped("%s", st.status.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    if (ImGui::CollapsingHeader("NavMesh Bake & Persistence", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::BeginDisabled(!editable);
+        ImGui::DragFloat("Cell Size", &st.bake_settings.cell_size, 0.02F, 0.1F, 4.0F, "%.2f m");
+        ImGui::DragFloat("Agent Radius", &st.bake_settings.agent_radius, 0.02F, 0.05F, 5.0F, "%.2f m");
+        ImGui::DragFloat("Agent Height", &st.bake_settings.agent_height, 0.05F, 0.2F, 10.0F, "%.2f m");
+        ImGui::DragFloat("Max Slope (deg)", &st.bake_settings.max_slope_degrees, 0.5F, 1.0F, 85.0F, "%.1f");
+        ImGui::DragFloat("Max Step Height", &st.bake_settings.max_step_height, 0.02F, 0.05F, 4.0F, "%.2f m");
+        ImGui::Checkbox("Include Terrain", &st.bake_settings.include_terrain);
+        ImGui::SameLine();
+        ImGui::Checkbox("Custom Bounds", &st.bake_settings.use_custom_bounds);
+        if (st.bake_settings.use_custom_bounds) {
+            ImGui::DragFloat3("Bounds Min", &st.bake_settings.custom_bounds_min.x, 0.5F, -10000.0F, 10000.0F, "%.1f");
+            ImGui::DragFloat3("Bounds Max", &st.bake_settings.custom_bounds_max.x, 0.5F, -10000.0F, 10000.0F, "%.1f");
+        }
+        int max_cells = static_cast<int>(st.bake_settings.max_grid_cells_per_axis);
+        if (ImGui::SliderInt("Max Grid / Axis", &max_cells, 16, 512)) {
+            st.bake_settings.max_grid_cells_per_axis =
+                static_cast<std::uint32_t>(std::clamp(max_cells, 16, 512));
+        }
+
+        if (ImGui::Button("Bake NavMesh##NavBakeBtn")) {
+            std::string err;
+            static_cast<void>(mcp_navigation_bake(scene, renderer, nullptr, err));
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Clear##NavClearBtn")) {
+            mcp_navigation_clear();
+        }
+        ImGui::SameLine();
+        static_cast<void>(ImGui::Checkbox("Viewport Overlay##NavPanelOverlay", &show_navigation_debug_));
+
+        ImGui::InputTextWithHint(
+            "NavMesh Path",
+            "navmesh/main.vcrnav.json",
+            st.navmesh_path_buf.data(),
+            st.navmesh_path_buf.size());
+        if (ImGui::Button("Save .vcrnav.json##NavSaveBtn")) {
+            std::string saved;
+            std::string err;
+            static_cast<void>(mcp_navigation_save(
+                scene, st.navmesh_path_buf.data(), saved, err));
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Load .vcrnav.json##NavLoadBtn")) {
+            std::string err;
+            static_cast<void>(
+                mcp_navigation_load(st.navmesh_path_buf.data(), err));
+        }
+        ImGui::EndDisabled();
+    }
+
+    if (ImGui::CollapsingHeader("Pathfinder Test", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::DragFloat3("Start", &st.test_start.x, 0.1F, -5000.0F, 5000.0F, "%.2f");
+        if (ImGui::SmallButton("Cam -> Start")) {
+            st.test_start = camera.position();
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Selected -> Goal") && scene.valid(selected_node_)) {
+            if (const auto w = scene_world_matrix(scene, selected_node_)) {
+                st.test_goal = glm::vec3((*w)[3]);
+            }
+        }
+        ImGui::DragFloat3("Goal", &st.test_goal.x, 0.1F, -5000.0F, 5000.0F, "%.2f");
+        if (ImGui::Button("Find Test Path##NavFindTestPath") && editable) {
+            NavPath tmp{};
+            std::string err;
+            static_cast<void>(
+                mcp_navigation_test_path(scene, st.test_start, st.test_goal, tmp, err));
+        }
+        if (st.has_test_path) {
+            ImGui::Text(
+                "Waypoints: %u | Cost: %.2f | %s%s",
+                st.last_test_path.waypoint_count,
+                st.last_test_path.total_cost,
+                st.last_test_path.complete ? "Complete" : "Partial",
+                st.last_test_path.used_off_mesh_link ? " + Off-Mesh" : "");
+        }
+    }
+
+    if (ImGui::CollapsingHeader("Behavior Tree & Perception")) {
+        ImGui::InputTextWithHint(
+            "BT Asset Path",
+            "ai/default_tactical.vcrbt.json",
+            st.bt_path_buf.data(),
+            st.bt_path_buf.size());
+        ImGui::InputText("BT ID", st.bt_id_buf.data(), st.bt_id_buf.size());
+        ImGui::InputText("BT Title", st.bt_title_buf.data(), st.bt_title_buf.size());
+        if (ImGui::Button("Create Default Tactical BT##NavCreateBt") && editable) {
+            std::string saved;
+            std::string err;
+            static_cast<void>(mcp_navigation_create_default_bt(
+                st.bt_path_buf.data(),
+                st.bt_id_buf.data(),
+                st.bt_title_buf.data(),
+                saved,
+                err));
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Assign to Selected NPC##NavAssignBt") &&
+            editable && scene.valid(selected_node_)) {
+            if (const auto npc_opt = scene.npc_ai(selected_node_)) {
+                NpcAiComponent updated = npc_opt->get();
+                if (updated.set_behavior_tree_path(st.bt_path_buf.data())) {
+                    checkpoint_scene(scene);
+                    updated.mode = NpcAiControlMode::behavior_tree;
+                    static_cast<void>(scene.set_npc_ai(selected_node_, updated));
+                    st.error.clear();
+                    st.status = "Assigned Behavior Tree to selected node.";
+                } else {
+                    st.error = "Invalid .vcrbt.json path.";
+                }
+            }
+        }
+
+        ImGui::Separator();
+        ImGui::DragFloat("Noise Loudness", &st.test_noise_loudness, 0.05F, 0.05F, 20.0F, "%.2f");
+        ImGui::DragFloat("Noise Radius", &st.test_noise_radius, 0.5F, 0.5F, 500.0F, "%.1f m");
+        if (ImGui::Button("Emit AI Noise at Camera##NavEmitNoise") &&
+            !editable && gameplay_session_ != nullptr && gameplay_session_->active()) {
+            gameplay_session_->emit_ai_noise(
+                camera.position(), st.test_noise_loudness, st.test_noise_radius);
+            st.status = "Emitted AI noise event.";
+        }
+        if (!editable && gameplay_session_ != nullptr && gameplay_session_->active()) {
+            for (const NpcRuntimeAgent& a : gameplay_session_->npc_ai().agents()) {
+                std::string name = "NPC";
+                if (const auto nr = scene.node(a.node_id)) {
+                    name = nr->get().name;
+                }
+                ImGui::Text(
+                    "%s | %s | HP %.0f | see=%d hear=%d wps=%u",
+                    name.c_str(),
+                    to_token(a.state).data(),
+                    a.health,
+                    a.perception.can_see_target ? 1 : 0,
+                    a.investigating_noise ? 1 : 0,
+                    a.current_path.waypoint_count);
+            }
+        }
     }
 
     ImGui::End();

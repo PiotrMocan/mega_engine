@@ -426,6 +426,8 @@ set(VCR_ENGINE_CORE_SOURCES
     src/asset_browser.cpp
     src/editor_scene_tools.cpp
     src/render_fixture_scene.cpp
+    src/navigation.cpp
+    src/npc_ai.cpp
 )
 
 add_library(vcr_engine SHARED ${VCR_ENGINE_CORE_SOURCES})
@@ -1044,6 +1046,23 @@ if(BUILD_TESTING)
     )
     vcr_apply_cxx_warning_flags(vcr_sequencer_camera_tests)
     add_test(NAME vcr_sequencer_camera_tests COMMAND vcr_sequencer_camera_tests)
+
+    add_executable(vcr_navigation_ai_tests tests/navigation_ai_tests.cpp)
+    target_link_libraries(vcr_navigation_ai_tests PRIVATE
+        vcr_engine
+        glm::glm
+        nlohmann_json::nlohmann_json
+        Threads::Threads
+    )
+    set_target_properties(vcr_navigation_ai_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+    if(WIN32)
+        target_link_libraries(vcr_navigation_ai_tests PRIVATE shell32)
+    endif()
+    add_dependencies(vcr_navigation_ai_tests vulkan_cube vcr_runtime_assets)
+    vcr_apply_cxx_warning_flags(vcr_navigation_ai_tests)
+    add_test(NAME vcr_navigation_ai_tests COMMAND vcr_navigation_ai_tests)
 
     add_executable(vcr_engine_gameplay_api_tests tests/engine_gameplay_api_tests.cpp)
     target_compile_definitions(vcr_engine_gameplay_api_tests PRIVATE

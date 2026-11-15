@@ -6,6 +6,8 @@
 #include "cutscene_sequencer.hpp"
 #include "game_overlay.hpp"
 #include "localization.hpp"
+#include "navigation.hpp"
+#include "npc_ai.hpp"
 #include "runtime_assets.hpp"
 #include "scene_io.hpp"
 
@@ -28,7 +30,7 @@ using Json = nlohmann::json;
     return {text.begin(), text.end()};
 }
 
-[[nodiscard]] std::filesystem::path from_utf8(const std::string& text) {
+[[nodiscard]] std::filesystem::path from_utf8(const std::string_view text) {
     return std::filesystem::path(std::u8string(text.begin(), text.end()));
 }
 
@@ -168,6 +170,8 @@ private:
     std::vector<std::filesystem::path> fonts;
     std::vector<std::filesystem::path> localizations;
     std::vector<std::filesystem::path> cutscenes;
+    std::vector<std::filesystem::path> navmeshes;
+    std::vector<std::filesystem::path> behavior_trees;
     for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
         if (++file_count > 1'000'000U) {
             error = "Project content exceeds the shipping file limit.";
@@ -192,9 +196,12 @@ private:
             (*rel.begin() == "dialogues" && ext == ".json");
         const bool cutscene = name.ends_with(".vcrseq.json") ||
             (*rel.begin() == "cutscenes" && ext == ".json");
+        const bool navmesh = name.ends_with(".vcrnav.json");
+        const bool behavior_tree = name.ends_with(".vcrbt.json");
         const bool font = name.ends_with(".vcrfont.json");
         const bool metadata = texture || model || audio || scene || config ||
-            localization || dialogue || cutscene || font ||
+            localization || dialogue || cutscene || navmesh ||
+            behavior_tree || font ||
             name.ends_with(".vcrmaterial.json") || name.ends_with(".vcrprefab.json") ||
             name.ends_with(".vcrcue.json");
         if (ext == ".wav" || ext == ".ogg" || ext == ".flac") {
@@ -254,6 +261,20 @@ private:
                 }
                 if (!copy_audio_references(doc, root, target, error)) return false;
                 cutscenes.push_back(rel);
+            } else if (navmesh) {
+                NavMeshData nav_check;
+                if (!load_navmesh_file(root, name, nav_check, error)) {
+                    error = "Shipping NavMesh validation failed for '" + name + "': " + error;
+                    return false;
+                }
+                navmeshes.push_back(rel);
+            } else if (behavior_tree) {
+                BehaviorTreeAsset bt_check;
+                if (!load_behavior_tree_file(root, name, bt_check, error)) {
+                    error = "Shipping Behavior Tree validation failed for '" + name + "': " + error;
+                    return false;
+                }
+                behavior_trees.push_back(rel);
             } else if (font) {
                 if (!doc.contains("image") || !doc["image"].is_string() ||
                     doc["image"].get_ref<const std::string&>().empty()) {
@@ -294,6 +315,37 @@ private:
         for (const auto& node : nodes) {
             if (node.value.kind == SceneNodeKind::model &&
                 !regular_unlinked_file(target, from_utf8(node.value.asset_path), error)) return false;
+            if (node.npc_ai.has_value()) {
+                const std::string_view bt_path =
+                    node.npc_ai->behavior_tree_path_view();
+                if (!bt_path.empty()) {
+                    if (!regular_unlinked_file(
+                            target, from_utf8(bt_path), error)) {
+                        return false;
+                    }
+                    BehaviorTreeAsset bt_verify;
+                    if (!load_behavior_tree_file(
+                            target, bt_path, bt_verify, error)) {
+                        error = "Shipping scene Behavior Tree validation failed for '" +
+                                std::string(bt_path) + "': " + error;
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    for (const auto& nav_rel : navmeshes) {
+        NavMeshData nav_verify;
+        if (!load_navmesh_file(target, utf8(nav_rel), nav_verify, error)) {
+            error = "Shipping NavMesh validation failed for '" + utf8(nav_rel) + "': " + error;
+            return false;
+        }
+    }
+    for (const auto& bt_rel : behavior_trees) {
+        BehaviorTreeAsset bt_verify;
+        if (!load_behavior_tree_file(target, utf8(bt_rel), bt_verify, error)) {
+            error = "Shipping Behavior Tree validation failed for '" + utf8(bt_rel) + "': " + error;
+            return false;
         }
     }
     for (const auto& loc_rel : localizations) {

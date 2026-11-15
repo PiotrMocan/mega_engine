@@ -683,6 +683,9 @@ struct ParsedPrefabNode {
     std::optional<GameplayComponent> gameplay{};
     std::optional<UiMarkerComponent> ui_marker{};
     std::optional<SplineComponent> spline{};
+    std::optional<NavObstacleComponent> nav_obstacle{};
+    std::optional<OffMeshLinkComponent> off_mesh_link{};
+    std::optional<NpcAiComponent> npc_ai{};
     std::uint32_t parent_index = invalid_scene_node_index;
 };
 
@@ -784,6 +787,21 @@ bool save_prefab_file(
             if (record.rigid_body &&
                 !valid_rigid_body_component(*record.rigid_body)) {
                 error = "Prefab rigid_body component values are invalid.";
+                return false;
+            }
+            if (record.nav_obstacle &&
+                !valid_nav_obstacle_component(*record.nav_obstacle)) {
+                error = "Prefab nav_obstacle component values are invalid.";
+                return false;
+            }
+            if (record.off_mesh_link &&
+                !valid_off_mesh_link_component(*record.off_mesh_link)) {
+                error = "Prefab off_mesh_link component values are invalid.";
+                return false;
+            }
+            if (record.npc_ai &&
+                !valid_npc_ai_component(*record.npc_ai)) {
+                error = "Prefab npc_ai component values are invalid.";
                 return false;
             }
             SceneNode node = record.value;
@@ -900,7 +918,8 @@ bool save_prefab_file(
             if (record.collider || record.rigid_body || record.audio_source ||
                 record.audio_listener || record.reverb_zone ||
                 record.animator || record.gameplay || record.ui_marker ||
-                record.spline) {
+                record.spline || record.nav_obstacle ||
+                record.off_mesh_link || record.npc_ai) {
                 Json components = Json::object();
                 if (record.collider) {
                     components["collider"] = collider_json(*record.collider);
@@ -936,6 +955,18 @@ bool save_prefab_file(
                 if (record.spline) {
                     components["spline"] =
                         component_json::spline_to_json(*record.spline);
+                }
+                if (record.nav_obstacle) {
+                    components["nav_obstacle"] =
+                        component_json::nav_obstacle_to_json(*record.nav_obstacle);
+                }
+                if (record.off_mesh_link) {
+                    components["off_mesh_link"] =
+                        component_json::off_mesh_link_to_json(*record.off_mesh_link);
+                }
+                if (record.npc_ai) {
+                    components["npc_ai"] =
+                        component_json::npc_ai_to_json(*record.npc_ai);
                 }
                 encoded["components"] = std::move(components);
             }
@@ -1299,6 +1330,9 @@ bool instantiate_prefab_file(
             std::optional<GameplayComponent> gameplay{};
             std::optional<UiMarkerComponent> ui_marker{};
             std::optional<SplineComponent> spline{};
+            std::optional<NavObstacleComponent> nav_obstacle{};
+            std::optional<OffMeshLinkComponent> off_mesh_link{};
+            std::optional<NpcAiComponent> npc_ai{};
             if (encoded.contains("components")) {
                 const Json& comps = encoded["components"];
                 if (!comps.is_object()) {
@@ -1310,7 +1344,8 @@ bool instantiate_prefab_file(
                         ckey != "audio_source" && ckey != "audio_listener" &&
                         ckey != "reverb_zone" && ckey != "animator" &&
                         ckey != "gameplay" && ckey != "ui_marker" &&
-                        ckey != "spline") {
+                        ckey != "spline" && ckey != "nav_obstacle" &&
+                        ckey != "off_mesh_link" && ckey != "npc_ai") {
                         error = "Prefab node contains an unknown component.";
                         return false;
                     }
@@ -1391,6 +1426,33 @@ bool instantiate_prefab_file(
                     }
                     spline = sp;
                 }
+                if (comps.contains("nav_obstacle")) {
+                    NavObstacleComponent obs{};
+                    if (!component_json::parse_nav_obstacle_json(
+                            comps["nav_obstacle"], obs)) {
+                        error = "Prefab nav_obstacle component is invalid.";
+                        return false;
+                    }
+                    nav_obstacle = obs;
+                }
+                if (comps.contains("off_mesh_link")) {
+                    OffMeshLinkComponent oml{};
+                    if (!component_json::parse_off_mesh_link_json(
+                            comps["off_mesh_link"], oml)) {
+                        error = "Prefab off_mesh_link component is invalid.";
+                        return false;
+                    }
+                    off_mesh_link = oml;
+                }
+                if (comps.contains("npc_ai")) {
+                    NpcAiComponent npc{};
+                    if (!component_json::parse_npc_ai_json(
+                            comps["npc_ai"], npc)) {
+                        error = "Prefab npc_ai component is invalid.";
+                        return false;
+                    }
+                    npc_ai = npc;
+                }
             }
 
             parsed_nodes.push_back(ParsedPrefabNode{
@@ -1421,6 +1483,9 @@ bool instantiate_prefab_file(
                 .gameplay = gameplay,
                 .ui_marker = ui_marker,
                 .spline = spline,
+                .nav_obstacle = nav_obstacle,
+                .off_mesh_link = off_mesh_link,
+                .npc_ai = npc_ai,
                 .parent_index = parent_index,
             });
         }
@@ -1567,6 +1632,27 @@ bool instantiate_prefab_file(
             }
             target.spline = sanitize_spline_component(*ov.spline);
         }
+        if (ov.nav_obstacle) {
+            if (!valid_nav_obstacle_component(*ov.nav_obstacle)) {
+                error = "Prefab override nav_obstacle component is invalid.";
+                return false;
+            }
+            target.nav_obstacle = sanitize_nav_obstacle_component(*ov.nav_obstacle);
+        }
+        if (ov.off_mesh_link) {
+            if (!valid_off_mesh_link_component(*ov.off_mesh_link)) {
+                error = "Prefab override off_mesh_link component is invalid.";
+                return false;
+            }
+            target.off_mesh_link = sanitize_off_mesh_link_component(*ov.off_mesh_link);
+        }
+        if (ov.npc_ai) {
+            if (!valid_npc_ai_component(*ov.npc_ai)) {
+                error = "Prefab override npc_ai component is invalid.";
+                return false;
+            }
+            target.npc_ai = sanitize_npc_ai_component(*ov.npc_ai);
+        }
     }
 
     std::vector<SceneNodeId> created(parsed_nodes.size());
@@ -1660,6 +1746,48 @@ bool instantiate_prefab_file(
             static_cast<void>(scene.destroy_subtree(root_created));
             error = "Unable to attach prefab spline component.";
             return false;
+        }
+        if (spec.nav_obstacle &&
+            !scene.set_nav_obstacle(id, *spec.nav_obstacle)) {
+            static_cast<void>(scene.destroy_subtree(root_created));
+            error = "Unable to attach prefab nav_obstacle component.";
+            return false;
+        }
+        if (spec.off_mesh_link &&
+            !scene.set_off_mesh_link(id, *spec.off_mesh_link)) {
+            static_cast<void>(scene.destroy_subtree(root_created));
+            error = "Unable to attach prefab off_mesh_link component.";
+            return false;
+        }
+        if (spec.npc_ai &&
+            !scene.set_npc_ai(id, *spec.npc_ai)) {
+            static_cast<void>(scene.destroy_subtree(root_created));
+            error = "Unable to attach prefab npc_ai component.";
+            return false;
+        }
+    }
+
+    // Remap intra-prefab UUID references (OffMeshLink, NpcAi).
+    const auto remap_prefab_uuid = [&](SceneUuid& uuid_ref) noexcept {
+        if (!uuid_ref) {
+            return;
+        }
+        for (std::size_t src_idx = 0U; src_idx < parsed_nodes.size(); ++src_idx) {
+            if (parsed_nodes[src_idx].source_uuid == uuid_ref) {
+                if (const auto inst_uuid = scene.uuid(created[src_idx])) {
+                    uuid_ref = *inst_uuid;
+                }
+                break;
+            }
+        }
+    };
+    for (std::size_t idx = 0U; idx < created.size(); ++idx) {
+        if (const auto oml_opt = scene.off_mesh_link_mut(created[idx])) {
+            remap_prefab_uuid(oml_opt->get().target_node_uuid);
+        }
+        if (const auto npc_opt = scene.npc_ai_mut(created[idx])) {
+            remap_prefab_uuid(npc_opt->get().target_node_uuid);
+            remap_prefab_uuid(npc_opt->get().patrol_spline_uuid);
         }
     }
 

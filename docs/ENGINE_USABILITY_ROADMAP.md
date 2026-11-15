@@ -97,10 +97,8 @@
 - [x] 3D-сплайны (`SplineComponent` для `Linear` / `Catmull-Rom` / `Cubic Hermite` с замкнутыми контурами, arc-length параметризацией, поведением `spline_mover`, секцией Inspector `3D Spline` и wireframe/frustum-гизмо в viewport), процедурный `Camera Shake` (`CameraShakeSystem`), плавный блендинг между игровой камерой и кат-сценой (`blend_camera_poses`), 3 MCP-инструмента (`editor.scene.set_spline`, `editor.scene.remove_spline`, `editor.sequencer.control`) и набор тестов `vcr_sequencer_camera_tests`.
 
 ### Этап 7. Навигация и искусственный интеллект (**P1**)
-- [ ] Генерация и запекание `NavMesh` по статической геометрии и террейну,
-      динамические препятствия, прыжковые переходы (`off-mesh links`) и поиск пути.
-- [ ] Управление NPC: конечные автоматы / Behavior Trees и система восприятия
-      (конус зрения через raycast, слух от звуковых событий).
+- [x] Генерация и запекание `NavMesh` (`*.vcrnav.json`, `bake_navmesh_from_scene` по статической геометрии `ground` / `cube` / `model` / `ColliderComponent` и процедурному `terrain` с учётом уклона, ступеньки, клиренса и радиуса агента), динамические препятствия (`NavObstacleComponent` + динамические/кинематические `RigidBodyComponent`), прыжковые/вертикальные переходы (`OffMeshLinkComponent`: `jump` / `drop` / `climb` / `teleport`) и zero-allocation поиск пути A* + String-Pulling Funnel с локальным рулением (`NavigationRuntime`).
+- [x] Управление NPC (`NpcAiComponent`: встроенный тактический FSM `Idle` / `Patrol` / `Investigate` / `Chase` / `Attack` / `Search` / `Return` и сериализуемые деревья поведений `BehaviorTreeAsset` / `*.vcrbt.json` с 20 типами узлов и `AiBlackboard`), система восприятия (`AiPerceptionSystem`: конус зрения с проверкой прямой видимости raycast через `CollisionWorld` / `PhysicsWorld` и слух от звуковых событий с затуханием через препятствия), панель редактора `Navigation & AI`, оверлей вьюпорта `"Nav & AI"`, сериализация в `.vcrsave.json`, валидация `ship_project`, 7 MCP-инструментов (`editor.scene.set_nav_obstacle`, `editor.scene.remove_nav_obstacle`, `editor.scene.set_off_mesh_link`, `editor.scene.remove_off_mesh_link`, `editor.scene.set_npc_ai`, `editor.scene.remove_npc_ai`, `editor.navigation.control`) и набор тестов `vcr_navigation_ai_tests`.
 
 ### Этап 8. Игровые визуальные эффекты и развитие рендера (**P1**)
 - [ ] Система частиц (`GPU / CPU Particles`) и редактор VFX-эмиттеров.

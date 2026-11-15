@@ -3,6 +3,7 @@
 #include "audio_engine.hpp"
 #include "collision.hpp"
 #include "gameplay.hpp"
+#include "npc_ai.hpp"
 #include "physics_world.hpp"
 #include "scene_components.hpp"
 #include "scene_document.hpp"
@@ -339,6 +340,7 @@ struct GameStateSnapshot {
     std::vector<GameplaySaveEntity> entities{};
     std::vector<GameplaySavePhysicsBody> physics_bodies{};
     std::vector<AnimatorSaveEntry> animators{};
+    std::vector<NpcSaveEntry> npc_agents{};
     std::string custom_project_json{};
 };
 

@@ -776,6 +776,21 @@ bool save_scene_file(
             error = "Scene prefab instance component values are invalid.";
             return false;
         }
+        if (record.nav_obstacle &&
+            !valid_nav_obstacle_component(*record.nav_obstacle)) {
+            error = "Scene nav_obstacle component values are invalid.";
+            return false;
+        }
+        if (record.off_mesh_link &&
+            !valid_off_mesh_link_component(*record.off_mesh_link)) {
+            error = "Scene off_mesh_link component values are invalid.";
+            return false;
+        }
+        if (record.npc_ai &&
+            !valid_npc_ai_component(*record.npc_ai)) {
+            error = "Scene npc_ai component values are invalid.";
+            return false;
+        }
         const SceneNode& node = record.value;
         if (node.kind == SceneNodeKind::ocean && !valid_ocean_settings(node.ocean)) {
             error = "Scene ocean settings are invalid.";
@@ -960,7 +975,8 @@ bool save_scene_file(
         if (record.collider || record.rigid_body || record.prefab_instance ||
             record.audio_source || record.audio_listener ||
             record.reverb_zone || record.animator || record.gameplay ||
-            record.ui_marker || record.spline) {
+            record.ui_marker || record.spline || record.nav_obstacle ||
+            record.off_mesh_link || record.npc_ai) {
             Json components = Json::object();
             if (record.collider) {
                 components["collider"] = collider_json(*record.collider);
@@ -999,6 +1015,18 @@ bool save_scene_file(
             if (record.spline) {
                 components["spline"] =
                     component_json::spline_to_json(*record.spline);
+            }
+            if (record.nav_obstacle) {
+                components["nav_obstacle"] =
+                    component_json::nav_obstacle_to_json(*record.nav_obstacle);
+            }
+            if (record.off_mesh_link) {
+                components["off_mesh_link"] =
+                    component_json::off_mesh_link_to_json(*record.off_mesh_link);
+            }
+            if (record.npc_ai) {
+                components["npc_ai"] =
+                    component_json::npc_ai_to_json(*record.npc_ai);
             }
             encoded["components"] = std::move(components);
         }
@@ -1391,6 +1419,9 @@ bool load_scene_file(
             std::optional<GameplayComponent> parsed_gameplay{};
             std::optional<UiMarkerComponent> parsed_ui_marker{};
             std::optional<SplineComponent> parsed_spline{};
+            std::optional<NavObstacleComponent> parsed_nav_obstacle{};
+            std::optional<OffMeshLinkComponent> parsed_off_mesh_link{};
+            std::optional<NpcAiComponent> parsed_npc_ai{};
             if (encoded.contains("components")) {
                 const Json& components = encoded["components"];
                 if (!components.is_object()) {
@@ -1407,7 +1438,10 @@ bool load_scene_file(
                         component_key != "animator" &&
                         component_key != "gameplay" &&
                         component_key != "ui_marker" &&
-                        component_key != "spline") {
+                        component_key != "spline" &&
+                        component_key != "nav_obstacle" &&
+                        component_key != "off_mesh_link" &&
+                        component_key != "npc_ai") {
                         error = "Scene node contains an unknown component.";
                         return false;
                     }
@@ -1504,6 +1538,33 @@ bool load_scene_file(
                     }
                     parsed_spline = spline_value;
                 }
+                if (components.contains("nav_obstacle")) {
+                    NavObstacleComponent obs_value{};
+                    if (!component_json::parse_nav_obstacle_json(
+                            components["nav_obstacle"], obs_value)) {
+                        error = "Scene node nav_obstacle component is invalid.";
+                        return false;
+                    }
+                    parsed_nav_obstacle = obs_value;
+                }
+                if (components.contains("off_mesh_link")) {
+                    OffMeshLinkComponent oml_value{};
+                    if (!component_json::parse_off_mesh_link_json(
+                            components["off_mesh_link"], oml_value)) {
+                        error = "Scene node off_mesh_link component is invalid.";
+                        return false;
+                    }
+                    parsed_off_mesh_link = oml_value;
+                }
+                if (components.contains("npc_ai")) {
+                    NpcAiComponent npc_value{};
+                    if (!component_json::parse_npc_ai_json(
+                            components["npc_ai"], npc_value)) {
+                        error = "Scene node npc_ai component is invalid.";
+                        return false;
+                    }
+                    parsed_npc_ai = npc_value;
+                }
             }
             const SceneNodeId id = parsed_uuid
                 ? loaded.create_node_with_uuid(name, *kind, *parsed_uuid, parent_id)
@@ -1560,6 +1621,21 @@ bool load_scene_file(
             if (parsed_spline &&
                 !loaded.set_spline(id, *parsed_spline)) {
                 error = "Unable to attach scene spline component.";
+                return false;
+            }
+            if (parsed_nav_obstacle &&
+                !loaded.set_nav_obstacle(id, *parsed_nav_obstacle)) {
+                error = "Unable to attach scene nav_obstacle component.";
+                return false;
+            }
+            if (parsed_off_mesh_link &&
+                !loaded.set_off_mesh_link(id, *parsed_off_mesh_link)) {
+                error = "Unable to attach scene off_mesh_link component.";
+                return false;
+            }
+            if (parsed_npc_ai &&
+                !loaded.set_npc_ai(id, *parsed_npc_ai)) {
+                error = "Unable to attach scene npc_ai component.";
                 return false;
             }
             auto node = loaded.node(id);

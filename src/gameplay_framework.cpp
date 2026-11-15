@@ -38,6 +38,7 @@ constexpr std::uint32_t kMaxSaveVariables = 1'024U;
 constexpr std::uint32_t kMaxSaveEntities = 100'000U;
 constexpr std::uint32_t kMaxSavePhysicsBodies = 100'000U;
 constexpr std::uint32_t kMaxSaveAnimators = 100'000U;
+constexpr std::uint32_t kMaxSaveNpcAgents = 100'000U;
 constexpr std::size_t kMaxGameSubsteps = 4U;
 
 [[nodiscard]] bool finite_vec3(const glm::vec3 v) noexcept {
@@ -1829,6 +1830,9 @@ void GameplayBehaviorRegistry::register_default_behaviors() {
             .on_start = &behavior_spline_mover_start,
             .on_fixed_update = &behavior_spline_mover_fixed_update,
         });
+    register_behavior(
+        "npc_ai",
+        GameplayBehaviorCallbacks{});
 }
 
 bool GameplayBehaviorRegistry::register_behavior(
@@ -2634,6 +2638,30 @@ bool save_game_state_file(
             });
         }
         root["animators"] = std::move(anims_json);
+
+        Json npc_json = Json::array();
+        for (const NpcSaveEntry& npc : snapshot.npc_agents) {
+            if (!npc.node_uuid) {
+                continue;
+            }
+            npc_json.push_back(Json{
+                {"uuid", format_scene_uuid(npc.node_uuid)},
+                {"fsm_state", to_token(npc.fsm_state)},
+                {"position", vec3_to_json(npc.position)},
+                {"facing_yaw_degrees", npc.facing_yaw_degrees},
+                {"last_known_target_pos", vec3_to_json(npc.last_known_target_pos)},
+                {"last_noise_pos", vec3_to_json(npc.last_noise_pos)},
+                {"has_last_known_target", npc.has_last_known_target},
+                {"heard_recent_noise", npc.heard_recent_noise},
+                {"state_timer", npc.state_timer},
+                {"attack_cooldown_remaining", npc.attack_cooldown_remaining},
+                {"search_timer", npc.search_timer},
+                {"patrol_index", npc.patrol_index},
+                {"patrol_forward", npc.patrol_forward},
+                {"spline_u", npc.spline_u},
+            });
+        }
+        root["npc_agents"] = std::move(npc_json);
         if (!snapshot.custom_project_json.empty()) {
             Json parsed = Json::parse(
                 snapshot.custom_project_json, nullptr, false);
@@ -2943,6 +2971,101 @@ bool load_game_state_file(
                     sa.fsm_time = std::max(0.0F, *ft);
                 }
                 out_snapshot.animators.push_back(sa);
+            }
+        }
+        if (root.contains("npc_agents")) {
+            if (!root["npc_agents"].is_array() ||
+                root["npc_agents"].size() > kMaxSaveNpcAgents) {
+                error = "Invalid npc_agents array in save file.";
+                return false;
+            }
+            for (const Json& nj : root["npc_agents"]) {
+                if (!nj.is_object() ||
+                    !nj.contains("uuid") ||
+                    !nj["uuid"].is_string()) {
+                    continue;
+                }
+                for (const auto& [k, _] : nj.items()) {
+                    if (k != "uuid" && k != "fsm_state" &&
+                        k != "position" && k != "facing_yaw_degrees" &&
+                        k != "last_known_target_pos" && k != "last_noise_pos" &&
+                        k != "has_last_known_target" &&
+                        k != "heard_recent_noise" && k != "state_timer" &&
+                        k != "attack_cooldown_remaining" &&
+                        k != "search_timer" && k != "patrol_index" &&
+                        k != "patrol_forward" && k != "spline_u") {
+                        error = "NPC save entry contains unknown key.";
+                        return false;
+                    }
+                }
+                const std::optional<SceneUuid> uuid =
+                    parse_scene_uuid(nj["uuid"].get<std::string_view>());
+                if (!uuid.has_value()) {
+                    error = "Malformed NPC UUID in save file.";
+                    return false;
+                }
+                NpcSaveEntry sn{};
+                sn.node_uuid = *uuid;
+                if (nj.contains("fsm_state") && nj["fsm_state"].is_string()) {
+                    if (const auto st = parse_npc_fsm_state(
+                            nj["fsm_state"].get<std::string_view>())) {
+                        sn.fsm_state = *st;
+                    } else {
+                        error = "Unknown NPC FSM state in save file.";
+                        return false;
+                    }
+                }
+                if (nj.contains("position") &&
+                    !read_vec3_json(nj["position"], sn.position)) {
+                    error = "Invalid NPC position in save file.";
+                    return false;
+                }
+                if (const auto y = read_finite_float(nj, "facing_yaw_degrees")) {
+                    sn.facing_yaw_degrees = *y;
+                }
+                if (nj.contains("last_known_target_pos") &&
+                    !read_vec3_json(
+                        nj["last_known_target_pos"], sn.last_known_target_pos)) {
+                    error = "Invalid NPC last_known_target_pos in save file.";
+                    return false;
+                }
+                if (nj.contains("last_noise_pos") &&
+                    !read_vec3_json(nj["last_noise_pos"], sn.last_noise_pos)) {
+                    error = "Invalid NPC last_noise_pos in save file.";
+                    return false;
+                }
+                if (nj.contains("has_last_known_target") &&
+                    nj["has_last_known_target"].is_boolean()) {
+                    sn.has_last_known_target =
+                        nj["has_last_known_target"].get<bool>();
+                }
+                if (nj.contains("heard_recent_noise") &&
+                    nj["heard_recent_noise"].is_boolean()) {
+                    sn.heard_recent_noise =
+                        nj["heard_recent_noise"].get<bool>();
+                }
+                if (const auto st = read_finite_float(nj, "state_timer")) {
+                    sn.state_timer = std::max(0.0F, *st);
+                }
+                if (const auto cd =
+                        read_finite_float(nj, "attack_cooldown_remaining")) {
+                    sn.attack_cooldown_remaining = std::max(0.0F, *cd);
+                }
+                if (const auto st2 = read_finite_float(nj, "search_timer")) {
+                    sn.search_timer = std::max(0.0F, *st2);
+                }
+                if (nj.contains("patrol_index") &&
+                    nj["patrol_index"].is_number_unsigned()) {
+                    sn.patrol_index = nj["patrol_index"].get<std::uint32_t>();
+                }
+                if (nj.contains("patrol_forward") &&
+                    nj["patrol_forward"].is_boolean()) {
+                    sn.patrol_forward = nj["patrol_forward"].get<bool>();
+                }
+                if (const auto su = read_finite_float(nj, "spline_u")) {
+                    sn.spline_u = std::clamp(*su, 0.0F, 1.0F);
+                }
+                out_snapshot.npc_agents.push_back(sn);
             }
         }
         if (root.contains("project_state")) {

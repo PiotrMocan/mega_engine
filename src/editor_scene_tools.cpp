@@ -311,6 +311,24 @@ SceneNodeId duplicate_scene_subtree(
             static_cast<void>(scene.destroy_subtree(duplicate_root));
             return {};
         }
+        if (record.nav_obstacle &&
+            !scene.set_nav_obstacle(copy, *record.nav_obstacle)) {
+            error = "Unable to copy nav_obstacle component to duplicated node.";
+            static_cast<void>(scene.destroy_subtree(duplicate_root));
+            return {};
+        }
+        if (record.off_mesh_link &&
+            !scene.set_off_mesh_link(copy, *record.off_mesh_link)) {
+            error = "Unable to copy off_mesh_link component to duplicated node.";
+            static_cast<void>(scene.destroy_subtree(duplicate_root));
+            return {};
+        }
+        if (record.npc_ai &&
+            !scene.set_npc_ai(copy, *record.npc_ai)) {
+            error = "Unable to copy npc_ai component to duplicated node.";
+            static_cast<void>(scene.destroy_subtree(duplicate_root));
+            return {};
+        }
         const bool copy_prefab_link =
             record.prefab_instance.has_value() &&
             (record_index != begin ||
@@ -323,21 +341,31 @@ SceneNodeId duplicate_scene_subtree(
             return {};
         }
     }
-    // Remap intra-subtree GameplayComponent::target_node_uuid references.
-    for (std::size_t idx = 0U; idx < copies.size(); ++idx) {
-        const auto gp_opt = scene.gameplay_mut(copies[idx]);
-        if (!gp_opt || !gp_opt->get().target_node_uuid) {
-            continue;
+    // Remap intra-subtree UUID references across Gameplay, OffMeshLink, and NpcAi.
+    const auto remap_uuid = [&](SceneUuid& target_uuid) noexcept {
+        if (!target_uuid) {
+            return;
         }
-        const SceneUuid old_target = gp_opt->get().target_node_uuid;
         for (std::size_t src_idx = begin; src_idx < end; ++src_idx) {
-            if (records[src_idx].uuid == old_target) {
+            if (records[src_idx].uuid == target_uuid) {
                 if (const auto new_uuid =
                         scene.uuid(copies[src_idx - begin])) {
-                    gp_opt->get().target_node_uuid = *new_uuid;
+                    target_uuid = *new_uuid;
                 }
                 break;
             }
+        }
+    };
+    for (std::size_t idx = 0U; idx < copies.size(); ++idx) {
+        if (const auto gp_opt = scene.gameplay_mut(copies[idx])) {
+            remap_uuid(gp_opt->get().target_node_uuid);
+        }
+        if (const auto oml_opt = scene.off_mesh_link_mut(copies[idx])) {
+            remap_uuid(oml_opt->get().target_node_uuid);
+        }
+        if (const auto npc_opt = scene.npc_ai_mut(copies[idx])) {
+            remap_uuid(npc_opt->get().target_node_uuid);
+            remap_uuid(npc_opt->get().patrol_spline_uuid);
         }
     }
     duplicated_nodes = static_cast<std::uint32_t>(subtree_size);
