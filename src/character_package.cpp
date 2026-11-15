@@ -3107,11 +3107,11 @@ void emit_clipped_template_part(
     const float hs) noexcept {
     const float abs_x = std::abs(pos.x - head_c.x);
     // Exclude full outer ear pinna bounds
-    if (abs_x > 0.063F * hs &&
-        pos.y > eye_y - 0.052F * hs &&
-        pos.y < eye_y + 0.035F * hs &&
-        pos.z > head_c.z - 0.032F * hs &&
-        pos.z < head_c.z + 0.030F * hs) {
+    if (abs_x > 0.0645F * hs &&
+        pos.y > eye_y - 0.048F * hs &&
+        pos.y < eye_y + 0.014F * hs &&
+        pos.z > head_c.z - 0.028F * hs &&
+        pos.z < head_c.z + 0.018F * hs) {
         return 0.0F;
     }
     // Exclude lower cheek/jaw/neck below ear lobe
@@ -3145,7 +3145,7 @@ void emit_clipped_template_part(
         const float front_profile = glm::mix(frontal_w, temple_w, side_blend);
         cap_w = glm::mix(nape_w, front_profile, blend_front);
     } else if (abs_x >= 0.054F * hs && pos.z > head_c.z - 0.012F * hs) {
-        const float temple_w = smoothstep_f(pos.y, eye_y - 0.002F * hs, eye_y + 0.008F * hs);
+        const float temple_w = smoothstep_f(pos.y, eye_y - 0.006F * hs, eye_y + 0.006F * hs);
         cap_w = (std::min)(cap_w, temple_w);
     }
     return std::clamp(cap_w, 0.0F, 1.0F);
@@ -3160,61 +3160,66 @@ void emit_clipped_template_part(
     const float hs) noexcept {
     const float dx = pos.x - mouth_c.x;
     const float abs_x = std::abs(dx);
-    if (abs_x > 0.0665F * hs || pos.z < head_c.z + 0.026F * hs || pos.y < chin_y - 0.010F * hs) {
+    if (abs_x > 0.0690F * hs || pos.z < head_c.z + 0.012F * hs || pos.y < chin_y - 0.012F * hs) {
         return 0.0F;
     }
-    if (pos.y < chin_y - 0.002F * hs && pos.z < head_c.z + 0.034F * hs) {
+    if (pos.y < chin_y - 0.002F * hs && pos.z < head_c.z + 0.026F * hs) {
         return 0.0F;
     }
     const float lip_slit_y = mouth_c.y + 0.0023F * hs;
     const float dy_slit = pos.y - lip_slit_y;
     const float dz = pos.z - mouth_c.z;
     // Exclusion ellipse matched to true oral slit (lip_slit_y)
-    const float lip_dist = std::hypot(dx / (0.0295F * hs), dy_slit / (0.0125F * hs));
-    if (lip_dist < 1.05F && dz > -0.025F * hs) {
+    const float lip_dist = std::hypot(dx / (0.0305F * hs), dy_slit / (0.0130F * hs));
+    if (lip_dist < 1.04F && dz > -0.025F * hs) {
         return 0.0F;
     }
-    // Keep clean skin hollows beside the central soul-patch connector below lower lip
-    if (abs_x > 0.0065F * hs && abs_x < 0.0215F * hs &&
-        pos.y > lip_slit_y - 0.019F * hs && pos.y < lip_slit_y - 0.009F * hs &&
-        dz > -0.020F * hs) {
-        return 0.0F;
-    }
+    // Softened sub-lip hollow beside the central soul-patch connector below lower lip
+    const float hx =
+        smoothstep_f(abs_x, 0.0065F * hs, 0.0105F * hs) *
+        (1.0F - smoothstep_f(abs_x, 0.0185F * hs, 0.0235F * hs));
+    const float hy =
+        smoothstep_f(pos.y, lip_slit_y - 0.0195F * hs, lip_slit_y - 0.0155F * hs) *
+        (1.0F - smoothstep_f(pos.y, lip_slit_y - 0.0115F * hs, lip_slit_y - 0.0085F * hs));
+    const float hz = smoothstep_f(dz, -0.022F * hs, -0.014F * hs);
+    const float sub_lip_atten = 1.0F - 0.52F * hx * hy * hz;
+
+    const float rear_w = smoothstep_f(pos.z - (head_c.z + 0.012F * hs), 0.0F, 0.008F * hs);
 
     // Mustache bar strictly below nostrils
     const float must_top =
-        mouth_c.y + (0.0215F - 0.0030F * (std::min)(1.0F, abs_x / (0.029F * hs))) * hs;
-    if (abs_x <= 0.0295F * hs &&
-        pos.y >= mouth_c.y + 0.0132F * hs &&
+        mouth_c.y + (0.0222F - 0.0028F * (std::min)(1.0F, abs_x / (0.031F * hs))) * hs;
+    if (abs_x <= 0.0315F * hs &&
+        pos.y >= mouth_c.y + 0.0124F * hs &&
         pos.y <= must_top &&
-        dz > -0.014F * hs) {
-        return 1.0F;
+        dz > -0.016F * hs) {
+        const float top_feather = smoothstep_f(must_top - pos.y, 0.0F, 0.0018F * hs);
+        return std::clamp(0.45F + 0.55F * top_feather, 0.0F, 1.0F);
     }
     // Oral corner connectors flanking the lip aperture
-    if (abs_x >= 0.0255F * hs && abs_x <= 0.0365F * hs &&
-        pos.y >= mouth_c.y - 0.012F * hs &&
-        pos.y <= mouth_c.y + 0.015F * hs &&
-        dz > -0.022F * hs) {
-        return 1.0F;
+    if (abs_x >= 0.0245F * hs && abs_x <= 0.0385F * hs &&
+        pos.y >= mouth_c.y - 0.014F * hs &&
+        pos.y <= mouth_c.y + 0.016F * hs &&
+        dz > -0.024F * hs) {
+        return rear_w;
     }
-    // Narrow pre-auricular sideburn strictly in front of ear pinna
-    if (abs_x >= 0.054F * hs &&
-        abs_x <= 0.0665F * hs &&
-        pos.z >= head_c.z + 0.028F * hs &&
-        pos.z <= head_c.z + 0.062F * hs &&
-        pos.y <= eye_y + 0.004F * hs &&
-        pos.y >= mouth_c.y - 0.015F * hs) {
-        return 1.0F;
+    // Pre-auricular sideburn extending cleanly up to lower temple
+    if (abs_x >= 0.0510F * hs &&
+        abs_x <= 0.0690F * hs &&
+        pos.z >= head_c.z + 0.012F * hs &&
+        pos.z <= head_c.z + 0.064F * hs &&
+        pos.y <= eye_y + 0.016F * hs &&
+        pos.y >= mouth_c.y - 0.016F * hs) {
+        const float sb_top = 1.0F - 0.50F * smoothstep_f(pos.y, eye_y + 0.006F * hs, eye_y + 0.016F * hs);
+        return std::clamp(sb_top * rear_w, 0.0F, 1.0F);
     }
 
     const float cheek_upper_y =
-        mouth_c.y - 0.005F * hs +
-        0.022F * hs * smoothstep_f(abs_x, 0.030F * hs, 0.060F * hs);
-    if (pos.y <= cheek_upper_y) {
-        const float fade = smoothstep_f(cheek_upper_y - pos.y, 0.0F, 0.004F * hs);
-        return std::clamp(0.45F + 0.55F * fade, 0.0F, 1.0F);
-    }
-    return 0.0F;
+        mouth_c.y - 0.003F * hs +
+        0.024F * hs * smoothstep_f(abs_x, 0.028F * hs, 0.060F * hs);
+    const float cheek_lin = smoothstep_f(cheek_upper_y - pos.y, -0.0040F * hs, 0.0100F * hs);
+    const float cheek_w = cheek_lin * (0.35F + 0.65F * cheek_lin);
+    return std::clamp((std::min)(cheek_w, rear_w) * sub_lip_atten, 0.0F, 1.0F);
 }
 
 [[nodiscard]] CharacterGroomInputs build_groom_inputs_from_template(
@@ -3297,7 +3302,7 @@ void emit_clipped_template_part(
                 eval.positions[c1.vid], pkg.body.gender, in.head_center, eye_y, in.neck_center.y, hs);
             const float hl2 = eval_anatomical_hairline_weight(
                 eval.positions[c2.vid], pkg.body.gender, in.head_center, eye_y, in.neck_center.y, hs);
-            if (hl_mid >= 0.52F && (std::min)({hl0, hl1, hl2}) >= 0.24F) {
+            if (hl_mid >= 0.44F && (std::min)({hl0, hl1, hl2}) >= 0.10F) {
                 in.scalp_triangles.push_back({c0.vid, c1.vid, c2.vid});
             }
         }
@@ -3309,7 +3314,7 @@ void emit_clipped_template_part(
             const float max_vy = (std::max)({eval.positions[c0.vid].y, eval.positions[c1.vid].y, eval.positions[c2.vid].y});
             const float min_vy = (std::min)({eval.positions[c0.vid].y, eval.positions[c1.vid].y, eval.positions[c2.vid].y});
             const float max_vz = (std::max)({eval.positions[c0.vid].z, eval.positions[c1.vid].z, eval.positions[c2.vid].z});
-            if (min_vy < eye_y - 0.016F * hs &&
+            if (min_vy < eye_y + 0.018F * hs &&
                 max_vy > in.chin_y - 0.016F * hs &&
                 max_vz > in.head_center.z - 0.012F * hs) {
                 in.beard_triangles.push_back({c0.vid, c1.vid, c2.vid});
@@ -5070,18 +5075,24 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
                                 }
                             }
 
-                            // Subtle follicular shadow bed under 3D beard strands
+                            // Subtle follicular shadow bed under 3D beard strands + fine pore stipple
                             if (is_head && pkg.wardrobe.has_beard && cell.valid != 0U) {
                                 const float bw_3d = eval_anatomical_beard_weight(
                                     cell.pos, head_c, mouth_c, chin_y, eye_y, hs);
                                 if (bw_3d > 0.05F) {
-                                    const float beard_shadow = bw_3d * 0.46F;
+                                    const float pore_stipple = smoothstep_f(
+                                        value_noise_2d(u * 440.0F, v * 440.0F, 711U) * 0.65F +
+                                        hash_float01(x / 2U, y / 2U, 733U) * 0.35F,
+                                        0.38F, 0.85F);
+                                    const float bw_shaped = bw_3d * bw_3d;
+                                    const float beard_shadow = bw_shaped * (0.22F + 0.16F * pore_stipple);
                                     const glm::vec3 follicle_tone = glm::mix(
-                                        col * 0.54F,
-                                        hair_lin * 0.65F + glm::vec3(0.012F, 0.009F, 0.006F),
-                                        0.48F);
+                                        col * 0.58F,
+                                        hair_lin * 0.62F + glm::vec3(0.012F, 0.009F, 0.006F),
+                                        0.44F);
                                     col = glm::mix(col, follicle_tone, beard_shadow);
                                     roughness = glm::mix(roughness, 0.78F, beard_shadow);
+                                    ao = glm::mix(ao, 0.68F, bw_shaped * 0.45F);
                                 }
                             }
                         }
