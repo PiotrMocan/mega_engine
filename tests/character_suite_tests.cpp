@@ -20,17 +20,28 @@
 #include <windows.h>
 #endif
 
+#include <glm/common.hpp>
 #include <glm/geometric.hpp>
+#include <glm/gtc/quaternion.hpp>
+#include <glm/matrix.hpp>
+#include <glm/trigonometric.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -791,6 +802,400 @@ bool test_unified_character_studio_cli_discover_and_verify() {
     return true;
 }
 
+bool test_anatomical_rig_and_human_locomotion_biomechanics() {
+    constexpr std::size_t bone_pelvis = 1U;
+    constexpr std::size_t bone_spine_03 = 4U;
+    constexpr std::size_t bone_upper_arm_l = 8U;
+    constexpr std::size_t bone_forearm_l = 9U;
+    constexpr std::size_t bone_hand_l = 10U;
+    constexpr std::size_t bone_index_l = 12U;
+    constexpr std::size_t bone_middle_l = 13U;
+    constexpr std::size_t bone_pinky_l = 14U;
+    constexpr std::size_t bone_upper_arm_r = 16U;
+    constexpr std::size_t bone_forearm_r = 17U;
+    constexpr std::size_t bone_hand_r = 18U;
+    constexpr std::size_t bone_index_r = 20U;
+    constexpr std::size_t bone_middle_r = 21U;
+    constexpr std::size_t bone_pinky_r = 22U;
+    constexpr std::size_t bone_thigh_l = 23U;
+    constexpr std::size_t bone_shin_l = 24U;
+    constexpr std::size_t bone_foot_l = 25U;
+    constexpr std::size_t bone_toe_l = 26U;
+    constexpr std::size_t bone_foot_r = 29U;
+    constexpr std::size_t bone_toe_r = 30U;
+    constexpr std::size_t bone_shoulder_twist_l = 31U;
+    constexpr std::size_t bone_forearm_twist_l = 32U;
+    constexpr std::size_t bone_shoulder_twist_r = 33U;
+    constexpr std::size_t bone_forearm_twist_r = 34U;
+    constexpr std::size_t bone_jaw = 38U;
+    constexpr std::size_t bone_lip_upper = 39U;
+    constexpr std::size_t bone_lip_lower = 40U;
+
+    const auto bind_model_pos =
+        [](const vcr::CookedSkeletonAsset& skel, const std::size_t idx) -> glm::vec3 {
+            return glm::vec3(glm::inverse(skel.bones[idx].inverse_bind_matrix)[3]);
+        };
+
+    const auto quat_angle_deg = [](const glm::quat& q_in) -> float {
+        const float len = glm::length(q_in);
+        if (len <= 1.0e-6F) {
+            return 0.0F;
+        }
+        const glm::quat q = q_in / len;
+        return glm::degrees(2.0F * std::acos(std::clamp(std::abs(q.w), 0.0F, 1.0F)));
+    };
+
+    const auto extract_mat_yaw = [](const glm::mat4& m) -> float {
+        const glm::vec3 fwd = glm::vec3(m[2]);
+        return std::atan2(fwd.x, fwd.z);
+    };
+
+    const auto find_clip_index =
+        [](const std::vector<vcr::AnimationClip>& clips,
+           const std::string_view name) -> std::optional<std::size_t> {
+            for (std::size_t i = 0U; i < clips.size(); ++i) {
+                if (clips[i].name == name) {
+                    return i;
+                }
+            }
+            return std::nullopt;
+        };
+
+    struct TwistMidpointSpec {
+        std::size_t twist_idx;
+        std::size_t a_idx;
+        std::size_t b_idx;
+        const char* name;
+    };
+    constexpr std::array<TwistMidpointSpec, 4U> twist_specs{{
+        {bone_shoulder_twist_l, bone_upper_arm_l, bone_forearm_l, "ShoulderTwist_L"},
+        {bone_forearm_twist_l, bone_forearm_l, bone_hand_l, "ForearmTwist_L"},
+        {bone_shoulder_twist_r, bone_upper_arm_r, bone_forearm_r, "ShoulderTwist_R"},
+        {bone_forearm_twist_r, bone_forearm_r, bone_hand_r, "ForearmTwist_R"},
+    }};
+
+    constexpr std::array<std::size_t, 6U> finger_bones{
+        bone_index_l, bone_middle_l, bone_pinky_l,
+        bone_index_r, bone_middle_r, bone_pinky_r,
+    };
+
+    constexpr std::array<std::string_view, 8U> looping_clip_names{
+        "idle", "walk", "run", "turn_left", "turn_right", "fall", "wave", "talk",
+    };
+
+    for (const vcr::CharacterGender gender :
+         {vcr::CharacterGender::female, vcr::CharacterGender::male}) {
+        const std::string label =
+            (gender == vcr::CharacterGender::female) ? "female" : "male";
+        vcr::CharacterPackage pkg = vcr::make_default_character_package(
+            "rig_bio_" + label, "Rig Bio " + label);
+        pkg.body.gender = gender;
+
+        const auto mesh = vcr::build_character_mesh(pkg);
+        const auto clips = vcr::generate_character_animation_clips(pkg, mesh.skeleton);
+        VCR_EXPECT(mesh.skeleton.bones.size() == vcr::character_total_bone_count,
+                   label + ": Expected 50-bone character skeleton");
+        VCR_EXPECT(mesh.vertices.size() == mesh.skin_vertices.size(),
+                   label + ": Skin vertex count must match vertex count");
+
+        VCR_EXPECT(mesh.skeleton.bones[bone_jaw].name == "Jaw" &&
+                   mesh.skeleton.bones[bone_lip_upper].name == "Lip_Upper" &&
+                   mesh.skeleton.bones[bone_lip_lower].name == "Lip_Lower",
+                   label + ": Facial bone indices 38/39/40 mismatch");
+
+        // 1. TMJ Jaw placement, Lip_Upper/Lip_Lower vertical ordering, collinear twists,
+        //    and swapped lip skin-weight regression check.
+        const glm::vec3 jaw_bind = bind_model_pos(mesh.skeleton, bone_jaw);
+        const glm::vec3 lip_upper_bind = bind_model_pos(mesh.skeleton, bone_lip_upper);
+        const glm::vec3 lip_lower_bind = bind_model_pos(mesh.skeleton, bone_lip_lower);
+        VCR_EXPECT(lip_upper_bind.z - jaw_bind.z > 0.05F,
+                   label + ": Jaw (38) bind Z must be posterior to Lip_Upper (39) by > 0.05 m");
+        VCR_EXPECT(lip_lower_bind.z - jaw_bind.z > 0.05F,
+                   label + ": Jaw (38) bind Z must be posterior to Lip_Lower (40) by > 0.05 m");
+        VCR_EXPECT(lip_upper_bind.y > lip_lower_bind.y,
+                   label + ": Lip_Upper (39) bind Y must exceed Lip_Lower (40) bind Y");
+
+        for (const TwistMidpointSpec& tc : twist_specs) {
+            const glm::vec3 actual = bind_model_pos(mesh.skeleton, tc.twist_idx);
+            const glm::vec3 expected = glm::mix(
+                bind_model_pos(mesh.skeleton, tc.a_idx),
+                bind_model_pos(mesh.skeleton, tc.b_idx),
+                0.50F);
+            VCR_EXPECT(glm::length(actual - expected) < 1.0e-4F,
+                       label + ": Twist bone " + tc.name + " must lie at exact 50% midpoint");
+        }
+
+        std::optional<std::size_t> skin_sub_idx;
+        for (std::size_t s = 0U; s < mesh.submeshes.size(); ++s) {
+            if (mesh.submeshes[s].name == "skin") {
+                skin_sub_idx = s;
+                break;
+            }
+        }
+        VCR_EXPECT(skin_sub_idx.has_value(), label + ": Missing skin submesh");
+        const auto& skin_sub = mesh.submeshes[*skin_sub_idx];
+
+        std::vector<std::uint8_t> visited(mesh.vertices.size(), 0U);
+        std::vector<std::uint32_t> upper_lip_verts;
+        std::vector<std::uint32_t> lower_lip_verts;
+        const std::uint32_t skin_end = skin_sub.first_index + skin_sub.index_count;
+        for (std::uint32_t ii = skin_sub.first_index;
+             ii < skin_end && ii < mesh.indices.size();
+             ++ii) {
+            const std::uint32_t vi = mesh.indices[ii];
+            if (vi >= mesh.vertices.size() || visited[vi] != 0U) {
+                continue;
+            }
+            visited[vi] = 1U;
+            const auto& sv = mesh.skin_vertices[vi];
+            std::uint16_t dom_joint = 0U;
+            float dom_weight = -1.0F;
+            for (std::size_t k = 0U; k < 4U; ++k) {
+                if (sv.weights[k] <= 0.0F) {
+                    continue;
+                }
+                float joint_weight = 0.0F;
+                for (std::size_t m = 0U; m < 4U; ++m) {
+                    if (sv.joints[m] == sv.joints[k]) {
+                        joint_weight += sv.weights[m];
+                    }
+                }
+                if (joint_weight > dom_weight) {
+                    dom_weight = joint_weight;
+                    dom_joint = sv.joints[k];
+                }
+            }
+            if (dom_joint == static_cast<std::uint16_t>(bone_lip_upper)) {
+                upper_lip_verts.push_back(vi);
+            } else if (dom_joint == static_cast<std::uint16_t>(bone_lip_lower)) {
+                lower_lip_verts.push_back(vi);
+            }
+        }
+        VCR_EXPECT(!upper_lip_verts.empty(),
+                   label + ": Expected body vertices with dominant weight on Lip_Upper (39)");
+        VCR_EXPECT(!lower_lip_verts.empty(),
+                   label + ": Expected body vertices with dominant weight on Lip_Lower (40)");
+
+        vcr::FacialPreviewParams facial_closed{};
+        vcr::FacialPreviewParams facial_open{};
+        facial_open.jaw_open = 1.0F;
+
+        vcr::SkeletonPose pose_closed{};
+        vcr::SkeletonPose pose_open{};
+        vcr::evaluate_character_preview_pose(
+            mesh.skeleton, clips, "idle", 0.0F, facial_closed, pose_closed);
+        vcr::evaluate_character_preview_pose(
+            mesh.skeleton, clips, "idle", 0.0F, facial_open, pose_open);
+
+        const auto mean_lbs_dy =
+            [&](const std::vector<std::uint32_t>& vert_indices) -> float {
+                double sum_dy = 0.0;
+                for (const std::uint32_t vi : vert_indices) {
+                    const auto& p_arr = mesh.vertices[vi].position;
+                    const auto& sv = mesh.skin_vertices[vi];
+                    const glm::vec4 p(p_arr[0], p_arr[1], p_arr[2], 1.0F);
+                    glm::vec4 skinned_closed(0.0F);
+                    glm::vec4 skinned_open(0.0F);
+                    for (std::size_t k = 0U; k < 4U; ++k) {
+                        const float w = sv.weights[k];
+                        if (w > 0.0F) {
+                            const std::size_t j = sv.joints[k];
+                            skinned_closed += w * (pose_closed.skin_matrices[j] * p);
+                            skinned_open += w * (pose_open.skin_matrices[j] * p);
+                        }
+                    }
+                    sum_dy += static_cast<double>(skinned_open.y - skinned_closed.y);
+                }
+                return static_cast<float>(sum_dy / static_cast<double>(vert_indices.size()));
+            };
+
+        const float mean_dy_bone39 = mean_lbs_dy(upper_lip_verts);
+        const float mean_dy_bone40 = mean_lbs_dy(lower_lip_verts);
+        VCR_EXPECT(mean_dy_bone40 < -0.008F,
+                   label + ": Lip_Lower (40) vertices must drop on jaw_open (mean_dy=" +
+                   std::to_string(mean_dy_bone40) + ")");
+        VCR_EXPECT(std::abs(mean_dy_bone39) < 0.003F,
+                   label + ": Lip_Upper (39) vertices must remain anchored on jaw_open (mean_dy=" +
+                   std::to_string(mean_dy_bone39) + ")");
+
+        // 2. Idle biomechanics: relaxed hanging arms, grounded feet, curled fingers.
+        const glm::vec3 bind_hand_l = bind_model_pos(mesh.skeleton, bone_hand_l);
+        const glm::vec3 bind_hand_r = bind_model_pos(mesh.skeleton, bone_hand_r);
+        const glm::vec3 bind_foot_l = bind_model_pos(mesh.skeleton, bone_foot_l);
+        const glm::vec3 bind_foot_r = bind_model_pos(mesh.skeleton, bone_foot_r);
+        VCR_EXPECT(std::abs(bind_hand_l.x) > 0.44F && std::abs(bind_hand_r.x) > 0.44F,
+                   label + ": Bind A-pose wrists must exceed 0.44 m width");
+
+        const auto idle_idx = find_clip_index(clips, "idle");
+        VCR_EXPECT(idle_idx.has_value(), label + ": Missing idle clip");
+        const vcr::AnimationClip& idle_clip = clips[*idle_idx];
+        VCR_EXPECT(idle_clip.duration_seconds > 0.1F, label + ": Invalid idle clip duration");
+
+        constexpr std::uint32_t idle_samples = 24U;
+        vcr::SkeletonPose pose{};
+        for (std::uint32_t s = 0U; s < idle_samples; ++s) {
+            const float t = (static_cast<float>(s) / static_cast<float>(idle_samples)) *
+                idle_clip.duration_seconds;
+            vcr::sample_animation_clip(mesh.skeleton, idle_clip, t, idle_clip.looping, pose);
+            vcr::compute_model_space_pose(mesh.skeleton, pose);
+
+            const glm::vec3 hand_l = glm::vec3(pose.model_space[bone_hand_l][3]);
+            const glm::vec3 hand_r = glm::vec3(pose.model_space[bone_hand_r][3]);
+            VCR_EXPECT(std::abs(hand_l.x) < 0.30F && std::abs(hand_r.x) < 0.30F,
+                       label + ": idle wrists must hang naturally near torso (|x| < 0.30 m)");
+
+            const glm::vec3 foot_l = glm::vec3(pose.model_space[bone_foot_l][3]);
+            const glm::vec3 foot_r = glm::vec3(pose.model_space[bone_foot_r][3]);
+            const glm::vec3 toe_l = glm::vec3(pose.model_space[bone_toe_l][3]);
+            const glm::vec3 toe_r = glm::vec3(pose.model_space[bone_toe_r][3]);
+            VCR_EXPECT(std::abs(foot_l.y - bind_foot_l.y) < 0.025F &&
+                       std::abs(foot_r.y - bind_foot_r.y) < 0.025F,
+                       label + ": idle feet must remain grounded near bind ankle Y");
+            VCR_EXPECT(toe_l.y > 0.004F && toe_r.y > 0.004F,
+                       label + ": idle toes must remain above Y=0 ground plane");
+
+            for (const std::size_t finger_idx : finger_bones) {
+                const float deg = quat_angle_deg(pose.local[finger_idx].rotation);
+                VCR_EXPECT(deg > 5.0F,
+                           label + ": idle fingers must have natural curl (> 5 deg)");
+            }
+        }
+
+        // 3. Walk gait biomechanics: knee flexion phase, pelvis bob, torso counter-rotation,
+        //    and narrow gait track.
+        const auto walk_idx = find_clip_index(clips, "walk");
+        VCR_EXPECT(walk_idx.has_value(), label + ": Missing walk clip");
+        const vcr::AnimationClip& walk_clip = clips[*walk_idx];
+        VCR_EXPECT(walk_clip.duration_seconds > 0.1F, label + ": Invalid walk clip duration");
+
+        constexpr std::uint32_t walk_samples = 36U;
+        float max_swing_knee_l_deg = 0.0F;
+        float max_stance_knee_l_deg = 0.0F;
+        std::uint32_t swing_count = 0U;
+        std::uint32_t stance_count = 0U;
+        float min_pelvis_y = std::numeric_limits<float>::max();
+        float max_pelvis_y = std::numeric_limits<float>::lowest();
+        float max_walk_abs_foot_l_x = 0.0F;
+        float peak_pelvis_yaw = -std::numeric_limits<float>::max();
+        float spine03_model_yaw_at_peak = 0.0F;
+        float spine03_rel_yaw_at_peak = 0.0F;
+
+        for (std::uint32_t s = 0U; s < walk_samples; ++s) {
+            const float phase = static_cast<float>(s) / static_cast<float>(walk_samples);
+            const float t = phase * walk_clip.duration_seconds;
+            vcr::sample_animation_clip(mesh.skeleton, walk_clip, t, walk_clip.looping, pose);
+            vcr::compute_model_space_pose(mesh.skeleton, pose);
+
+            const glm::vec3 thigh_l = glm::vec3(pose.model_space[bone_thigh_l][3]);
+            const glm::vec3 shin_l = glm::vec3(pose.model_space[bone_shin_l][3]);
+            const glm::vec3 foot_l = glm::vec3(pose.model_space[bone_foot_l][3]);
+            const glm::vec3 u = glm::normalize(shin_l - thigh_l);
+            const glm::vec3 v = glm::normalize(foot_l - shin_l);
+            const float knee_deg = glm::degrees(std::acos(std::clamp(glm::dot(u, v), -1.0F, 1.0F)));
+
+            if (phase >= 0.65F && phase <= 0.85F) {
+                max_swing_knee_l_deg = (std::max)(max_swing_knee_l_deg, knee_deg);
+                ++swing_count;
+            }
+            if (phase >= 0.25F && phase <= 0.40F) {
+                max_stance_knee_l_deg = (std::max)(max_stance_knee_l_deg, knee_deg);
+                ++stance_count;
+            }
+
+            const float pelvis_y = pose.model_space[bone_pelvis][3].y;
+            min_pelvis_y = (std::min)(min_pelvis_y, pelvis_y);
+            max_pelvis_y = (std::max)(max_pelvis_y, pelvis_y);
+            max_walk_abs_foot_l_x = (std::max)(max_walk_abs_foot_l_x, std::abs(foot_l.x));
+
+            const float pelvis_yaw = extract_mat_yaw(pose.model_space[bone_pelvis]);
+            if (pelvis_yaw > peak_pelvis_yaw) {
+                peak_pelvis_yaw = pelvis_yaw;
+                spine03_model_yaw_at_peak = extract_mat_yaw(pose.model_space[bone_spine_03]);
+                const glm::mat3 pelvis_rot(pose.model_space[bone_pelvis]);
+                const glm::mat3 spine_rot(pose.model_space[bone_spine_03]);
+                const glm::mat3 rel_rot = glm::transpose(pelvis_rot) * spine_rot;
+                const glm::vec3 rel_fwd = rel_rot[2];
+                spine03_rel_yaw_at_peak = std::atan2(rel_fwd.x, rel_fwd.z);
+            }
+        }
+
+        VCR_EXPECT(swing_count > 0U && stance_count > 0U,
+                   label + ": walk sampling must cover stance and swing windows");
+        VCR_EXPECT(max_swing_knee_l_deg - max_stance_knee_l_deg >= 25.0F,
+                   label + ": walk swing knee flexion (" + std::to_string(max_swing_knee_l_deg) +
+                   " deg) must exceed stance (" + std::to_string(max_stance_knee_l_deg) +
+                   " deg) by >= 25 deg");
+        VCR_EXPECT(max_pelvis_y - min_pelvis_y > 0.012F,
+                   label + ": walk Pelvis vertical bob must exceed 0.012 m");
+        VCR_EXPECT(peak_pelvis_yaw > glm::radians(1.5F),
+                   label + ": walk Pelvis must rotate in transverse yaw");
+        VCR_EXPECT(spine03_model_yaw_at_peak < peak_pelvis_yaw &&
+                   spine03_rel_yaw_at_peak < -glm::radians(1.5F),
+                   label + ": Spine_03 must counter-rotate against peak Pelvis yaw");
+        VCR_EXPECT(std::abs(bind_foot_l.x) - max_walk_abs_foot_l_x > 0.03F,
+                   label + ": walk ankle X-width must be narrower than bind straddle by > 0.03 m");
+
+        // 4. Twist bones activation during wave & loop continuity across all 8 looping clips.
+        const auto wave_idx = find_clip_index(clips, "wave");
+        VCR_EXPECT(wave_idx.has_value(), label + ": Missing wave clip");
+        const vcr::AnimationClip& wave_clip = clips[*wave_idx];
+        VCR_EXPECT(wave_clip.duration_seconds > 0.1F, label + ": Invalid wave clip duration");
+
+        float max_shoulder_twist_r_deg = 0.0F;
+        float max_forearm_twist_r_deg = 0.0F;
+        constexpr std::uint32_t wave_samples = 36U;
+        for (std::uint32_t s = 0U; s < wave_samples; ++s) {
+            const float t = (static_cast<float>(s) / static_cast<float>(wave_samples)) *
+                wave_clip.duration_seconds;
+            vcr::sample_animation_clip(mesh.skeleton, wave_clip, t, wave_clip.looping, pose);
+            max_shoulder_twist_r_deg = (std::max)(
+                max_shoulder_twist_r_deg, quat_angle_deg(pose.local[bone_shoulder_twist_r].rotation));
+            max_forearm_twist_r_deg = (std::max)(
+                max_forearm_twist_r_deg, quat_angle_deg(pose.local[bone_forearm_twist_r].rotation));
+        }
+        VCR_EXPECT(max_shoulder_twist_r_deg > 5.0F,
+                   label + ": wave must rotate ShoulderTwist_R (33) > 5 deg");
+        VCR_EXPECT(max_forearm_twist_r_deg > 5.0F,
+                   label + ": wave must rotate ForearmTwist_R (34) > 5 deg");
+
+        vcr::SkeletonPose pose_start{};
+        vcr::SkeletonPose pose_end{};
+        for (const std::string_view clip_name : looping_clip_names) {
+            const auto clip_idx = find_clip_index(clips, clip_name);
+            VCR_EXPECT(clip_idx.has_value(),
+                       label + ": Missing looping clip " + std::string(clip_name));
+            const vcr::AnimationClip& clip = clips[*clip_idx];
+            VCR_EXPECT(clip.looping,
+                       label + ": Expected clip " + std::string(clip_name) + " to be looping");
+            VCR_EXPECT(clip.duration_seconds > 0.05F,
+                       label + ": Expected valid duration for " + std::string(clip_name));
+
+            // Evaluate with looping=false so duration_seconds samples the final authored keyframe
+            // rather than wrapping back to 0.0F via fmod.
+            vcr::sample_animation_clip(mesh.skeleton, clip, 0.0F, false, pose_start);
+            vcr::compute_model_space_pose(mesh.skeleton, pose_start);
+            vcr::sample_animation_clip(
+                mesh.skeleton, clip, clip.duration_seconds, false, pose_end);
+            vcr::compute_model_space_pose(mesh.skeleton, pose_end);
+            VCR_EXPECT(pose_start.bone_count == vcr::character_total_bone_count &&
+                       pose_end.bone_count == vcr::character_total_bone_count,
+                       label + ": Pose bone count mismatch in loop check");
+
+            float max_joint_pos_diff = 0.0F;
+            for (std::size_t b = 0U; b < vcr::character_total_bone_count; ++b) {
+                const glm::vec3 p0 = glm::vec3(pose_start.model_space[b][3]);
+                const glm::vec3 p1 = glm::vec3(pose_end.model_space[b][3]);
+                max_joint_pos_diff = (std::max)(max_joint_pos_diff, glm::length(p1 - p0));
+            }
+            VCR_EXPECT(max_joint_pos_diff < 1.0e-3F,
+                       label + ": Loop discontinuity in '" + std::string(clip_name) +
+                       "' (max diff = " + std::to_string(max_joint_pos_diff) + " m)");
+        }
+    }
+
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -814,6 +1219,9 @@ int main() {
     }
     if (!test_unified_character_studio_cli_discover_and_verify()) {
         return 7;
+    }
+    if (!test_anatomical_rig_and_human_locomotion_biomechanics()) {
+        return 8;
     }
     std::cout << "[PASS] vcr_character_suite_tests passed all checks.\n";
     return 0;

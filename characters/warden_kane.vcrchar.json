@@ -10,18 +10,18 @@
     "run_speed_mps": 4.900000095367432,
     "stride_energy": 1.0,
     "temperament": "neutral",
-    "walk_speed_mps": 1.850000023841858
+    "walk_speed_mps": 1.8600000143051147
   },
   "body": {
     "age_wear": 0.18409478664398193,
     "archetype": "human_athletic",
-    "arm_length": 0.10000000149011612,
-    "body_fat": 0.0,
-    "chest_depth": 0.10000000149011612,
+    "arm_length": 0.5199999809265137,
+    "body_fat": 0.5,
+    "chest_depth": 0.5199999809265137,
     "face": {
-      "brow_ridge": 1.0,
+      "brow_ridge": 0.5600000023841858,
       "cheekbone_prominence": 0.75,
-      "chin_length": 1.0,
+      "chin_length": 0.5099999904632568,
       "eye_color": [
         0.23999999463558197,
         0.4399999976158142,
@@ -39,11 +39,11 @@
     "freckles": 0.07999999821186066,
     "gender": "male",
     "height_meters": 2.2100000381469727,
-    "hip_width": 0.10000000149011612,
-    "leg_length": 1.0,
+    "hip_width": 0.5400000214576721,
+    "leg_length": 0.6000000238418579,
     "lip_tint": 0.3799999952316284,
-    "musculature": 0.0,
-    "shoulder_width": 0.10000000149011612,
+    "musculature": 0.46000000834465027,
+    "shoulder_width": 0.41999998688697815,
     "skin_color": [
       0.800000011920929,
       0.6200000047683716,
@@ -51,7 +51,7 @@
     ],
     "skin_roughness": 0.550000011920929,
     "skin_subsurface_strength": 0.7799999713897705,
-    "waist_width": 0.10000000149011612
+    "waist_width": 0.550000011920929
   },
   "dialogue": {
     "dialogue_id": "warden_kane_dialogue",

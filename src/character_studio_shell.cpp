@@ -7,6 +7,7 @@
 #include "window_icon_sdl.hpp"
 
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/trigonometric.hpp>
 #include <imgui_impl_sdl3.h>
 #include <imgui_internal.h>
 #include <nlohmann/json.hpp>
@@ -16,6 +17,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -45,6 +47,25 @@ void copy_cstr(char* dst, const std::size_t dst_size, const std::string_view src
         std::memcpy(dst, src.data(), n);
     }
     dst[n] = '\0';
+}
+
+[[nodiscard]] std::optional<float> parse_finite_float(const std::string_view text) {
+    if (text.empty()) {
+        return std::nullopt;
+    }
+    const std::string copy(text);
+    char* end_ptr = nullptr;
+    const float value = std::strtof(copy.c_str(), &end_ptr);
+    if (end_ptr == nullptr || end_ptr == copy.c_str()) {
+        return std::nullopt;
+    }
+    while (*end_ptr != '\0' && std::isspace(static_cast<unsigned char>(*end_ptr)) != 0) {
+        ++end_ptr;
+    }
+    if (*end_ptr != '\0' || !std::isfinite(value)) {
+        return std::nullopt;
+    }
+    return value;
 }
 
 [[nodiscard]] CharacterPackage make_studio_character_template(
@@ -336,7 +357,8 @@ bool CharacterStudioShell::parse_cli_args(
             arg == "--belt" || arg == "--no-belt" ||
             arg == "--beard" || arg == "--no-beard" ||
             arg == "--studio-underwear" || arg == "--no-studio-underwear" ||
-            arg == "--occlude-body" || arg == "--no-occlude-body") {
+            arg == "--occlude-body" || arg == "--no-occlude-body" ||
+            arg == "--rig-overlay") {
             out_args.options[std::string(arg.substr(2U))] = "true";
             continue;
         }
@@ -843,6 +865,30 @@ void CharacterStudioShell::initialize_gui(
         focus_camera_face();
     } else {
         focus_camera_full_body();
+    }
+
+    // Flush initial package-loaded defaults before applying deterministic CLI preview overrides.
+    tool.on_frame_tick(*this, 0.0F);
+
+    if (const auto clip_opt = args.find_option("clip")) {
+        if (!clip_opt->empty()) {
+            set_preview_clip(*clip_opt);
+        }
+    }
+    if (const auto time_opt = args.find_option("anim-time")) {
+        if (const auto parsed = parse_finite_float(*time_opt)) {
+            set_preview_time(std::max(0.0F, *parsed));
+            set_preview_paused(true);
+        }
+    }
+    if (const auto yaw_opt = args.find_option("yaw-deg")) {
+        if (const auto yaw_deg = parse_finite_float(*yaw_opt)) {
+            orbit_azimuth_ = glm::radians(*yaw_deg);
+            update_orbit_camera();
+        }
+    }
+    if (args.has_flag("rig-overlay")) {
+        set_show_skeleton_overlay(true);
     }
 
     if (args.ollama.enable_network) {

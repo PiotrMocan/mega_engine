@@ -1796,14 +1796,14 @@ void solve_two_bone_ik(
     }
 
     const glm::vec3 ab_dir = (pos_b - pos_a) / len_ab;
-    const glm::vec3 bc_dir = (pos_c - pos_b) / len_bc;
 
     glm::vec3 at_vec = target - pos_a;
     float dist_ac = glm::length(at_vec);
     const float min_reach = std::fabs(len_ab - len_bc) + 1.0e-4F;
     const float max_reach = (len_ab + len_bc) * 0.999F;
     if (dist_ac <= 1.0e-5F) {
-        at_vec = glm::normalize(pos_c - pos_a);
+        const glm::vec3 ac_vec = pos_c - pos_a;
+        at_vec = (glm::dot(ac_vec, ac_vec) > 1.0e-8F) ? glm::normalize(ac_vec) : ab_dir;
         dist_ac = min_reach;
     } else {
         at_vec /= dist_ac;
@@ -1816,26 +1816,22 @@ void solve_two_bone_ik(
         -1.0F, 1.0F);
     const float hip_angle = std::acos(cos_hip);
 
-    glm::vec3 bend_axis = glm::cross(ab_dir, bc_dir);
-    if (glm::dot(bend_axis, bend_axis) <= 1.0e-8F) {
-        bend_axis = glm::cross(at_vec, pole_vector_model);
+    glm::vec3 pole_dir = pole_vector_model - at_vec * glm::dot(pole_vector_model, at_vec);
+    if (glm::dot(pole_dir, pole_dir) <= 1.0e-8F) {
+        const glm::vec3 ab_delta = pos_b - pos_a;
+        pole_dir = ab_delta - at_vec * glm::dot(ab_delta, at_vec);
     }
-    if (glm::dot(bend_axis, bend_axis) <= 1.0e-8F) {
-        bend_axis = glm::cross(at_vec, glm::vec3(1.0F, 0.0F, 0.0F));
+    if (glm::dot(pole_dir, pole_dir) <= 1.0e-8F) {
+        const glm::vec3 fallback_axis = (std::fabs(at_vec.z) < 0.9F)
+            ? glm::vec3(0.0F, 0.0F, 1.0F)
+            : glm::vec3(1.0F, 0.0F, 0.0F);
+        pole_dir = fallback_axis - at_vec * glm::dot(fallback_axis, at_vec);
     }
-    bend_axis = glm::normalize(bend_axis);
+    pole_dir = glm::normalize(pole_dir);
 
-    // Ensure knee bends toward pole vector.
-    glm::vec3 desired_ab = glm::normalize(
-        glm::mat3(glm::rotate(glm::mat4{1.0F}, hip_angle, bend_axis)) * at_vec);
-    const glm::vec3 proposed_b = pos_a + desired_ab * len_ab;
-    const glm::vec3 to_pole = pole_vector_model - (pos_a + at_vec * glm::dot(pole_vector_model - pos_a, at_vec));
-    const glm::vec3 to_b = proposed_b - (pos_a + at_vec * glm::dot(proposed_b - pos_a, at_vec));
-    if (glm::dot(to_pole, to_pole) > 1.0e-8F && glm::dot(to_b, to_pole) < 0.0F) {
-        desired_ab = glm::normalize(
-            glm::mat3(glm::rotate(glm::mat4{1.0F}, -hip_angle, bend_axis)) * at_vec);
-    }
-
+    const glm::vec3 bend_axis = glm::normalize(glm::cross(at_vec, pole_dir));
+    const glm::vec3 desired_ab = glm::normalize(
+        at_vec * cos_hip + pole_dir * std::sin(hip_angle));
     const glm::vec3 final_b = pos_a + desired_ab * len_ab;
     const glm::vec3 desired_bc = glm::normalize((pos_a + at_vec * dist_ac) - final_b);
 

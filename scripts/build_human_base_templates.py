@@ -313,7 +313,8 @@ def build_skin_weights(weights_ge: dict, weights_def: dict, face_groups: Dict[st
     for bidx, mname, sc in ge_direct:
         add_w(bidx, mname, sc, weights_ge)
 
-    # Split upperarm / lowerarm across primary & twist joints cleanly using weights.default.json
+    # Split upperarm / lowerarm across primary & twist joints cleanly using weights.default.json.
+    # Twist bones 31..34 are placed at equal 50/50 segment midpoints at runtime.
     add_w(8, "upperarm01.L", 1.0, weights_def)
     add_w(31, "upperarm02.L", 1.0, weights_def)
     add_w(9, "lowerarm01.L", 1.0, weights_def)
@@ -335,15 +336,18 @@ def build_skin_weights(weights_ge: dict, weights_def: dict, face_groups: Dict[st
             if 0 <= vi_i < vcount and (raw_weights[vi_i].get(bidx, 0.0) + raw_weights[vi_i].get(twist_b, 0.0)) < 1e-4:
                 raw_weights[vi_i][bidx] = raw_weights[vi_i].get(bidx, 0.0) + float(w)
 
-    # Extract 12-bone facial mini-rig weights on body vertices (0..13379)
+    # Extract 12-bone facial mini-rig weights on body vertices (0..13379).
+    # Bone 38 ("Jaw") pivots at the anatomical TMJ condyle hinge at runtime;
+    # Bone 39 ("Lip_Upper", child of Head) maps to upper lip (oris03/04/05 + levator02);
+    # Bone 40 ("Lip_Lower", child of Jaw) maps to lower lip (oris01/02/06).
     facial_map: List[Tuple[int, str, float]] = [
         (38, "jaw", 1.0),
         (38, "temporalis01.L", 0.35), (38, "temporalis01.R", 0.35),
         (38, "temporalis02.L", 0.35), (38, "temporalis02.R", 0.35),
-        (39, "oris01", 1.0), (39, "oris02", 1.0), (39, "oris06", 0.8),
+        (39, "oris05", 1.0), (39, "oris04.L", 0.9), (39, "oris04.R", 0.9),
+        (39, "oris03.L", 0.5), (39, "oris03.R", 0.5),
         (39, "levator02.L", 0.7), (39, "levator02.R", 0.7),
-        (40, "oris05", 1.0), (40, "oris04.L", 0.9), (40, "oris04.R", 0.9),
-        (40, "oris03.L", 0.5), (40, "oris03.R", 0.5),
+        (40, "oris01", 1.0), (40, "oris02", 1.0), (40, "oris06", 0.8),
         (41, "oris06.L", 1.0), (41, "oris07.L", 1.0),
         (41, "risorius02.L", 0.9), (41, "risorius03.L", 0.9), (41, "levator03.L", 0.6),
         (42, "oris06.R", 1.0), (42, "oris07.R", 1.0),
@@ -1188,16 +1192,18 @@ def build_template_for_gender(gender: str, out_path: Path):
         (joint_verts["joint-r-knee"], (0.0, 0.0, 0.0)),  # 28 Shin_R
         (joint_verts["joint-r-ankle"], (0.0, 0.0, 0.0)),  # 29 Foot_R
         (joint_verts["joint-r-foot-1"], (0.0, 0.0, 0.0)),  # 30 Toe_R
-        (joint_verts["joint-l-shoulder"] + joint_verts["joint-l-elbow"], (0.0, 0.0, 0.0)),  # 31 ShoulderTwist_L
-        (joint_verts["joint-l-elbow"] + joint_verts["joint-l-hand"], (0.0, 0.0, 0.0)),  # 32 ForearmTwist_L
-        (joint_verts["joint-r-shoulder"] + joint_verts["joint-r-elbow"], (0.0, 0.0, 0.0)),  # 33 ShoulderTwist_R
-        (joint_verts["joint-r-elbow"] + joint_verts["joint-r-hand"], (0.0, 0.0, 0.0)),  # 34 ForearmTwist_R
+        # Twist bones 31..34 sit at equal 50/50 segment midpoints (enforced via glm::mix at runtime in C++).
+        (joint_verts["joint-l-shoulder"] + joint_verts["joint-l-elbow"], (0.0, 0.0, 0.0)),  # 31 ShoulderTwist_L (50/50 UpperArm_L..Forearm_L midpoint)
+        (joint_verts["joint-l-elbow"] + joint_verts["joint-l-hand"], (0.0, 0.0, 0.0)),  # 32 ForearmTwist_L (50/50 Forearm_L..Hand_L midpoint)
+        (joint_verts["joint-r-shoulder"] + joint_verts["joint-r-elbow"], (0.0, 0.0, 0.0)),  # 33 ShoulderTwist_R (50/50 UpperArm_R..Forearm_R midpoint)
+        (joint_verts["joint-r-elbow"] + joint_verts["joint-r-hand"], (0.0, 0.0, 0.0)),  # 34 ForearmTwist_R (50/50 Forearm_R..Hand_R midpoint)
         (top_pectoral_verts("breast.L"), (0.0, 0.0, 0.0)),  # 35 Pectoral_L
         (top_pectoral_verts("breast.R"), (0.0, 0.0, 0.0)),  # 36 Pectoral_R
         (joint_verts["joint-pelvis"], (0.0, -0.05, -0.08)),  # 37 TailCoatBase
-        (joint_verts["joint-jaw"], (0.0, 0.0, 0.0)),  # 38 Jaw
-        (top_verts_for_bone(39), (0.0, 0.0, 0.0)),  # 39 Lip_Upper
-        (top_verts_for_bone(40), (0.0, 0.0, 0.0)),  # 40 Lip_Lower
+        # MakeHuman's joint-jaw is the anterior chin tip; C++ runtime repositions Jaw (38) posteriorly to the anatomical TMJ condyle hinge.
+        (joint_verts["joint-jaw"], (0.0, 0.0, 0.0)),  # 38 Jaw (anatomical TMJ condyle hinge at runtime)
+        (top_verts_for_bone(39), (0.0, 0.0, 0.0)),  # 39 Lip_Upper (child of Head; oris03/04/05 + levator02)
+        (top_verts_for_bone(40), (0.0, 0.0, 0.0)),  # 40 Lip_Lower (child of Jaw; oris01/02/06)
         (top_verts_for_bone(41), (0.0, 0.0, 0.0)),  # 41 Mouth_Corner_L
         (top_verts_for_bone(42), (0.0, 0.0, 0.0)),  # 42 Mouth_Corner_R
         (joint_verts["joint-l-eye"], (0.0, 0.0, 0.0)),  # 43 Eye_L

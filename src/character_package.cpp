@@ -402,7 +402,7 @@ fallback_character_bone_layout(const CharacterBodyParams& body) noexcept {
     const float elbow_x = shld_x + 0.26F * arm_scale;
     const float wrist_x = elbow_x + 0.24F * arm_scale;
 
-    return std::array<BoneModelSpec, character_total_bone_count>{{
+    std::array<BoneModelSpec, character_total_bone_count> bones{{
         {"Root", -1, {0.0F, 0.0F, 0.0F}},                                  // 0
         {"Pelvis", 0, {0.0F, pelvis_y, 0.0F}},                             // 1
         {"Spine_01", 1, {0.0F, spine1_y, 0.0F}},                           // 2
@@ -442,7 +442,7 @@ fallback_character_bone_layout(const CharacterBodyParams& body) noexcept {
         {"Pectoral_R", 4, {-0.07F * sw, spine3_y - 0.05F * h, 0.09F}},     // 36
         {"TailCoatBase", 1, {0.0F, pelvis_y - 0.05F * h, -0.08F}},         // 37
         // --- 12-bone classic facial mini-rig (bones 38..49) ---
-        {"Jaw", 6, {0.0F, head_y + 0.025F * head_scale * h, 0.03F}},       // 38
+        {"Jaw", 6, {0.0F, head_y + 0.068F * head_scale * h, 0.022F * head_scale}}, // 38
         {"Lip_Upper", 6, {0.0F, head_y + 0.048F * head_scale * h, 0.105F * head_scale}}, // 39
         {"Lip_Lower", 38, {0.0F, head_y + 0.032F * head_scale * h - jaw_drop * 0.1F, 0.102F * head_scale}}, // 40
         {"Mouth_Corner_L", 6, {0.030F * head_scale, head_y + 0.040F * head_scale * h, 0.096F * head_scale}}, // 41
@@ -455,6 +455,11 @@ fallback_character_bone_layout(const CharacterBodyParams& body) noexcept {
         {"Brow_R", 6, {-0.035F * head_scale, head_y + 0.132F * head_scale * h, 0.098F * head_scale}}, // 48
         {"Brow_Center", 6, {0.0F, head_y + 0.130F * head_scale * h, 0.102F * head_scale}}, // 49
     }};
+    bones[31U].model_pos = glm::mix(bones[8U].model_pos, bones[9U].model_pos, 0.50F);
+    bones[32U].model_pos = glm::mix(bones[9U].model_pos, bones[10U].model_pos, 0.50F);
+    bones[33U].model_pos = glm::mix(bones[16U].model_pos, bones[17U].model_pos, 0.50F);
+    bones[34U].model_pos = glm::mix(bones[17U].model_pos, bones[18U].model_pos, 0.50F);
+    return bones;
 }
 
 // ============================================================================
@@ -765,6 +770,18 @@ private:
     }
     if (!rd.ok() || rd.remaining() != 0U) return false;
 
+    // Repair swapped Lip_Upper (39) <-> Lip_Lower (40) vertex groups in legacy vcrcharbase templates.
+    for (CookedSkinVertex& sv : tpl.skin_weights) {
+        for (std::uint16_t& joint_id : sv.joints) {
+            if (joint_id == 39U) {
+                joint_id = 40U;
+            } else if (joint_id == 40U) {
+                joint_id = 39U;
+            }
+        }
+    }
+    std::swap(tpl.bone_locators[39U], tpl.bone_locators[40U]);
+
     out_tpl = std::move(tpl);
     return true;
 }
@@ -995,6 +1012,26 @@ struct EvaluatedHumanTemplate {
                 locator_mean(b) + tpl.bone_locators[b].offset * height_scale;
         }
     }
+
+    // Enforce exact collinear midpoints for upper-arm and forearm twist pivots.
+    eval.bones[31U].model_pos =
+        glm::mix(eval.bones[8U].model_pos, eval.bones[9U].model_pos, 0.50F);
+    eval.bones[32U].model_pos =
+        glm::mix(eval.bones[9U].model_pos, eval.bones[10U].model_pos, 0.50F);
+    eval.bones[33U].model_pos =
+        glm::mix(eval.bones[16U].model_pos, eval.bones[17U].model_pos, 0.50F);
+    eval.bones[34U].model_pos =
+        glm::mix(eval.bones[17U].model_pos, eval.bones[18U].model_pos, 0.50F);
+
+    // Anchor Jaw (38) posteriorly at the anatomical TMJ condyle hinge.
+    const glm::vec3 eye_mid =
+        0.5F * (eval.bones[43U].model_pos + eval.bones[44U].model_pos);
+    const glm::vec3 corner_mid =
+        0.5F * (eval.bones[41U].model_pos + eval.bones[42U].model_pos);
+    eval.bones[38U].model_pos = glm::vec3(
+        0.0F,
+        glm::mix(corner_mid.y, eye_mid.y, 0.55F),
+        eval.bones[6U].model_pos.z + 0.22F * (eye_mid.z - eval.bones[6U].model_pos.z));
 
     return eval;
 }
@@ -3275,7 +3312,7 @@ void emit_clipped_template_part(
     in.eye_l = eval.bones[43].model_pos;
     in.eye_r = eval.bones[44].model_pos;
     in.jaw_center = eval.bones[38].model_pos;
-    in.mouth_center = eval.bones[39].model_pos;
+    in.mouth_center = 0.5F * (eval.bones[39].model_pos + eval.bones[40].model_pos);
     in.body_positions = eval.positions;
     in.body_skin = tpl.skin_weights;
     in.landmark_chains = tpl.landmark_chains;
@@ -4758,7 +4795,7 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
         : (head_c.y + 0.04F * hs);
     const float neck_y = has_eval ? eval.bones[5].model_pos.y : (head_c.y - 0.085F * hs);
     const glm::vec3 mouth_c = has_eval
-        ? eval.bones[39].model_pos
+        ? 0.5F * (eval.bones[39].model_pos + eval.bones[40].model_pos)
         : glm::vec3(0.0F, eye_y - 0.074F * hs, head_c.z + 0.115F * hs);
     float chin_y = mouth_c.y - 0.050F * hs;
     if (has_eval && tpl != nullptr) {
@@ -5304,42 +5341,806 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
 
 namespace {
 
-void add_rot_track(
-    AnimationClip& clip,
-    const CookedSkeletonAsset& skel,
-    const std::string_view bone_name,
-    const std::span<const std::pair<float, glm::vec3>> euler_deg_keys) {
-    const std::int32_t idx = skel.find_bone_index(bone_name);
-    if (idx < 0) return;
-    BoneAnimationTrack tr{};
-    tr.bone_name = std::string(bone_name);
-    tr.bone_index = idx;
-    tr.rotations.reserve(euler_deg_keys.size());
-    for (const auto& [t, deg] : euler_deg_keys) {
-        tr.rotations.push_back(QuatKey{
-            .time = t,
-            .value = glm::quat(glm::radians(deg)),
-        });
-    }
-    clip.tracks.push_back(std::move(tr));
+[[nodiscard]] float smoothstep01(const float x) noexcept {
+    const float t = std::clamp(x, 0.0F, 1.0F);
+    return t * t * (3.0F - 2.0F * t);
 }
 
-void add_trans_track(
-    AnimationClip& clip,
-    const CookedSkeletonAsset& skel,
-    const std::string_view bone_name,
-    const std::span<const std::pair<float, glm::vec3>> offset_keys) {
-    const std::int32_t idx = skel.find_bone_index(bone_name);
-    if (idx < 0) return;
-    BoneAnimationTrack tr{};
-    tr.bone_name = std::string(bone_name);
-    tr.bone_index = idx;
-    const glm::vec3 bind_t = skel.bones[static_cast<std::size_t>(idx)].local_bind_translation;
-    tr.translations.reserve(offset_keys.size());
-    for (const auto& [t, off] : offset_keys) {
-        tr.translations.push_back(Vec3Key{.time = t, .value = bind_t + off});
+[[nodiscard]] glm::vec3 safe_normalize(
+    const glm::vec3& v,
+    const glm::vec3& fallback) noexcept {
+    const float len2 = glm::dot(v, v);
+    if (len2 > 1.0e-10F) {
+        return v * (1.0F / std::sqrt(len2));
     }
-    clip.tracks.push_back(std::move(tr));
+    return fallback;
+}
+
+[[nodiscard]] glm::vec3 proj_perp(
+    const glm::vec3& v,
+    const glm::vec3& axis_unit) noexcept {
+    return v - axis_unit * glm::dot(v, axis_unit);
+}
+
+[[nodiscard]] glm::mat3 make_ortho_frame_01(
+    const glm::vec3& x_dir,
+    const glm::vec3& y_hint,
+    const glm::vec3& fallback_y) noexcept {
+    const glm::vec3 x = safe_normalize(x_dir, glm::vec3(0.0F, 1.0F, 0.0F));
+    glm::vec3 y_p = proj_perp(y_hint, x);
+    if (glm::dot(y_p, y_p) < 1.0e-8F) {
+        y_p = proj_perp(fallback_y, x);
+        if (glm::dot(y_p, y_p) < 1.0e-8F) {
+            const glm::vec3 alt = std::abs(x.z) < 0.9F
+                ? glm::vec3(0.0F, 0.0F, 1.0F)
+                : glm::vec3(1.0F, 0.0F, 0.0F);
+            y_p = proj_perp(alt, x);
+        }
+    }
+    const glm::vec3 y = safe_normalize(y_p, glm::vec3(1.0F, 0.0F, 0.0F));
+    const glm::vec3 z = glm::cross(x, y);
+    return glm::mat3(x, y, z);
+}
+
+[[nodiscard]] glm::quat shortest_arc_quat(
+    const glm::vec3& from_unit,
+    const glm::vec3& to_unit) noexcept {
+    const float d = std::clamp(glm::dot(from_unit, to_unit), -1.0F, 1.0F);
+    if (d > 0.99999F) {
+        return glm::quat(1.0F, 0.0F, 0.0F, 0.0F);
+    }
+    if (d < -0.99999F) {
+        glm::vec3 ortho = glm::cross(glm::vec3(1.0F, 0.0F, 0.0F), from_unit);
+        if (glm::dot(ortho, ortho) < 1.0e-6F) {
+            ortho = glm::cross(glm::vec3(0.0F, 1.0F, 0.0F), from_unit);
+        }
+        return glm::angleAxis(
+            glm::pi<float>(),
+            safe_normalize(ortho, glm::vec3(0.0F, 0.0F, 1.0F)));
+    }
+    const glm::vec3 c = glm::cross(from_unit, to_unit);
+    return glm::normalize(glm::quat(1.0F + d, c.x, c.y, c.z));
+}
+
+[[nodiscard]] float quat_axis_twist_angle(
+    const glm::quat& q_in,
+    const glm::vec3& axis_unit) noexcept {
+    const glm::quat q = (q_in.w < 0.0F) ? -q_in : q_in;
+    const float d = glm::dot(glm::vec3(q.x, q.y, q.z), axis_unit);
+    const glm::vec3 p = d * axis_unit;
+    const float plen = glm::length(p);
+    if (plen < 1.0e-7F) {
+        return 0.0F;
+    }
+    const float angle = 2.0F * std::atan2(plen, q.w);
+    return d >= 0.0F ? angle : -angle;
+}
+
+[[nodiscard]] glm::quat euler_yxz_deg(const glm::vec3& deg) noexcept {
+    const glm::vec3 r = glm::radians(deg);
+    return glm::angleAxis(r.y, glm::vec3(0.0F, 1.0F, 0.0F)) *
+           glm::angleAxis(r.x, glm::vec3(1.0F, 0.0F, 0.0F)) *
+           glm::angleAxis(r.z, glm::vec3(0.0F, 0.0F, 1.0F));
+}
+
+[[nodiscard]] float pchip_interior_slope(
+    const float h0,
+    const float h1,
+    const float dy0,
+    const float dy1) noexcept {
+    const float s0 = h0 > 1.0e-6F ? (dy0 / h0) : 0.0F;
+    const float s1 = h1 > 1.0e-6F ? (dy1 / h1) : 0.0F;
+    if (s0 * s1 <= 0.0F) {
+        return 0.0F;
+    }
+    const float w1 = 2.0F * h1 + h0;
+    const float w2 = h1 + 2.0F * h0;
+    return (w1 + w2) / (w1 / s0 + w2 / s1);
+}
+
+[[nodiscard]] float pchip_periodic_slope(
+    const std::span<const std::pair<float, float>> knots,
+    const std::size_t idx) noexcept {
+    const std::size_t segs = knots.size() - 1U;
+    const std::size_t k = idx % segs;
+    const std::size_t kp = (k == 0U) ? (segs - 1U) : (k - 1U);
+    const float h0 = knots[kp + 1U].first - knots[kp].first;
+    const float h1 = knots[k + 1U].first - knots[k].first;
+    const float dy0 = knots[kp + 1U].second - knots[kp].second;
+    const float dy1 = knots[k + 1U].second - knots[k].second;
+    return pchip_interior_slope(h0, h1, dy0, dy1);
+}
+
+[[nodiscard]] float pchip_endpoint_slope(
+    const float h0,
+    const float h1,
+    const float s0,
+    const float s1) noexcept {
+    const float denom = h0 + h1;
+    if (denom <= 1.0e-6F) {
+        return s0;
+    }
+    const float d = ((2.0F * h0 + h1) * s0 - h0 * s1) / denom;
+    if (d * s0 <= 0.0F) {
+        return 0.0F;
+    }
+    if (std::abs(d) > 3.0F * std::abs(s0)) {
+        return 3.0F * s0;
+    }
+    return d;
+}
+
+[[nodiscard]] float eval_pchip_periodic(
+    const std::span<const std::pair<float, float>> knots,
+    const float u_raw) noexcept {
+    if (knots.size() < 3U) {
+        return knots.empty() ? 0.0F : knots.front().second;
+    }
+    const float u = u_raw - std::floor(u_raw);
+    const std::size_t segs = knots.size() - 1U;
+    std::size_t seg = 0U;
+    for (std::size_t i = 0U; i < segs; ++i) {
+        if (u <= knots[i + 1U].first || i + 1U == segs) {
+            seg = i;
+            break;
+        }
+    }
+    const float t0 = knots[seg].first;
+    const float t1 = knots[seg + 1U].first;
+    const float h = t1 - t0;
+    if (h <= 1.0e-6F) {
+        return knots[seg].second;
+    }
+    const float m0 = pchip_periodic_slope(knots, seg);
+    const float m1 = pchip_periodic_slope(knots, seg + 1U);
+    const float s = std::clamp((u - t0) / h, 0.0F, 1.0F);
+    const float s2 = s * s;
+    const float s3 = s2 * s;
+    return (2.0F * s3 - 3.0F * s2 + 1.0F) * knots[seg].second +
+           (s3 - 2.0F * s2 + s) * (h * m0) +
+           (-2.0F * s3 + 3.0F * s2) * knots[seg + 1U].second +
+           (s3 - s2) * (h * m1);
+}
+
+[[nodiscard]] float eval_pchip_clamped(
+    const std::span<const std::pair<float, float>> knots,
+    const float u_raw) noexcept {
+    if (knots.size() < 2U) {
+        return knots.empty() ? 0.0F : knots.front().second;
+    }
+    if (knots.size() == 2U) {
+        const float h = knots[1U].first - knots[0U].first;
+        const float s = h > 1.0e-6F ? std::clamp((u_raw - knots[0U].first) / h, 0.0F, 1.0F) : 0.0F;
+        return glm::mix(knots[0U].second, knots[1U].second, s);
+    }
+    const float u = std::clamp(u_raw, knots.front().first, knots.back().first);
+    const std::size_t segs = knots.size() - 1U;
+    std::size_t seg = 0U;
+    for (std::size_t i = 0U; i < segs; ++i) {
+        if (u <= knots[i + 1U].first || i + 1U == segs) {
+            seg = i;
+            break;
+        }
+    }
+    const auto slope_at = [&](const std::size_t k) noexcept -> float {
+        if (k == 0U) {
+            const float h0 = knots[1U].first - knots[0U].first;
+            const float h1 = knots[2U].first - knots[1U].first;
+            const float s0 = h0 > 1.0e-6F ? (knots[1U].second - knots[0U].second) / h0 : 0.0F;
+            const float s1 = h1 > 1.0e-6F ? (knots[2U].second - knots[1U].second) / h1 : 0.0F;
+            return pchip_endpoint_slope(h0, h1, s0, s1);
+        }
+        if (k == segs) {
+            const float h0 = knots[segs].first - knots[segs - 1U].first;
+            const float h1 = knots[segs - 1U].first - knots[segs - 2U].first;
+            const float s0 = h0 > 1.0e-6F ? (knots[segs].second - knots[segs - 1U].second) / h0 : 0.0F;
+            const float s1 = h1 > 1.0e-6F ? (knots[segs - 1U].second - knots[segs - 2U].second) / h1 : 0.0F;
+            return pchip_endpoint_slope(h0, h1, s0, s1);
+        }
+        return pchip_interior_slope(
+            knots[k].first - knots[k - 1U].first,
+            knots[k + 1U].first - knots[k].first,
+            knots[k].second - knots[k - 1U].second,
+            knots[k + 1U].second - knots[k].second);
+    };
+    const float t0 = knots[seg].first;
+    const float t1 = knots[seg + 1U].first;
+    const float h = t1 - t0;
+    if (h <= 1.0e-6F) {
+        return knots[seg].second;
+    }
+    const float m0 = slope_at(seg);
+    const float m1 = slope_at(seg + 1U);
+    const float s = std::clamp((u - t0) / h, 0.0F, 1.0F);
+    const float s2 = s * s;
+    const float s3 = s2 * s;
+    return (2.0F * s3 - 3.0F * s2 + 1.0F) * knots[seg].second +
+           (s3 - 2.0F * s2 + s) * (h * m0) +
+           (-2.0F * s3 + 3.0F * s2) * knots[seg + 1U].second +
+           (s3 - s2) * (h * m1);
+}
+
+struct LegRigMetrics {
+    std::size_t hip_idx = 0U;
+    std::size_t shin_idx = 0U;
+    std::size_t foot_idx = 0U;
+    std::size_t toe_idx = 0U;
+    float side_sign = 1.0F;
+    float len_thigh = 0.40F;
+    float len_shin = 0.40F;
+    glm::vec3 u_thigh0{0.0F, -1.0F, 0.0F};
+    glm::vec3 v_shin0{0.0F, -1.0F, 0.0F};
+    glm::vec3 n_leg0{1.0F, 0.0F, 0.0F};
+    glm::mat3 L_thigh0{1.0F};
+    glm::mat3 L_shin0{1.0F};
+};
+
+struct ArmRigMetrics {
+    std::size_t clavicle_idx = 0U;
+    std::size_t upper_idx = 0U;
+    std::size_t forearm_idx = 0U;
+    std::size_t hand_idx = 0U;
+    std::size_t thumb_idx = 0U;
+    std::size_t index_idx = 0U;
+    std::size_t middle_idx = 0U;
+    std::size_t pinky_idx = 0U;
+    std::size_t shoulder_twist_idx = 0U;
+    std::size_t forearm_twist_idx = 0U;
+    std::size_t pectoral_idx = 0U;
+    float side_sign = 1.0F;
+    glm::vec3 u_arm0{0.0F, -1.0F, 0.0F};
+    glm::vec3 v_farm0{0.0F, -1.0F, 0.0F};
+    glm::vec3 n_arm0{1.0F, 0.0F, 0.0F};
+    glm::vec3 f_hand0{0.0F, -1.0F, 0.0F};
+    glm::vec3 p_palm0{-1.0F, 0.0F, 0.0F};
+    glm::vec3 c_finger0{0.0F, 0.0F, 1.0F};
+    glm::vec3 c_spread0{0.0F, 1.0F, 0.0F};
+    glm::vec3 c_thumb0{0.0F, 1.0F, 0.0F};
+    glm::mat3 F_upper0{1.0F};
+    glm::mat3 F_fore0{1.0F};
+    glm::mat3 F_hand0{1.0F};
+};
+
+struct HumanRigMetrics {
+    float pelvis_y = 0.85F;
+    float ankle_bind_y = 0.067F;
+    float foot_len = 0.11F;
+    float heel_back = 0.05F;
+    float stance_half_x = 0.095F;
+    float leg_len = 0.80F;
+    float leg_ratio = 1.0F;
+    LegRigMetrics leg_l{};
+    LegRigMetrics leg_r{};
+    ArmRigMetrics arm_l{};
+    ArmRigMetrics arm_r{};
+};
+
+[[nodiscard]] HumanRigMetrics build_human_rig_metrics(
+    const CookedSkeletonAsset& skeleton,
+    const CharacterBodyParams& body) noexcept {
+    std::array<glm::vec3, character_total_bone_count> p{};
+    const auto fallback = fallback_character_bone_layout(body);
+    for (std::size_t i = 0U; i < character_total_bone_count; ++i) {
+        p[i] = fallback[i].model_pos;
+    }
+    const std::size_t bone_n =
+        (std::min)(skeleton.bones.size(), static_cast<std::size_t>(character_total_bone_count));
+    for (std::size_t i = 0U; i < bone_n; ++i) {
+        const std::int32_t parent = skeleton.bones[i].parent_index;
+        if (parent >= 0 && static_cast<std::size_t>(parent) < i) {
+            p[i] = p[static_cast<std::size_t>(parent)] + skeleton.bones[i].local_bind_translation;
+        } else {
+            p[i] = skeleton.bones[i].local_bind_translation;
+        }
+    }
+
+    const auto extract_leg = [&](
+                                 const std::size_t hip,
+                                 const std::size_t shin,
+                                 const std::size_t foot,
+                                 const std::size_t toe,
+                                 const float side) noexcept -> LegRigMetrics {
+        LegRigMetrics lm{};
+        lm.hip_idx = hip;
+        lm.shin_idx = shin;
+        lm.foot_idx = foot;
+        lm.toe_idx = toe;
+        lm.side_sign = side;
+        lm.len_thigh = (std::max)(glm::distance(p[hip], p[shin]), 0.15F);
+        lm.len_shin = (std::max)(glm::distance(p[shin], p[foot]), 0.15F);
+        lm.u_thigh0 = safe_normalize(p[shin] - p[hip], glm::vec3(0.0F, -1.0F, 0.0F));
+        lm.v_shin0 = safe_normalize(p[foot] - p[shin], glm::vec3(0.0F, -1.0F, 0.0F));
+        lm.n_leg0 = safe_normalize(
+            glm::cross(glm::vec3(0.0F, 0.0F, 1.0F), lm.u_thigh0),
+            glm::vec3(1.0F, 0.0F, 0.0F));
+        if (lm.n_leg0.x < 0.0F) {
+            lm.n_leg0 = -lm.n_leg0;
+        }
+        lm.L_thigh0 = make_ortho_frame_01(lm.u_thigh0, lm.n_leg0, glm::vec3(1.0F, 0.0F, 0.0F));
+        lm.L_shin0 = make_ortho_frame_01(lm.v_shin0, lm.n_leg0, glm::vec3(1.0F, 0.0F, 0.0F));
+        return lm;
+    };
+
+    const auto extract_arm = [&](
+                                 const std::size_t clav,
+                                 const std::size_t upper,
+                                 const std::size_t forearm,
+                                 const std::size_t hand,
+                                 const std::size_t thumb,
+                                 const std::size_t index_b,
+                                 const std::size_t middle_b,
+                                 const std::size_t pinky_b,
+                                 const std::size_t shld_tw,
+                                 const std::size_t farm_tw,
+                                 const std::size_t pec,
+                                 const float side) noexcept -> ArmRigMetrics {
+        ArmRigMetrics am{};
+        am.clavicle_idx = clav;
+        am.upper_idx = upper;
+        am.forearm_idx = forearm;
+        am.hand_idx = hand;
+        am.thumb_idx = thumb;
+        am.index_idx = index_b;
+        am.middle_idx = middle_b;
+        am.pinky_idx = pinky_b;
+        am.shoulder_twist_idx = shld_tw;
+        am.forearm_twist_idx = farm_tw;
+        am.pectoral_idx = pec;
+        am.side_sign = side;
+
+        am.u_arm0 = safe_normalize(
+            p[forearm] - p[upper],
+            glm::vec3(side * 0.707F, -0.707F, 0.0F));
+        am.v_farm0 = safe_normalize(
+            p[hand] - p[forearm],
+            glm::vec3(side * 0.50F, -0.55F, 0.65F));
+
+        glm::vec3 hinge = glm::cross(am.u_arm0, am.v_farm0);
+        if (glm::dot(hinge, hinge) < 1.0e-5F) {
+            hinge = glm::cross(am.u_arm0, glm::vec3(0.0F, 0.35F, 1.0F));
+        }
+        glm::vec3 hinge_unit = safe_normalize(hinge, glm::vec3(1.0F, 0.0F, 0.0F));
+        if (glm::dot(glm::cross(hinge_unit, am.u_arm0), glm::vec3(0.0F, 0.35F, 1.0F)) < 0.0F) {
+            hinge_unit = -hinge_unit;
+        }
+        am.n_arm0 = -hinge_unit;
+        am.F_upper0 = make_ortho_frame_01(am.u_arm0, am.n_arm0, glm::vec3(1.0F, 0.0F, 0.0F));
+        am.F_fore0 = make_ortho_frame_01(am.v_farm0, am.n_arm0, am.n_arm0);
+
+        am.f_hand0 = safe_normalize(p[middle_b] - p[hand], am.v_farm0);
+        const glm::vec3 u_ulnar0 = safe_normalize(
+            proj_perp(p[pinky_b] - p[index_b], am.f_hand0),
+            glm::vec3(0.0F, 0.0F, -1.0F));
+        am.p_palm0 = (side > 0.0F)
+            ? safe_normalize(glm::cross(u_ulnar0, am.f_hand0), -am.n_arm0)
+            : safe_normalize(glm::cross(am.f_hand0, u_ulnar0), am.n_arm0);
+        const glm::vec3 n_hand0 = -side * am.p_palm0;
+        am.F_hand0 = make_ortho_frame_01(am.f_hand0, n_hand0, am.n_arm0);
+        am.c_finger0 = safe_normalize(glm::cross(am.f_hand0, am.p_palm0), am.n_arm0);
+        am.c_spread0 = safe_normalize(glm::cross(am.f_hand0, -u_ulnar0), am.p_palm0);
+        const glm::vec3 t_dir0 = safe_normalize(p[thumb] - p[hand], am.f_hand0);
+        const glm::vec3 t_target0 = safe_normalize(0.25F * am.p_palm0 + 0.75F * u_ulnar0, am.p_palm0);
+        am.c_thumb0 = safe_normalize(glm::cross(t_dir0, t_target0), am.c_finger0);
+        return am;
+    };
+
+    HumanRigMetrics m{};
+    m.pelvis_y = p[1U].y;
+    m.ankle_bind_y = 0.5F * (p[25U].y + p[29U].y);
+    const float fl_l = p[26U].z - p[25U].z;
+    const float fl_r = p[30U].z - p[29U].z;
+    m.foot_len = std::clamp(0.5F * (fl_l + fl_r), 0.08F, 0.18F);
+    m.heel_back = m.foot_len * 0.45F;
+    const float hip_bind_x = 0.5F * (std::abs(p[23U].x) + std::abs(p[27U].x));
+    m.stance_half_x = std::clamp(hip_bind_x * 0.96F, 0.085F, 0.125F);
+    m.leg_l = extract_leg(23U, 24U, 25U, 26U, 1.0F);
+    m.leg_r = extract_leg(27U, 28U, 29U, 30U, -1.0F);
+    m.leg_len = 0.5F * ((m.leg_l.len_thigh + m.leg_l.len_shin) +
+                        (m.leg_r.len_thigh + m.leg_r.len_shin));
+    m.leg_ratio = std::clamp(m.leg_len / 0.80F, 0.65F, 1.50F);
+    m.arm_l = extract_arm(7U, 8U, 9U, 10U, 11U, 12U, 13U, 14U, 31U, 32U, 35U, 1.0F);
+    m.arm_r = extract_arm(15U, 16U, 17U, 18U, 19U, 20U, 21U, 22U, 33U, 34U, 36U, -1.0F);
+    return m;
+}
+
+struct FootTargetSpec {
+    float x = 0.10F;
+    float lift_y = 0.0F;
+    float z = 0.0F;
+    float yaw_deg = 0.0F;
+    float rocker_deg = 0.0F;
+    float knee_out_bias = 0.06F;
+};
+
+struct ArmTargetSpec {
+    float elevation_deg = 14.5F;
+    float azimuth_deg = 10.0F;
+    float elbow_flex_deg = 16.0F;
+    float pronation_deg = 10.0F;
+    float wrist_pitch_deg = 0.0F;
+    float wrist_ulnar_deg = 0.0F;
+    float finger_curl = 0.30F;
+    float finger_spread = 0.25F;
+    glm::vec3 elbow_pole_local{0.22F, -0.12F, -0.96F};
+};
+
+struct HumanPoseSpec {
+    glm::vec3 pelvis_offset{0.0F};
+    glm::vec3 pelvis_euler_deg{0.0F};
+    glm::vec3 spine_euler_deg{0.0F};
+    glm::vec3 head_euler_deg{0.0F};
+    float tailcoat_pitch_deg = 0.0F;
+    float breath = 0.0F;
+    FootTargetSpec foot_l{};
+    FootTargetSpec foot_r{};
+    ArmTargetSpec arm_l{};
+    ArmTargetSpec arm_r{};
+    float blink = 0.0F;
+    float smile = 0.0F;
+    float jaw_open = 0.0F;
+    float lip_upper_raise = 0.0F;
+    float lip_round = 0.0F;
+    float brow_lift = 0.0F;
+};
+
+void solve_human_pose(
+    const CookedSkeletonAsset& skeleton,
+    const HumanRigMetrics& metrics,
+    const HumanPoseSpec& spec,
+    SkeletonPose& out_pose) noexcept {
+    set_bind_pose(skeleton, out_pose);
+    if (skeleton.bones.size() < character_total_bone_count) {
+        return;
+    }
+
+    out_pose.local[1U].translation =
+        skeleton.bones[1U].local_bind_translation + spec.pelvis_offset;
+    out_pose.local[1U].rotation = euler_yxz_deg(spec.pelvis_euler_deg);
+    out_pose.local[2U].rotation = euler_yxz_deg(spec.spine_euler_deg * 0.35F);
+    out_pose.local[3U].rotation = euler_yxz_deg(
+        spec.spine_euler_deg * 0.35F + glm::vec3(-spec.breath * 1.4F, 0.0F, 0.0F));
+    out_pose.local[4U].rotation = euler_yxz_deg(
+        spec.spine_euler_deg * 0.30F + glm::vec3(-spec.breath * 0.8F, 0.0F, 0.0F));
+    out_pose.local[5U].rotation = euler_yxz_deg(spec.head_euler_deg * 0.45F);
+    out_pose.local[6U].rotation = euler_yxz_deg(spec.head_euler_deg * 0.55F);
+    out_pose.local[37U].rotation = euler_yxz_deg({spec.tailcoat_pitch_deg, 0.0F, 0.0F});
+
+    const auto apply_clavicle = [&](const ArmRigMetrics& am, const ArmTargetSpec& at) noexcept {
+        const float clav_elev_deg = std::clamp(
+            0.22F * (std::max)(0.0F, at.elevation_deg - 22.0F) + spec.breath * 1.4F,
+            -6.0F,
+            24.0F);
+        const float clav_protract_deg = std::clamp(
+            0.14F * at.elevation_deg * std::sin(glm::radians(at.azimuth_deg)),
+            -10.0F,
+            12.0F);
+        out_pose.local[am.clavicle_idx].rotation = euler_yxz_deg(
+            {0.0F, -am.side_sign * clav_protract_deg, am.side_sign * clav_elev_deg});
+        out_pose.local[am.pectoral_idx].rotation = euler_yxz_deg(
+            {0.0F, -am.side_sign * 0.15F * clav_protract_deg, am.side_sign * 0.15F * clav_elev_deg});
+    };
+    apply_clavicle(metrics.arm_l, spec.arm_l);
+    apply_clavicle(metrics.arm_r, spec.arm_r);
+
+    compute_model_space_pose(skeleton, out_pose);
+
+    const glm::quat r_pelvis_model =
+        glm::normalize(glm::quat_cast(glm::mat3(out_pose.model_space[1U])));
+    const auto solve_leg = [&](const LegRigMetrics& lm, const FootTargetSpec& ft) noexcept {
+        const glm::quat q_foot_yaw = glm::angleAxis(
+            glm::radians(ft.yaw_deg),
+            glm::vec3(0.0F, 1.0F, 0.0F));
+        const float rocker_rad = glm::radians(ft.rocker_deg);
+        const float c_r = std::cos(rocker_rad);
+        const float s_r = std::sin(rocker_rad);
+        glm::vec3 ankle_local_offset(0.0F, metrics.ankle_bind_y, 0.0F);
+        float toe_local_pitch_deg = 0.0F;
+        if (ft.rocker_deg < -0.05F) {
+            const glm::vec3 v_heel(0.0F, -metrics.ankle_bind_y, -metrics.heel_back);
+            const glm::vec3 v_rot(0.0F, v_heel.y * c_r - v_heel.z * s_r, v_heel.y * s_r + v_heel.z * c_r);
+            ankle_local_offset += (v_heel - v_rot);
+            toe_local_pitch_deg = std::clamp(0.20F * ft.rocker_deg, -8.0F, 0.0F);
+        } else if (ft.rocker_deg > 0.05F) {
+            const glm::vec3 v_ball(0.0F, -metrics.ankle_bind_y, metrics.foot_len);
+            const glm::vec3 v_rot(0.0F, v_ball.y * c_r - v_ball.z * s_r, v_ball.y * s_r + v_ball.z * c_r);
+            ankle_local_offset += (v_ball - v_rot);
+            const float ground_blend = 1.0F - smoothstep01((ft.lift_y - 0.015F) / 0.045F);
+            toe_local_pitch_deg =
+                -0.85F * ft.rocker_deg * ground_blend +
+                0.28F * ft.rocker_deg * (1.0F - ground_blend);
+        }
+
+        const glm::vec3 base_foot_pos(lm.side_sign * ft.x, ft.lift_y, ft.z);
+        const glm::vec3 p_ankle = base_foot_pos + q_foot_yaw * ankle_local_offset;
+        const glm::vec3 p_hip(out_pose.model_space[lm.hip_idx][3U]);
+        const glm::vec3 to_ankle = p_ankle - p_hip;
+
+        const float max_reach = 0.996F * (lm.len_thigh + lm.len_shin);
+        const float min_reach = std::abs(lm.len_thigh - lm.len_shin) + 0.05F;
+        const float dist = std::clamp(glm::length(to_ankle), min_reach, max_reach);
+        const glm::vec3 d_hat = safe_normalize(to_ankle, glm::vec3(0.0F, -1.0F, 0.0F));
+        const float cos_hip = std::clamp(
+            (lm.len_thigh * lm.len_thigh + dist * dist - lm.len_shin * lm.len_shin) /
+                (2.0F * lm.len_thigh * dist),
+            -1.0F,
+            1.0F);
+        const float sin_hip = std::sqrt((std::max)(0.0F, 1.0F - cos_hip * cos_hip));
+
+        const glm::quat q_pole_yaw = glm::angleAxis(
+            glm::radians(spec.pelvis_euler_deg.y * 0.45F + ft.yaw_deg * 0.55F),
+            glm::vec3(0.0F, 1.0F, 0.0F));
+        const glm::vec3 knee_pole = safe_normalize(
+            q_pole_yaw * glm::vec3(lm.side_sign * ft.knee_out_bias, 0.05F, 1.0F),
+            glm::vec3(0.0F, 0.0F, 1.0F));
+        const glm::vec3 n1 = safe_normalize(
+            glm::cross(knee_pole, d_hat),
+            glm::vec3(1.0F, 0.0F, 0.0F));
+        const glm::vec3 bend_dir = safe_normalize(glm::cross(d_hat, n1), knee_pole);
+        const glm::vec3 p_knee =
+            p_hip + (d_hat * cos_hip + bend_dir * sin_hip) * lm.len_thigh;
+        const glm::vec3 p_ankle_clamped = p_hip + d_hat * dist;
+
+        const glm::vec3 u1 = safe_normalize(p_knee - p_hip, d_hat);
+        const glm::vec3 v1 = safe_normalize(p_ankle_clamped - p_knee, d_hat);
+        const glm::mat3 L_thigh1 = make_ortho_frame_01(u1, n1, n1);
+        const glm::mat3 L_shin1 = make_ortho_frame_01(v1, n1, n1);
+
+        const glm::quat r_thigh_model =
+            glm::normalize(glm::quat_cast(L_thigh1 * glm::transpose(lm.L_thigh0)));
+        const glm::quat r_shin_model =
+            glm::normalize(glm::quat_cast(L_shin1 * glm::transpose(lm.L_shin0)));
+        const glm::quat r_foot_model = glm::normalize(
+            q_foot_yaw * glm::angleAxis(rocker_rad, glm::vec3(1.0F, 0.0F, 0.0F)));
+
+        out_pose.local[lm.hip_idx].rotation =
+            glm::normalize(glm::conjugate(r_pelvis_model) * r_thigh_model);
+        out_pose.local[lm.shin_idx].rotation =
+            glm::normalize(glm::conjugate(r_thigh_model) * r_shin_model);
+        out_pose.local[lm.foot_idx].rotation =
+            glm::normalize(glm::conjugate(r_shin_model) * r_foot_model);
+        out_pose.local[lm.toe_idx].rotation =
+            glm::angleAxis(glm::radians(toe_local_pitch_deg), glm::vec3(1.0F, 0.0F, 0.0F));
+    };
+    solve_leg(metrics.leg_l, spec.foot_l);
+    solve_leg(metrics.leg_r, spec.foot_r);
+
+    const glm::mat3 r_spine3_mat(out_pose.model_space[4U]);
+    const auto solve_arm = [&](const ArmRigMetrics& am, const ArmTargetSpec& at) noexcept {
+        const glm::quat r_clav_model =
+            glm::normalize(glm::quat_cast(glm::mat3(out_pose.model_space[am.clavicle_idx])));
+        const float el_rad = glm::radians(std::clamp(at.elevation_deg, 2.0F, 175.0F));
+        const float az_rad = glm::radians(at.azimuth_deg);
+        const float sin_el = std::sin(el_rad);
+        const glm::vec3 u1_torso(
+            am.side_sign * sin_el * std::cos(az_rad),
+            -std::cos(el_rad),
+            sin_el * std::sin(az_rad));
+        const glm::vec3 u1 = safe_normalize(r_spine3_mat * u1_torso, glm::vec3(0.0F, -1.0F, 0.0F));
+        const glm::vec3 pole_torso(
+            am.side_sign * at.elbow_pole_local.x,
+            at.elbow_pole_local.y,
+            at.elbow_pole_local.z);
+        const glm::vec3 pole = safe_normalize(r_spine3_mat * pole_torso, glm::vec3(0.0F, 0.0F, -1.0F));
+
+        glm::vec3 a1_proj = proj_perp(-pole, u1);
+        if (glm::dot(a1_proj, a1_proj) < 1.0e-6F) {
+            a1_proj = proj_perp(r_spine3_mat * glm::vec3(0.0F, 0.35F, 1.0F), u1);
+        }
+        const glm::vec3 a1 = safe_normalize(a1_proj, glm::vec3(0.0F, 0.0F, 1.0F));
+        const glm::vec3 n1 = safe_normalize(glm::cross(a1, u1), glm::vec3(1.0F, 0.0F, 0.0F));
+        const glm::mat3 F_upper1(u1, n1, glm::cross(u1, n1));
+        const glm::quat r_hum_full =
+            glm::normalize(glm::quat_cast(F_upper1 * glm::transpose(am.F_upper0)));
+
+        const glm::vec3 u_clav = safe_normalize(r_clav_model * am.u_arm0, u1);
+        const glm::quat q_swing = shortest_arc_quat(u_clav, u1);
+        const glm::quat r_upper_swing = glm::normalize(q_swing * r_clav_model);
+        const glm::quat q_twist_delta = glm::normalize(r_hum_full * glm::conjugate(r_upper_swing));
+        const float psi = quat_axis_twist_angle(q_twist_delta, u1);
+        const glm::quat r_upper_model =
+            glm::normalize(glm::angleAxis(0.50F * psi, u1) * r_upper_swing);
+        out_pose.local[am.upper_idx].rotation =
+            glm::normalize(glm::conjugate(r_clav_model) * r_upper_model);
+        out_pose.local[am.shoulder_twist_idx].rotation =
+            glm::angleAxis(0.50F * psi, am.u_arm0);
+
+        const float flex_rad = glm::radians(std::clamp(at.elbow_flex_deg, 2.0F, 145.0F));
+        const glm::vec3 v1 = safe_normalize(
+            std::cos(flex_rad) * u1 + std::sin(flex_rad) * a1,
+            u1);
+        const glm::mat3 F_fore1 = make_ortho_frame_01(v1, n1, n1);
+        const glm::quat r_fore_model =
+            glm::normalize(glm::quat_cast(F_fore1 * glm::transpose(am.F_fore0)));
+        out_pose.local[am.forearm_idx].rotation =
+            glm::normalize(glm::conjugate(r_upper_model) * r_fore_model);
+
+        const glm::quat q_pron = glm::angleAxis(
+            am.side_sign * glm::radians(at.pronation_deg),
+            v1);
+        const glm::mat3 F_wrist_base = glm::mat3_cast(q_pron) * F_fore1;
+        const glm::vec3 n_w = F_wrist_base[1U];
+        const glm::vec3 a_w = F_wrist_base[2U];
+        const glm::quat q_wrist =
+            glm::angleAxis(am.side_sign * glm::radians(at.wrist_pitch_deg), a_w) *
+            glm::angleAxis(-glm::radians(at.wrist_ulnar_deg), n_w);
+        const glm::mat3 F_hand1 = glm::mat3_cast(q_wrist) * F_wrist_base;
+        const glm::quat r_hand_model =
+            glm::normalize(glm::quat_cast(F_hand1 * glm::transpose(am.F_hand0)));
+        const glm::quat q_fore_to_hand =
+            glm::normalize(glm::conjugate(r_fore_model) * r_hand_model);
+        out_pose.local[am.hand_idx].rotation = q_fore_to_hand;
+        const float phi = quat_axis_twist_angle(q_fore_to_hand, am.v_farm0);
+        out_pose.local[am.forearm_twist_idx].rotation =
+            glm::angleAxis(0.55F * phi, am.v_farm0);
+
+        const float curl = std::clamp(at.finger_curl, 0.0F, 1.0F);
+        constexpr float max_curl_deg = 128.0F;
+        const float idx_scale = glm::mix(0.82F, 0.96F, curl);
+        const float pnk_scale = glm::mix(1.18F, 1.06F, curl);
+        const float spread_base = at.finger_spread * (1.0F - 0.85F * curl);
+        out_pose.local[am.index_idx].rotation =
+            glm::angleAxis(glm::radians(spread_base * 4.5F), am.c_spread0) *
+            glm::angleAxis(glm::radians(idx_scale * curl * max_curl_deg), am.c_finger0);
+        out_pose.local[am.middle_idx].rotation =
+            glm::angleAxis(glm::radians(curl * max_curl_deg), am.c_finger0);
+        out_pose.local[am.pinky_idx].rotation =
+            glm::angleAxis(glm::radians(-spread_base * 6.0F), am.c_spread0) *
+            glm::angleAxis(glm::radians(pnk_scale * curl * max_curl_deg), am.c_finger0);
+        out_pose.local[am.thumb_idx].rotation =
+            glm::angleAxis(glm::radians(0.40F * curl * 80.0F + 8.0F), am.c_thumb0);
+    };
+    solve_arm(metrics.arm_l, spec.arm_l);
+    solve_arm(metrics.arm_r, spec.arm_r);
+
+    out_pose.local[38U].rotation =
+        glm::angleAxis(glm::radians(spec.jaw_open * 13.5F), glm::vec3(1.0F, 0.0F, 0.0F));
+    out_pose.local[39U].translation =
+        skeleton.bones[39U].local_bind_translation +
+        glm::vec3(0.0F, spec.lip_upper_raise * 0.006F, spec.lip_round * 0.008F);
+    out_pose.local[40U].translation =
+        skeleton.bones[40U].local_bind_translation +
+        glm::vec3(0.0F, -spec.jaw_open * 0.0025F, spec.lip_round * 0.008F);
+    const float mc_x = spec.smile * 0.004F - spec.lip_round * 0.005F;
+    const float mc_y = spec.smile * 0.007F - spec.jaw_open * 0.0035F;
+    const float mc_z = -spec.smile * 0.003F;
+    out_pose.local[41U].translation =
+        skeleton.bones[41U].local_bind_translation + glm::vec3(mc_x, mc_y, mc_z);
+    out_pose.local[42U].translation =
+        skeleton.bones[42U].local_bind_translation + glm::vec3(-mc_x, mc_y, mc_z);
+    out_pose.local[45U].translation =
+        skeleton.bones[45U].local_bind_translation +
+        glm::vec3(0.0F, -spec.blink * 0.015F, spec.blink * 0.002F);
+    out_pose.local[46U].translation =
+        skeleton.bones[46U].local_bind_translation +
+        glm::vec3(0.0F, -spec.blink * 0.015F, spec.blink * 0.002F);
+    out_pose.local[47U].translation =
+        skeleton.bones[47U].local_bind_translation + glm::vec3(0.0F, spec.brow_lift * 0.005F, 0.0F);
+    out_pose.local[48U].translation =
+        skeleton.bones[48U].local_bind_translation + glm::vec3(0.0F, spec.brow_lift * 0.005F, 0.0F);
+    out_pose.local[49U].translation =
+        skeleton.bones[49U].local_bind_translation + glm::vec3(0.0F, spec.brow_lift * 0.004F, 0.0F);
+}
+
+template <typename EvalFn>
+[[nodiscard]] AnimationClip bake_human_clip(
+    const std::string_view name,
+    const float duration_seconds,
+    const bool looping,
+    const CookedSkeletonAsset& skeleton,
+    const HumanRigMetrics& metrics,
+    const bool include_blink,
+    const bool include_smile,
+    const bool include_speech,
+    const bool include_brows,
+    EvalFn&& eval_fn) {
+    AnimationClip clip{};
+    clip.name = std::string(name);
+    clip.duration_seconds = duration_seconds;
+    clip.ticks_per_second = 30.0F;
+    clip.looping = looping;
+
+    const std::size_t bone_n =
+        (std::min)(skeleton.bones.size(), static_cast<std::size_t>(character_total_bone_count));
+    const std::uint32_t sample_intervals = (std::max)(
+        2U,
+        static_cast<std::uint32_t>(std::lround(duration_seconds * 30.0F)));
+    const std::size_t sample_count = static_cast<std::size_t>(sample_intervals) + 1U;
+
+    std::array<BoneAnimationTrack, character_total_bone_count> bone_tracks{};
+    std::array<bool, character_total_bone_count> track_rot_enabled{};
+    std::array<bool, character_total_bone_count> track_trans_enabled{};
+
+    if (bone_n > 1U) {
+        track_trans_enabled[1U] = true;
+    }
+    for (std::size_t b = 1U; b < (std::min)(bone_n, std::size_t{38U}); ++b) {
+        track_rot_enabled[b] = true;
+    }
+    if (include_blink && bone_n > 46U) {
+        track_trans_enabled[45U] = true;
+        track_trans_enabled[46U] = true;
+    }
+    if ((include_smile || include_speech) && bone_n > 42U) {
+        track_trans_enabled[41U] = true;
+        track_trans_enabled[42U] = true;
+    }
+    if (include_speech && bone_n > 40U) {
+        track_rot_enabled[38U] = true;
+        track_trans_enabled[39U] = true;
+        track_trans_enabled[40U] = true;
+    }
+    if (include_brows && bone_n > 49U) {
+        track_rot_enabled[38U] = true;
+        track_trans_enabled[47U] = true;
+        track_trans_enabled[48U] = true;
+        track_trans_enabled[49U] = true;
+    }
+
+    for (std::size_t b = 0U; b < bone_n; ++b) {
+        if (!track_rot_enabled[b] && !track_trans_enabled[b]) {
+            continue;
+        }
+        bone_tracks[b].bone_name = skeleton.bones[b].name;
+        bone_tracks[b].bone_index = static_cast<std::int32_t>(b);
+        if (track_rot_enabled[b]) {
+            bone_tracks[b].rotations.reserve(sample_count);
+        }
+        if (track_trans_enabled[b]) {
+            bone_tracks[b].translations.reserve(sample_count);
+        }
+    }
+
+    SkeletonPose pose{};
+    for (std::size_t k = 0U; k < sample_count; ++k) {
+        const float u = static_cast<float>(k) / static_cast<float>(sample_intervals);
+        const float t = (k + 1U == sample_count) ? duration_seconds : duration_seconds * u;
+
+        if (looping && k + 1U == sample_count) {
+            for (std::size_t b = 0U; b < bone_n; ++b) {
+                if (track_rot_enabled[b]) {
+                    bone_tracks[b].rotations.push_back(QuatKey{
+                        .time = duration_seconds,
+                        .value = bone_tracks[b].rotations.front().value,
+                    });
+                }
+                if (track_trans_enabled[b]) {
+                    bone_tracks[b].translations.push_back(Vec3Key{
+                        .time = duration_seconds,
+                        .value = bone_tracks[b].translations.front().value,
+                    });
+                }
+            }
+            continue;
+        }
+
+        const HumanPoseSpec spec = eval_fn(t, u);
+        solve_human_pose(skeleton, metrics, spec, pose);
+        for (std::size_t b = 0U; b < bone_n; ++b) {
+            if (track_rot_enabled[b]) {
+                glm::quat q = glm::normalize(pose.local[b].rotation);
+                if (!bone_tracks[b].rotations.empty() &&
+                    glm::dot(q, bone_tracks[b].rotations.back().value) < 0.0F) {
+                    q = -q;
+                }
+                bone_tracks[b].rotations.push_back(QuatKey{.time = t, .value = q});
+            }
+            if (track_trans_enabled[b]) {
+                bone_tracks[b].translations.push_back(Vec3Key{
+                    .time = t,
+                    .value = pose.local[b].translation,
+                });
+            }
+        }
+    }
+
+    clip.tracks.reserve(character_total_bone_count);
+    for (std::size_t b = 0U; b < bone_n; ++b) {
+        if (track_rot_enabled[b] || track_trans_enabled[b]) {
+            clip.tracks.push_back(std::move(bone_tracks[b]));
+        }
+    }
+    bind_clip_to_skeleton(clip, skeleton);
+    return clip;
 }
 
 } // namespace
@@ -5349,190 +6150,631 @@ std::vector<AnimationClip> generate_character_animation_clips(
     const CookedSkeletonAsset& skeleton) {
     CharacterPackage pkg = input_pkg;
     sanitize_character_package(pkg);
-    const float br = pkg.acting.idle_breath_amplitude;
-    const float en = pkg.acting.stride_energy;
-    const float sw = pkg.acting.arm_swing;
+    const HumanRigMetrics metrics = build_human_rig_metrics(skeleton, pkg.body);
+    const float br = std::clamp(pkg.acting.idle_breath_amplitude, 0.25F, 2.0F);
+    const float en = std::clamp(pkg.acting.stride_energy, 0.50F, 1.50F);
+    const float sw = std::clamp(pkg.acting.arm_swing, 0.35F, 1.65F);
+    constexpr float two_pi = glm::two_pi<float>();
 
     std::vector<AnimationClip> clips;
+    clips.reserve(12U);
 
-    // 1. idle (with chest breathing + relaxed natural A-pose arms + eye blink)
+    // 1. idle (contrapposto weight shift, thoracic breathing, relaxed arms & progressive fingers, blink)
     {
-        AnimationClip c{.name = "idle", .duration_seconds = 3.2F, .ticks_per_second = 30.0F, .looping = true};
-        const std::array<std::pair<float, glm::vec3>, 4U> chest{{
-            {0.0F, {-1.5F * br, 0.0F, 0.0F}},
-            {1.5F, {2.0F * br, 0.0F, 0.0F}},
-            {2.4F, {1.2F * br, 1.0F * br, 0.0F}},
-            {3.2F, {-1.5F * br, 0.0F, 0.0F}},
+        auto c = bake_human_clip(
+            "idle", 3.60F, true, skeleton, metrics, true, false, false, false,
+            [&](const float /*t*/, const float u) noexcept {
+                const float w = two_pi * u;
+                const float breath_phase = 0.5F - 0.5F * std::cos(w);
+                const float sway = std::sin(w);
+                const float blink_env = smoothstep01((u - 0.72F) / 0.028F) *
+                    (1.0F - smoothstep01((u - 0.76F) / 0.042F));
+
+                HumanPoseSpec s{};
+                s.breath = br * breath_phase;
+                s.pelvis_offset = {
+                    (-0.016F + 0.004F * sway) * metrics.leg_ratio,
+                    (-0.015F + 0.002F * breath_phase) * metrics.leg_ratio,
+                    0.0F};
+                s.pelvis_euler_deg = {1.5F, -2.5F + 1.0F * sway, -2.2F + 0.4F * sway};
+                s.spine_euler_deg = {-1.0F, 2.5F - 1.0F * sway, 2.0F - 0.3F * sway};
+                s.head_euler_deg = {-0.5F - 0.8F * s.breath, -0.4F * sway, 0.2F};
+                s.tailcoat_pitch_deg = 2.0F + 1.0F * breath_phase;
+                s.foot_l = {metrics.stance_half_x * 1.12F, 0.0F, 0.045F * metrics.leg_len, 5.0F, 0.0F, 0.07F};
+                s.foot_r = {metrics.stance_half_x * 1.04F, 0.0F, -0.020F * metrics.leg_len, -5.0F, 0.0F, 0.06F};
+                s.arm_l = {7.8F + 0.4F * s.breath, 16.0F + 2.0F * sway, 16.0F + 1.2F * breath_phase, 10.0F, 2.0F, 0.0F, 0.19F, 0.25F, {0.30F, -0.10F, -0.95F}};
+                s.arm_r = {7.8F + 0.4F * s.breath, 16.0F - 2.0F * sway, 17.0F + 1.2F * breath_phase, 10.0F, 2.0F, 0.0F, 0.20F, 0.25F, {0.30F, -0.10F, -0.95F}};
+                s.blink = blink_env;
+                return s;
+            });
+        clips.push_back(std::move(c));
+    }
+
+    // 2. walk (grounded 3-rocker feet, Law-of-Cosines swing flexion, Pelvis/Spine counter-torsion)
+    {
+        static constexpr std::array<std::pair<float, float>, 8U> walk_z_knots{{
+            {0.00F, 1.00F}, {0.12F, 0.72F}, {0.30F, 0.00F}, {0.45F, -0.62F},
+            {0.56F, -1.00F}, {0.72F, -0.15F}, {0.88F, 0.78F}, {1.00F, 1.00F},
         }};
-        add_rot_track(c, skeleton, "Spine_02", chest);
-        const std::array<std::pair<float, glm::vec3>, 3U> arm_l{{
-            {0.0F, {0.0F, 0.0F, -12.0F}}, {1.6F, {-2.0F, 0.0F, -10.0F}}, {3.2F, {0.0F, 0.0F, -12.0F}}}};
-        const std::array<std::pair<float, glm::vec3>, 3U> arm_r{{
-            {0.0F, {0.0F, 0.0F, 12.0F}}, {1.6F, {-2.0F, 0.0F, 10.0F}}, {3.2F, {0.0F, 0.0F, 12.0F}}}};
-        add_rot_track(c, skeleton, "UpperArm_L", arm_l);
-        add_rot_track(c, skeleton, "UpperArm_R", arm_r);
-        const std::array<std::pair<float, glm::vec3>, 2U> farm_l{{{0.0F, {-8.0F, -10.0F, 0.0F}}, {3.2F, {-8.0F, -10.0F, 0.0F}}}};
-        const std::array<std::pair<float, glm::vec3>, 2U> farm_r{{{0.0F, {-8.0F, 10.0F, 0.0F}}, {3.2F, {-8.0F, 10.0F, 0.0F}}}};
-        add_rot_track(c, skeleton, "Forearm_L", farm_l);
-        add_rot_track(c, skeleton, "Forearm_R", farm_r);
-        const std::array<std::pair<float, glm::vec3>, 5U> blink{{
-            {0.0F, {0.0F, 0.0F, 0.0F}}, {2.52F, {0.0F, 0.0F, 0.0F}},
-            {2.60F, {0.0F, -0.015F, 0.002F}}, {2.70F, {0.0F, 0.0F, 0.0F}}, {3.2F, {0.0F, 0.0F, 0.0F}}}};
-        add_trans_track(c, skeleton, "Eyelid_Upper_L", blink);
-        add_trans_track(c, skeleton, "Eyelid_Upper_R", blink);
-        bind_clip_to_skeleton(c, skeleton);
+        static constexpr std::array<std::pair<float, float>, 9U> walk_lift_knots{{
+            {0.00F, 0.000F}, {0.12F, 0.000F}, {0.30F, 0.000F}, {0.45F, 0.000F},
+            {0.55F, 0.014F}, {0.70F, 0.115F}, {0.86F, 0.052F}, {0.97F, 0.003F}, {1.00F, 0.000F},
+        }};
+        static constexpr std::array<std::pair<float, float>, 9U> walk_rocker_knots{{
+            {0.00F, -19.0F}, {0.09F, -2.0F}, {0.13F, 0.0F}, {0.38F, 0.0F},
+            {0.47F, 16.0F}, {0.57F, 35.0F}, {0.70F, -4.0F}, {0.88F, -14.0F}, {1.00F, -19.0F},
+        }};
+        static constexpr std::array<std::pair<float, float>, 6U> walk_pelvis_y_knots{{
+            {0.00F, -0.032F}, {0.20F, -0.046F}, {0.56F, -0.010F}, {0.78F, -0.016F},
+            {0.92F, -0.026F}, {1.00F, -0.032F},
+        }};
+
+        const float stride = 0.34F * metrics.leg_len * en;
+        const float step_x = metrics.stance_half_x * 0.94F;
+        auto c = bake_human_clip(
+            "walk", 1.00F, true, skeleton, metrics, false, false, false, false,
+            [&](const float /*t*/, const float u) noexcept {
+                const float u_r = std::fmod(u + 0.50F, 1.0F);
+                const float step_phase = std::fmod(u * 2.0F, 1.0F);
+                const float cos_u = std::cos(two_pi * u);
+                const float sin_u = std::sin(two_pi * u);
+                const float cos_2u = std::cos(2.0F * two_pi * u);
+
+                HumanPoseSpec s{};
+                s.breath = 0.25F * br;
+                s.pelvis_offset = {
+                    0.022F * metrics.leg_ratio * sin_u,
+                    eval_pchip_periodic(walk_pelvis_y_knots, step_phase) * metrics.leg_ratio,
+                    0.0F};
+                s.pelvis_euler_deg = {
+                    3.5F + 1.4F * cos_2u,
+                    -5.5F * en * cos_u,
+                    3.2F * sin_u};
+                s.spine_euler_deg = {
+                    4.0F + 1.2F * cos_2u,
+                    12.0F * en * cos_u,
+                    -2.2F * sin_u};
+                s.head_euler_deg = {
+                    -5.5F - 1.2F * cos_2u,
+                    -6.0F * en * cos_u,
+                    -0.8F * sin_u};
+                s.tailcoat_pitch_deg = 7.0F + 2.5F * cos_2u;
+
+                s.foot_l = {
+                    step_x,
+                    eval_pchip_periodic(walk_lift_knots, u) * metrics.leg_ratio,
+                    eval_pchip_periodic(walk_z_knots, u) * stride,
+                    3.5F,
+                    eval_pchip_periodic(walk_rocker_knots, u),
+                    0.05F};
+                s.foot_r = {
+                    step_x,
+                    eval_pchip_periodic(walk_lift_knots, u_r) * metrics.leg_ratio,
+                    eval_pchip_periodic(walk_z_knots, u_r) * stride,
+                    -3.5F,
+                    eval_pchip_periodic(walk_rocker_knots, u_r),
+                    0.05F};
+
+                const float arm_l_phase = -cos_u;
+                const float arm_r_phase = cos_u;
+                s.arm_l = {
+                    15.0F + 13.0F * arm_l_phase * arm_l_phase * sw,
+                    arm_l_phase * 78.0F * sw,
+                    26.0F + 14.0F * arm_l_phase * sw,
+                    10.0F + 6.0F * arm_l_phase,
+                    2.0F,
+                    0.0F,
+                    0.25F,
+                    0.20F,
+                    {0.20F, -0.12F, -0.97F}};
+                s.arm_r = {
+                    15.0F + 13.0F * arm_r_phase * arm_r_phase * sw,
+                    arm_r_phase * 78.0F * sw,
+                    26.0F + 14.0F * arm_r_phase * sw,
+                    10.0F + 6.0F * arm_r_phase,
+                    2.0F,
+                    0.0F,
+                    0.25F,
+                    0.20F,
+                    {0.20F, -0.12F, -0.97F}};
+                return s;
+            });
+        c.events.push_back({0.10F, AnimationEventKind::footstep, "footstep", "left", 1.0F});
+        c.events.push_back({0.60F, AnimationEventKind::footstep, "footstep", "right", 1.0F});
         clips.push_back(std::move(c));
     }
 
-    // 2. walk
+    // 3. run (forward athletic lean, brief double-float flight phase, high heel kick, compact arm pump)
     {
-        AnimationClip c{.name = "walk", .duration_seconds = 1.0F, .ticks_per_second = 30.0F, .looping = true};
-        const std::array<std::pair<float, glm::vec3>, 5U> th_l{{
-            {0.0F, {-24.0F * en, 0, 0}}, {0.25F, {0, 0, 0}}, {0.5F, {22.0F * en, 0, 0}},
-            {0.75F, {-8.0F * en, 0, 0}}, {1.0F, {-24.0F * en, 0, 0}}}};
-        const std::array<std::pair<float, glm::vec3>, 5U> th_r{{
-            {0.0F, {22.0F * en, 0, 0}}, {0.25F, {-8.0F * en, 0, 0}}, {0.5F, {-24.0F * en, 0, 0}},
-            {0.75F, {0, 0, 0}}, {1.0F, {22.0F * en, 0, 0}}}};
-        const std::array<std::pair<float, glm::vec3>, 5U> sh_l{{
-            {0.0F, {6.0F * en, 0, 0}}, {0.25F, {34.0F * en, 0, 0}}, {0.5F, {10.0F * en, 0, 0}},
-            {0.75F, {0, 0, 0}}, {1.0F, {6.0F * en, 0, 0}}}};
-        const std::array<std::pair<float, glm::vec3>, 5U> sh_r{{
-            {0.0F, {10.0F * en, 0, 0}}, {0.25F, {0, 0, 0}}, {0.5F, {6.0F * en, 0, 0}},
-            {0.75F, {34.0F * en, 0, 0}}, {1.0F, {10.0F * en, 0, 0}}}};
-        const std::array<std::pair<float, glm::vec3>, 5U> ar_l{{
-            {0.0F, {20.0F * sw, 0, -14.0F}}, {0.25F, {0, 0, -14.0F}}, {0.5F, {-20.0F * sw, 0, -14.0F}},
-            {0.75F, {0, 0, -14.0F}}, {1.0F, {20.0F * sw, 0, -14.0F}}}};
-        const std::array<std::pair<float, glm::vec3>, 5U> ar_r{{
-            {0.0F, {-20.0F * sw, 0, 14.0F}}, {0.25F, {0, 0, 14.0F}}, {0.5F, {20.0F * sw, 0, 14.0F}},
-            {0.75F, {0, 0, 14.0F}}, {1.0F, {-20.0F * sw, 0, 14.0F}}}};
-        add_rot_track(c, skeleton, "Thigh_L", th_l);
-        add_rot_track(c, skeleton, "Thigh_R", th_r);
-        add_rot_track(c, skeleton, "Shin_L", sh_l);
-        add_rot_track(c, skeleton, "Shin_R", sh_r);
-        add_rot_track(c, skeleton, "UpperArm_L", ar_l);
-        add_rot_track(c, skeleton, "UpperArm_R", ar_r);
-        c.events.push_back({0.15F, AnimationEventKind::footstep, "footstep", "left", 1.0F});
-        c.events.push_back({0.65F, AnimationEventKind::footstep, "footstep", "right", 1.0F});
-        bind_clip_to_skeleton(c, skeleton);
+        static constexpr std::array<std::pair<float, float>, 8U> run_z_knots{{
+            {0.00F, 0.96F}, {0.14F, 0.05F}, {0.29F, -1.00F}, {0.42F, -0.78F},
+            {0.62F, -0.25F}, {0.78F, 0.65F}, {0.92F, 1.00F}, {1.00F, 0.96F},
+        }};
+        static constexpr std::array<std::pair<float, float>, 9U> run_lift_knots{{
+            {0.00F, 0.000F}, {0.06F, 0.000F}, {0.22F, 0.000F}, {0.32F, 0.045F},
+            {0.46F, 0.210F}, {0.64F, 0.320F}, {0.82F, 0.140F}, {0.95F, 0.018F}, {1.00F, 0.000F},
+        }};
+        static constexpr std::array<std::pair<float, float>, 9U> run_rocker_knots{{
+            {0.00F, -10.0F}, {0.07F, 0.0F}, {0.21F, 0.0F}, {0.30F, 36.0F},
+            {0.44F, 22.0F}, {0.64F, -5.0F}, {0.82F, -14.0F}, {0.95F, -12.0F}, {1.00F, -10.0F},
+        }};
+        static constexpr std::array<std::pair<float, float>, 6U> run_pelvis_y_knots{{
+            {0.00F, -0.048F}, {0.26F, -0.076F}, {0.54F, -0.022F}, {0.78F, 0.022F},
+            {0.92F, -0.028F}, {1.00F, -0.048F},
+        }};
+
+        const float stride = 0.45F * metrics.leg_len * en;
+        const float step_x = metrics.stance_half_x * 0.78F;
+        auto c = bake_human_clip(
+            "run", 0.68F, true, skeleton, metrics, false, false, false, false,
+            [&](const float /*t*/, const float u) noexcept {
+                const float u_r = std::fmod(u + 0.50F, 1.0F);
+                const float step_phase = std::fmod(u * 2.0F, 1.0F);
+                const float cos_u = std::cos(two_pi * u);
+                const float sin_u = std::sin(two_pi * u);
+                const float cos_2u = std::cos(2.0F * two_pi * u);
+
+                HumanPoseSpec s{};
+                s.breath = 0.40F * br;
+                s.pelvis_offset = {
+                    0.015F * metrics.leg_ratio * sin_u,
+                    eval_pchip_periodic(run_pelvis_y_knots, step_phase) * metrics.leg_ratio,
+                    0.0F};
+                s.pelvis_euler_deg = {
+                    7.0F + 2.0F * cos_2u,
+                    -7.5F * en * cos_u,
+                    3.5F * sin_u};
+                s.spine_euler_deg = {
+                    14.5F + 1.8F * cos_2u,
+                    16.5F * en * cos_u,
+                    -2.5F * sin_u};
+                s.head_euler_deg = {
+                    -16.5F - 2.0F * cos_2u,
+                    -8.0F * en * cos_u,
+                    -1.0F * sin_u};
+                s.tailcoat_pitch_deg = 22.0F + 4.0F * cos_2u;
+
+                s.foot_l = {
+                    step_x,
+                    eval_pchip_periodic(run_lift_knots, u) * metrics.leg_ratio,
+                    eval_pchip_periodic(run_z_knots, u) * stride,
+                    2.0F,
+                    eval_pchip_periodic(run_rocker_knots, u),
+                    0.05F};
+                s.foot_r = {
+                    step_x,
+                    eval_pchip_periodic(run_lift_knots, u_r) * metrics.leg_ratio,
+                    eval_pchip_periodic(run_z_knots, u_r) * stride,
+                    -2.0F,
+                    eval_pchip_periodic(run_rocker_knots, u_r),
+                    0.05F};
+
+                const float arm_l_phase = -cos_u;
+                const float arm_r_phase = cos_u;
+                s.arm_l = {
+                    24.0F + 22.0F * arm_l_phase * arm_l_phase * sw,
+                    arm_l_phase * (arm_l_phase >= 0.0F ? 102.0F : 74.0F) * sw,
+                    86.0F + 14.0F * arm_l_phase,
+                    16.0F,
+                    4.0F,
+                    0.0F,
+                    0.76F,
+                    0.10F,
+                    {0.25F, -0.14F, -0.96F}};
+                s.arm_r = {
+                    24.0F + 22.0F * arm_r_phase * arm_r_phase * sw,
+                    arm_r_phase * (arm_r_phase >= 0.0F ? 102.0F : 74.0F) * sw,
+                    86.0F + 14.0F * arm_r_phase,
+                    16.0F,
+                    4.0F,
+                    0.0F,
+                    0.76F,
+                    0.10F,
+                    {0.25F, -0.14F, -0.96F}};
+                return s;
+            });
+        c.events.push_back({0.06F, AnimationEventKind::footstep, "footstep", "left", 1.25F});
+        c.events.push_back({0.40F, AnimationEventKind::footstep, "footstep", "right", 1.25F});
         clips.push_back(std::move(c));
     }
 
-    // 3. run
+    // 4. stop (braking forward plant -> shock absorb -> upright settle)
     {
-        AnimationClip c{.name = "run", .duration_seconds = 0.65F, .ticks_per_second = 30.0F, .looping = true};
-        const std::array<std::pair<float, glm::vec3>, 2U> lean{{{0.0F, {12.0F, 0, 0}}, {0.65F, {12.0F, 0, 0}}}};
-        const std::array<std::pair<float, glm::vec3>, 5U> th_l{{
-            {0.0F, {-40.0F * en, 0, 0}}, {0.16F, {-10.0F, 0, 0}}, {0.32F, {38.0F * en, 0, 0}},
-            {0.48F, {-18.0F * en, 0, 0}}, {0.65F, {-40.0F * en, 0, 0}}}};
-        const std::array<std::pair<float, glm::vec3>, 5U> th_r{{
-            {0.0F, {38.0F * en, 0, 0}}, {0.16F, {-18.0F * en, 0, 0}}, {0.32F, {-40.0F * en, 0, 0}},
-            {0.48F, {-10.0F, 0, 0}}, {0.65F, {38.0F * en, 0, 0}}}};
-        const std::array<std::pair<float, glm::vec3>, 3U> sh_l{{{0.0F, {18.0F * en, 0, 0}}, {0.32F, {48.0F * en, 0, 0}}, {0.65F, {18.0F * en, 0, 0}}}};
-        const std::array<std::pair<float, glm::vec3>, 3U> sh_r{{{0.0F, {48.0F * en, 0, 0}}, {0.32F, {18.0F * en, 0, 0}}, {0.65F, {48.0F * en, 0, 0}}}};
-        const std::array<std::pair<float, glm::vec3>, 3U> ar_l{{{0.0F, {28.0F * sw, 0, -14.0F}}, {0.32F, {-34.0F * sw, 0, -14.0F}}, {0.65F, {28.0F * sw, 0, -14.0F}}}};
-        const std::array<std::pair<float, glm::vec3>, 3U> ar_r{{{0.0F, {-34.0F * sw, 0, 14.0F}}, {0.32F, {28.0F * sw, 0, 14.0F}}, {0.65F, {-34.0F * sw, 0, 14.0F}}}};
-        const std::array<std::pair<float, glm::vec3>, 3U> elb_l{{{0.0F, {-36.0F, -28.0F, 0}}, {0.32F, {-48.0F, -36.0F, 0}}, {0.65F, {-36.0F, -28.0F, 0}}}};
-        const std::array<std::pair<float, glm::vec3>, 3U> elb_r{{{0.0F, {-48.0F, 36.0F, 0}}, {0.32F, {-36.0F, 28.0F, 0}}, {0.65F, {-48.0F, 36.0F, 0}}}};
-        add_rot_track(c, skeleton, "Spine_01", lean);
-        add_rot_track(c, skeleton, "Thigh_L", th_l);
-        add_rot_track(c, skeleton, "Thigh_R", th_r);
-        add_rot_track(c, skeleton, "Shin_L", sh_l);
-        add_rot_track(c, skeleton, "Shin_R", sh_r);
-        add_rot_track(c, skeleton, "UpperArm_L", ar_l);
-        add_rot_track(c, skeleton, "UpperArm_R", ar_r);
-        add_rot_track(c, skeleton, "Forearm_L", elb_l);
-        add_rot_track(c, skeleton, "Forearm_R", elb_r);
-        c.events.push_back({0.10F, AnimationEventKind::footstep, "footstep", "left", 1.25F});
-        c.events.push_back({0.42F, AnimationEventKind::footstep, "footstep", "right", 1.25F});
-        bind_clip_to_skeleton(c, skeleton);
+        static constexpr std::array<std::pair<float, float>, 4U> stop_pelvis_y{{
+            {0.00F, -0.058F}, {0.35F, -0.072F}, {0.72F, -0.025F}, {1.00F, -0.015F},
+        }};
+        static constexpr std::array<std::pair<float, float>, 4U> stop_foot_lz{{
+            {0.00F, 0.25F}, {0.35F, 0.20F}, {0.78F, 0.06F}, {1.00F, 0.04F},
+        }};
+        static constexpr std::array<std::pair<float, float>, 4U> stop_foot_rz{{
+            {0.00F, -0.18F}, {0.30F, -0.08F}, {0.70F, 0.00F}, {1.00F, -0.02F},
+        }};
+        auto c = bake_human_clip(
+            "stop", 0.40F, false, skeleton, metrics, false, false, false, false,
+            [&](const float /*t*/, const float u) noexcept {
+                const float ease = smoothstep01(u);
+                const float r_lift = std::sin(glm::pi<float>() * std::clamp((u - 0.15F) / 0.65F, 0.0F, 1.0F));
+                HumanPoseSpec s{};
+                s.pelvis_offset = {
+                    -0.010F * ease * metrics.leg_ratio,
+                    eval_pchip_clamped(stop_pelvis_y, u) * metrics.leg_ratio,
+                    0.0F};
+                s.pelvis_euler_deg = {glm::mix(6.0F, 1.5F, ease), glm::mix(-4.0F, -2.0F, ease), -1.5F * ease};
+                s.spine_euler_deg = {glm::mix(-9.0F, -0.8F, ease), glm::mix(6.0F, 2.0F, ease), 1.5F * ease};
+                s.head_euler_deg = {glm::mix(4.0F, -0.5F, ease), glm::mix(-2.0F, 0.0F, ease), 0.0F};
+                s.tailcoat_pitch_deg = glm::mix(14.0F, 2.0F, ease);
+                s.foot_l = {
+                    metrics.stance_half_x * 1.12F,
+                    0.0F,
+                    eval_pchip_clamped(stop_foot_lz, u) * metrics.leg_len,
+                    5.0F,
+                    glm::mix(-12.0F, 0.0F, smoothstep01(u / 0.35F)),
+                    0.07F};
+                s.foot_r = {
+                    metrics.stance_half_x * 1.06F,
+                    0.045F * r_lift * metrics.leg_ratio,
+                    eval_pchip_clamped(stop_foot_rz, u) * metrics.leg_len,
+                    -5.0F,
+                    glm::mix(18.0F, 0.0F, ease),
+                    0.06F};
+                s.arm_l = {glm::mix(22.0F, 14.5F, ease), glm::mix(-48.0F, 10.0F, ease), glm::mix(34.0F, 16.0F, ease), 12.0F, 2.0F, 0.0F, 0.25F, 0.25F, {0.22F, -0.12F, -0.96F}};
+                s.arm_r = {glm::mix(24.0F, 14.5F, ease), glm::mix(52.0F, 10.0F, ease), glm::mix(44.0F, 17.0F, ease), 12.0F, 2.0F, 0.0F, 0.25F, 0.25F, {0.22F, -0.12F, -0.96F}};
+                return s;
+            });
+        c.events.push_back({0.08F, AnimationEventKind::footstep, "footstep", "left", 1.05F});
+        c.events.push_back({0.30F, AnimationEventKind::footstep, "footstep", "right", 0.75F});
         clips.push_back(std::move(c));
     }
 
-    // 4..9 Required CharacterAnimationConfig locomotion clips (stop, turn_left, turn_right, jump, fall, land)
-    const struct SimpleClipSpec {
-        const char* name;
-        float dur;
-        bool loop;
-        glm::vec3 spine;
-        glm::vec3 arm_l;
-        glm::vec3 arm_r;
-        glm::vec3 thigh_l;
-        glm::vec3 thigh_r;
-    } simple_specs[] = {
-        {"stop", 0.35F, false, {-6.0F, 0, 0}, {-8.0F, 0, -14.0F}, {-8.0F, 0, 14.0F}, {12.0F, 0, 0}, {-12.0F, 0, 0}},
-        {"turn_left", 0.60F, true, {0, 14.0F, 0}, {0, 0, -12.0F}, {0, 0, 12.0F}, {-10.0F, 0, 0}, {10.0F, 0, 0}},
-        {"turn_right", 0.60F, true, {0, -14.0F, 0}, {0, 0, -12.0F}, {0, 0, 12.0F}, {10.0F, 0, 0}, {-10.0F, 0, 0}},
-        {"jump", 0.55F, false, {-10.0F, 0, 0}, {-28.0F, 0, 18.0F}, {-28.0F, 0, -18.0F}, {-35.0F, 0, 0}, {18.0F, 0, 0}},
-        {"fall", 0.80F, true, {8.0F, 0, 0}, {-22.0F, 0, 16.0F}, {-22.0F, 0, -16.0F}, {-28.0F, 0, 0}, {-18.0F, 0, 0}},
-        {"land", 0.30F, false, {18.0F, 0, 0}, {-18.0F, 0, -8.0F}, {-18.0F, 0, 8.0F}, {-32.0F, 0, 0}, {-32.0F, 0, 0}},
-    };
-    for (const SimpleClipSpec& sp : simple_specs) {
-        AnimationClip c{.name = sp.name, .duration_seconds = sp.dur, .ticks_per_second = 30.0F, .looping = sp.loop};
-        const std::array<std::pair<float, glm::vec3>, 3U> s_keys{{{0.0F, {0.0F, 0.0F, 0.0F}}, {sp.dur * 0.5F, sp.spine}, {sp.dur, sp.loop ? glm::vec3(0.0F) : sp.spine * 0.4F}}};
-        const std::array<std::pair<float, glm::vec3>, 2U> al_keys{{{0.0F, sp.arm_l}, {sp.dur, sp.arm_l}}};
-        const std::array<std::pair<float, glm::vec3>, 2U> ar_keys{{{0.0F, sp.arm_r}, {sp.dur, sp.arm_r}}};
-        const std::array<std::pair<float, glm::vec3>, 3U> tl_keys{{{0.0F, sp.thigh_l}, {sp.dur * 0.5F, sp.thigh_l * 0.4F}, {sp.dur, sp.thigh_l}}};
-        const std::array<std::pair<float, glm::vec3>, 3U> tr_keys{{{0.0F, sp.thigh_r}, {sp.dur * 0.5F, sp.thigh_r * 0.4F}, {sp.dur, sp.thigh_r}}};
-        add_rot_track(c, skeleton, "Spine_02", s_keys);
-        add_rot_track(c, skeleton, "UpperArm_L", al_keys);
-        add_rot_track(c, skeleton, "UpperArm_R", ar_keys);
-        add_rot_track(c, skeleton, "Thigh_L", tl_keys);
-        add_rot_track(c, skeleton, "Thigh_R", tr_keys);
-        bind_clip_to_skeleton(c, skeleton);
+    // 5 & 6. turn_left / turn_right (athletic pivot-in-place turn step cadence)
+    for (const bool is_left : {true, false}) {
+        const float dir = is_left ? 1.0F : -1.0F;
+        auto c = bake_human_clip(
+            is_left ? "turn_left" : "turn_right",
+            0.60F, true, skeleton, metrics, false, false, false, false,
+            [&](const float /*t*/, const float u) noexcept {
+                const float w = two_pi * u;
+                const float sin_w = std::sin(w);
+                const float cos_w = std::cos(w);
+                const float l_step = is_left ? smoothstep01(std::sin(glm::pi<float>() * std::clamp(u * 2.0F, 0.0F, 1.0F)))
+                                             : smoothstep01(std::sin(glm::pi<float>() * std::clamp((u - 0.50F) * 2.0F, 0.0F, 1.0F)));
+                const float r_step = is_left ? smoothstep01(std::sin(glm::pi<float>() * std::clamp((u - 0.50F) * 2.0F, 0.0F, 1.0F)))
+                                             : smoothstep01(std::sin(glm::pi<float>() * std::clamp(u * 2.0F, 0.0F, 1.0F)));
+
+                HumanPoseSpec s{};
+                s.pelvis_offset = {
+                    dir * -0.018F * sin_w * metrics.leg_ratio,
+                    (-0.022F - 0.008F * std::cos(2.0F * w)) * metrics.leg_ratio,
+                    0.0F};
+                s.pelvis_euler_deg = {2.5F, dir * (5.0F + 6.5F * sin_w), dir * 2.0F * sin_w};
+                s.spine_euler_deg = {3.0F, dir * (7.0F + 5.0F * cos_w), dir * -1.5F * sin_w};
+                s.head_euler_deg = {-3.0F, dir * 8.0F, 0.0F};
+                s.tailcoat_pitch_deg = 4.0F;
+                s.foot_l = {
+                    metrics.stance_half_x * 1.15F,
+                    0.055F * l_step * metrics.leg_ratio,
+                    dir * 0.045F * sin_w * metrics.leg_len,
+                    4.0F + dir * (6.0F + 8.0F * sin_w),
+                    -6.0F * l_step,
+                    0.07F};
+                s.foot_r = {
+                    metrics.stance_half_x * 1.15F,
+                    0.055F * r_step * metrics.leg_ratio,
+                    -dir * 0.045F * sin_w * metrics.leg_len,
+                    -4.0F + dir * (6.0F - 8.0F * cos_w),
+                    -6.0F * r_step,
+                    0.07F};
+                s.arm_l = {19.0F, 22.0F + dir * -14.0F * cos_w, 30.0F + 6.0F * sin_w, 12.0F, 2.0F, 0.0F, 0.25F, 0.25F, {0.24F, -0.14F, -0.96F}};
+                s.arm_r = {19.0F, 22.0F + dir * 14.0F * cos_w, 30.0F - 6.0F * sin_w, 12.0F, 2.0F, 0.0F, 0.25F, 0.25F, {0.24F, -0.14F, -0.96F}};
+                return s;
+            });
         clips.push_back(std::move(c));
     }
 
-    // 10. wave (friendly greeting on right arm + symmetric smile on Mouth_Corner_L/R)
+    // 7. jump (counter-movement crouch -> explosive triple extension push-off -> aerial split tuck)
     {
-        AnimationClip c{.name = "wave", .duration_seconds = 1.6F, .ticks_per_second = 30.0F, .looping = true};
-        const std::array<std::pair<float, glm::vec3>, 4U> arm_r{{
-            {0.0F, {-24.0F, 0, -68.0F}}, {0.5F, {-28.0F, 0, -78.0F}}, {1.1F, {-22.0F, 0, -70.0F}}, {1.6F, {-24.0F, 0, -68.0F}}}};
-        const std::array<std::pair<float, glm::vec3>, 4U> forearm_r{{
-            {0.0F, {-38.0F, 0, -18.0F}}, {0.5F, {-52.0F, 18.0F, -24.0F}}, {1.1F, {-34.0F, -18.0F, -14.0F}}, {1.6F, {-38.0F, 0, -18.0F}}}};
-        const std::array<std::pair<float, glm::vec3>, 2U> arm_l{{
-            {0.0F, {0, 0, -12.0F}}, {1.6F, {0, 0, -12.0F}}}};
-        const std::array<std::pair<float, glm::vec3>, 3U> smile_l{{
-            {0.0F, {0.003F, 0.005F, -0.002F}}, {0.8F, {0.004F, 0.007F, -0.003F}}, {1.6F, {0.003F, 0.005F, -0.002F}}}};
-        const std::array<std::pair<float, glm::vec3>, 3U> smile_r{{
-            {0.0F, {-0.003F, 0.005F, -0.002F}}, {0.8F, {-0.004F, 0.007F, -0.003F}}, {1.6F, {-0.003F, 0.005F, -0.002F}}}};
-        add_rot_track(c, skeleton, "UpperArm_R", arm_r);
-        add_rot_track(c, skeleton, "Forearm_R", forearm_r);
-        add_rot_track(c, skeleton, "UpperArm_L", arm_l);
-        add_trans_track(c, skeleton, "Mouth_Corner_L", smile_l);
-        add_trans_track(c, skeleton, "Mouth_Corner_R", smile_r);
-        bind_clip_to_skeleton(c, skeleton);
+        static constexpr std::array<std::pair<float, float>, 5U> jump_pelvis_y{{
+            {0.00F, -0.02F}, {0.30F, -0.145F}, {0.56F, 0.020F}, {0.82F, 0.065F}, {1.00F, 0.045F},
+        }};
+        static constexpr std::array<std::pair<float, float>, 5U> jump_lift_l{{
+            {0.00F, 0.00F}, {0.32F, 0.00F}, {0.58F, 0.04F}, {0.82F, 0.23F}, {1.00F, 0.21F},
+        }};
+        static constexpr std::array<std::pair<float, float>, 5U> jump_lift_r{{
+            {0.00F, 0.00F}, {0.32F, 0.00F}, {0.58F, 0.02F}, {0.82F, 0.12F}, {1.00F, 0.14F},
+        }};
+        static constexpr std::array<std::pair<float, float>, 5U> jump_rocker{{
+            {0.00F, 0.0F}, {0.28F, -8.0F}, {0.56F, 34.0F}, {0.84F, 16.0F}, {1.00F, 12.0F},
+        }};
+        static constexpr std::array<std::pair<float, float>, 4U> jump_arm_el{{
+            {0.00F, 18.0F}, {0.28F, 38.0F}, {0.62F, 114.0F}, {1.00F, 88.0F},
+        }};
+        static constexpr std::array<std::pair<float, float>, 4U> jump_arm_az{{
+            {0.00F, 15.0F}, {0.28F, -78.0F}, {0.62F, 68.0F}, {1.00F, 52.0F},
+        }};
+        auto c = bake_human_clip(
+            "jump", 0.55F, false, skeleton, metrics, false, false, false, false,
+            [&](const float /*t*/, const float u) noexcept {
+                const float drive = smoothstep01((u - 0.25F) / 0.35F);
+                const float crouch = std::sin(glm::pi<float>() * std::clamp(u / 0.45F, 0.0F, 1.0F));
+                HumanPoseSpec s{};
+                s.pelvis_offset = {0.0F, eval_pchip_clamped(jump_pelvis_y, u) * metrics.leg_ratio, 0.0F};
+                s.pelvis_euler_deg = {6.0F * crouch - 4.0F * drive, 0.0F, 0.0F};
+                s.spine_euler_deg = {15.0F * crouch - 8.0F * drive, 0.0F, 0.0F};
+                s.head_euler_deg = {-10.0F * crouch + 4.0F * drive, 0.0F, 0.0F};
+                s.tailcoat_pitch_deg = 8.0F + 18.0F * drive;
+                s.foot_l = {
+                    metrics.stance_half_x * 1.12F,
+                    eval_pchip_clamped(jump_lift_l, u) * metrics.leg_ratio,
+                    0.12F * drive * metrics.leg_len,
+                    4.0F,
+                    eval_pchip_clamped(jump_rocker, u),
+                    0.07F};
+                s.foot_r = {
+                    metrics.stance_half_x * 1.12F,
+                    eval_pchip_clamped(jump_lift_r, u) * metrics.leg_ratio,
+                    -0.08F * drive * metrics.leg_len,
+                    -4.0F,
+                    eval_pchip_clamped(jump_rocker, u),
+                    0.07F};
+                const float el = eval_pchip_clamped(jump_arm_el, u);
+                const float az = eval_pchip_clamped(jump_arm_az, u);
+                const float flex = 28.0F + 24.0F * drive;
+                s.arm_l = {el, az, flex, 8.0F, 0.0F, 0.0F, 0.36F, 0.25F, {0.28F, -0.30F, -0.91F}};
+                s.arm_r = {el, az, flex, 8.0F, 0.0F, 0.0F, 0.36F, 0.25F, {0.28F, -0.30F, -0.91F}};
+                return s;
+            });
         clips.push_back(std::move(c));
     }
 
-    // 11. talk (looping hand gesture + expressive jaw cadence)
+    // 8. fall (looping aerial fall posture with windmilling balance arms & bent knees)
     {
-        AnimationClip c{.name = "talk", .duration_seconds = 1.4F, .ticks_per_second = 30.0F, .looping = true};
-        const std::array<std::pair<float, glm::vec3>, 5U> jaw{{
-            {0.0F, {0, 0, 0}}, {0.3F, {10.0F, 0, 0}}, {0.65F, {3.0F, 0, 0}},
-            {1.05F, {12.0F, 0, 0}}, {1.4F, {0, 0, 0}}}};
-        const std::array<std::pair<float, glm::vec3>, 3U> arm_l{{
-            {0.0F, {-16.0F, -10.0F, -10.0F}}, {0.7F, {-26.0F, 6.0F, -6.0F}}, {1.4F, {-16.0F, -10.0F, -10.0F}}}};
-        const std::array<std::pair<float, glm::vec3>, 3U> farm_l{{
-            {0.0F, {-28.0F, -18.0F, 0}}, {0.7F, {-42.0F, -24.0F, 0}}, {1.4F, {-28.0F, -18.0F, 0}}}};
-        add_rot_track(c, skeleton, "Jaw", jaw);
-        add_rot_track(c, skeleton, "UpperArm_L", arm_l);
-        add_rot_track(c, skeleton, "Forearm_L", farm_l);
-        bind_clip_to_skeleton(c, skeleton);
+        auto c = bake_human_clip(
+            "fall", 0.80F, true, skeleton, metrics, false, false, false, false,
+            [&](const float /*t*/, const float u) noexcept {
+                const float w = two_pi * u;
+                const float sw_a = std::sin(w);
+                const float sw_b = std::cos(w);
+                HumanPoseSpec s{};
+                s.pelvis_offset = {0.0F, 0.025F * metrics.leg_ratio + 0.015F * sw_a * metrics.leg_ratio, 0.0F};
+                s.pelvis_euler_deg = {4.0F + 2.0F * sw_b, 3.0F * sw_a, 0.0F};
+                s.spine_euler_deg = {8.0F + 3.0F * sw_a, -3.0F * sw_a, 0.0F};
+                s.head_euler_deg = {-10.0F - 2.0F * sw_a, 0.0F, 0.0F};
+                s.tailcoat_pitch_deg = 28.0F + 8.0F * sw_a;
+                s.foot_l = {
+                    metrics.stance_half_x * 1.25F,
+                    (0.22F + 0.03F * sw_a) * metrics.leg_ratio,
+                    0.12F * metrics.leg_len,
+                    8.0F,
+                    12.0F + 5.0F * sw_b,
+                    0.09F};
+                s.foot_r = {
+                    metrics.stance_half_x * 1.25F,
+                    (0.14F - 0.03F * sw_a) * metrics.leg_ratio,
+                    -0.06F * metrics.leg_len,
+                    -8.0F,
+                    18.0F - 5.0F * sw_b,
+                    0.09F};
+                s.arm_l = {68.0F + 8.0F * sw_a, 24.0F + 14.0F * sw_b, 50.0F + 8.0F * sw_a, 6.0F, -4.0F, 0.0F, 0.22F, 0.65F, {0.32F, -0.55F, -0.77F}};
+                s.arm_r = {68.0F - 8.0F * sw_a, 24.0F - 14.0F * sw_b, 50.0F - 8.0F * sw_a, 6.0F, -4.0F, 0.0F, 0.22F, 0.65F, {0.32F, -0.55F, -0.77F}};
+                return s;
+            });
         clips.push_back(std::move(c));
     }
 
-    // 12. attack (with hitbox events)
+    // 9. land (impact absorption squat -> upright recovery)
     {
-        AnimationClip c{.name = "attack", .duration_seconds = 0.75F, .ticks_per_second = 30.0F, .looping = false};
-        const std::array<std::pair<float, glm::vec3>, 4U> sp{{
-            {0.0F, {0, -24.0F, 0}}, {0.25F, {10.0F, 34.0F, 0}}, {0.45F, {14.0F, -18.0F, 0}}, {0.75F, {0, 0, 0}}}};
-        const std::array<std::pair<float, glm::vec3>, 4U> arm_r{{
-            {0.0F, {-12.0F, 0, 10.0F}}, {0.22F, {-55.0F, 24.0F, -48.0F}}, {0.42F, {-38.0F, -45.0F, -12.0F}}, {0.75F, {-12.0F, 0, 10.0F}}}};
-        add_rot_track(c, skeleton, "Spine_02", sp);
-        add_rot_track(c, skeleton, "UpperArm_R", arm_r);
+        static constexpr std::array<std::pair<float, float>, 4U> land_pelvis_y{{
+            {0.00F, -0.055F}, {0.28F, -0.185F}, {0.65F, -0.085F}, {1.00F, -0.018F},
+        }};
+        static constexpr std::array<std::pair<float, float>, 4U> land_spine_p{{
+            {0.00F, 12.0F}, {0.28F, 22.0F}, {0.65F, 10.0F}, {1.00F, 0.0F},
+        }};
+        static constexpr std::array<std::pair<float, float>, 4U> land_rocker{{
+            {0.00F, 12.0F}, {0.18F, 0.0F}, {0.65F, 0.0F}, {1.00F, 0.0F},
+        }};
+        auto c = bake_human_clip(
+            "land", 0.35F, false, skeleton, metrics, false, false, false, false,
+            [&](const float /*t*/, const float u) noexcept {
+                const float ease = smoothstep01(u);
+                const float absorb = std::sin(glm::pi<float>() * std::clamp(u / 0.72F, 0.0F, 1.0F));
+                HumanPoseSpec s{};
+                s.pelvis_offset = {0.0F, eval_pchip_clamped(land_pelvis_y, u) * metrics.leg_ratio, 0.0F};
+                s.pelvis_euler_deg = {7.0F * absorb + 1.5F * ease, 0.0F, 0.0F};
+                s.spine_euler_deg = {eval_pchip_clamped(land_spine_p, u), 0.0F, 0.0F};
+                s.head_euler_deg = {-0.75F * s.spine_euler_deg.x, 0.0F, 0.0F};
+                s.tailcoat_pitch_deg = 12.0F * absorb + 2.0F;
+                s.foot_l = {metrics.stance_half_x * 1.18F, 0.0F, 0.035F * metrics.leg_len, 6.0F, eval_pchip_clamped(land_rocker, u), 0.08F};
+                s.foot_r = {metrics.stance_half_x * 1.18F, 0.0F, -0.025F * metrics.leg_len, -6.0F, eval_pchip_clamped(land_rocker, u), 0.08F};
+                s.arm_l = {16.0F + 22.0F * absorb, 12.0F - 46.0F * absorb, 18.0F + 28.0F * absorb, 14.0F, 2.0F, 0.0F, 0.26F, 0.25F, {0.24F, -0.14F, -0.96F}};
+                s.arm_r = {16.0F + 22.0F * absorb, 12.0F - 46.0F * absorb, 18.0F + 28.0F * absorb, 14.0F, 2.0F, 0.0F, 0.26F, 0.25F, {0.24F, -0.14F, -0.96F}};
+                return s;
+            });
+        c.events.push_back({0.05F, AnimationEventKind::footstep, "footstep", "both", 1.35F});
+        clips.push_back(std::move(c));
+    }
+
+    // 10. wave (friendly raised right-arm wave with +Z palm, ShoulderTwist_R/ForearmTwist_R articulation & smile)
+    {
+        auto c = bake_human_clip(
+            "wave", 1.60F, true, skeleton, metrics, true, true, false, false,
+            [&](const float /*t*/, const float u) noexcept {
+                const float w = two_pi * u;
+                const float wave2 = std::sin(2.0F * w);
+                const float wave2c = std::cos(2.0F * w);
+                const float sway = std::sin(w);
+                const float blink_env = smoothstep01((u - 0.80F) / 0.03F) *
+                    (1.0F - smoothstep01((u - 0.86F) / 0.04F));
+
+                HumanPoseSpec s{};
+                s.breath = 0.45F * br * (0.5F - 0.5F * std::cos(w));
+                s.pelvis_offset = {0.018F * metrics.leg_ratio, -0.015F * metrics.leg_ratio, 0.0F};
+                s.pelvis_euler_deg = {1.5F, 2.5F + 1.5F * sway, 2.2F};
+                s.spine_euler_deg = {-2.5F, -3.5F + 2.5F * wave2, -2.5F};
+                s.head_euler_deg = {-1.0F, -2.0F + 1.5F * sway, 3.0F * sway};
+                s.tailcoat_pitch_deg = 2.5F;
+                s.foot_l = {metrics.stance_half_x * 1.10F, 0.0F, -0.015F * metrics.leg_len, 5.0F, 0.0F, 0.06F};
+                s.foot_r = {metrics.stance_half_x * 1.12F, 0.0F, 0.045F * metrics.leg_len, -5.0F, 0.0F, 0.07F};
+                s.arm_l = {14.5F, 11.0F, 18.0F, 12.0F, 2.0F, 0.0F, 0.20F, 0.25F, {0.22F, -0.12F, -0.96F}};
+                s.arm_r = {
+                    76.0F + 3.5F * wave2,
+                    28.0F + 5.0F * wave2c,
+                    98.0F + 8.0F * wave2,
+                    -22.0F + 10.0F * wave2,
+                    -8.0F,
+                    14.0F * wave2c,
+                    0.10F,
+                    0.90F,
+                    {0.00F, -0.88F, -0.47F}};
+                s.smile = 0.72F + 0.16F * sway;
+                s.blink = blink_env;
+                return s;
+            });
+        clips.push_back(std::move(c));
+    }
+
+    // 11. talk (looping expressive presenter gestures + calibrated TMJ speech cadence)
+    {
+        static constexpr std::array<std::pair<float, float>, 9U> talk_jaw_knots{{
+            {0.00F, 0.04F}, {0.10F, 0.30F}, {0.21F, 0.80F}, {0.34F, 0.18F},
+            {0.48F, 0.68F}, {0.62F, 0.12F}, {0.75F, 0.86F}, {0.88F, 0.22F}, {1.00F, 0.04F},
+        }};
+        auto c = bake_human_clip(
+            "talk", 1.40F, true, skeleton, metrics, true, true, true, true,
+            [&](const float /*t*/, const float u) noexcept {
+                const float w = two_pi * u;
+                const float g1 = std::sin(w);
+                const float g2 = std::cos(w);
+                const float jaw = eval_pchip_periodic(talk_jaw_knots, u);
+                const float blink_env = smoothstep01((u - 0.84F) / 0.03F) *
+                    (1.0F - smoothstep01((u - 0.90F) / 0.04F));
+
+                HumanPoseSpec s{};
+                s.breath = 0.40F * br * (0.5F - 0.5F * g2);
+                s.pelvis_offset = {-0.012F * metrics.leg_ratio, -0.015F * metrics.leg_ratio, 0.0F};
+                s.pelvis_euler_deg = {1.5F, -2.5F + 2.0F * g1, -1.8F};
+                s.spine_euler_deg = {-1.0F, 4.0F + 3.5F * g2, 1.5F};
+                s.head_euler_deg = {2.5F * g1, -2.0F + 4.5F * g1, 2.5F * g2};
+                s.tailcoat_pitch_deg = 2.0F;
+                s.foot_l = {metrics.stance_half_x * 1.12F, 0.0F, 0.04F * metrics.leg_len, 5.0F, 0.0F, 0.07F};
+                s.foot_r = {metrics.stance_half_x * 1.08F, 0.0F, -0.015F * metrics.leg_len, -5.0F, 0.0F, 0.06F};
+                s.arm_l = {
+                    38.0F + 7.0F * g1,
+                    62.0F + 14.0F * g2,
+                    78.0F + 14.0F * std::sin(w - 0.5F),
+                    -24.0F + 10.0F * g2,
+                    -6.0F,
+                    8.0F * g1,
+                    0.16F,
+                    0.50F,
+                    {0.25F, -0.35F, -0.90F}};
+                s.arm_r = {
+                    24.0F + 5.0F * g2,
+                    38.0F + 10.0F * g1,
+                    46.0F + 10.0F * g1,
+                    -10.0F + 8.0F * g1,
+                    0.0F,
+                    0.0F,
+                    0.19F,
+                    0.40F,
+                    {0.24F, -0.20F, -0.95F}};
+                s.jaw_open = jaw;
+                s.lip_upper_raise = 0.45F * jaw;
+                s.lip_round = 0.35F * (0.5F + 0.5F * std::sin(2.0F * w));
+                s.smile = 0.25F + 0.12F * g1;
+                s.brow_lift = 0.45F * jaw + 0.15F * g1;
+                s.blink = blink_env;
+                return s;
+            });
+        clips.push_back(std::move(c));
+    }
+
+    // 12. attack (coiled wind-up -> dynamic forward horizontal slash -> balanced follow-through + hitboxes)
+    {
+        static constexpr std::array<std::pair<float, float>, 5U> atk_pelvis_yaw{{
+            {0.00F, -3.0F}, {0.26F, -18.0F}, {0.48F, 16.0F}, {0.66F, 22.0F}, {1.00F, -2.0F},
+        }};
+        static constexpr std::array<std::pair<float, float>, 5U> atk_spine_yaw{{
+            {0.00F, 3.0F}, {0.26F, -24.0F}, {0.46F, 26.0F}, {0.66F, 32.0F}, {1.00F, 2.0F},
+        }};
+        static constexpr std::array<std::pair<float, float>, 5U> atk_spine_pitch{{
+            {0.00F, 2.0F}, {0.26F, -4.0F}, {0.46F, 13.0F}, {0.68F, 15.0F}, {1.00F, 2.0F},
+        }};
+        static constexpr std::array<std::pair<float, float>, 5U> atk_arm_r_el{{
+            {0.00F, 24.0F}, {0.26F, 108.0F}, {0.45F, 90.0F}, {0.66F, 64.0F}, {1.00F, 18.0F},
+        }};
+        static constexpr std::array<std::pair<float, float>, 5U> atk_arm_r_az{{
+            {0.00F, 28.0F}, {0.26F, -32.0F}, {0.45F, 82.0F}, {0.66F, 122.0F}, {1.00F, 16.0F},
+        }};
+        static constexpr std::array<std::pair<float, float>, 5U> atk_arm_r_flex{{
+            {0.00F, 45.0F}, {0.26F, 72.0F}, {0.45F, 22.0F}, {0.66F, 38.0F}, {1.00F, 22.0F},
+        }};
+        static constexpr std::array<std::pair<float, float>, 5U> atk_lunge_lz{{
+            {0.00F, 0.06F}, {0.26F, 0.07F}, {0.46F, 0.185F}, {0.68F, 0.17F}, {1.00F, 0.05F},
+        }};
+        static constexpr std::array<std::pair<float, float>, 5U> atk_trail_rz{{
+            {0.00F, -0.04F}, {0.26F, -0.20F}, {0.46F, -0.22F}, {0.68F, -0.17F}, {1.00F, -0.02F},
+        }};
+        auto c = bake_human_clip(
+            "attack", 0.75F, false, skeleton, metrics, false, false, false, true,
+            [&](const float /*t*/, const float u) noexcept {
+                const float strike = smoothstep01((u - 0.24F) / 0.24F) *
+                    (1.0F - smoothstep01((u - 0.65F) / 0.35F));
+                const float pel_yaw = eval_pchip_clamped(atk_pelvis_yaw, u);
+                const float sp_yaw = eval_pchip_clamped(atk_spine_yaw, u);
+                const float sp_pitch = eval_pchip_clamped(atk_spine_pitch, u);
+                const float ar_el = eval_pchip_clamped(atk_arm_r_el, u);
+                const float ar_az = eval_pchip_clamped(atk_arm_r_az, u);
+                const float ar_fl = eval_pchip_clamped(atk_arm_r_flex, u);
+
+                HumanPoseSpec s{};
+                s.pelvis_offset = {
+                    0.022F * strike * metrics.leg_ratio,
+                    (-0.025F - 0.100F * strike) * metrics.leg_ratio,
+                    0.075F * strike * metrics.leg_len};
+                s.pelvis_euler_deg = {5.0F * strike + 1.5F, pel_yaw, -3.0F * strike};
+                s.spine_euler_deg = {sp_pitch, sp_yaw, 2.5F * strike};
+                s.head_euler_deg = {-0.7F * sp_pitch, -0.65F * (pel_yaw + sp_yaw), 0.0F};
+                s.tailcoat_pitch_deg = 6.0F + 14.0F * strike;
+                s.foot_l = {
+                    metrics.stance_half_x * 1.15F,
+                    0.0F,
+                    eval_pchip_clamped(atk_lunge_lz, u) * metrics.leg_len,
+                    8.0F,
+                    0.0F,
+                    0.07F};
+                s.foot_r = {
+                    metrics.stance_half_x * 1.25F,
+                    0.0F,
+                    eval_pchip_clamped(atk_trail_rz, u) * metrics.leg_len,
+                    -18.0F,
+                    18.0F * strike,
+                    0.08F};
+                s.arm_l = {
+                    glm::mix(34.0F, 52.0F, 1.0F - strike),
+                    glm::mix(58.0F, -48.0F, strike),
+                    glm::mix(72.0F, 36.0F, strike),
+                    14.0F,
+                    0.0F,
+                    0.0F,
+                    0.55F,
+                    0.15F,
+                    {0.28F, -0.24F, -0.93F}};
+                s.arm_r = {
+                    ar_el,
+                    ar_az,
+                    ar_fl,
+                    glm::mix(10.0F, 48.0F, strike),
+                    4.0F * strike,
+                    0.0F,
+                    1.00F,
+                    0.05F,
+                    {0.46F, -0.64F, -0.61F}};
+                s.jaw_open = 0.08F * strike;
+                s.brow_lift = -0.80F * strike;
+                return s;
+            });
         c.events.push_back({0.25F, AnimationEventKind::hitbox_begin, "melee", "right_hand", 1.0F});
         c.events.push_back({0.48F, AnimationEventKind::hitbox_end, "melee", "right_hand", 1.0F});
-        bind_clip_to_skeleton(c, skeleton);
         clips.push_back(std::move(c));
     }
 
@@ -5642,34 +6884,57 @@ SynthesizedSpeechClip synthesize_dialogue_speech(
     const std::int32_t jaw_idx = skeleton.find_bone_index("Jaw");
     const std::int32_t lu_idx = skeleton.find_bone_index("Lip_Upper");
     const std::int32_t ll_idx = skeleton.find_bone_index("Lip_Lower");
+    const std::int32_t mcl_idx = skeleton.find_bone_index("Mouth_Corner_L");
+    const std::int32_t mcr_idx = skeleton.find_bone_index("Mouth_Corner_R");
     BoneAnimationTrack t_jaw{.bone_name = "Jaw", .bone_index = jaw_idx};
     BoneAnimationTrack t_lu{.bone_name = "Lip_Upper", .bone_index = lu_idx};
     BoneAnimationTrack t_ll{.bone_name = "Lip_Lower", .bone_index = ll_idx};
+    BoneAnimationTrack t_mcl{.bone_name = "Mouth_Corner_L", .bone_index = mcl_idx};
+    BoneAnimationTrack t_mcr{.bone_name = "Mouth_Corner_R", .bone_index = mcr_idx};
     const glm::vec3 lu_bind = lu_idx >= 0 ? skeleton.bones[static_cast<std::size_t>(lu_idx)].local_bind_translation : glm::vec3(0.0F);
     const glm::vec3 ll_bind = ll_idx >= 0 ? skeleton.bones[static_cast<std::size_t>(ll_idx)].local_bind_translation : glm::vec3(0.0F);
+    const glm::vec3 mcl_bind = mcl_idx >= 0 ? skeleton.bones[static_cast<std::size_t>(mcl_idx)].local_bind_translation : glm::vec3(0.0F);
+    const glm::vec3 mcr_bind = mcr_idx >= 0 ? skeleton.bones[static_cast<std::size_t>(mcr_idx)].local_bind_translation : glm::vec3(0.0F);
     for (const VisemeKeyframe& vk : result.visemes) {
         if (jaw_idx >= 0) {
             t_jaw.rotations.push_back(QuatKey{
                 .time = vk.time_seconds,
-                .value = glm::quat(glm::radians(glm::vec3(vk.jaw_open * 18.0F, 0.0F, 0.0F))),
+                .value = glm::quat(glm::radians(glm::vec3(vk.jaw_open * 13.5F, 0.0F, 0.0F))),
             });
         }
+        const float round_or_pucker = (std::max)(vk.lip_round, vk.lip_pucker);
         if (lu_idx >= 0) {
             t_lu.translations.push_back(Vec3Key{
                 .time = vk.time_seconds,
-                .value = lu_bind + glm::vec3(0.0F, vk.upper_lip_raise * 0.008F, vk.lip_pucker * 0.010F),
+                .value = lu_bind + glm::vec3(0.0F, vk.upper_lip_raise * 0.006F, round_or_pucker * 0.008F),
             });
         }
         if (ll_idx >= 0) {
             t_ll.translations.push_back(Vec3Key{
                 .time = vk.time_seconds,
-                .value = ll_bind + glm::vec3(0.0F, -vk.jaw_open * 0.010F, vk.lip_pucker * 0.010F),
+                .value = ll_bind + glm::vec3(0.0F, -vk.jaw_open * 0.0025F, round_or_pucker * 0.008F),
+            });
+        }
+        const float corner_x = (vk.lip_wide - round_or_pucker) * 0.006F;
+        const float corner_y = -vk.jaw_open * 0.0035F;
+        if (mcl_idx >= 0) {
+            t_mcl.translations.push_back(Vec3Key{
+                .time = vk.time_seconds,
+                .value = mcl_bind + glm::vec3(corner_x, corner_y, 0.0F),
+            });
+        }
+        if (mcr_idx >= 0) {
+            t_mcr.translations.push_back(Vec3Key{
+                .time = vk.time_seconds,
+                .value = mcr_bind + glm::vec3(-corner_x, corner_y, 0.0F),
             });
         }
     }
     if (jaw_idx >= 0) fclip.tracks.push_back(std::move(t_jaw));
     if (lu_idx >= 0) fclip.tracks.push_back(std::move(t_lu));
     if (ll_idx >= 0) fclip.tracks.push_back(std::move(t_ll));
+    if (mcl_idx >= 0) fclip.tracks.push_back(std::move(t_mcl));
+    if (mcr_idx >= 0) fclip.tracks.push_back(std::move(t_mcr));
     bind_clip_to_skeleton(fclip, skeleton);
     result.facial_clip = std::move(fclip);
     return result;
@@ -5755,11 +7020,11 @@ void apply_facial_preview_pose(
     const float brow = std::clamp(facial.brow_raise, 0.0F, 1.0F);
     const float blink = std::clamp(facial.eye_blink, 0.0F, 1.0F);
 
-    add_rot("Jaw", {jaw * 18.0F, 0.0F, 0.0F});
-    add_trans("Lip_Upper", {0.0F, facial.upper_lip_raise * 0.008F, facial.lip_round * 0.009F});
-    add_trans("Lip_Lower", {0.0F, -jaw * 0.009F, facial.lip_round * 0.009F});
+    add_rot("Jaw", {jaw * 13.5F, 0.0F, 0.0F});
+    add_trans("Lip_Upper", {0.0F, facial.upper_lip_raise * 0.006F, facial.lip_round * 0.008F});
+    add_trans("Lip_Lower", {0.0F, -jaw * 0.0025F, facial.lip_round * 0.008F});
 
-    const float corner_y = (smile - frown) * 0.008F;
+    const float corner_y = (smile - frown) * 0.008F - jaw * 0.0035F;
     const float corner_x = (facial.lip_wide - facial.lip_round) * 0.008F;
     add_trans("Mouth_Corner_L", {corner_x, corner_y, -smile * 0.004F});
     add_trans("Mouth_Corner_R", {-corner_x, corner_y, -smile * 0.004F});
