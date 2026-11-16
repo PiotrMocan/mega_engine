@@ -909,49 +909,106 @@ void CharacterStudioApplication::draw_wardrobe_bottom(
     CharacterStudioShell& shell,
     CharacterToolFrameActions& actions) {
     CharacterPackage& pkg = shell.package();
-    ImGui::Text("| Paint: %zu | Presets:", pkg.paint_strokes.size());
+    const auto clear_hood_hair = [&]() noexcept {
+        if (pkg.wardrobe.hair_style == HairStyle::hood) {
+            pkg.wardrobe.hair_style = (pkg.body.gender == CharacterGender::female)
+                ? HairStyle::bob
+                : HairStyle::short_crop;
+        }
+    };
+    ImGui::Text("| Paint: %zu |", pkg.paint_strokes.size());
     ImGui::SameLine();
-    if (ImGui::SmallButton("Studio Underwear")) {
+    if (ImGui::SmallButton("Underwear")) {
         pkg.wardrobe.top_style = TopGarmentStyle::none;
         pkg.wardrobe.bottom_style = BottomGarmentStyle::none;
         pkg.wardrobe.footwear_style = FootwearStyle::barefoot;
+        clear_hood_hair();
         pkg.wardrobe.has_belt = false;
         pkg.wardrobe.has_gloves = false;
         pkg.wardrobe.has_pauldrons = false;
         pkg.wardrobe.has_cape = false;
         pkg.wardrobe.studio_underwear = true;
+        pkg.wardrobe.wear_and_tear = 0.05F;
         actions.mark_dirty = true;
         actions.rebuild_preview = true;
     }
     ImGui::SameLine();
-    if (ImGui::SmallButton("Steel Knight")) {
+    if (ImGui::SmallButton("Knight")) {
         pkg.wardrobe.top_style = TopGarmentStyle::armor_cuirass;
         pkg.wardrobe.bottom_style = BottomGarmentStyle::tactical_greaves;
         pkg.wardrobe.footwear_style = FootwearStyle::greave_boots;
+        clear_hood_hair();
         pkg.wardrobe.primary_material = OutfitMaterialPreset::brushed_steel;
+        pkg.wardrobe.secondary_material = OutfitMaterialPreset::cloth_linen;
+        pkg.wardrobe.primary_color = {0.56F, 0.59F, 0.63F};
+        pkg.wardrobe.secondary_color = {0.35F, 0.11F, 0.12F};
+        pkg.wardrobe.accent_color = {0.83F, 0.66F, 0.31F};
+        pkg.wardrobe.footwear_color = {0.22F, 0.23F, 0.26F};
+        pkg.wardrobe.has_belt = true;
+        pkg.wardrobe.has_gloves = true;
         pkg.wardrobe.has_pauldrons = true;
         pkg.wardrobe.has_cape = true;
+        pkg.wardrobe.wear_and_tear = 0.35F;
         actions.mark_dirty = true;
         actions.rebuild_preview = true;
     }
     ImGui::SameLine();
-    if (ImGui::SmallButton("Street Coat")) {
+    if (ImGui::SmallButton("Coat")) {
         pkg.wardrobe.top_style = TopGarmentStyle::trench_coat;
         pkg.wardrobe.bottom_style = BottomGarmentStyle::cargo_pants;
         pkg.wardrobe.footwear_style = FootwearStyle::combat_boots;
+        clear_hood_hair();
         pkg.wardrobe.primary_material = OutfitMaterialPreset::leather;
+        pkg.wardrobe.secondary_material = OutfitMaterialPreset::cloth_linen;
+        pkg.wardrobe.primary_color = {0.23F, 0.16F, 0.12F};
+        pkg.wardrobe.secondary_color = {0.18F, 0.21F, 0.19F};
+        pkg.wardrobe.accent_color = {0.78F, 0.61F, 0.29F};
+        pkg.wardrobe.footwear_color = {0.12F, 0.10F, 0.09F};
+        pkg.wardrobe.has_belt = true;
+        pkg.wardrobe.has_gloves = true;
         pkg.wardrobe.has_pauldrons = false;
         pkg.wardrobe.has_cape = false;
+        pkg.wardrobe.wear_and_tear = 0.40F;
         actions.mark_dirty = true;
         actions.rebuild_preview = true;
     }
     ImGui::SameLine();
-    if (ImGui::SmallButton("Cyber Hoodie")) {
+    if (ImGui::SmallButton("Hoodie")) {
         pkg.wardrobe.top_style = TopGarmentStyle::hoodie;
         pkg.wardrobe.bottom_style = BottomGarmentStyle::trousers;
         pkg.wardrobe.footwear_style = FootwearStyle::sneakers;
         pkg.wardrobe.primary_material = OutfitMaterialPreset::tactical_weave;
+        pkg.wardrobe.secondary_material = OutfitMaterialPreset::denim;
+        pkg.wardrobe.primary_color = {0.15F, 0.18F, 0.22F};
+        pkg.wardrobe.secondary_color = {0.18F, 0.27F, 0.40F};
+        pkg.wardrobe.accent_color = {0.81F, 0.64F, 0.31F};
+        pkg.wardrobe.footwear_color = {0.14F, 0.14F, 0.16F};
         pkg.wardrobe.hair_style = HairStyle::hood;
+        pkg.wardrobe.has_belt = false;
+        pkg.wardrobe.has_gloves = true;
+        pkg.wardrobe.has_pauldrons = false;
+        pkg.wardrobe.has_cape = false;
+        pkg.wardrobe.wear_and_tear = 0.20F;
+        actions.mark_dirty = true;
+        actions.rebuild_preview = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Tunic")) {
+        pkg.wardrobe.top_style = TopGarmentStyle::tunic;
+        pkg.wardrobe.bottom_style = BottomGarmentStyle::skirt;
+        pkg.wardrobe.footwear_style = FootwearStyle::boots;
+        clear_hood_hair();
+        pkg.wardrobe.primary_material = OutfitMaterialPreset::cloth_linen;
+        pkg.wardrobe.secondary_material = OutfitMaterialPreset::leather;
+        pkg.wardrobe.primary_color = {0.42F, 0.23F, 0.26F};
+        pkg.wardrobe.secondary_color = {0.19F, 0.15F, 0.13F};
+        pkg.wardrobe.accent_color = {0.84F, 0.71F, 0.42F};
+        pkg.wardrobe.footwear_color = {0.17F, 0.13F, 0.11F};
+        pkg.wardrobe.has_belt = true;
+        pkg.wardrobe.has_gloves = false;
+        pkg.wardrobe.has_pauldrons = false;
+        pkg.wardrobe.has_cape = false;
+        pkg.wardrobe.wear_and_tear = 0.20F;
         actions.mark_dirty = true;
         actions.rebuild_preview = true;
     }
@@ -1635,6 +1692,19 @@ int CharacterStudioApplication::run_cli(const CharacterStudioCliArgs& args) {
             pkg.wardrobe.hair_color = *rgb;
             mutated = true;
         }
+    }
+    if (const auto v = args.find_option("wear")) {
+        try {
+            pkg.wardrobe.wear_and_tear = std::clamp(std::stof(std::string(*v)), 0.0F, 1.0F);
+            mutated = true;
+        } catch (...) {}
+    }
+    if (args.has_flag("hood")) { pkg.wardrobe.hair_style = HairStyle::hood; mutated = true; }
+    if (args.has_flag("no-hood") && pkg.wardrobe.hair_style == HairStyle::hood) {
+        pkg.wardrobe.hair_style = (pkg.body.gender == CharacterGender::female)
+            ? HairStyle::bob
+            : HairStyle::short_crop;
+        mutated = true;
     }
     if (args.has_flag("cape")) { pkg.wardrobe.has_cape = true; mutated = true; }
     if (args.has_flag("no-cape")) { pkg.wardrobe.has_cape = false; mutated = true; }

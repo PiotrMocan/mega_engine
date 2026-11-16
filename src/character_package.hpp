@@ -337,6 +337,9 @@ struct CharacterMeshBuildResult {
     std::vector<std::uint8_t> vertex_paint_targets{};
     glm::vec3 bounds_min{0.0F};
     glm::vec3 bounds_max{0.0F};
+    std::vector<std::uint8_t> vertex_garment_zones{};
+    std::vector<float> vertex_garment_ao{};
+    std::vector<float> vertex_garment_curv{};
 };
 
 struct BakedPbrTextureSet {

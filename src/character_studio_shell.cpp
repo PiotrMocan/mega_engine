@@ -68,6 +68,184 @@ void copy_cstr(char* dst, const std::size_t dst_size, const std::string_view src
     return value;
 }
 
+[[nodiscard]] std::optional<glm::vec3> parse_hex_rgb(std::string_view hex) noexcept {
+    if (hex.starts_with('#')) {
+        hex.remove_prefix(1U);
+    }
+    if (hex.size() != 6U) {
+        return std::nullopt;
+    }
+    const auto nibble = [](const char c) noexcept -> int {
+        if (c >= '0' && c <= '9') {
+            return c - '0';
+        }
+        if (c >= 'a' && c <= 'f') {
+            return 10 + (c - 'a');
+        }
+        if (c >= 'A' && c <= 'F') {
+            return 10 + (c - 'A');
+        }
+        return -1;
+    };
+    std::array<float, 3U> out{};
+    for (std::size_t i = 0U; i < 3U; ++i) {
+        const int hi = nibble(hex[i * 2U]);
+        const int lo = nibble(hex[i * 2U + 1U]);
+        if (hi < 0 || lo < 0) {
+            return std::nullopt;
+        }
+        out[i] = static_cast<float>((hi << 4) | lo) / 255.0F;
+    }
+    return glm::vec3(out[0], out[1], out[2]);
+}
+
+[[nodiscard]] std::optional<FootwearStyle> parse_preview_footwear_style(
+    const std::string_view token) {
+    const std::string low = ascii_lower(token);
+    if (const auto exact = parse_footwear_style(low)) {
+        return exact;
+    }
+    if (low == "shoes" || low == "low_shoes") {
+        return FootwearStyle::sneakers;
+    }
+    return std::nullopt;
+}
+
+[[nodiscard]] std::optional<HairStyle> parse_preview_hair_style(
+    const std::string_view token) {
+    const std::string low = ascii_lower(token);
+    if (const auto exact = parse_hair_style(low)) {
+        return exact;
+    }
+    if (low == "short_tousled" || low == "tousled") {
+        return HairStyle::short_crop;
+    }
+    if (low == "long_wavy" || low == "wavy") {
+        return HairStyle::bob;
+    }
+    if (low == "braided_crown" || low == "braided") {
+        return HairStyle::ponytail;
+    }
+    return std::nullopt;
+}
+
+void apply_cli_preview_wardrobe_overrides(
+    const CharacterStudioCliArgs& args,
+    CharacterPackage& pkg) {
+    if (const auto v = args.find_option("top")) {
+        if (const auto s = parse_top_garment_style(ascii_lower(*v))) {
+            pkg.wardrobe.top_style = *s;
+        }
+    }
+    if (const auto v = args.find_option("bottom")) {
+        if (const auto s = parse_bottom_garment_style(ascii_lower(*v))) {
+            pkg.wardrobe.bottom_style = *s;
+        }
+    }
+    if (const auto v = args.find_option("footwear")) {
+        if (const auto s = parse_preview_footwear_style(*v)) {
+            pkg.wardrobe.footwear_style = *s;
+        }
+    }
+    if (const auto v = args.find_option("hair")) {
+        if (const auto s = parse_preview_hair_style(*v)) {
+            pkg.wardrobe.hair_style = *s;
+        }
+    }
+    if (args.has_flag("no-hood")) {
+        if (pkg.wardrobe.hair_style == HairStyle::hood) {
+            pkg.wardrobe.hair_style = (pkg.body.gender == CharacterGender::female)
+                ? HairStyle::bob
+                : HairStyle::short_crop;
+        }
+    } else if (args.has_flag("hood")) {
+        pkg.wardrobe.hair_style = HairStyle::hood;
+    }
+    if (const auto v = args.find_option("material")) {
+        if (const auto m = parse_outfit_material_preset(ascii_lower(*v))) {
+            pkg.wardrobe.primary_material = *m;
+        }
+    }
+    if (const auto v = args.find_option("secondary-material")) {
+        if (const auto m = parse_outfit_material_preset(ascii_lower(*v))) {
+            pkg.wardrobe.secondary_material = *m;
+        }
+    }
+    if (const auto v = args.find_option("primary-color")) {
+        if (const auto rgb = parse_hex_rgb(*v)) {
+            pkg.wardrobe.primary_color = *rgb;
+        }
+    }
+    if (const auto v = args.find_option("secondary-color")) {
+        if (const auto rgb = parse_hex_rgb(*v)) {
+            pkg.wardrobe.secondary_color = *rgb;
+        }
+    }
+    if (const auto v = args.find_option("accent-color")) {
+        if (const auto rgb = parse_hex_rgb(*v)) {
+            pkg.wardrobe.accent_color = *rgb;
+        }
+    }
+    if (const auto v = args.find_option("footwear-color")) {
+        if (const auto rgb = parse_hex_rgb(*v)) {
+            pkg.wardrobe.footwear_color = *rgb;
+        }
+    }
+    if (const auto v = args.find_option("hair-color")) {
+        if (const auto rgb = parse_hex_rgb(*v)) {
+            pkg.wardrobe.hair_color = *rgb;
+        }
+    }
+    if (const auto v = args.find_option("wear")) {
+        if (const auto wear = parse_finite_float(*v)) {
+            pkg.wardrobe.wear_and_tear = std::clamp(*wear, 0.0F, 1.0F);
+        }
+    }
+    if (args.has_flag("belt")) {
+        pkg.wardrobe.has_belt = true;
+    }
+    if (args.has_flag("no-belt")) {
+        pkg.wardrobe.has_belt = false;
+    }
+    if (args.has_flag("gloves")) {
+        pkg.wardrobe.has_gloves = true;
+    }
+    if (args.has_flag("no-gloves")) {
+        pkg.wardrobe.has_gloves = false;
+    }
+    if (args.has_flag("pauldrons")) {
+        pkg.wardrobe.has_pauldrons = true;
+    }
+    if (args.has_flag("no-pauldrons")) {
+        pkg.wardrobe.has_pauldrons = false;
+    }
+    if (args.has_flag("cape")) {
+        pkg.wardrobe.has_cape = true;
+    }
+    if (args.has_flag("no-cape")) {
+        pkg.wardrobe.has_cape = false;
+    }
+    if (args.has_flag("studio-underwear")) {
+        pkg.wardrobe.studio_underwear = true;
+    }
+    if (args.has_flag("no-studio-underwear")) {
+        pkg.wardrobe.studio_underwear = false;
+    }
+    if (args.has_flag("beard")) {
+        pkg.wardrobe.has_beard = true;
+    }
+    if (args.has_flag("no-beard")) {
+        pkg.wardrobe.has_beard = false;
+    }
+    if (args.has_flag("occlude-body")) {
+        pkg.wardrobe.occlude_covered_body = true;
+    }
+    if (args.has_flag("no-occlude-body")) {
+        pkg.wardrobe.occlude_covered_body = false;
+    }
+    sanitize_character_package(pkg);
+}
+
 [[nodiscard]] CharacterPackage make_studio_character_template(
     const std::string_view slug,
     const std::string_view display_name,
@@ -357,6 +535,8 @@ bool CharacterStudioShell::parse_cli_args(
             arg == "--belt" || arg == "--no-belt" ||
             arg == "--beard" || arg == "--no-beard" ||
             arg == "--studio-underwear" || arg == "--no-studio-underwear" ||
+            arg == "--hood" || arg == "--no-hood" ||
+            arg == "--closeup" ||
             arg == "--occlude-body" || arg == "--no-occlude-body" ||
             arg == "--rig-overlay") {
             out_args.options[std::string(arg.substr(2U))] = "true";
@@ -739,6 +919,7 @@ void CharacterStudioShell::initialize_gui(
     } else {
         set_status("Loaded " + character_path_.filename().string(), EditorTone::success);
     }
+    apply_cli_preview_wardrobe_overrides(args, package_);
     package_dirty_ = false;
     last_cook_verified_ = false;
     refresh_project_characters();
@@ -863,6 +1044,14 @@ void CharacterStudioShell::initialize_gui(
     preview_rebuild_requested_ = false;
     if (args.focus_face) {
         focus_camera_face();
+    } else if (args.has_flag("closeup")) {
+        focus_camera_full_body();
+        const float h = std::clamp(package_.body.height_meters, 1.2F, 2.5F);
+        orbit_target_ = glm::vec3(0.0F, h * 0.56F, 0.03F);
+        orbit_distance_ = std::max(0.90F, h * 0.54F);
+        orbit_azimuth_ = 0.24F;
+        orbit_elevation_ = 0.06F;
+        update_orbit_camera();
     } else {
         focus_camera_full_body();
     }
@@ -881,11 +1070,35 @@ void CharacterStudioShell::initialize_gui(
             set_preview_paused(true);
         }
     }
+    bool camera_adjusted = false;
+    if (const auto target_y_opt = args.find_option("camera-target-y")) {
+        if (const auto ty = parse_finite_float(*target_y_opt)) {
+            orbit_target_.y = std::clamp(*ty, 0.05F, 2.6F);
+            camera_adjusted = true;
+        }
+    }
+    if (const auto dist_opt = args.find_option("camera-distance")) {
+        if (const auto dist = parse_finite_float(*dist_opt)) {
+            orbit_distance_ = *dist;
+            camera_adjusted = true;
+        }
+    }
+    if (const auto zoom_opt = args.find_option("zoom")) {
+        if (const auto zoom = parse_finite_float(*zoom_opt)) {
+            if (*zoom > 0.05F) {
+                orbit_distance_ /= std::clamp(*zoom, 0.20F, 6.0F);
+                camera_adjusted = true;
+            }
+        }
+    }
     if (const auto yaw_opt = args.find_option("yaw-deg")) {
         if (const auto yaw_deg = parse_finite_float(*yaw_opt)) {
             orbit_azimuth_ = glm::radians(*yaw_deg);
-            update_orbit_camera();
+            camera_adjusted = true;
         }
+    }
+    if (camera_adjusted) {
+        update_orbit_camera();
     }
     if (args.has_flag("rig-overlay")) {
         set_show_skeleton_overlay(true);

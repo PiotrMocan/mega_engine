@@ -1,6 +1,7 @@
 #include "character_package.hpp"
 
 #include "character_strand_groom.hpp"
+#include "character_wardrobe.hpp"
 #include "cooked_audio_asset.hpp"
 #include "cooked_texture_asset.hpp"
 #include "game_ui_runtime.hpp"
@@ -52,23 +53,7 @@ constexpr std::uint32_t max_paint_strokes = 4096U;
 constexpr std::uint32_t max_dialogue_nodes = 64U;
 constexpr std::uint32_t max_dialogue_choices_per_node = 4U;
 
-enum class TemplateRegion : std::uint8_t {
-    none = 0U,
-    head = 1U,
-    neck = 2U,
-    torso_upper = 3U,
-    torso_lower = 4U,
-    pelvis = 5U,
-    upper_arm = 6U,
-    forearm = 7U,
-    hand = 8U,
-    thigh_upper = 9U,
-    thigh_lower = 10U,
-    shin = 11U,
-    ankle_boot = 12U,
-    foot = 13U,
-    inner_mouth = 14U,
-};
+using TemplateRegion = WardrobeTemplateRegion;
 
 constexpr std::uint32_t template_morph_count = 18U;
 constexpr std::uint32_t template_part_count = 5U;
@@ -476,13 +461,7 @@ struct TemplateMorphDelta {
     glm::vec3 delta{0.0F};
 };
 
-struct TemplateCorner {
-    std::uint16_t vid = 0U;
-    std::uint8_t region = 0U;
-    std::uint8_t flags = 0U;
-    float u = 0.0F;
-    float v = 0.0F;
-};
+using TemplateCorner = WardrobeTemplateCorner;
 
 struct TemplatePart {
     std::vector<TemplateCorner> corners{};
@@ -1052,6 +1031,9 @@ struct MeshBuilder {
     std::vector<CookedModelVertex> vertices{};
     std::vector<CookedSkinVertex> skin_vertices{};
     std::vector<std::uint8_t> vertex_paint_targets{};
+    std::vector<std::uint8_t> vertex_garment_zones{};
+    std::vector<float> vertex_garment_ao{};
+    std::vector<float> vertex_garment_curv{};
     std::vector<std::uint32_t> indices{};
     std::vector<CharacterSubmeshBuild> submeshes{};
 
@@ -1075,6 +1057,9 @@ struct MeshBuilder {
         sanitize_skin_vertex(sanitized, character_total_bone_count);
         skin_vertices.push_back(sanitized);
         vertex_paint_targets.push_back(static_cast<std::uint8_t>(target));
+        vertex_garment_zones.push_back(static_cast<std::uint8_t>(GarmentZoneId::none));
+        vertex_garment_ao.push_back(1.0F);
+        vertex_garment_curv.push_back(0.5F);
     }
 };
 
@@ -1374,40 +1359,10 @@ void apply_sculpt_strokes_to_mesh(
     }
 }
 
-[[nodiscard]] PbrMaterial preset_outfit_material(
+[[maybe_unused]] [[nodiscard]] PbrMaterial preset_outfit_material(
     const OutfitMaterialPreset preset,
     const glm::vec3& color) noexcept {
-    PbrMaterial m{};
-    m.base_color = glm::vec4(color, 1.0F);
-    m.model = MaterialModel::standard;
-    m.ambient_occlusion = 1.0F;
-    switch (preset) {
-    case OutfitMaterialPreset::cloth_linen:
-        m.metallic = 0.02F;
-        m.roughness = 0.86F;
-        break;
-    case OutfitMaterialPreset::leather:
-        m.metallic = 0.05F;
-        m.roughness = 0.52F;
-        break;
-    case OutfitMaterialPreset::denim:
-        m.metallic = 0.02F;
-        m.roughness = 0.82F;
-        break;
-    case OutfitMaterialPreset::tactical_weave:
-        m.metallic = 0.08F;
-        m.roughness = 0.66F;
-        break;
-    case OutfitMaterialPreset::brushed_steel:
-        m.metallic = 0.88F;
-        m.roughness = 0.28F;
-        break;
-    case OutfitMaterialPreset::gilded_plate:
-        m.metallic = 0.92F;
-        m.roughness = 0.24F;
-        break;
-    }
-    return sanitize_pbr_material(m);
+    return make_wardrobe_preset_material(preset, color);
 }
 
 // ============================================================================
@@ -2742,11 +2697,13 @@ void emit_template_part_subset(
     case TemplateRegion::torso_upper:
         return has_top;
     case TemplateRegion::torso_lower:
-        return has_top && (has_bottom || long_top_pelvis);
+        return has_top &&
+            w.bottom_style != BottomGarmentStyle::skirt &&
+            (has_bottom || w.top_style == TopGarmentStyle::trench_coat);
     case TemplateRegion::pelvis:
         return has_bottom || long_top_pelvis;
     case TemplateRegion::upper_arm:
-        return long_sleeves || w.top_style == TopGarmentStyle::tunic;
+        return long_sleeves;
     case TemplateRegion::forearm:
         return long_sleeves;
     case TemplateRegion::hand:
@@ -2885,7 +2842,7 @@ void recompute_vertex_normals_range(
     }
 }
 
-[[nodiscard]] glm::vec2 azimuthal_crown_uv(
+[[maybe_unused]] [[nodiscard]] glm::vec2 azimuthal_crown_uv(
     const glm::vec3& p,
     const glm::vec3& head_center) noexcept {
     const glm::vec3 d = p - head_center;
@@ -3763,25 +3720,45 @@ CharacterMeshBuildResult build_character_mesh(const CharacterPackage& input_pkg)
                 tpl->vertex_count, pkg.wardrobe.occlude_covered_body ? 0U : 1U);
             if (pkg.wardrobe.occlude_covered_body) {
                 std::vector<std::uint8_t> touches_uncovered(tpl->vertex_count, 0U);
+                const float neck_y_ref = bones[5].model_pos.y;
+                const float chest_y_ref = bones[4].model_pos.y;
+                const float head_z_ref = bones[6].model_pos.z;
                 for (const TemplateCorner& c : body_part.corners) {
-                    if (!is_region_covered_by_wardrobe(
-                            pkg.wardrobe, static_cast<TemplateRegion>(c.region))) {
+                    const auto reg = static_cast<TemplateRegion>(c.region);
+                    bool uncovered = !is_region_covered_by_wardrobe(pkg.wardrobe, reg);
+                    if (!uncovered && reg == TemplateRegion::torso_upper) {
+                        const glm::vec3& vp = eval.positions[c.vid];
+                        const bool collar_ring = vp.y >= neck_y_ref - 0.065F * h;
+                        const bool front_vneck_chest =
+                            vp.y >= chest_y_ref - 0.015F * h &&
+                            std::abs(vp.x) <= 0.105F * h &&
+                            vp.z >= head_z_ref + 0.010F * h;
+                        if (collar_ring || front_vneck_chest) {
+                            uncovered = true;
+                        }
+                    }
+                    if (uncovered) {
                         touches_uncovered[c.vid] = 1U;
                     }
                 }
-                // Keep a conservative 1-ring border of skin vertices adjacent to any exposed triangle.
+                // Keep a conservative 2-ring border of skin vertices adjacent to exposed regions
+                // so V-neck collars, short sleeves, shorts, and boot cuffs have zero floating gaps.
                 ring1_uncovered = touches_uncovered;
-                for (std::size_t i = 0U; i + 2U < body_part.indices.size(); i += 3U) {
-                    const std::uint16_t v0 = body_part.corners[body_part.indices[i + 0U]].vid;
-                    const std::uint16_t v1 = body_part.corners[body_part.indices[i + 1U]].vid;
-                    const std::uint16_t v2 = body_part.corners[body_part.indices[i + 2U]].vid;
-                    if (touches_uncovered[v0] != 0U ||
-                        touches_uncovered[v1] != 0U ||
-                        touches_uncovered[v2] != 0U) {
-                        ring1_uncovered[v0] = 1U;
-                        ring1_uncovered[v1] = 1U;
-                        ring1_uncovered[v2] = 1U;
+                for (int ring = 0; ring < 2; ++ring) {
+                    std::vector<std::uint8_t> next_ring = ring1_uncovered;
+                    for (std::size_t i = 0U; i + 2U < body_part.indices.size(); i += 3U) {
+                        const std::uint16_t v0 = body_part.corners[body_part.indices[i + 0U]].vid;
+                        const std::uint16_t v1 = body_part.corners[body_part.indices[i + 1U]].vid;
+                        const std::uint16_t v2 = body_part.corners[body_part.indices[i + 2U]].vid;
+                        if (ring1_uncovered[v0] != 0U ||
+                            ring1_uncovered[v1] != 0U ||
+                            ring1_uncovered[v2] != 0U) {
+                            next_ring[v0] = 1U;
+                            next_ring[v1] = 1U;
+                            next_ring[v2] = 1U;
+                        }
                     }
+                    ring1_uncovered = std::move(next_ring);
                 }
             }
 
@@ -3891,620 +3868,103 @@ CharacterMeshBuildResult build_character_mesh(const CharacterPackage& input_pkg)
             end_submesh(std::move(cornea_sub));
         }
 
-        // ---- Submesh 2: Primary Outfit (Shirt / Jacket / Trench Coat / Hoodie / Armor + Hood + Pauldrons + Cape) ----
+        // ---- Submeshes 2 & 3: Modular 3D Tailored Wardrobe (Primary & Secondary) ----
         {
-            const bool use_underwear_top =
-                pkg.wardrobe.studio_underwear &&
-                pkg.wardrobe.top_style == TopGarmentStyle::none &&
-                pkg.body.gender == CharacterGender::female;
-            PbrMaterial primary_mat = preset_outfit_material(
-                pkg.wardrobe.primary_material, pkg.wardrobe.primary_color);
-            if (use_underwear_top) {
-                primary_mat.base_color = glm::vec4(0.145F, 0.152F, 0.168F, 1.0F);
-                primary_mat.metallic = 0.0F;
-                primary_mat.roughness = 0.94F;
-                primary_mat.ambient_occlusion = 1.0F;
-                primary_mat.model = MaterialModel::standard;
-                primary_mat = sanitize_pbr_material(primary_mat);
+            CharacterWardrobeBuildInputs wardrobe_in{};
+            wardrobe_in.package = &pkg;
+            wardrobe_in.positions = eval.positions;
+            wardrobe_in.body_normals = skin_normals;
+            wardrobe_in.tights_normals = tights_normals;
+            wardrobe_in.skirt_normals = skirt_normals;
+            wardrobe_in.skin_weights = tpl->skin_weights;
+            for (std::size_t b = 0U; b < character_total_bone_count; ++b) {
+                wardrobe_in.bone_positions[b] = bones[b].model_pos;
             }
-            auto out1_sub = begin_submesh(
-                "outfit_primary", CharacterPaintTarget::outfit_primary, primary_mat);
+            wardrobe_in.body_part = WardrobeTemplatePartView{
+                tpl->parts[part_body].corners, tpl->parts[part_body].indices};
+            wardrobe_in.tights_part = WardrobeTemplatePartView{
+                tpl->parts[part_tights].corners, tpl->parts[part_tights].indices};
+            wardrobe_in.skirt_part = WardrobeTemplatePartView{
+                tpl->parts[part_skirt].corners, tpl->parts[part_skirt].indices};
 
-            const float t_extra = (std::max)(0.0F, pkg.wardrobe.top_thickness - 0.010F);
-            const float rim_top = std::clamp(pkg.wardrobe.top_thickness * 0.22F, 0.002F, 0.004F);
-            // Anatomical natural waist (narrowest torso waistline, ~Spine_02..Spine_03 lower bound)
-            const float waist_belt_y = glm::mix(bones[3].model_pos.y, bones[4].model_pos.y, 0.14F);
-            const float neck_collar_y = bones[5].model_pos.y - 0.004F * h;
-            const float eye_y_ref = 0.5F * (bones[43].model_pos.y + bones[44].model_pos.y);
-            const glm::vec3 head_c_ref = bones[6].model_pos;
+            const CharacterWardrobeMeshOutputs wardrobe_out =
+                build_character_wardrobe_meshes(wardrobe_in);
 
-            const std::uint32_t top_v_start = static_cast<std::uint32_t>(mb.vertices.size());
-            const std::uint32_t top_i_start = static_cast<std::uint32_t>(mb.indices.size());
-
-            if (use_underwear_top) {
-                const float shoulder_x = (std::max)(0.10F * h, std::abs(bones[8].model_pos.x));
-                const float chest_y_band = bones[4].model_pos.y;
-                const float top_edge_max = chest_y_band + 0.058F * h;
-                const float bot_edge = chest_y_band - 0.068F * h;
-                const float band_span = (std::max)(0.06F, top_edge_max - bot_edge);
-                const float arm_limit_x = shoulder_x * 0.86F;
-                emit_clipped_template_part(
-                    mb,
-                    tpl->parts[part_body],
-                    eval.positions,
-                    skin_normals,
-                    tpl->skin_weights,
-                    0.0020F,
-                    CharacterPaintTarget::outfit_primary,
-                    [](const TemplateCorner& c0, const TemplateCorner& c1, const TemplateCorner& c2) noexcept {
-                        const auto allowed = [](const TemplateCorner& c) noexcept {
-                            const auto reg = static_cast<TemplateRegion>(c.region);
-                            return reg == TemplateRegion::torso_upper ||
-                                   reg == TemplateRegion::torso_lower;
-                        };
-                        return allowed(c0) && allowed(c1) && allowed(c2);
-                    },
-                    3U,
-                    [&](const std::size_t plane_idx, const ClipVert& v) noexcept -> float {
-                        if (plane_idx == 0U) {
-                            const float front_w = (v.base_p.z > 0.0F) ? 1.0F : 0.45F;
-                            const float scoop = 0.018F * h * front_w *
-                                std::exp(-(v.base_p.x * v.base_p.x) / (0.0020F * h * h));
-                            const float top_edge = top_edge_max - scoop;
-                            return top_edge - v.base_p.y;
-                        }
-                        if (plane_idx == 1U) {
-                            return v.base_p.y - bot_edge;
-                        }
-                        return arm_limit_x - std::abs(v.base_p.x);
-                    },
-                    [](const ClipVert& v, const float) noexcept {
-                        return v.base_p + v.nrm * 0.0036F;
-                    },
-                    [&](const ClipVert& v, const glm::vec3& p) noexcept {
-                        const float rad_xz = (std::max)(0.03F * h, std::hypot(v.base_p.x, v.base_p.z));
-                        const float u_fold = std::clamp(
-                            0.04F + 0.92F * (std::acos(std::clamp(v.base_p.z / rad_xz, -1.0F, 1.0F)) /
-                                             glm::pi<float>()),
-                            0.04F, 0.96F);
-                        const float v_norm = std::clamp((top_edge_max - p.y) / band_span, 0.04F, 0.64F);
-                        return glm::vec2(u_fold, v_norm);
-                    });
-            } else if (pkg.wardrobe.top_style != TopGarmentStyle::none) {
-                const bool long_sleeves =
-                    pkg.wardrobe.top_style == TopGarmentStyle::jacket ||
-                    pkg.wardrobe.top_style == TopGarmentStyle::trench_coat ||
-                    pkg.wardrobe.top_style == TopGarmentStyle::hoodie;
-                const bool short_sleeves = (pkg.wardrobe.top_style == TopGarmentStyle::tunic);
-                const bool include_pelvis =
-                    pkg.wardrobe.top_style == TopGarmentStyle::trench_coat ||
-                    pkg.wardrobe.top_style == TopGarmentStyle::tunic;
-                const float shoulder_x = (std::max)(0.10F * h, std::abs(bones[8].model_pos.x));
-                const float short_sleeve_limit = shoulder_x + 0.14F * h;
-                const float wrist_limit_x = (std::max)(
-                    shoulder_x + 0.12F * h,
-                    0.5F * (std::abs(bones[10].model_pos.x) + std::abs(bones[18].model_pos.x)) -
-                        0.005F * h);
-                const float top_hem_y = include_pelvis
-                    ? (bones[1].model_pos.y - 0.035F * h)
-                    : (waist_belt_y - 0.030F * h);
-
-                const float neck_y = neck_collar_y + 0.015F * h;
-                const float top_v_span = (std::max)(0.15F, neck_y - top_hem_y + 0.08F * h);
-
-                emit_clipped_template_part(
-                    mb,
-                    tpl->parts[part_tights],
-                    eval.positions,
-                    tights_normals,
-                    tpl->skin_weights,
-                    rim_top,
-                    CharacterPaintTarget::outfit_primary,
-                    [&](const TemplateCorner& c0, const TemplateCorner& c1, const TemplateCorner& c2) noexcept {
-                        const auto allowed = [&](const TemplateCorner& c) noexcept {
-                            const auto reg = static_cast<TemplateRegion>(c.region);
-                            if (reg != TemplateRegion::neck &&
-                                reg != TemplateRegion::torso_upper &&
-                                reg != TemplateRegion::torso_lower &&
-                                reg != TemplateRegion::pelvis &&
-                                reg != TemplateRegion::upper_arm &&
-                                reg != TemplateRegion::forearm &&
-                                reg != TemplateRegion::hand) {
-                                return false;
-                            }
-                            if (!long_sleeves && reg == TemplateRegion::hand) {
-                                return false;
-                            }
-                            return true;
-                        };
-                        return allowed(c0) && allowed(c1) && allowed(c2);
-                    },
-                    3U,
-                    [&](const std::size_t plane_idx, const ClipVert& v) noexcept -> float {
-                        if (plane_idx == 0U) {
-                            const float front_t = std::clamp(
-                                (v.base_p.z - (head_c_ref.z - 0.030F * h)) / (0.090F * h),
-                                0.0F, 1.0F);
-                            const float neck_r = std::clamp(
-                                (std::abs(v.base_p.x) - 0.075F * h) / (0.040F * h),
-                                0.0F, 1.0F);
-                            const float collar_y =
-                                (neck_collar_y - 0.020F * h * front_t) * (1.0F - neck_r) +
-                                (neck_collar_y + 0.080F * h) * neck_r;
-                            return collar_y - v.base_p.y;
-                        }
-                        if (plane_idx == 1U) {
-                            if (std::abs(v.base_p.x) > shoulder_x + 0.060F * h &&
-                                v.base_p.y < bones[4].model_pos.y) {
-                                return 0.20F;
-                            }
-                            return v.base_p.y - top_hem_y;
-                        }
-                        if (long_sleeves) {
-                            return wrist_limit_x - std::abs(v.base_p.x);
-                        }
-                        if (short_sleeves) {
-                            return short_sleeve_limit - std::abs(v.base_p.x);
-                        }
-                        return (shoulder_x + 0.024F * h) - std::abs(v.base_p.x);
-                    },
-                    [&](const ClipVert& v, const float) noexcept {
-                        float flare = 0.0F;
-                        if (pkg.wardrobe.top_style == TopGarmentStyle::trench_coat &&
-                            v.base_p.y < waist_belt_y - 0.028F * h) {
-                            flare = 0.006F;
-                        } else if (pkg.wardrobe.top_style == TopGarmentStyle::trench_coat &&
-                                   pkg.wardrobe.has_belt &&
-                                   std::abs(v.base_p.y - waist_belt_y) < 0.028F * h) {
-                            flare = -0.002F;
-                        }
-                        return v.base_p + v.nrm * ((std::max)(0.002F, 0.006F + t_extra + flare));
-                    },
-                    [&](const ClipVert& v, const glm::vec3& p) noexcept {
-                        if (v.flags == 1U) {
-                            return glm::vec2(std::clamp(v.orig_u, 0.04F, 0.96F),
-                                             std::clamp(0.70F + v.orig_v * 0.25F, 0.70F, 0.96F));
-                        }
-                        const float v_norm = std::clamp((neck_y - p.y) / top_v_span, 0.08F, 0.66F);
-                        return glm::vec2(std::clamp(v.orig_u, 0.02F, 0.98F), v_norm);
-                    });
-
-                // Flared lower coat skirt on trench coat
-                if (pkg.wardrobe.top_style == TopGarmentStyle::trench_coat) {
-                    const float coat_top_y = waist_belt_y - 0.010F * h;
-                    emit_clipped_template_part(
-                        mb,
-                        tpl->parts[part_skirt],
-                        eval.positions,
-                        skirt_normals,
-                        tpl->skin_weights,
-                        rim_top,
-                        CharacterPaintTarget::outfit_primary,
-                        [](const TemplateCorner&, const TemplateCorner&, const TemplateCorner&) noexcept {
-                            return true;
-                        },
-                        1U,
-                        [&](const std::size_t, const ClipVert& v) noexcept -> float {
-                            return coat_top_y - v.base_p.y;
-                        },
-                        [&](const ClipVert& v, const float) noexcept {
-                            const float drop = (std::max)(0.0F, coat_top_y - v.base_p.y);
-                            return v.base_p + v.nrm * (0.007F + t_extra + drop * 0.055F);
-                        },
-                        [](const ClipVert& v, const glm::vec3&) noexcept {
-                            return glm::vec2(std::clamp(v.orig_u, 0.02F, 0.98F),
-                                             std::clamp(0.32F + v.orig_v * 0.36F, 0.32F, 0.68F));
-                        });
+            const auto append_wardrobe_slot = [&](
+                const char* slot_name,
+                const CharacterPaintTarget target,
+                const WardrobeSlotMesh& slot) {
+                if (slot.vertices.empty() || slot.indices.size() < 3U) {
+                    return;
                 }
-            }
+                auto sub = begin_submesh(
+                    slot_name, target, sanitize_pbr_material(slot.material));
+                const auto v_base = static_cast<std::uint32_t>(mb.vertices.size());
+                const std::size_t n = slot.vertices.size();
 
-            if (pkg.wardrobe.hair_style == HairStyle::hood) {
-                emit_clipped_template_part(
-                    mb,
-                    tpl->parts[part_body],
-                    eval.positions,
-                    skin_normals,
-                    tpl->skin_weights,
-                    0.004F,
-                    CharacterPaintTarget::outfit_primary,
-                    [](const TemplateCorner& c0, const TemplateCorner& c1, const TemplateCorner& c2) noexcept {
-                        const auto allowed = [](const TemplateCorner& c) noexcept {
-                            const auto reg = static_cast<TemplateRegion>(c.region);
-                            return reg == TemplateRegion::head ||
-                                   reg == TemplateRegion::neck ||
-                                   reg == TemplateRegion::torso_upper;
-                        };
-                        return allowed(c0) && allowed(c1) && allowed(c2);
-                    },
-                    2U,
-                    [&](const std::size_t plane_idx, const ClipVert& v) noexcept -> float {
-                        if (plane_idx == 0U) {
-                            return v.base_p.y - (neck_collar_y - 0.022F * h);
-                        }
-                        if (v.base_p.z <= head_c_ref.z + 0.020F * hs) {
-                            return 0.060F * hs;
-                        }
-                        const float d = glm::length(glm::vec2(
-                            v.base_p.x / (0.068F * hs),
-                            (v.base_p.y - (eye_y_ref - 0.032F * hs)) / (0.078F * hs)));
-                        return (d - 1.0F) * 0.060F * hs;
-                    },
-                    [&](const ClipVert& v, const float) noexcept {
-                        return v.base_p + v.nrm * (0.018F * hs + t_extra * 0.5F);
-                    },
-                    [&](const ClipVert&, const glm::vec3& p) noexcept {
-                        const glm::vec2 uv = azimuthal_crown_uv(p, head_c_ref);
-                        return glm::vec2(uv.x, 0.08F + uv.y * 0.50F);
-                    });
-            }
-            recompute_vertex_normals_range(mb, top_v_start, top_i_start);
-
-            if (pkg.wardrobe.has_pauldrons) {
-                for (int side = -1; side <= 1; side += 2) {
-                    const std::uint16_t clav = side < 0 ? 15U : 7U;
-                    const std::uint16_t shld = side < 0 ? 16U : 8U;
-                    CookedSkinVertex sk{};
-                    sk.joints = {shld, clav, 4U, 0U};
-                    sk.weights = {0.65F, 0.25F, 0.10F, 0.0F};
-                    emit_ellipsoid(
-                        mb,
-                        bones[shld].model_pos + glm::vec3(static_cast<float>(side) * 0.024F * h, 0.042F * h, 0.0F),
-                        {0.082F * h, 0.056F * h, 0.088F * h},
-                        8U,
-                        12U,
-                        {0.58F, 0.06F},
-                        {0.94F, 0.36F},
-                        sk,
-                        CharacterPaintTarget::outfit_primary);
+                mb.vertices.insert(
+                    mb.vertices.end(), slot.vertices.begin(), slot.vertices.end());
+                if (slot.skin_vertices.size() == n) {
+                    mb.skin_vertices.reserve(mb.skin_vertices.size() + n);
+                    for (CookedSkinVertex sk : slot.skin_vertices) {
+                        sanitize_skin_vertex(sk, character_total_bone_count);
+                        mb.skin_vertices.push_back(sk);
+                    }
+                } else {
+                    mb.skin_vertices.resize(mb.vertices.size(), CookedSkinVertex{});
                 }
-            }
+                mb.vertex_paint_targets.resize(
+                    mb.vertices.size(), static_cast<std::uint8_t>(target));
 
-            if (pkg.wardrobe.has_cape) {
-                const float cape_w = 0.26F * h * (0.85F + pkg.body.shoulder_width * 0.35F);
-                const std::array<LoftRing, 4U> cape_rings{{
-                    {bones[1].model_pos - glm::vec3(0.0F, 0.62F * h, 0.16F * h), {1,0,0}, {0,0,1},
-                     cape_w * 1.42F, 0.014F, 0.0F,
-                     {{37U, 1U, 0U, 0U}, {0.70F, 0.30F, 0, 0}}},
-                    {bones[1].model_pos + glm::vec3(0.0F, -0.05F * h, -0.14F * h), {1,0,0}, {0,0,1},
-                     cape_w * 1.18F, 0.013F, 0.40F,
-                     {{37U, 2U, 0U, 0U}, {0.60F, 0.40F, 0, 0}}},
-                    {bones[3].model_pos + glm::vec3(0.0F, 0.0F, -0.135F * h), {1,0,0}, {0,0,1},
-                     cape_w * 1.04F, 0.013F, 0.72F,
-                     {{3U, 4U, 0U, 0U}, {0.50F, 0.50F, 0, 0}}},
-                    {bones[4].model_pos + glm::vec3(0.0F, 0.035F * h, -0.12F * h), {1,0,0}, {0,0,1},
-                     cape_w * 0.78F, 0.013F, 1.0F,
-                     {{4U, 5U, 0U, 0U}, {0.80F, 0.20F, 0, 0}}},
-                }};
-                emit_loft_tube(
-                    mb, cape_rings, 10U, {0.10F, 0.10F}, {0.90F, 0.66F},
-                    CharacterPaintTarget::outfit_primary, true, true, 0.85F);
-            }
+                mb.vertex_garment_zones.resize(
+                    v_base, static_cast<std::uint8_t>(GarmentZoneId::none));
+                mb.vertex_garment_ao.resize(v_base, 1.0F);
+                mb.vertex_garment_curv.resize(v_base, 0.5F);
 
-            end_submesh(std::move(out1_sub));
-        }
+                if (slot.vertex_zones.size() == n) {
+                    mb.vertex_garment_zones.insert(
+                        mb.vertex_garment_zones.end(),
+                        slot.vertex_zones.begin(),
+                        slot.vertex_zones.end());
+                } else {
+                    mb.vertex_garment_zones.resize(
+                        mb.vertices.size(), static_cast<std::uint8_t>(GarmentZoneId::none));
+                }
+                if (slot.vertex_ao.size() == n) {
+                    mb.vertex_garment_ao.insert(
+                        mb.vertex_garment_ao.end(),
+                        slot.vertex_ao.begin(),
+                        slot.vertex_ao.end());
+                } else {
+                    mb.vertex_garment_ao.resize(mb.vertices.size(), 1.0F);
+                }
+                if (slot.vertex_curv.size() == n) {
+                    mb.vertex_garment_curv.insert(
+                        mb.vertex_garment_curv.end(),
+                        slot.vertex_curv.begin(),
+                        slot.vertex_curv.end());
+                } else {
+                    mb.vertex_garment_curv.resize(mb.vertices.size(), 0.5F);
+                }
 
-        // ---- Submesh 3: Secondary Outfit (Pants / Skirt / Shorts + Belt + Gloves + Footwear) ----
-        {
-            const bool use_underwear_bottom =
-                pkg.wardrobe.studio_underwear &&
-                pkg.wardrobe.bottom_style == BottomGarmentStyle::none;
-            PbrMaterial secondary_mat = preset_outfit_material(
-                pkg.wardrobe.secondary_material, pkg.wardrobe.secondary_color);
-            if (use_underwear_bottom &&
-                pkg.wardrobe.footwear_style == FootwearStyle::barefoot &&
-                !pkg.wardrobe.has_belt &&
-                !pkg.wardrobe.has_gloves) {
-                secondary_mat.base_color = glm::vec4(0.145F, 0.152F, 0.168F, 1.0F);
-                secondary_mat.metallic = 0.0F;
-                secondary_mat.roughness = 0.94F;
-                secondary_mat.ambient_occlusion = 1.0F;
-                secondary_mat.model = MaterialModel::standard;
-                secondary_mat = sanitize_pbr_material(secondary_mat);
-            }
-            auto out2_sub = begin_submesh(
-                "outfit_secondary", CharacterPaintTarget::outfit_secondary, secondary_mat);
+                mb.indices.reserve(mb.indices.size() + slot.indices.size());
+                for (std::size_t ii = 0U; ii + 2U < slot.indices.size(); ii += 3U) {
+                    const std::uint32_t i0 = slot.indices[ii + 0U];
+                    const std::uint32_t i1 = slot.indices[ii + 1U];
+                    const std::uint32_t i2 = slot.indices[ii + 2U];
+                    if (i0 < n && i1 < n && i2 < n) {
+                        mb.indices.push_back(v_base + i0);
+                        mb.indices.push_back(v_base + i1);
+                        mb.indices.push_back(v_base + i2);
+                    }
+                }
+                end_submesh(std::move(sub));
+            };
 
-            const float bt_extra = (std::max)(0.0F, pkg.wardrobe.bottom_thickness - 0.010F);
-            const float rim_bot = std::clamp(pkg.wardrobe.bottom_thickness * 0.22F, 0.002F, 0.004F);
-            const float waist_belt_y = glm::mix(bones[3].model_pos.y, bones[4].model_pos.y, 0.14F);
-
-            if (use_underwear_bottom) {
-                const float pelvis_y_u = bones[1].model_pos.y;
-                const float waist_top = pelvis_y_u + 0.032F * h;
-                const float crotch_drop =
-                    (pkg.body.gender == CharacterGender::female) ? (0.108F * h) : (0.136F * h);
-                const float hip_cut_gain =
-                    (pkg.body.gender == CharacterGender::female) ? (0.056F * h) : (0.020F * h);
-                const float x_start =
-                    (pkg.body.gender == CharacterGender::female) ? (0.032F * h) : (0.042F * h);
-                const float briefs_span = (std::max)(0.06F, waist_top - (pelvis_y_u - crotch_drop));
-
-                const std::uint32_t briefs_v_start = static_cast<std::uint32_t>(mb.vertices.size());
-                const std::uint32_t briefs_i_start = static_cast<std::uint32_t>(mb.indices.size());
-                emit_clipped_template_part(
-                    mb,
-                    tpl->parts[part_body],
-                    eval.positions,
-                    skin_normals,
-                    tpl->skin_weights,
-                    0.0020F,
-                    CharacterPaintTarget::outfit_secondary,
-                    [](const TemplateCorner& c0, const TemplateCorner& c1, const TemplateCorner& c2) noexcept {
-                        const auto allowed = [](const TemplateCorner& c) noexcept {
-                            const auto reg = static_cast<TemplateRegion>(c.region);
-                            return reg == TemplateRegion::pelvis ||
-                                   reg == TemplateRegion::torso_lower ||
-                                   reg == TemplateRegion::thigh_upper;
-                        };
-                        return allowed(c0) && allowed(c1) && allowed(c2);
-                    },
-                    2U,
-                    [&](const std::size_t plane_idx, const ClipVert& v) noexcept -> float {
-                        if (plane_idx == 0U) {
-                            return waist_top - v.base_p.y;
-                        }
-                        const float abs_x = std::abs(v.base_p.x);
-                        const float back_fullness = (v.base_p.z < -0.015F * h) ? 0.55F : 1.0F;
-                        const float hip_rise = hip_cut_gain * back_fullness *
-                            std::clamp((abs_x - x_start) / (0.105F * h), 0.0F, 1.0F);
-                        const float leg_cut = (pelvis_y_u - crotch_drop) + hip_rise;
-                        return v.base_p.y - leg_cut;
-                    },
-                    [](const ClipVert& v, const float) noexcept {
-                        return v.base_p + v.nrm * 0.0036F;
-                    },
-                    [&](const ClipVert& v, const glm::vec3& p) noexcept {
-                        const float rad_xz = (std::max)(0.03F * h, std::hypot(v.base_p.x, v.base_p.z));
-                        const float u_fold = std::clamp(
-                            0.04F + 0.92F * (std::acos(std::clamp(v.base_p.z / rad_xz, -1.0F, 1.0F)) /
-                                             glm::pi<float>()),
-                            0.04F, 0.96F);
-                        const float v_norm = std::clamp(
-                            0.04F + 0.60F * ((waist_top - p.y) / briefs_span),
-                            0.04F, 0.66F);
-                        return glm::vec2(u_fold, v_norm);
-                    });
-                recompute_vertex_normals_range(mb, briefs_v_start, briefs_i_start);
-            } else if (pkg.wardrobe.bottom_style == BottomGarmentStyle::skirt) {
-                emit_template_part_subset(
-                    mb,
-                    tpl->parts[part_skirt],
-                    eval.positions,
-                    skirt_normals,
-                    rim_bot,
-                    CharacterPaintTarget::outfit_secondary,
-                    [](const TemplateCorner&, const TemplateCorner&, const TemplateCorner&) noexcept {
-                        return true;
-                    },
-                    [&](const TemplateCorner&, const glm::vec3& p, const glm::vec3& n) noexcept {
-                        return p + n * (0.006F + bt_extra);
-                    },
-                    [](const TemplateCorner& c, const glm::vec3&) noexcept {
-                        return glm::vec2(std::clamp(c.u, 0.02F, 0.98F),
-                                         std::clamp(0.05F + c.v * 0.64F, 0.05F, 0.70F));
-                    },
-                    [&](const TemplateCorner& c, const glm::vec3&) noexcept {
-                        return tpl->skin_weights[c.vid];
-                    });
-                // Fitted inner shorts/briefs under skirt so low angles remain solid
-                emit_template_part_subset(
-                    mb,
-                    tpl->parts[part_tights],
-                    eval.positions,
-                    tights_normals,
-                    rim_bot,
-                    CharacterPaintTarget::outfit_secondary,
-                    [](const TemplateCorner& c0, const TemplateCorner& c1, const TemplateCorner& c2) noexcept {
-                        const auto is_pelvis = [](const TemplateCorner& c) noexcept {
-                            return static_cast<TemplateRegion>(c.region) == TemplateRegion::pelvis;
-                        };
-                        return is_pelvis(c0) && is_pelvis(c1) && is_pelvis(c2);
-                    },
-                    [&](const TemplateCorner&, const glm::vec3& p, const glm::vec3& n) noexcept {
-                        return p + n * 0.001F;
-                    },
-                    [](const TemplateCorner& c, const glm::vec3&) noexcept {
-                        return glm::vec2(std::clamp(c.u, 0.02F, 0.98F),
-                                         std::clamp(0.08F + c.v * 0.30F, 0.08F, 0.40F));
-                    },
-                    [&](const TemplateCorner& c, const glm::vec3&) noexcept {
-                        return tpl->skin_weights[c.vid];
-                    });
-            } else if (pkg.wardrobe.bottom_style != BottomGarmentStyle::none) {
-                const bool full_leg =
-                    pkg.wardrobe.bottom_style == BottomGarmentStyle::trousers ||
-                    pkg.wardrobe.bottom_style == BottomGarmentStyle::cargo_pants ||
-                    pkg.wardrobe.bottom_style == BottomGarmentStyle::tactical_greaves;
-                const float knee_y = bones[24].model_pos.y;
-                const float ankle_y = bones[25].model_pos.y;
-                const float waist_top_y = waist_belt_y + 0.014F * h;
-                const float hem_bot_y = full_leg
-                    ? (ankle_y + 0.006F * h)
-                    : glm::mix(knee_y, bones[23].model_pos.y, 0.42F);
-                const float leg_span = (std::max)(0.20F, waist_top_y - ankle_y);
-
-                const std::uint32_t bot_v_start = static_cast<std::uint32_t>(mb.vertices.size());
-                const std::uint32_t bot_i_start = static_cast<std::uint32_t>(mb.indices.size());
-                emit_clipped_template_part(
-                    mb,
-                    tpl->parts[part_tights],
-                    eval.positions,
-                    tights_normals,
-                    tpl->skin_weights,
-                    rim_bot,
-                    CharacterPaintTarget::outfit_secondary,
-                    [&](const TemplateCorner& c0, const TemplateCorner& c1, const TemplateCorner& c2) noexcept {
-                        const auto allowed = [&](const TemplateCorner& c) noexcept {
-                            const auto reg = static_cast<TemplateRegion>(c.region);
-                            if (reg == TemplateRegion::torso_upper ||
-                                reg == TemplateRegion::torso_lower ||
-                                reg == TemplateRegion::pelvis ||
-                                reg == TemplateRegion::thigh_upper) {
-                                return true;
-                            }
-                            if (full_leg &&
-                                (reg == TemplateRegion::thigh_lower ||
-                                 reg == TemplateRegion::shin ||
-                                 reg == TemplateRegion::ankle_boot)) {
-                                return true;
-                            }
-                            return false;
-                        };
-                        return allowed(c0) && allowed(c1) && allowed(c2);
-                    },
-                    2U,
-                    [&](const std::size_t plane_idx, const ClipVert& v) noexcept -> float {
-                        if (plane_idx == 0U) {
-                            return waist_top_y - v.base_p.y;
-                        }
-                        return v.base_p.y - hem_bot_y;
-                    },
-                    [&](const ClipVert& v, const float) noexcept {
-                        float pad = 0.0025F + bt_extra;
-                        if (pkg.wardrobe.bottom_style == BottomGarmentStyle::cargo_pants &&
-                            static_cast<TemplateRegion>(v.region) == TemplateRegion::thigh_upper) {
-                            pad += 0.004F;
-                        } else if (pkg.wardrobe.bottom_style == BottomGarmentStyle::tactical_greaves &&
-                                   v.base_p.y < knee_y + 0.04F * h) {
-                            pad += 0.005F;
-                        }
-                        return v.base_p + v.nrm * pad;
-                    },
-                    [&](const ClipVert& v, const glm::vec3& p) noexcept {
-                        const float v_norm = std::clamp((waist_top_y - p.y) / leg_span, 0.04F, 0.68F);
-                        return glm::vec2(std::clamp(v.orig_u, 0.02F, 0.98F), v_norm);
-                    });
-                recompute_vertex_normals_range(mb, bot_v_start, bot_i_start);
-            }
-
-            if (pkg.wardrobe.has_belt) {
-                const float belt_center_y = waist_belt_y;
-                const float belt_half_h = 0.015F * h;
-                const float t_extra = (std::max)(0.0F, pkg.wardrobe.top_thickness - 0.010F);
-                const float belt_offset =
-                    (pkg.wardrobe.top_style == TopGarmentStyle::trench_coat
-                        ? (0.0105F + t_extra)
-                        : (std::max)(0.0095F + t_extra, 0.0065F + bt_extra));
-                const std::uint32_t belt_v_start = static_cast<std::uint32_t>(mb.vertices.size());
-                const std::uint32_t belt_i_start = static_cast<std::uint32_t>(mb.indices.size());
-                emit_clipped_template_part(
-                    mb,
-                    tpl->parts[part_tights],
-                    eval.positions,
-                    tights_normals,
-                    tpl->skin_weights,
-                    0.0028F,
-                    CharacterPaintTarget::outfit_secondary,
-                    [](const TemplateCorner& c0, const TemplateCorner& c1, const TemplateCorner& c2) noexcept {
-                        const auto allowed = [](const TemplateCorner& c) noexcept {
-                            const auto reg = static_cast<TemplateRegion>(c.region);
-                            return reg == TemplateRegion::torso_upper ||
-                                   reg == TemplateRegion::torso_lower ||
-                                   reg == TemplateRegion::pelvis;
-                        };
-                        return allowed(c0) && allowed(c1) && allowed(c2);
-                    },
-                    2U,
-                    [&](const std::size_t plane_idx, const ClipVert& v) noexcept -> float {
-                        if (plane_idx == 0U) {
-                            return v.base_p.y - (belt_center_y - belt_half_h);
-                        }
-                        return (belt_center_y + belt_half_h) - v.base_p.y;
-                    },
-                    [&](const ClipVert& v, const float) noexcept {
-                        return v.base_p + v.nrm * belt_offset;
-                    },
-                    [&](const ClipVert& v, const glm::vec3&) noexcept {
-                        const float rad = (std::max)(0.05F, std::hypot(v.base_p.x, v.base_p.z));
-                        const float theta = std::acos(std::clamp(v.base_p.z / rad, -1.0F, 1.0F));
-                        const float u_fold = std::clamp(
-                            0.50F - 0.46F * (theta / glm::pi<float>()),
-                            0.04F, 0.50F);
-                        const float t_v = std::clamp(
-                            (v.base_p.y - (belt_center_y - belt_half_h)) / (2.0F * belt_half_h),
-                            0.0F, 1.0F);
-                        return glm::vec2(u_fold, 0.735F + t_v * 0.050F);
-                    });
-                recompute_vertex_normals_range(mb, belt_v_start, belt_i_start);
-            }
-
-            if (pkg.wardrobe.has_gloves) {
-                emit_template_part_subset(
-                    mb,
-                    tpl->parts[part_tights],
-                    eval.positions,
-                    tights_normals,
-                    0.004F,
-                    CharacterPaintTarget::outfit_secondary,
-                    [](const TemplateCorner& c0, const TemplateCorner& c1, const TemplateCorner& c2) noexcept {
-                        const auto is_hand = [](const TemplateCorner& c) noexcept {
-                            return static_cast<TemplateRegion>(c.region) == TemplateRegion::hand;
-                        };
-                        return is_hand(c0) && is_hand(c1) && is_hand(c2);
-                    },
-                    [&](const TemplateCorner&, const glm::vec3& p, const glm::vec3& n) noexcept {
-                        return p + n * 0.002F;
-                    },
-                    [](const TemplateCorner& c, const glm::vec3&) noexcept {
-                        return glm::vec2(std::clamp(c.u, 0.06F, 0.94F),
-                                         0.702F + std::clamp(c.v, 0.0F, 1.0F) * 0.020F);
-                    },
-                    [&](const TemplateCorner& c, const glm::vec3&) noexcept {
-                        return tpl->skin_weights[c.vid];
-                    });
-            }
-
-            if (pkg.wardrobe.footwear_style != FootwearStyle::barefoot) {
-                const bool tall_boots =
-                    pkg.wardrobe.footwear_style == FootwearStyle::combat_boots ||
-                    pkg.wardrobe.footwear_style == FootwearStyle::greave_boots;
-                const float ankle_y = bones[25].model_pos.y;
-                const float boot_top_y = tall_boots
-                    ? glm::mix(ankle_y, bones[24].model_pos.y, 0.68F)
-                    : (ankle_y + 0.038F * h);
-                const float boot_offset = bt_extra + (tall_boots ? 0.007F : 0.004F);
-
-                const std::uint32_t boot_v_start = static_cast<std::uint32_t>(mb.vertices.size());
-                const std::uint32_t boot_i_start = static_cast<std::uint32_t>(mb.indices.size());
-                emit_clipped_template_part(
-                    mb,
-                    tpl->parts[part_tights],
-                    eval.positions,
-                    tights_normals,
-                    tpl->skin_weights,
-                    0.004F,
-                    CharacterPaintTarget::outfit_secondary,
-                    [](const TemplateCorner& c0, const TemplateCorner& c1, const TemplateCorner& c2) noexcept {
-                        const auto allowed = [](const TemplateCorner& c) noexcept {
-                            const auto reg = static_cast<TemplateRegion>(c.region);
-                            return reg == TemplateRegion::thigh_lower ||
-                                   reg == TemplateRegion::shin ||
-                                   reg == TemplateRegion::ankle_boot ||
-                                   reg == TemplateRegion::foot;
-                        };
-                        return allowed(c0) && allowed(c1) && allowed(c2);
-                    },
-                    1U,
-                    [&](const std::size_t, const ClipVert& v) noexcept -> float {
-                        return boot_top_y - v.base_p.y;
-                    },
-                    [&](const ClipVert& v, const float) noexcept {
-                        glm::vec3 q = v.base_p + v.nrm * boot_offset;
-                        // Anchor sole cleanly at floor Y >= 0 without negative foot dip
-                        q.y = (std::max)(0.0F, q.y);
-                        return q;
-                    },
-                    [&](const ClipVert& v, const glm::vec3& p) noexcept {
-                        const float h_frac = std::clamp(
-                            (boot_top_y - p.y) / (std::max)(0.05F, boot_top_y),
-                            0.0F, 1.0F);
-                        return glm::vec2(std::clamp(v.orig_u, 0.02F, 0.98F),
-                                         0.805F + h_frac * 0.180F);
-                    });
-                recompute_vertex_normals_range(mb, boot_v_start, boot_i_start);
-            }
-
-            end_submesh(std::move(out2_sub));
+            append_wardrobe_slot(
+                "outfit_primary", CharacterPaintTarget::outfit_primary, wardrobe_out.primary);
+            append_wardrobe_slot(
+                "outfit_secondary", CharacterPaintTarget::outfit_secondary, wardrobe_out.secondary);
         }
 
         // ---- Submesh 4: Vendor-Agnostic 3D Micro-Strand Hair, Eyebrows, Eyelashes & Beard ----
@@ -4530,6 +3990,10 @@ CharacterMeshBuildResult build_character_mesh(const CharacterPackage& input_pkg)
                     mb.skin_vertices.end(), groom.skin_vertices.begin(), groom.skin_vertices.end());
                 mb.vertex_paint_targets.resize(
                     mb.vertices.size(), static_cast<std::uint8_t>(CharacterPaintTarget::hair));
+                mb.vertex_garment_zones.resize(
+                    mb.vertices.size(), static_cast<std::uint8_t>(GarmentZoneId::none));
+                mb.vertex_garment_ao.resize(mb.vertices.size(), 1.0F);
+                mb.vertex_garment_curv.resize(mb.vertices.size(), 0.5F);
                 mb.indices.reserve(mb.indices.size() + groom.indices.size());
                 for (const std::uint32_t idx : groom.indices) {
                     mb.indices.push_back(hair_v_start + idx);
@@ -4571,11 +4035,19 @@ CharacterMeshBuildResult build_character_mesh(const CharacterPackage& input_pkg)
         recompute_uv_derivative_tangents_for_submeshes(mb);
     }
 
+    mb.vertex_garment_zones.resize(
+        mb.vertices.size(), static_cast<std::uint8_t>(GarmentZoneId::none));
+    mb.vertex_garment_ao.resize(mb.vertices.size(), 1.0F);
+    mb.vertex_garment_curv.resize(mb.vertices.size(), 0.5F);
+
     result.vertices = std::move(mb.vertices);
     result.skin_vertices = std::move(mb.skin_vertices);
     result.indices = std::move(mb.indices);
     result.submeshes = std::move(mb.submeshes);
     result.vertex_paint_targets = std::move(mb.vertex_paint_targets);
+    result.vertex_garment_zones = std::move(mb.vertex_garment_zones);
+    result.vertex_garment_ao = std::move(mb.vertex_garment_ao);
+    result.vertex_garment_curv = std::move(mb.vertex_garment_curv);
 
     if (!result.vertices.empty()) {
         glm::vec3 mn(
@@ -4814,6 +4286,10 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
     outputs.reserve(mesh.submeshes.size());
 
     for (const CharacterSubmeshBuild& sub : mesh.submeshes) {
+        if (sub.name == "outfit_primary" || sub.name == "outfit_secondary") {
+            outputs.push_back(bake_character_wardrobe_textures(pkg, mesh, sub, res));
+            continue;
+        }
         if (sub.name == "hair" && tpl != nullptr && has_eval) {
             const CharacterGroomInputs groom_in =
                 build_groom_inputs_from_template(pkg, *tpl, eval);
@@ -7395,8 +6871,10 @@ bool cook_character_package_to_project(
         }
 
         const std::string mat_rel = "materials/" + slot + ".vcrmaterial.json";
+        const bool is_outfit_slot =
+            (slot == "outfit_primary" || slot == "outfit_secondary");
         const bool texture_driven_pbr =
-            (slot == "skin" || slot == "eyes" || slot == "hair");
+            (slot == "skin" || slot == "eyes" || slot == "hair" || is_outfit_slot);
         Json pbr_json{
             {"base_color", {1.0F, 1.0F, 1.0F, sub.material.base_color.a}},
             {"metallic", texture_driven_pbr ? 1.0F : sub.material.metallic},
@@ -7420,10 +6898,10 @@ bool cook_character_package_to_project(
                  {"metallic_roughness", mr_tex_rel},
              }},
         };
-        if (slot == "skin" || slot == "hair") {
+        if (slot == "skin" || slot == "hair" || is_outfit_slot) {
             mat_json["occlusion_in_metallic_roughness"] = true;
         }
-        if (slot == "hair") {
+        if (slot == "hair" || is_outfit_slot) {
             mat_json["double_sided"] = true;
         } else if (slot == "cornea") {
             mat_json["glass"] = true;

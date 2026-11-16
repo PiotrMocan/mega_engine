@@ -430,6 +430,8 @@ set(VCR_ENGINE_CORE_SOURCES
     src/npc_ai.cpp
     src/character_package.cpp
     src/character_strand_groom.cpp
+    src/character_wardrobe_mesh.cpp
+    src/character_wardrobe_textures.cpp
     src/character_ai_bridge.cpp
     src/vegetation_generator.cpp
 )

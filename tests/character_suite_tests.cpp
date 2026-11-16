@@ -1,5 +1,6 @@
 #include "character_ai_bridge.hpp"
 #include "character_package.hpp"
+#include "character_wardrobe.hpp"
 #include "cooked_audio_asset.hpp"
 #include "cooked_model_asset.hpp"
 #include "cooked_texture_asset.hpp"
@@ -1196,6 +1197,1032 @@ bool test_anatomical_rig_and_human_locomotion_biomechanics() {
     return true;
 }
 
+[[nodiscard]] const vcr::CharacterSubmeshBuild* find_submesh_by_name(
+    const vcr::CharacterMeshBuildResult& mesh,
+    const std::string_view name) noexcept {
+    for (const auto& sub : mesh.submeshes) {
+        if (sub.name == name) {
+            return &sub;
+        }
+    }
+    return nullptr;
+}
+
+[[nodiscard]] const vcr::BakedPbrTextureSet* find_baked_texture_by_slot(
+    const std::vector<vcr::BakedPbrTextureSet>& textures,
+    const std::string_view slot_name) noexcept {
+    for (const auto& tex : textures) {
+        if (tex.slot_name == slot_name) {
+            return &tex;
+        }
+    }
+    return nullptr;
+}
+
+[[nodiscard]] glm::vec3 skeleton_bind_model_pos(
+    const vcr::CookedSkeletonAsset& skel,
+    const std::size_t bone_idx) noexcept {
+    return glm::vec3(glm::inverse(skel.bones[bone_idx].inverse_bind_matrix)[3]);
+}
+
+[[nodiscard]] std::uint16_t dominant_bone_of(
+    const vcr::CookedSkinVertex& sv) noexcept {
+    std::uint16_t best_joint = sv.joints[0];
+    float best_weight = -1.0F;
+    for (std::size_t k = 0U; k < 4U; ++k) {
+        if (sv.weights[k] > best_weight) {
+            best_weight = sv.weights[k];
+            best_joint = sv.joints[k];
+        }
+    }
+    return best_joint;
+}
+
+[[nodiscard]] bool is_arm_or_hand_bone(const std::uint16_t joint) noexcept {
+    switch (joint) {
+    case 9U:
+    case 10U:
+    case 11U:
+    case 12U:
+    case 13U:
+    case 14U:
+    case 17U:
+    case 18U:
+    case 19U:
+    case 20U:
+    case 21U:
+    case 22U:
+    case 32U:
+    case 34U:
+        return true;
+    default:
+        return false;
+    }
+}
+
+[[nodiscard]] bool is_hand_finger_bone(const std::uint16_t joint) noexcept {
+    switch (joint) {
+    case 10U:
+    case 11U:
+    case 12U:
+    case 13U:
+    case 14U:
+    case 18U:
+    case 19U:
+    case 20U:
+    case 21U:
+    case 22U:
+        return true;
+    default:
+        return false;
+    }
+}
+
+[[nodiscard]] bool is_footwear_zone(const std::uint8_t zone_raw) noexcept {
+    const auto z = static_cast<vcr::GarmentZoneId>(zone_raw);
+    return z == vcr::GarmentZoneId::boot_upper ||
+           z == vcr::GarmentZoneId::boot_toe_heel ||
+           z == vcr::GarmentZoneId::boot_tongue_laces ||
+           z == vcr::GarmentZoneId::boot_sole_welt;
+}
+
+[[nodiscard]] bool is_glove_zone(
+    const std::uint8_t zone_raw,
+    const vcr::CookedSkinVertex& sv) noexcept {
+    const auto z = static_cast<vcr::GarmentZoneId>(zone_raw);
+    if (z == vcr::GarmentZoneId::glove_dorsal ||
+        z == vcr::GarmentZoneId::glove_palm ||
+        z == vcr::GarmentZoneId::glove_knuckle) {
+        return true;
+    }
+    if (z == vcr::GarmentZoneId::cuff_hem_rib) {
+        return is_arm_or_hand_bone(dominant_bone_of(sv));
+    }
+    return false;
+}
+
+[[nodiscard]] bool verify_wardrobe_mesh_integrity(
+    const vcr::CharacterMeshBuildResult& mesh,
+    const vcr::CharacterWardrobeSpec& spec,
+    const vcr::CharacterGender gender,
+    const std::string& label) {
+    VCR_EXPECT(mesh.skeleton.bones.size() == vcr::character_total_bone_count,
+               label + ": Expected 50-bone skeleton");
+    VCR_EXPECT(!mesh.vertices.empty(), label + ": Mesh vertices must not be empty");
+    VCR_EXPECT(mesh.vertices.size() == mesh.skin_vertices.size(),
+               label + ": skin_vertices size mismatch");
+    VCR_EXPECT(mesh.vertex_paint_targets.size() == mesh.vertices.size(),
+               label + ": vertex_paint_targets size mismatch");
+    VCR_EXPECT(mesh.vertex_garment_zones.size() == mesh.vertices.size(),
+               label + ": vertex_garment_zones size mismatch");
+    VCR_EXPECT(mesh.vertex_garment_ao.size() == mesh.vertices.size(),
+               label + ": vertex_garment_ao size mismatch");
+    VCR_EXPECT(mesh.vertex_garment_curv.size() == mesh.vertices.size(),
+               label + ": vertex_garment_curv size mismatch");
+    VCR_EXPECT(!mesh.indices.empty() && (mesh.indices.size() % 3U) == 0U,
+               label + ": Index buffer must be non-empty triangle list");
+
+    VCR_EXPECT(std::isfinite(mesh.bounds_min.x) &&
+               std::isfinite(mesh.bounds_min.y) &&
+               std::isfinite(mesh.bounds_min.z) &&
+               std::isfinite(mesh.bounds_max.x) &&
+               std::isfinite(mesh.bounds_max.y) &&
+               std::isfinite(mesh.bounds_max.z),
+               label + ": Mesh bounds must be finite");
+    VCR_EXPECT(mesh.bounds_min.y >= -0.02F,
+               label + ": Mesh bounds_min.y must remain grounded >= -0.02 (got " +
+               std::to_string(mesh.bounds_min.y) + ")");
+
+    for (std::size_t vi = 0U; vi < mesh.vertices.size(); ++vi) {
+        const auto& v = mesh.vertices[vi];
+        const bool finite_pos =
+            std::isfinite(v.position[0]) &&
+            std::isfinite(v.position[1]) &&
+            std::isfinite(v.position[2]);
+        const bool finite_nrm =
+            std::isfinite(v.normal[0]) &&
+            std::isfinite(v.normal[1]) &&
+            std::isfinite(v.normal[2]);
+        const bool finite_tan =
+            std::isfinite(v.tangent[0]) &&
+            std::isfinite(v.tangent[1]) &&
+            std::isfinite(v.tangent[2]) &&
+            std::isfinite(v.tangent[3]);
+        const bool finite_uv =
+            std::isfinite(v.texcoord[0]) &&
+            std::isfinite(v.texcoord[1]);
+        VCR_EXPECT(finite_pos && finite_nrm && finite_tan && finite_uv,
+                   label + ": Non-finite vertex attribute detected");
+
+        const float n_len = std::hypot(v.normal[0], v.normal[1], v.normal[2]);
+        const float t_len = std::hypot(v.tangent[0], v.tangent[1], v.tangent[2]);
+        VCR_EXPECT(n_len >= 0.95F && n_len <= 1.05F,
+                   label + ": Vertex normal must be unit length");
+        VCR_EXPECT(t_len >= 0.95F && t_len <= 1.05F,
+                   label + ": Vertex tangent must be unit length");
+
+        const auto& sv = mesh.skin_vertices[vi];
+        float w_sum = 0.0F;
+        for (std::size_t k = 0U; k < 4U; ++k) {
+            VCR_EXPECT(sv.joints[k] < vcr::character_total_bone_count,
+                       label + ": Skin joint index >= 50");
+            VCR_EXPECT(std::isfinite(sv.weights[k]) && sv.weights[k] >= 0.0F,
+                       label + ": Invalid skin weight");
+            w_sum += sv.weights[k];
+        }
+        VCR_EXPECT(w_sum >= 0.99F && w_sum <= 1.01F,
+                   label + ": Skin weights must sum to 1.0");
+
+        const float ao = mesh.vertex_garment_ao[vi];
+        const float curv = mesh.vertex_garment_curv[vi];
+        VCR_EXPECT(std::isfinite(ao) && ao >= 0.0F && ao <= 1.0F,
+                   label + ": vertex_garment_ao out of [0, 1]");
+        VCR_EXPECT(std::isfinite(curv) && curv >= 0.0F && curv <= 1.0F,
+                   label + ": vertex_garment_curv out of [0, 1]");
+    }
+
+    for (const std::uint32_t idx : mesh.indices) {
+        VCR_EXPECT(idx < mesh.vertices.size(), label + ": Mesh index out of bounds");
+    }
+
+    for (const auto& sub : mesh.submeshes) {
+        VCR_EXPECT(static_cast<std::size_t>(sub.first_index) +
+                   static_cast<std::size_t>(sub.index_count) <= mesh.indices.size(),
+                   label + ": Submesh index range exceeds mesh.indices");
+        VCR_EXPECT((sub.index_count % 3U) == 0U,
+                   label + ": Submesh index_count must be divisible by 3");
+
+        if (sub.name != "outfit_primary" && sub.name != "outfit_secondary") {
+            continue;
+        }
+        VCR_EXPECT(sub.index_count > 0U, label + ": Outfit submesh has zero triangles");
+
+        float footwear_min_y = std::numeric_limits<float>::max();
+        std::size_t footwear_verts = 0U;
+        float min_ao = 1.0F;
+        float max_ao = 0.0F;
+        float min_curv = 1.0F;
+        float max_curv = 0.0F;
+        const std::size_t idx_end =
+            static_cast<std::size_t>(sub.first_index) + static_cast<std::size_t>(sub.index_count);
+        for (std::size_t ii = sub.first_index; ii < idx_end; ++ii) {
+            const std::uint32_t vi = mesh.indices[ii];
+            const auto& v = mesh.vertices[vi];
+            VCR_EXPECT(v.texcoord[0] >= 0.0F && v.texcoord[0] <= 1.0F &&
+                       v.texcoord[1] >= 0.0F && v.texcoord[1] <= 1.0F,
+                       label + ": Outfit UV out of [0, 1] in " + sub.name);
+            VCR_EXPECT(mesh.vertex_garment_zones[vi] !=
+                       static_cast<std::uint8_t>(vcr::GarmentZoneId::none),
+                       label + ": Outfit vertex missing GarmentZoneId in " + sub.name);
+            const float v_ao = mesh.vertex_garment_ao[vi];
+            const float v_curv = mesh.vertex_garment_curv[vi];
+            VCR_EXPECT(v_ao >= 0.05F && v_ao <= 1.0F,
+                       label + ": Outfit vertex AO out of range in " + sub.name);
+            min_ao = (std::min)(min_ao, v_ao);
+            max_ao = (std::max)(max_ao, v_ao);
+            min_curv = (std::min)(min_curv, v_curv);
+            max_curv = (std::max)(max_curv, v_curv);
+            if (is_footwear_zone(mesh.vertex_garment_zones[vi])) {
+                footwear_min_y = (std::min)(footwear_min_y, v.position[1]);
+                ++footwear_verts;
+            }
+        }
+        if (sub.index_count >= 300U) {
+            VCR_EXPECT(max_ao > min_ao && max_curv > min_curv,
+                       label + ": Outfit vertex AO/curvature must vary across " + sub.name);
+        }
+
+        if (sub.name == "outfit_secondary" &&
+            spec.footwear_style != vcr::FootwearStyle::barefoot) {
+            VCR_EXPECT(footwear_verts > 0U,
+                       label + ": Expected footwear vertices when footwear != barefoot");
+            VCR_EXPECT(footwear_min_y >= -0.02F && footwear_min_y <= 0.05F,
+                       label + ": Footwear sole must sit grounded near floor Y=0 (min_y=" +
+                       std::to_string(footwear_min_y) + ")");
+        }
+    }
+
+    const bool expect_primary =
+        spec.top_style != vcr::TopGarmentStyle::none ||
+        spec.hair_style == vcr::HairStyle::hood ||
+        (spec.studio_underwear && gender == vcr::CharacterGender::female);
+    const bool expect_secondary =
+        spec.bottom_style != vcr::BottomGarmentStyle::none ||
+        spec.studio_underwear ||
+        spec.footwear_style != vcr::FootwearStyle::barefoot ||
+        spec.has_belt ||
+        spec.has_gloves ||
+        spec.has_pauldrons ||
+        spec.has_cape;
+    if (expect_primary) {
+        const auto* sub1 = find_submesh_by_name(mesh, "outfit_primary");
+        VCR_EXPECT(sub1 != nullptr && sub1->index_count > 0U,
+                   label + ": Missing expected outfit_primary submesh");
+    }
+    if (expect_secondary) {
+        const auto* sub2 = find_submesh_by_name(mesh, "outfit_secondary");
+        VCR_EXPECT(sub2 != nullptr && sub2->index_count > 0U,
+                   label + ": Missing expected outfit_secondary submesh");
+    }
+
+    return true;
+}
+
+[[nodiscard]] float compute_calf_mean_radius(
+    const vcr::CharacterMeshBuildResult& mesh,
+    const vcr::CharacterSubmeshBuild& sub,
+    const bool filter_trouser_zone) noexcept {
+    const glm::vec3 thigh_l = skeleton_bind_model_pos(mesh.skeleton, 23U);
+    const glm::vec3 shin_l = skeleton_bind_model_pos(mesh.skeleton, 24U);
+    const glm::vec3 foot_l = skeleton_bind_model_pos(mesh.skeleton, 25U);
+    const glm::vec3 thigh_r = skeleton_bind_model_pos(mesh.skeleton, 27U);
+    const glm::vec3 shin_r = skeleton_bind_model_pos(mesh.skeleton, 28U);
+    const glm::vec3 foot_r = skeleton_bind_model_pos(mesh.skeleton, 29U);
+
+    std::vector<std::uint8_t> seen(mesh.vertices.size(), 0U);
+    double sum_r = 0.0;
+    std::size_t count = 0U;
+
+    const std::size_t idx_end =
+        static_cast<std::size_t>(sub.first_index) + static_cast<std::size_t>(sub.index_count);
+    for (std::size_t ii = sub.first_index; ii < idx_end && ii < mesh.indices.size(); ++ii) {
+        const std::uint32_t vi = mesh.indices[ii];
+        if (vi >= mesh.vertices.size() || seen[vi] != 0U) {
+            continue;
+        }
+        seen[vi] = 1U;
+        if (filter_trouser_zone &&
+            mesh.vertex_garment_zones[vi] !=
+                static_cast<std::uint8_t>(vcr::GarmentZoneId::trouser_leg)) {
+            continue;
+        }
+        const auto& pos_arr = mesh.vertices[vi].position;
+        if (pos_arr[1] < 0.22F || pos_arr[1] > 0.45F || std::abs(pos_arr[0]) > 0.28F) {
+            continue;
+        }
+        const bool is_left = (pos_arr[0] >= 0.0F);
+        const glm::vec3& foot_p = is_left ? foot_l : foot_r;
+        const glm::vec3& shin_p = is_left ? shin_l : shin_r;
+        const glm::vec3& thigh_p = is_left ? thigh_l : thigh_r;
+
+        glm::vec2 axis_xz(shin_p.x, shin_p.z);
+        if (pos_arr[1] <= shin_p.y) {
+            const float denom = (std::max)(1.0e-4F, shin_p.y - foot_p.y);
+            const float t = std::clamp((pos_arr[1] - foot_p.y) / denom, 0.0F, 1.0F);
+            axis_xz = glm::mix(
+                glm::vec2(foot_p.x, foot_p.z),
+                glm::vec2(shin_p.x, shin_p.z),
+                t);
+        } else {
+            const float denom = (std::max)(1.0e-4F, thigh_p.y - shin_p.y);
+            const float t = std::clamp((pos_arr[1] - shin_p.y) / denom, 0.0F, 1.0F);
+            axis_xz = glm::mix(
+                glm::vec2(shin_p.x, shin_p.z),
+                glm::vec2(thigh_p.x, thigh_p.z),
+                t);
+        }
+        sum_r += static_cast<double>(std::hypot(pos_arr[0] - axis_xz.x, pos_arr[2] - axis_xz.y));
+        ++count;
+    }
+
+    return count > 0U ? static_cast<float>(sum_r / static_cast<double>(count)) : -1.0F;
+}
+
+struct TexelZoneCoverage final {
+    bool covered = false;
+    std::uint8_t zone = 0U;
+};
+
+[[nodiscard]] std::vector<TexelZoneCoverage> rasterize_submesh_coverage(
+    const vcr::CharacterMeshBuildResult& mesh,
+    const vcr::CharacterSubmeshBuild& sub,
+    const std::uint32_t res) {
+    const std::size_t pixel_count = static_cast<std::size_t>(res) * static_cast<std::size_t>(res);
+    std::vector<TexelZoneCoverage> grid(pixel_count);
+    const float fres = static_cast<float>(res);
+    const std::size_t idx_end =
+        static_cast<std::size_t>(sub.first_index) + static_cast<std::size_t>(sub.index_count);
+
+    for (std::size_t ii = sub.first_index; ii + 2U < idx_end && ii + 2U < mesh.indices.size(); ii += 3U) {
+        const std::uint32_t i0 = mesh.indices[ii + 0U];
+        const std::uint32_t i1 = mesh.indices[ii + 1U];
+        const std::uint32_t i2 = mesh.indices[ii + 2U];
+        if (i0 >= mesh.vertices.size() ||
+            i1 >= mesh.vertices.size() ||
+            i2 >= mesh.vertices.size()) {
+            continue;
+        }
+        const auto& v0 = mesh.vertices[i0];
+        const auto& v1 = mesh.vertices[i1];
+        const auto& v2 = mesh.vertices[i2];
+
+        const glm::vec2 p0(v0.texcoord[0] * fres, (1.0F - v0.texcoord[1]) * fres);
+        const glm::vec2 p1(v1.texcoord[0] * fres, (1.0F - v1.texcoord[1]) * fres);
+        const glm::vec2 p2(v2.texcoord[0] * fres, (1.0F - v2.texcoord[1]) * fres);
+
+        const float area2 = (p1.x - p0.x) * (p2.y - p0.y) - (p1.y - p0.y) * (p2.x - p0.x);
+        if (std::abs(area2) <= 1.0e-5F) {
+            continue;
+        }
+        const float inv_area2 = 1.0F / area2;
+
+        const int x0 = std::clamp(
+            static_cast<int>(std::floor((std::min)(p0.x, (std::min)(p1.x, p2.x)))),
+            0, static_cast<int>(res) - 1);
+        const int x1 = std::clamp(
+            static_cast<int>(std::ceil((std::max)(p0.x, (std::max)(p1.x, p2.x)))),
+            0, static_cast<int>(res) - 1);
+        const int y0 = std::clamp(
+            static_cast<int>(std::floor((std::min)(p0.y, (std::min)(p1.y, p2.y)))),
+            0, static_cast<int>(res) - 1);
+        const int y1 = std::clamp(
+            static_cast<int>(std::ceil((std::max)(p0.y, (std::max)(p1.y, p2.y)))),
+            0, static_cast<int>(res) - 1);
+
+        const std::uint8_t z0 = mesh.vertex_garment_zones[i0];
+        const std::uint8_t z1 = mesh.vertex_garment_zones[i1];
+        const std::uint8_t z2 = mesh.vertex_garment_zones[i2];
+
+        for (int py = y0; py <= y1; ++py) {
+            const float cy = static_cast<float>(py) + 0.5F;
+            for (int px = x0; px <= x1; ++px) {
+                const float cx = static_cast<float>(px) + 0.5F;
+                const float w0 = ((p1.x - cx) * (p2.y - cy) - (p1.y - cy) * (p2.x - cx)) * inv_area2;
+                const float w1 = ((p2.x - cx) * (p0.y - cy) - (p2.y - cy) * (p0.x - cx)) * inv_area2;
+                const float w2 = 1.0F - w0 - w1;
+                if (w0 < -1.0e-3F || w1 < -1.0e-3F || w2 < -1.0e-3F) {
+                    continue;
+                }
+                const std::uint8_t dom_z = (w0 >= w1 && w0 >= w2) ? z0 : ((w1 >= w2) ? z1 : z2);
+                const std::size_t cell_idx =
+                    static_cast<std::size_t>(py) * res + static_cast<std::size_t>(px);
+                grid[cell_idx] = TexelZoneCoverage{true, dom_z};
+            }
+        }
+    }
+    return grid;
+}
+
+bool test_production_wardrobe_geometry_materials_and_uv_isolation() {
+    // 1 & 2. Default CharacterWardrobeSpec invariants & valid studio_underwear on both genders.
+    const vcr::CharacterWardrobeSpec default_spec{};
+    VCR_EXPECT(default_spec.top_style == vcr::TopGarmentStyle::none &&
+               default_spec.bottom_style == vcr::BottomGarmentStyle::none &&
+               default_spec.footwear_style == vcr::FootwearStyle::barefoot &&
+               !default_spec.has_belt &&
+               default_spec.studio_underwear,
+               "Default CharacterWardrobeSpec invariants violated");
+
+    for (const vcr::CharacterGender gender :
+         {vcr::CharacterGender::female, vcr::CharacterGender::male}) {
+        const std::string g_label =
+            (gender == vcr::CharacterGender::female) ? "female" : "male";
+        vcr::CharacterPackage def_pkg = vcr::make_default_character_package(
+            "wardrobe_def_" + g_label, "Wardrobe Def " + g_label);
+        def_pkg.body.gender = gender;
+        vcr::sanitize_character_package(def_pkg);
+        VCR_EXPECT(def_pkg.wardrobe.top_style == vcr::TopGarmentStyle::none &&
+                   def_pkg.wardrobe.bottom_style == vcr::BottomGarmentStyle::none &&
+                   def_pkg.wardrobe.footwear_style == vcr::FootwearStyle::barefoot &&
+                   !def_pkg.wardrobe.has_belt &&
+                   def_pkg.wardrobe.studio_underwear,
+                   g_label + ": make_default_character_package must preserve wardrobe defaults");
+
+        const auto def_mesh = vcr::build_character_mesh(def_pkg);
+        if (!verify_wardrobe_mesh_integrity(
+                def_mesh, def_pkg.wardrobe, gender, g_label + "_default_underwear")) {
+            return false;
+        }
+        const auto* uw_sec = find_submesh_by_name(def_mesh, "outfit_secondary");
+        VCR_EXPECT(uw_sec != nullptr && uw_sec->index_count > 0U,
+                   g_label + ": Default studio_underwear must emit outfit_secondary briefs");
+        bool has_uw_bottom = false;
+        for (std::size_t ii = uw_sec->first_index;
+             ii < static_cast<std::size_t>(uw_sec->first_index) + uw_sec->index_count;
+             ++ii) {
+            if (def_mesh.vertex_garment_zones[def_mesh.indices[ii]] ==
+                static_cast<std::uint8_t>(vcr::GarmentZoneId::underwear_bottom)) {
+                has_uw_bottom = true;
+                break;
+            }
+        }
+        VCR_EXPECT(has_uw_bottom, g_label + ": Missing underwear_bottom zone on default character");
+
+        if (gender == vcr::CharacterGender::female) {
+            const auto* uw_prim = find_submesh_by_name(def_mesh, "outfit_primary");
+            VCR_EXPECT(uw_prim != nullptr && uw_prim->index_count > 0U,
+                       "female: Default studio_underwear must emit outfit_primary top");
+            bool has_uw_top = false;
+            for (std::size_t ii = uw_prim->first_index;
+                 ii < static_cast<std::size_t>(uw_prim->first_index) + uw_prim->index_count;
+                 ++ii) {
+                if (def_mesh.vertex_garment_zones[def_mesh.indices[ii]] ==
+                    static_cast<std::uint8_t>(vcr::GarmentZoneId::underwear_top)) {
+                    has_uw_top = true;
+                    break;
+                }
+            }
+            VCR_EXPECT(has_uw_top, "female: Missing underwear_top zone on default character");
+        }
+    }
+
+    // 1 & 3. Full combination matrix across BOTH female and male covering every top, bottom,
+    //        footwear style, material preset, and accessory.
+    struct OutfitComboSpec {
+        const char* name;
+        vcr::TopGarmentStyle top;
+        vcr::BottomGarmentStyle bottom;
+        vcr::FootwearStyle footwear;
+        vcr::HairStyle hair;
+        vcr::OutfitMaterialPreset primary_mat;
+        vcr::OutfitMaterialPreset secondary_mat;
+        bool belt;
+        bool gloves;
+        bool pauldrons;
+        bool cape;
+        bool underwear;
+    };
+    constexpr std::array<OutfitComboSpec, 7U> combos{{
+        {
+            "studio_underwear",
+            vcr::TopGarmentStyle::none,
+            vcr::BottomGarmentStyle::none,
+            vcr::FootwearStyle::barefoot,
+            vcr::HairStyle::short_crop,
+            vcr::OutfitMaterialPreset::tactical_weave,
+            vcr::OutfitMaterialPreset::leather,
+            false, false, false, false, true,
+        },
+        {
+            "tunic_skirt_boots_belt",
+            vcr::TopGarmentStyle::tunic,
+            vcr::BottomGarmentStyle::skirt,
+            vcr::FootwearStyle::boots,
+            vcr::HairStyle::ponytail,
+            vcr::OutfitMaterialPreset::cloth_linen,
+            vcr::OutfitMaterialPreset::leather,
+            true, false, false, false, true,
+        },
+        {
+            "jacket_trousers_sneakers_belt",
+            vcr::TopGarmentStyle::jacket,
+            vcr::BottomGarmentStyle::trousers,
+            vcr::FootwearStyle::sneakers,
+            vcr::HairStyle::bob,
+            vcr::OutfitMaterialPreset::leather,
+            vcr::OutfitMaterialPreset::denim,
+            true, false, false, false, true,
+        },
+        {
+            "trench_cargo_combat_belt_gloves",
+            vcr::TopGarmentStyle::trench_coat,
+            vcr::BottomGarmentStyle::cargo_pants,
+            vcr::FootwearStyle::combat_boots,
+            vcr::HairStyle::short_crop,
+            vcr::OutfitMaterialPreset::leather,
+            vcr::OutfitMaterialPreset::cloth_linen,
+            true, true, false, false, true,
+        },
+        {
+            "hoodie_shorts_combat_hood_gloves",
+            vcr::TopGarmentStyle::hoodie,
+            vcr::BottomGarmentStyle::shorts,
+            vcr::FootwearStyle::combat_boots,
+            vcr::HairStyle::hood,
+            vcr::OutfitMaterialPreset::tactical_weave,
+            vcr::OutfitMaterialPreset::cloth_linen,
+            false, true, false, false, true,
+        },
+        {
+            "cuirass_greaves_full_kit",
+            vcr::TopGarmentStyle::armor_cuirass,
+            vcr::BottomGarmentStyle::tactical_greaves,
+            vcr::FootwearStyle::greave_boots,
+            vcr::HairStyle::spiky,
+            vcr::OutfitMaterialPreset::brushed_steel,
+            vcr::OutfitMaterialPreset::cloth_linen,
+            true, true, true, true, true,
+        },
+        {
+            "gilded_tunic_trousers",
+            vcr::TopGarmentStyle::tunic,
+            vcr::BottomGarmentStyle::trousers,
+            vcr::FootwearStyle::boots,
+            vcr::HairStyle::mohawk,
+            vcr::OutfitMaterialPreset::gilded_plate,
+            vcr::OutfitMaterialPreset::tactical_weave,
+            false, false, false, false, true,
+        },
+    }};
+
+    for (const vcr::CharacterGender gender :
+         {vcr::CharacterGender::female, vcr::CharacterGender::male}) {
+        const std::string g_label =
+            (gender == vcr::CharacterGender::female) ? "female" : "male";
+        for (const OutfitComboSpec& c : combos) {
+            vcr::CharacterPackage pkg = vcr::make_default_character_package(
+                "combo_" + g_label + "_" + c.name, c.name);
+            pkg.body.gender = gender;
+            pkg.wardrobe.top_style = c.top;
+            pkg.wardrobe.bottom_style = c.bottom;
+            pkg.wardrobe.footwear_style = c.footwear;
+            pkg.wardrobe.hair_style = c.hair;
+            pkg.wardrobe.primary_material = c.primary_mat;
+            pkg.wardrobe.secondary_material = c.secondary_mat;
+            pkg.wardrobe.has_belt = c.belt;
+            pkg.wardrobe.has_gloves = c.gloves;
+            pkg.wardrobe.has_pauldrons = c.pauldrons;
+            pkg.wardrobe.has_cape = c.cape;
+            pkg.wardrobe.studio_underwear = c.underwear;
+
+            const auto mesh = vcr::build_character_mesh(pkg);
+            if (!verify_wardrobe_mesh_integrity(
+                    mesh, pkg.wardrobe, gender, g_label + "/" + c.name)) {
+                return false;
+            }
+        }
+    }
+
+    // 4. Glove fix regression: body_part-derived gloves (>= 1500 vertices) preserving distal
+    //    fingertip reach (NO hand amputation!).
+    for (const vcr::CharacterGender gender :
+         {vcr::CharacterGender::female, vcr::CharacterGender::male}) {
+        const std::string g_label =
+            (gender == vcr::CharacterGender::female) ? "female" : "male";
+
+        vcr::CharacterPackage bare_pkg = vcr::make_default_character_package(
+            "glove_bare_" + g_label, "Bare");
+        bare_pkg.body.gender = gender;
+        bare_pkg.wardrobe.studio_underwear = false;
+        bare_pkg.wardrobe.occlude_covered_body = false;
+        const auto bare_mesh = vcr::build_character_mesh(bare_pkg);
+
+        const auto* bare_skin = find_submesh_by_name(bare_mesh, "skin");
+        VCR_EXPECT(bare_skin != nullptr, g_label + ": Missing bare skin submesh");
+        float bare_max_left_x = 0.0F;
+        float bare_max_right_abs_x = 0.0F;
+        for (std::size_t ii = bare_skin->first_index;
+             ii < static_cast<std::size_t>(bare_skin->first_index) + bare_skin->index_count;
+             ++ii) {
+            const std::uint32_t vi = bare_mesh.indices[ii];
+            if (!is_hand_finger_bone(dominant_bone_of(bare_mesh.skin_vertices[vi]))) {
+                continue;
+            }
+            const float px = bare_mesh.vertices[vi].position[0];
+            if (px >= 0.0F) {
+                bare_max_left_x = (std::max)(bare_max_left_x, px);
+            } else {
+                bare_max_right_abs_x = (std::max)(bare_max_right_abs_x, -px);
+            }
+        }
+
+        vcr::CharacterPackage gloved_pkg = vcr::make_default_character_package(
+            "glove_on_" + g_label, "Gloved");
+        gloved_pkg.body.gender = gender;
+        gloved_pkg.wardrobe.top_style = vcr::TopGarmentStyle::trench_coat;
+        gloved_pkg.wardrobe.bottom_style = vcr::BottomGarmentStyle::cargo_pants;
+        gloved_pkg.wardrobe.footwear_style = vcr::FootwearStyle::combat_boots;
+        gloved_pkg.wardrobe.has_belt = true;
+        gloved_pkg.wardrobe.has_gloves = true;
+        const auto gloved_mesh = vcr::build_character_mesh(gloved_pkg);
+
+        const auto* sec_sub = find_submesh_by_name(gloved_mesh, "outfit_secondary");
+        VCR_EXPECT(sec_sub != nullptr, g_label + ": Missing outfit_secondary on gloved character");
+
+        std::vector<std::uint8_t> seen(gloved_mesh.vertices.size(), 0U);
+        std::size_t glove_vertex_count = 0U;
+        std::size_t dorsal_count = 0U;
+        std::size_t palm_count = 0U;
+        std::size_t knuckle_count = 0U;
+        float glove_max_left_x = 0.0F;
+        float glove_max_right_abs_x = 0.0F;
+
+        const std::size_t idx_end =
+            static_cast<std::size_t>(sec_sub->first_index) + sec_sub->index_count;
+        for (std::size_t ii = sec_sub->first_index; ii < idx_end; ++ii) {
+            const std::uint32_t vi = gloved_mesh.indices[ii];
+            if (seen[vi] != 0U) {
+                continue;
+            }
+            seen[vi] = 1U;
+            const std::uint8_t z_raw = gloved_mesh.vertex_garment_zones[vi];
+            if (!is_glove_zone(z_raw, gloved_mesh.skin_vertices[vi])) {
+                continue;
+            }
+            ++glove_vertex_count;
+            const auto z = static_cast<vcr::GarmentZoneId>(z_raw);
+            if (z == vcr::GarmentZoneId::glove_dorsal) ++dorsal_count;
+            if (z == vcr::GarmentZoneId::glove_palm) ++palm_count;
+            if (z == vcr::GarmentZoneId::glove_knuckle) ++knuckle_count;
+
+            const float px = gloved_mesh.vertices[vi].position[0];
+            if (px >= 0.0F) {
+                glove_max_left_x = (std::max)(glove_max_left_x, px);
+            } else {
+                glove_max_right_abs_x = (std::max)(glove_max_right_abs_x, -px);
+            }
+        }
+
+        const glm::vec3 middle_l = skeleton_bind_model_pos(gloved_mesh.skeleton, 13U);
+        const glm::vec3 middle_r = skeleton_bind_model_pos(gloved_mesh.skeleton, 21U);
+
+        VCR_EXPECT(glove_vertex_count >= 1500U,
+                   g_label + ": Gloves must contain >= 1500 body_part-derived vertices (got " +
+                   std::to_string(glove_vertex_count) + ")");
+        VCR_EXPECT(dorsal_count > 0U && palm_count > 0U && knuckle_count > 0U,
+                   g_label + ": Gloves must partition into dorsal, palm, and knuckle zones");
+        VCR_EXPECT(glove_max_left_x >= middle_l.x - 0.01F &&
+                   glove_max_right_abs_x >= std::abs(middle_r.x) - 0.01F,
+                   g_label + ": Gloved fingertips must reach skeletal Middle_L/R tips");
+        VCR_EXPECT(glove_max_left_x >= bare_max_left_x - 0.01F &&
+                   glove_max_right_abs_x >= bare_max_right_abs_x - 0.01F,
+                   g_label + ": Gloves must match bare fingertip reach without amputation");
+    }
+
+    // 5. Trouser drape vs bare leg around calf/shin (y in [0.22, 0.45]).
+    for (const vcr::CharacterGender gender :
+         {vcr::CharacterGender::female, vcr::CharacterGender::male}) {
+        const std::string g_label =
+            (gender == vcr::CharacterGender::female) ? "female" : "male";
+
+        vcr::CharacterPackage bare_pkg = vcr::make_default_character_package(
+            "drape_bare_" + g_label, "Drape Bare");
+        bare_pkg.body.gender = gender;
+        bare_pkg.wardrobe.studio_underwear = false;
+        bare_pkg.wardrobe.occlude_covered_body = false;
+        const auto bare_mesh = vcr::build_character_mesh(bare_pkg);
+        const auto* bare_skin = find_submesh_by_name(bare_mesh, "skin");
+        VCR_EXPECT(bare_skin != nullptr, g_label + ": Missing skin submesh for drape baseline");
+        const float bare_calf_r = compute_calf_mean_radius(bare_mesh, *bare_skin, false);
+        VCR_EXPECT(bare_calf_r > 0.02F, g_label + ": Failed sampling bare calf skin vertices");
+
+        for (const vcr::BottomGarmentStyle pant_style :
+             {vcr::BottomGarmentStyle::trousers, vcr::BottomGarmentStyle::cargo_pants}) {
+            vcr::CharacterPackage pants_pkg = vcr::make_default_character_package(
+                "drape_pants_" + g_label, "Drape Pants");
+            pants_pkg.body.gender = gender;
+            pants_pkg.wardrobe.top_style = vcr::TopGarmentStyle::jacket;
+            pants_pkg.wardrobe.bottom_style = pant_style;
+            pants_pkg.wardrobe.footwear_style = vcr::FootwearStyle::barefoot;
+            const auto pants_mesh = vcr::build_character_mesh(pants_pkg);
+            const auto* pants_sub = find_submesh_by_name(pants_mesh, "outfit_secondary");
+            VCR_EXPECT(pants_sub != nullptr,
+                       g_label + ": Missing outfit_secondary for trouser drape check");
+            const float pants_calf_r = compute_calf_mean_radius(pants_mesh, *pants_sub, true);
+            VCR_EXPECT(pants_calf_r > bare_calf_r + 0.005F,
+                       g_label + ": " + std::string(vcr::to_token(pant_style)) +
+                       " calf radius (" + std::to_string(pants_calf_r) +
+                       " m) must exceed bare skin (" + std::to_string(bare_calf_r) +
+                       " m) with genuine cloth drape");
+        }
+    }
+
+    // 6. Cooked .vcrmaterial.json validation (occlusion_in_metallic_roughness, double_sided,
+    //    metallic = 1.0, roughness = 1.0).
+    {
+        ScopedTempDir tmp("vcr_wardrobe_cook_mat");
+        vcr::CharacterPackage cook_pkg = vcr::make_default_character_package(
+            "wardrobe_cook", "Wardrobe Cook");
+        cook_pkg.body.gender = vcr::CharacterGender::male;
+        cook_pkg.wardrobe.top_style = vcr::TopGarmentStyle::trench_coat;
+        cook_pkg.wardrobe.bottom_style = vcr::BottomGarmentStyle::cargo_pants;
+        cook_pkg.wardrobe.footwear_style = vcr::FootwearStyle::combat_boots;
+        cook_pkg.wardrobe.primary_material = vcr::OutfitMaterialPreset::leather;
+        cook_pkg.wardrobe.secondary_material = vcr::OutfitMaterialPreset::cloth_linen;
+        cook_pkg.wardrobe.has_belt = true;
+        cook_pkg.wardrobe.has_gloves = true;
+        cook_pkg.wardrobe.wear_and_tear = 0.45F;
+
+        vcr::CharacterCookOptions opts{};
+        opts.texture_resolution = 256U;
+        vcr::CharacterCookReport report{};
+        std::string err;
+        VCR_EXPECT(vcr::cook_character_package_to_project(cook_pkg, tmp.dir, opts, report, err),
+                   err);
+
+        const std::filesystem::path asset_root = tmp.dir / "assets";
+        const std::filesystem::path mat_dir =
+            asset_root / "characters" / report.character_slug / "materials";
+        for (const char* slot : {"outfit_primary", "outfit_secondary"}) {
+            const std::filesystem::path mat_path =
+                mat_dir / (std::string(slot) + ".vcrmaterial.json");
+            std::string mat_bytes;
+            VCR_EXPECT(read_file_bytes(mat_path, mat_bytes),
+                       std::string("Missing cooked material JSON: ") + slot);
+            const Json mat_json = Json::parse(mat_bytes, nullptr, false);
+            VCR_EXPECT(!mat_json.is_discarded(),
+                       std::string("Invalid cooked material JSON: ") + slot);
+            VCR_EXPECT(mat_json.value("occlusion_in_metallic_roughness", false),
+                       std::string(slot) + ": occlusion_in_metallic_roughness must be true");
+            VCR_EXPECT(mat_json.value("double_sided", false),
+                       std::string(slot) + ": double_sided must be true");
+            VCR_EXPECT(mat_json.contains("pbr") && mat_json["pbr"].is_object(),
+                       std::string(slot) + ": missing pbr object");
+            const float j_met = mat_json["pbr"].value("metallic", -1.0F);
+            const float j_rgh = mat_json["pbr"].value("roughness", -1.0F);
+            VCR_EXPECT(std::abs(j_met - 1.0F) < 1.0e-5F &&
+                       std::abs(j_rgh - 1.0F) < 1.0e-5F,
+                       std::string(slot) + ": JSON pbr metallic/roughness factors must be 1.0");
+        }
+
+        const auto reloaded = vcr::load_cooked_model_asset(asset_root, report.model_asset_relative);
+        VCR_EXPECT(static_cast<bool>(reloaded), reloaded.error().message);
+        for (const char* slot : {"outfit_primary", "outfit_secondary"}) {
+            const vcr::CookedModelMaterial* found = nullptr;
+            for (const auto& mat : reloaded.value().materials) {
+                if (mat.name == slot) {
+                    found = &mat;
+                    break;
+                }
+            }
+            VCR_EXPECT(found != nullptr, std::string("Reloaded model missing material ") + slot);
+            VCR_EXPECT((found->coverage & vcr::material_coverage_packed_ao_bit) != 0U,
+                       std::string(slot) + ": packed AO bit missing on reloaded material");
+            VCR_EXPECT((found->coverage & vcr::material_coverage_two_sided_bit) != 0U,
+                       std::string(slot) + ": double_sided bit missing on reloaded material");
+            VCR_EXPECT(std::abs(found->factors.metallic - 1.0F) < 1.0e-5F &&
+                       std::abs(found->factors.roughness - 1.0F) < 1.0e-5F,
+                       std::string(slot) + ": Reloaded PBR factors metallic/roughness must be 1.0");
+        }
+    }
+
+    // 7. Baked PBR texture validation at 256 resolution.
+    constexpr std::uint32_t bake_res = 256U;
+    {
+        // 7a. brushed_steel primary (> 0.70 metalness) vs cloth_linen / denim (< 0.10 median).
+        vcr::CharacterPackage steel_pkg = vcr::make_default_character_package(
+            "pbr_steel", "PBR Steel");
+        steel_pkg.wardrobe.top_style = vcr::TopGarmentStyle::armor_cuirass;
+        steel_pkg.wardrobe.bottom_style = vcr::BottomGarmentStyle::tactical_greaves;
+        steel_pkg.wardrobe.footwear_style = vcr::FootwearStyle::greave_boots;
+        steel_pkg.wardrobe.primary_material = vcr::OutfitMaterialPreset::brushed_steel;
+        steel_pkg.wardrobe.primary_color = {0.56F, 0.59F, 0.63F};
+        const auto steel_mesh = vcr::build_character_mesh(steel_pkg);
+        const auto steel_tex = vcr::bake_character_textures(steel_pkg, steel_mesh, bake_res);
+        const auto* steel_sub = find_submesh_by_name(steel_mesh, "outfit_primary");
+        const auto* steel_bt = find_baked_texture_by_slot(steel_tex, "outfit_primary");
+        VCR_EXPECT(steel_sub != nullptr && steel_bt != nullptr,
+                   "Missing outfit_primary submesh or texture for brushed_steel");
+        VCR_EXPECT(steel_bt->width == bake_res && steel_bt->height == bake_res &&
+                   steel_bt->metallic_roughness_rgba.size() ==
+                       static_cast<std::size_t>(bake_res) * bake_res * 4U,
+                   "Unexpected baked texture dimensions for brushed_steel");
+
+        const auto steel_cov = rasterize_submesh_coverage(steel_mesh, *steel_sub, bake_res);
+        std::vector<float> steel_metals;
+        double steel_metal_sum = 0.0;
+        for (std::size_t px = 0U; px < steel_cov.size(); ++px) {
+            if (!steel_cov[px].covered) {
+                continue;
+            }
+            const float m = static_cast<float>(steel_bt->metallic_roughness_rgba[px * 4U + 2U]) / 255.0F;
+            steel_metals.push_back(m);
+            steel_metal_sum += static_cast<double>(m);
+        }
+        VCR_EXPECT(!steel_metals.empty(), "brushed_steel must cover UV pixels");
+        const float steel_mean_m = static_cast<float>(
+            steel_metal_sum / static_cast<double>(steel_metals.size()));
+        const std::size_t steel_mid = steel_metals.size() / 2U;
+        std::nth_element(
+            steel_metals.begin(),
+            steel_metals.begin() + static_cast<std::ptrdiff_t>(steel_mid),
+            steel_metals.end());
+        const float steel_median_m = steel_metals[steel_mid];
+        VCR_EXPECT(steel_mean_m > 0.70F && steel_median_m > 0.70F,
+                   "brushed_steel primary ORM metalness must exceed 0.70 (mean=" +
+                   std::to_string(steel_mean_m) + ", median=" +
+                   std::to_string(steel_median_m) + ")");
+
+        for (const vcr::OutfitMaterialPreset cloth_preset :
+             {vcr::OutfitMaterialPreset::cloth_linen, vcr::OutfitMaterialPreset::denim}) {
+            vcr::CharacterPackage cloth_pkg = vcr::make_default_character_package(
+                "pbr_cloth", "PBR Cloth");
+            cloth_pkg.wardrobe.top_style = vcr::TopGarmentStyle::hoodie;
+            cloth_pkg.wardrobe.bottom_style = vcr::BottomGarmentStyle::trousers;
+            cloth_pkg.wardrobe.primary_material = cloth_preset;
+            const auto cloth_mesh = vcr::build_character_mesh(cloth_pkg);
+            const auto cloth_tex = vcr::bake_character_textures(cloth_pkg, cloth_mesh, bake_res);
+            const auto* cloth_sub = find_submesh_by_name(cloth_mesh, "outfit_primary");
+            const auto* cloth_bt = find_baked_texture_by_slot(cloth_tex, "outfit_primary");
+            VCR_EXPECT(cloth_sub != nullptr && cloth_bt != nullptr,
+                       "Missing outfit_primary submesh or texture for dielectric fabric");
+            const auto cloth_cov = rasterize_submesh_coverage(cloth_mesh, *cloth_sub, bake_res);
+            std::vector<float> cloth_metals;
+            for (std::size_t px = 0U; px < cloth_cov.size(); ++px) {
+                if (!cloth_cov[px].covered) {
+                    continue;
+                }
+                cloth_metals.push_back(
+                    static_cast<float>(cloth_bt->metallic_roughness_rgba[px * 4U + 2U]) / 255.0F);
+            }
+            VCR_EXPECT(!cloth_metals.empty(), "Dielectric fabric must cover UV pixels");
+            const std::size_t mid = cloth_metals.size() / 2U;
+            std::nth_element(
+                cloth_metals.begin(),
+                cloth_metals.begin() + static_cast<std::ptrdiff_t>(mid),
+                cloth_metals.end());
+            VCR_EXPECT(cloth_metals[mid] < 0.10F,
+                       std::string(vcr::to_token(cloth_preset)) +
+                       " median ORM metalness must be < 0.10 (got " +
+                       std::to_string(cloth_metals[mid]) + ")");
+        }
+
+        // 7b & 7c. leather secondary with has_belt=true: dielectric straps AND metallic buckle in
+        //          the same ORM texture, plus AO variation and normal perturbation.
+        vcr::CharacterPackage belt_pkg = vcr::make_default_character_package(
+            "pbr_belt", "PBR Belt");
+        belt_pkg.wardrobe.top_style = vcr::TopGarmentStyle::trench_coat;
+        belt_pkg.wardrobe.bottom_style = vcr::BottomGarmentStyle::cargo_pants;
+        belt_pkg.wardrobe.footwear_style = vcr::FootwearStyle::combat_boots;
+        belt_pkg.wardrobe.primary_material = vcr::OutfitMaterialPreset::leather;
+        belt_pkg.wardrobe.secondary_material = vcr::OutfitMaterialPreset::leather;
+        belt_pkg.wardrobe.accent_color = {0.84F, 0.65F, 0.28F};
+        belt_pkg.wardrobe.has_belt = true;
+        belt_pkg.wardrobe.has_gloves = true;
+        belt_pkg.wardrobe.wear_and_tear = 0.40F;
+
+        const auto belt_mesh = vcr::build_character_mesh(belt_pkg);
+        const auto belt_tex = vcr::bake_character_textures(belt_pkg, belt_mesh, bake_res);
+        const auto* sec_sub = find_submesh_by_name(belt_mesh, "outfit_secondary");
+        const auto* sec_bt = find_baked_texture_by_slot(belt_tex, "outfit_secondary");
+        const auto* prim_sub = find_submesh_by_name(belt_mesh, "outfit_primary");
+        const auto* prim_bt = find_baked_texture_by_slot(belt_tex, "outfit_primary");
+        VCR_EXPECT(sec_sub != nullptr && sec_bt != nullptr &&
+                   prim_sub != nullptr && prim_bt != nullptr,
+                   "Missing submeshes or baked textures for leather+belt check");
+
+        const auto sec_cov = rasterize_submesh_coverage(belt_mesh, *sec_sub, bake_res);
+        std::size_t strap_dielectric_px = 0U;
+        std::size_t buckle_metallic_px = 0U;
+        std::uint8_t min_ao = 255U;
+        std::uint8_t max_ao = 0U;
+        std::uint8_t min_nx = 255U;
+        std::uint8_t max_nx = 0U;
+        std::uint8_t min_ny = 255U;
+        std::uint8_t max_ny = 0U;
+
+        for (std::size_t px = 0U; px < sec_cov.size(); ++px) {
+            if (!sec_cov[px].covered) {
+                continue;
+            }
+            const std::size_t off = px * 4U;
+            const std::uint8_t ao_b = sec_bt->metallic_roughness_rgba[off + 0U];
+            const float metal = static_cast<float>(sec_bt->metallic_roughness_rgba[off + 2U]) / 255.0F;
+            min_ao = (std::min)(min_ao, ao_b);
+            max_ao = (std::max)(max_ao, ao_b);
+            min_nx = (std::min)(min_nx, sec_bt->normal_rgba[off + 0U]);
+            max_nx = (std::max)(max_nx, sec_bt->normal_rgba[off + 0U]);
+            min_ny = (std::min)(min_ny, sec_bt->normal_rgba[off + 1U]);
+            max_ny = (std::max)(max_ny, sec_bt->normal_rgba[off + 1U]);
+
+            const auto z = static_cast<vcr::GarmentZoneId>(sec_cov[px].zone);
+            if (z == vcr::GarmentZoneId::belt_strap && metal < 0.15F) {
+                ++strap_dielectric_px;
+            } else if (z == vcr::GarmentZoneId::belt_buckle && metal > 0.75F) {
+                ++buckle_metallic_px;
+            }
+        }
+        VCR_EXPECT(strap_dielectric_px >= 20U,
+                   "Leather belt strap must produce dielectric ORM metalness < 0.15 pixels (got " +
+                   std::to_string(strap_dielectric_px) + ")");
+        VCR_EXPECT(buckle_metallic_px >= 8U,
+                   "Belt buckle must produce metallic ORM metalness > 0.75 pixels (got " +
+                   std::to_string(buckle_metallic_px) + ")");
+        VCR_EXPECT(static_cast<int>(min_ao) < static_cast<int>(max_ao) - 20,
+                   "Baked ORM AO (R channel) must vary across cavities (min=" +
+                   std::to_string(min_ao) + ", max=" + std::to_string(max_ao) + ")");
+        VCR_EXPECT((max_nx - min_nx) >= 8U || (max_ny - min_ny) >= 8U,
+                   "Baked normal map must exhibit real micro-surface perturbation");
+
+        // Also verify primary slot AO & normal variation
+        const auto prim_cov = rasterize_submesh_coverage(belt_mesh, *prim_sub, bake_res);
+        std::uint8_t p_min_ao = 255U;
+        std::uint8_t p_max_ao = 0U;
+        std::uint8_t p_min_nx = 255U;
+        std::uint8_t p_max_nx = 0U;
+        std::uint8_t p_min_ny = 255U;
+        std::uint8_t p_max_ny = 0U;
+        for (std::size_t px = 0U; px < prim_cov.size(); ++px) {
+            if (!prim_cov[px].covered) {
+                continue;
+            }
+            const std::size_t off = px * 4U;
+            p_min_ao = (std::min)(p_min_ao, prim_bt->metallic_roughness_rgba[off + 0U]);
+            p_max_ao = (std::max)(p_max_ao, prim_bt->metallic_roughness_rgba[off + 0U]);
+            p_min_nx = (std::min)(p_min_nx, prim_bt->normal_rgba[off + 0U]);
+            p_max_nx = (std::max)(p_max_nx, prim_bt->normal_rgba[off + 0U]);
+            p_min_ny = (std::min)(p_min_ny, prim_bt->normal_rgba[off + 1U]);
+            p_max_ny = (std::max)(p_max_ny, prim_bt->normal_rgba[off + 1U]);
+        }
+        VCR_EXPECT(static_cast<int>(p_min_ao) < static_cast<int>(p_max_ao) - 20,
+                   "Primary ORM AO (R channel) must vary across garment cavities");
+        VCR_EXPECT((p_max_nx - p_min_nx) >= 8U || (p_max_ny - p_min_ny) >= 8U,
+                   "Primary normal map must exhibit real micro-surface perturbation");
+
+        // 7d. wear_and_tear = 0.75F vs 0.0F measurably changes baked albedo & roughness.
+        vcr::CharacterPackage clean_pkg = vcr::make_default_character_package(
+            "pbr_wear", "PBR Wear");
+        clean_pkg.wardrobe.top_style = vcr::TopGarmentStyle::jacket;
+        clean_pkg.wardrobe.bottom_style = vcr::BottomGarmentStyle::trousers;
+        clean_pkg.wardrobe.footwear_style = vcr::FootwearStyle::boots;
+        clean_pkg.wardrobe.primary_material = vcr::OutfitMaterialPreset::leather;
+        clean_pkg.wardrobe.secondary_material = vcr::OutfitMaterialPreset::denim;
+        clean_pkg.wardrobe.primary_color = {0.22F, 0.15F, 0.11F};
+        clean_pkg.wardrobe.secondary_color = {0.18F, 0.27F, 0.40F};
+        clean_pkg.wardrobe.has_belt = true;
+        clean_pkg.wardrobe.wear_and_tear = 0.0F;
+
+        vcr::CharacterPackage worn_pkg = clean_pkg;
+        worn_pkg.wardrobe.wear_and_tear = 0.75F;
+
+        const auto wear_mesh = vcr::build_character_mesh(clean_pkg);
+        const auto clean_tex = vcr::bake_character_textures(clean_pkg, wear_mesh, bake_res);
+        const auto worn_tex = vcr::bake_character_textures(worn_pkg, wear_mesh, bake_res);
+
+        for (const char* slot : {"outfit_primary", "outfit_secondary"}) {
+            const auto* w_sub = find_submesh_by_name(wear_mesh, slot);
+            const auto* bt_clean = find_baked_texture_by_slot(clean_tex, slot);
+            const auto* bt_worn = find_baked_texture_by_slot(worn_tex, slot);
+            VCR_EXPECT(w_sub != nullptr && bt_clean != nullptr && bt_worn != nullptr,
+                       std::string("Missing submesh/texture for wear test: ") + slot);
+            const auto w_cov = rasterize_submesh_coverage(wear_mesh, *w_sub, bake_res);
+            double sum_albedo_diff = 0.0;
+            double sum_rough_diff = 0.0;
+            std::size_t cov_count = 0U;
+            for (std::size_t px = 0U; px < w_cov.size(); ++px) {
+                if (!w_cov[px].covered) {
+                    continue;
+                }
+                const std::size_t off = px * 4U;
+                const int dr = std::abs(
+                    static_cast<int>(bt_worn->base_color_rgba[off + 0U]) -
+                    static_cast<int>(bt_clean->base_color_rgba[off + 0U]));
+                const int dg = std::abs(
+                    static_cast<int>(bt_worn->base_color_rgba[off + 1U]) -
+                    static_cast<int>(bt_clean->base_color_rgba[off + 1U]));
+                const int db = std::abs(
+                    static_cast<int>(bt_worn->base_color_rgba[off + 2U]) -
+                    static_cast<int>(bt_clean->base_color_rgba[off + 2U]));
+                const int drgh = std::abs(
+                    static_cast<int>(bt_worn->metallic_roughness_rgba[off + 1U]) -
+                    static_cast<int>(bt_clean->metallic_roughness_rgba[off + 1U]));
+                sum_albedo_diff += static_cast<double>(dr + dg + db) / 3.0;
+                sum_rough_diff += static_cast<double>(drgh);
+                ++cov_count;
+            }
+            VCR_EXPECT(cov_count > 0U, std::string("No covered pixels for ") + slot);
+            const double mean_albedo_diff = sum_albedo_diff / static_cast<double>(cov_count);
+            const double mean_rough_diff = sum_rough_diff / static_cast<double>(cov_count);
+            VCR_EXPECT(mean_albedo_diff > 0.15 && mean_rough_diff > 0.10,
+                       std::string(slot) + ": wear_and_tear=0.75 vs 0.0 must measurably change "
+                       "albedo (diff=" + std::to_string(mean_albedo_diff) +
+                       ") and roughness (diff=" + std::to_string(mean_rough_diff) + ")");
+        }
+    }
+
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -1222,6 +2249,9 @@ int main() {
     }
     if (!test_anatomical_rig_and_human_locomotion_biomechanics()) {
         return 8;
+    }
+    if (!test_production_wardrobe_geometry_materials_and_uv_isolation()) {
+        return 9;
     }
     std::cout << "[PASS] vcr_character_suite_tests passed all checks.\n";
     return 0;
