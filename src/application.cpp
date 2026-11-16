@@ -1,5 +1,6 @@
 #include "application.hpp"
 
+#include "crash_log.hpp"
 #include "icon_system.hpp"
 #include "runtime_assets.hpp"
 #include "render_fixture_scene.hpp"
@@ -101,10 +102,15 @@ Application::~Application() {
 }
 
 int Application::run(const int argc, char** argv) {
+    set_crash_stage("cli_parse");
     const auto parsed = parse_cli_options(argc, argv);
     if (!parsed) {
+        const auto log_path = write_crash_log("CLI Error", parsed.error);
         std::cerr << "error: " << parsed.error << "\n\n"
                   << cli_usage(argc > 0 ? argv[0] : "vulkan_cube");
+        if (!log_path.empty()) {
+            std::cerr << "crash log written to: " << log_path.string() << '\n';
+        }
         return 1;
     }
     if (parsed.options.show_help) {
@@ -121,16 +127,20 @@ int Application::run(const int argc, char** argv) {
             original_stdout_buffer_.emplace(*original);
         }
     }
+    set_crash_stage("initialize");
     initialize(parsed.options);
     if (options_.mcp_stdio) {
         mcp_server_.start();
     }
+    set_crash_stage("main_loop");
     main_loop();
+    set_crash_stage("shutdown");
     shutdown();
     return exit_code_;
 }
 
 void Application::initialize(const CliOptions& options) {
+    set_crash_stage("sdl_init");
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fatal(SDL_GetError());
     }
@@ -145,6 +155,7 @@ void Application::initialize(const CliOptions& options) {
         fatal(SDL_GetError());
     }
 
+    set_crash_stage("vulkan_context_init");
     context_.initialize(window_.get(), options.validation);
     VkPresentModeKHR preferred_present = VK_PRESENT_MODE_IMMEDIATE_KHR;
     switch (options.present) {
@@ -163,6 +174,7 @@ void Application::initialize(const CliOptions& options) {
         preferred_present = VK_PRESENT_MODE_FIFO_KHR;
         break;
     }
+    set_crash_stage("project_and_assets_load");
     std::filesystem::path resolved_project_root{};
     std::filesystem::path resolved_project_icon{};
     if (!options.project_path.empty()) {
@@ -206,6 +218,7 @@ void Application::initialize(const CliOptions& options) {
         apply_window_builtin_icon(window_.get(), BuiltinIconKind::engine);
     }
     const auto lighting = resolve_scene_lighting(options, scene_.lighting);
+    set_crash_stage("renderer_init");
     renderer_.initialize(context_, window_.get(), preferred_present, options.initial_mode,
                          options.instances, options.gpu_workload_iterations, options.anti_aliasing,
                          options.mcp_stdio, false,

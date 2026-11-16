@@ -1,4 +1,5 @@
 #include "asset_browser.hpp"
+#include "crash_log.hpp"
 #include "editor_scene_tools.hpp"
 #include "cli_options.hpp"
 #include "coarse_depth_order.hpp"
@@ -3025,6 +3026,34 @@ int main() {
         std::filesystem::remove_all(prefab_dir, fs_err);
     };
     run_prefab_tests();
+
+    {
+        const char* test_argv[]{"vcr_core_tests.exe", "--test-flag"};
+        vcr::install_crash_handlers("vcr_core_tests", 2, const_cast<char**>(test_argv));
+        vcr::set_crash_stage("unit_test_stage");
+        vcr::record_crash_diagnostic("test diagnostic detail");
+        const auto written_path = vcr::write_crash_log(
+            "Test Fatal Error",
+            "Simulated failure for crash log verification");
+        std::error_code fs_err;
+        expect(!written_path.empty() && std::filesystem::is_regular_file(written_path, fs_err),
+               "write_crash_log creates a crash log file");
+        std::ifstream log_stream(written_path);
+        const std::string log_contents(
+            (std::istreambuf_iterator<char>(log_stream)),
+            std::istreambuf_iterator<char>());
+        log_stream.close();
+        expect(log_contents.find("Stage: unit_test_stage") != std::string::npos &&
+                   log_contents.find("Category: Test Fatal Error") != std::string::npos &&
+                   log_contents.find("Message: Simulated failure for crash log verification") !=
+                       std::string::npos &&
+                   log_contents.find("LastDiagnostic: test diagnostic detail") !=
+                       std::string::npos &&
+                   log_contents.find("CommandLine: vcr_core_tests.exe --test-flag") !=
+                       std::string::npos,
+               "crash log contains stage, category, message, diagnostic, and command line");
+        std::filesystem::remove(written_path, fs_err);
+    }
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";

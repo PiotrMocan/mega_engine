@@ -459,6 +459,7 @@ set(VCR_ENGINE_CORE_SOURCES
     src/character_wardrobe_textures.cpp
     src/character_ai_bridge.cpp
     src/vegetation_generator.cpp
+    src/crash_log.cpp
 )
 
 add_library(vcr_engine SHARED ${VCR_ENGINE_CORE_SOURCES})

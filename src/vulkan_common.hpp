@@ -1,5 +1,7 @@
 #pragma once
 
+#include "crash_log.hpp"
+
 #include <volk.h>
 
 #include <iostream>
@@ -14,6 +16,7 @@ namespace vcr {
 [[noreturn]] inline void fatal(const std::string_view message) {
     // Failure is outside the successful hot path. Both executables catch at
     // main(), allowing application/device resources to unwind first.
+    record_crash_diagnostic(message);
     throw std::runtime_error(std::string(message));
 }
 
@@ -23,8 +26,13 @@ inline void check_vk(
     const char* file,
     const int line) {
     if (result != VK_SUCCESS) {
+        const std::string message =
+            std::string(expression) + " failed with VkResult " +
+            std::to_string(static_cast<int>(result)) +
+            " at " + file + ':' + std::to_string(line);
         std::cerr << "Vulkan call failed: " << expression << " -> "
                   << static_cast<int>(result) << " at " << file << ':' << line << '\n';
+        record_crash_diagnostic(message);
         throw std::runtime_error(
             std::string(expression) + " failed with VkResult " +
             std::to_string(static_cast<int>(result)));
