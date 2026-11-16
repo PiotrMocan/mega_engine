@@ -1866,6 +1866,16 @@ CharacterPackage make_default_character_package(
     return pkg;
 }
 
+CharacterGroomSettings sanitize_character_groom_settings(CharacterGroomSettings g) noexcept {
+    g.density = clamp_finite(g.density, 0.15F, 1.5F, 1.0F);
+    g.length = clamp_finite(g.length, 0.6F, 1.4F, 1.0F);
+    g.width = clamp_finite(g.width, 0.5F, 1.5F, 1.0F);
+    g.clumping = clamp_finite(g.clumping, 0.0F, 1.0F, 0.35F);
+    g.flyaways = clamp_finite(g.flyaways, 0.0F, 1.0F, 0.15F);
+    g.part = clamp_finite(g.part, -1.0F, 1.0F, 0.25F);
+    return g;
+}
+
 void sanitize_character_package(CharacterPackage& p) noexcept {
     p.version = character_package_version;
     p.identity.slug = sanitize_character_slug(p.identity.slug);
@@ -1919,6 +1929,7 @@ void sanitize_character_package(CharacterPackage& p) noexcept {
     w.accent_color = clamp_vec3_color(w.accent_color, {0.82F, 0.64F, 0.28F});
     w.footwear_color = clamp_vec3_color(w.footwear_color, {0.14F, 0.12F, 0.11F});
     w.hair_color = clamp_vec3_color(w.hair_color, {0.16F, 0.11F, 0.08F});
+    w.groom = sanitize_character_groom_settings(w.groom);
     w.top_thickness = clamp_finite(w.top_thickness, 0.005F, 0.045F, 0.016F);
     w.bottom_thickness = clamp_finite(w.bottom_thickness, 0.005F, 0.040F, 0.014F);
     w.wear_and_tear = clamp_finite(w.wear_and_tear, 0.0F, 1.0F, 0.15F);
@@ -2153,7 +2164,8 @@ bool load_character_package_file(
              "has_pauldrons", "has_gloves", "has_cape", "has_beard",
              "occlude_covered_body", "studio_underwear", "primary_color",
              "secondary_color", "accent_color", "footwear_color",
-             "hair_color", "top_thickness", "bottom_thickness", "wear_and_tear"});
+             "hair_color", "hair_density", "hair_length", "hair_width", "hair_clumping",
+             "hair_flyaways", "hair_part", "top_thickness", "bottom_thickness", "wear_and_tear"});
         if (const auto ts = parse_top_garment_style(w.value("top_style", "none"))) {
             pkg.wardrobe.top_style = *ts;
         }
@@ -2184,6 +2196,12 @@ bool load_character_package_file(
         if (w.contains("accent_color")) (void)read_vec3_json(w["accent_color"], pkg.wardrobe.accent_color);
         if (w.contains("footwear_color")) (void)read_vec3_json(w["footwear_color"], pkg.wardrobe.footwear_color);
         if (w.contains("hair_color")) (void)read_vec3_json(w["hair_color"], pkg.wardrobe.hair_color);
+        pkg.wardrobe.groom.density = w.value("hair_density", pkg.wardrobe.groom.density);
+        pkg.wardrobe.groom.length = w.value("hair_length", pkg.wardrobe.groom.length);
+        pkg.wardrobe.groom.width = w.value("hair_width", pkg.wardrobe.groom.width);
+        pkg.wardrobe.groom.clumping = w.value("hair_clumping", pkg.wardrobe.groom.clumping);
+        pkg.wardrobe.groom.flyaways = w.value("hair_flyaways", pkg.wardrobe.groom.flyaways);
+        pkg.wardrobe.groom.part = w.value("hair_part", pkg.wardrobe.groom.part);
         pkg.wardrobe.top_thickness = w.value("top_thickness", pkg.wardrobe.top_thickness);
         pkg.wardrobe.bottom_thickness = w.value("bottom_thickness", pkg.wardrobe.bottom_thickness);
         pkg.wardrobe.wear_and_tear = w.value("wear_and_tear", pkg.wardrobe.wear_and_tear);
@@ -2359,6 +2377,12 @@ bool save_character_package_file(
         {"accent_color", vec3_to_json(p.wardrobe.accent_color)},
         {"footwear_color", vec3_to_json(p.wardrobe.footwear_color)},
         {"hair_color", vec3_to_json(p.wardrobe.hair_color)},
+        {"hair_density", p.wardrobe.groom.density},
+        {"hair_length", p.wardrobe.groom.length},
+        {"hair_width", p.wardrobe.groom.width},
+        {"hair_clumping", p.wardrobe.groom.clumping},
+        {"hair_flyaways", p.wardrobe.groom.flyaways},
+        {"hair_part", p.wardrobe.groom.part},
         {"top_thickness", p.wardrobe.top_thickness},
         {"bottom_thickness", p.wardrobe.bottom_thickness},
         {"wear_and_tear", p.wardrobe.wear_and_tear},
@@ -3129,59 +3153,6 @@ void emit_clipped_template_part(
     return t * t * (3.0F - 2.0F * t);
 }
 
-[[nodiscard]] float eval_anatomical_hairline_weight(
-    const glm::vec3& pos,
-    const CharacterGender gender,
-    const glm::vec3& head_c,
-    const float eye_y,
-    const float neck_y,
-    const float hs) noexcept {
-    const float abs_x = std::abs(pos.x - head_c.x);
-    // Exclude full outer ear pinna bounds
-    if (abs_x > 0.0645F * hs &&
-        pos.y > eye_y - 0.048F * hs &&
-        pos.y < eye_y + 0.014F * hs &&
-        pos.z > head_c.z - 0.028F * hs &&
-        pos.z < head_c.z + 0.018F * hs) {
-        return 0.0F;
-    }
-    // Exclude lower cheek/jaw/neck below ear lobe
-    if (pos.y < eye_y - 0.052F * hs &&
-        (pos.z > head_c.z - 0.006F * hs || abs_x > 0.055F * hs)) {
-        return 0.0F;
-    }
-
-    const float front_z = head_c.z + 0.020F * hs;
-    const float nape_w = smoothstep_f(pos.y, neck_y + 0.038F * hs, neck_y + 0.056F * hs);
-
-    float cap_w = nape_w;
-    if (pos.z > front_z) {
-        const float blend_front = smoothstep_f(pos.z, front_z, front_z + 0.016F * hs);
-        float trichion_y = eye_y + 0.056F * hs;
-        if (gender == CharacterGender::female) {
-            const float x_norm = std::clamp(abs_x / (0.055F * hs), 0.0F, 1.2F);
-            trichion_y = eye_y + (0.054F + 0.004F * x_norm * x_norm) * hs;
-        } else {
-            const float temple_recess =
-                std::exp(-std::pow((abs_x - 0.036F * hs) / (0.015F * hs), 2.0F));
-            trichion_y = eye_y + (0.053F + 0.008F * temple_recess) * hs;
-        }
-        const float frontal_w = smoothstep_f(pos.y, trichion_y, trichion_y + 0.008F * hs);
-        const float temple_arch_y = glm::mix(
-            eye_y + 0.026F * hs,
-            eye_y - 0.002F * hs,
-            smoothstep_f(abs_x, 0.050F * hs, 0.064F * hs));
-        const float temple_w = smoothstep_f(pos.y, temple_arch_y, temple_arch_y + 0.009F * hs);
-        const float side_blend = smoothstep_f(abs_x, 0.047F * hs, 0.063F * hs);
-        const float front_profile = glm::mix(frontal_w, temple_w, side_blend);
-        cap_w = glm::mix(nape_w, front_profile, blend_front);
-    } else if (abs_x >= 0.054F * hs && pos.z > head_c.z - 0.012F * hs) {
-        const float temple_w = smoothstep_f(pos.y, eye_y - 0.006F * hs, eye_y + 0.006F * hs);
-        cap_w = (std::min)(cap_w, temple_w);
-    }
-    return std::clamp(cap_w, 0.0F, 1.0F);
-}
-
 [[nodiscard]] float eval_anatomical_beard_weight(
     const glm::vec3& pos,
     const glm::vec3& head_c,
@@ -3262,6 +3233,7 @@ void emit_clipped_template_part(
     in.hair_style = pkg.wardrobe.hair_style;
     in.has_beard = pkg.wardrobe.has_beard;
     in.seed = pkg.identity.seed;
+    in.settings = pkg.wardrobe.groom;
     const float h = pkg.body.height_meters / 1.78F;
     in.head_scale = pkg.body.face.head_scale * h;
     in.head_center = eval.bones[6].model_pos;
@@ -3297,6 +3269,7 @@ void emit_clipped_template_part(
         pkg.wardrobe.hair_style != HairStyle::hood;
 
     in.scalp_triangles.reserve(1600U);
+    in.head_triangles.reserve(2400U);
     if (pkg.wardrobe.has_beard) {
         in.beard_triangles.reserve(1200U);
     }
@@ -3325,15 +3298,19 @@ void emit_clipped_template_part(
             (r1 == TemplateRegion::head || r1 == TemplateRegion::neck) &&
             (r2 == TemplateRegion::head || r2 == TemplateRegion::neck);
         if (collect_scalp && all_head_or_neck) {
-            const float hl_mid = eval_anatomical_hairline_weight(
+            in.head_triangles.push_back({c0.vid, c1.vid, c2.vid});
+        }
+        if (collect_scalp && all_head_or_neck) {
+            const float hl_mid = character_scalp_growth_weight(
                 p_mid, pkg.body.gender, in.head_center, eye_y, in.neck_center.y, hs);
-            const float hl0 = eval_anatomical_hairline_weight(
+            const float hl0 = character_scalp_growth_weight(
                 eval.positions[c0.vid], pkg.body.gender, in.head_center, eye_y, in.neck_center.y, hs);
-            const float hl1 = eval_anatomical_hairline_weight(
+            const float hl1 = character_scalp_growth_weight(
                 eval.positions[c1.vid], pkg.body.gender, in.head_center, eye_y, in.neck_center.y, hs);
-            const float hl2 = eval_anatomical_hairline_weight(
+            const float hl2 = character_scalp_growth_weight(
                 eval.positions[c2.vid], pkg.body.gender, in.head_center, eye_y, in.neck_center.y, hs);
-            if (hl_mid >= 0.44F && (std::min)({hl0, hl1, hl2}) >= 0.10F) {
+            // Keep boundary triangles; the continuous mask is evaluated at each actual root.
+            if ((std::max)({hl_mid, hl0, hl1, hl2}) > 0.001F) {
                 in.scalp_triangles.push_back({c0.vid, c1.vid, c2.vid});
             }
         }
@@ -4607,7 +4584,7 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
                                        pkg.wardrobe.hair_style != HairStyle::bald &&
                                        pkg.wardrobe.hair_style != HairStyle::hood) {
                                 // Cranial scalp follicle root bed gated across complete hairline
-                                const float hl_w = eval_anatomical_hairline_weight(
+                                const float hl_w = character_scalp_growth_weight(
                                     cell.pos, pkg.body.gender, head_c, eye_y, neck_y, hs);
                                 const bool is_short_crop = (pkg.wardrobe.hair_style == HairStyle::short_crop);
                                 const float scalp_w = is_short_crop

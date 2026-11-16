@@ -45,6 +45,37 @@ Key options:
 - Morph / identity / wardrobe / acting flags: `--name`, `--role`, `--seed`, `--gender`, `--archetype`, `--height`, `--musculature`, `--skin`, `--top`, `--bottom`, `--footwear`, `--hair`, `--material`, `--secondary-material`, `--primary-color`, `--secondary-color`, `--accent-color`, `--footwear-color`, `--hair-color`, `--[no-]cape`, `--[no-]belt`, `--[no-]gloves`, `--[no-]pauldrons`, `--[no-]beard`, `--[no-]studio-underwear`, `--[no-]occlude-body`, `--temperament`, `--pitch`, `--rate`, `--walk-speed`, `--run-speed`, `--add-node <id:sp:en[:ru]>`
 - Output & verification: `--export-wav <path>`, `--cook`, `--tex-res <256|512|1024>`, `--no-voice`, `--no-prefabs`, `--no-loc`, `--verify`, `--dry-run`, `--json`
 
+### Groom controls
+
+The **Anatomy & Groom** inspector saves these scalp settings in the package's `wardrobe` object.
+They are also available as CLI and GUI preview flags. Existing packages use the defaults below.
+
+| Inspector | Flag / JSON key | Range | Default |
+| :--- | :--- | :--- | ---: |
+| Hair Density | `--hair-density` / `hair_density` | 0.15–1.5 of the style strand budget | 1.0 |
+| Hair Length | `--hair-length` / `hair_length` | 0.6–1.4 of style length (ponytail: hanging tail) | 1.0 |
+| Hair Width | `--hair-width` / `hair_width` | 0.5–1.5 of ribbon width | 1.0 |
+| Hair Clumping | `--hair-clumping` / `hair_clumping` | 0–1 attraction toward compatible guides | 0.35 |
+| Hair Flyaways | `--hair-flyaways` / `hair_flyaways` | 0–1 loose-fiber amount for bob/ponytail scalp | 0.15 |
+| Hair Part | `--hair-part` / `hair_part` | −1–1 lateral bob part position | 0.25 |
+
+Slider changes rebuild the preview on release. Lower density reduces emitted scalp geometry;
+brows, lashes and beard retain their own budgets and deterministic random streams.
+Settings are finite-checked and clamped when loading/cooking; they do not add per-frame work.
+
+Scalp roots and the skin's follicle shadow use the same continuous anatomical mask, including
+forehead/ear exclusions. Boundary triangles are sampled per follicle. Area-weighted root normals
+and four integration substeps per guide segment reduce polygon-shaped growth patches and large
+collision jumps. The emitted segment count is unchanged; the bob allocates more of its samples
+near the curved roots. A bounded 72×37 radial contact field is built from the morphed cranial mesh
+at generation time, with analytic fallbacks for open surfaces and the jaw/neck. It is an approximate
+cranial collision proxy, not full body strand simulation. Collision corrections no longer accumulate
+down a strand, and interpolation never crosses bob part groups or mohawk crest/side groups.
+
+This remains a procedural ribbon groom. Artist-authored guides and painted growth masks, dynamic
+hair LOD, motion/collision simulation and temporal/subpixel coverage need separate production work;
+the controls above do not constitute an AAA quality certification or a measured FPS improvement.
+
 ## MCP Automation Server (`--mcp-stdio`)
 
 Pass `--mcp-stdio` to expose JSON-RPC 2.0 MCP tools on stdin/stdout (`serverInfo.name = "vulkan_character_studio"`), including:

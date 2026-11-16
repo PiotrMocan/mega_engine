@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -23,6 +24,15 @@ namespace vcr {
 namespace {
 
 using Json = nlohmann::json;
+
+[[nodiscard]] std::optional<float> parse_finite_float(const std::string_view text) noexcept {
+    float value = 0.0F;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() || !std::isfinite(value)) {
+        return std::nullopt;
+    }
+    return value;
+}
 
 [[nodiscard]] std::optional<glm::vec3> parse_hex_rgb(std::string_view hex) noexcept {
     if (hex.starts_with('#')) {
@@ -677,6 +687,13 @@ void CharacterStudioApplication::draw_anatomy_right(
         actions.mark_dirty = true;
         actions.rebuild_preview = true;
     }
+    face_slider("Hair Density", &pkg.wardrobe.groom.density, 0.15F, 1.5F);
+    face_slider("Hair Length", &pkg.wardrobe.groom.length, 0.6F, 1.4F);
+    face_slider("Hair Width", &pkg.wardrobe.groom.width, 0.5F, 1.5F);
+    face_slider("Hair Clumping", &pkg.wardrobe.groom.clumping);
+    face_slider("Hair Flyaways", &pkg.wardrobe.groom.flyaways);
+    face_slider("Hair Part", &pkg.wardrobe.groom.part, -1.0F, 1.0F);
+    ImGui::TextWrapped("Density controls scalp geometry cost. Changes apply when the slider is released.");
     if (ImGui::Checkbox("Studio Underwear", &pkg.wardrobe.studio_underwear)) {
         actions.mark_dirty = true;
         actions.rebuild_preview = true;
@@ -1651,6 +1668,42 @@ int CharacterStudioApplication::run_cli(const CharacterStudioCliArgs& args) {
             mutated = true;
         }
     }
+    if (const auto v = args.find_option("hair-density")) {
+        if (const auto value = parse_finite_float(*v)) {
+            pkg.wardrobe.groom.density = *value;
+            mutated = true;
+        }
+    }
+    if (const auto v = args.find_option("hair-length")) {
+        if (const auto value = parse_finite_float(*v)) {
+            pkg.wardrobe.groom.length = *value;
+            mutated = true;
+        }
+    }
+    if (const auto v = args.find_option("hair-width")) {
+        if (const auto value = parse_finite_float(*v)) {
+            pkg.wardrobe.groom.width = *value;
+            mutated = true;
+        }
+    }
+    if (const auto v = args.find_option("hair-clumping")) {
+        if (const auto value = parse_finite_float(*v)) {
+            pkg.wardrobe.groom.clumping = *value;
+            mutated = true;
+        }
+    }
+    if (const auto v = args.find_option("hair-flyaways")) {
+        if (const auto value = parse_finite_float(*v)) {
+            pkg.wardrobe.groom.flyaways = *value;
+            mutated = true;
+        }
+    }
+    if (const auto v = args.find_option("hair-part")) {
+        if (const auto value = parse_finite_float(*v)) {
+            pkg.wardrobe.groom.part = *value;
+            mutated = true;
+        }
+    }
     if (const auto v = args.find_option("material")) {
         if (const auto m = parse_outfit_material_preset(*v)) {
             pkg.wardrobe.primary_material = *m;
@@ -1930,6 +1983,8 @@ void CharacterStudioApplication::print_cli_help() const {
         << "  --height / --musculature / --skin <#RRGGBB>\n"
         << "  --top / --bottom / --footwear / --hair / --material / --secondary-material\n"
         << "  --primary-color / --secondary-color / --accent-color / --footwear-color / --hair-color\n"
+        << "  --hair-density <0.15..1.5> / --hair-length <0.6..1.4> / --hair-width <0.5..1.5>\n"
+        << "  --hair-clumping <0..1> / --hair-flyaways <0..1> / --hair-part <-1..1>\n"
         << "  --cape / --no-cape / --belt / --no-belt / --gloves / --no-gloves\n"
         << "  --pauldrons / --no-pauldrons / --beard / --no-beard / --studio-underwear / --no-studio-underwear\n"
         << "  --temperament / --pitch / --rate / --walk-speed / --run-speed\n"

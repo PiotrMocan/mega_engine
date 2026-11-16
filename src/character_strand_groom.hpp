@@ -18,6 +18,7 @@ struct CharacterGroomInputs {
     HairStyle hair_style = HairStyle::short_crop;
     bool has_beard = false;
     std::uint64_t seed = 1337ULL;
+    CharacterGroomSettings settings{};
     float head_scale = 1.0F;
     glm::vec3 head_center{0.0F, 1.54F, 0.0F};
     glm::vec3 neck_center{0.0F, 1.46F, 0.0F};
@@ -36,9 +37,16 @@ struct CharacterGroomInputs {
     std::array<std::vector<std::uint16_t>, 6U> landmark_chains{};
     // Welded scalp triangle vertex triples (already morphed) for cranial roots.
     std::vector<std::array<std::uint16_t, 3U>> scalp_triangles{};
+    // Complete head/neck surface for collision, including regions where roots are forbidden.
+    std::vector<std::array<std::uint16_t, 3U>> head_triangles{};
     // Welded jaw/cheek/chin triangle triples (already morphed) for beard roots.
     std::vector<std::array<std::uint16_t, 3U>> beard_triangles{};
 };
+
+// Shared by root placement and the skin's follicle shadow bake.
+[[nodiscard]] float character_scalp_growth_weight(
+    const glm::vec3& position, CharacterGender gender,
+    const glm::vec3& head_center, float eye_y, float neck_y, float head_scale) noexcept;
 
 struct CharacterStrandGroomMesh {
     std::vector<CookedModelVertex> vertices{};

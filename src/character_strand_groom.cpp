@@ -71,6 +71,11 @@ struct SplitMix64 {
 }
 
 struct HeadColliderSdf {
+    static constexpr std::uint32_t longitude_count = 72U;
+    static constexpr std::uint32_t latitude_count = 37U;
+    // Bounded radial contact proxy baked from the morphed mesh, never updated per frame.
+    std::array<float, longitude_count * latitude_count> surface_radius{};
+    float surface_min_y = 0.0F;
     glm::vec3 cranium_center{0.0F};
     glm::vec3 cranium_radii{0.082F, 0.105F, 0.102F};
     glm::vec3 face_center{0.0F};
@@ -96,6 +101,7 @@ struct HeadColliderSdf {
     c.head_scale = s;
     const glm::vec3 eye_mid = 0.5F * (in.eye_l + in.eye_r);
     const float eye_span = glm::length(in.eye_l - in.eye_r);
+    c.surface_min_y = eye_mid.y - 0.045F * s;
 
     // Infer tight inscribed cranial radii from actual scalp vertices so collider never balloons roots
     float min_x = 1.0e6F;
@@ -143,9 +149,9 @@ struct HeadColliderSdf {
     c.neck_bot = in.neck_center + glm::vec3(0.0F, -0.075F * s, -0.012F * s);
     c.neck_radius = (in.gender == CharacterGender::male ? 0.058F : 0.050F) * s;
 
-    c.ear_l = glm::vec3(skull_w * 1.02F, eye_mid.y - 0.008F * s, in.head_center.z - 0.012F * s);
-    c.ear_r = glm::vec3(-skull_w * 1.02F, eye_mid.y - 0.008F * s, in.head_center.z - 0.012F * s);
-    c.ear_radius = 0.017F * s;
+    c.ear_l = glm::vec3(eye_mid.x + skull_w * 1.02F, eye_mid.y - 0.020F * s, in.head_center.z + 0.008F * s);
+    c.ear_r = glm::vec3(eye_mid.x - skull_w * 1.02F, eye_mid.y - 0.020F * s, in.head_center.z + 0.008F * s);
+    c.ear_radius = 0.024F * s;
 
     c.eye_l = in.eye_l;
     c.eye_r = in.eye_r;
@@ -154,7 +160,83 @@ struct HeadColliderSdf {
     c.back_shoulder_l = in.neck_center + glm::vec3(0.115F * s, -0.105F * s, -0.020F * s);
     c.back_shoulder_r = in.neck_center + glm::vec3(-0.115F * s, -0.105F * s, -0.020F * s);
     c.shoulder_radius = 0.080F * s;
+    const auto& surface_triangles = in.head_triangles.empty() ? in.scalp_triangles : in.head_triangles;
+    if (in.hair_style != HairStyle::bald && in.hair_style != HairStyle::hood) {
+        for (std::uint32_t lat = 0U; lat < HeadColliderSdf::latitude_count; ++lat) {
+            const float theta = glm::pi<float>() * static_cast<float>(lat) /
+                static_cast<float>(HeadColliderSdf::latitude_count - 1U);
+            for (std::uint32_t lon = 0U; lon < HeadColliderSdf::longitude_count; ++lon) {
+                const float phi = glm::two_pi<float>() * static_cast<float>(lon) /
+                    static_cast<float>(HeadColliderSdf::longitude_count);
+                const glm::vec3 direction(std::sin(theta) * std::cos(phi), std::cos(theta),
+                    std::sin(theta) * std::sin(phi));
+                float radius = 0.0F;
+                for (const auto& tri : surface_triangles) {
+                    if (tri[0] >= in.body_positions.size() || tri[1] >= in.body_positions.size() ||
+                        tri[2] >= in.body_positions.size()) {
+                        continue;
+                    }
+                    const glm::vec3& a = in.body_positions[tri[0]];
+                    const glm::vec3 e1 = in.body_positions[tri[1]] - a;
+                    const glm::vec3 e2 = in.body_positions[tri[2]] - a;
+                    const glm::vec3 h = glm::cross(direction, e2);
+                    const float det = glm::dot(e1, h);
+                    if (std::abs(det) < 1.0e-10F) {
+                        continue;
+                    }
+                    const glm::vec3 d = c.cranium_center - a;
+                    const float u = glm::dot(d, h) / det;
+                    const glm::vec3 q = glm::cross(d, e1);
+                    const float v = glm::dot(direction, q) / det;
+                    if (u >= -1.0e-5F && v >= -1.0e-5F && u + v <= 1.00001F) {
+                        const float hit_distance = glm::dot(e2, q) / det;
+                        if (c.cranium_center.y + direction.y * hit_distance >= c.surface_min_y) {
+                            radius = std::max(radius, hit_distance);
+                        }
+                    }
+                }
+                c.surface_radius[lat * HeadColliderSdf::longitude_count + lon] = radius;
+            }
+        }
+    }
     return c;
+}
+
+bool collide_head_surface(glm::vec3& p, const HeadColliderSdf& c, const float clearance) noexcept {
+    // A cranial radial field is not valid for hanging hair beside the jaw/neck:
+    // downward rays can exit far away at the neck base and incorrectly flare the hem.
+    if (p.y < c.surface_min_y) {
+        return false;
+    }
+    const glm::vec3 d = p - c.cranium_center;
+    const float distance = glm::length(d);
+    if (distance < 1.0e-6F) {
+        return false;
+    }
+    const glm::vec3 direction = d / distance;
+    const float longitude = (std::atan2(direction.z, direction.x) + glm::two_pi<float>()) *
+        (static_cast<float>(HeadColliderSdf::longitude_count) / glm::two_pi<float>());
+    const float latitude = std::acos(std::clamp(direction.y, -1.0F, 1.0F)) *
+        (static_cast<float>(HeadColliderSdf::latitude_count - 1U) / glm::pi<float>());
+    const auto lon0 = static_cast<std::uint32_t>(longitude) % HeadColliderSdf::longitude_count;
+    const auto lon1 = (lon0 + 1U) % HeadColliderSdf::longitude_count;
+    const auto lat0 = std::min(static_cast<std::uint32_t>(latitude), HeadColliderSdf::latitude_count - 2U);
+    const float u = longitude - std::floor(longitude);
+    const float v = latitude - static_cast<float>(lat0);
+    const float r00 = c.surface_radius[lat0 * HeadColliderSdf::longitude_count + lon0];
+    const float r01 = c.surface_radius[lat0 * HeadColliderSdf::longitude_count + lon1];
+    const float r10 = c.surface_radius[(lat0 + 1U) * HeadColliderSdf::longitude_count + lon0];
+    const float r11 = c.surface_radius[(lat0 + 1U) * HeadColliderSdf::longitude_count + lon1];
+    if (std::min({r00, r01, r10, r11}) <= 0.0F) {
+        return false; // Open or incomplete surface: retain the analytic collider fallback.
+    }
+    const float radius = glm::mix(glm::mix(r00, r01, u), glm::mix(r10, r11, u), v);
+    // Covers proxy interpolation error on the cranial surface; roots remain separately pinned to triangles.
+    const float target = radius + clearance + 0.0006F * c.head_scale;
+    if (distance < target) {
+        p = c.cranium_center + direction * target;
+    }
+    return true;
 }
 
 void push_out_ellipsoid(
@@ -203,12 +285,17 @@ void collide_scalp_strand_point(
     const float clearance,
     const HairStyle hair_style,
     const float preferred_side_sign = 0.0F) noexcept {
-    push_out_ellipsoid(p, col.cranium_center, col.cranium_radii, clearance);
-    if (p.y < col.eye_l.y + 0.008F * col.head_scale) {
-        push_out_ellipsoid(p, col.face_center, col.face_radii, clearance + 0.0012F);
+    const bool mesh_contact = collide_head_surface(p, col, clearance);
+    if (!mesh_contact) {
+        push_out_ellipsoid(p, col.cranium_center, col.cranium_radii, clearance);
+        if (p.y < col.eye_l.y + 0.008F * col.head_scale) {
+            push_out_ellipsoid(p, col.face_center, col.face_radii, clearance + 0.0012F);
+        }
+        push_out_capsule(p, col.neck_top, col.neck_bot, col.neck_radius + clearance);
     }
-    push_out_capsule(p, col.neck_top, col.neck_bot, col.neck_radius + clearance);
-    push_out_capsule(p, col.back_shoulder_l, col.back_shoulder_r, col.shoulder_radius + clearance);
+    if (hair_style == HairStyle::ponytail) {
+        push_out_capsule(p, col.back_shoulder_l, col.back_shoulder_r, col.shoulder_radius + clearance);
+    }
     // Ear pinna tucking: push hair gently up & behind ears rather than slicing through helix
     const float ear_lat = (hair_style == HairStyle::short_crop) ? 0.05F : 0.26F;
     for (const glm::vec3& ear : {col.ear_l, col.ear_r}) {
@@ -245,6 +332,7 @@ void collide_scalp_strand_point(
             p.x = col.cranium_center.x + push_sign * throat_clear_x;
         }
     }
+    collide_head_surface(p, col, clearance);
 }
 
 void enforce_short_crop_forehead_keepout(
@@ -534,6 +622,7 @@ struct RootTriangleSample {
     glm::vec3 pos{0.0F};
     glm::vec3 normal{0.0F, 1.0F, 0.0F};
     CookedSkinVertex skin{};
+    bool valid = false;
 };
 
 void build_weighted_triangle_cdf(
@@ -551,7 +640,9 @@ void build_weighted_triangle_cdf(
         const glm::vec3 e1 = positions[t[1]] - positions[t[0]];
         const glm::vec3 e2 = positions[t[2]] - positions[t[0]];
         const double area = static_cast<double>(glm::length(glm::cross(e1, e2))) * 0.5;
-        acc += std::max(0.0, area);
+        if (std::isfinite(area)) {
+            acc += std::max(0.0, area);
+        }
         cdf_out.push_back(acc);
     }
 }
@@ -561,15 +652,27 @@ void build_weighted_triangle_cdf(
     std::span<const double> cdf,
     std::span<const glm::vec3> positions,
     std::span<const CookedSkinVertex> skin,
-    SplitMix64& rng) noexcept {
+    SplitMix64& rng,
+    std::span<const glm::vec3> normals = {}) noexcept {
     RootTriangleSample res{};
     if (tris.empty() || cdf.empty() || cdf.back() <= 1.0e-12) {
         return res;
     }
     const double target = static_cast<double>(rng.next_float()) * cdf.back();
-    auto it = std::lower_bound(cdf.begin(), cdf.end(), target);
-    const std::size_t idx = std::min(static_cast<std::size_t>(it - cdf.begin()), tris.size() - 1U);
+    // Skip zero-area/invalid plateaus, including when the RNG rounds to 0 or 1.
+    auto it = std::upper_bound(cdf.begin(), cdf.end(), std::min(target, std::nextafter(cdf.back(), 0.0)));
+    if (it == cdf.end()) {
+        return res;
+    }
+    const std::size_t idx = static_cast<std::size_t>(it - cdf.begin());
+    if (idx >= tris.size()) {
+        return res;
+    }
     const auto& t = tris[idx];
+    if (t[0] >= positions.size() || t[1] >= positions.size() || t[2] >= positions.size() ||
+        t[0] >= skin.size() || t[1] >= skin.size() || t[2] >= skin.size()) {
+        return res;
+    }
     const float r1 = std::sqrt(rng.next_float());
     const float r2 = rng.next_float();
     const glm::vec3 bary(1.0F - r1, r1 * (1.0F - r2), r1 * r2);
@@ -579,7 +682,11 @@ void build_weighted_triangle_cdf(
     const glm::vec3& p2 = positions[t[2]];
     res.pos = p0 * bary.x + p1 * bary.y + p2 * bary.z;
     res.normal = safe_normalize(glm::cross(p1 - p0, p2 - p0), glm::vec3(0.0F, 1.0F, 0.0F));
+    if (normals.size() == positions.size()) {
+        res.normal = safe_normalize(normals[t[0]] * bary.x + normals[t[1]] * bary.y + normals[t[2]] * bary.z, res.normal);
+    }
     res.skin = interpolate_skin(skin[t[0]], skin[t[1]], skin[t[2]], bary);
+    res.valid = true;
     return res;
 }
 
@@ -591,7 +698,8 @@ void for_each_stratified_triangle_sample(
     const std::span<const CookedSkinVertex> skin,
     std::uint32_t total_count,
     SplitMix64& rng,
-    Fn&& fn) {
+    Fn&& fn,
+    std::span<const glm::vec3> normals = {}) {
     if (tris.empty() || cdf.empty() || total_count == 0U) {
         return;
     }
@@ -645,7 +753,11 @@ void for_each_stratified_triangle_sample(
             RootTriangleSample s{};
             s.pos = p0 * bary.x + p1 * bary.y + p2 * bary.z;
             s.normal = face_n;
+            if (normals.size() == positions.size()) {
+                s.normal = safe_normalize(normals[t[0]] * bary.x + normals[t[1]] * bary.y + normals[t[2]] * bary.z, face_n);
+            }
             s.skin = interpolate_skin(skin[t[0]], skin[t[1]], skin[t[2]], bary);
+            s.valid = true;
             fn(s);
         }
     }
@@ -668,13 +780,45 @@ void generate_scalp_groom(
 
     const float s = col.head_scale;
     const glm::vec3 head_c = col.cranium_center;
-    const glm::vec3 part_anchor(0.018F * s, in.crown_y - 0.018F * s, head_c.z + 0.010F * s);
+    const CharacterGroomSettings settings = sanitize_character_groom_settings(in.settings);
+    // A polygon's flat normal must not create a visible patch of differently directed follicles.
+    std::vector<glm::vec3> scalp_normals(in.body_positions.size(), glm::vec3(0.0F));
+    for (const auto& t : in.scalp_triangles) {
+        if (t[0] >= in.body_positions.size() || t[1] >= in.body_positions.size() || t[2] >= in.body_positions.size()) {
+            continue;
+        }
+        const glm::vec3 n = glm::cross(in.body_positions[t[1]] - in.body_positions[t[0]],
+            in.body_positions[t[2]] - in.body_positions[t[0]]);
+        for (const auto index : t) {
+            scalp_normals[index] += n;
+        }
+    }
+    for (auto& normal : scalp_normals) {
+        normal = safe_normalize(normal, glm::vec3(0.0F, 1.0F, 0.0F));
+    }
+    const auto growth_weight = [&](const glm::vec3& p) noexcept {
+        return character_scalp_growth_weight(p, in.gender, in.head_center,
+            0.5F * (in.eye_l.y + in.eye_r.y), in.neck_center.y, s);
+    };
+    const auto sample_scalp_root = [&]() {
+        for (std::uint32_t attempt = 0U; attempt < 64U; ++attempt) {
+            const RootTriangleSample root = sample_triangle_surface(
+                in.scalp_triangles, cdf, in.body_positions, in.body_skin, rng, scalp_normals);
+            if (root.valid && rng.next_float() < growth_weight(root.pos)) {
+                return root;
+            }
+        }
+        return RootTriangleSample{};
+    };
+    const glm::vec3 part_anchor(head_c.x + settings.part * 0.072F * s,
+        in.crown_y - 0.018F * s, head_c.z + 0.010F * s);
     const glm::vec3 crown_whorl(0.016F * s, in.crown_y - 0.032F * s, head_c.z - 0.052F * s);
     const glm::vec3 pony_tie(0.0F, in.eye_l.y + 0.024F * s, head_c.z - col.cranium_radii.z - 0.028F * s);
 
     // Filter scalp roots for mohawk crest width if needed, or spawn short buzz on sides
+    constexpr std::uint32_t guide_substeps = 4U;
     struct GuideCurve {
-        std::array<glm::vec3, 10U> pts{};
+        std::array<glm::vec3, 29U> pts{};
         std::uint32_t segs = 6U;
         glm::vec3 root_normal{0.0F, 1.0F, 0.0F};
         CookedSkinVertex skin{};
@@ -691,13 +835,16 @@ void generate_scalp_groom(
     const std::uint32_t segs = long_style
         ? 7U
         : (in.hair_style == HairStyle::short_crop ? 5U : 6U);
+    const std::uint32_t guide_segs = segs * guide_substeps;
 
     std::vector<GuideCurve> guides{};
     guides.reserve(kScalpClumpCount);
 
     for (std::uint32_t cidx = 0U; cidx < kScalpClumpCount; ++cidx) {
-        RootTriangleSample root = sample_triangle_surface(
-            in.scalp_triangles, cdf, in.body_positions, in.body_skin, rng);
+        RootTriangleSample root = sample_scalp_root();
+        if (!root.valid) {
+            continue;
+        }
 
         // Blue-noise best-of-4 repulsion for unstratified guides so guide coverage stays uniform
         if (cidx < 280U && !guides.empty()) {
@@ -714,8 +861,10 @@ void generate_scalp_groom(
             };
             float best_score = score_candidate(root.pos);
             for (int k_rep = 0; k_rep < 3; ++k_rep) {
-                const RootTriangleSample cand = sample_triangle_surface(
-                    in.scalp_triangles, cdf, in.body_positions, in.body_skin, rng);
+                const RootTriangleSample cand = sample_scalp_root();
+                if (!cand.valid) {
+                    continue;
+                }
                 const float sc = score_candidate(cand.pos);
                 if (sc > best_score) {
                     best_score = sc;
@@ -728,9 +877,8 @@ void generate_scalp_groom(
         if (in.hair_style != HairStyle::mohawk) {
             if (cidx >= 280U && cidx < 290U) {
                 for (int retry = 0; retry < 16; ++retry) {
-                    const RootTriangleSample cand = sample_triangle_surface(
-                        in.scalp_triangles, cdf, in.body_positions, in.body_skin, rng);
-                    if (std::abs(cand.pos.x - part_anchor.x) < 0.020F * s &&
+                    const RootTriangleSample cand = sample_scalp_root();
+                    if (cand.valid && std::abs(cand.pos.x - part_anchor.x) < 0.020F * s &&
                         cand.pos.z > head_c.z + 0.010F * s &&
                         cand.pos.y > in.eye_l.y + 0.054F * s) {
                         root = cand;
@@ -739,9 +887,8 @@ void generate_scalp_groom(
                 }
             } else if (cidx >= 290U && cidx < 298U) {
                 for (int retry = 0; retry < 16; ++retry) {
-                    const RootTriangleSample cand = sample_triangle_surface(
-                        in.scalp_triangles, cdf, in.body_positions, in.body_skin, rng);
-                    if (std::abs(cand.pos.x - part_anchor.x) < 0.026F * s &&
+                    const RootTriangleSample cand = sample_scalp_root();
+                    if (cand.valid && std::abs(cand.pos.x - part_anchor.x) < 0.026F * s &&
                         cand.pos.y > in.crown_y - 0.034F * s &&
                         cand.pos.z > head_c.z - 0.055F * s) {
                         root = cand;
@@ -750,18 +897,16 @@ void generate_scalp_groom(
                 }
             } else if (cidx >= 298U && cidx < 330U) {
                 for (int retry = 0; retry < 12; ++retry) {
-                    const RootTriangleSample cand = sample_triangle_surface(
-                        in.scalp_triangles, cdf, in.body_positions, in.body_skin, rng);
-                    if (cand.pos.y > in.eye_l.y + 0.050F * s) {
+                    const RootTriangleSample cand = sample_scalp_root();
+                    if (cand.valid && cand.pos.y > in.eye_l.y + 0.050F * s) {
                         root = cand;
                         break;
                     }
                 }
             } else if (cidx >= 330U) {
                 for (int retry = 0; retry < 14; ++retry) {
-                    const RootTriangleSample cand = sample_triangle_surface(
-                        in.scalp_triangles, cdf, in.body_positions, in.body_skin, rng);
-                    if (cand.pos.z > head_c.z + 0.015F * s &&
+                    const RootTriangleSample cand = sample_scalp_root();
+                    if (cand.valid && cand.pos.z > head_c.z + 0.015F * s &&
                         cand.pos.y > in.eye_l.y + 0.010F * s) {
                         root = cand;
                         break;
@@ -775,11 +920,10 @@ void generate_scalp_groom(
             root.pos.y < in.eye_l.y + 0.030F * s &&
             root.pos.z > head_c.z + 0.022F * s) {
             for (int retry = 0; retry < 12; ++retry) {
-                const RootTriangleSample cand = sample_triangle_surface(
-                    in.scalp_triangles, cdf, in.body_positions, in.body_skin, rng);
-                if (std::abs(cand.pos.x - head_c.x) <= 0.046F * s ||
+                const RootTriangleSample cand = sample_scalp_root();
+                if (cand.valid && (std::abs(cand.pos.x - head_c.x) <= 0.046F * s ||
                     cand.pos.y >= in.eye_l.y + 0.030F * s ||
-                    cand.pos.z <= head_c.z + 0.022F * s) {
+                    cand.pos.z <= head_c.z + 0.022F * s)) {
                     root = cand;
                     break;
                 }
@@ -790,9 +934,8 @@ void generate_scalp_groom(
         const bool in_crest = std::abs(root.pos.x - head_c.x) < 0.030F * s;
         if (in.hair_style == HairStyle::mohawk && !in_crest && (cidx % 5U != 0U)) {
             for (int retry = 0; retry < 12; ++retry) {
-                const RootTriangleSample cand = sample_triangle_surface(
-                    in.scalp_triangles, cdf, in.body_positions, in.body_skin, rng);
-                if (std::abs(cand.pos.x - head_c.x) < 0.030F * s) {
+                const RootTriangleSample cand = sample_scalp_root();
+                if (cand.valid && std::abs(cand.pos.x - head_c.x) < 0.030F * s) {
                     root = cand;
                     break;
                 }
@@ -800,7 +943,7 @@ void generate_scalp_groom(
         }
 
         GuideCurve g{};
-        g.segs = segs;
+        g.segs = guide_segs;
         g.root_normal = root.normal;
         g.skin = root.skin;
         g.is_pony_tail = false;
@@ -823,7 +966,8 @@ void generate_scalp_groom(
         const float front_factor =
             clamp_f((start.z - head_c.z) / std::max(0.04F, col.cranium_radii.z), -1.0F, 1.0F);
         const float back_grad = smoothstep_local(-front_factor, -0.05F, 0.65F);
-        const float bob_hem_y = in.chin_y + (0.006F + 0.026F * back_grad) * s;
+        const float bob_hem_y = start.y - settings.length *
+            (start.y - (in.chin_y + (0.006F + 0.026F * back_grad) * s));
         g.hem_y = bob_hem_y;
 
         if (in.hair_style == HairStyle::bob) {
@@ -844,7 +988,7 @@ void generate_scalp_groom(
         float length_m = 0.045F * s;
         if (in.hair_style == HairStyle::short_crop) {
             length_m = glm::mix(
-                0.0160F,
+                0.0070F,
                 0.026F + 0.009F * std::max(0.0F, front_factor),
                 short_top_blend) * s * rng.next_float(0.92F, 1.08F);
             g.half_w = 0.00068F * s;
@@ -876,21 +1020,27 @@ void generate_scalp_groom(
         } else if (in.hair_style == HairStyle::mohawk) {
             const bool crest = std::abs(start.x - head_c.x) < 0.032F * s;
             length_m = crest
-                ? (0.070F + 0.028F * std::max(0.0F, front_factor + 0.4F)) * s * rng.next_float(0.88F, 1.14F)
+                ? glm::mix(0.0095F, 0.070F + 0.028F * std::max(0.0F, front_factor + 0.4F),
+                    smoothstep_local(start.y - in.eye_l.y, -0.010F * s, 0.045F * s)) * s * rng.next_float(0.88F, 1.14F)
                 : 0.0095F * s * rng.next_float(0.85F, 1.15F);
             g.half_w = crest ? 0.00105F * s : 0.00072F * s;
             g.children = crest ? 10U : 5U;
             g.clump_radius = crest ? 0.0042F * s : 0.0038F * s;
         }
 
-        const float seg_len = length_m / static_cast<float>(segs);
+        if (in.hair_style != HairStyle::bob && in.hair_style != HairStyle::ponytail) {
+            length_m *= settings.length;
+        }
+        // Integrate at short steps so collision projection does not turn a 3 cm step into a crown spike.
+        // Only the guides use these substeps; the shipped ribbon vertex/index budget stays unchanged.
+        const float seg_len = length_m / static_cast<float>(guide_segs);
         glm::vec3 cur = start;
         glm::vec3 radial = safe_normalize(start - head_c, root.normal);
 
         // Crown whorl spiral component
         const glm::vec3 to_whorl = start - crown_whorl;
         const glm::vec3 swirl = safe_normalize(glm::vec3(-to_whorl.z, 0.0F, to_whorl.x), glm::vec3(1.0F, 0.0F, 0.0F));
-        const glm::vec3 surf_out0 = safe_normalize((start - head_c) / col.cranium_radii, root.normal);
+        const glm::vec3 surf_out0 = root.normal;
         glm::vec3 init_tang = glm::vec3(0.0F, -1.0F, 0.0F);
         if (in.hair_style == HairStyle::bob) {
             const float bridge_lat = is_part_bridge ? 0.22F : 0.34F;
@@ -900,9 +1050,8 @@ void generate_scalp_groom(
             init_tang = glm::vec3(lat_x * 0.54F, -0.78F, z_init);
         } else if (in.hair_style == HairStyle::short_crop) {
             const glm::vec3 temple_down(0.0F, -0.92F, -0.24F);
-            const glm::vec3 top_flow = (front_factor > 0.22F)
-                ? glm::vec3(short_sweep_x, 0.44F, 0.14F)
-                : glm::vec3(short_sweep_x * 0.75F, 0.08F, 0.58F);
+            // One continuous back-swept field: opposing front/crown flows form an artificial ridge.
+            const glm::vec3 top_flow(short_sweep_x, -0.05F, -0.80F);
             init_tang = glm::mix(temple_down, top_flow, short_top_blend);
         }
         init_tang -= surf_out0 * glm::dot(init_tang, surf_out0);
@@ -911,15 +1060,14 @@ void generate_scalp_groom(
             ? root.normal
             : safe_normalize(init_tang + surf_out0 * init_lift, glm::vec3(0.0F, -1.0F, 0.0F));
 
-        for (std::uint32_t k = 1U; k <= segs; ++k) {
-            const float tk = static_cast<float>(k) / static_cast<float>(segs);
-            const glm::vec3 surf_out = safe_normalize((cur - head_c) / col.cranium_radii, root.normal);
+        for (std::uint32_t k = 1U; k <= guide_segs; ++k) {
+            const float tk = static_cast<float>(k) / static_cast<float>(guide_segs);
+            const glm::vec3 surf_out = safe_normalize(
+                (cur - head_c) / (col.cranium_radii * col.cranium_radii), root.normal);
             glm::vec3 desired{};
             if (in.hair_style == HairStyle::short_crop) {
                 const glm::vec3 temple_down(0.0F, -0.92F, -0.24F);
-                const glm::vec3 top_flow = (front_factor > 0.22F)
-                    ? glm::vec3(short_sweep_x, 0.44F * (1.0F - 0.35F * tk), 0.14F - 0.26F * tk)
-                    : glm::vec3(short_sweep_x * 0.75F, 0.08F - 0.18F * tk, 0.58F * (1.0F - 0.25F * tk));
+                const glm::vec3 top_flow(short_sweep_x * (1.0F - 0.25F * tk), -0.05F, -0.80F);
                 const glm::vec3 base_flow = glm::mix(temple_down, top_flow, short_top_blend);
                 const float out_lift = (0.02F + 0.10F * short_top_blend) * (1.0F - tk * 0.65F);
                 glm::vec3 tang_flow = base_flow - surf_out * glm::dot(base_flow, surf_out);
@@ -989,7 +1137,7 @@ void generate_scalp_groom(
             if (in.hair_style == HairStyle::bob && cur.y < bob_hem_y - 0.008F * s) {
                 cur.y = bob_hem_y - 0.008F * s;
             }
-            prev_dir = step_dir;
+            prev_dir = safe_normalize(cur - g.pts[k - 1U], step_dir);
             g.pts[k] = cur;
         }
         guides.push_back(g);
@@ -1016,11 +1164,11 @@ void generate_scalp_groom(
             const float rad = std::sqrt(rng.next_float()) * 0.011F * s;
             glm::vec3 cur = pony_tie + glm::vec3(std::cos(ang) * rad, std::sin(ang) * rad, 0.0F);
             g.pts[0] = cur;
-            const float tail_len = (0.165F + rng.next_float(-0.025F, 0.030F)) * s;
-            const float step_len = tail_len / static_cast<float>(segs);
+            const float tail_len = (0.165F + rng.next_float(-0.025F, 0.030F)) * s * settings.length;
+            const float step_len = tail_len / static_cast<float>(guide_segs);
             const float tail_side = (cur.x - head_c.x >= 0.0F) ? 1.0F : -1.0F;
-            for (std::uint32_t k = 1U; k <= segs; ++k) {
-                const float tk = static_cast<float>(k) / static_cast<float>(segs);
+            for (std::uint32_t k = 1U; k <= guide_segs; ++k) {
+                const float tk = static_cast<float>(k) / static_cast<float>(guide_segs);
                 const float spread = 1.0F + 2.3F * smoothstep_local(tk, 0.05F, 0.65F);
                 const glm::vec3 swirl_off(
                     std::cos(ang + tk * 0.65F) * rad * spread * 0.18F,
@@ -1067,6 +1215,9 @@ void generate_scalp_groom(
         reserve_strands = 8500U;
     }
 
+    base_follicle_count = static_cast<std::uint32_t>(std::lround(static_cast<float>(base_follicle_count) * settings.density));
+    reserve_strands = static_cast<std::uint32_t>(std::ceil(static_cast<float>(reserve_strands) * settings.density)) +
+        static_cast<std::uint32_t>(in.scalp_triangles.size());
     out.vertices.reserve(out.vertices.size() + static_cast<std::size_t>(reserve_strands) * (segs + 1U) * 2U);
     out.skin_vertices.reserve(out.skin_vertices.size() + static_cast<std::size_t>(reserve_strands) * (segs + 1U) * 2U);
     out.indices.reserve(out.indices.size() + static_cast<std::size_t>(reserve_strands) * segs * 6U);
@@ -1074,8 +1225,19 @@ void generate_scalp_groom(
     const float sigma = 0.015F * s;
     const float inv_2sigma2 = 1.0F / (2.0F * sigma * sigma);
     std::vector<glm::vec3> strand_pts(segs + 1U);
+    const auto sample_guide = [&](const GuideCurve& g, const std::uint32_t point) {
+        const float t = static_cast<float>(point) / static_cast<float>(segs);
+        // Spend the existing segments on the curved root/crown; the hanging ends are almost straight.
+        const float sample = (long_style ? std::pow(t, 1.5F) : t) *
+            static_cast<float>(g.segs);
+        const auto i0 = std::min(static_cast<std::uint32_t>(sample), g.segs);
+        return glm::mix(g.pts[i0], g.pts[std::min(i0 + 1U, g.segs)], sample - static_cast<float>(i0));
+    };
 
     auto emit_interpolated_follicle = [&](const RootTriangleSample& foll) {
+        if (!foll.valid || rng.next_float() >= growth_weight(foll.pos)) {
+            return;
+        }
         const float abs_rx = std::abs(foll.pos.x - head_c.x);
         float temple_mask = 0.0F;
         if (in.hair_style == HairStyle::short_crop) {
@@ -1125,18 +1287,13 @@ void generate_scalp_groom(
         };
 
         for (std::uint32_t gi = 0U; gi < static_cast<std::uint32_t>(guides.size()); ++gi) {
-            if (guides[gi].is_pony_tail || guides[gi].group_id != foll_group) {
+            if (guides[gi].is_pony_tail || guides[gi].group_id != foll_group ||
+                glm::dot(guides[gi].root_normal, foll.normal) < 0.25F) {
                 continue;
             }
             consider_guide(gi);
         }
-        if (top_cnt == 0U) {
-            for (std::uint32_t gi = 0U; gi < static_cast<std::uint32_t>(guides.size()); ++gi) {
-                if (!guides[gi].is_pony_tail) {
-                    consider_guide(gi);
-                }
-            }
-        }
+        // Never bridge a part or borrow a guide from the other side of the skull.
         if (top_cnt == 0U) {
             return;
         }
@@ -1161,7 +1318,8 @@ void generate_scalp_groom(
             const float front_factor_f =
                 clamp_f((foll_root.z - head_c.z) / std::max(0.04F, col.cranium_radii.z), -1.0F, 1.0F);
             const float back_grad_f = smoothstep_local(-front_factor_f, -0.05F, 0.65F);
-            foll_hem_y = in.chin_y + (0.006F + 0.026F * back_grad_f) * s;
+            foll_hem_y = foll_root.y - settings.length *
+                (foll_root.y - (in.chin_y + (0.006F + 0.026F * back_grad_f) * s));
             float guide_drop = 0.0F;
             for (std::uint32_t slot = 0U; slot < top_cnt; ++slot) {
                 const GuideCurve& gg = guides[top_idx[slot]];
@@ -1179,7 +1337,7 @@ void generate_scalp_groom(
         glm::vec3 d1(0.0F);
         for (std::uint32_t slot = 0U; slot < top_cnt; ++slot) {
             const GuideCurve& gg = guides[top_idx[slot]];
-            d1 += w[slot] * (gg.pts[1] - gg.pts[0]);
+            d1 += w[slot] * (sample_guide(gg, 1U) - gg.pts[0]);
         }
         const glm::vec3 f_tang = safe_normalize(d1, foll.normal);
         const glm::vec3 f_u = safe_normalize(
@@ -1188,7 +1346,7 @@ void generate_scalp_groom(
         const glm::vec3 f_v = safe_normalize(glm::cross(f_tang, f_u), glm::vec3(0.0F, 0.0F, 1.0F));
 
         const float sp_ang = rng.next_float(0.0F, glm::two_pi<float>());
-        const bool is_flyaway = (long_style && rng.next_float() < 0.03F);
+        const bool is_flyaway = (long_style && rng.next_float() < settings.flyaways * 0.20F);
         const float max_spread = (in.hair_style == HairStyle::short_crop)
             ? 0.00085F * s
             : (is_flyaway ? 0.0036F * s : 0.0020F * s);
@@ -1198,14 +1356,18 @@ void generate_scalp_groom(
             ? static_cast<float>(foll_group)
             : ((foll_root.x - head_c.x >= 0.0F) ? 1.0F : -1.0F);
 
-        glm::vec3 raw_prev = foll_root;
-        glm::vec3 cur = foll_root;
+        glm::vec3 clump_offset(0.0F);
+        for (std::uint32_t slot = 0U; slot < top_cnt; ++slot) {
+            clump_offset += w[slot] * (guides[top_idx[slot]].pts[0] - foll_root);
+        }
+        // Keep root attachment and local emergence intact while converging toward guide bundles.
+        clump_offset -= foll.normal * glm::dot(clump_offset, foll.normal);
         for (std::uint32_t k = 1U; k <= segs; ++k) {
             const float tk = static_cast<float>(k) / static_cast<float>(segs);
             glm::vec3 delta(0.0F);
             for (std::uint32_t slot = 0U; slot < top_cnt; ++slot) {
                 const GuideCurve& gg = guides[top_idx[slot]];
-                delta += w[slot] * (gg.pts[k] - gg.pts[0]);
+                delta += w[slot] * (sample_guide(gg, k) - gg.pts[0]);
             }
             if (in.hair_style == HairStyle::bob) {
                 delta.y *= bob_y_scale;
@@ -1214,9 +1376,9 @@ void generate_scalp_groom(
                 delta *= len_scale;
             }
             const float wave = is_flyaway ? (std::sin(tk * 6.5F + sp_ang) * 0.0005F * s) : 0.0F;
-            const glm::vec3 raw_k = foll_root + delta + sp_dir * (sp_rad * (0.16F + 0.84F * tk) + wave);
-            cur += (raw_k - raw_prev);
-            raw_prev = raw_k;
+            glm::vec3 cur = foll_root + delta +
+                clump_offset * (settings.clumping * 0.45F * tk * tk) +
+                sp_dir * (sp_rad * smoothstep_local(tk, 0.0F, 1.0F) + wave * tk);
             const float extra_clear = (in.hair_style == HairStyle::bob)
                 ? (0.0010F + 0.0018F * smoothstep_local(tk, 0.15F, 0.85F))
                 : 0.0008F;
@@ -1232,10 +1394,18 @@ void generate_scalp_groom(
                 in.hair_style == HairStyle::ponytail) {
                 cur.y = std::min(cur.y, in.crown_y + 0.009F * s);
             }
+            if (!long_style && cur.z > col.eye_l.z - 0.024F * s &&
+                cur.y < col.eye_l.y + 0.020F * s && cur.y > col.eye_l.y - 0.088F * s &&
+                std::abs(cur.x - head_c.x) < 0.066F * s) {
+                // Short styles have no face-framing locks. Reject a guide that enters the
+                // facial aperture instead of turning its keepout projection into cheek whiskers.
+                return;
+            }
             const glm::vec3 seg_d = cur - strand_pts[k - 1U];
             const float seg_l = glm::length(seg_d);
-            if (seg_l > 0.042F * s) {
-                cur = strand_pts[k - 1U] + (seg_d / seg_l) * (0.030F * s);
+            if (seg_l > 0.060F * s || !std::isfinite(seg_l)) {
+                // A keepout correction must not become a long visible spike or be clipped back into skin.
+                return;
             }
             strand_pts[k] = cur;
         }
@@ -1265,7 +1435,7 @@ void generate_scalp_groom(
 
         const float twist_step = rng.next_float(0.30F, 0.32F);
         const float phase = -0.5F * static_cast<float>(segs) * twist_step + rng.next_float(-0.42F, 0.42F);
-        const float len_w = base_hw * rng.next_float(0.84F, 1.16F);
+        const float len_w = base_hw * settings.width * rng.next_float(0.84F, 1.16F);
         emit_twisted_ribbon_strand(
             strand_pts, cid, len_w, guides[chosen_g].tip_scale, phase, twist_step,
             head_c, foll.skin, nullptr, out);
@@ -1274,14 +1444,14 @@ void generate_scalp_groom(
 
     for_each_stratified_triangle_sample(
         in.scalp_triangles, cdf, in.body_positions, in.body_skin,
-        base_follicle_count, rng, emit_interpolated_follicle);
+        base_follicle_count, rng, emit_interpolated_follicle, scalp_normals);
 
     if (in.hair_style == HairStyle::bob) {
         std::uint32_t boosted = 0U;
-        constexpr std::uint32_t kPartBoostTarget = 2400U;
+        const std::uint32_t kPartBoostTarget = static_cast<std::uint32_t>(std::lround(2400.0F * settings.density));
         for (std::uint32_t draw = 0U; draw < kPartBoostTarget * 8U && boosted < kPartBoostTarget; ++draw) {
             const RootTriangleSample cand = sample_triangle_surface(
-                in.scalp_triangles, cdf, in.body_positions, in.body_skin, rng);
+                in.scalp_triangles, cdf, in.body_positions, in.body_skin, rng, scalp_normals);
             const bool near_part =
                 std::abs(cand.pos.x - part_anchor.x) < 0.036F * s &&
                 cand.pos.y > in.eye_l.y + 0.030F * s &&
@@ -1294,8 +1464,9 @@ void generate_scalp_groom(
                 cand.pos.y > in.eye_l.y + 0.010F * s &&
                 cand.pos.z > head_c.z - 0.015F * s;
             if (near_part || near_front_hairline || near_temple_curtain) {
+                const auto before = out.scalp_strand_count;
                 emit_interpolated_follicle(cand);
-                ++boosted;
+                boosted += out.scalp_strand_count - before;
             }
         }
     }
@@ -1315,14 +1486,15 @@ void generate_scalp_groom(
             const glm::vec3 g_v = safe_normalize(glm::cross(g_tang, g_u), glm::vec3(0.0F, 0.0F, 1.0F));
             const float tail_side = (g.pts[0].x - head_c.x >= 0.0F) ? 1.0F : -1.0F;
 
-            for (std::uint32_t si = 0U; si < g.children; ++si) {
+            const auto child_count = static_cast<std::uint32_t>(std::lround(static_cast<float>(g.children) * settings.density));
+            for (std::uint32_t si = 0U; si < child_count; ++si) {
                 const float ang = rng.next_float(0.0F, glm::two_pi<float>());
                 const float r_frac = std::sqrt(rng.next_float()) * g.clump_radius;
                 const glm::vec3 jitter_dir = g_u * std::cos(ang) + g_v * std::sin(ang);
-                for (std::uint32_t k = 0U; k <= g.segs; ++k) {
-                    const float tk = static_cast<float>(k) / static_cast<float>(g.segs);
+                for (std::uint32_t k = 0U; k <= segs; ++k) {
+                    const float tk = static_cast<float>(k) / static_cast<float>(segs);
                     const float clump_env = 0.35F + 0.85F * tk;
-                    glm::vec3 p = g.pts[k] + jitter_dir * (r_frac * clump_env);
+                    glm::vec3 p = g.pts[k * guide_substeps] + jitter_dir * (r_frac * clump_env);
                     if (k > 0U) {
                         collide_scalp_strand_point(p, col, 0.0008F, in.hair_style, tail_side);
                     }
@@ -1330,8 +1502,8 @@ void generate_scalp_groom(
                     strand_pts[k] = p;
                 }
                 const float twist_step = rng.next_float(0.30F, 0.32F);
-                const float phase = -0.5F * static_cast<float>(g.segs) * twist_step + rng.next_float(-0.42F, 0.42F);
-                const float len_w = g.half_w * rng.next_float(0.84F, 1.16F);
+                const float phase = -0.5F * static_cast<float>(segs) * twist_step + rng.next_float(-0.42F, 0.42F);
+                const float len_w = g.half_w * settings.width * rng.next_float(0.84F, 1.16F);
                 emit_twisted_ribbon_strand(
                     strand_pts, cid, len_w, g.tip_scale, phase, twist_step,
                     head_c, g.skin, &pony_tip_skin, out);
@@ -1786,17 +1958,72 @@ CharacterStrandGroomMesh build_strand_groom_impl(
     }
 
     const HeadColliderSdf col = build_head_collider(inputs);
-    SplitMix64 rng{};
-    rng.state = inputs.seed ^ 0x517cc1b727220a95ULL;
-
-    generate_scalp_groom(inputs, col, rng, emit_geometry, out);
-    generate_eyebrow_grooms(inputs, col, rng, emit_geometry, out);
-    generate_eyelash_grooms(inputs, col, rng, emit_geometry, out);
-    generate_beard_groom(inputs, col, rng, emit_geometry, out);
+    // Geometry-only child generation must not change other regions or their baked AO guides.
+    SplitMix64 scalp_rng{inputs.seed ^ 0x517cc1b727220a95ULL};
+    SplitMix64 brow_rng{inputs.seed ^ 0x72ad6b91c40385e7ULL};
+    SplitMix64 lash_rng{inputs.seed ^ 0xa47c19e6d25308bfULL};
+    SplitMix64 beard_rng{inputs.seed ^ 0x8e2059c47b16ad03ULL};
+    generate_scalp_groom(inputs, col, scalp_rng, emit_geometry, out);
+    generate_eyebrow_grooms(inputs, col, brow_rng, emit_geometry, out);
+    generate_eyelash_grooms(inputs, col, lash_rng, emit_geometry, out);
+    generate_beard_groom(inputs, col, beard_rng, emit_geometry, out);
     return out;
 }
 
 } // namespace
+
+float character_scalp_growth_weight(
+    const glm::vec3& pos,
+    const CharacterGender gender,
+    const glm::vec3& head_c,
+    const float eye_y,
+    const float neck_y,
+    const float hs) noexcept {
+    const float abs_x = std::abs(pos.x - head_c.x);
+    // Exclude full outer ear pinna bounds
+    if (abs_x > 0.0645F * hs &&
+        pos.y > eye_y - 0.052F * hs &&
+        pos.y < eye_y + 0.016F * hs &&
+        pos.z > head_c.z - 0.032F * hs &&
+        pos.z < head_c.z + 0.044F * hs) {
+        return 0.0F;
+    }
+    // Exclude lower cheek/jaw/neck below ear lobe
+    if (pos.y < eye_y - 0.052F * hs &&
+        (pos.z > head_c.z - 0.006F * hs || abs_x > 0.055F * hs)) {
+        return 0.0F;
+    }
+
+    const float front_z = head_c.z + 0.020F * hs;
+    const float nape_w = smoothstep_local(pos.y, neck_y + 0.038F * hs, neck_y + 0.056F * hs);
+
+    float cap_w = nape_w;
+    if (pos.z > front_z) {
+        const float blend_front = smoothstep_local(pos.z, front_z, front_z + 0.016F * hs);
+        float trichion_y = eye_y + 0.056F * hs;
+        if (gender == CharacterGender::female) {
+            const float x_norm = std::clamp(abs_x / (0.055F * hs), 0.0F, 1.2F);
+            trichion_y = eye_y + (0.054F + 0.004F * x_norm * x_norm) * hs;
+        } else {
+            const float temple_recess =
+                std::exp(-std::pow((abs_x - 0.036F * hs) / (0.015F * hs), 2.0F));
+            trichion_y = eye_y + (0.053F + 0.008F * temple_recess) * hs;
+        }
+        const float frontal_w = smoothstep_local(pos.y, trichion_y, trichion_y + 0.008F * hs);
+        const float temple_arch_y = glm::mix(
+            eye_y + 0.026F * hs,
+            eye_y - 0.002F * hs,
+            smoothstep_local(abs_x, 0.050F * hs, 0.064F * hs));
+        const float temple_w = smoothstep_local(pos.y, temple_arch_y, temple_arch_y + 0.009F * hs);
+        const float side_blend = smoothstep_local(abs_x, 0.047F * hs, 0.063F * hs);
+        const float front_profile = glm::mix(frontal_w, temple_w, side_blend);
+        cap_w = glm::mix(nape_w, front_profile, blend_front);
+    } else if (abs_x >= 0.054F * hs && pos.z > head_c.z - 0.012F * hs) {
+        const float temple_w = smoothstep_local(pos.y, eye_y - 0.006F * hs, eye_y + 0.006F * hs);
+        cap_w = (std::min)(cap_w, temple_w);
+    }
+    return std::clamp(cap_w, 0.0F, 1.0F);
+}
 
 CharacterStrandGroomMesh build_character_strand_groom_mesh(
     const CharacterGroomInputs& inputs) {

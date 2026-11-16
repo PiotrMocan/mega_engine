@@ -134,7 +134,7 @@
     "display_name": "Warden Kane",
     "prompt": "athletic ranger with sharp jaw and weathered skin",
     "role": "npc",
-    "seed": 1337,
+    "seed": 15679432875311680283,
     "slug": "warden_kane"
   },
   "paint_strokes": [],
@@ -162,12 +162,18 @@
       0.10999999940395355
     ],
     "footwear_style": "barefoot",
+    "hair_clumping": 0.3499999940395355,
     "hair_color": [
       0.12999999523162842,
       0.09000000357627869,
       0.05999999865889549
     ],
+    "hair_density": 1.0,
+    "hair_flyaways": 0.15000000596046448,
+    "hair_length": 1.0,
+    "hair_part": 0.25,
     "hair_style": "short_crop",
+    "hair_width": 1.0,
     "has_beard": true,
     "has_belt": false,
     "has_cape": false,

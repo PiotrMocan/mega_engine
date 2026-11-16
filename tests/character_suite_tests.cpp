@@ -1,5 +1,6 @@
 #include "character_ai_bridge.hpp"
 #include "character_package.hpp"
+#include "character_strand_groom.hpp"
 #include "character_wardrobe.hpp"
 #include "cooked_audio_asset.hpp"
 #include "cooked_model_asset.hpp"
@@ -397,6 +398,152 @@ bool test_female_and_male_templates_morphs_and_ai() {
                    "Cooked female character must reload full high-detail geometry");
     }
 
+    return true;
+}
+
+bool test_groom_root_masks_controls_and_region_stability() {
+    // Deliberately include triangles in front of the forehead and on the ear,
+    // plus one crossing the hairline: triangle-level filtering is insufficient.
+    const std::array<glm::vec3, 15U> positions{{
+        {-0.05F, 1.71F, -0.04F}, {0.0F, 1.72F, 0.04F}, {0.05F, 1.71F, -0.04F},
+        {-0.025F, 1.60F, 0.095F}, {0.025F, 1.60F, 0.095F}, {0.0F, 1.63F, 0.095F},
+        {-0.025F, 1.66F, 0.085F}, {0.025F, 1.66F, 0.085F}, {0.0F, 1.71F, 0.085F},
+        {0.080F, 1.61F, -0.01F}, {0.080F, 1.61F, 0.01F}, {0.080F, 1.63F, 0.0F},
+        {0.012F, 1.64F, 0.09F}, {0.030F, 1.645F, 0.087F}, {0.052F, 1.638F, 0.080F},
+    }};
+    std::array<vcr::CookedSkinVertex, positions.size()> skin{};
+    for (auto& sk : skin) {
+        sk.joints = {6U, 0U, 0U, 0U};
+        sk.weights = {1.0F, 0.0F, 0.0F, 0.0F};
+    }
+    vcr::CharacterGroomInputs in{};
+    in.head_center = {0.0F, 1.60F, 0.0F};
+    in.neck_center = {0.0F, 1.49F, 0.0F};
+    in.eye_l = {0.03F, 1.62F, 0.08F};
+    in.eye_r = {-0.03F, 1.62F, 0.08F};
+    in.crown_y = 1.72F;
+    in.chin_y = 1.49F;
+    in.body_positions = positions;
+    in.body_skin = skin;
+    VCR_EXPECT(vcr::character_scalp_growth_weight({0.08F, 1.61F, 0.03F}, in.gender,
+        in.head_center, in.eye_l.y, in.neck_center.y, in.head_scale) == 0.0F,
+        "Anterior ear surface must not receive scalp roots");
+    in.scalp_triangles = {{65535U, 1U, 2U}, {0U, 0U, 0U}, {0U, 1U, 2U},
+        {3U, 4U, 5U}, {6U, 7U, 8U}, {9U, 10U, 11U}};
+    in.landmark_chains[4] = {12U, 13U, 14U};
+    const auto full = vcr::build_character_strand_groom_mesh(in);
+    VCR_EXPECT(full.scalp_strand_count > 500U, "Valid scalp must retain coverage");
+    VCR_EXPECT(full.brow_strand_count > 0U, "Fixture must exercise facial groom stability");
+    constexpr std::size_t vertices_per_strand = 12U; // Short crop: five segments.
+    for (std::uint32_t strand = 0U; strand < full.scalp_strand_count; ++strand) {
+        const std::size_t first = static_cast<std::size_t>(strand) * vertices_per_strand;
+        const auto center_at = [&](const std::size_t point) {
+            const auto& a = full.vertices[first + point * 2U].position;
+            const auto& b = full.vertices[first + point * 2U + 1U].position;
+            return 0.5F * (glm::vec3(a[0], a[1], a[2]) + glm::vec3(b[0], b[1], b[2]));
+        };
+        const glm::vec3 root = center_at(0U);
+        VCR_EXPECT(root.y > 1.673F, "No scalp roots may appear on forehead or ear triangles");
+        if (root.z > 0.08F) {
+            VCR_EXPECT(root.y >= 1.674F, "Hairline-crossing triangles must be masked per follicle");
+        }
+        for (std::size_t k = 1U; k < 6U; ++k) {
+            const float len = glm::length(center_at(k) - center_at(k - 1U));
+            VCR_EXPECT(std::isfinite(len) && len <= 0.0601F, "No invalid or stretched scalp segments");
+        }
+    }
+    for (const auto index : full.indices) {
+        VCR_EXPECT(index < full.vertices.size(), "Groom indices must remain in bounds");
+    }
+    in.settings.density = 0.25F;
+    const auto sparse = vcr::build_character_strand_groom_mesh(in);
+    VCR_EXPECT(sparse.scalp_strand_count < full.scalp_strand_count / 2U,
+        "Density control must reduce actual geometry cost");
+    VCR_EXPECT(sparse.brow_strand_count == full.brow_strand_count, "Scalp budget must not affect brows");
+    const std::size_t full_face = static_cast<std::size_t>(full.scalp_strand_count) * vertices_per_strand;
+    const std::size_t sparse_face = static_cast<std::size_t>(sparse.scalp_strand_count) * vertices_per_strand;
+    VCR_EXPECT(full.vertices.size() - full_face == sparse.vertices.size() - sparse_face,
+        "Facial geometry must be independent of scalp density");
+    for (std::size_t i = 0U; i < full.vertices.size() - full_face; ++i) {
+        VCR_EXPECT(full.vertices[full_face + i].position == sparse.vertices[sparse_face + i].position,
+            "Changing scalp density must not rerandomize eyebrows");
+    }
+    in.scalp_triangles = {{3U, 4U, 5U}, {9U, 10U, 11U}};
+    const auto forbidden = vcr::build_character_strand_groom_mesh(in);
+    VCR_EXPECT(forbidden.scalp_strand_count == 0U, "No fallback may populate forbidden scalp zones");
+
+    auto pkg = vcr::make_default_character_package("groom_controls", "Groom Controls");
+    pkg.wardrobe.groom = {0.4F, 1.2F, 0.8F, 0.7F, 0.0F, -0.5F};
+    ScopedTempDir tmp("vcr_groom_controls");
+    std::string error;
+    const auto path = tmp.dir / "groom.vcrchar.json";
+    VCR_EXPECT(vcr::save_character_package_file(path, pkg, error), error);
+    vcr::CharacterPackage loaded{};
+    VCR_EXPECT(vcr::load_character_package_file(path, loaded, error), error);
+    const auto& g = loaded.wardrobe.groom;
+    VCR_EXPECT(g.density == 0.4F && g.length == 1.2F && g.width == 0.8F &&
+        g.clumping == 0.7F && g.flyaways == 0.0F && g.part == -0.5F,
+        "All groom controls must survive save/load");
+    loaded.wardrobe.groom = {std::numeric_limits<float>::quiet_NaN(), 100.0F, -1.0F,
+        std::numeric_limits<float>::infinity(), -5.0F, 50.0F};
+    vcr::sanitize_character_package(loaded);
+    const auto& clean = loaded.wardrobe.groom;
+    VCR_EXPECT(clean.density == 1.0F && clean.length == 1.4F && clean.width == 0.5F &&
+        clean.clumping == 0.35F && clean.flyaways == 0.0F && clean.part == 1.0F,
+        "Nonfinite/out-of-range groom controls must remain bounded");
+
+    // A deliberately broad cranium exposes the old inscribed-ellipsoid penetration.
+    std::vector<glm::vec3> sphere_positions;
+    std::vector<vcr::CookedSkinVertex> sphere_skin;
+    constexpr std::uint16_t longitude_count = 32U;
+    constexpr std::uint16_t latitude_count = 20U;
+    const glm::vec3 sphere_center(0.0F, 1.62F, 0.0F);
+    const glm::vec3 sphere_radii(0.10F, 0.10F, 0.12F);
+    in.scalp_triangles.clear();
+    for (std::uint16_t lat = 0U; lat <= latitude_count; ++lat) {
+        const float theta = 3.14159265F * static_cast<float>(lat) / latitude_count;
+        for (std::uint16_t lon = 0U; lon < longitude_count; ++lon) {
+            const float phi = 6.2831853F * static_cast<float>(lon) / longitude_count;
+            sphere_positions.push_back(sphere_center + sphere_radii *
+                glm::vec3(std::sin(theta) * std::cos(phi), std::cos(theta), std::sin(theta) * std::sin(phi)));
+            sphere_skin.push_back(skin[0]);
+            if (lat < latitude_count) {
+                const auto a = static_cast<std::uint16_t>(lat * longitude_count + lon);
+                const auto b = static_cast<std::uint16_t>(lat * longitude_count + (lon + 1U) % longitude_count);
+                const auto c = static_cast<std::uint16_t>(a + longitude_count);
+                const auto d = static_cast<std::uint16_t>(b + longitude_count);
+                in.scalp_triangles.push_back({a, b, c});
+                in.scalp_triangles.push_back({b, d, c});
+            }
+        }
+    }
+    in.head_triangles = in.scalp_triangles;
+    in.body_positions = sphere_positions;
+    in.body_skin = sphere_skin;
+    in.landmark_chains = {};
+    in.settings.density = 0.15F;
+    for (const auto style : {vcr::HairStyle::short_crop, vcr::HairStyle::bob,
+                            vcr::HairStyle::ponytail, vcr::HairStyle::spiky, vcr::HairStyle::mohawk}) {
+        in.hair_style = style;
+        const auto groom = vcr::build_character_strand_groom_mesh(in);
+        VCR_EXPECT(groom.scalp_strand_count > 0U, "Each scalp style must generate on a closed surface");
+        for (std::size_t i = 0U; i + 1U < groom.vertices.size(); i += 2U) {
+            const auto& a = groom.vertices[i];
+            const auto& b = groom.vertices[i + 1U];
+            const glm::vec3 p = 0.5F * (glm::vec3(a.position[0], a.position[1], a.position[2]) +
+                glm::vec3(b.position[0], b.position[1], b.position[2]));
+            VCR_EXPECT(std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z), "All groom points must be finite");
+            if (style != vcr::HairStyle::bob && style != vcr::HairStyle::ponytail && a.texcoord[1] < 0.97F) {
+                const bool in_face_aperture = p.z > in.eye_l.z - 0.024F &&
+                    p.y < in.eye_l.y + 0.020F && p.y > in.eye_l.y - 0.088F && std::abs(p.x) < 0.066F;
+                VCR_EXPECT(!in_face_aperture, "Short styles must not sprout projected locks on the cheeks");
+            }
+            if (a.texcoord[1] < 0.97F && p.y > in.eye_l.y + 0.05F) {
+                VCR_EXPECT(glm::length((p - sphere_center) / sphere_radii) > 0.985F,
+                    "Emergent crown fibers must stay outside the actual scalp, not only an inscribed ellipsoid");
+            }
+        }
+    }
     return true;
 }
 
@@ -2226,6 +2373,9 @@ bool test_production_wardrobe_geometry_materials_and_uv_isolation() {
 } // namespace
 
 int main() {
+    if (!test_groom_root_masks_controls_and_region_stability()) {
+        return 10;
+    }
     if (!test_non_destructive_handoff_and_foreign_fields()) {
         return 1;
     }

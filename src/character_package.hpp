@@ -225,6 +225,18 @@ struct CharacterPaintStroke {
     bool mirror_u = false;
 };
 
+struct CharacterGroomSettings {
+    float density = 1.0F;       // Relative strand budget, [0.15, 1.5].
+    float length = 1.0F;        // Relative style length, [0.6, 1.4].
+    float width = 1.0F;         // Relative ribbon width, [0.5, 1.5].
+    float clumping = 0.35F;     // Attraction toward compatible guides, [0, 1].
+    float flyaways = 0.15F;     // Fraction/strength of loose fibers, [0, 1].
+    float part = 0.25F;        // Lateral part position, [-1, 1].
+};
+
+[[nodiscard]] CharacterGroomSettings sanitize_character_groom_settings(
+    CharacterGroomSettings settings) noexcept;
+
 struct CharacterWardrobeSpec {
     TopGarmentStyle top_style = TopGarmentStyle::none;
     BottomGarmentStyle bottom_style = BottomGarmentStyle::none;
@@ -244,6 +256,7 @@ struct CharacterWardrobeSpec {
     glm::vec3 accent_color{0.82F, 0.64F, 0.28F};
     glm::vec3 footwear_color{0.14F, 0.12F, 0.11F};
     glm::vec3 hair_color{0.16F, 0.11F, 0.08F};
+    CharacterGroomSettings groom{};
     float top_thickness = 0.016F;
     float bottom_thickness = 0.014F;
     float wear_and_tear = 0.15F;

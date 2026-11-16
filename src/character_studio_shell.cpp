@@ -152,6 +152,36 @@ void apply_cli_preview_wardrobe_overrides(
             pkg.wardrobe.hair_style = *s;
         }
     }
+    if (const auto v = args.find_option("hair-density")) {
+        if (const auto value = parse_finite_float(*v)) {
+            pkg.wardrobe.groom.density = *value;
+        }
+    }
+    if (const auto v = args.find_option("hair-length")) {
+        if (const auto value = parse_finite_float(*v)) {
+            pkg.wardrobe.groom.length = *value;
+        }
+    }
+    if (const auto v = args.find_option("hair-width")) {
+        if (const auto value = parse_finite_float(*v)) {
+            pkg.wardrobe.groom.width = *value;
+        }
+    }
+    if (const auto v = args.find_option("hair-clumping")) {
+        if (const auto value = parse_finite_float(*v)) {
+            pkg.wardrobe.groom.clumping = *value;
+        }
+    }
+    if (const auto v = args.find_option("hair-flyaways")) {
+        if (const auto value = parse_finite_float(*v)) {
+            pkg.wardrobe.groom.flyaways = *value;
+        }
+    }
+    if (const auto v = args.find_option("hair-part")) {
+        if (const auto value = parse_finite_float(*v)) {
+            pkg.wardrobe.groom.part = *value;
+        }
+    }
     if (args.has_flag("no-hood")) {
         if (pkg.wardrobe.hair_style == HairStyle::hood) {
             pkg.wardrobe.hair_style = (pkg.body.gender == CharacterGender::female)
