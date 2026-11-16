@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -33,7 +34,28 @@ enum class CookedTextureColorSpace : std::uint8_t {
 
 enum class CookedTexturePixelFormat : std::uint8_t {
     rgba8_unorm,
+    bc7_unorm,
+    bc4_unorm,
 };
+
+[[nodiscard]] constexpr bool is_block_compressed_format(
+    const CookedTexturePixelFormat format) noexcept {
+    return format == CookedTexturePixelFormat::bc7_unorm ||
+        format == CookedTexturePixelFormat::bc4_unorm;
+}
+
+[[nodiscard]] constexpr std::uint32_t texture_block_byte_size(
+    const CookedTexturePixelFormat format) noexcept {
+    switch (format) {
+        case CookedTexturePixelFormat::rgba8_unorm:
+            return 4U;
+        case CookedTexturePixelFormat::bc7_unorm:
+            return 16U;
+        case CookedTexturePixelFormat::bc4_unorm:
+            return 8U;
+    }
+    return 0U;
+}
 
 struct CookedTextureAsset {
     std::filesystem::path metadata_relative_path{};
@@ -48,6 +70,9 @@ struct CookedTextureAsset {
     std::uint32_t width = 0U;
     std::uint32_t height = 0U;
     std::uint32_t row_stride_bytes = 0U;
+    std::uint32_t mip_levels = 1U;
+    std::vector<std::size_t> mip_byte_offsets{};
+    std::optional<std::array<float, 3U>> average_linear{};
     std::vector<std::uint8_t> pixels{};
 };
 
@@ -128,9 +153,10 @@ struct CookedTextureLoadOptions {
     std::size_t maximum_reference_bytes = 4096U;
 };
 
-// Loads an imported .vcrtexture.json and returns owned RGBA8 pixels.
+// Loads an imported .vcrtexture.json and returns owned pixel or block data.
 // JPEG/PNG data is decoded with Assimp's pinned stb_image copy; OpenEXR is
 // decoded through pinned OpenEXR, including DWA-compressed normal maps.
+// Pre-cooked .vcrtex containers supply BC7/BC4 blocks and mip levels directly.
 // Every referenced path remains beneath asset_root and symbolic links are
 // rejected.
 [[nodiscard]] CookedTextureLoadResult load_cooked_texture_asset(

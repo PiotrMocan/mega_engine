@@ -81,6 +81,9 @@ public:
     [[nodiscard]] bool sampler_anisotropy_enabled() const noexcept {
         return sampler_anisotropy_enabled_;
     }
+    [[nodiscard]] bool texture_compression_bc_enabled() const noexcept {
+        return texture_compression_bc_enabled_;
+    }
     [[nodiscard]] float max_sampler_anisotropy() const noexcept {
         return max_sampler_anisotropy_;
     }
@@ -101,6 +104,7 @@ private:
   bool tessellation_shader_enabled_ = false;
   bool independent_blend_enabled_ = false;
   bool sampler_anisotropy_enabled_ = false;
+  bool texture_compression_bc_enabled_ = false;
   float max_sampler_anisotropy_ = 1.0F;
   bool buffer_device_address_enabled_ = false;
   bool ray_query_supported_ = false;

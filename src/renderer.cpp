@@ -7,6 +7,7 @@
 #include "model_lod.hpp"
 #include "packed_model_vertex.hpp"
 #include "terrain_height.hpp"
+#include "texture_compression.hpp"
 #include "vulkan_common.hpp"
 
 #include <SDL3/SDL.h>
@@ -1303,11 +1304,35 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_texture(const Prepare
         error = "Texture exceeds the device's maximum image dimension";
         return std::nullopt;
     }
-    if (texture.width == 0U || texture.height == 0U ||
-        texture.row_stride_bytes != texture.width * 4U ||
-        texture.pixels.size() !=
-            static_cast<std::size_t>(texture.row_stride_bytes) *
-                texture.height) {
+    const bool block_compressed =
+        is_block_compressed_format(texture.pixel_format);
+    if (texture.width == 0U || texture.height == 0U) {
+        error = "Texture '" + cache_key + "' has zero dimensions.";
+        return std::nullopt;
+    }
+    if (block_compressed) {
+        if (!context_->texture_compression_bc_enabled()) {
+            error = "The selected GPU does not support BC texture compression.";
+            return std::nullopt;
+        }
+        std::vector<std::size_t> expected_offsets;
+        std::uint64_t expected_bytes = 0U;
+        if (!compute_bc_mip_layout(
+                texture.width,
+                texture.height,
+                texture.mip_levels,
+                texture.pixel_format,
+                expected_offsets,
+                expected_bytes) ||
+            texture.mip_byte_offsets != expected_offsets ||
+            texture.pixels.size() != expected_bytes) {
+            error = "Texture '" + cache_key + "' has an invalid compressed mip layout.";
+            return std::nullopt;
+        }
+    } else if (texture.row_stride_bytes != texture.width * 4U ||
+               texture.pixels.size() !=
+                   static_cast<std::size_t>(texture.row_stride_bytes) *
+                       texture.height) {
         error =
             "Texture '" + cache_key +
             "' did not decode to tightly packed RGBA8 pixels.";
@@ -1315,15 +1340,16 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_texture(const Prepare
     }
 
     const std::uint64_t base_bytes = texture.pixels.size();
-    if (base_bytes >
-        std::numeric_limits<VkDeviceSize>::max() / 2U) {
+    if (!block_compressed &&
+        base_bytes > std::numeric_limits<VkDeviceSize>::max() / 2U) {
         error = "Texture '" + cache_key + "' exceeds the GPU size range.";
         return std::nullopt;
     }
-    // A complete mip chain is less than 4/3 of the base image. The 2x
-    // bound keeps the accounting overflow-free and conservative.
-    const VkDeviceSize gpu_bytes =
-        static_cast<VkDeviceSize>(base_bytes * 2U);
+    // Uncompressed RGBA8 reserves 2x base bytes for its mip chain; compressed
+    // textures already include every mip level inside `texture.pixels`.
+    const VkDeviceSize gpu_bytes = block_compressed
+        ? static_cast<VkDeviceSize>(base_bytes)
+        : static_cast<VkDeviceSize>(base_bytes * 2U);
     if (gpu_bytes > maximum_single_editor_texture_gpu_bytes ||
         editor_texture_gpu_bytes_ >
             maximum_editor_texture_gpu_bytes - gpu_bytes) {
@@ -1333,10 +1359,22 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_texture(const Prepare
         return std::nullopt;
     }
 
-    const VkFormat format =
-        texture.color_space == CookedTextureColorSpace::srgb
-        ? VK_FORMAT_R8G8B8A8_SRGB
-        : VK_FORMAT_R8G8B8A8_UNORM;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    if (texture.pixel_format == CookedTexturePixelFormat::bc7_unorm) {
+        format = texture.color_space == CookedTextureColorSpace::srgb
+            ? VK_FORMAT_BC7_SRGB_BLOCK
+            : VK_FORMAT_BC7_UNORM_BLOCK;
+    } else if (texture.pixel_format == CookedTexturePixelFormat::bc4_unorm) {
+        if (texture.color_space == CookedTextureColorSpace::srgb) {
+            error = "BC4 texture '" + cache_key + "' cannot use sRGB color space.";
+            return std::nullopt;
+        }
+        format = VK_FORMAT_BC4_UNORM_BLOCK;
+    } else {
+        format = texture.color_space == CookedTextureColorSpace::srgb
+            ? VK_FORMAT_R8G8B8A8_SRGB
+            : VK_FORMAT_R8G8B8A8_UNORM;
+    }
     VkFormatProperties properties{};
     vkGetPhysicalDeviceFormatProperties(
         context_->physical_device(), format, &properties);
@@ -1347,16 +1385,16 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_texture(const Prepare
     if ((properties.optimalTilingFeatures & required_features) !=
         required_features) {
         error =
-            "The selected GPU cannot sample imported RGBA8 textures.";
+            "The selected GPU cannot sample the imported texture format.";
         return std::nullopt;
     }
     constexpr VkFormatFeatureFlags mip_features =
         VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
         VK_FORMAT_FEATURE_BLIT_SRC_BIT |
         VK_FORMAT_FEATURE_BLIT_DST_BIT;
-    const bool mipmaps_supported =
-        (properties.optimalTilingFeatures & mip_features) ==
-        mip_features;
+    const bool mipmaps_supported = block_compressed
+        ? (texture.mip_levels > 1U)
+        : ((properties.optimalTilingFeatures & mip_features) == mip_features);
 
     EditorTextureAsset gpu_texture{};
     gpu_texture.relative_path = cache_key;
@@ -1365,7 +1403,25 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_texture(const Prepare
     gpu_texture.color_space = texture.color_space;
     gpu_texture.gpu_bytes = gpu_bytes;
     std::uint32_t mip_levels = 1U;
-    if (mipmaps_supported) {
+    if (block_compressed) {
+        mip_levels = texture.mip_levels;
+        if (mip_levels > 1U) {
+            gpu_texture.texture.create_precomputed_mipmapped(
+                *context_,
+                texture.width,
+                texture.height,
+                mip_levels,
+                format,
+                "editor imported material texture");
+        } else {
+            gpu_texture.texture.create(
+                *context_,
+                texture.width,
+                texture.height,
+                format,
+                "editor imported material texture");
+        }
+    } else if (mipmaps_supported) {
         for (std::uint32_t extent =
                  std::max(texture.width, texture.height);
              extent > 1U;
@@ -1387,21 +1443,29 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_texture(const Prepare
             format,
             "editor imported material texture");
     }
-    const bool use_precomputed_mips =
-        mipmaps_supported &&
-        mip_levels > 1U &&
-        !prepared.mip_chain_rgba.empty() &&
-        prepared.mip_byte_offsets.size() == mip_levels;
-    const std::span<const std::uint8_t> upload_pixels = use_precomputed_mips
-        ? std::span<const std::uint8_t>{prepared.mip_chain_rgba}
-        : std::span<const std::uint8_t>{texture.pixels};
+    const bool use_precomputed_mips = block_compressed
+        ? (mip_levels > 1U)
+        : (mipmaps_supported &&
+           mip_levels > 1U &&
+           !prepared.mip_chain_rgba.empty() &&
+           prepared.mip_byte_offsets.size() == mip_levels);
+    const std::span<const std::uint8_t> upload_pixels = block_compressed
+        ? std::span<const std::uint8_t>{texture.pixels}
+        : (use_precomputed_mips
+              ? std::span<const std::uint8_t>{prepared.mip_chain_rgba}
+              : std::span<const std::uint8_t>{texture.pixels});
     const std::span<const std::size_t> precomputed_mips = use_precomputed_mips
-        ? std::span<const std::size_t>{prepared.mip_byte_offsets}
+        ? (block_compressed
+              ? std::span<const std::size_t>{texture.mip_byte_offsets}
+              : std::span<const std::size_t>{prepared.mip_byte_offsets})
         : std::span<const std::size_t>{};
+    const std::uint32_t upload_element_bytes = block_compressed
+        ? texture_block_byte_size(texture.pixel_format)
+        : 4U;
     upload_to_device_texture(
         gpu_texture.texture,
         std::as_bytes(upload_pixels),
-        4U,
+        upload_element_bytes,
         cache_key,
         precomputed_mips);
 
@@ -5892,25 +5956,41 @@ void Renderer::upload_to_device_texture(
     if (bytes_per_pixel == 0U) {
         fatal("Texture upload bytes-per-pixel must be non-zero.");
     }
+    const bool block_compressed =
+        destination.format() == VK_FORMAT_BC4_UNORM_BLOCK ||
+        destination.format() == VK_FORMAT_BC4_SNORM_BLOCK ||
+        destination.format() == VK_FORMAT_BC7_UNORM_BLOCK ||
+        destination.format() == VK_FORMAT_BC7_SRGB_BLOCK;
+    const auto compute_level_bytes = [&](const std::uint32_t lw, const std::uint32_t lh) -> std::uint64_t {
+        if (block_compressed) {
+            return ((static_cast<std::uint64_t>(lw) + 3ULL) / 4ULL) *
+                ((static_cast<std::uint64_t>(lh) + 3ULL) / 4ULL) *
+                bytes_per_pixel;
+        }
+        return static_cast<std::uint64_t>(lw) *
+            static_cast<std::uint64_t>(lh) *
+            bytes_per_pixel;
+    };
     const bool has_precomputed_mips =
         !precomputed_mip_offsets.empty() &&
         precomputed_mip_offsets.size() == destination.mip_levels() &&
         destination.mip_levels() > 1U &&
         destination.depth() == 1U;
-    std::uint64_t expected_bytes =
-        static_cast<std::uint64_t>(destination.width()) *
-        static_cast<std::uint64_t>(destination.height()) *
-        static_cast<std::uint64_t>(destination.depth()) *
-        bytes_per_pixel;
+    if (block_compressed && destination.mip_levels() > 1U && !has_precomputed_mips) {
+        fatal("Block-compressed mipmapped textures require precomputed mip levels.");
+    }
+    std::uint64_t expected_bytes = block_compressed
+        ? compute_level_bytes(destination.width(), destination.height())
+        : static_cast<std::uint64_t>(destination.width()) *
+            static_cast<std::uint64_t>(destination.height()) *
+            static_cast<std::uint64_t>(destination.depth()) *
+            bytes_per_pixel;
     if (has_precomputed_mips) {
         expected_bytes = 0ULL;
         std::uint32_t lw = destination.width();
         std::uint32_t lh = destination.height();
         for (std::uint32_t level = 0U; level < destination.mip_levels(); ++level) {
-            const std::uint64_t level_bytes =
-                static_cast<std::uint64_t>(lw) *
-                static_cast<std::uint64_t>(lh) *
-                bytes_per_pixel;
+            const std::uint64_t level_bytes = compute_level_bytes(lw, lh);
             if (precomputed_mip_offsets[level] > pixels.size_bytes() ||
                 level_bytes > pixels.size_bytes() - precomputed_mip_offsets[level]) {
                 fatal("Precomputed mipmap offset exceeds uploaded pixel buffer.");

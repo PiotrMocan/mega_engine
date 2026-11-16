@@ -442,28 +442,34 @@ PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,
             } else {
                 result.upload_bytes += decoded->pixels.size() + 256;
                 entry.texture = std::move(decoded).value();
-                if (!is_resident && build_mips_if_partial_alpha) {
+                if (!is_resident && build_mips_if_partial_alpha &&
+                    entry.texture->pixel_format == CookedTexturePixelFormat::rgba8_unorm) {
                     build_texture_mip_chain(
                         *entry.texture, alpha_cutoff, entry, result.upload_bytes);
                     applied_cutoff = alpha_cutoff;
                 }
-                const auto &pixels = entry.texture->pixels;
-                if (pixels.size() >= 4U) {
-                    glm::vec3 sum(0);
-                    const auto &lut = srgb_to_linear_lut();
-                    const bool is_srgb =
-                        entry.texture->color_space == CookedTextureColorSpace::srgb;
-                    const auto count = std::min<std::size_t>(1024, pixels.size() / 4);
-                    for (std::size_t sample = 0; sample < count; ++sample) {
-                        const auto offset = (sample * (pixels.size() / 4) / count) * 4;
-                        for (unsigned c = 0; c < 3; ++c) {
-                            const std::uint8_t byte_val = pixels[offset + c];
-                            sum[static_cast<int>(c)] += is_srgb
-                                ? lut[byte_val]
-                                : static_cast<float>(byte_val) / 255.0F;
+                if (entry.texture->average_linear.has_value()) {
+                    const auto &avg = *entry.texture->average_linear;
+                    entry.average_linear = glm::vec3(avg[0], avg[1], avg[2]);
+                } else if (entry.texture->pixel_format == CookedTexturePixelFormat::rgba8_unorm) {
+                    const auto &pixels = entry.texture->pixels;
+                    if (pixels.size() >= 4U) {
+                        glm::vec3 sum(0);
+                        const auto &lut = srgb_to_linear_lut();
+                        const bool is_srgb =
+                            entry.texture->color_space == CookedTextureColorSpace::srgb;
+                        const auto count = std::min<std::size_t>(1024, pixels.size() / 4);
+                        for (std::size_t sample = 0; sample < count; ++sample) {
+                            const auto offset = (sample * (pixels.size() / 4) / count) * 4;
+                            for (unsigned c = 0; c < 3; ++c) {
+                                const std::uint8_t byte_val = pixels[offset + c];
+                                sum[static_cast<int>(c)] += is_srgb
+                                    ? lut[byte_val]
+                                    : static_cast<float>(byte_val) / 255.0F;
+                            }
                         }
+                        entry.average_linear = sum / static_cast<float>(count);
                     }
-                    entry.average_linear = sum / static_cast<float>(count);
                 }
             }
             result.textures.push_back(std::move(entry));

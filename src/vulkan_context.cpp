@@ -589,6 +589,10 @@ void VulkanContext::create_device() {
         std::isfinite(properties_.limits.maxSamplerAnisotropy) &&
         properties_.limits.maxSamplerAnisotropy >= 1.0F;
     features2.features.samplerAnisotropy = sampler_anisotropy_enabled_ ? VK_TRUE : VK_FALSE;
+    texture_compression_bc_enabled_ =
+        supported2.features.textureCompressionBC == VK_TRUE;
+    features2.features.textureCompressionBC =
+        texture_compression_bc_enabled_ ? VK_TRUE : VK_FALSE;
     max_sampler_anisotropy_ = sampler_anisotropy_enabled_
         ? std::clamp(properties_.limits.maxSamplerAnisotropy, 1.0F, 16.0F)
         : 1.0F;
@@ -614,6 +618,9 @@ void VulkanContext::create_device() {
               << '\n'
               << "  hardware ray query: "
               << (ray_query_supported_ ? "enabled" : "unavailable")
+              << '\n'
+              << "  BC texture compression: "
+              << (texture_compression_bc_enabled_ ? "enabled" : "unavailable")
               << '\n'
               << "  sampler anisotropy: ";
     if (sampler_anisotropy_enabled_) {

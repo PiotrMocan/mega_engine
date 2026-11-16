@@ -30,6 +30,13 @@ public:
         std::uint32_t mip_levels,
         VkFormat format,
         std::string_view debug_name);
+    void create_precomputed_mipmapped(
+        VulkanContext& context,
+        std::uint32_t width,
+        std::uint32_t height,
+        std::uint32_t mip_levels,
+        VkFormat format,
+        std::string_view debug_name);
     void create_shadow_map(
         VulkanContext& context,
         std::uint32_t width,

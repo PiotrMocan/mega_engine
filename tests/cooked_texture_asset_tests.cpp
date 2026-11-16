@@ -1,5 +1,6 @@
 #include "cooked_texture_asset.hpp"
 #include "png_encoder.hpp"
+#include "texture_compression.hpp"
 
 #include <ImfHeader.h>
 #include <ImfRgbaFile.h>
@@ -497,6 +498,110 @@ int main() {
                 symlinked.error().code ==
                     vcr::CookedTextureLoadErrorCode::symbolic_link,
             "texture source symlink is rejected");
+    }
+
+    // Compressed .vcrtex BC7 (sRGB with partial alpha) and BC4 (linear displacement) tests.
+    {
+        vcr::CookedTextureAsset src_bc7{};
+        src_bc7.semantic = vcr::CookedTextureSemantic::base_color;
+        src_bc7.color_space = vcr::CookedTextureColorSpace::srgb;
+        src_bc7.pixel_format = vcr::CookedTexturePixelFormat::rgba8_unorm;
+        src_bc7.width = 6U;
+        src_bc7.height = 5U;
+        src_bc7.row_stride_bytes = 24U;
+        src_bc7.pixels.resize(6U * 5U * 4U);
+        for (std::size_t i = 0U; i < 6U * 5U; ++i) {
+            src_bc7.pixels[i * 4U + 0U] = 40U;
+            src_bc7.pixels[i * 4U + 1U] = 180U;
+            src_bc7.pixels[i * 4U + 2U] = 90U;
+            src_bc7.pixels[i * 4U + 3U] = (i % 2U == 0U) ? 230U : 30U;
+        }
+        std::vector<std::uint8_t> vcrtex_bc7;
+        std::uint32_t mips = 0U;
+        std::string cook_error;
+        expect(
+            vcr::cook_texture_to_vcrtex(
+                src_bc7,
+                0.5F,
+                vcr::CookedTexturePixelFormat::bc7_unorm,
+                vcrtex_bc7,
+                mips,
+                cook_error),
+            "NPOT BC7 texture cooks cleanly: " + cook_error);
+        expect(mips == 3U, "6x5 texture produces 3 mip levels");
+        expect(write_bytes(textures / "albedo.vcrtex", vcrtex_bc7), "BC7 .vcrtex written");
+        Json bc7_meta = texture_metadata("albedo", "textures/albedo.vcrtex", "base_color", "srgb");
+        bc7_meta.erase("decode");
+        bc7_meta["storage"] = "bc7";
+        expect(write_json(textures / "albedo_bc7.vcrtexture.json", bc7_meta), "BC7 meta written");
+        const auto loaded_bc7 = vcr::load_cooked_texture_asset(
+            asset_root, "painted/textures/albedo_bc7.vcrtexture.json");
+        expect(static_cast<bool>(loaded_bc7), "BC7 .vcrtex loads cleanly");
+        if (loaded_bc7) {
+            expect(
+                loaded_bc7->pixel_format == vcr::CookedTexturePixelFormat::bc7_unorm &&
+                    loaded_bc7->width == 6U && loaded_bc7->height == 5U &&
+                    loaded_bc7->mip_levels == 3U,
+                "BC7 metadata & mip count match");
+            std::vector<std::uint8_t> unpacked;
+            std::string unpack_err;
+            expect(
+                vcr::decode_bc_mip0_to_rgba8(*loaded_bc7, unpacked, unpack_err) &&
+                    unpacked.size() == 6U * 5U * 4U &&
+                    close_byte(unpacked[0], 40U, 16U) &&
+                    close_byte(unpacked[1], 180U, 16U) &&
+                    close_byte(unpacked[3], 230U, 20U),
+                "BC7 mip0 unpacks back to expected RGBA values");
+        }
+
+        auto truncated = vcrtex_bc7;
+        truncated.pop_back();
+        expect(write_bytes(textures / "truncated.vcrtex", truncated), "truncated .vcrtex written");
+        Json trunc_meta = bc7_meta;
+        trunc_meta["source"] = "textures/truncated.vcrtex";
+        expect(write_json(textures / "truncated_bc7.vcrtexture.json", trunc_meta), "trunc meta written");
+        const auto loaded_trunc = vcr::load_cooked_texture_asset(
+            asset_root, "painted/textures/truncated_bc7.vcrtexture.json");
+        expect(!loaded_trunc, "truncated .vcrtex is rejected");
+
+        vcr::CookedTextureAsset src_bc4{};
+        src_bc4.semantic = vcr::CookedTextureSemantic::displacement;
+        src_bc4.color_space = vcr::CookedTextureColorSpace::linear;
+        src_bc4.pixel_format = vcr::CookedTexturePixelFormat::rgba8_unorm;
+        src_bc4.width = 8U;
+        src_bc4.height = 8U;
+        src_bc4.row_stride_bytes = 32U;
+        src_bc4.pixels.resize(8U * 8U * 4U);
+        for (std::size_t i = 0U; i < 64U; ++i) {
+            src_bc4.pixels[i * 4U + 0U] = static_cast<std::uint8_t>(i * 4U);
+            src_bc4.pixels[i * 4U + 1U] = 0U;
+            src_bc4.pixels[i * 4U + 2U] = 0U;
+            src_bc4.pixels[i * 4U + 3U] = 255U;
+        }
+        std::vector<std::uint8_t> vcrtex_bc4;
+        std::uint32_t bc4_mips = 0U;
+        expect(
+            vcr::cook_texture_to_vcrtex(
+                src_bc4,
+                0.0F,
+                vcr::CookedTexturePixelFormat::bc4_unorm,
+                vcrtex_bc4,
+                bc4_mips,
+                cook_error),
+            "BC4 displacement texture cooks cleanly: " + cook_error);
+        expect(bc4_mips == 4U, "8x8 texture produces 4 mip levels");
+        expect(write_bytes(textures / "disp.vcrtex", vcrtex_bc4), "BC4 .vcrtex written");
+        Json bc4_meta = texture_metadata("disp", "textures/disp.vcrtex", "displacement", "linear");
+        bc4_meta.erase("decode");
+        bc4_meta["storage"] = "bc4";
+        expect(write_json(textures / "disp_bc4.vcrtexture.json", bc4_meta), "BC4 meta written");
+        const auto loaded_bc4 = vcr::load_cooked_texture_asset(
+            asset_root, "painted/textures/disp_bc4.vcrtexture.json");
+        expect(
+            static_cast<bool>(loaded_bc4) &&
+                loaded_bc4->pixel_format == vcr::CookedTexturePixelFormat::bc4_unorm &&
+                loaded_bc4->mip_levels == 4U,
+            "BC4 .vcrtex loads cleanly");
     }
 
     if (failures != 0) {

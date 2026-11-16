@@ -3,6 +3,7 @@
 #include "cooked_audio_asset.hpp"
 #include "cooked_model_asset.hpp"
 #include "cooked_texture_asset.hpp"
+#include "texture_compression.hpp"
 #include "cutscene_sequencer.hpp"
 #include "game_overlay.hpp"
 #include "localization.hpp"
@@ -14,11 +15,14 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cwctype>
 #include <fstream>
 #include <limits>
 #include <system_error>
+#include <thread>
+#include <unordered_map>
 
 namespace vcr {
 namespace {
@@ -163,10 +167,17 @@ private:
     return true;
 }
 
+struct PendingTextureCook {
+    std::filesystem::path rel{};
+    std::string name{};
+    Json doc{};
+};
+
 [[nodiscard]] bool copy_game_content(
     const std::filesystem::path& root, const std::filesystem::path& target,
     std::size_t& textures, std::string& error) {
     std::size_t file_count = 0U;
+    std::vector<PendingTextureCook> pending_textures;
     std::vector<std::filesystem::path> models;
     std::vector<std::filesystem::path> scenes;
     std::vector<std::filesystem::path> fonts;
@@ -230,23 +241,12 @@ private:
                 }
             }
             if (texture) {
-                const auto cooked = load_cooked_texture_asset(root, rel);
-                if (!cooked) {
-                    error = "Texture cook failed for '" + name + "': " + cooked.error().message;
-                    return false;
-                }
-                auto payload = rel;
-                payload += ".rgba8";
-                auto package = rel.parent_path();
-                if (package.filename() == "textures") package = package.parent_path();
-                doc["source"] = utf8(payload.lexically_relative(package));
-                doc.erase("decode");
-                doc["storage"] = "rgba8";
-                doc["dimensions"] = {cooked->width, cooked->height};
-                if (!write_bytes(target / payload,
-                        reinterpret_cast<const char*>(cooked->pixels.data()),
-                        cooked->pixels.size(), error)) return false;
-                ++textures;
+                pending_textures.push_back(PendingTextureCook{
+                    .rel = rel,
+                    .name = name,
+                    .doc = std::move(doc),
+                });
+                continue;
             } else if (audio) {
                 std::filesystem::path resolved, relative;
                 std::string audio_name;
@@ -303,6 +303,111 @@ private:
             if (model) models.push_back(rel);
             if (scene) scenes.push_back(rel);
         }
+    }
+    if (!pending_textures.empty()) {
+        std::unordered_map<std::string, float> alpha_cutoffs;
+        for (const auto& model : models) {
+            const auto loaded = load_cooked_model_asset(root, model);
+            if (!loaded) {
+                continue;
+            }
+            for (const auto& material : loaded->materials) {
+                if ((material.coverage & material_coverage_alpha_mask_bit) == 0U ||
+                    !material.base_color_texture.has_value()) {
+                    continue;
+                }
+                const std::uint32_t packed_cutoff = material.coverage >> 16U;
+                const float cutoff = packed_cutoff > 0U
+                    ? static_cast<float>(packed_cutoff) / 65535.0F
+                    : 0.5F;
+                const auto key = material.base_color_texture->lexically_normal().generic_string();
+                const auto [it, inserted] = alpha_cutoffs.try_emplace(key, cutoff);
+                if (!inserted) {
+                    it->second = std::min(it->second, cutoff);
+                }
+            }
+        }
+        // Create all texture target directories before worker threads run so
+        // concurrent writes never race on directory creation.
+        for (const auto& item : pending_textures) {
+            std::filesystem::create_directories((target / item.rel).parent_path());
+        }
+        const unsigned hw_threads = std::thread::hardware_concurrency();
+        const std::size_t worker_count = std::min<std::size_t>(
+            pending_textures.size(),
+            std::max<std::size_t>(1U, hw_threads == 0U ? 4U : hw_threads));
+        std::atomic<std::size_t> next_index{0U};
+        std::vector<std::string> worker_errors(worker_count);
+        {
+            std::vector<std::jthread> workers;
+            workers.reserve(worker_count);
+            for (std::size_t worker_id = 0U; worker_id < worker_count; ++worker_id) {
+                workers.emplace_back([&, worker_id]() {
+                    std::vector<std::uint8_t> vcrtex_bytes;
+                    std::string local_error;
+                    for (;;) {
+                        const std::size_t idx = next_index.fetch_add(1U, std::memory_order_relaxed);
+                        if (idx >= pending_textures.size()) {
+                            return;
+                        }
+                        const auto& item = pending_textures[idx];
+                        const auto cooked = load_cooked_texture_asset(root, item.rel);
+                        if (!cooked) {
+                            worker_errors[worker_id] =
+                                "Texture cook failed for '" + item.name + "': " + cooked.error().message;
+                            next_index.store(pending_textures.size(), std::memory_order_relaxed);
+                            return;
+                        }
+                        const auto tex_key = item.rel.lexically_normal().generic_string();
+                        const auto cutoff_it = alpha_cutoffs.find(tex_key);
+                        const float alpha_cutoff =
+                            cutoff_it != alpha_cutoffs.end() ? cutoff_it->second : 0.0F;
+                        const CookedTexturePixelFormat target_format =
+                            select_shipped_texture_format(cooked->semantic);
+                        std::uint32_t mip_levels = 0U;
+                        if (!cook_texture_to_vcrtex(
+                                *cooked,
+                                alpha_cutoff,
+                                target_format,
+                                vcrtex_bytes,
+                                mip_levels,
+                                local_error)) {
+                            worker_errors[worker_id] =
+                                "Texture cook failed for '" + item.name + "': " + local_error;
+                            next_index.store(pending_textures.size(), std::memory_order_relaxed);
+                            return;
+                        }
+                        auto payload = item.rel;
+                        payload += ".vcrtex";
+                        auto package = item.rel.parent_path();
+                        if (package.filename() == "textures") package = package.parent_path();
+                        Json doc = item.doc;
+                        doc["source"] = utf8(payload.lexically_relative(package));
+                        doc.erase("decode");
+                        doc["storage"] = target_format == CookedTexturePixelFormat::bc4_unorm
+                            ? "bc4"
+                            : "bc7";
+                        doc["dimensions"] = {cooked->width, cooked->height};
+                        doc["mip_levels"] = mip_levels;
+                        if (!write_bytes(target / payload,
+                                reinterpret_cast<const char*>(vcrtex_bytes.data()),
+                                vcrtex_bytes.size(), local_error) ||
+                            !write_json(target / item.rel, doc, local_error)) {
+                            worker_errors[worker_id] = std::move(local_error);
+                            next_index.store(pending_textures.size(), std::memory_order_relaxed);
+                            return;
+                        }
+                    }
+                });
+            }
+        }
+        for (const auto& worker_err : worker_errors) {
+            if (!worker_err.empty()) {
+                error = worker_err;
+                return false;
+            }
+        }
+        textures += pending_textures.size();
     }
     // Validate against exported content, so accidentally excluded dependencies
     // cannot be satisfied by files left in the authoring project.

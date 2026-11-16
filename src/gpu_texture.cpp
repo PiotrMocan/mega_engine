@@ -86,6 +86,30 @@ void GpuTexture::create_mipmapped(
         debug_name);
 }
 
+void GpuTexture::create_precomputed_mipmapped(
+    VulkanContext& context,
+    const std::uint32_t width,
+    const std::uint32_t height,
+    const std::uint32_t mip_levels,
+    const VkFormat format,
+    const std::string_view debug_name) {
+    create_impl(
+        context,
+        width,
+        height,
+        mip_levels,
+        format,
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+            VK_IMAGE_USAGE_SAMPLED_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        VK_FILTER_LINEAR,
+        VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        VK_FALSE,
+        VK_COMPARE_OP_ALWAYS,
+        VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK,
+        debug_name);
+}
+
 void GpuTexture::create_shadow_map(
     VulkanContext& context,
     const std::uint32_t width,

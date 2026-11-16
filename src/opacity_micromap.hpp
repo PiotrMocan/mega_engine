@@ -2,6 +2,7 @@
 
 #include "cooked_model_asset.hpp"
 #include "cooked_texture_asset.hpp"
+#include "texture_compression.hpp"
 
 #include <glm/vec2.hpp>
 
@@ -162,10 +163,24 @@ inline constexpr std::uint32_t rt_max_masked_triangle_capacity = 16'000'000U;
 // row order uploaded to VkImage so inline rayQueryEXT evaluates texel-accurate
 // bilinear alpha cutouts for needles, leaves, and fences at all distances.
 [[nodiscard]] inline std::vector<std::uint32_t> pack_alpha_r8_1024_words(
-    const CookedTextureAsset& texture) {
-    if (texture.width == 0U || texture.height == 0U || texture.pixels.empty()) {
+    const CookedTextureAsset& input_texture) {
+    if (input_texture.width == 0U || input_texture.height == 0U || input_texture.pixels.empty()) {
         return {};
     }
+    CookedTextureAsset decoded_rgba8;
+    const CookedTextureAsset* texture_ptr = &input_texture;
+    if (input_texture.pixel_format != CookedTexturePixelFormat::rgba8_unorm) {
+        std::string decode_error;
+        if (!decode_bc_mip0_to_rgba8(input_texture, decoded_rgba8.pixels, decode_error)) {
+            return {};
+        }
+        decoded_rgba8.width = input_texture.width;
+        decoded_rgba8.height = input_texture.height;
+        decoded_rgba8.row_stride_bytes = input_texture.width * 4U;
+        decoded_rgba8.pixel_format = CookedTexturePixelFormat::rgba8_unorm;
+        texture_ptr = &decoded_rgba8;
+    }
+    const CookedTextureAsset& texture = *texture_ptr;
     const std::size_t stride = texture.row_stride_bytes >= texture.width * 4U
         ? static_cast<std::size_t>(texture.row_stride_bytes)
         : static_cast<std::size_t>(texture.width) * 4ULL;

@@ -1,4 +1,5 @@
 #include "cooked_texture_asset.hpp"
+#include "texture_compression.hpp"
 
 #include <ImfRgbaFile.h>
 #include <ImfStdIO.h>
@@ -811,13 +812,17 @@ parse_color_space(const std::string_view value) {
     const bool deferred =
         json_string(metadata, "decode", 32U, decode) &&
         decode == "deferred";
-    const bool raw_rgba8 =
-        json_string(metadata, "storage", 32U, storage) &&
-        storage == "rgba8";
-    if (deferred == raw_rgba8) {
+    const bool has_storage = json_string(metadata, "storage", 32U, storage);
+    const bool raw_rgba8 = has_storage && storage == "rgba8";
+    const bool compressed_bc7 = has_storage && storage == "bc7";
+    const bool compressed_bc4 = has_storage && storage == "bc4";
+    const bool cooked_storage = raw_rgba8 || compressed_bc7 || compressed_bc4;
+
+
+    if (deferred == cooked_storage || (has_storage && !cooked_storage)) {
         return fail(
             CookedTextureLoadErrorCode::unsupported_schema,
-            "Texture metadata must select deferred decode or raw RGBA8 storage.",
+            "Texture metadata must select deferred decode, raw RGBA8, or BC7/BC4 storage.",
             metadata_file.absolute);
     }
     const auto semantic = parse_semantic(usage);
@@ -878,6 +883,34 @@ parse_color_space(const std::string_view value) {
     };
     const std::string extension =
         lowercase_extension(source_file.relative);
+    if (compressed_bc7 || compressed_bc4) {
+        if (extension != ".vcrtex") {
+            return fail(
+                CookedTextureLoadErrorCode::unsupported_format,
+                "Compressed BC7/BC4 textures must reference a .vcrtex file.",
+                source_file.relative);
+        }
+        std::vector<std::uint8_t> file_bytes;
+        if (auto error = read_file(source_file, file_bytes)) {
+            return CookedTextureLoadResult(std::move(*error));
+        }
+        const CookedTexturePixelFormat expected_format = compressed_bc7
+            ? CookedTexturePixelFormat::bc7_unorm
+            : CookedTexturePixelFormat::bc4_unorm;
+        std::string vcrtex_error;
+        if (!decode_vcrtex_bytes(
+                file_bytes,
+                expected_format,
+                options,
+                asset,
+                vcrtex_error)) {
+            return fail(
+                CookedTextureLoadErrorCode::decode_failed,
+                std::move(vcrtex_error),
+                source_file.absolute);
+        }
+        return CookedTextureLoadResult(std::move(asset));
+    }
     if (raw_rgba8) {
         const auto dimensions = metadata.find("dimensions");
         if (extension != ".rgba8" ||

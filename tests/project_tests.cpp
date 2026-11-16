@@ -504,7 +504,9 @@ void test_shipping_runtime_content_and_rollback() {
     const auto texture_rel = "starter/flat_plane/textures/grid_floor.vcrtexture.json";
     const auto texture = vcr::load_cooked_texture_asset(destination / "assets", texture_rel);
     REQUIRE_MSG(static_cast<bool>(texture), texture ? "" : texture.error().message);
-    REQUIRE(texture->source_relative_path.extension() == ".rgba8");
+    REQUIRE(texture->source_relative_path.extension() == ".vcrtex");
+    REQUIRE(texture->pixel_format == vcr::CookedTexturePixelFormat::bc7_unorm);
+    REQUIRE(texture->mip_levels == 8U);
     REQUIRE(texture->width == 128U && texture->height == 128U);
     REQUIRE(!std::filesystem::exists(destination / "assets/starter/flat_plane/textures/grid_floor.png"));
     REQUIRE(std::filesystem::is_regular_file(project / "assets/starter/flat_plane/textures/grid_floor.png"));

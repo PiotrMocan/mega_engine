@@ -167,6 +167,11 @@ FetchContent_Declare(
     GIT_TAG 0.11.25
     GIT_SHALLOW TRUE
 )
+FetchContent_Declare(
+    bc7enc_rdo
+    GIT_REPOSITORY https://github.com/richgel999/bc7enc_rdo.git
+    GIT_TAG b9438627eef73a1157e84201b6fa6eb2ffd6d9f0
+)
 if(WIN32 AND MSVC)
     FetchContent_Declare(
         FidelityFXSDK
@@ -197,6 +202,10 @@ endif()
 FetchContent_GetProperties(miniaudio)
 if(NOT miniaudio_POPULATED)
     FetchContent_Populate(miniaudio)
+endif()
+FetchContent_GetProperties(bc7enc_rdo)
+if(NOT bc7enc_rdo_POPULATED)
+    FetchContent_Populate(bc7enc_rdo)
 endif()
 
 # v1.92.8 stores the first secondary viewport's VkFormat address in the
@@ -381,6 +390,21 @@ target_link_libraries(vcr_imgui PUBLIC
 
 find_package(Threads REQUIRED)
 
+add_library(vcr_bc7enc STATIC
+    "${bc7enc_rdo_SOURCE_DIR}/bc7enc.cpp"
+    "${bc7enc_rdo_SOURCE_DIR}/bc7decomp.cpp"
+    "${bc7enc_rdo_SOURCE_DIR}/rgbcx.cpp"
+)
+target_include_directories(vcr_bc7enc SYSTEM PUBLIC
+    "${bc7enc_rdo_SOURCE_DIR}"
+)
+set_source_files_properties(
+    "${bc7enc_rdo_SOURCE_DIR}/bc7enc.cpp"
+    "${bc7enc_rdo_SOURCE_DIR}/bc7decomp.cpp"
+    "${bc7enc_rdo_SOURCE_DIR}/rgbcx.cpp"
+    PROPERTIES COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:MSVC>,/W0,-w>"
+)
+
 set(VCR_ENGINE_CORE_SOURCES
     src/miniaudio_impl.c
     src/cooked_audio_asset.cpp
@@ -389,6 +413,7 @@ set(VCR_ENGINE_CORE_SOURCES
     src/cooked_model_asset.cpp
     src/skeletal_animation.cpp
     src/cooked_texture_asset.cpp
+    src/texture_compression.cpp
     src/png_encoder.cpp
     src/icon_system.cpp
     src/model_lod.cpp
@@ -477,6 +502,7 @@ target_link_libraries(vcr_engine
     PRIVATE
         OpenEXR::OpenEXR
         meshoptimizer
+        vcr_bc7enc
 )
 if(WIN32)
     target_link_libraries(vcr_engine PRIVATE shell32 winhttp)
