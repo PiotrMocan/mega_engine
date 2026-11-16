@@ -348,9 +348,11 @@ private:
     void handle_sdl_event(
         const SDL_Event& event,
         ICharacterStudioTool& tool);
-    void render_gui_frame(
+    bool render_gui_frame(
         ICharacterStudioTool& tool,
-        float dt_seconds);
+        float dt_seconds,
+        std::chrono::steady_clock::time_point frame_begin,
+        bool cooked_before_ui);
 
     void draw_top_toolbar(
         ICharacterStudioTool& tool,

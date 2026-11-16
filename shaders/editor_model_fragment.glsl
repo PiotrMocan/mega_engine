@@ -111,17 +111,60 @@ vec3 sampleWorldNormal(vec2 uvDx, vec2 uvDy)
 void main()
 {
     // Derivatives after nonuniform discard are undefined. All material maps
-    // share authored UVs, so compute their gradients before applying coverage.
+    // share authored UVs and surface/tangent variance gradients must execute
+    // before any coverage discard so helper invocations remain valid.
     const vec2 rawUvDx = dFdx(inUv);
     const vec2 rawUvDy = dFdy(inUv);
-    const bool seamX = dot(rawUvDx, rawUvDx) > 0.0036;
-    const bool seamY = dot(rawUvDy, rawUvDy) > 0.0036;
-    const vec2 uvDx = seamX
-        ? (seamY ? vec2(0.0008, 0.0) : clamp(vec2(-rawUvDy.y, rawUvDy.x), vec2(-0.0025), vec2(0.0025)))
+    const vec3 dWorldDx = dFdx(inWorldPosition);
+    const vec3 dWorldDy = dFdy(inWorldPosition);
+    const bool inUnitUv =
+        inUv.x >= 0.0 && inUv.x <= 1.0 &&
+        inUv.y >= 0.0 && inUv.y <= 1.0;
+    const bool wrapJumpX =
+        inUnitUv && dot(dWorldDx, dWorldDx) < 0.01 &&
+        (abs(rawUvDx.x) > 0.50 || abs(rawUvDx.y) > 0.50);
+    const bool wrapJumpY =
+        inUnitUv && dot(dWorldDy, dWorldDy) < 0.01 &&
+        (abs(rawUvDy.x) > 0.50 || abs(rawUvDy.y) > 0.50);
+    vec2 uvDx = wrapJumpX
+        ? (wrapJumpY
+            ? vec2(max(abs(rawUvDx.y), 0.004), rawUvDx.y)
+            : vec2(-rawUvDy.y, rawUvDy.x))
         : rawUvDx;
-    const vec2 uvDy = seamY
-        ? (seamX ? vec2(0.0, 0.0008) : clamp(vec2(rawUvDx.y, -rawUvDx.x), vec2(-0.0025), vec2(0.0025)))
+    vec2 uvDy = wrapJumpY
+        ? (wrapJumpX
+            ? vec2(rawUvDy.y, max(abs(rawUvDy.y), 0.004))
+            : vec2(rawUvDx.y, -rawUvDx.x))
         : rawUvDy;
+    if (inMaterialModel == 4u) {
+        uvDx = vec2(0.0, clamp(rawUvDx.y, -0.015, 0.015));
+        uvDy = vec2(0.0, clamp(rawUvDy.y, -0.015, 0.015));
+    }
+
+    const vec3 geomNormal = materialFaceNormal(
+        pushConstants.padding, safeNormalize(inWorldNormal, vec3(0.0, 1.0, 0.0)));
+    vec3 surfaceNormal = geomNormal;
+    float normVar = 0.0;
+    float hairTanVar = 0.0;
+    if (inMaterialModel != 1u) {
+        if (inMaterialModel == 4u) {
+            const float tanLenSq = dot(inWorldTangent, inWorldTangent);
+            const vec3 preFiberTangent = (tanLenSq > 1.0e-8)
+                ? inWorldTangent * inversesqrt(tanLenSq)
+                : normalize(abs(geomNormal.y) < 0.9
+                    ? cross(geomNormal, vec3(0.0, 1.0, 0.0))
+                    : cross(geomNormal, vec3(1.0, 0.0, 0.0)));
+            const vec3 dTdx = dFdx(preFiberTangent);
+            const vec3 dTdy = dFdy(preFiberTangent);
+            hairTanVar = min(dot(dTdx, dTdx) + dot(dTdy, dTdy), 0.30);
+        } else {
+            surfaceNormal = sampleWorldNormal(uvDx, uvDy);
+            const vec3 dNdx = dFdx(surfaceNormal);
+            const vec3 dNdy = dFdy(surfaceNormal);
+            normVar = min(dot(dNdx, dNdx) + dot(dNdy, dNdy), 0.25);
+        }
+    }
+
 #if !defined(VCR_OPAQUE_EARLY_Z) && !defined(VCR_TRANSPARENT_PASS)
     if (!lodKeep(inLodToken, uvec2(gl_FragCoord.xy))) discard;
 #endif
@@ -132,18 +175,27 @@ void main()
     if (!materialKeepsAlpha(pushConstants.padding, baseColor.a)) discard;
 #endif
 
+    const float kHairOpaqueCoreThreshold = 0.78;
+    float strandCoverage = clamp(baseColor.a, 0.0, 1.0);
+    if (inMaterialModel == 4u && abs(inMaterialParameters.w) > 0.001) {
+        const float edgeS = clamp(inMaterialParameters.w, -1.0, 1.0);
+        const float cyl = sqrt(max(1.0 - edgeS * edgeS, 0.0));
+        strandCoverage = clamp(baseColor.a * mix(0.38, 1.0, cyl), 0.0, 1.0);
+    }
+#if !defined(VCR_OPAQUE_EARLY_Z) && !defined(VCR_TRANSPARENT_PASS)
+    if (inMaterialModel == 4u && strandCoverage < kHairOpaqueCoreThreshold) discard;
+#endif
+#ifdef VCR_TRANSPARENT_PASS
+    if (inMaterialModel == 4u && strandCoverage >= kHairOpaqueCoreThreshold) discard;
+#endif
+
     const vec3 clampedBaseColor = clamp(baseColor.rgb, vec3(0.0), vec3(1.0));
     vec3 shadedColor = clampedBaseColor;
-    vec3 surfaceNormal = materialFaceNormal(
-        pushConstants.padding, safeNormalize(inWorldNormal, vec3(0.0, 1.0, 0.0)));
     vec3 surfaceMaterialParameters = inMaterialParameters.xyz;
     PbrLightingComponents lightingComponents;
     lightingComponents.diffuse = vec3(0.0);
     lightingComponents.specular = vec3(0.0);
     if (inMaterialModel != 1u) {
-        surfaceNormal = sampleWorldNormal(uvDx, uvDy);
-        const vec3 geomNormal = materialFaceNormal(
-            pushConstants.padding, safeNormalize(inWorldNormal, vec3(0.0, 1.0, 0.0)));
         const vec4 sampledMetallicRoughness =
             textureGrad(materialMetallicRoughnessTexture, inUv, uvDx, uvDy);
         surfaceMaterialParameters = vec3(
@@ -159,8 +211,13 @@ void main()
                 geomNormal,
                 inWorldTangent,
                 inWorldPosition,
-                inDielectricF0);
+                inDielectricF0,
+                hairTanVar);
         } else {
+            const float r = clamp(surfaceMaterialParameters.y, pbrMinimumRoughness, 1.0);
+            const float alpha = r * r;
+            const float alphaAA = clamp(alpha * alpha + 0.35 * normVar, 0.0, 1.0);
+            surfaceMaterialParameters.y = clamp(sqrt(sqrt(alphaAA)), pbrMinimumRoughness, 1.0);
             lightingComponents = evaluateLitSurfaceComponents(
                 clampedBaseColor,
                 surfaceMaterialParameters,
@@ -194,6 +251,12 @@ void main()
     if (inMaterialModel == 1u) {
         effectiveAlpha = rawOpacity * (backFaceTwoSided ? 0.5 : 1.0) * lodPresence;
         premulRgb = min((clampedBaseColor + emittedRadiance) * effectiveAlpha, vec3(65504.0));
+    } else if (inMaterialModel == 4u) {
+        effectiveAlpha = strandCoverage * lodPresence;
+        premulRgb = min(
+            (lightingComponents.diffuse + lightingComponents.specular + emittedRadiance)
+                * effectiveAlpha,
+            vec3(65504.0));
     } else {
         const vec3 viewDir = safeNormalize(
             frame.cameraPosition.xyz - inWorldPosition,
@@ -226,10 +289,14 @@ void main()
     outColor = vec4(premulRgb, effectiveAlpha);
 #endif
 #else
+    const float opaqueOutputAlpha =
+        (inMaterialModel != 4u && (pushConstants.padding & kMaterialAlphaMaskBit) != 0u)
+            ? baseColor.a
+            : 1.0;
     writeLitSurface(
         lightingComponents.diffuse, lightingComponents.specular + emittedRadiance,
         shadedColor + emittedRadiance,
-        baseColor.a, inMaterialModel, inSubsurfaceProfile,
+        opaqueOutputAlpha, inMaterialModel, inSubsurfaceProfile,
         inSubsurfaceStrength);
 #endif
 #ifdef VCR_SSS_TEMPORAL

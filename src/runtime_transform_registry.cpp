@@ -60,6 +60,17 @@ namespace {
     return pose;
 }
 
+[[nodiscard]] bool poses_equal(
+    const RuntimePose& a,
+    const RuntimePose& b) noexcept {
+    return a.position == b.position &&
+        a.rotation.x == b.rotation.x &&
+        a.rotation.y == b.rotation.y &&
+        a.rotation.z == b.rotation.z &&
+        a.rotation.w == b.rotation.w &&
+        a.scale == b.scale;
+}
+
 } // namespace
 
 glm::mat4 RuntimePose::to_matrix() const noexcept {
@@ -205,6 +216,12 @@ bool RuntimeTransformRegistry::set_world_pose(
     if (node == nullptr) {
         return false;
     }
+    if (!node->is_attached &&
+        !node->world_dirty &&
+        !node->local_dirty &&
+        poses_equal(node->world_pose, world_pose)) {
+        return true;
+    }
 
     node->world_pose = world_pose;
     node->world_matrix = world_pose.to_matrix();
@@ -239,6 +256,12 @@ bool RuntimeTransformRegistry::set_world_matrix(
     if (node == nullptr) {
         return false;
     }
+    if (!node->is_attached &&
+        !node->world_dirty &&
+        !node->local_dirty &&
+        node->world_matrix == world_matrix) {
+        return true;
+    }
 
     node->world_matrix = world_matrix;
     node->world_pose = matrix_to_pose(world_matrix);
@@ -272,6 +295,14 @@ bool RuntimeTransformRegistry::set_local_pose(
     NodeRecord* const node = find_node(id);
     if (node == nullptr) {
         return false;
+    }
+    const NodeRecord* const parent =
+        node->is_attached ? find_node(node->parent_id) : nullptr;
+    if ((parent == nullptr || !parent->world_dirty) &&
+        !node->local_dirty &&
+        !node->world_dirty &&
+        poses_equal(node->local_pose, local_pose)) {
+        return true;
     }
 
     node->local_pose = local_pose;

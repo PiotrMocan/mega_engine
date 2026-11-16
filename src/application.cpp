@@ -1137,6 +1137,7 @@ void Application::apply_mcp_key(
     case McpInputKey::e: mapped = InputKey::e; break;
     case McpInputKey::space: mapped = InputKey::space; break;
     case McpInputKey::shift: mapped = InputKey::left_shift; break;
+    case McpInputKey::p: mapped = InputKey::p; break;
     default: break;
     }
     if (mapped != InputKey::none) {

@@ -161,7 +161,8 @@ public:
         AudioEngine* audio_engine = nullptr,
         std::span<const SceneWorldNode> cached_world_nodes = {},
         bool preview_only_mode = false,
-        const RuntimeTransformSink* transform_sink = nullptr);
+        const RuntimeTransformSink* transform_sink = nullptr,
+        std::span<const std::uint32_t> world_node_index_by_id = {});
 
     void set_preview(
         SceneNodeId id,
@@ -215,6 +216,7 @@ private:
         std::string_view asset_path);
 
     std::vector<AnimatorNodeRuntime> nodes_{};
+    std::vector<std::uint32_t> runtime_index_by_node_{};
     std::vector<SceneNodeId> active_ids_scratch_{};
     std::vector<SceneWorldNode> local_world_scratch_{};
     std::vector<std::uint32_t> ancestor_scratch_{};

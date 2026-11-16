@@ -259,7 +259,9 @@ public:
 
     void sync_dynamic_obstacles(
         const SceneDocument& scene,
-        const PhysicsWorld* physics_world = nullptr) noexcept;
+        const PhysicsWorld* physics_world = nullptr,
+        std::span<const SceneWorldNode> prebuilt_world_nodes = {},
+        std::span<const std::uint32_t> world_node_index_by_id = {}) noexcept;
 
     [[nodiscard]] std::span<const DynamicNavBlocker> dynamic_blockers()
         const noexcept {
@@ -275,6 +277,7 @@ public:
         return blockers_.capacity() +
             blockers_scratch_.capacity() +
             world_nodes_scratch_.capacity() +
+            world_node_index_scratch_.capacity() +
             ancestor_scratch_.capacity() +
             scratch_.g_score.capacity() +
             scratch_.f_score.capacity() +
@@ -375,6 +378,7 @@ private:
     std::vector<DynamicNavBlocker> blockers_{};
     std::vector<DynamicNavBlocker> blockers_scratch_{};
     std::vector<SceneWorldNode> world_nodes_scratch_{};
+    std::vector<std::uint32_t> world_node_index_scratch_{};
     std::vector<std::uint32_t> ancestor_scratch_{};
     NavQueryScratch scratch_{};
     std::uint64_t navmesh_revision_ = 1U;

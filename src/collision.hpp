@@ -270,11 +270,19 @@ private:
         std::uint32_t triangle_count = 0U;
     };
 
+    struct ChunkBvhNode {
+        Bounds local_aabb{};
+        std::uint32_t left_or_chunk = 0U;
+        std::uint32_t right = 0U;
+        bool is_leaf = false;
+    };
+
     struct SharedTriangleMesh {
         std::string key{};
         std::vector<glm::vec3> positions{};
         std::vector<std::uint32_t> indices{};
         std::vector<TriangleChunk> chunks{};
+        std::vector<ChunkBvhNode> chunk_bvh{};
         Bounds local_aabb{};
     };
 
@@ -302,6 +310,34 @@ private:
         triangle_mesh = 5U,
     };
 
+    static constexpr std::uint8_t kBvhHasEnabledSolid = 1U;
+    static constexpr std::uint8_t kBvhHasEnabledTrigger = 2U;
+    static constexpr std::uint8_t kBvhIsLeaf = 4U;
+    static constexpr std::uint32_t kInvalidBvhNode = 0xFFFFFFFFU;
+
+    struct ColliderLeaf {
+        ColliderStorageKind kind = ColliderStorageKind::none;
+        std::uint32_t index = 0U;
+    };
+
+    struct ColliderBvhNode {
+        Bounds world_aabb{};
+        std::uint32_t left = 0U;
+        std::uint32_t right_or_index = 0U;
+        std::uint32_t layer_mask = 0U;
+        ColliderStorageKind leaf_kind = ColliderStorageKind::none;
+        std::uint8_t flags = 0U;
+    };
+
+    struct BvhBuildLeaf {
+        Bounds world_aabb{};
+        std::uint32_t index = 0U;
+        std::uint32_t layer = 0U;
+        ColliderStorageKind kind = ColliderStorageKind::none;
+        bool is_trigger = false;
+        bool enabled = true;
+    };
+
     struct NodeColliderRef {
         SceneNodeId id{};
         ColliderStorageKind kind = ColliderStorageKind::none;
@@ -321,6 +357,48 @@ private:
         std::string_view key,
         const CookedModelCollision& collision);
 
+    void build_top_level_bvh();
+    void refit_bvh_leaf(std::uint32_t leaf_node_idx) noexcept;
+    void refit_bvh_storage_element(
+        ColliderStorageKind kind,
+        std::uint32_t index) noexcept;
+
+    [[nodiscard]] bool is_solid_leaf_candidate(
+        ColliderLeaf leaf,
+        std::uint32_t layer_mask,
+        SceneNodeId ignored_node) const noexcept;
+    void resolve_capsule_leaf(
+        ColliderLeaf leaf,
+        glm::vec3& feet,
+        float radius,
+        float safe_height,
+        float walk_cos,
+        CapsuleContactResult& result,
+        bool& any_penetration) const noexcept;
+    [[nodiscard]] bool check_capsule_free_leaf(
+        ColliderLeaf leaf,
+        const Bounds& cap_aabb,
+        glm::vec3 cap_a,
+        glm::vec3 cap_b,
+        float radius,
+        std::uint32_t layer_mask,
+        SceneNodeId ignored_node) const noexcept;
+    void gather_sphere_leaf(
+        ColliderLeaf leaf,
+        glm::vec3 center,
+        float radius,
+        const Bounds& sphere_aabb,
+        std::uint32_t layer_mask,
+        std::vector<SphereContact>& output) const;
+    void query_trigger_leaf(
+        ColliderLeaf leaf,
+        const Bounds& cap_aabb,
+        glm::vec3 cap_a,
+        glm::vec3 cap_b,
+        float radius,
+        std::uint32_t layer_mask,
+        std::vector<TriggerOverlap>& output) const;
+
     std::vector<OrientedBox> boxes_{};
     std::vector<SphereCollider> spheres_{};
     std::vector<CapsuleCollider> capsules_{};
@@ -328,8 +406,17 @@ private:
     std::vector<SharedTriangleMesh> shared_meshes_{};
     std::vector<TriangleMeshCollider> triangle_meshes_{};
     std::vector<NodeColliderRef> node_collider_lookup_{};
+    std::vector<ColliderBvhNode> bvh_nodes_{};
+    std::vector<std::uint32_t> bvh_parent_{};
+    std::vector<std::uint32_t> box_bvh_node_{};
+    std::vector<std::uint32_t> sphere_bvh_node_{};
+    std::vector<std::uint32_t> capsule_bvh_node_{};
+    std::vector<std::uint32_t> hull_bvh_node_{};
+    std::vector<std::uint32_t> tmesh_bvh_node_{};
+    std::vector<BvhBuildLeaf> bvh_build_leaves_scratch_{};
     std::vector<SceneWorldNode> world_nodes_scratch_{};
     std::vector<std::uint32_t> ancestor_scratch_{};
+    std::size_t bvh_indexed_box_count_ = 0U;
     SceneNodeId terrain_node_id_{};
     SceneUuid terrain_node_uuid_{};
     std::uint32_t solid_count_ = 0U;

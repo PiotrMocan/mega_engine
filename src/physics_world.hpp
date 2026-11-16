@@ -110,6 +110,7 @@ public:
     bool set_body_motion_type(SceneNodeId id, RigidBodyMotionType type,
         float mass = 0.0F) noexcept;
     bool wake_body(SceneNodeId id) noexcept;
+    bool sleep_body(SceneNodeId id) noexcept;
     bool apply_central_force(
         SceneNodeId id,
         glm::vec3 force,

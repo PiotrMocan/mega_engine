@@ -19,7 +19,8 @@ PbrLightingComponents evaluateHairDirectLight(
     vec3 viewDirection,
     vec3 lightDirection,
     vec3 lightRadiance,
-    float visibility)
+    float visibility,
+    float tanVar)
 {
     PbrLightingComponents outComp;
     outComp.diffuse = vec3(0.0);
@@ -51,8 +52,10 @@ PbrLightingComponents evaluateHairDirectLight(
     const float alphaTRT = -1.5 * alphaR;
 
     const float betaM = clamp(roughness, 0.16, 0.72);
-    const float varR = max(betaM * betaM * 0.65, 0.014);
-    const float varTT = 0.36 * varR;
+    const float safeTanVar = clamp(tanVar, 0.0, 0.30);
+    const float baseVarR = max(betaM * betaM * 0.65, 0.014);
+    const float varR = baseVarR + 0.45 * safeTanVar;
+    const float varTT = 0.36 * baseVarR + 0.25 * safeTanVar;
     const float varTRT = 2.45 * varR;
 
     const float longR = hairGaussian(varR, thetaH - alphaR);
@@ -101,7 +104,8 @@ PbrLightingComponents evaluateHairPunctualLight(
     vec3 fiberTangent,
     vec3 cylinderNormal,
     vec3 viewDirection,
-    vec3 worldPosition)
+    vec3 worldPosition,
+    float tanVar)
 {
     PbrLightingComponents zeroComp;
     zeroComp.diffuse = vec3(0.0);
@@ -133,7 +137,7 @@ PbrLightingComponents evaluateHairPunctualLight(
     const vec3 rad = light.colorIntensity.rgb * (light.colorIntensity.w * atten * angular);
     return evaluateHairDirectLight(
         baseColor, roughness, ao, fiberTangent, cylinderNormal,
-        viewDirection, lDir, rad, 1.0);
+        viewDirection, lDir, rad, 1.0, tanVar);
 }
 
 PbrLightingComponents evaluateHairSurfaceComponents(
@@ -143,7 +147,8 @@ PbrLightingComponents evaluateHairSurfaceComponents(
     vec3 geomNormal,
     vec3 worldTangent,
     vec3 worldPosition,
-    float dielectricF0)
+    float dielectricF0,
+    float tanVar)
 {
     const float roughness = clamp(materialParameters.y, pbrMinimumRoughness, 1.0);
     const float ao = clamp(materialParameters.z, 0.0, 1.0);
@@ -182,7 +187,7 @@ PbrLightingComponents evaluateHairSurfaceComponents(
         const vec3 sunRadiance = frame.sunColorSkyYaw.rgb * frame.sunDirectionIntensity.w;
         const PbrLightingComponents sunHair = evaluateHairDirectLight(
             clampedBaseColor, roughness, ao, fiberTangent, cylinderNormal,
-            viewDirection, lightDirection, sunRadiance, softVis);
+            viewDirection, lightDirection, sunRadiance, softVis, tanVar);
         total.diffuse += sunHair.diffuse;
         total.specular += sunHair.specular;
     }
@@ -212,7 +217,7 @@ PbrLightingComponents evaluateHairSurfaceComponents(
                 {
                     const PbrLightingComponents pHair = evaluateHairPunctualLight(
                         clusterData[first + entry], clampedBaseColor, roughness, ao,
-                        fiberTangent, cylinderNormal, viewDirection, worldPosition);
+                        fiberTangent, cylinderNormal, viewDirection, worldPosition, tanVar);
                     total.diffuse += pHair.diffuse;
                     total.specular += pHair.specular;
                 }
@@ -224,7 +229,7 @@ PbrLightingComponents evaluateHairSurfaceComponents(
             {
                 const PbrLightingComponents pHair = evaluateHairPunctualLight(
                     index, clampedBaseColor, roughness, ao,
-                    fiberTangent, cylinderNormal, viewDirection, worldPosition);
+                    fiberTangent, cylinderNormal, viewDirection, worldPosition, tanVar);
                 total.diffuse += pHair.diffuse;
                 total.specular += pHair.specular;
             }

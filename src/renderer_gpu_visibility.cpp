@@ -480,6 +480,7 @@ void Renderer::destroy_gpu_visibility() noexcept {
     hiz_fallback_.destroy();
     hiz_fallback_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     hiz_valid_ = false;
+    prev_committed_runtime_revision_ = 0U;
     packet_used_hiz_ = false;
     gpu_visibility_active_ = false;
 }
@@ -925,6 +926,7 @@ void Renderer::build_gpu_visibility_scene(std::uint32_t plane_count, std::uint32
     gpu_packet_revision_ = 0;
     reset_lod_history_ = true;
     hiz_valid_ = false;
+    prev_committed_runtime_revision_ = 0U;
     packet_used_hiz_ = false;
 }
 
@@ -975,6 +977,7 @@ void Renderer::sync_gpu_visibility_skinned_draws() noexcept {
     ++gpu_scene_revision_;
     reset_lod_history_ = true;
     hiz_valid_ = false;
+    prev_committed_runtime_revision_ = 0U;
     packet_used_hiz_ = false;
 }
 
@@ -982,10 +985,54 @@ void Renderer::prepare_gpu_scene_packet(const glm::mat4 &vp, glm::vec3 camera, V
     const bool fade_enabled = lod_fade_pattern_ != LodFadePattern::off && visibility_settings_.lod &&
                               !editor_model_draws_.empty();
     const float camera_step = hiz_valid_ ? glm::length(camera - hiz_camera_) : 0.0F;
+    bool dynamic_discontinuity = !hiz_valid_;
+    float dynamic_step = 0.0F;
+    if (hiz_valid_) {
+        if (hiz_runtime_revision_ == runtime_transforms_.revision()) {
+            dynamic_discontinuity = false;
+            dynamic_step = 0.0F;
+        } else if (hiz_runtime_revision_ == prev_committed_runtime_revision_ &&
+                   gpu_packet_revision_ == gpu_scene_revision_) {
+            dynamic_discontinuity = false;
+            for (const std::uint32_t node : runtime_transforms_.dirty_indices()) {
+                if (node >= node_record_heads_.size()) {
+                    continue;
+                }
+                for (std::uint32_t i = node_record_heads_[node]; i != UINT32_MAX;
+                     i = node_record_next_[i]) {
+                    const SceneNodeId id = scene_metadata_[i].id;
+                    if (!runtime_transforms_.contains(id)) {
+                        continue;
+                    }
+                    const TransformRows prev_t = runtime_transforms_.previous(id);
+                    const TransformRows curr_t = runtime_transforms_.current(id);
+                    const Bounds prev_bounds = transform_bounds(
+                        scene_metadata_[i].local_bounds, prev_t.x, prev_t.y, prev_t.z);
+                    const Bounds curr_bounds = transform_bounds(
+                        scene_metadata_[i].local_bounds, curr_t.x, curr_t.y, curr_t.z);
+                    const float step =
+                        glm::length(curr_bounds.center - prev_bounds.center) +
+                        glm::length(glm::max(prev_bounds.extent - curr_bounds.extent,
+                                             glm::vec3(0.0F)));
+                    if (!std::isfinite(step) || step > 1.5F) {
+                        dynamic_discontinuity = true;
+                        break;
+                    }
+                    dynamic_step = std::max(dynamic_step, step);
+                }
+                if (dynamic_discontinuity) {
+                    break;
+                }
+            }
+        } else {
+            dynamic_discontinuity = true;
+        }
+    }
+    const float effective_hiz_step = std::max(camera_step, dynamic_step);
     const bool hiz_ready =
         should_use_hiz_occlusion() && hiz_valid_ && hiz_mip_count_ > 0U &&
-        hiz_runtime_revision_ == runtime_transforms_.revision() &&
-        hiz_document_revision_ == editor_scene_revision_ && camera_step <= 5.0F;
+        !dynamic_discontinuity && hiz_document_revision_ == editor_scene_revision_ &&
+        std::isfinite(camera_step) && effective_hiz_step <= 5.0F;
     // Optional fading advances without a camera change. It never requires
     // synchronous readback of the active-transition count.
     const bool changed = fade_enabled || reset_lod_history_ ||
@@ -1148,7 +1195,7 @@ void Renderer::prepare_gpu_scene_packet(const glm::mat4 &vp, glm::vec3 camera, V
          fade_enabled ? std::clamp(fsr_frame_time_ms_ * 0.001F / lod_fade_seconds_, 0.0F, 1.0F)
                       : 0.0F},
         {static_cast<float>(active_mip0_w), static_cast<float>(active_mip0_h),
-         static_cast<float>(active_max_mip), use_hiz ? camera_step : 0.0F},
+         static_cast<float>(active_max_mip), use_hiz ? effective_hiz_step : 0.0F},
         {static_cast<unsigned>(scene_metadata_.size()), visibility_settings_.frustum ? 1U : 0U,
          occlusion_flags,
          unsigned(visibility_settings_.lod) |

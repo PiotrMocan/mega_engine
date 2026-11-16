@@ -7,8 +7,10 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <vector>
 
 #include <glm/geometric.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 
 namespace {
 
@@ -699,6 +701,496 @@ int main() {
         expect(
             jumper.grounded() && max_landing_speed > 4.0F,
             "landing_impact_speed() reports downward impact speed on touchdown");
+    }
+
+    // CollisionWorld BVH + SharedTriangleMesh::chunk_bvh parity, dynamic refit, and >128 fallback:
+    {
+        vcr::CookedModelCollision mesh_collision{};
+        mesh_collision.local_bounds = vcr::CookedCollisionBox{
+            .center = {0.0F, 0.5F, 0.0F},
+            .half_extents = {2.0F, 0.5F, 2.0F},
+        };
+        mesh_collision.convex_hull_vertices = {
+            {-1.0F, 0.0F, -1.0F},
+            {1.0F, 0.0F, -1.0F},
+            {1.0F, 0.0F, 1.0F},
+            {-1.0F, 0.0F, 1.0F},
+            {0.0F, 2.0F, 0.0F},
+        };
+        // 10x10 quad grid (200 triangles > 32 triangles/chunk) sloped in X: y = 0.25 * (x + 2).
+        constexpr int grid_n = 10;
+        for (int iz = 0; iz <= grid_n; ++iz) {
+            for (int ix = 0; ix <= grid_n; ++ix) {
+                const float x = -2.0F + 0.4F * static_cast<float>(ix);
+                const float z = -2.0F + 0.4F * static_cast<float>(iz);
+                const float y = 0.25F * (x + 2.0F);
+                mesh_collision.triangle_positions.push_back({x, y, z});
+            }
+        }
+        for (int iz = 0; iz < grid_n; ++iz) {
+            for (int ix = 0; ix < grid_n; ++ix) {
+                const auto v00 = static_cast<std::uint32_t>(iz * (grid_n + 1) + ix);
+                const auto v10 = v00 + 1U;
+                const auto v01 = v00 + static_cast<std::uint32_t>(grid_n + 1);
+                const auto v11 = v01 + 1U;
+                mesh_collision.triangle_indices.push_back(v00);
+                mesh_collision.triangle_indices.push_back(v01);
+                mesh_collision.triangle_indices.push_back(v10);
+                mesh_collision.triangle_indices.push_back(v10);
+                mesh_collision.triangle_indices.push_back(v01);
+                mesh_collision.triangle_indices.push_back(v11);
+            }
+        }
+
+        const vcr::ModelCollisionProvider provider{
+            .context = &mesh_collision,
+            .query = [](const void* const ctx,
+                        const std::string_view path) noexcept
+                -> const vcr::CookedModelCollision* {
+                return path == "models/sloped_grid.vcrasset.json"
+                    ? static_cast<const vcr::CookedModelCollision*>(ctx)
+                    : nullptr;
+            },
+        };
+
+        vcr::SceneDocument scene;
+        for (int idx = 0; idx < 24; ++idx) {
+            const auto filler = scene.create_node("FillerBox", vcr::SceneNodeKind::cube);
+            scene.node(filler)->get().transform.translation = {
+                -60.0F + static_cast<float>(idx % 6) * 4.0F,
+                0.5F,
+                25.0F + static_cast<float>(idx / 6) * 4.0F,
+            };
+            scene.node(filler)->get().transform.scale = {0.5F, 0.5F, 0.5F};
+        }
+
+        const auto tri_ramp = scene.create_node("TriRamp", vcr::SceneNodeKind::model);
+        scene.node(tri_ramp)->get().asset_path = "models/sloped_grid.vcrasset.json";
+        scene.node(tri_ramp)->get().transform.translation = {20.0F, 0.0F, 0.0F};
+        expect(
+            scene.set_collider(
+                tri_ramp,
+                vcr::ColliderComponent{
+                    .collision_layer = 1U,
+                    .shape = vcr::ColliderShape::triangle_mesh,
+                }),
+            "attach layer-1 triangle_mesh ramp");
+
+        const auto tri_layer2 = scene.create_node("TriLayer2", vcr::SceneNodeKind::model);
+        scene.node(tri_layer2)->get().asset_path = "models/sloped_grid.vcrasset.json";
+        scene.node(tri_layer2)->get().transform.translation = {20.0F, 3.0F, 0.0F};
+        expect(
+            scene.set_collider(
+                tri_layer2,
+                vcr::ColliderComponent{
+                    .collision_layer = 2U,
+                    .shape = vcr::ColliderShape::triangle_mesh,
+                }),
+            "attach layer-2 triangle_mesh above ramp");
+
+        const auto tri_trigger = scene.create_node("TriTrigger", vcr::SceneNodeKind::model);
+        scene.node(tri_trigger)->get().asset_path = "models/sloped_grid.vcrasset.json";
+        scene.node(tri_trigger)->get().transform.translation = {-20.0F, 0.0F, 0.0F};
+        expect(
+            scene.set_collider(
+                tri_trigger,
+                vcr::ColliderComponent{
+                    .collision_layer = 1U,
+                    .shape = vcr::ColliderShape::triangle_mesh,
+                    .is_trigger = true,
+                }),
+            "attach trigger triangle_mesh");
+
+        const auto box_trigger = scene.create_node("BoxTrigger", vcr::SceneNodeKind::folder);
+        scene.node(box_trigger)->get().transform.translation = {-20.0F, 1.0F, 0.0F};
+        expect(
+            scene.set_collider(
+                box_trigger,
+                vcr::ColliderComponent{
+                    .half_extents = {1.0F, 1.0F, 1.0F},
+                    .collision_layer = 1U,
+                    .shape = vcr::ColliderShape::box,
+                    .is_trigger = true,
+                }),
+            "attach overlapping box trigger");
+
+        const auto solid_box = scene.create_node("SolidBox", vcr::SceneNodeKind::cube);
+        scene.node(solid_box)->get().transform.translation = {30.0F, 0.5F, 0.0F};
+        scene.node(solid_box)->get().transform.scale = {1.0F, 0.5F, 1.0F};
+
+        const auto solid_sphere = scene.create_node("SolidSphere", vcr::SceneNodeKind::folder);
+        scene.node(solid_sphere)->get().transform.translation = {35.0F, 1.0F, 0.0F};
+        expect(
+            scene.set_collider(
+                solid_sphere,
+                vcr::ColliderComponent{
+                    .radius = 1.0F,
+                    .shape = vcr::ColliderShape::sphere,
+                }),
+            "attach solid sphere");
+
+        const auto solid_cap = scene.create_node("SolidCapsule", vcr::SceneNodeKind::folder);
+        scene.node(solid_cap)->get().transform.translation = {40.0F, 1.5F, 0.0F};
+        expect(
+            scene.set_collider(
+                solid_cap,
+                vcr::ColliderComponent{
+                    .radius = 0.5F,
+                    .half_height = 1.0F,
+                    .shape = vcr::ColliderShape::capsule,
+                }),
+            "attach solid capsule");
+
+        const auto solid_hull = scene.create_node("SolidHull", vcr::SceneNodeKind::model);
+        scene.node(solid_hull)->get().asset_path = "models/sloped_grid.vcrasset.json";
+        scene.node(solid_hull)->get().transform.translation = {45.0F, 0.0F, 0.0F};
+        expect(
+            scene.set_collider(
+                solid_hull,
+                vcr::ColliderComponent{
+                    .shape = vcr::ColliderShape::convex_hull,
+                }),
+            "attach solid convex_hull");
+
+        vcr::CollisionWorld world;
+        world.rebuild_from_scene(scene, {}, {}, provider);
+
+        // 1. BVH + chunk_bvh raycast, layer filtering, ignored_node, trigger filtering, and max_distance:
+        const auto layer1_hit = world.raycast(
+            {20.0F, 10.0F, 0.0F}, {0.0F, -1.0F, 0.0F}, 20.0F, 1U, false);
+        expect(
+            layer1_hit && layer1_hit->node_id == tri_ramp &&
+                close_to(layer1_hit->point.y, 0.5F, 0.01F) &&
+                layer1_hit->normal.y > 0.9F,
+            "BVH raycast filters layer-2 triangle_mesh and hits layer-1 multi-chunk ramp");
+
+        const auto layer2_hit = world.raycast(
+            {20.0F, 10.0F, 0.0F}, {0.0F, -1.0F, 0.0F}, 20.0F, 2U, false);
+        expect(
+            layer2_hit && layer2_hit->node_id == tri_layer2 &&
+                close_to(layer2_hit->point.y, 3.5F, 0.01F),
+            "BVH raycast hits layer-2 triangle_mesh when layer 2 is queried");
+
+        const auto ignored_hit = world.raycast(
+            {20.0F, 10.0F, 0.0F},
+            {0.0F, -1.0F, 0.0F},
+            20.0F,
+            0xFFFFFFFFU,
+            false,
+            tri_layer2);
+        expect(
+            ignored_hit && ignored_hit->node_id == tri_ramp &&
+                close_to(ignored_hit->point.y, 0.5F, 0.01F),
+            "BVH raycast skips ignored_node and continues to farther triangle_mesh");
+
+        const auto short_miss = world.raycast(
+            {20.0F, 10.0F, 0.0F}, {0.0F, -1.0F, 0.0F}, 5.0F, 1U, false);
+        expect(
+            !short_miss.has_value(),
+            "BVH raycast respects max_distance");
+
+        const auto trig_skip = world.raycast(
+            {-20.0F, 5.0F, 0.0F}, {0.0F, -1.0F, 0.0F}, 10.0F, 0xFFFFFFFFU, false);
+        const auto trig_hit = world.raycast(
+            {-20.0F, 5.0F, 0.0F}, {0.0F, -1.0F, 0.0F}, 10.0F, 0xFFFFFFFFU, true);
+        expect(
+            !trig_skip.has_value() &&
+                trig_hit && trig_hit->is_trigger &&
+                (trig_hit->node_id == box_trigger || trig_hit->node_id == tri_trigger),
+            "BVH raycast excludes triggers by default and finds them when include_triggers=true");
+
+        // 2. sample_supporting_height across multiple chunk_bvh branches:
+        const auto sup_low = world.sample_supporting_height(18.8F, 0.5F, 5.0F, 20.0F, 1U);
+        const auto sup_high = world.sample_supporting_height(21.2F, -0.5F, 5.0F, 20.0F, 1U);
+        const auto sup_void = world.sample_supporting_height(200.0F, 200.0F, 5.0F, 20.0F, 1U);
+        expect(
+            sup_low && close_to(*sup_low, 0.20F, 0.01F) &&
+                sup_high && close_to(*sup_high, 0.80F, 0.01F) &&
+                !sup_void.has_value(),
+            "sample_supporting_height queries distinct chunk_bvh branches accurately");
+
+        // 3. gather_sphere_contacts on multi-chunk triangle_mesh, box, capsule, hull, ignoring triggers:
+        std::vector<vcr::SphereContact> sphere_contacts;
+        world.gather_sphere_contacts({20.0F, 0.65F, 0.0F}, 0.35F, 1U, sphere_contacts);
+        bool saw_tri_contact = false;
+        for (const vcr::SphereContact& sc : sphere_contacts) {
+            if (sc.node_id == tri_ramp && sc.penetration > 0.05F && sc.normal.y > 0.8F) {
+                saw_tri_contact = true;
+            }
+        }
+        expect(saw_tri_contact, "gather_sphere_contacts traverses chunk_bvh on triangle_mesh");
+
+        world.gather_sphere_contacts({-20.0F, 0.65F, 0.0F}, 0.5F, 0xFFFFFFFFU, sphere_contacts);
+        expect(
+            sphere_contacts.empty(),
+            "gather_sphere_contacts ignores trigger colliders");
+
+        world.gather_sphere_contacts({35.0F, 1.8F, 0.0F}, 0.4F, 0xFFFFFFFFU, sphere_contacts);
+        expect(
+            sphere_contacts.size() == 1U && sphere_contacts[0].node_id == solid_sphere,
+            "gather_sphere_contacts hits sphere collider through BVH");
+
+        // 4. resolve_capsule & check_capsule_free:
+        const auto cap_res = world.resolve_capsule(
+            {20.0F, 0.2F, 0.0F}, 0.35F, 1.6F, 0.7F, 1U);
+        expect(
+            cap_res.grounded && cap_res.ground_node == tri_ramp &&
+                cap_res.resolved_feet.y > 0.45F,
+            "resolve_capsule resolves onto multi-chunk triangle_mesh ramp");
+
+        expect(
+            !world.check_capsule_free({20.0F, 0.2F, 0.0F}, 0.35F, 1.6F, 1U) &&
+                world.check_capsule_free({20.0F, 0.2F, 0.0F}, 0.35F, 1.6F, 1U, tri_ramp) &&
+                world.check_capsule_free({-20.0F, 0.2F, 0.0F}, 0.35F, 1.6F) &&
+                !world.check_capsule_free({40.0F, 0.5F, 0.0F}, 0.35F, 1.6F) &&
+                !world.check_capsule_free({45.0F, 0.2F, 0.0F}, 0.35F, 1.6F),
+            "check_capsule_free matches solid/ignored/trigger filtering through BVH");
+
+        // 5. query_capsule_triggers (including 0-trigger early-out on separate world):
+        std::vector<vcr::TriggerOverlap> triggers;
+        world.query_capsule_triggers({-20.0F, 0.2F, 0.0F}, 0.35F, 1.6F, 1U, triggers);
+        expect(
+            triggers.size() == 2U &&
+                triggers[0].node_id == tri_trigger &&
+                triggers[1].node_id == box_trigger,
+            "query_capsule_triggers returns sorted overlapping box and triangle_mesh triggers");
+
+        world.query_capsule_triggers({-20.0F, 0.2F, 0.0F}, 0.35F, 1.6F, 2U, triggers);
+        expect(
+            triggers.empty(),
+            "query_capsule_triggers respects layer_mask pruning");
+
+        // 6. Dynamic BVH refit: update_collider_transform & set_collider_enabled & upsert_box_collider:
+        const glm::mat4 moved_ramp =
+            glm::translate(glm::mat4(1.0F), glm::vec3{60.0F, 0.0F, 0.0F});
+        const glm::mat4 moved_box =
+            glm::translate(glm::mat4(1.0F), glm::vec3{70.0F, 0.5F, 0.0F}) *
+            glm::scale(glm::mat4(1.0F), glm::vec3{1.0F, 0.5F, 1.0F});
+        const glm::mat4 moved_cap =
+            glm::translate(glm::mat4(1.0F), glm::vec3{80.0F, 1.5F, 0.0F});
+        expect(
+            world.update_collider_transform(tri_ramp, moved_ramp) &&
+                world.update_collider_transform(solid_box, moved_box) &&
+                world.update_collider_transform(solid_cap, moved_cap),
+            "update_collider_transform refits triangle_mesh, box, and capsule in BVH");
+
+        expect(
+            !world.raycast({20.0F, 10.0F, 0.0F}, {0.0F, -1.0F, 0.0F}, 20.0F, 1U).has_value() &&
+                world.check_capsule_free({20.0F, 0.2F, 0.0F}, 0.35F, 1.6F, 1U) &&
+                world.check_capsule_free({30.0F, 0.2F, 0.0F}, 0.35F, 1.6F) &&
+                world.check_capsule_free({40.0F, 0.5F, 0.0F}, 0.35F, 1.6F),
+            "BVH queries no longer hit old positions after update_collider_transform");
+
+        const auto moved_sup = world.sample_supporting_height(61.2F, 0.0F, 5.0F, 20.0F, 1U);
+        const auto moved_box_hit = world.raycast({70.0F, 5.0F, 0.0F}, {0.0F, -1.0F, 0.0F}, 10.0F);
+        expect(
+            moved_sup && close_to(*moved_sup, 0.80F, 0.01F) &&
+                moved_box_hit && moved_box_hit->node_id == solid_box &&
+                !world.check_capsule_free({60.0F, 0.2F, 0.0F}, 0.35F, 1.6F, 1U) &&
+                !world.check_capsule_free({70.0F, 0.2F, 0.0F}, 0.35F, 1.6F) &&
+                !world.check_capsule_free({80.0F, 0.5F, 0.0F}, 0.35F, 1.6F),
+            "BVH queries hit moved triangle_mesh, box, and capsule at new positions");
+
+        world.set_collider_enabled(tri_ramp, false);
+        world.set_collider_enabled(solid_cap, false);
+        world.set_collider_enabled(tri_trigger, false);
+        world.set_collider_enabled(solid_box, false);
+        expect(
+            world.update_collider_transform(
+                solid_box,
+                glm::translate(glm::mat4(1.0F), glm::vec3{75.0F, 0.5F, 0.0F}) *
+                    glm::scale(glm::mat4(1.0F), glm::vec3{1.0F, 0.5F, 1.0F})),
+            "update_collider_transform updates bounds while collider is disabled");
+
+        world.gather_sphere_contacts({60.0F, 0.65F, 0.0F}, 0.35F, 1U, sphere_contacts);
+        world.query_capsule_triggers({-20.0F, 0.2F, 0.0F}, 0.35F, 1.6F, 1U, triggers);
+        expect(
+            !world.sample_supporting_height(61.2F, 0.0F, 5.0F, 20.0F, 1U).has_value() &&
+                world.check_capsule_free({60.0F, 0.2F, 0.0F}, 0.35F, 1.6F, 1U) &&
+                world.check_capsule_free({75.0F, 0.2F, 0.0F}, 0.35F, 1.6F) &&
+                world.check_capsule_free({80.0F, 0.5F, 0.0F}, 0.35F, 1.6F) &&
+                sphere_contacts.empty() &&
+                triggers.size() == 1U && triggers[0].node_id == box_trigger,
+            "set_collider_enabled(false) prunes disabled solids and triggers in BVH");
+
+        world.set_collider_enabled(tri_ramp, true);
+        world.set_collider_enabled(solid_cap, true);
+        world.set_collider_enabled(tri_trigger, true);
+        world.set_collider_enabled(solid_box, true);
+        world.query_capsule_triggers({-20.0F, 0.2F, 0.0F}, 0.35F, 1.6F, 1U, triggers);
+        expect(
+            world.sample_supporting_height(61.2F, 0.0F, 5.0F, 20.0F, 1U).has_value() &&
+                !world.check_capsule_free({75.0F, 0.2F, 0.0F}, 0.35F, 1.6F) &&
+                !world.check_capsule_free({80.0F, 0.5F, 0.0F}, 0.35F, 1.6F) &&
+                triggers.size() == 2U,
+            "set_collider_enabled(true) restores refitted solids and triggers in BVH");
+
+        expect(
+            world.upsert_box_collider(
+                solid_box, {90.0F, 0.5F, 0.0F}, glm::mat3(1.0F), {1.0F, 0.5F, 1.0F}),
+            "upsert_box_collider updates indexed box");
+        const auto upserted_hit = world.raycast({90.0F, 5.0F, 0.0F}, {0.0F, -1.0F, 0.0F}, 10.0F);
+        expect(
+            world.check_capsule_free({75.0F, 0.2F, 0.0F}, 0.35F, 1.6F) &&
+                upserted_hit && upserted_hit->node_id == solid_box,
+            "upsert_box_collider refits indexed BVH box");
+
+        const vcr::SceneNodeId appended_solid{99901U, 1U};
+        const vcr::SceneNodeId appended_trig{99902U, 1U};
+        expect(
+            world.upsert_box_collider(
+                appended_solid, {100.0F, 0.5F, 0.0F}, glm::mat3(1.0F), {1.0F, 0.5F, 1.0F}) &&
+                world.upsert_box_collider(
+                    appended_trig,
+                    {110.0F, 1.0F, 0.0F},
+                    glm::mat3(1.0F),
+                    {1.0F, 1.0F, 1.0F},
+                    1U,
+                    0xFFFFFFFFU,
+                    true),
+            "upsert_box_collider appends dynamic boxes past bvh_indexed_box_count_");
+        const auto app_hit = world.raycast({100.0F, 5.0F, 0.0F}, {0.0F, -1.0F, 0.0F}, 10.0F);
+        world.query_capsule_triggers({110.0F, 0.2F, 0.0F}, 0.35F, 1.6F, 1U, triggers);
+        expect(
+            app_hit && app_hit->node_id == appended_solid &&
+                !world.check_capsule_free({100.0F, 0.2F, 0.0F}, 0.35F, 1.6F) &&
+                triggers.size() == 1U && triggers[0].node_id == appended_trig,
+            "appended boxes >= bvh_indexed_box_count_ participate in all queries");
+
+        // 7. Zero-trigger root early-out + >128 resolve_capsule overflow fallback:
+        vcr::SceneDocument crowd_scene;
+        for (int i = 0; i < 140; ++i) {
+            const auto box = crowd_scene.create_node("CrowdBox", vcr::SceneNodeKind::cube);
+            crowd_scene.node(box)->get().transform.translation = {
+                static_cast<float>(i % 5) * 0.02F,
+                0.5F,
+                static_cast<float>(i / 5) * 0.005F,
+            };
+            crowd_scene.node(box)->get().transform.scale = {1.0F, 0.5F, 1.0F};
+        }
+        vcr::CollisionWorld crowd_world;
+        crowd_world.rebuild_from_scene(crowd_scene);
+        crowd_world.query_capsule_triggers({0.0F, 0.2F, 0.0F}, 0.35F, 1.6F, 0xFFFFFFFFU, triggers);
+        const auto crowd_res = crowd_world.resolve_capsule(
+            {0.0F, 0.2F, 0.0F}, 0.35F, 1.6F, 0.7F);
+        expect(
+            triggers.empty() &&
+                crowd_res.grounded &&
+                crowd_res.resolved_feet.y >= 0.99F,
+            "zero-trigger BVH early-outs cleanly and >128 resolve_capsule fallback preserves resolution");
+
+        crowd_world.clear();
+        expect(
+            crowd_world.empty() &&
+                !crowd_world.raycast({0.0F, 5.0F, 0.0F}, {0.0F, -1.0F, 0.0F}, 10.0F).has_value() &&
+                crowd_world.check_capsule_free({0.0F, 0.2F, 0.0F}, 0.35F, 1.6F),
+            "CollisionWorld::clear() resets BVH state cleanly");
+    }
+
+    // PhysicsWorld::sleep_body and wake-on-impact:
+    {
+        vcr::SceneDocument scene;
+        const auto ground = scene.create_node("Ground", vcr::SceneNodeKind::ground);
+        scene.node(ground)->get().transform.scale = {20.0F, 1.0F, 20.0F};
+
+        const auto parked = scene.create_node("ParkedBody", vcr::SceneNodeKind::cube);
+        scene.node(parked)->get().transform.translation = {0.0F, 0.5F, 0.0F};
+        scene.node(parked)->get().transform.scale = {0.5F, 0.5F, 0.5F};
+        expect(
+            scene.set_rigid_body(
+                parked,
+                vcr::RigidBodyComponent{
+                    .mass = 10.0F,
+                    .restitution = 0.0F,
+                    .friction = 0.8F,
+                    .motion_type = vcr::RigidBodyMotionType::dynamic,
+                }),
+            "attach dynamic rigid_body to ParkedBody");
+
+        const auto impactor = scene.create_node("ImpactorBody", vcr::SceneNodeKind::cube);
+        scene.node(impactor)->get().transform.translation = {0.0F, 5.0F, 0.0F};
+        scene.node(impactor)->get().transform.scale = {0.5F, 0.5F, 0.5F};
+        expect(
+            scene.set_rigid_body(
+                impactor,
+                vcr::RigidBodyComponent{
+                    .mass = 40.0F,
+                    .restitution = 0.2F,
+                    .friction = 0.4F,
+                    .motion_type = vcr::RigidBodyMotionType::dynamic,
+                }),
+            "attach heavy ImpactorBody above ParkedBody");
+
+        const auto kin = scene.create_node("KinematicBody", vcr::SceneNodeKind::cube);
+        scene.node(kin)->get().transform.translation = {8.0F, 0.5F, 0.0F};
+        expect(
+            scene.set_rigid_body(
+                kin,
+                vcr::RigidBodyComponent{
+                    .mass = 100.0F,
+                    .motion_type = vcr::RigidBodyMotionType::kinematic,
+                }),
+            "attach kinematic rigid_body");
+
+        const auto disabled_dyn = scene.create_node("DisabledBody", vcr::SceneNodeKind::cube);
+        scene.node(disabled_dyn)->get().transform.translation = {12.0F, 0.5F, 0.0F};
+        expect(
+            scene.set_rigid_body(
+                disabled_dyn,
+                vcr::RigidBodyComponent{
+                    .mass = 5.0F,
+                    .motion_type = vcr::RigidBodyMotionType::dynamic,
+                }),
+            "attach disabled dynamic rigid_body");
+
+        vcr::CollisionWorld static_world;
+        static_world.rebuild_from_scene(scene, {}, {}, {}, true);
+        vcr::PhysicsWorld physics;
+        physics.rebuild_from_scene(scene);
+        expect(physics.set_body_enabled(disabled_dyn, false), "disable DisabledBody");
+
+        expect(
+            !physics.sleep_body(vcr::SceneNodeId{}) &&
+                !physics.sleep_body(kin) &&
+                !physics.sleep_body(disabled_dyn),
+            "sleep_body rejects invalid, kinematic, and disabled bodies");
+
+        expect(
+            physics.set_linear_velocity(parked, {4.0F, 2.0F, 0.0F}) &&
+                physics.set_angular_velocity(parked, {0.0F, 3.0F, 0.0F}) &&
+                physics.apply_central_force(parked, {0.0F, 150.0F, 0.0F}, 1.0F / 60.0F),
+            "excite ParkedBody before sleep_body");
+        expect(physics.sleep_body(parked), "sleep_body puts enabled dynamic body to sleep");
+
+        const auto slept_state = physics.body_state(parked);
+        expect(
+            slept_state && slept_state->sleeping &&
+                glm::length(slept_state->linear_velocity) == 0.0F &&
+                glm::length(slept_state->angular_velocity) == 0.0F,
+            "sleep_body zeroes velocities and sets sleeping=true");
+
+        for (int frame = 0; frame < 15; ++frame) {
+            physics.step(1.0F / 60.0F, static_world);
+        }
+        const auto mid_state = physics.body_state(parked);
+        expect(
+            mid_state && mid_state->sleeping &&
+                close_to(mid_state->position.x, 0.0F, 1.0e-5F) &&
+                close_to(mid_state->position.y, 0.5F, 1.0e-5F) &&
+                close_to(mid_state->position.z, 0.0F, 1.0e-5F),
+            "slept body stays stationary with cleared pending impulses before impact");
+
+        bool woke_on_impact = false;
+        for (int frame = 0; frame < 120; ++frame) {
+            physics.step(1.0F / 60.0F, static_world);
+            if (const auto s = physics.body_state(parked); s && !s->sleeping) {
+                woke_on_impact = true;
+                break;
+            }
+        }
+        expect(
+            woke_on_impact,
+            "body slept via sleep_body wakes cleanly when struck by falling dynamic body");
     }
 
     if (failures != 0) {

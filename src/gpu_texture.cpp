@@ -340,6 +340,14 @@ void GpuTexture::create_impl(VulkanContext &context, const std::uint32_t width,
         check_vk(view_result, "vkCreateImageView", __FILE__, __LINE__);
     }
 
+    const bool enable_anisotropy =
+        context.sampler_anisotropy_enabled() &&
+        mip_levels > 1U &&
+        linear_mipmaps &&
+        filter == VK_FILTER_LINEAR &&
+        compare_enable == VK_FALSE &&
+        depth == 1U &&
+        samples == VK_SAMPLE_COUNT_1_BIT;
     const VkSamplerCreateInfo sampler_info{
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .pNext = nullptr,
@@ -354,8 +362,8 @@ void GpuTexture::create_impl(VulkanContext &context, const std::uint32_t width,
         .addressModeV = address_mode,
         .addressModeW = address_mode,
         .mipLodBias = 0.0F,
-        .anisotropyEnable = VK_FALSE,
-        .maxAnisotropy = 1.0F,
+        .anisotropyEnable = enable_anisotropy ? VK_TRUE : VK_FALSE,
+        .maxAnisotropy = enable_anisotropy ? context.max_sampler_anisotropy() : 1.0F,
         .compareEnable = compare_enable,
         .compareOp = compare_op,
         .minLod = 0.0F,

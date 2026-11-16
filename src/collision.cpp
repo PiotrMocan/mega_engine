@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -967,6 +968,187 @@ struct Penetration {
     return std::nullopt;
 }
 
+[[nodiscard]] Bounds union_bounds(
+    const Bounds& a,
+    const Bounds& b) noexcept {
+    const glm::vec3 mn = glm::min(a.center - a.extent, b.center - b.extent);
+    const glm::vec3 mx = glm::max(a.center + a.extent, b.center + b.extent);
+    const glm::vec3 center = 0.5F * (mn + mx);
+    const glm::vec3 half_span = 0.5F * (mx - mn);
+    const glm::vec3 pad = glm::max(glm::abs(mn), glm::abs(mx)) * 1.0e-6F;
+    const glm::vec3 extent =
+        glm::max(half_span, glm::max(mx - center, center - mn)) + pad;
+    return Bounds{.center = center, .extent = extent};
+}
+
+struct RayQuery {
+    glm::vec3 origin{0.0F};
+    glm::vec3 dir{0.0F, 0.0F, -1.0F};
+    glm::vec3 inv_dir{0.0F};
+    std::array<bool, 3> axis_parallel{false, false, false};
+};
+
+[[nodiscard]] RayQuery make_ray_query(
+    const glm::vec3 origin,
+    const glm::vec3 dir) noexcept {
+    RayQuery q{};
+    q.origin = origin;
+    q.dir = dir;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (std::abs(dir[axis]) <= collision_math_epsilon) {
+            q.axis_parallel[static_cast<std::size_t>(axis)] = true;
+            q.inv_dir[axis] = 0.0F;
+        } else {
+            q.axis_parallel[static_cast<std::size_t>(axis)] = false;
+            q.inv_dir[axis] = 1.0F / dir[axis];
+        }
+    }
+    return q;
+}
+
+[[nodiscard]] bool ray_aabb_t_enter(
+    const RayQuery& ray,
+    const float max_dist,
+    const Bounds& aabb,
+    float& t_enter_out) noexcept {
+    const glm::vec3 bmin = aabb.center - aabb.extent;
+    const glm::vec3 bmax = aabb.center + aabb.extent;
+    float t_min = 0.0F;
+    float t_max = max_dist;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (ray.axis_parallel[static_cast<std::size_t>(axis)]) {
+            if (ray.origin[axis] < bmin[axis] ||
+                ray.origin[axis] > bmax[axis]) {
+                return false;
+            }
+            continue;
+        }
+        const float inv = ray.inv_dir[axis];
+        float t1 = (bmin[axis] - ray.origin[axis]) * inv;
+        float t2 = (bmax[axis] - ray.origin[axis]) * inv;
+        if (t1 > t2) {
+            std::swap(t1, t2);
+        }
+        t_min = std::max(t_min, t1);
+        t_max = std::min(t_max, t2);
+        if (t_min > t_max) {
+            return false;
+        }
+    }
+    t_enter_out = t_min;
+    return true;
+}
+
+template <typename MeshT, typename Fn>
+void for_each_overlapping_chunk_triangle(
+    const MeshT& shared,
+    const glm::mat4& world_from_local,
+    const Bounds& local_aabb,
+    Fn&& on_triangle) noexcept(noexcept(
+        on_triangle(glm::vec3{}, glm::vec3{}, glm::vec3{}))) {
+    if (shared.chunk_bvh.empty() ||
+        !aabb_overlaps(local_aabb, shared.local_aabb) ||
+        !aabb_overlaps(local_aabb, shared.chunk_bvh[0].local_aabb)) {
+        return;
+    }
+    std::array<std::uint32_t, 64> stack{};
+    std::size_t sp = 0U;
+    stack[sp++] = 0U;
+    while (sp > 0U) {
+        const auto& node = shared.chunk_bvh[stack[--sp]];
+        if (node.is_leaf) {
+            const auto& chunk = shared.chunks[node.left_or_chunk];
+            const std::uint32_t end_tri =
+                chunk.first_triangle + chunk.triangle_count;
+            for (std::uint32_t t = chunk.first_triangle; t < end_tri; ++t) {
+                const glm::vec3 v0 = glm::vec3(
+                    world_from_local *
+                    glm::vec4(
+                        shared.positions[shared.indices[t * 3U + 0U]], 1.0F));
+                const glm::vec3 v1 = glm::vec3(
+                    world_from_local *
+                    glm::vec4(
+                        shared.positions[shared.indices[t * 3U + 1U]], 1.0F));
+                const glm::vec3 v2 = glm::vec3(
+                    world_from_local *
+                    glm::vec4(
+                        shared.positions[shared.indices[t * 3U + 2U]], 1.0F));
+                if (!on_triangle(v0, v1, v2)) {
+                    return;
+                }
+            }
+            continue;
+        }
+        if (aabb_overlaps(
+                local_aabb, shared.chunk_bvh[node.right].local_aabb)) {
+            assert(sp < stack.size());
+            if (sp < stack.size()) {
+                stack[sp++] = node.right;
+            }
+        }
+        if (aabb_overlaps(
+                local_aabb,
+                shared.chunk_bvh[node.left_or_chunk].local_aabb)) {
+            assert(sp < stack.size());
+            if (sp < stack.size()) {
+                stack[sp++] = node.left_or_chunk;
+            }
+        }
+    }
+}
+
+template <typename NodeT, typename Fn>
+void traverse_bvh_aabb(
+    const std::span<const NodeT> nodes,
+    const Bounds& query_aabb,
+    const std::uint32_t layer_mask,
+    const std::uint8_t wanted_flags,
+    const std::uint8_t leaf_flag,
+    Fn&& on_leaf) noexcept(noexcept(
+        on_leaf(NodeT{}.leaf_kind, std::uint32_t{0U}))) {
+    if (nodes.empty()) {
+        return;
+    }
+    const NodeT& root = nodes[0];
+    if ((root.flags & wanted_flags) == 0U ||
+        (root.layer_mask & layer_mask) == 0U ||
+        !aabb_overlaps(query_aabb, root.world_aabb)) {
+        return;
+    }
+    std::array<std::uint32_t, 128> stack{};
+    std::size_t sp = 0U;
+    stack[sp++] = 0U;
+    while (sp > 0U) {
+        const NodeT& node = nodes[stack[--sp]];
+        if ((node.flags & leaf_flag) != 0U) {
+            if (!on_leaf(node.leaf_kind, node.right_or_index)) {
+                return;
+            }
+            continue;
+        }
+        const std::uint32_t right_idx = node.right_or_index;
+        const NodeT& right = nodes[right_idx];
+        if ((right.flags & wanted_flags) != 0U &&
+            (right.layer_mask & layer_mask) != 0U &&
+            aabb_overlaps(query_aabb, right.world_aabb)) {
+            assert(sp < stack.size());
+            if (sp < stack.size()) {
+                stack[sp++] = right_idx;
+            }
+        }
+        const std::uint32_t left_idx = node.left;
+        const NodeT& left = nodes[left_idx];
+        if ((left.flags & wanted_flags) != 0U &&
+            (left.layer_mask & layer_mask) != 0U &&
+            aabb_overlaps(query_aabb, left.world_aabb)) {
+            assert(sp < stack.size());
+            if (sp < stack.size()) {
+                stack[sp++] = left_idx;
+            }
+        }
+    }
+}
+
 } // namespace
 
 CollisionWorld::CollisionWorld() {
@@ -977,6 +1159,14 @@ CollisionWorld::CollisionWorld() {
     shared_meshes_.reserve(16U);
     triangle_meshes_.reserve(32U);
     node_collider_lookup_.reserve(256U);
+    bvh_nodes_.reserve(512U);
+    bvh_parent_.reserve(512U);
+    box_bvh_node_.reserve(256U);
+    sphere_bvh_node_.reserve(64U);
+    capsule_bvh_node_.reserve(64U);
+    hull_bvh_node_.reserve(32U);
+    tmesh_bvh_node_.reserve(32U);
+    bvh_build_leaves_scratch_.reserve(512U);
     world_nodes_scratch_.reserve(256U);
     ancestor_scratch_.reserve(256U);
 }
@@ -989,6 +1179,15 @@ void CollisionWorld::clear() noexcept {
     shared_meshes_.clear();
     triangle_meshes_.clear();
     std::fill(node_collider_lookup_.begin(), node_collider_lookup_.end(), NodeColliderRef{});
+    bvh_nodes_.clear();
+    bvh_parent_.clear();
+    box_bvh_node_.clear();
+    sphere_bvh_node_.clear();
+    capsule_bvh_node_.clear();
+    hull_bvh_node_.clear();
+    tmesh_bvh_node_.clear();
+    bvh_build_leaves_scratch_.clear();
+    bvh_indexed_box_count_ = 0U;
     terrain_node_id_ = {};
     terrain_node_uuid_ = {};
     solid_count_ = 0U;
@@ -1086,40 +1285,54 @@ std::optional<std::uint32_t> CollisionWorld::intern_triangle_mesh(
     std::iota(tri_order.begin(), tri_order.end(), 0U);
 
     constexpr std::uint32_t triangles_per_chunk = 32U;
+    const std::size_t estimated_chunks =
+        (tri_count + triangles_per_chunk - 1U) / triangles_per_chunk;
     mesh.indices.reserve(tri_count * 3U);
-    mesh.chunks.reserve((total_tris + triangles_per_chunk - 1U) /
-                        triangles_per_chunk);
+    mesh.chunks.reserve(estimated_chunks);
+    mesh.chunk_bvh.reserve(std::max<std::size_t>(1U, estimated_chunks * 4U));
 
     const auto build_chunks = [&](auto& self,
                                   const std::uint32_t begin,
-                                  const std::uint32_t end) -> void {
+                                  const std::uint32_t end) -> std::uint32_t {
         const std::uint32_t count = end - begin;
         if (count == 0U) {
-            return;
+            return kInvalidBvhNode;
         }
         if (count <= triangles_per_chunk) {
-            const auto first_out = static_cast<std::uint32_t>(mesh.indices.size() / 3U);
+            const auto first_out =
+                static_cast<std::uint32_t>(mesh.indices.size() / 3U);
             glm::vec3 cmin(std::numeric_limits<float>::max());
             glm::vec3 cmax(std::numeric_limits<float>::lowest());
             for (std::uint32_t idx = begin; idx < end; ++idx) {
                 const std::uint32_t src_t = tri_order[idx];
                 for (std::uint32_t corner = 0U; corner < 3U; ++corner) {
-                    const std::uint32_t vi = collision.triangle_indices[src_t * 3U + corner];
+                    const std::uint32_t vi =
+                        collision.triangle_indices[src_t * 3U + corner];
                     mesh.indices.push_back(vi);
                     const glm::vec3& v = mesh.positions[vi];
                     cmin = glm::min(cmin, v);
                     cmax = glm::max(cmax, v);
                 }
             }
+            const Bounds chunk_bounds{
+                .center = 0.5F * (cmin + cmax),
+                .extent = glm::max(0.5F * (cmax - cmin), glm::vec3(0.001F)),
+            };
+            const auto chunk_idx = static_cast<std::uint32_t>(mesh.chunks.size());
             mesh.chunks.push_back(TriangleChunk{
-                .local_aabb = Bounds{
-                    .center = 0.5F * (cmin + cmax),
-                    .extent = glm::max(0.5F * (cmax - cmin), glm::vec3(0.001F)),
-                },
+                .local_aabb = chunk_bounds,
                 .first_triangle = first_out,
                 .triangle_count = count,
             });
-            return;
+            const auto node_idx =
+                static_cast<std::uint32_t>(mesh.chunk_bvh.size());
+            mesh.chunk_bvh.push_back(ChunkBvhNode{
+                .local_aabb = chunk_bounds,
+                .left_or_chunk = chunk_idx,
+                .right = 0U,
+                .is_leaf = true,
+            });
+            return node_idx;
         }
 
         glm::vec3 cent_min(std::numeric_limits<float>::max());
@@ -1141,13 +1354,27 @@ std::optional<std::uint32_t> CollisionWorld::intern_triangle_mesh(
             tri_order.begin() + static_cast<std::ptrdiff_t>(begin),
             tri_order.begin() + static_cast<std::ptrdiff_t>(mid),
             tri_order.begin() + static_cast<std::ptrdiff_t>(end),
-            [&tri_centroids, axis](const std::uint32_t a, const std::uint32_t b) noexcept {
+            [&tri_centroids, axis](
+                const std::uint32_t a, const std::uint32_t b) noexcept {
                 return tri_centroids[a][axis] < tri_centroids[b][axis];
             });
-        self(self, begin, mid);
-        self(self, mid, end);
+        const auto node_idx =
+            static_cast<std::uint32_t>(mesh.chunk_bvh.size());
+        mesh.chunk_bvh.push_back(ChunkBvhNode{});
+        const std::uint32_t left_idx = self(self, begin, mid);
+        const std::uint32_t right_idx = self(self, mid, end);
+        const Bounds combined = union_bounds(
+            mesh.chunk_bvh[left_idx].local_aabb,
+            mesh.chunk_bvh[right_idx].local_aabb);
+        mesh.chunk_bvh[node_idx] = ChunkBvhNode{
+            .local_aabb = combined,
+            .left_or_chunk = left_idx,
+            .right = right_idx,
+            .is_leaf = false,
+        };
+        return node_idx;
     };
-    build_chunks(build_chunks, 0U, total_tris);
+    static_cast<void>(build_chunks(build_chunks, 0U, total_tris));
 
     const auto out_idx = static_cast<std::uint32_t>(shared_meshes_.size());
     shared_meshes_.push_back(std::move(mesh));
@@ -1609,6 +1836,334 @@ void CollisionWorld::rebuild_from_scene(
             record_counts(resolved.is_trigger);
         }
     }
+
+    build_top_level_bvh();
+}
+
+void CollisionWorld::build_top_level_bvh() {
+    const std::size_t total_leaves =
+        boxes_.size() +
+        spheres_.size() +
+        capsules_.size() +
+        convex_hulls_.size() +
+        triangle_meshes_.size();
+
+    bvh_nodes_.clear();
+    bvh_parent_.clear();
+    box_bvh_node_.assign(boxes_.size(), kInvalidBvhNode);
+    sphere_bvh_node_.assign(spheres_.size(), kInvalidBvhNode);
+    capsule_bvh_node_.assign(capsules_.size(), kInvalidBvhNode);
+    hull_bvh_node_.assign(convex_hulls_.size(), kInvalidBvhNode);
+    tmesh_bvh_node_.assign(triangle_meshes_.size(), kInvalidBvhNode);
+    bvh_indexed_box_count_ = boxes_.size();
+
+    if (total_leaves == 0U ||
+        total_leaves >
+            (std::numeric_limits<std::uint32_t>::max() - 1U) / 2U) {
+        return;
+    }
+
+    bvh_build_leaves_scratch_.clear();
+    bvh_build_leaves_scratch_.reserve(total_leaves);
+
+    for (std::uint32_t i = 0U; i < static_cast<std::uint32_t>(boxes_.size()); ++i) {
+        const OrientedBox& c = boxes_[i];
+        bvh_build_leaves_scratch_.push_back(BvhBuildLeaf{
+            .world_aabb = c.world_aabb,
+            .index = i,
+            .layer = c.layer,
+            .kind = ColliderStorageKind::box,
+            .is_trigger = c.is_trigger,
+            .enabled = c.enabled,
+        });
+    }
+    for (std::uint32_t i = 0U; i < static_cast<std::uint32_t>(spheres_.size()); ++i) {
+        const SphereCollider& c = spheres_[i];
+        bvh_build_leaves_scratch_.push_back(BvhBuildLeaf{
+            .world_aabb = c.world_aabb,
+            .index = i,
+            .layer = c.layer,
+            .kind = ColliderStorageKind::sphere,
+            .is_trigger = c.is_trigger,
+            .enabled = c.enabled,
+        });
+    }
+    for (std::uint32_t i = 0U; i < static_cast<std::uint32_t>(capsules_.size()); ++i) {
+        const CapsuleCollider& c = capsules_[i];
+        bvh_build_leaves_scratch_.push_back(BvhBuildLeaf{
+            .world_aabb = c.world_aabb,
+            .index = i,
+            .layer = c.layer,
+            .kind = ColliderStorageKind::capsule,
+            .is_trigger = c.is_trigger,
+            .enabled = c.enabled,
+        });
+    }
+    for (std::uint32_t i = 0U; i < static_cast<std::uint32_t>(convex_hulls_.size()); ++i) {
+        const ConvexHullCollider& c = convex_hulls_[i];
+        bvh_build_leaves_scratch_.push_back(BvhBuildLeaf{
+            .world_aabb = c.world_aabb,
+            .index = i,
+            .layer = c.layer,
+            .kind = ColliderStorageKind::convex_hull,
+            .is_trigger = c.is_trigger,
+            .enabled = c.enabled,
+        });
+    }
+    for (std::uint32_t i = 0U; i < static_cast<std::uint32_t>(triangle_meshes_.size()); ++i) {
+        const TriangleMeshCollider& c = triangle_meshes_[i];
+        bvh_build_leaves_scratch_.push_back(BvhBuildLeaf{
+            .world_aabb = c.world_aabb,
+            .index = i,
+            .layer = c.layer,
+            .kind = ColliderStorageKind::triangle_mesh,
+            .is_trigger = c.is_trigger,
+            .enabled = c.enabled,
+        });
+    }
+
+    const std::size_t total_nodes = 2U * total_leaves - 1U;
+    bvh_nodes_.reserve(total_nodes);
+    bvh_parent_.reserve(total_nodes);
+
+    const auto set_leaf_node_index = [&](
+        const ColliderStorageKind kind,
+        const std::uint32_t elem_idx,
+        const std::uint32_t node_idx) noexcept {
+        switch (kind) {
+        case ColliderStorageKind::box:
+            box_bvh_node_[elem_idx] = node_idx;
+            break;
+        case ColliderStorageKind::sphere:
+            sphere_bvh_node_[elem_idx] = node_idx;
+            break;
+        case ColliderStorageKind::capsule:
+            capsule_bvh_node_[elem_idx] = node_idx;
+            break;
+        case ColliderStorageKind::convex_hull:
+            hull_bvh_node_[elem_idx] = node_idx;
+            break;
+        case ColliderStorageKind::triangle_mesh:
+            tmesh_bvh_node_[elem_idx] = node_idx;
+            break;
+        case ColliderStorageKind::none:
+        default:
+            break;
+        }
+    };
+
+    const auto build_node = [&](auto& self,
+                                const std::uint32_t begin,
+                                const std::uint32_t end,
+                                const std::uint32_t parent) -> std::uint32_t {
+        const std::uint32_t count = end - begin;
+        const auto node_idx = static_cast<std::uint32_t>(bvh_nodes_.size());
+        if (count == 1U) {
+            const BvhBuildLeaf& leaf = bvh_build_leaves_scratch_[begin];
+            std::uint8_t flags = kBvhIsLeaf;
+            if (leaf.enabled) {
+                flags |= leaf.is_trigger
+                    ? kBvhHasEnabledTrigger
+                    : kBvhHasEnabledSolid;
+            }
+            bvh_nodes_.push_back(ColliderBvhNode{
+                .world_aabb = leaf.world_aabb,
+                .left = kInvalidBvhNode,
+                .right_or_index = leaf.index,
+                .layer_mask = leaf.enabled ? leaf.layer : 0U,
+                .leaf_kind = leaf.kind,
+                .flags = flags,
+            });
+            bvh_parent_.push_back(parent);
+            set_leaf_node_index(leaf.kind, leaf.index, node_idx);
+            return node_idx;
+        }
+
+        glm::vec3 cent_min(std::numeric_limits<float>::max());
+        glm::vec3 cent_max(std::numeric_limits<float>::lowest());
+        for (std::uint32_t i = begin; i < end; ++i) {
+            const glm::vec3& c = bvh_build_leaves_scratch_[i].world_aabb.center;
+            cent_min = glm::min(cent_min, c);
+            cent_max = glm::max(cent_max, c);
+        }
+        const glm::vec3 span = cent_max - cent_min;
+        int axis = 0;
+        if (span.y > span.x && span.y >= span.z) {
+            axis = 1;
+        } else if (span.z > span.x && span.z > span.y) {
+            axis = 2;
+        }
+        const std::uint32_t mid = begin + count / 2U;
+        std::nth_element(
+            bvh_build_leaves_scratch_.begin() +
+                static_cast<std::ptrdiff_t>(begin),
+            bvh_build_leaves_scratch_.begin() +
+                static_cast<std::ptrdiff_t>(mid),
+            bvh_build_leaves_scratch_.begin() +
+                static_cast<std::ptrdiff_t>(end),
+            [axis](const BvhBuildLeaf& a, const BvhBuildLeaf& b) noexcept {
+                return a.world_aabb.center[axis] < b.world_aabb.center[axis];
+            });
+
+        bvh_nodes_.push_back(ColliderBvhNode{});
+        bvh_parent_.push_back(parent);
+        const std::uint32_t left_idx = self(self, begin, mid, node_idx);
+        const std::uint32_t right_idx = self(self, mid, end, node_idx);
+        const ColliderBvhNode& left_node = bvh_nodes_[left_idx];
+        const ColliderBvhNode& right_node = bvh_nodes_[right_idx];
+        const Bounds combined = union_bounds(
+            left_node.world_aabb, right_node.world_aabb);
+        const std::uint32_t combined_mask =
+            left_node.layer_mask | right_node.layer_mask;
+        const auto combined_flags = static_cast<std::uint8_t>(
+            (left_node.flags | right_node.flags) &
+            (kBvhHasEnabledSolid | kBvhHasEnabledTrigger));
+        bvh_nodes_[node_idx] = ColliderBvhNode{
+            .world_aabb = combined,
+            .left = left_idx,
+            .right_or_index = right_idx,
+            .layer_mask = combined_mask,
+            .leaf_kind = ColliderStorageKind::none,
+            .flags = combined_flags,
+        };
+        return node_idx;
+    };
+
+    static_cast<void>(build_node(
+        build_node,
+        0U,
+        static_cast<std::uint32_t>(total_leaves),
+        kInvalidBvhNode));
+}
+
+void CollisionWorld::refit_bvh_leaf(const std::uint32_t leaf_node_idx) noexcept {
+    if (leaf_node_idx >= bvh_nodes_.size()) {
+        return;
+    }
+    ColliderBvhNode& leaf = bvh_nodes_[leaf_node_idx];
+    if ((leaf.flags & kBvhIsLeaf) == 0U) {
+        return;
+    }
+
+    Bounds new_aabb{};
+    std::uint32_t layer = 0U;
+    bool is_trigger = false;
+    bool enabled = false;
+    switch (leaf.leaf_kind) {
+    case ColliderStorageKind::box: {
+        if (leaf.right_or_index >= boxes_.size()) {
+            return;
+        }
+        const OrientedBox& c = boxes_[leaf.right_or_index];
+        new_aabb = c.world_aabb;
+        layer = c.layer;
+        is_trigger = c.is_trigger;
+        enabled = c.enabled;
+        break;
+    }
+    case ColliderStorageKind::sphere: {
+        if (leaf.right_or_index >= spheres_.size()) {
+            return;
+        }
+        const SphereCollider& c = spheres_[leaf.right_or_index];
+        new_aabb = c.world_aabb;
+        layer = c.layer;
+        is_trigger = c.is_trigger;
+        enabled = c.enabled;
+        break;
+    }
+    case ColliderStorageKind::capsule: {
+        if (leaf.right_or_index >= capsules_.size()) {
+            return;
+        }
+        const CapsuleCollider& c = capsules_[leaf.right_or_index];
+        new_aabb = c.world_aabb;
+        layer = c.layer;
+        is_trigger = c.is_trigger;
+        enabled = c.enabled;
+        break;
+    }
+    case ColliderStorageKind::convex_hull: {
+        if (leaf.right_or_index >= convex_hulls_.size()) {
+            return;
+        }
+        const ConvexHullCollider& c = convex_hulls_[leaf.right_or_index];
+        new_aabb = c.world_aabb;
+        layer = c.layer;
+        is_trigger = c.is_trigger;
+        enabled = c.enabled;
+        break;
+    }
+    case ColliderStorageKind::triangle_mesh: {
+        if (leaf.right_or_index >= triangle_meshes_.size()) {
+            return;
+        }
+        const TriangleMeshCollider& c = triangle_meshes_[leaf.right_or_index];
+        new_aabb = c.world_aabb;
+        layer = c.layer;
+        is_trigger = c.is_trigger;
+        enabled = c.enabled;
+        break;
+    }
+    case ColliderStorageKind::none:
+    default:
+        return;
+    }
+
+    leaf.world_aabb = new_aabb;
+    leaf.layer_mask = enabled ? layer : 0U;
+    leaf.flags = kBvhIsLeaf;
+    if (enabled) {
+        leaf.flags |= is_trigger ? kBvhHasEnabledTrigger : kBvhHasEnabledSolid;
+    }
+
+    std::uint32_t curr = bvh_parent_[leaf_node_idx];
+    while (curr < bvh_nodes_.size()) {
+        ColliderBvhNode& node = bvh_nodes_[curr];
+        const ColliderBvhNode& left = bvh_nodes_[node.left];
+        const ColliderBvhNode& right = bvh_nodes_[node.right_or_index];
+        node.world_aabb = union_bounds(left.world_aabb, right.world_aabb);
+        node.layer_mask = left.layer_mask | right.layer_mask;
+        node.flags = static_cast<std::uint8_t>(
+            (left.flags | right.flags) &
+            (kBvhHasEnabledSolid | kBvhHasEnabledTrigger));
+        curr = bvh_parent_[curr];
+    }
+}
+
+void CollisionWorld::refit_bvh_storage_element(
+    const ColliderStorageKind kind,
+    const std::uint32_t index) noexcept {
+    switch (kind) {
+    case ColliderStorageKind::box:
+        if (index < bvh_indexed_box_count_ && index < box_bvh_node_.size()) {
+            refit_bvh_leaf(box_bvh_node_[index]);
+        }
+        break;
+    case ColliderStorageKind::sphere:
+        if (index < sphere_bvh_node_.size()) {
+            refit_bvh_leaf(sphere_bvh_node_[index]);
+        }
+        break;
+    case ColliderStorageKind::capsule:
+        if (index < capsule_bvh_node_.size()) {
+            refit_bvh_leaf(capsule_bvh_node_[index]);
+        }
+        break;
+    case ColliderStorageKind::convex_hull:
+        if (index < hull_bvh_node_.size()) {
+            refit_bvh_leaf(hull_bvh_node_[index]);
+        }
+        break;
+    case ColliderStorageKind::triangle_mesh:
+        if (index < tmesh_bvh_node_.size()) {
+            refit_bvh_leaf(tmesh_bvh_node_[index]);
+        }
+        break;
+    case ColliderStorageKind::none:
+    default:
+        break;
+    }
 }
 
 std::optional<RaycastHit> CollisionWorld::raycast(
@@ -1629,18 +2184,28 @@ std::optional<RaycastHit> CollisionWorld::raycast(
         return std::nullopt;
     }
     const glm::vec3 unit_dir = direction / dir_len;
+    const RayQuery world_ray = make_ray_query(origin, unit_dir);
+    const std::uint8_t wanted_flags = include_triggers
+        ? static_cast<std::uint8_t>(kBvhHasEnabledSolid | kBvhHasEnabledTrigger)
+        : kBvhHasEnabledSolid;
 
     std::optional<RaycastHit> closest{};
     float best_dist = max_distance;
 
-    for (const OrientedBox& box : boxes_) {
+    const auto test_box = [&](const OrientedBox& box,
+                              const bool check_aabb) noexcept {
         if (!box.enabled ||
             (ignored_node && box.node_id == ignored_node) ||
             (box.layer & layer_mask) == 0U ||
-            (box.is_trigger && !include_triggers) ||
-            !ray_intersects_aabb(origin, unit_dir, best_dist, box.world_aabb)) {
-            continue;
+            (box.is_trigger && !include_triggers)) {
+            return;
         }
+        float t_box = 0.0F;
+        if (check_aabb &&
+            !ray_aabb_t_enter(world_ray, best_dist, box.world_aabb, t_box)) {
+            return;
+        }
+        static_cast<void>(t_box);
         if (auto hit = raycast_obb(
                 origin,
                 unit_dir,
@@ -1655,160 +2220,328 @@ std::optional<RaycastHit> CollisionWorld::raycast(
             best_dist = hit->distance;
             closest = hit;
         }
-    }
+    };
 
-    for (const SphereCollider& sphere : spheres_) {
-        if (!sphere.enabled ||
-            (ignored_node && sphere.node_id == ignored_node) ||
-            (sphere.layer & layer_mask) == 0U ||
-            (sphere.is_trigger && !include_triggers) ||
-            !ray_intersects_aabb(origin, unit_dir, best_dist, sphere.world_aabb)) {
-            continue;
-        }
-        if (auto hit = raycast_sphere(
-                origin,
-                unit_dir,
-                best_dist,
-                sphere.center,
-                sphere.radius)) {
-            hit->node_id = sphere.node_id;
-            hit->node_uuid = sphere.node_uuid;
-            hit->collision_layer = sphere.layer;
-            hit->is_trigger = sphere.is_trigger;
-            best_dist = hit->distance;
-            closest = hit;
-        }
-    }
-
-    for (const CapsuleCollider& cap : capsules_) {
-        if (!cap.enabled ||
-            (ignored_node && cap.node_id == ignored_node) ||
-            (cap.layer & layer_mask) == 0U ||
-            (cap.is_trigger && !include_triggers) ||
-            !ray_intersects_aabb(origin, unit_dir, best_dist, cap.world_aabb)) {
-            continue;
-        }
-        if (auto hit = raycast_capsule(
-                origin,
-                unit_dir,
-                best_dist,
-                cap.point_a,
-                cap.point_b,
-                cap.radius)) {
-            hit->node_id = cap.node_id;
-            hit->node_uuid = cap.node_uuid;
-            hit->collision_layer = cap.layer;
-            hit->is_trigger = cap.is_trigger;
-            best_dist = hit->distance;
-            closest = hit;
-        }
-    }
-
-    for (const ConvexHullCollider& hull : convex_hulls_) {
-        if (!hull.enabled ||
-            (ignored_node && hull.node_id == ignored_node) ||
-            (hull.layer & layer_mask) == 0U ||
-            (hull.is_trigger && !include_triggers) ||
-            !ray_intersects_aabb(origin, unit_dir, best_dist, hull.world_aabb)) {
-            continue;
-        }
-        if (auto hit = raycast_convex_hull(
-                origin,
-                unit_dir,
-                best_dist,
-                std::span<const glm::vec3>(
-                    hull.vertices.data(), hull.vertex_count),
-                hull.axes)) {
-            hit->node_id = hull.node_id;
-            hit->node_uuid = hull.node_uuid;
-            hit->collision_layer = hull.layer;
-            hit->is_trigger = hull.is_trigger;
-            best_dist = hit->distance;
-            closest = hit;
-        }
-    }
-
-    for (const TriangleMeshCollider& tmesh : triangle_meshes_) {
-        if (!tmesh.enabled ||
-            (ignored_node && tmesh.node_id == ignored_node) ||
-            (tmesh.layer & layer_mask) == 0U ||
-            (tmesh.is_trigger && !include_triggers) ||
-            !ray_intersects_aabb(origin, unit_dir, best_dist, tmesh.world_aabb)) {
-            continue;
-        }
-        const SharedTriangleMesh& shared =
-            shared_meshes_[tmesh.shared_mesh_index];
-        const glm::vec3 local_o =
-            glm::vec3(tmesh.local_from_world * glm::vec4(origin, 1.0F));
-        const glm::vec3 end_world = origin + unit_dir * best_dist;
-        const glm::vec3 local_end =
-            glm::vec3(tmesh.local_from_world * glm::vec4(end_world, 1.0F));
-        const glm::vec3 local_seg = local_end - local_o;
-        const float local_max_t = glm::length(local_seg);
-        if (!std::isfinite(local_max_t) || local_max_t <= epsilon) {
-            continue;
-        }
-        const glm::vec3 local_d = local_seg / local_max_t;
-        if (!ray_intersects_aabb(
-                local_o, local_d, local_max_t, shared.local_aabb)) {
-            continue;
-        }
-
-        float best_local_t = local_max_t;
-        glm::vec3 best_local_n{0.0F, 1.0F, 0.0F};
-        bool found_tri = false;
-        for (const TriangleChunk& chunk : shared.chunks) {
-            if (!ray_intersects_aabb(
-                    local_o, local_d, best_local_t, chunk.local_aabb)) {
-                continue;
+    const auto test_leaf = [&](const ColliderStorageKind kind,
+                               const std::uint32_t index) noexcept {
+        switch (kind) {
+        case ColliderStorageKind::box:
+            test_box(boxes_[index], false);
+            break;
+        case ColliderStorageKind::sphere: {
+            const SphereCollider& sphere = spheres_[index];
+            if (!sphere.enabled ||
+                (ignored_node && sphere.node_id == ignored_node) ||
+                (sphere.layer & layer_mask) == 0U ||
+                (sphere.is_trigger && !include_triggers)) {
+                return;
             }
-            for (std::uint32_t t = chunk.first_triangle;
-                 t < chunk.first_triangle + chunk.triangle_count;
-                 ++t) {
-                const glm::vec3 a = shared.positions[shared.indices[t * 3U + 0U]];
-                const glm::vec3 b = shared.positions[shared.indices[t * 3U + 1U]];
-                const glm::vec3 c = shared.positions[shared.indices[t * 3U + 2U]];
-                float tri_t = 0.0F;
-                glm::vec3 tri_n{0.0F};
-                if (raycast_triangle_double_sided(
-                        local_o,
-                        local_d,
+            if (auto hit = raycast_sphere(
+                    origin,
+                    unit_dir,
+                    best_dist,
+                    sphere.center,
+                    sphere.radius)) {
+                hit->node_id = sphere.node_id;
+                hit->node_uuid = sphere.node_uuid;
+                hit->collision_layer = sphere.layer;
+                hit->is_trigger = sphere.is_trigger;
+                best_dist = hit->distance;
+                closest = hit;
+            }
+            break;
+        }
+        case ColliderStorageKind::capsule: {
+            const CapsuleCollider& cap = capsules_[index];
+            if (!cap.enabled ||
+                (ignored_node && cap.node_id == ignored_node) ||
+                (cap.layer & layer_mask) == 0U ||
+                (cap.is_trigger && !include_triggers)) {
+                return;
+            }
+            if (auto hit = raycast_capsule(
+                    origin,
+                    unit_dir,
+                    best_dist,
+                    cap.point_a,
+                    cap.point_b,
+                    cap.radius)) {
+                hit->node_id = cap.node_id;
+                hit->node_uuid = cap.node_uuid;
+                hit->collision_layer = cap.layer;
+                hit->is_trigger = cap.is_trigger;
+                best_dist = hit->distance;
+                closest = hit;
+            }
+            break;
+        }
+        case ColliderStorageKind::convex_hull: {
+            const ConvexHullCollider& hull = convex_hulls_[index];
+            if (!hull.enabled ||
+                (ignored_node && hull.node_id == ignored_node) ||
+                (hull.layer & layer_mask) == 0U ||
+                (hull.is_trigger && !include_triggers)) {
+                return;
+            }
+            if (auto hit = raycast_convex_hull(
+                    origin,
+                    unit_dir,
+                    best_dist,
+                    std::span<const glm::vec3>(
+                        hull.vertices.data(), hull.vertex_count),
+                    hull.axes)) {
+                hit->node_id = hull.node_id;
+                hit->node_uuid = hull.node_uuid;
+                hit->collision_layer = hull.layer;
+                hit->is_trigger = hull.is_trigger;
+                best_dist = hit->distance;
+                closest = hit;
+            }
+            break;
+        }
+        case ColliderStorageKind::triangle_mesh: {
+            const TriangleMeshCollider& tmesh = triangle_meshes_[index];
+            if (!tmesh.enabled ||
+                (ignored_node && tmesh.node_id == ignored_node) ||
+                (tmesh.layer & layer_mask) == 0U ||
+                (tmesh.is_trigger && !include_triggers)) {
+                return;
+            }
+            const SharedTriangleMesh& shared =
+                shared_meshes_[tmesh.shared_mesh_index];
+            const glm::vec3 local_o =
+                glm::vec3(tmesh.local_from_world * glm::vec4(origin, 1.0F));
+            const glm::vec3 end_world = origin + unit_dir * best_dist;
+            const glm::vec3 local_end =
+                glm::vec3(tmesh.local_from_world * glm::vec4(end_world, 1.0F));
+            const glm::vec3 local_seg = local_end - local_o;
+            const float local_max_t = glm::length(local_seg);
+            if (!std::isfinite(local_max_t) || local_max_t <= epsilon) {
+                return;
+            }
+            const glm::vec3 local_d = local_seg / local_max_t;
+            const RayQuery local_ray = make_ray_query(local_o, local_d);
+            float shared_t = 0.0F;
+            if (shared.chunk_bvh.empty() ||
+                !ray_aabb_t_enter(
+                    local_ray, local_max_t, shared.local_aabb, shared_t)) {
+                return;
+            }
+            static_cast<void>(shared_t);
+
+            float best_local_t = local_max_t;
+            glm::vec3 best_local_n{0.0F, 1.0F, 0.0F};
+            bool found_tri = false;
+            float chunk_root_t = 0.0F;
+            if (ray_aabb_t_enter(
+                    local_ray,
+                    best_local_t,
+                    shared.chunk_bvh[0].local_aabb,
+                    chunk_root_t)) {
+                std::array<std::uint32_t, 64> chunk_stack{};
+                std::array<float, 64> chunk_t_stack{};
+                std::size_t chunk_sp = 0U;
+                chunk_stack[chunk_sp] = 0U;
+                chunk_t_stack[chunk_sp] = chunk_root_t;
+                ++chunk_sp;
+                while (chunk_sp > 0U) {
+                    --chunk_sp;
+                    const std::uint32_t cnode_idx = chunk_stack[chunk_sp];
+                    const float cnode_t = chunk_t_stack[chunk_sp];
+                    if (cnode_t > best_local_t) {
+                        continue;
+                    }
+                    const ChunkBvhNode& cnode = shared.chunk_bvh[cnode_idx];
+                    if (cnode.is_leaf) {
+                        const TriangleChunk& chunk =
+                            shared.chunks[cnode.left_or_chunk];
+                        const std::uint32_t end_tri =
+                            chunk.first_triangle + chunk.triangle_count;
+                        for (std::uint32_t t = chunk.first_triangle;
+                             t < end_tri;
+                             ++t) {
+                            const glm::vec3 a =
+                                shared.positions[shared.indices[t * 3U + 0U]];
+                            const glm::vec3 b =
+                                shared.positions[shared.indices[t * 3U + 1U]];
+                            const glm::vec3 c =
+                                shared.positions[shared.indices[t * 3U + 2U]];
+                            float tri_t = 0.0F;
+                            glm::vec3 tri_n{0.0F};
+                            if (raycast_triangle_double_sided(
+                                    local_o,
+                                    local_d,
+                                    best_local_t,
+                                    a,
+                                    b,
+                                    c,
+                                    tri_t,
+                                    tri_n)) {
+                                best_local_t = tri_t;
+                                best_local_n = tri_n;
+                                found_tri = true;
+                            }
+                        }
+                        continue;
+                    }
+                    float t_left = 0.0F;
+                    float t_right = 0.0F;
+                    const bool hit_left = ray_aabb_t_enter(
+                        local_ray,
                         best_local_t,
-                        a,
-                        b,
-                        c,
-                        tri_t,
-                        tri_n)) {
-                    best_local_t = tri_t;
-                    best_local_n = tri_n;
-                    found_tri = true;
+                        shared.chunk_bvh[cnode.left_or_chunk].local_aabb,
+                        t_left);
+                    const bool hit_right = ray_aabb_t_enter(
+                        local_ray,
+                        best_local_t,
+                        shared.chunk_bvh[cnode.right].local_aabb,
+                        t_right);
+                    if (hit_left && hit_right) {
+                        const bool left_first = t_left <= t_right;
+                        const std::uint32_t first_idx =
+                            left_first ? cnode.left_or_chunk : cnode.right;
+                        const float first_t = left_first ? t_left : t_right;
+                        const std::uint32_t second_idx =
+                            left_first ? cnode.right : cnode.left_or_chunk;
+                        const float second_t = left_first ? t_right : t_left;
+                        assert(chunk_sp + 2U <= chunk_stack.size());
+                        if (chunk_sp + 2U <= chunk_stack.size()) {
+                            chunk_stack[chunk_sp] = second_idx;
+                            chunk_t_stack[chunk_sp] = second_t;
+                            ++chunk_sp;
+                            chunk_stack[chunk_sp] = first_idx;
+                            chunk_t_stack[chunk_sp] = first_t;
+                            ++chunk_sp;
+                        }
+                    } else if (hit_left) {
+                        assert(chunk_sp < chunk_stack.size());
+                        if (chunk_sp < chunk_stack.size()) {
+                            chunk_stack[chunk_sp] = cnode.left_or_chunk;
+                            chunk_t_stack[chunk_sp] = t_left;
+                            ++chunk_sp;
+                        }
+                    } else if (hit_right) {
+                        assert(chunk_sp < chunk_stack.size());
+                        if (chunk_sp < chunk_stack.size()) {
+                            chunk_stack[chunk_sp] = cnode.right;
+                            chunk_t_stack[chunk_sp] = t_right;
+                            ++chunk_sp;
+                        }
+                    }
+                }
+            }
+            if (found_tri) {
+                const glm::vec3 local_hit = local_o + local_d * best_local_t;
+                const glm::vec3 world_hit = glm::vec3(
+                    tmesh.world_from_local * glm::vec4(local_hit, 1.0F));
+                const float world_dist = glm::length(world_hit - origin);
+                if (world_dist <= best_dist) {
+                    glm::vec3 wn = tmesh.normal_matrix * best_local_n;
+                    const float wn_len = glm::length(wn);
+                    wn = wn_len > epsilon ? (wn / wn_len) : -unit_dir;
+                    if (glm::dot(wn, unit_dir) > 0.0F) {
+                        wn = -wn;
+                    }
+                    best_dist = world_dist;
+                    closest = RaycastHit{
+                        .point = world_hit,
+                        .normal = wn,
+                        .distance = world_dist,
+                        .node_id = tmesh.node_id,
+                        .node_uuid = tmesh.node_uuid,
+                        .collision_layer = tmesh.layer,
+                        .is_trigger = tmesh.is_trigger,
+                    };
+                }
+            }
+            break;
+        }
+        case ColliderStorageKind::none:
+        default:
+            break;
+        }
+    };
+
+    if (!bvh_nodes_.empty()) {
+        const ColliderBvhNode& root = bvh_nodes_[0];
+        float root_t = 0.0F;
+        if ((root.flags & wanted_flags) != 0U &&
+            (root.layer_mask & layer_mask) != 0U &&
+            ray_aabb_t_enter(world_ray, best_dist, root.world_aabb, root_t)) {
+            std::array<std::uint32_t, 128> node_stack{};
+            std::array<float, 128> node_t_stack{};
+            std::size_t sp = 0U;
+            node_stack[sp] = 0U;
+            node_t_stack[sp] = root_t;
+            ++sp;
+            while (sp > 0U) {
+                --sp;
+                const std::uint32_t node_idx = node_stack[sp];
+                const float node_t = node_t_stack[sp];
+                if (node_t > best_dist) {
+                    continue;
+                }
+                const ColliderBvhNode& node = bvh_nodes_[node_idx];
+                if ((node.flags & kBvhIsLeaf) != 0U) {
+                    test_leaf(node.leaf_kind, node.right_or_index);
+                    continue;
+                }
+                const std::uint32_t left_idx = node.left;
+                const ColliderBvhNode& left = bvh_nodes_[left_idx];
+                float t_left = 0.0F;
+                const bool hit_left =
+                    (left.flags & wanted_flags) != 0U &&
+                    (left.layer_mask & layer_mask) != 0U &&
+                    ray_aabb_t_enter(
+                        world_ray, best_dist, left.world_aabb, t_left);
+
+                const std::uint32_t right_idx = node.right_or_index;
+                const ColliderBvhNode& right = bvh_nodes_[right_idx];
+                float t_right = 0.0F;
+                const bool hit_right =
+                    (right.flags & wanted_flags) != 0U &&
+                    (right.layer_mask & layer_mask) != 0U &&
+                    ray_aabb_t_enter(
+                        world_ray, best_dist, right.world_aabb, t_right);
+
+                if (hit_left && hit_right) {
+                    const bool left_first = t_left <= t_right;
+                    const std::uint32_t first_idx =
+                        left_first ? left_idx : right_idx;
+                    const float first_t = left_first ? t_left : t_right;
+                    const std::uint32_t second_idx =
+                        left_first ? right_idx : left_idx;
+                    const float second_t = left_first ? t_right : t_left;
+                    assert(sp + 2U <= node_stack.size());
+                    if (sp + 2U <= node_stack.size()) {
+                        node_stack[sp] = second_idx;
+                        node_t_stack[sp] = second_t;
+                        ++sp;
+                        node_stack[sp] = first_idx;
+                        node_t_stack[sp] = first_t;
+                        ++sp;
+                    }
+                } else if (hit_left) {
+                    assert(sp < node_stack.size());
+                    if (sp < node_stack.size()) {
+                        node_stack[sp] = left_idx;
+                        node_t_stack[sp] = t_left;
+                        ++sp;
+                    }
+                } else if (hit_right) {
+                    assert(sp < node_stack.size());
+                    if (sp < node_stack.size()) {
+                        node_stack[sp] = right_idx;
+                        node_t_stack[sp] = t_right;
+                        ++sp;
+                    }
                 }
             }
         }
-        if (found_tri) {
-            const glm::vec3 local_hit = local_o + local_d * best_local_t;
-            const glm::vec3 world_hit = glm::vec3(
-                tmesh.world_from_local * glm::vec4(local_hit, 1.0F));
-            const float world_dist = glm::length(world_hit - origin);
-            if (world_dist <= best_dist) {
-                glm::vec3 wn = tmesh.normal_matrix * best_local_n;
-                const float wn_len = glm::length(wn);
-                wn = wn_len > epsilon ? (wn / wn_len) : -unit_dir;
-                if (glm::dot(wn, unit_dir) > 0.0F) {
-                    wn = -wn;
-                }
-                best_dist = world_dist;
-                closest = RaycastHit{
-                    .point = world_hit,
-                    .normal = wn,
-                    .distance = world_dist,
-                    .node_id = tmesh.node_id,
-                    .node_uuid = tmesh.node_uuid,
-                    .collision_layer = tmesh.layer,
-                    .is_trigger = tmesh.is_trigger,
-                };
-            }
-        }
+    }
+
+    for (std::size_t i = bvh_indexed_box_count_; i < boxes_.size(); ++i) {
+        test_box(boxes_[i], true);
     }
 
     if (terrain_enabled_ && (layer_mask & 1U) != 0U) {
@@ -1849,6 +2582,186 @@ std::optional<float> CollisionWorld::sample_supporting_height(
         return std::nullopt;
     }
     return hit->point.y;
+}
+
+bool CollisionWorld::is_solid_leaf_candidate(
+    const ColliderLeaf leaf,
+    const std::uint32_t layer_mask,
+    const SceneNodeId ignored_node) const noexcept {
+    switch (leaf.kind) {
+    case ColliderStorageKind::box: {
+        const OrientedBox& c = boxes_[leaf.index];
+        return c.enabled && !c.is_trigger && (c.layer & layer_mask) != 0U &&
+               !(ignored_node && c.node_id == ignored_node);
+    }
+    case ColliderStorageKind::sphere: {
+        const SphereCollider& c = spheres_[leaf.index];
+        return c.enabled && !c.is_trigger && (c.layer & layer_mask) != 0U &&
+               !(ignored_node && c.node_id == ignored_node);
+    }
+    case ColliderStorageKind::capsule: {
+        const CapsuleCollider& c = capsules_[leaf.index];
+        return c.enabled && !c.is_trigger && (c.layer & layer_mask) != 0U &&
+               !(ignored_node && c.node_id == ignored_node);
+    }
+    case ColliderStorageKind::convex_hull: {
+        const ConvexHullCollider& c = convex_hulls_[leaf.index];
+        return c.enabled && !c.is_trigger && (c.layer & layer_mask) != 0U &&
+               !(ignored_node && c.node_id == ignored_node);
+    }
+    case ColliderStorageKind::triangle_mesh: {
+        const TriangleMeshCollider& c = triangle_meshes_[leaf.index];
+        return c.enabled && !c.is_trigger && (c.layer & layer_mask) != 0U &&
+               !(ignored_node && c.node_id == ignored_node);
+    }
+    case ColliderStorageKind::none:
+    default:
+        return false;
+    }
+}
+
+void CollisionWorld::resolve_capsule_leaf(
+    const ColliderLeaf leaf,
+    glm::vec3& feet,
+    const float radius,
+    const float safe_height,
+    const float walk_cos,
+    CapsuleContactResult& result,
+    bool& any_penetration) const noexcept {
+    const auto apply_contact = [&](const Penetration& pen,
+                                   const SceneNodeId id) noexcept {
+        if (pen.depth <= 0.0F) {
+            return;
+        }
+        feet += pen.normal * pen.depth;
+        any_penetration = true;
+        if (pen.normal.y >= walk_cos) {
+            if (!result.grounded ||
+                pen.normal.y > result.ground_normal.y) {
+                result.grounded = true;
+                result.ground_normal = pen.normal;
+                result.ground_node = id;
+            }
+        } else if (pen.normal.y < -0.5F) {
+            result.hit_ceiling = true;
+        } else {
+            result.hit_wall = true;
+        }
+    };
+
+    const Bounds cap_aabb{
+        .center = glm::vec3(feet.x, feet.y + 0.5F * safe_height, feet.z),
+        .extent = glm::vec3(radius, 0.5F * safe_height, radius),
+    };
+
+    switch (leaf.kind) {
+    case ColliderStorageKind::box: {
+        const OrientedBox& box = boxes_[leaf.index];
+        if (!aabb_overlaps(cap_aabb, box.world_aabb)) {
+            return;
+        }
+        const glm::vec3 cap_a = feet + glm::vec3(0.0F, radius, 0.0F);
+        const glm::vec3 cap_b =
+            feet + glm::vec3(0.0F, safe_height - radius, 0.0F);
+        if (const auto pen = capsule_obb_penetration(
+                cap_a,
+                cap_b,
+                radius,
+                box.center,
+                box.axes,
+                box.half_extents)) {
+            apply_contact(*pen, box.node_id);
+        }
+        break;
+    }
+    case ColliderStorageKind::sphere: {
+        const SphereCollider& sphere = spheres_[leaf.index];
+        if (!aabb_overlaps(cap_aabb, sphere.world_aabb)) {
+            return;
+        }
+        const glm::vec3 cap_a = feet + glm::vec3(0.0F, radius, 0.0F);
+        const glm::vec3 cap_b =
+            feet + glm::vec3(0.0F, safe_height - radius, 0.0F);
+        if (const auto pen = capsule_sphere_penetration(
+                cap_a,
+                cap_b,
+                radius,
+                sphere.center,
+                sphere.radius)) {
+            apply_contact(*pen, sphere.node_id);
+        }
+        break;
+    }
+    case ColliderStorageKind::capsule: {
+        const CapsuleCollider& cap = capsules_[leaf.index];
+        if (!aabb_overlaps(cap_aabb, cap.world_aabb)) {
+            return;
+        }
+        const glm::vec3 cap_a = feet + glm::vec3(0.0F, radius, 0.0F);
+        const glm::vec3 cap_b =
+            feet + glm::vec3(0.0F, safe_height - radius, 0.0F);
+        if (const auto pen = capsule_capsule_penetration(
+                cap_a,
+                cap_b,
+                radius,
+                cap.point_a,
+                cap.point_b,
+                cap.radius)) {
+            apply_contact(*pen, cap.node_id);
+        }
+        break;
+    }
+    case ColliderStorageKind::convex_hull: {
+        const ConvexHullCollider& hull = convex_hulls_[leaf.index];
+        if (!aabb_overlaps(cap_aabb, hull.world_aabb)) {
+            return;
+        }
+        const glm::vec3 cap_a = feet + glm::vec3(0.0F, radius, 0.0F);
+        const glm::vec3 cap_b =
+            feet + glm::vec3(0.0F, safe_height - radius, 0.0F);
+        if (const auto pen = capsule_convex_hull_penetration(
+                cap_a,
+                cap_b,
+                radius,
+                std::span<const glm::vec3>(
+                    hull.vertices.data(), hull.vertex_count),
+                hull.centroid,
+                hull.axes)) {
+            apply_contact(*pen, hull.node_id);
+        }
+        break;
+    }
+    case ColliderStorageKind::triangle_mesh: {
+        const TriangleMeshCollider& tmesh = triangle_meshes_[leaf.index];
+        if (!aabb_overlaps(cap_aabb, tmesh.world_aabb)) {
+            return;
+        }
+        const SharedTriangleMesh& shared =
+            shared_meshes_[tmesh.shared_mesh_index];
+        const Bounds local_cap_aabb =
+            transform_aabb_matrix(cap_aabb, tmesh.local_from_world);
+        for_each_overlapping_chunk_triangle(
+            shared,
+            tmesh.world_from_local,
+            local_cap_aabb,
+            [&](const glm::vec3 v0,
+                const glm::vec3 v1,
+                const glm::vec3 v2) noexcept {
+                const glm::vec3 cap_a = feet + glm::vec3(0.0F, radius, 0.0F);
+                const glm::vec3 cap_b =
+                    feet + glm::vec3(0.0F, safe_height - radius, 0.0F);
+                if (const auto pen = capsule_triangle_penetration(
+                        cap_a, cap_b, radius, v0, v1, v2)) {
+                    apply_contact(*pen, tmesh.node_id);
+                }
+                return true;
+            });
+        break;
+    }
+    case ColliderStorageKind::none:
+    default:
+        break;
+    }
 }
 
 CapsuleContactResult CollisionWorld::resolve_capsule(
@@ -1892,191 +2805,101 @@ CapsuleContactResult CollisionWorld::resolve_capsule(
             }
         }
 
-        const auto apply_contact = [&](const Penetration& pen,
-                                       const SceneNodeId id) noexcept {
-            if (pen.depth <= 0.0F) {
-                return;
-            }
-            feet += pen.normal * pen.depth;
-            any_penetration = true;
-            if (pen.normal.y >= walk_cos) {
-                if (!result.grounded ||
-                    pen.normal.y > result.ground_normal.y) {
-                    result.grounded = true;
-                    result.ground_normal = pen.normal;
-                    result.ground_node = id;
-                }
-            } else if (pen.normal.y < -0.5F) {
-                result.hit_ceiling = true;
-            } else {
-                result.hit_wall = true;
-            }
+        const Bounds query_cap_aabb{
+            .center = glm::vec3(feet.x, feet.y + 0.5F * safe_height, feet.z),
+            .extent = glm::vec3(radius, 0.5F * safe_height, radius),
         };
+        std::array<ColliderLeaf, 128> leaves{};
+        std::size_t leaf_count = 0U;
+        bool overflowed = false;
 
-        for (const OrientedBox& box : boxes_) {
-            if (!box.enabled ||
-                (ignored_node && box.node_id == ignored_node) ||
-                box.is_trigger ||
-                (box.layer & layer_mask) == 0U) {
-                continue;
-            }
-            const Bounds cap_aabb{
-                .center = glm::vec3(feet.x, feet.y + 0.5F * safe_height, feet.z),
-                .extent = glm::vec3(radius, 0.5F * safe_height, radius),
-            };
-            if (!aabb_overlaps(cap_aabb, box.world_aabb)) {
-                continue;
-            }
-            const glm::vec3 cap_a = feet + glm::vec3(0.0F, radius, 0.0F);
-            const glm::vec3 cap_b =
-                feet + glm::vec3(0.0F, safe_height - radius, 0.0F);
-            if (const auto pen = capsule_obb_penetration(
-                    cap_a,
-                    cap_b,
-                    radius,
-                    box.center,
-                    box.axes,
-                    box.half_extents)) {
-                apply_contact(*pen, box.node_id);
-            }
-        }
+        traverse_bvh_aabb(
+            std::span<const ColliderBvhNode>(bvh_nodes_),
+            query_cap_aabb,
+            layer_mask,
+            kBvhHasEnabledSolid,
+            kBvhIsLeaf,
+            [&](const ColliderStorageKind kind,
+                const std::uint32_t index) noexcept {
+                const ColliderLeaf leaf{.kind = kind, .index = index};
+                if (!is_solid_leaf_candidate(leaf, layer_mask, ignored_node)) {
+                    return true;
+                }
+                if (leaf_count >= leaves.size()) {
+                    overflowed = true;
+                    return false;
+                }
+                leaves[leaf_count++] = leaf;
+                return true;
+            });
 
-        for (const SphereCollider& sphere : spheres_) {
-            if (!sphere.enabled ||
-                (ignored_node && sphere.node_id == ignored_node) ||
-                sphere.is_trigger ||
-                (sphere.layer & layer_mask) == 0U) {
-                continue;
-            }
-            const Bounds cap_aabb{
-                .center = glm::vec3(feet.x, feet.y + 0.5F * safe_height, feet.z),
-                .extent = glm::vec3(radius, 0.5F * safe_height, radius),
-            };
-            if (!aabb_overlaps(cap_aabb, sphere.world_aabb)) {
-                continue;
-            }
-            const glm::vec3 cap_a = feet + glm::vec3(0.0F, radius, 0.0F);
-            const glm::vec3 cap_b =
-                feet + glm::vec3(0.0F, safe_height - radius, 0.0F);
-            if (const auto pen = capsule_sphere_penetration(
-                    cap_a,
-                    cap_b,
-                    radius,
-                    sphere.center,
-                    sphere.radius)) {
-                apply_contact(*pen, sphere.node_id);
-            }
-        }
-
-        for (const CapsuleCollider& cap : capsules_) {
-            if (!cap.enabled ||
-                (ignored_node && cap.node_id == ignored_node) ||
-                cap.is_trigger ||
-                (cap.layer & layer_mask) == 0U) {
-                continue;
-            }
-            const Bounds cap_aabb{
-                .center = glm::vec3(feet.x, feet.y + 0.5F * safe_height, feet.z),
-                .extent = glm::vec3(radius, 0.5F * safe_height, radius),
-            };
-            if (!aabb_overlaps(cap_aabb, cap.world_aabb)) {
-                continue;
-            }
-            const glm::vec3 cap_a = feet + glm::vec3(0.0F, radius, 0.0F);
-            const glm::vec3 cap_b =
-                feet + glm::vec3(0.0F, safe_height - radius, 0.0F);
-            if (const auto pen = capsule_capsule_penetration(
-                    cap_a,
-                    cap_b,
-                    radius,
-                    cap.point_a,
-                    cap.point_b,
-                    cap.radius)) {
-                apply_contact(*pen, cap.node_id);
-            }
-        }
-
-        for (const ConvexHullCollider& hull : convex_hulls_) {
-            if (!hull.enabled ||
-                (ignored_node && hull.node_id == ignored_node) ||
-                hull.is_trigger ||
-                (hull.layer & layer_mask) == 0U) {
-                continue;
-            }
-            const Bounds cap_aabb{
-                .center = glm::vec3(feet.x, feet.y + 0.5F * safe_height, feet.z),
-                .extent = glm::vec3(radius, 0.5F * safe_height, radius),
-            };
-            if (!aabb_overlaps(cap_aabb, hull.world_aabb)) {
-                continue;
-            }
-            const glm::vec3 cap_a = feet + glm::vec3(0.0F, radius, 0.0F);
-            const glm::vec3 cap_b =
-                feet + glm::vec3(0.0F, safe_height - radius, 0.0F);
-            if (const auto pen = capsule_convex_hull_penetration(
-                    cap_a,
-                    cap_b,
-                    radius,
-                    std::span<const glm::vec3>(
-                        hull.vertices.data(), hull.vertex_count),
-                    hull.centroid,
-                    hull.axes)) {
-                apply_contact(*pen, hull.node_id);
-            }
-        }
-
-        for (const TriangleMeshCollider& tmesh : triangle_meshes_) {
-            if (!tmesh.enabled ||
-                (ignored_node && tmesh.node_id == ignored_node) ||
-                tmesh.is_trigger ||
-                (tmesh.layer & layer_mask) == 0U) {
-                continue;
-            }
-            const Bounds cap_aabb{
-                .center = glm::vec3(feet.x, feet.y + 0.5F * safe_height, feet.z),
-                .extent = glm::vec3(radius, 0.5F * safe_height, radius),
-            };
-            if (!aabb_overlaps(cap_aabb, tmesh.world_aabb)) {
-                continue;
-            }
-            const SharedTriangleMesh& shared =
-                shared_meshes_[tmesh.shared_mesh_index];
-            const Bounds local_cap_aabb =
-                transform_aabb_matrix(cap_aabb, tmesh.local_from_world);
-            if (!aabb_overlaps(local_cap_aabb, shared.local_aabb)) {
-                continue;
-            }
-            for (const TriangleChunk& chunk : shared.chunks) {
-                if (!aabb_overlaps(local_cap_aabb, chunk.local_aabb)) {
+        if (!overflowed) {
+            for (std::size_t i = bvh_indexed_box_count_; i < boxes_.size(); ++i) {
+                const ColliderLeaf leaf{
+                    .kind = ColliderStorageKind::box,
+                    .index = static_cast<std::uint32_t>(i),
+                };
+                if (!is_solid_leaf_candidate(leaf, layer_mask, ignored_node) ||
+                    !aabb_overlaps(query_cap_aabb, boxes_[i].world_aabb)) {
                     continue;
                 }
-                for (std::uint32_t t = chunk.first_triangle;
-                     t < chunk.first_triangle + chunk.triangle_count;
-                     ++t) {
-                    const glm::vec3 v0 = glm::vec3(
-                        tmesh.world_from_local *
-                        glm::vec4(
-                            shared.positions[shared.indices[t * 3U + 0U]],
-                            1.0F));
-                    const glm::vec3 v1 = glm::vec3(
-                        tmesh.world_from_local *
-                        glm::vec4(
-                            shared.positions[shared.indices[t * 3U + 1U]],
-                            1.0F));
-                    const glm::vec3 v2 = glm::vec3(
-                        tmesh.world_from_local *
-                        glm::vec4(
-                            shared.positions[shared.indices[t * 3U + 2U]],
-                            1.0F));
-                    const glm::vec3 cap_a = feet + glm::vec3(0.0F, radius, 0.0F);
-                    const glm::vec3 cap_b =
-                        feet + glm::vec3(0.0F, safe_height - radius, 0.0F);
-                    if (const auto pen = capsule_triangle_penetration(
-                            cap_a, cap_b, radius, v0, v1, v2)) {
-                        apply_contact(*pen, tmesh.node_id);
+                if (leaf_count >= leaves.size()) {
+                    overflowed = true;
+                    break;
+                }
+                leaves[leaf_count++] = leaf;
+            }
+        }
+
+        if (!overflowed) {
+            std::sort(
+                leaves.begin(),
+                leaves.begin() + static_cast<std::ptrdiff_t>(leaf_count),
+                [](const ColliderLeaf a, const ColliderLeaf b) noexcept {
+                    const auto ka = static_cast<std::uint8_t>(a.kind);
+                    const auto kb = static_cast<std::uint8_t>(b.kind);
+                    if (ka != kb) {
+                        return ka < kb;
+                    }
+                    return a.index < b.index;
+                });
+            for (std::size_t k = 0U; k < leaf_count; ++k) {
+                resolve_capsule_leaf(
+                    leaves[k],
+                    feet,
+                    radius,
+                    safe_height,
+                    walk_cos,
+                    result,
+                    any_penetration);
+            }
+        } else {
+            const auto visit_storage = [&](const ColliderStorageKind kind,
+                                           const std::size_t count) noexcept {
+                for (std::size_t i = 0U; i < count; ++i) {
+                    const ColliderLeaf leaf{
+                        .kind = kind,
+                        .index = static_cast<std::uint32_t>(i),
+                    };
+                    if (is_solid_leaf_candidate(
+                            leaf, layer_mask, ignored_node)) {
+                        resolve_capsule_leaf(
+                            leaf,
+                            feet,
+                            radius,
+                            safe_height,
+                            walk_cos,
+                            result,
+                            any_penetration);
                     }
                 }
-            }
+            };
+            visit_storage(ColliderStorageKind::box, boxes_.size());
+            visit_storage(ColliderStorageKind::sphere, spheres_.size());
+            visit_storage(ColliderStorageKind::capsule, capsules_.size());
+            visit_storage(ColliderStorageKind::convex_hull, convex_hulls_.size());
+            visit_storage(
+                ColliderStorageKind::triangle_mesh, triangle_meshes_.size());
         }
 
         if (!any_penetration) {
@@ -2086,6 +2909,94 @@ CapsuleContactResult CollisionWorld::resolve_capsule(
 
     result.resolved_feet = feet;
     return result;
+}
+
+bool CollisionWorld::check_capsule_free_leaf(
+    const ColliderLeaf leaf,
+    const Bounds& cap_aabb,
+    const glm::vec3 cap_a,
+    const glm::vec3 cap_b,
+    const float radius,
+    const std::uint32_t layer_mask,
+    const SceneNodeId ignored_node) const noexcept {
+    if (!is_solid_leaf_candidate(leaf, layer_mask, ignored_node)) {
+        return true;
+    }
+    constexpr float pen_tolerance = 1.0e-3F;
+    switch (leaf.kind) {
+    case ColliderStorageKind::box: {
+        const OrientedBox& box = boxes_[leaf.index];
+        if (!aabb_overlaps(cap_aabb, box.world_aabb)) {
+            return true;
+        }
+        const auto pen = capsule_obb_penetration(
+            cap_a, cap_b, radius, box.center, box.axes, box.half_extents);
+        return !(pen && pen->depth > pen_tolerance);
+    }
+    case ColliderStorageKind::sphere: {
+        const SphereCollider& sphere = spheres_[leaf.index];
+        if (!aabb_overlaps(cap_aabb, sphere.world_aabb)) {
+            return true;
+        }
+        const auto pen = capsule_sphere_penetration(
+            cap_a, cap_b, radius, sphere.center, sphere.radius);
+        return !(pen && pen->depth > pen_tolerance);
+    }
+    case ColliderStorageKind::capsule: {
+        const CapsuleCollider& cap = capsules_[leaf.index];
+        if (!aabb_overlaps(cap_aabb, cap.world_aabb)) {
+            return true;
+        }
+        const auto pen = capsule_capsule_penetration(
+            cap_a, cap_b, radius, cap.point_a, cap.point_b, cap.radius);
+        return !(pen && pen->depth > pen_tolerance);
+    }
+    case ColliderStorageKind::convex_hull: {
+        const ConvexHullCollider& hull = convex_hulls_[leaf.index];
+        if (!aabb_overlaps(cap_aabb, hull.world_aabb)) {
+            return true;
+        }
+        const auto pen = capsule_convex_hull_penetration(
+            cap_a,
+            cap_b,
+            radius,
+            std::span<const glm::vec3>(
+                hull.vertices.data(), hull.vertex_count),
+            hull.centroid,
+            hull.axes);
+        return !(pen && pen->depth > pen_tolerance);
+    }
+    case ColliderStorageKind::triangle_mesh: {
+        const TriangleMeshCollider& tmesh = triangle_meshes_[leaf.index];
+        if (!aabb_overlaps(cap_aabb, tmesh.world_aabb)) {
+            return true;
+        }
+        const SharedTriangleMesh& shared =
+            shared_meshes_[tmesh.shared_mesh_index];
+        const Bounds local_cap_aabb =
+            transform_aabb_matrix(cap_aabb, tmesh.local_from_world);
+        bool is_free = true;
+        for_each_overlapping_chunk_triangle(
+            shared,
+            tmesh.world_from_local,
+            local_cap_aabb,
+            [&](const glm::vec3 v0,
+                const glm::vec3 v1,
+                const glm::vec3 v2) noexcept {
+                if (const auto pen = capsule_triangle_penetration(
+                        cap_a, cap_b, radius, v0, v1, v2);
+                    pen && pen->depth > pen_tolerance) {
+                    is_free = false;
+                    return false;
+                }
+                return true;
+            });
+        return is_free;
+    }
+    case ColliderStorageKind::none:
+    default:
+        return true;
+    }
 }
 
 bool CollisionWorld::check_capsule_free(
@@ -2120,117 +3031,45 @@ bool CollisionWorld::check_capsule_free(
     const glm::vec3 cap_b =
         feet + glm::vec3(0.0F, safe_height - radius, 0.0F);
 
-    for (const OrientedBox& box : boxes_) {
-        if (!box.enabled ||
-            (ignored_node && box.node_id == ignored_node) ||
-            box.is_trigger ||
-            (box.layer & layer_mask) == 0U ||
-            !aabb_overlaps(cap_aabb, box.world_aabb)) {
-            continue;
-        }
-        if (const auto pen = capsule_obb_penetration(
+    bool is_free = true;
+    traverse_bvh_aabb(
+        std::span<const ColliderBvhNode>(bvh_nodes_),
+        cap_aabb,
+        layer_mask,
+        kBvhHasEnabledSolid,
+        kBvhIsLeaf,
+        [&](const ColliderStorageKind kind,
+            const std::uint32_t index) noexcept {
+            if (!check_capsule_free_leaf(
+                    ColliderLeaf{.kind = kind, .index = index},
+                    cap_aabb,
+                    cap_a,
+                    cap_b,
+                    radius,
+                    layer_mask,
+                    ignored_node)) {
+                is_free = false;
+                return false;
+            }
+            return true;
+        });
+    if (!is_free) {
+        return false;
+    }
+
+    for (std::size_t i = bvh_indexed_box_count_; i < boxes_.size(); ++i) {
+        if (!check_capsule_free_leaf(
+                ColliderLeaf{
+                    .kind = ColliderStorageKind::box,
+                    .index = static_cast<std::uint32_t>(i),
+                },
+                cap_aabb,
                 cap_a,
                 cap_b,
                 radius,
-                box.center,
-                box.axes,
-                box.half_extents);
-            pen && pen->depth > pen_tolerance) {
+                layer_mask,
+                ignored_node)) {
             return false;
-        }
-    }
-
-    for (const SphereCollider& sphere : spheres_) {
-        if (!sphere.enabled ||
-            (ignored_node && sphere.node_id == ignored_node) ||
-            sphere.is_trigger ||
-            (sphere.layer & layer_mask) == 0U ||
-            !aabb_overlaps(cap_aabb, sphere.world_aabb)) {
-            continue;
-        }
-        if (const auto pen = capsule_sphere_penetration(
-                cap_a, cap_b, radius, sphere.center, sphere.radius);
-            pen && pen->depth > pen_tolerance) {
-            return false;
-        }
-    }
-
-    for (const CapsuleCollider& cap : capsules_) {
-        if (!cap.enabled ||
-            (ignored_node && cap.node_id == ignored_node) ||
-            cap.is_trigger ||
-            (cap.layer & layer_mask) == 0U ||
-            !aabb_overlaps(cap_aabb, cap.world_aabb)) {
-            continue;
-        }
-        if (const auto pen = capsule_capsule_penetration(
-                cap_a, cap_b, radius, cap.point_a, cap.point_b, cap.radius);
-            pen && pen->depth > pen_tolerance) {
-            return false;
-        }
-    }
-
-    for (const ConvexHullCollider& hull : convex_hulls_) {
-        if (!hull.enabled ||
-            (ignored_node && hull.node_id == ignored_node) ||
-            hull.is_trigger ||
-            (hull.layer & layer_mask) == 0U ||
-            !aabb_overlaps(cap_aabb, hull.world_aabb)) {
-            continue;
-        }
-        if (const auto pen = capsule_convex_hull_penetration(
-                cap_a,
-                cap_b,
-                radius,
-                std::span<const glm::vec3>(
-                    hull.vertices.data(), hull.vertex_count),
-                hull.centroid,
-                hull.axes);
-            pen && pen->depth > pen_tolerance) {
-            return false;
-        }
-    }
-
-    for (const TriangleMeshCollider& tmesh : triangle_meshes_) {
-        if (!tmesh.enabled ||
-            (ignored_node && tmesh.node_id == ignored_node) ||
-            tmesh.is_trigger ||
-            (tmesh.layer & layer_mask) == 0U ||
-            !aabb_overlaps(cap_aabb, tmesh.world_aabb)) {
-            continue;
-        }
-        const SharedTriangleMesh& shared =
-            shared_meshes_[tmesh.shared_mesh_index];
-        const Bounds local_cap_aabb =
-            transform_aabb_matrix(cap_aabb, tmesh.local_from_world);
-        if (!aabb_overlaps(local_cap_aabb, shared.local_aabb)) {
-            continue;
-        }
-        for (const TriangleChunk& chunk : shared.chunks) {
-            if (!aabb_overlaps(local_cap_aabb, chunk.local_aabb)) {
-                continue;
-            }
-            for (std::uint32_t t = chunk.first_triangle;
-                 t < chunk.first_triangle + chunk.triangle_count;
-                 ++t) {
-                const glm::vec3 v0 = glm::vec3(
-                    tmesh.world_from_local *
-                    glm::vec4(
-                        shared.positions[shared.indices[t * 3U + 0U]], 1.0F));
-                const glm::vec3 v1 = glm::vec3(
-                    tmesh.world_from_local *
-                    glm::vec4(
-                        shared.positions[shared.indices[t * 3U + 1U]], 1.0F));
-                const glm::vec3 v2 = glm::vec3(
-                    tmesh.world_from_local *
-                    glm::vec4(
-                        shared.positions[shared.indices[t * 3U + 2U]], 1.0F));
-                if (const auto pen = capsule_triangle_penetration(
-                        cap_a, cap_b, radius, v0, v1, v2);
-                    pen && pen->depth > pen_tolerance) {
-                    return false;
-                }
-            }
         }
     }
 
@@ -2279,14 +3118,17 @@ bool CollisionWorld::upsert_box_collider(
         for (std::uint32_t i = ref->first; i < end; ++i) {
             if (boxes_[i].node_id == id) {
                 apply_box(boxes_[i]);
+                refit_bvh_storage_element(ColliderStorageKind::box, i);
                 return true;
             }
         }
     }
 
-    for (OrientedBox& box : boxes_) {
-        if (box.node_id == id) {
-            apply_box(box);
+    for (std::size_t i = 0U; i < boxes_.size(); ++i) {
+        if (boxes_[i].node_id == id) {
+            apply_box(boxes_[i]);
+            refit_bvh_storage_element(
+                ColliderStorageKind::box, static_cast<std::uint32_t>(i));
             return true;
         }
     }
@@ -2455,6 +3297,7 @@ bool CollisionWorld::update_collider_transform(
             for (std::uint32_t i = first; i < end; ++i) {
                 if (boxes_[i].node_id == id) {
                     update_box(boxes_[i]);
+                    refit_bvh_storage_element(ColliderStorageKind::box, i);
                     updated = true;
                 }
             }
@@ -2466,6 +3309,7 @@ bool CollisionWorld::update_collider_transform(
             for (std::uint32_t i = first; i < end; ++i) {
                 if (spheres_[i].node_id == id) {
                     update_sphere(spheres_[i]);
+                    refit_bvh_storage_element(ColliderStorageKind::sphere, i);
                     updated = true;
                 }
             }
@@ -2477,6 +3321,7 @@ bool CollisionWorld::update_collider_transform(
             for (std::uint32_t i = first; i < end; ++i) {
                 if (capsules_[i].node_id == id) {
                     update_capsule(capsules_[i]);
+                    refit_bvh_storage_element(ColliderStorageKind::capsule, i);
                     updated = true;
                 }
             }
@@ -2486,7 +3331,10 @@ bool CollisionWorld::update_collider_transform(
             const std::uint32_t end = std::min<std::uint32_t>(
                 first + count, static_cast<std::uint32_t>(convex_hulls_.size()));
             for (std::uint32_t i = first; i < end; ++i) {
-                if (convex_hulls_[i].node_id == id && update_hull(convex_hulls_[i])) {
+                if (convex_hulls_[i].node_id == id &&
+                    update_hull(convex_hulls_[i])) {
+                    refit_bvh_storage_element(
+                        ColliderStorageKind::convex_hull, i);
                     updated = true;
                 }
             }
@@ -2498,6 +3346,8 @@ bool CollisionWorld::update_collider_transform(
             for (std::uint32_t i = first; i < end; ++i) {
                 if (triangle_meshes_[i].node_id == id &&
                     update_tmesh(triangle_meshes_[i])) {
+                    refit_bvh_storage_element(
+                        ColliderStorageKind::triangle_mesh, i);
                     updated = true;
                 }
             }
@@ -2515,31 +3365,44 @@ bool CollisionWorld::update_collider_transform(
     }
 
     bool updated = false;
-    for (OrientedBox& box : boxes_) {
-        if (box.node_id == id) {
-            update_box(box);
+    for (std::size_t i = 0U; i < boxes_.size(); ++i) {
+        if (boxes_[i].node_id == id) {
+            update_box(boxes_[i]);
+            refit_bvh_storage_element(
+                ColliderStorageKind::box, static_cast<std::uint32_t>(i));
             updated = true;
         }
     }
-    for (SphereCollider& sphere : spheres_) {
-        if (sphere.node_id == id) {
-            update_sphere(sphere);
+    for (std::size_t i = 0U; i < spheres_.size(); ++i) {
+        if (spheres_[i].node_id == id) {
+            update_sphere(spheres_[i]);
+            refit_bvh_storage_element(
+                ColliderStorageKind::sphere, static_cast<std::uint32_t>(i));
             updated = true;
         }
     }
-    for (CapsuleCollider& cap : capsules_) {
-        if (cap.node_id == id) {
-            update_capsule(cap);
+    for (std::size_t i = 0U; i < capsules_.size(); ++i) {
+        if (capsules_[i].node_id == id) {
+            update_capsule(capsules_[i]);
+            refit_bvh_storage_element(
+                ColliderStorageKind::capsule, static_cast<std::uint32_t>(i));
             updated = true;
         }
     }
-    for (ConvexHullCollider& hull : convex_hulls_) {
-        if (hull.node_id == id && update_hull(hull)) {
+    for (std::size_t i = 0U; i < convex_hulls_.size(); ++i) {
+        if (convex_hulls_[i].node_id == id && update_hull(convex_hulls_[i])) {
+            refit_bvh_storage_element(
+                ColliderStorageKind::convex_hull,
+                static_cast<std::uint32_t>(i));
             updated = true;
         }
     }
-    for (TriangleMeshCollider& tmesh : triangle_meshes_) {
-        if (tmesh.node_id == id && update_tmesh(tmesh)) {
+    for (std::size_t i = 0U; i < triangle_meshes_.size(); ++i) {
+        if (triangle_meshes_[i].node_id == id &&
+            update_tmesh(triangle_meshes_[i])) {
+            refit_bvh_storage_element(
+                ColliderStorageKind::triangle_mesh,
+                static_cast<std::uint32_t>(i));
             updated = true;
         }
     }
@@ -2560,8 +3423,9 @@ void CollisionWorld::set_collider_enabled(
             const std::uint32_t end = std::min<std::uint32_t>(
                 first + count, static_cast<std::uint32_t>(boxes_.size()));
             for (std::uint32_t i = first; i < end; ++i) {
-                if (boxes_[i].node_id == id) {
+                if (boxes_[i].node_id == id && boxes_[i].enabled != enabled) {
                     boxes_[i].enabled = enabled;
+                    refit_bvh_storage_element(ColliderStorageKind::box, i);
                 }
             }
             return;
@@ -2570,8 +3434,9 @@ void CollisionWorld::set_collider_enabled(
             const std::uint32_t end = std::min<std::uint32_t>(
                 first + count, static_cast<std::uint32_t>(spheres_.size()));
             for (std::uint32_t i = first; i < end; ++i) {
-                if (spheres_[i].node_id == id) {
+                if (spheres_[i].node_id == id && spheres_[i].enabled != enabled) {
                     spheres_[i].enabled = enabled;
+                    refit_bvh_storage_element(ColliderStorageKind::sphere, i);
                 }
             }
             return;
@@ -2580,8 +3445,9 @@ void CollisionWorld::set_collider_enabled(
             const std::uint32_t end = std::min<std::uint32_t>(
                 first + count, static_cast<std::uint32_t>(capsules_.size()));
             for (std::uint32_t i = first; i < end; ++i) {
-                if (capsules_[i].node_id == id) {
+                if (capsules_[i].node_id == id && capsules_[i].enabled != enabled) {
                     capsules_[i].enabled = enabled;
+                    refit_bvh_storage_element(ColliderStorageKind::capsule, i);
                 }
             }
             return;
@@ -2590,8 +3456,11 @@ void CollisionWorld::set_collider_enabled(
             const std::uint32_t end = std::min<std::uint32_t>(
                 first + count, static_cast<std::uint32_t>(convex_hulls_.size()));
             for (std::uint32_t i = first; i < end; ++i) {
-                if (convex_hulls_[i].node_id == id) {
+                if (convex_hulls_[i].node_id == id &&
+                    convex_hulls_[i].enabled != enabled) {
                     convex_hulls_[i].enabled = enabled;
+                    refit_bvh_storage_element(
+                        ColliderStorageKind::convex_hull, i);
                 }
             }
             return;
@@ -2600,8 +3469,11 @@ void CollisionWorld::set_collider_enabled(
             const std::uint32_t end = std::min<std::uint32_t>(
                 first + count, static_cast<std::uint32_t>(triangle_meshes_.size()));
             for (std::uint32_t i = first; i < end; ++i) {
-                if (triangle_meshes_[i].node_id == id) {
+                if (triangle_meshes_[i].node_id == id &&
+                    triangle_meshes_[i].enabled != enabled) {
                     triangle_meshes_[i].enabled = enabled;
+                    refit_bvh_storage_element(
+                        ColliderStorageKind::triangle_mesh, i);
                 }
             }
             return;
@@ -2615,30 +3487,182 @@ void CollisionWorld::set_collider_enabled(
     if (id.index < max_scene_nodes) {
         return;
     }
-    for (OrientedBox& box : boxes_) {
-        if (box.node_id == id) {
-            box.enabled = enabled;
+    for (std::size_t i = 0U; i < boxes_.size(); ++i) {
+        if (boxes_[i].node_id == id && boxes_[i].enabled != enabled) {
+            boxes_[i].enabled = enabled;
+            refit_bvh_storage_element(
+                ColliderStorageKind::box, static_cast<std::uint32_t>(i));
         }
     }
-    for (SphereCollider& sphere : spheres_) {
-        if (sphere.node_id == id) {
-            sphere.enabled = enabled;
+    for (std::size_t i = 0U; i < spheres_.size(); ++i) {
+        if (spheres_[i].node_id == id && spheres_[i].enabled != enabled) {
+            spheres_[i].enabled = enabled;
+            refit_bvh_storage_element(
+                ColliderStorageKind::sphere, static_cast<std::uint32_t>(i));
         }
     }
-    for (CapsuleCollider& cap : capsules_) {
-        if (cap.node_id == id) {
-            cap.enabled = enabled;
+    for (std::size_t i = 0U; i < capsules_.size(); ++i) {
+        if (capsules_[i].node_id == id && capsules_[i].enabled != enabled) {
+            capsules_[i].enabled = enabled;
+            refit_bvh_storage_element(
+                ColliderStorageKind::capsule, static_cast<std::uint32_t>(i));
         }
     }
-    for (ConvexHullCollider& hull : convex_hulls_) {
-        if (hull.node_id == id) {
-            hull.enabled = enabled;
+    for (std::size_t i = 0U; i < convex_hulls_.size(); ++i) {
+        if (convex_hulls_[i].node_id == id &&
+            convex_hulls_[i].enabled != enabled) {
+            convex_hulls_[i].enabled = enabled;
+            refit_bvh_storage_element(
+                ColliderStorageKind::convex_hull,
+                static_cast<std::uint32_t>(i));
         }
     }
-    for (TriangleMeshCollider& tmesh : triangle_meshes_) {
-        if (tmesh.node_id == id) {
-            tmesh.enabled = enabled;
+    for (std::size_t i = 0U; i < triangle_meshes_.size(); ++i) {
+        if (triangle_meshes_[i].node_id == id &&
+            triangle_meshes_[i].enabled != enabled) {
+            triangle_meshes_[i].enabled = enabled;
+            refit_bvh_storage_element(
+                ColliderStorageKind::triangle_mesh,
+                static_cast<std::uint32_t>(i));
         }
+    }
+}
+
+void CollisionWorld::gather_sphere_leaf(
+    const ColliderLeaf leaf,
+    const glm::vec3 center,
+    const float radius,
+    const Bounds& sphere_aabb,
+    const std::uint32_t layer_mask,
+    std::vector<SphereContact>& output) const {
+    switch (leaf.kind) {
+    case ColliderStorageKind::box: {
+        const OrientedBox& box = boxes_[leaf.index];
+        if (!box.enabled ||
+            box.is_trigger ||
+            (box.layer & layer_mask) == 0U ||
+            !aabb_overlaps(sphere_aabb, box.world_aabb)) {
+            return;
+        }
+        if (const auto pen = capsule_obb_penetration(
+                center,
+                center,
+                radius,
+                box.center,
+                box.axes,
+                box.half_extents)) {
+            output.push_back(SphereContact{
+                .point = pen->contact_point,
+                .normal = pen->normal,
+                .penetration = pen->depth,
+                .node_id = box.node_id,
+            });
+        }
+        break;
+    }
+    case ColliderStorageKind::sphere: {
+        const SphereCollider& sphere = spheres_[leaf.index];
+        if (!sphere.enabled ||
+            sphere.is_trigger ||
+            (sphere.layer & layer_mask) == 0U ||
+            !aabb_overlaps(sphere_aabb, sphere.world_aabb)) {
+            return;
+        }
+        if (const auto pen = capsule_sphere_penetration(
+                center, center, radius, sphere.center, sphere.radius)) {
+            output.push_back(SphereContact{
+                .point = pen->contact_point,
+                .normal = pen->normal,
+                .penetration = pen->depth,
+                .node_id = sphere.node_id,
+            });
+        }
+        break;
+    }
+    case ColliderStorageKind::capsule: {
+        const CapsuleCollider& cap = capsules_[leaf.index];
+        if (!cap.enabled ||
+            cap.is_trigger ||
+            (cap.layer & layer_mask) == 0U ||
+            !aabb_overlaps(sphere_aabb, cap.world_aabb)) {
+            return;
+        }
+        if (const auto pen = capsule_capsule_penetration(
+                center,
+                center,
+                radius,
+                cap.point_a,
+                cap.point_b,
+                cap.radius)) {
+            output.push_back(SphereContact{
+                .point = pen->contact_point,
+                .normal = pen->normal,
+                .penetration = pen->depth,
+                .node_id = cap.node_id,
+            });
+        }
+        break;
+    }
+    case ColliderStorageKind::convex_hull: {
+        const ConvexHullCollider& hull = convex_hulls_[leaf.index];
+        if (!hull.enabled ||
+            hull.is_trigger ||
+            (hull.layer & layer_mask) == 0U ||
+            !aabb_overlaps(sphere_aabb, hull.world_aabb)) {
+            return;
+        }
+        if (const auto pen = capsule_convex_hull_penetration(
+                center,
+                center,
+                radius,
+                std::span<const glm::vec3>(
+                    hull.vertices.data(), hull.vertex_count),
+                hull.centroid,
+                hull.axes)) {
+            output.push_back(SphereContact{
+                .point = pen->contact_point,
+                .normal = pen->normal,
+                .penetration = pen->depth,
+                .node_id = hull.node_id,
+            });
+        }
+        break;
+    }
+    case ColliderStorageKind::triangle_mesh: {
+        const TriangleMeshCollider& tmesh = triangle_meshes_[leaf.index];
+        if (!tmesh.enabled ||
+            tmesh.is_trigger ||
+            (tmesh.layer & layer_mask) == 0U ||
+            !aabb_overlaps(sphere_aabb, tmesh.world_aabb)) {
+            return;
+        }
+        const SharedTriangleMesh& shared =
+            shared_meshes_[tmesh.shared_mesh_index];
+        const Bounds local_aabb =
+            transform_aabb_matrix(sphere_aabb, tmesh.local_from_world);
+        for_each_overlapping_chunk_triangle(
+            shared,
+            tmesh.world_from_local,
+            local_aabb,
+            [&](const glm::vec3 v0,
+                const glm::vec3 v1,
+                const glm::vec3 v2) {
+                if (const auto pen = capsule_triangle_penetration(
+                        center, center, radius, v0, v1, v2)) {
+                    output.push_back(SphereContact{
+                        .point = pen->contact_point,
+                        .normal = pen->normal,
+                        .penetration = pen->depth,
+                        .node_id = tmesh.node_id,
+                    });
+                }
+                return true;
+            });
+        break;
+    }
+    case ColliderStorageKind::none:
+    default:
+        break;
     }
 }
 
@@ -2673,138 +3697,158 @@ void CollisionWorld::gather_sphere_contacts(
     }
 
     const Bounds sphere_aabb{.center = center, .extent = glm::vec3(radius)};
-    for (const OrientedBox& box : boxes_) {
-        if (!box.enabled ||
-            box.is_trigger ||
-            (box.layer & layer_mask) == 0U ||
-            !aabb_overlaps(sphere_aabb, box.world_aabb)) {
-            continue;
+    traverse_bvh_aabb(
+        std::span<const ColliderBvhNode>(bvh_nodes_),
+        sphere_aabb,
+        layer_mask,
+        kBvhHasEnabledSolid,
+        kBvhIsLeaf,
+        [&](const ColliderStorageKind kind, const std::uint32_t index) {
+            gather_sphere_leaf(
+                ColliderLeaf{.kind = kind, .index = index},
+                center,
+                radius,
+                sphere_aabb,
+                layer_mask,
+                output);
+            return true;
+        });
+
+    for (std::size_t i = bvh_indexed_box_count_; i < boxes_.size(); ++i) {
+        gather_sphere_leaf(
+            ColliderLeaf{
+                .kind = ColliderStorageKind::box,
+                .index = static_cast<std::uint32_t>(i),
+            },
+            center,
+            radius,
+            sphere_aabb,
+            layer_mask,
+            output);
+    }
+}
+
+void CollisionWorld::query_trigger_leaf(
+    const ColliderLeaf leaf,
+    const Bounds& cap_aabb,
+    const glm::vec3 cap_a,
+    const glm::vec3 cap_b,
+    const float radius,
+    const std::uint32_t layer_mask,
+    std::vector<TriggerOverlap>& output) const {
+    const auto push_unique = [&](const SceneNodeId id, const SceneUuid uuid) {
+        for (const TriggerOverlap& existing : output) {
+            if (existing.node_id == id) {
+                return;
+            }
         }
-        if (const auto pen = capsule_obb_penetration(
-                center,
-                center,
+        output.push_back(TriggerOverlap{.node_id = id, .node_uuid = uuid});
+    };
+
+    switch (leaf.kind) {
+    case ColliderStorageKind::box: {
+        const OrientedBox& box = boxes_[leaf.index];
+        if (!box.enabled ||
+            !box.is_trigger ||
+            (box.layer & layer_mask) == 0U ||
+            !aabb_overlaps(cap_aabb, box.world_aabb)) {
+            return;
+        }
+        if (capsule_obb_penetration(
+                cap_a,
+                cap_b,
                 radius,
                 box.center,
                 box.axes,
                 box.half_extents)) {
-            output.push_back(SphereContact{
-                .point = pen->contact_point,
-                .normal = pen->normal,
-                .penetration = pen->depth,
-                .node_id = box.node_id,
-            });
+            push_unique(box.node_id, box.node_uuid);
         }
+        break;
     }
-
-    for (const SphereCollider& sphere : spheres_) {
+    case ColliderStorageKind::sphere: {
+        const SphereCollider& sphere = spheres_[leaf.index];
         if (!sphere.enabled ||
-            sphere.is_trigger ||
+            !sphere.is_trigger ||
             (sphere.layer & layer_mask) == 0U ||
-            !aabb_overlaps(sphere_aabb, sphere.world_aabb)) {
-            continue;
+            !aabb_overlaps(cap_aabb, sphere.world_aabb)) {
+            return;
         }
-        if (const auto pen = capsule_sphere_penetration(
-                center, center, radius, sphere.center, sphere.radius)) {
-            output.push_back(SphereContact{
-                .point = pen->contact_point,
-                .normal = pen->normal,
-                .penetration = pen->depth,
-                .node_id = sphere.node_id,
-            });
+        if (capsule_sphere_penetration(
+                cap_a, cap_b, radius, sphere.center, sphere.radius)) {
+            push_unique(sphere.node_id, sphere.node_uuid);
         }
+        break;
     }
-
-    for (const CapsuleCollider& cap : capsules_) {
+    case ColliderStorageKind::capsule: {
+        const CapsuleCollider& cap = capsules_[leaf.index];
         if (!cap.enabled ||
-            cap.is_trigger ||
+            !cap.is_trigger ||
             (cap.layer & layer_mask) == 0U ||
-            !aabb_overlaps(sphere_aabb, cap.world_aabb)) {
-            continue;
+            !aabb_overlaps(cap_aabb, cap.world_aabb)) {
+            return;
         }
-        if (const auto pen = capsule_capsule_penetration(
-                center,
-                center,
+        if (capsule_capsule_penetration(
+                cap_a,
+                cap_b,
                 radius,
                 cap.point_a,
                 cap.point_b,
                 cap.radius)) {
-            output.push_back(SphereContact{
-                .point = pen->contact_point,
-                .normal = pen->normal,
-                .penetration = pen->depth,
-                .node_id = cap.node_id,
-            });
+            push_unique(cap.node_id, cap.node_uuid);
         }
+        break;
     }
-
-    for (const ConvexHullCollider& hull : convex_hulls_) {
+    case ColliderStorageKind::convex_hull: {
+        const ConvexHullCollider& hull = convex_hulls_[leaf.index];
         if (!hull.enabled ||
-            hull.is_trigger ||
+            !hull.is_trigger ||
             (hull.layer & layer_mask) == 0U ||
-            !aabb_overlaps(sphere_aabb, hull.world_aabb)) {
-            continue;
+            !aabb_overlaps(cap_aabb, hull.world_aabb)) {
+            return;
         }
-        if (const auto pen = capsule_convex_hull_penetration(
-                center,
-                center,
+        if (capsule_convex_hull_penetration(
+                cap_a,
+                cap_b,
                 radius,
                 std::span<const glm::vec3>(
                     hull.vertices.data(), hull.vertex_count),
                 hull.centroid,
                 hull.axes)) {
-            output.push_back(SphereContact{
-                .point = pen->contact_point,
-                .normal = pen->normal,
-                .penetration = pen->depth,
-                .node_id = hull.node_id,
-            });
+            push_unique(hull.node_id, hull.node_uuid);
         }
+        break;
     }
-
-    for (const TriangleMeshCollider& tmesh : triangle_meshes_) {
+    case ColliderStorageKind::triangle_mesh: {
+        const TriangleMeshCollider& tmesh = triangle_meshes_[leaf.index];
         if (!tmesh.enabled ||
-            tmesh.is_trigger ||
+            !tmesh.is_trigger ||
             (tmesh.layer & layer_mask) == 0U ||
-            !aabb_overlaps(sphere_aabb, tmesh.world_aabb)) {
-            continue;
+            !aabb_overlaps(cap_aabb, tmesh.world_aabb)) {
+            return;
         }
         const SharedTriangleMesh& shared =
             shared_meshes_[tmesh.shared_mesh_index];
-        const Bounds local_aabb =
-            transform_aabb_matrix(sphere_aabb, tmesh.local_from_world);
-        if (!aabb_overlaps(local_aabb, shared.local_aabb)) {
-            continue;
-        }
-        for (const TriangleChunk& chunk : shared.chunks) {
-            if (!aabb_overlaps(local_aabb, chunk.local_aabb)) {
-                continue;
-            }
-            for (std::uint32_t t = chunk.first_triangle;
-                 t < chunk.first_triangle + chunk.triangle_count;
-                 ++t) {
-                const glm::vec3 v0 = glm::vec3(
-                    tmesh.world_from_local *
-                    glm::vec4(
-                        shared.positions[shared.indices[t * 3U + 0U]], 1.0F));
-                const glm::vec3 v1 = glm::vec3(
-                    tmesh.world_from_local *
-                    glm::vec4(
-                        shared.positions[shared.indices[t * 3U + 1U]], 1.0F));
-                const glm::vec3 v2 = glm::vec3(
-                    tmesh.world_from_local *
-                    glm::vec4(
-                        shared.positions[shared.indices[t * 3U + 2U]], 1.0F));
-                if (const auto pen = capsule_triangle_penetration(
-                        center, center, radius, v0, v1, v2)) {
-                    output.push_back(SphereContact{
-                        .point = pen->contact_point,
-                        .normal = pen->normal,
-                        .penetration = pen->depth,
-                        .node_id = tmesh.node_id,
-                    });
+        const Bounds local_cap_aabb =
+            transform_aabb_matrix(cap_aabb, tmesh.local_from_world);
+        for_each_overlapping_chunk_triangle(
+            shared,
+            tmesh.world_from_local,
+            local_cap_aabb,
+            [&](const glm::vec3 v0,
+                const glm::vec3 v1,
+                const glm::vec3 v2) {
+                if (capsule_triangle_penetration(
+                        cap_a, cap_b, radius, v0, v1, v2)) {
+                    push_unique(tmesh.node_id, tmesh.node_uuid);
+                    return false;
                 }
-            }
-        }
+                return true;
+            });
+        break;
+    }
+    case ColliderStorageKind::none:
+    default:
+        break;
     }
 }
 
@@ -2821,6 +3865,12 @@ void CollisionWorld::query_capsule_triggers(
         !std::isfinite(height)) {
         return;
     }
+    if (bvh_indexed_box_count_ == boxes_.size() &&
+        (bvh_nodes_.empty() ||
+         (bvh_nodes_[0].flags & kBvhHasEnabledTrigger) == 0U)) {
+        return;
+    }
+
     const float safe_height = std::max(height, radius * 2.0F);
     const glm::vec3 cap_a = feet + glm::vec3(0.0F, radius, 0.0F);
     const glm::vec3 cap_b =
@@ -2830,129 +3880,36 @@ void CollisionWorld::query_capsule_triggers(
         .extent = glm::vec3(radius, 0.5F * safe_height, radius),
     };
 
-    const auto push_unique = [&](const SceneNodeId id, const SceneUuid uuid) {
-        for (const TriggerOverlap& existing : output) {
-            if (existing.node_id == id) {
-                return;
-            }
-        }
-        output.push_back(TriggerOverlap{.node_id = id, .node_uuid = uuid});
-    };
-
-    for (const OrientedBox& box : boxes_) {
-        if (!box.enabled ||
-            !box.is_trigger ||
-            (box.layer & layer_mask) == 0U ||
-            !aabb_overlaps(cap_aabb, box.world_aabb)) {
-            continue;
-        }
-        if (capsule_obb_penetration(
+    traverse_bvh_aabb(
+        std::span<const ColliderBvhNode>(bvh_nodes_),
+        cap_aabb,
+        layer_mask,
+        kBvhHasEnabledTrigger,
+        kBvhIsLeaf,
+        [&](const ColliderStorageKind kind, const std::uint32_t index) {
+            query_trigger_leaf(
+                ColliderLeaf{.kind = kind, .index = index},
+                cap_aabb,
                 cap_a,
                 cap_b,
                 radius,
-                box.center,
-                box.axes,
-                box.half_extents)) {
-            push_unique(box.node_id, box.node_uuid);
-        }
-    }
+                layer_mask,
+                output);
+            return true;
+        });
 
-    for (const SphereCollider& sphere : spheres_) {
-        if (!sphere.enabled ||
-            !sphere.is_trigger ||
-            (sphere.layer & layer_mask) == 0U ||
-            !aabb_overlaps(cap_aabb, sphere.world_aabb)) {
-            continue;
-        }
-        if (capsule_sphere_penetration(
-                cap_a,
-                cap_b,
-                radius,
-                sphere.center,
-                sphere.radius)) {
-            push_unique(sphere.node_id, sphere.node_uuid);
-        }
-    }
-
-    for (const CapsuleCollider& cap : capsules_) {
-        if (!cap.enabled ||
-            !cap.is_trigger ||
-            (cap.layer & layer_mask) == 0U ||
-            !aabb_overlaps(cap_aabb, cap.world_aabb)) {
-            continue;
-        }
-        if (capsule_capsule_penetration(
-                cap_a,
-                cap_b,
-                radius,
-                cap.point_a,
-                cap.point_b,
-                cap.radius)) {
-            push_unique(cap.node_id, cap.node_uuid);
-        }
-    }
-
-    for (const ConvexHullCollider& hull : convex_hulls_) {
-        if (!hull.enabled ||
-            !hull.is_trigger ||
-            (hull.layer & layer_mask) == 0U ||
-            !aabb_overlaps(cap_aabb, hull.world_aabb)) {
-            continue;
-        }
-        if (capsule_convex_hull_penetration(
-                cap_a,
-                cap_b,
-                radius,
-                std::span<const glm::vec3>(
-                    hull.vertices.data(), hull.vertex_count),
-                hull.centroid,
-                hull.axes)) {
-            push_unique(hull.node_id, hull.node_uuid);
-        }
-    }
-
-    for (const TriangleMeshCollider& tmesh : triangle_meshes_) {
-        if (!tmesh.enabled ||
-            !tmesh.is_trigger ||
-            (tmesh.layer & layer_mask) == 0U ||
-            !aabb_overlaps(cap_aabb, tmesh.world_aabb)) {
-            continue;
-        }
-        const SharedTriangleMesh& shared =
-            shared_meshes_[tmesh.shared_mesh_index];
-        const Bounds local_cap_aabb =
-            transform_aabb_matrix(cap_aabb, tmesh.local_from_world);
-        if (!aabb_overlaps(local_cap_aabb, shared.local_aabb)) {
-            continue;
-        }
-        bool hit_any = false;
-        for (const TriangleChunk& chunk : shared.chunks) {
-            if (hit_any || !aabb_overlaps(local_cap_aabb, chunk.local_aabb)) {
-                continue;
-            }
-            for (std::uint32_t t = chunk.first_triangle;
-                 t < chunk.first_triangle + chunk.triangle_count;
-                 ++t) {
-                const glm::vec3 v0 = glm::vec3(
-                    tmesh.world_from_local *
-                    glm::vec4(
-                        shared.positions[shared.indices[t * 3U + 0U]], 1.0F));
-                const glm::vec3 v1 = glm::vec3(
-                    tmesh.world_from_local *
-                    glm::vec4(
-                        shared.positions[shared.indices[t * 3U + 1U]], 1.0F));
-                const glm::vec3 v2 = glm::vec3(
-                    tmesh.world_from_local *
-                    glm::vec4(
-                        shared.positions[shared.indices[t * 3U + 2U]], 1.0F));
-                if (capsule_triangle_penetration(
-                        cap_a, cap_b, radius, v0, v1, v2)) {
-                    push_unique(tmesh.node_id, tmesh.node_uuid);
-                    hit_any = true;
-                    break;
-                }
-            }
-        }
+    for (std::size_t i = bvh_indexed_box_count_; i < boxes_.size(); ++i) {
+        query_trigger_leaf(
+            ColliderLeaf{
+                .kind = ColliderStorageKind::box,
+                .index = static_cast<std::uint32_t>(i),
+            },
+            cap_aabb,
+            cap_a,
+            cap_b,
+            radius,
+            layer_mask,
+            output);
     }
 
     std::sort(

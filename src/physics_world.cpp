@@ -2127,6 +2127,22 @@ bool PhysicsWorld::wake_body(const SceneNodeId id) noexcept {
     return true;
 }
 
+bool PhysicsWorld::sleep_body(const SceneNodeId id) noexcept {
+    Body* const b = find_body_mut(id);
+    if (b == nullptr || !b->enabled || b->inv_mass <= 0.0F) {
+        return false;
+    }
+    b->linear_velocity = glm::vec3(0.0F);
+    b->angular_velocity = glm::vec3(0.0F);
+    b->pending_linear_impulse = glm::vec3(0.0F);
+    b->pending_angular_impulse = glm::vec3(0.0F);
+    b->prev_position = b->position;
+    b->prev_orientation = b->orientation;
+    b->sleeping = true;
+    b->sleep_timer = 0.0F;
+    return true;
+}
+
 bool PhysicsWorld::apply_central_force(
     const SceneNodeId id,
     const glm::vec3 force,

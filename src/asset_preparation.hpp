@@ -39,6 +39,17 @@ struct PreparedModel {
 [[nodiscard]] PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,
     std::span<const std::string> resident_textures = {});
 
+// Precomputes CPU RGBA8 mipmap levels into `entry.mip_chain_rgba` and
+// `entry.mip_byte_offsets` when `base` has partial/cutout alpha (leaving fully
+// opaque textures with alpha == 255 everywhere fast/untouched). sRGB textures
+// average RGB in linear light; when 0 < alpha_cutoff <= 1, alpha values are
+// scaled per mip level to preserve cutout coverage across mid and far mips.
+void build_texture_mip_chain(
+    const CookedTextureAsset &base,
+    float alpha_cutoff,
+    PreparedTexture &entry,
+    std::size_t &in_out_upload_bytes);
+
 // Two outstanding jobs at most, including results not consumed by the owner.
 // One persistent I/O/LOD worker leaves the submission thread and other engine
 // systems CPU capacity. No GPU calls, shared scene state or borrowed paths.

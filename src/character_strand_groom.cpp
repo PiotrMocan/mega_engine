@@ -529,7 +529,6 @@ void emit_twisted_ribbon_strand(
         return;
     }
     const std::size_t n = pts.size();
-    const float u_col = (static_cast<float>(clump_id) + 0.5F) / static_cast<float>(hair_clump_lut_columns);
     const std::uint32_t base_v = static_cast<std::uint32_t>(out.vertices.size());
 
     // Initial orthogonal frame perpendicular to root tangent
@@ -537,8 +536,9 @@ void emit_twisted_ribbon_strand(
     glm::vec3 up_ref = std::abs(t0.y) < 0.88F ? glm::vec3(0.0F, 1.0F, 0.0F) : glm::vec3(0.0F, 0.0F, 1.0F);
     if (std::abs(twist_step_rad) < 0.35F) {
         const glm::vec3 radial_out = safe_normalize(pts[0] - macro_center, glm::vec3(0.0F, 0.0F, 1.0F));
-        if (std::abs(glm::dot(radial_out, t0)) < 0.92F) {
-            up_ref = radial_out;
+        const glm::vec3 perp_out = radial_out - t0 * glm::dot(radial_out, t0);
+        if (glm::dot(perp_out, perp_out) > 1.0e-6F) {
+            up_ref = glm::normalize(perp_out);
         }
     }
     glm::vec3 ref_side = safe_normalize(glm::cross(up_ref, t0), glm::vec3(1.0F, 0.0F, 0.0F));
@@ -583,6 +583,8 @@ void emit_twisted_ribbon_strand(
         const glm::vec3 n_right = safe_normalize(ortho_n + width_dir * 0.36F, ortho_n);
 
         const float uv_v = 0.02F + 0.96F * v_t;
+        const float encoded_u =
+            static_cast<float>(clump_id + 1U) + std::clamp(half_w / 0.004F, 0.001F, 0.998F);
         const CookedSkinVertex sk = (tip_skin_opt != nullptr)
             ? blend_skin_pair(root_skin, *tip_skin_opt, v_t)
             : root_skin;
@@ -593,12 +595,13 @@ void emit_twisted_ribbon_strand(
         CookedModelVertex vl{};
         vl.position = {left_pos.x, left_pos.y, left_pos.z};
         vl.normal = {n_left.x, n_left.y, n_left.z};
-        vl.texcoord = {u_col, 1.0F - uv_v};
-        vl.tangent = {tang.x, tang.y, tang.z, 1.0F};
+        vl.texcoord = {encoded_u, 1.0F - uv_v};
+        vl.tangent = {tang.x, tang.y, tang.z, -1.0F};
 
         CookedModelVertex vr = vl;
         vr.position = {right_pos.x, right_pos.y, right_pos.z};
         vr.normal = {n_right.x, n_right.y, n_right.z};
+        vr.tangent = {tang.x, tang.y, tang.z, 1.0F};
 
         out.vertices.push_back(vl);
         out.skin_vertices.push_back(sk);
@@ -1724,13 +1727,13 @@ void generate_eyelash_grooms(
                     out.clump_active[cid] = 1U;
                     out.clump_guides[cid] = {pts[0], pts[1], pts[2], pts[3], pts[3], pts[3]};
                 }
-                const float lash_phase = rng.next_float(0.0F, glm::two_pi<float>());
+                const float lash_phase = -0.30F + rng.next_float(-0.22F, 0.22F);
                 if (emit_geometry) {
                     const CookedSkinVertex sk = blend_skin_pair(in.body_skin[v0], in.body_skin[v1], lt);
                     const float w = (is_lower == 0 ? 0.00029F : 0.00018F) * s;
                     emit_twisted_ribbon_strand(
                         pts, cid, w, 0.16F, lash_phase,
-                        0.90F, eye_c, sk, nullptr, out);
+                        0.20F, eye_c, sk, nullptr, out);
                     ++out.lash_strand_count;
                 }
             }
@@ -2115,7 +2118,7 @@ BakedPbrTextureSet bake_character_strand_groom_textures(
             static_cast<std::uint32_t>(u * static_cast<float>(hair_clump_lut_columns)));
 
         SplitMix64 crng{};
-        crng.state = (inputs.seed ^ (static_cast<std::uint64_t>(cid) * 0x9e3779b97f4a7c15ULL)) + x * 17ULL;
+        crng.state = inputs.seed ^ (static_cast<std::uint64_t>(cid) * 0x9e3779b97f4a7c15ULL);
         const float rough_var = crng.next_float(-0.04F, 0.05F);
         const bool is_brow = (cid >= kBrowClumpBase && cid < kLashClumpBase);
         const bool is_lash = (cid >= kLashClumpBase && cid < kBeardClumpBase);

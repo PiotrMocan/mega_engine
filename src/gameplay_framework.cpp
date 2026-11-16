@@ -212,12 +212,23 @@ void discover_ik_bones(
 [[nodiscard]] glm::mat4 find_node_world_matrix(
     const SceneNodeId id,
     const std::span<const SceneWorldNode> world_nodes,
+    const std::span<const std::uint32_t> world_node_index_by_id,
     const SceneNode& fallback_node,
     bool& out_visible) noexcept {
-    for (const SceneWorldNode& wn : world_nodes) {
-        if (wn.id == id) {
-            out_visible = wn.world_visible;
-            return wn.world_matrix;
+    if (!world_node_index_by_id.empty()) {
+        if (id && id.index < world_node_index_by_id.size()) {
+            const std::uint32_t idx = world_node_index_by_id[id.index];
+            if (idx < world_nodes.size() && world_nodes[idx].id == id) {
+                out_visible = world_nodes[idx].world_visible;
+                return world_nodes[idx].world_matrix;
+            }
+        }
+    } else {
+        for (const SceneWorldNode& wn : world_nodes) {
+            if (wn.id == id) {
+                out_visible = wn.world_visible;
+                return wn.world_matrix;
+            }
         }
     }
     out_visible = fallback_node.visible;
@@ -896,6 +907,10 @@ void AnimatorRuntimeSystem::clear(
         }
     }
     nodes_.clear();
+    std::fill(
+        runtime_index_by_node_.begin(),
+        runtime_index_by_node_.end(),
+        UINT32_MAX);
     active_ids_scratch_.clear();
     event_head_ = 0U;
     event_count_ = 0U;
@@ -927,22 +942,26 @@ std::string_view AnimatorRuntimeSystem::event_log_entry(
 
 AnimatorNodeRuntime* AnimatorRuntimeSystem::find_runtime_mut(
     const SceneNodeId id) noexcept {
-    for (AnimatorNodeRuntime& rt : nodes_) {
-        if (rt.node_id == id) {
-            return &rt;
-        }
+    if (!id || id.index >= runtime_index_by_node_.size()) {
+        return nullptr;
     }
-    return nullptr;
+    const std::uint32_t idx = runtime_index_by_node_[id.index];
+    if (idx >= nodes_.size() || nodes_[idx].node_id != id) {
+        return nullptr;
+    }
+    return &nodes_[idx];
 }
 
 const AnimatorNodeRuntime* AnimatorRuntimeSystem::node_runtime(
     const SceneNodeId id) const noexcept {
-    for (const AnimatorNodeRuntime& rt : nodes_) {
-        if (rt.node_id == id) {
-            return &rt;
-        }
+    if (!id || id.index >= runtime_index_by_node_.size()) {
+        return nullptr;
     }
-    return nullptr;
+    const std::uint32_t idx = runtime_index_by_node_[id.index];
+    if (idx >= nodes_.size() || nodes_[idx].node_id != id) {
+        return nullptr;
+    }
+    return &nodes_[idx];
 }
 
 AnimatorNodeRuntime& AnimatorRuntimeSystem::get_or_create_runtime(
@@ -970,9 +989,21 @@ AnimatorNodeRuntime& AnimatorRuntimeSystem::get_or_create_runtime(
         }
         return *existing;
     }
+    const auto new_idx = static_cast<std::uint32_t>(nodes_.size());
     nodes_.emplace_back();
     AnimatorNodeRuntime& created = nodes_.back();
     created.node_id = id;
+    if (id && id.index < max_scene_nodes) {
+        if (id.index >= runtime_index_by_node_.size()) {
+            const std::size_t grown = std::min<std::size_t>(
+                std::max<std::size_t>(
+                    static_cast<std::size_t>(id.index) + 1U,
+                    runtime_index_by_node_.size() * 2U),
+                static_cast<std::size_t>(max_scene_nodes));
+            runtime_index_by_node_.resize(grown, UINT32_MAX);
+        }
+        runtime_index_by_node_[id.index] = new_idx;
+    }
     created.node_uuid = uuid;
     created.asset_path.reserve(128U);
     created.asset_path.assign(asset_path);
@@ -1077,7 +1108,8 @@ void AnimatorRuntimeSystem::update(
     AudioEngine* const audio_engine,
     std::span<const SceneWorldNode> cached_world_nodes,
     const bool preview_only_mode,
-    const RuntimeTransformSink* const transform_sink) {
+    const RuntimeTransformSink* const transform_sink,
+    std::span<const std::uint32_t> world_node_index_by_id) {
     active_ids_scratch_.clear();
     bool local_world_built = false;
 
@@ -1122,11 +1154,12 @@ void AnimatorRuntimeSystem::update(
         if (cached_world_nodes.empty() && !local_world_built) {
             scene.build_world_nodes(local_world_scratch_, ancestor_scratch_);
             cached_world_nodes = local_world_scratch_;
+            world_node_index_by_id = {};
             local_world_built = true;
         }
         bool world_visible = false;
-        const glm::mat4 node_world =
-            find_node_world_matrix(id, cached_world_nodes, node, world_visible);
+        const glm::mat4 node_world = find_node_world_matrix(
+            id, cached_world_nodes, world_node_index_by_id, node, world_visible);
         if (!world_visible) {
             if (AnimatorNodeRuntime* const hidden_rt = find_runtime_mut(id)) {
                 hidden_rt->skin_submitted = false;
@@ -1652,15 +1685,31 @@ void AnimatorRuntimeSystem::update(
     }
 
     for (std::size_t i = nodes_.size(); i > 0U; --i) {
-        const SceneNodeId id = nodes_[i - 1U].node_id;
+        const std::size_t idx = i - 1U;
+        const SceneNodeId id = nodes_[idx].node_id;
         const bool still_active = std::any_of(
             active_ids_scratch_.begin(),
             active_ids_scratch_.end(),
             [id](const SceneNodeId other) noexcept { return other == id; });
         if (!still_active) {
-            if (!preview_only_mode || !nodes_[i - 1U].preview_override) {
+            if (!preview_only_mode || !nodes_[idx].preview_override) {
                 provider.remove(id);
-                nodes_.erase(nodes_.begin() + static_cast<std::ptrdiff_t>(i - 1U));
+                if (id &&
+                    id.index < runtime_index_by_node_.size() &&
+                    runtime_index_by_node_[id.index] == idx) {
+                    runtime_index_by_node_[id.index] = UINT32_MAX;
+                }
+                const std::size_t last_idx = nodes_.size() - 1U;
+                if (idx != last_idx) {
+                    nodes_[idx] = std::move(nodes_[last_idx]);
+                    const SceneNodeId moved_id = nodes_[idx].node_id;
+                    if (moved_id &&
+                        moved_id.index < runtime_index_by_node_.size()) {
+                        runtime_index_by_node_[moved_id.index] =
+                            static_cast<std::uint32_t>(idx);
+                    }
+                }
+                nodes_.pop_back();
             }
         }
     }

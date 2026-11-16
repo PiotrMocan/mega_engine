@@ -185,8 +185,99 @@ void main()
             vec3(0.0, 0.0, 1.0))
         * tangentHandedness;
 
+    vec4 vertexBaseColor = instance.baseColor;
+    vec4 vertexMaterialParameters = materialParameters;
+    gl_Position = frame.viewProjection * world;
+    if (shadingModel == 4u)
+    {
+        if (inUv.x >= 1.0)
+        {
+            const float clumpId = floor(inUv.x) - 1.0;
+            const float halfWidthModel = fract(inUv.x) * 0.004;
+            surfaceUv = vec2((clumpId + 0.5) / 512.0, 1.0 - inUv.y);
+            const vec3 projRow0 = vec3(
+                frame.viewProjection[0][0],
+                frame.viewProjection[1][0],
+                frame.viewProjection[2][0]);
+            const vec3 projRow1 = vec3(
+                frame.viewProjection[0][1],
+                frame.viewProjection[1][1],
+                frame.viewProjection[2][1]);
+            const vec3 projRow3 = vec3(
+                frame.viewProjection[0][3],
+                frame.viewProjection[1][3],
+                frame.viewProjection[2][3]);
+            const vec3 dir3 = safeNormalize(projRow3, vec3(0.0, 0.0, 1.0));
+            const float p00 = length(projRow0 - dir3 * dot(projRow0, dir3));
+            const float p11 = length(projRow1 - dir3 * dot(projRow1, dir3));
+            const float viewportHeight =
+                frame.cameraPosition.w > 1.0 ? frame.cameraPosition.w : 720.0;
+            const float viewportWidth =
+                max(viewportHeight * (p11 / max(p00, 1.0e-6)), 1.0);
+
+            const vec3 localSide = safeNormalize(
+                cross(sourceNormal, sourceTangent.xyz),
+                vec3(1.0, 0.0, 0.0));
+            const vec3 transformedSide =
+                column0 * localSide.x
+                + column1 * localSide.y
+                + column2 * localSide.z;
+            const float transformedSideLenSq = dot(transformedSide, transformedSide);
+            const float modelScale = transformedSideLenSq > 1.0e-12
+                ? sqrt(transformedSideLenSq)
+                : 1.0;
+            const vec3 sideWorld = transformedSideLenSq > 1.0e-12
+                ? (transformedSide * inversesqrt(transformedSideLenSq))
+                : safeNormalize(
+                    cross(worldNormal, worldTangent) * orientation,
+                    vec3(1.0, 0.0, 0.0));
+
+            const vec4 clipSide4 = frame.viewProjection * vec4(sideWorld, 0.0);
+            const vec2 ndcPos = gl_Position.xy / max(abs(gl_Position.w), 1.0e-4);
+            const vec2 sidePxVec =
+                ((clipSide4.xy - ndcPos * clipSide4.w) / max(abs(gl_Position.w), 1.0e-4))
+                * vec2(viewportWidth, viewportHeight) * 0.5;
+            const float sidePxPerMeter = length(sidePxVec);
+            const float trueHalfWidthPx = halfWidthModel * modelScale * sidePxPerMeter;
+            const float minHalfWidthPx = 0.72;
+            const float sideSign = (sourceTangent.w < 0.0 ? -1.0 : 1.0);
+            if (trueHalfWidthPx < minHalfWidthPx && gl_Position.w > 1.0e-4)
+            {
+                vec2 expandDirPx = vec2(0.0);
+                if (sidePxPerMeter > 1.0e-4)
+                {
+                    expandDirPx = sidePxVec / sidePxPerMeter;
+                }
+                else
+                {
+                    const vec4 clipTang4 = frame.viewProjection * vec4(worldTangent, 0.0);
+                    const vec2 tangPxVec =
+                        ((clipTang4.xy - ndcPos * clipTang4.w) / gl_Position.w)
+                        * vec2(viewportWidth, viewportHeight) * 0.5;
+                    const float tangPxLen = length(tangPxVec);
+                    if (tangPxLen > 1.0e-5)
+                    {
+                        expandDirPx = vec2(-tangPxVec.y, tangPxVec.x) / tangPxLen;
+                    }
+                }
+                gl_Position.xy += expandDirPx
+                    * (sideSign * (minHalfWidthPx - trueHalfWidthPx) * 2.0
+                       / vec2(viewportWidth, viewportHeight) * gl_Position.w);
+            }
+            vertexBaseColor = vec4(
+                instance.baseColor.rgb,
+                instance.baseColor.a
+                    * clamp(trueHalfWidthPx / max(trueHalfWidthPx, minHalfWidthPx), 0.04, 1.0));
+            vertexMaterialParameters = vec4(materialParameters.xyz, sideSign);
+        }
+        else
+        {
+            vertexMaterialParameters = vec4(materialParameters.xyz, 0.0);
+        }
+    }
+
     outWorldNormal = worldNormal;
-    outBaseColor = instance.baseColor;
+    outBaseColor = vertexBaseColor;
     outInstanceIndex = uint(instance.materialParameters.w);
     outShadowPosition = frame.lightViewProjection * world;
     outCurrentClip = frame.unjitteredViewProjection * world;
@@ -196,7 +287,7 @@ void main()
             dot(instance.previousRow1, previousLocalPosition),
             dot(instance.previousRow2, previousLocalPosition), 1.0);
     outWorldPosition = worldPosition;
-    outMaterialParameters = materialParameters;
+    outMaterialParameters = vertexMaterialParameters;
     outDielectricF0 = materialDielectricF0(instance.indexOfRefraction);
     outMaterialModel = shadingModel;
     outSubsurfaceProfile = subsurfaceProfile;
@@ -208,5 +299,4 @@ void main()
     outUv = surfaceUv;
     outWorldTangent = worldTangent;
     outWorldBitangent = worldBitangent;
-    gl_Position = frame.viewProjection * world;
 }

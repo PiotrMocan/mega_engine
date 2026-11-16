@@ -379,6 +379,8 @@ private:
         AudioEngine* audio_engine,
         InputActionSystem* input_actions) noexcept;
 
+    void rebuild_world_node_index() noexcept;
+
     void sync_scene_audio(
         const SceneDocument& scene,
         const FlyCamera& output_camera,
@@ -422,6 +424,7 @@ private:
     bool lens_cut_pending_ = false;
 
     std::vector<SceneWorldNode> cached_world_nodes_{};
+    std::vector<std::uint32_t> cached_world_node_index_by_id_{};
     std::vector<std::uint32_t> world_ancestor_scratch_{};
     std::vector<RuntimeAudioNode> runtime_audio_nodes_{};
     std::vector<std::pair<glm::vec3, AudioReverbZoneComponent>> reverb_scratch_{};

@@ -27,15 +27,28 @@ layout(location = 15) flat in float inSubsurfaceStrength;
 void main()
 {
     const vec3 clampedBaseColor = clamp(inBaseColor.rgb, vec3(0.0), vec3(1.0));
+    const float normalLenSq = dot(inWorldNormal, inWorldNormal);
+    const vec3 normal = normalLenSq > 1.0e-12
+        ? inWorldNormal * inversesqrt(normalLenSq)
+        : vec3(0.0, 1.0, 0.0);
+    const vec3 dNdx = dFdx(normal);
+    const vec3 dNdy = dFdy(normal);
+    const float normVar = min(dot(dNdx, dNdx) + dot(dNdy, dNdy), 0.25);
     vec3 shadedColor = clampedBaseColor;
     PbrLightingComponents lightingComponents;
     lightingComponents.diffuse = vec3(0.0);
     lightingComponents.specular = vec3(0.0);
     if (inMaterialModel != 1u) {
-        const vec3 normal = normalize(inWorldNormal);
+        vec3 surfaceMaterialParameters = inMaterialParameters.xyz;
+        if (inMaterialModel != 4u) {
+            const float r = clamp(surfaceMaterialParameters.y, pbrMinimumRoughness, 1.0);
+            const float alpha = r * r;
+            const float alphaAA = clamp(alpha * alpha + 0.35 * normVar, 0.0, 1.0);
+            surfaceMaterialParameters.y = clamp(sqrt(sqrt(alphaAA)), pbrMinimumRoughness, 1.0);
+        }
         lightingComponents = evaluateLitSurfaceComponents(
             clampedBaseColor,
-            inMaterialParameters.xyz,
+            surfaceMaterialParameters,
             normal,
             normal,
             inWorldPosition,

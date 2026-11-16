@@ -31,8 +31,11 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #if VCR_EDITOR_ENABLED
@@ -549,6 +552,7 @@ public:
     }
     void snap_runtime_transforms() noexcept {
         runtime_transforms_.snap_history();
+        prev_committed_runtime_revision_ = 0U;
     }
     [[nodiscard]] bool editor_scene_needs_sync() const noexcept {
         return editor_scene_revision_ == 0U;
@@ -855,6 +859,8 @@ private:
     [[nodiscard]] std::vector<std::string> resident_editor_texture_paths() const;
     [[nodiscard]] std::optional<std::uint32_t> publish_editor_model(const PreparedModel &prepared,
                                                                     std::string &error);
+    [[nodiscard]] std::optional<std::uint32_t> find_editor_model_asset_index(
+        std::string_view relative_path) const noexcept;
     void create_skinning_resources();
     void prepare_skinning_resources_for_frame(FrameContext& frame);
     void destroy_skinning_resources() noexcept;
@@ -1204,6 +1210,7 @@ private:
     glm::vec3 hiz_camera_{0.0F};
     VkExtent2D hiz_source_extent_{};
     std::uint64_t hiz_runtime_revision_ = 0U;
+    std::uint64_t prev_committed_runtime_revision_ = 0U;
     std::uint64_t hiz_document_revision_ = 0U;
     AssetPreparation asset_preparation_;
     UploadBatch asset_upload_;
@@ -1217,8 +1224,19 @@ private:
     std::optional<std::size_t> uploading_request_;
     std::size_t asset_requests_pending_ = 0;
     bool async_assets_ = false;
+    struct StringHash {
+        using is_transparent = void;
+
+        [[nodiscard]] std::size_t operator()(
+            const std::string_view sv) const noexcept {
+            return std::hash<std::string_view>{}(sv);
+        }
+    };
     std::vector<EditorModelAsset> editor_model_assets_{};
+    std::unordered_map<std::string, std::uint32_t, StringHash, std::equal_to<>>
+        editor_model_asset_lookup_{};
     std::vector<EditorModelDraw> editor_model_draws_{};
+    std::vector<std::uint32_t> transparent_model_draw_indices_{};
     static constexpr std::uint32_t max_skinned_pool_vertices = 2'097'152U;
     static constexpr std::uint32_t max_skinned_total_bones = 16'384U;
     struct SkinnedNodeSlot {

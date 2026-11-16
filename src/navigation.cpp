@@ -1810,6 +1810,7 @@ NavigationRuntime::NavigationRuntime() {
     blockers_.reserve(128U);
     blockers_scratch_.reserve(128U);
     world_nodes_scratch_.reserve(256U);
+    world_node_index_scratch_.reserve(256U);
     ancestor_scratch_.reserve(256U);
     scratch_.open_heap.reserve(512U);
     scratch_.corridor.reserve(512U);
@@ -1845,18 +1846,65 @@ void NavigationRuntime::set_navmesh(NavMeshData navmesh) {
 
 void NavigationRuntime::sync_dynamic_obstacles(
     const SceneDocument& scene,
-    const PhysicsWorld* const physics_world) noexcept {
+    const PhysicsWorld* const physics_world,
+    const std::span<const SceneWorldNode> prebuilt_world_nodes,
+    const std::span<const std::uint32_t> world_node_index_by_id) noexcept {
+    if (scene.nav_obstacles().owners().empty() &&
+        scene.rigid_bodies().owners().empty()) {
+        if (!blockers_.empty()) {
+            blockers_.clear();
+            ++obstacles_revision_;
+        }
+        return;
+    }
+
     blockers_scratch_.clear();
-    scene.build_world_nodes(world_nodes_scratch_, ancestor_scratch_);
+    std::span<const SceneWorldNode> world_nodes = prebuilt_world_nodes;
+    std::span<const std::uint32_t> index_by_id =
+        !prebuilt_world_nodes.empty()
+            ? world_node_index_by_id
+            : std::span<const std::uint32_t>{};
+    if (world_nodes.empty()) {
+        scene.build_world_nodes(world_nodes_scratch_, ancestor_scratch_);
+        world_nodes = world_nodes_scratch_;
+        index_by_id = {};
+    }
+    if (index_by_id.empty() && !world_nodes.empty()) {
+        std::uint32_t max_index = 0U;
+        bool has_valid = false;
+        for (const SceneWorldNode& wn : world_nodes) {
+            if (wn.id && wn.id.index < max_scene_nodes) {
+                if (!has_valid || wn.id.index > max_index) {
+                    max_index = wn.id.index;
+                }
+                has_valid = true;
+            }
+        }
+        if (has_valid) {
+            world_node_index_scratch_.assign(
+                static_cast<std::size_t>(max_index) + 1U, UINT32_MAX);
+            for (std::size_t idx = 0U; idx < world_nodes.size(); ++idx) {
+                const SceneNodeId id = world_nodes[idx].id;
+                if (id && id.index <= max_index) {
+                    world_node_index_scratch_[id.index] =
+                        static_cast<std::uint32_t>(idx);
+                }
+            }
+            index_by_id = world_node_index_scratch_;
+        }
+    }
 
     const auto find_world_node =
         [&](const SceneNodeId id) noexcept -> const SceneWorldNode* {
-        for (const SceneWorldNode& wn : world_nodes_scratch_) {
-            if (wn.id == id) {
-                return &wn;
-            }
+        if (!id || id.index >= index_by_id.size()) {
+            return nullptr;
         }
-        return nullptr;
+        const std::uint32_t idx = index_by_id[id.index];
+        if (idx >= world_nodes.size()) {
+            return nullptr;
+        }
+        const SceneWorldNode& wn = world_nodes[idx];
+        return wn.id == id ? &wn : nullptr;
     };
 
     // 1. Authored NavObstacleComponents.

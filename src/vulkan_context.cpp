@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <cstdio>
 #include <iomanip>
@@ -143,6 +144,8 @@ void VulkanContext::shutdown() noexcept {
     }
     buffer_device_address_enabled_ = false;
     ray_query_supported_ = false;
+    sampler_anisotropy_enabled_ = false;
+    max_sampler_anisotropy_ = 1.0F;
 }
 
 void VulkanContext::create_instance(SDL_Window* window, const bool validation_requested) {
@@ -581,6 +584,14 @@ void VulkanContext::create_device() {
         tessellation_shader_enabled_ ? VK_TRUE : VK_FALSE;
     independent_blend_enabled_ = supported2.features.independentBlend == VK_TRUE;
     features2.features.independentBlend = independent_blend_enabled_ ? VK_TRUE : VK_FALSE;
+    sampler_anisotropy_enabled_ =
+        supported2.features.samplerAnisotropy == VK_TRUE &&
+        std::isfinite(properties_.limits.maxSamplerAnisotropy) &&
+        properties_.limits.maxSamplerAnisotropy >= 1.0F;
+    features2.features.samplerAnisotropy = sampler_anisotropy_enabled_ ? VK_TRUE : VK_FALSE;
+    max_sampler_anisotropy_ = sampler_anisotropy_enabled_
+        ? std::clamp(properties_.limits.maxSamplerAnisotropy, 1.0F, 16.0F)
+        : 1.0F;
     const VkDeviceCreateInfo create_info{
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = &features2,
@@ -603,7 +614,13 @@ void VulkanContext::create_device() {
               << '\n'
               << "  hardware ray query: "
               << (ray_query_supported_ ? "enabled" : "unavailable")
-              << '\n';
+              << '\n'
+              << "  sampler anisotropy: ";
+    if (sampler_anisotropy_enabled_) {
+        std::cout << "enabled (max " << max_sampler_anisotropy_ << "x)\n";
+    } else {
+        std::cout << "unavailable\n";
+    }
 }
 
 void VulkanContext::create_allocator() {

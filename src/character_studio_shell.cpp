@@ -761,7 +761,7 @@ int CharacterStudioShell::run(
     last_metrics_update_ = prev_clock;
 
     while (running_) {
-        const auto frame_begin = std::chrono::steady_clock::now();
+        auto frame_begin = std::chrono::steady_clock::now();
         const float dt_seconds = std::clamp(
             std::chrono::duration<float>(frame_begin - prev_clock).count(),
             0.0001F,
@@ -806,9 +806,15 @@ int CharacterStudioShell::run(
         if (renderer_.poll_assets()) {
             submitted_scene_revision_ = 0U;
         }
+        bool cooked_before_ui = false;
         if (preview_rebuild_requested_) {
             rebuild_preview_assets(true);
             preview_rebuild_requested_ = false;
+            renderer_.reset_metrics();
+            ui_metrics_ = PerformanceSnapshot{};
+            frame_begin = std::chrono::steady_clock::now();
+            prev_clock = frame_begin;
+            cooked_before_ui = true;
         }
 
         const auto view = preview_scene_.build_render_view(
@@ -855,13 +861,10 @@ int CharacterStudioShell::run(
                 preview_pose_.active_skin_matrices());
         }
 
-        if (frame_begin - last_metrics_update_ >= std::chrono::milliseconds(250)) {
-            ui_metrics_ = renderer_.metrics_snapshot();
-            last_metrics_update_ = frame_begin;
-        }
-
         synchronize_renderer_textures();
-        render_gui_frame(tool, dt_seconds);
+        if (render_gui_frame(tool, dt_seconds, frame_begin, cooked_before_ui)) {
+            prev_clock = std::chrono::steady_clock::now();
+        }
         ++rendered_frames_;
 
         if (!screenshot_output_path_.empty()) {
@@ -1680,9 +1683,11 @@ void CharacterStudioShell::handle_sdl_event(
     }
 }
 
-void CharacterStudioShell::render_gui_frame(
+bool CharacterStudioShell::render_gui_frame(
     ICharacterStudioTool& tool,
-    float /*dt_seconds*/) {
+    float /*dt_seconds*/,
+    std::chrono::steady_clock::time_point frame_begin,
+    const bool cooked_before_ui) {
     CharacterToolFrameActions actions{};
     if (mcp_stdio_enabled_) {
         process_mcp_commands(tool, actions);
@@ -1786,6 +1791,7 @@ void CharacterStudioShell::render_gui_frame(
     if (!actions.status_message.empty()) {
         set_status(actions.status_message, actions.status_tone);
     }
+    bool cooked_in_actions = false;
     if (actions.rebuild_preview) {
         if (left_mouse_dragging_tool_) {
             // Fast interactive CPU mesh rebuild while dragging; GPU reloads cleanly on release.
@@ -1794,6 +1800,7 @@ void CharacterStudioShell::render_gui_frame(
         } else {
             rebuild_preview_assets(true);
             preview_rebuild_requested_ = false;
+            cooked_in_actions = true;
         }
     }
     if (actions.save_package) {
@@ -1803,14 +1810,37 @@ void CharacterStudioShell::render_gui_frame(
     if (actions.cook_to_project) {
         std::string err;
         static_cast<void>(cook_to_project(err));
+        cooked_in_actions = true;
     }
     if (title_dirty_state_ != package_dirty_ || title_slug_state_ != package_.identity.slug) {
         update_window_title();
     }
 
-    if (renderer_.draw_frame(last_timings_, camera_.view_matrix(), draw_data)) {
-        renderer_.record_metrics(last_timings_);
+    if (cooked_in_actions) {
+        renderer_.reset_metrics();
+        ui_metrics_ = PerformanceSnapshot{};
+        frame_begin = std::chrono::steady_clock::now();
     }
+
+    FrameTimings timings{};
+    if (renderer_.draw_frame(timings, camera_.view_matrix(), draw_data)) {
+        const auto frame_end = std::chrono::steady_clock::now();
+        timings.cpu_frame_ms = std::max(
+            0.001,
+            std::chrono::duration<double, std::milli>(frame_end - frame_begin).count());
+        last_timings_ = timings;
+        renderer_.record_metrics(timings);
+
+        if (ui_metrics_.timed_frames < 8U ||
+            (ui_metrics_.latest.gpu_frame_ms < 0.0 && timings.gpu_frame_ms >= 0.0) ||
+            cooked_before_ui ||
+            cooked_in_actions ||
+            frame_end - last_metrics_update_ >= std::chrono::milliseconds(120)) {
+            ui_metrics_ = renderer_.metrics_snapshot(true);
+            last_metrics_update_ = frame_end;
+        }
+    }
+    return cooked_in_actions;
 }
 
 void CharacterStudioShell::draw_top_toolbar(
@@ -2177,20 +2207,45 @@ void CharacterStudioShell::draw_viewport_panel(
     }
 
     char hud_buf[256]{};
-    const double fps = last_timings_.cpu_frame_ms > 0.01
-        ? (1000.0 / last_timings_.cpu_frame_ms)
-        : 0.0;
-    std::snprintf(
-        hud_buf, sizeof(hud_buf),
-        "%.0f FPS | %.2f ms | %zu verts / %zu tris / %zu bones%s%s",
-        fps,
-        last_timings_.cpu_frame_ms > 0.0 ? last_timings_.cpu_frame_ms : 0.0,
-        preview_mesh_.vertices.size(),
-        preview_mesh_.indices.size() / 3U,
-        preview_mesh_.skeleton.bones.size(),
-        last_hover_hit_ ? " | Hit: " : "",
-        last_hover_hit_ ? to_token(last_hover_hit_->target).data() : "");
-    ui_kit_.viewport_badge(ImVec2(img_min.x + 12.0F, img_min.y + 12.0F), hud_buf);
+    const double vp_fps = ui_metrics_.one_second_average_fps > 0.0
+        ? ui_metrics_.one_second_average_fps
+        : (ui_metrics_.instantaneous_fps > 0.0
+               ? ui_metrics_.instantaneous_fps
+               : (last_timings_.cpu_frame_ms > 0.0 ? (1000.0 / last_timings_.cpu_frame_ms) : 0.0));
+    const double cpu_ms = vp_fps > 0.0
+        ? (1000.0 / vp_fps)
+        : (ui_metrics_.latest.cpu_frame_ms >= 0.0
+               ? ui_metrics_.latest.cpu_frame_ms
+               : (last_timings_.cpu_frame_ms > 0.0 ? last_timings_.cpu_frame_ms : 0.0));
+    const double gpu_ms = ui_metrics_.latest.gpu_frame_ms;
+    if (gpu_ms >= 0.0) {
+        std::snprintf(
+            hud_buf, sizeof(hud_buf),
+            "%.0f FPS | CPU %.2f ms | GPU %.2f ms | %zu verts / %zu tris / %zu bones%s%s",
+            vp_fps,
+            cpu_ms,
+            gpu_ms,
+            preview_mesh_.vertices.size(),
+            preview_mesh_.indices.size() / 3U,
+            preview_mesh_.skeleton.bones.size(),
+            last_hover_hit_ ? " | Hit: " : "",
+            last_hover_hit_ ? to_token(last_hover_hit_->target).data() : "");
+    } else {
+        std::snprintf(
+            hud_buf, sizeof(hud_buf),
+            "%.0f FPS | CPU %.2f ms | %zu verts / %zu tris / %zu bones%s%s",
+            vp_fps,
+            cpu_ms,
+            preview_mesh_.vertices.size(),
+            preview_mesh_.indices.size() / 3U,
+            preview_mesh_.skeleton.bones.size(),
+            last_hover_hit_ ? " | Hit: " : "",
+            last_hover_hit_ ? to_token(last_hover_hit_->target).data() : "");
+    }
+    const EditorTone hud_tone = vp_fps >= 60.0
+        ? EditorTone::success
+        : (vp_fps > 0.0 ? EditorTone::warning : EditorTone::neutral);
+    ui_kit_.viewport_badge(ImVec2(img_min.x + 12.0F, img_min.y + 12.0F), hud_buf, hud_tone);
 
     ImGui::End();
 }

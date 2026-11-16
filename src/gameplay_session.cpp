@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 
 #include <glm/geometric.hpp>
@@ -278,6 +279,36 @@ void GameplaySession::emit_ai_noise(
         position, loudness, max_radius, instigator_node, instigator_uuid);
 }
 
+void GameplaySession::rebuild_world_node_index() noexcept {
+    if (cached_world_nodes_.empty()) {
+        cached_world_node_index_by_id_.clear();
+        return;
+    }
+    std::uint32_t max_index = 0U;
+    bool has_valid = false;
+    for (const SceneWorldNode& wn : cached_world_nodes_) {
+        if (wn.id && wn.id.index < max_scene_nodes) {
+            if (!has_valid || wn.id.index > max_index) {
+                max_index = wn.id.index;
+            }
+            has_valid = true;
+        }
+    }
+    if (!has_valid) {
+        cached_world_node_index_by_id_.clear();
+        return;
+    }
+    cached_world_node_index_by_id_.assign(
+        static_cast<std::size_t>(max_index) + 1U, UINT32_MAX);
+    for (std::size_t idx = 0U; idx < cached_world_nodes_.size(); ++idx) {
+        const SceneNodeId id = cached_world_nodes_[idx].id;
+        if (id && id.index <= max_index) {
+            cached_world_node_index_by_id_[id.index] =
+                static_cast<std::uint32_t>(idx);
+        }
+    }
+}
+
 bool GameplaySession::start(
     SceneDocument& scene,
     const SceneRenderView& initial_view,
@@ -304,6 +335,8 @@ bool GameplaySession::start(
     transform_registry_.reserve(scene.size() + 16U);
     overlay_canvas_.clear();
     runtime_audio_nodes_.clear();
+    cached_world_nodes_.clear();
+    cached_world_node_index_by_id_.clear();
     has_prev_listener_position_ = false;
     default_camera_look_enabled_ = true;
 
@@ -462,6 +495,7 @@ bool GameplaySession::start(
     }
 
     scene.build_world_nodes(cached_world_nodes_, world_ancestor_scratch_);
+    rebuild_world_node_index();
     cached_scene_instance_id_ = scene.instance_id();
     cached_content_revision_ = scene.content_revision();
     cached_structure_revision_ = scene.structure_revision();
@@ -513,7 +547,11 @@ bool GameplaySession::start(
             }
         }
     }
-    navigation_.sync_dynamic_obstacles(scene, &physics_world_);
+    navigation_.sync_dynamic_obstacles(
+        scene,
+        &physics_world_,
+        cached_world_nodes_,
+        cached_world_node_index_by_id_);
     npc_ai_.preload_behavior_trees(scene, content_asset_root_);
     npc_ai_.sync_agents_from_scene(scene, gameplay_world_);
 
@@ -540,6 +578,7 @@ bool GameplaySession::start(
         }
         transform_registry_.propagate_hierarchy();
         scene.build_world_nodes(cached_world_nodes_, world_ancestor_scratch_);
+        rebuild_world_node_index();
         cached_scene_instance_id_ = scene.instance_id();
         cached_content_revision_ = scene.content_revision();
         cached_structure_revision_ = scene.structure_revision();
@@ -808,6 +847,7 @@ bool GameplaySession::update_internal(
             bounds_provider,
             collision_provider);
         scene.build_world_nodes(cached_world_nodes_, world_ancestor_scratch_);
+        rebuild_world_node_index();
         gameplay_world_.sync_scene(
             scene,
             &collision_world_,
@@ -1070,7 +1110,15 @@ bool GameplaySession::update_internal(
         }
     }
 
-    navigation_.sync_dynamic_obstacles(scene, &physics_world_);
+    if (navigation_.has_navmesh() ||
+        !scene.npc_ais().owners().empty() ||
+        !scene.nav_obstacles().owners().empty()) {
+        navigation_.sync_dynamic_obstacles(
+            scene,
+            &physics_world_,
+            cached_world_nodes_,
+            cached_world_node_index_by_id_);
+    }
     NpcTransformDispatchContext npc_sink_ctx{
         .registry = &transform_registry_,
         .caller_sink = transform_sink,
@@ -1241,9 +1289,20 @@ bool GameplaySession::update_internal(
 
     // Stage 4: Animation & IK (uses updated live world matrices).
     const auto& live_pool = transform_registry_.live_world_nodes();
-    for (SceneWorldNode& wn : cached_world_nodes_) {
-        if (const auto live_mat = live_pool.get(wn.id)) {
-            wn.world_matrix = live_mat->get();
+    const std::span<const SceneNodeId> live_owners = live_pool.owners();
+    const std::span<const glm::mat4> live_mats = live_pool.values();
+    const std::size_t live_count =
+        std::min(live_owners.size(), live_mats.size());
+    for (std::size_t i = 0U; i < live_count; ++i) {
+        const SceneNodeId id = live_owners[i];
+        if (!id || id.index >= cached_world_node_index_by_id_.size()) {
+            continue;
+        }
+        const std::uint32_t widx =
+            cached_world_node_index_by_id_[id.index];
+        if (widx < cached_world_nodes_.size() &&
+            cached_world_nodes_[widx].id == id) {
+            cached_world_nodes_[widx].world_matrix = live_mats[i];
         }
     }
 
@@ -1256,7 +1315,8 @@ bool GameplaySession::update_internal(
         audio_engine,
         cached_world_nodes_,
         false,
-        mutable_sink.apply != nullptr ? &mutable_sink : nullptr);
+        mutable_sink.apply != nullptr ? &mutable_sink : nullptr,
+        cached_world_node_index_by_id_);
 
     for (const SceneNodeId anim_id : scene.animators().owners()) {
         if (const auto anim_comp = scene.animator(anim_id);
@@ -1423,6 +1483,17 @@ void GameplaySession::sync_scene_audio(
     AudioEngine& audio_engine) noexcept {
     const auto find_world_node =
         [this](const SceneNodeId id) noexcept -> const SceneWorldNode* {
+        if (!cached_world_node_index_by_id_.empty()) {
+            if (id && id.index < cached_world_node_index_by_id_.size()) {
+                const std::uint32_t idx =
+                    cached_world_node_index_by_id_[id.index];
+                if (idx < cached_world_nodes_.size() &&
+                    cached_world_nodes_[idx].id == id) {
+                    return &cached_world_nodes_[idx];
+                }
+            }
+            return nullptr;
+        }
         for (const auto& wn : cached_world_nodes_) {
             if (wn.id == id) {
                 return &wn;
@@ -1806,6 +1877,8 @@ void GameplaySession::stop(
     transform_registry_.clear();
     overlay_canvas_.clear();
     runtime_audio_nodes_.clear();
+    cached_world_nodes_.clear();
+    cached_world_node_index_by_id_.clear();
     has_prev_listener_position_ = false;
     collision_world_.clear();
     physics_world_.clear();
