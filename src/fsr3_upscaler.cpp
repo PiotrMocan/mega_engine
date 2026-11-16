@@ -65,10 +65,17 @@ void Fsr3Upscaler::initialize(
         unavailable_reason_ = SDL_GetError();
         return;
     }
+    const std::string_view base_sv(base_path);
     const std::filesystem::path library_path =
-        std::filesystem::path(base_path) / "amd_fidelityfx_vk.dll";
-    const std::string library_path_string = library_path.string();
-    library_ = SDL_LoadObject(library_path_string.c_str());
+        std::filesystem::path(
+            std::u8string_view(
+                reinterpret_cast<const char8_t*>(base_sv.data()),
+                base_sv.size())) /
+        "amd_fidelityfx_vk.dll";
+    const auto library_u8 = library_path.u8string();
+    const std::string library_path_utf8(
+        reinterpret_cast<const char*>(library_u8.data()), library_u8.size());
+    library_ = SDL_LoadObject(library_path_utf8.c_str());
     if (library_ == nullptr) {
         unavailable_reason_ =
             "unable to load amd_fidelityfx_vk.dll: ";

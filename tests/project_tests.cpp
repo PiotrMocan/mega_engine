@@ -1,4 +1,5 @@
 #include "asset_browser.hpp"
+#include "asset_pak.hpp"
 #include "audio_engine.hpp"
 #include "cli_options.hpp"
 #include "cooked_model_asset.hpp"
@@ -13,6 +14,9 @@
 #include "runtime_assets.hpp"
 #include "scene_document.hpp"
 #include "scene_io.hpp"
+#include "skeletal_animation.hpp"
+
+#include <nlohmann/json.hpp>
 
 #include <array>
 #include <algorithm>
@@ -501,6 +505,17 @@ void test_shipping_runtime_content_and_rollback() {
     REQUIRE(!std::filesystem::exists(destination / "assets/saves"));
     REQUIRE(std::filesystem::is_regular_file(destination / "assets/config/input_bindings.json"));
     REQUIRE(std::filesystem::is_regular_file(destination / "assets/config/cast.json"));
+    REQUIRE(std::filesystem::is_regular_file(destination / "assets/content.vcrpak"));
+    REQUIRE(!std::filesystem::exists(
+        destination / "assets/starter/flat_plane/flat_plane.vcrasset.json"));
+    REQUIRE(!std::filesystem::exists(
+        destination / "assets/starter/flat_plane/mesh/flat_plane.vcrmesh"));
+    REQUIRE(!std::filesystem::exists(
+        destination / "assets/starter/flat_plane/materials/grid_floor.vcrmaterial.json"));
+    REQUIRE(!std::filesystem::exists(
+        destination / "assets/starter/flat_plane/textures/grid_floor.vcrtexture.json"));
+    REQUIRE(!std::filesystem::exists(
+        destination / "assets/starter/flat_plane/textures/grid_floor.vcrtexture.json.vcrtex"));
     const auto texture_rel = "starter/flat_plane/textures/grid_floor.vcrtexture.json";
     const auto texture = vcr::load_cooked_texture_asset(destination / "assets", texture_rel);
     REQUIRE_MSG(static_cast<bool>(texture), texture ? "" : texture.error().message);
@@ -508,6 +523,18 @@ void test_shipping_runtime_content_and_rollback() {
     REQUIRE(texture->pixel_format == vcr::CookedTexturePixelFormat::bc7_unorm);
     REQUIRE(texture->mip_levels == 8U);
     REQUIRE(texture->width == 128U && texture->height == 128U);
+    const auto flat_plane = vcr::load_cooked_model_asset(
+        destination / "assets", "starter/flat_plane/flat_plane.vcrasset.json");
+    REQUIRE_MSG(static_cast<bool>(flat_plane), flat_plane ? "" : flat_plane.error().message);
+    REQUIRE(flat_plane->prebaked_lods);
+    REQUIRE(!flat_plane->generate_lods);
+    REQUIRE(flat_plane->lods.empty());
+    REQUIRE(!flat_plane->vertices.empty() && !flat_plane->indices.empty());
+    const auto unit_cube = vcr::load_cooked_model_asset(
+        destination / "assets", "starter/unit_cube/unit_cube.vcrasset.json");
+    REQUIRE_MSG(static_cast<bool>(unit_cube), unit_cube ? "" : unit_cube.error().message);
+    REQUIRE(unit_cube->prebaked_lods);
+    vcr::invalidate_asset_pak_cache(destination / "assets");
     REQUIRE(!std::filesystem::exists(destination / "assets/starter/flat_plane/textures/grid_floor.png"));
     REQUIRE(std::filesystem::is_regular_file(project / "assets/starter/flat_plane/textures/grid_floor.png"));
     for (const auto& file : std::filesystem::recursive_directory_iterator(destination)) {
@@ -533,6 +560,247 @@ void test_shipping_runtime_content_and_rollback() {
     for (const auto& entry : std::filesystem::directory_iterator(temp.path())) {
         REQUIRE(entry.path().filename().string().find(".shipping-") == std::string::npos);
     }
+}
+
+[[nodiscard]] std::vector<std::uint8_t> build_v1_vcrmesh_bytes(
+    const std::span<const vcr::CookedModelVertex> vertices,
+    const std::span<const std::uint32_t> indices,
+    const std::span<const std::pair<std::uint64_t, std::uint64_t>> submesh_ranges,
+    const std::span<const std::uint32_t> submesh_materials) {
+    std::vector<std::uint8_t> out;
+    const auto append_u32 = [&out](const std::uint32_t v) {
+        out.push_back(static_cast<std::uint8_t>(v & 0xFFU));
+        out.push_back(static_cast<std::uint8_t>((v >> 8U) & 0xFFU));
+        out.push_back(static_cast<std::uint8_t>((v >> 16U) & 0xFFU));
+        out.push_back(static_cast<std::uint8_t>((v >> 24U) & 0xFFU));
+    };
+    const auto append_u64 = [&append_u32](const std::uint64_t v) {
+        append_u32(static_cast<std::uint32_t>(v));
+        append_u32(static_cast<std::uint32_t>(v >> 32U));
+    };
+    const auto append_f32 = [&append_u32](const float v) {
+        append_u32(std::bit_cast<std::uint32_t>(v));
+    };
+    constexpr std::array<char, 8U> magic{'V', 'C', 'R', 'M', 'E', 'S', 'H', '\0'};
+    for (const char ch : magic) {
+        out.push_back(static_cast<std::uint8_t>(ch));
+    }
+    append_u32(vcr::cooked_mesh_binary_version);
+    append_u32(vcr::cooked_mesh_vertex_stride);
+    append_u64(vertices.size());
+    append_u64(indices.size());
+    append_u32(static_cast<std::uint32_t>(submesh_ranges.size()));
+    append_u32(0U);
+    for (std::size_t i = 0U; i < submesh_ranges.size(); ++i) {
+        append_u64(submesh_ranges[i].first);
+        append_u64(submesh_ranges[i].second);
+        append_u32(submesh_materials[i]);
+        append_u32(0U);
+    }
+    for (const vcr::CookedModelVertex& v : vertices) {
+        for (const float c : v.position) append_f32(c);
+        for (const float c : v.normal) append_f32(c);
+        for (const float c : v.texcoord) append_f32(c);
+        for (const float c : v.tangent) append_f32(c);
+    }
+    for (const std::uint32_t idx : indices) {
+        append_u32(idx);
+    }
+    return out;
+}
+
+void write_test_triangle_model(
+    const std::filesystem::path& assets_root,
+    const std::string_view rel_dir,
+    const std::string_view model_name,
+    const bool two_materials,
+    const nlohmann::json& extra_lods = nlohmann::json(),
+    const bool skinned = false) {
+    const std::filesystem::path pkg = assets_root / std::string(rel_dir);
+    std::filesystem::create_directories(pkg / "materials");
+    std::filesystem::create_directories(pkg / "mesh");
+
+    const nlohmann::json mat0{
+        {"schema", "vcr.asset"},
+        {"version", 1U},
+        {"kind", "material"},
+        {"name", "MatA"},
+        {"pbr", {
+            {"base_color", {0.7F, 0.2F, 0.2F, 1.0F}},
+            {"metallic", 0.0F},
+            {"roughness", 0.5F},
+            {"ambient_occlusion", 1.0F},
+        }},
+        {"textures", nlohmann::json::object()},
+    };
+    write_text_file(pkg / "materials/mat_a.vcrmaterial.json", mat0.dump(2));
+
+    nlohmann::json materials_arr = nlohmann::json::array({"materials/mat_a.vcrmaterial.json"});
+    if (two_materials) {
+        nlohmann::json mat1 = mat0;
+        mat1["name"] = "MatB";
+        write_text_file(pkg / "materials/mat_b.vcrmaterial.json", mat1.dump(2));
+        materials_arr.push_back("materials/mat_b.vcrmaterial.json");
+    }
+
+    std::vector<vcr::CookedModelVertex> verts{
+        {{0.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 0.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
+        {{1.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 0.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
+        {{0.0F, 1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 1.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
+    };
+    std::vector<std::uint32_t> inds{0U, 1U, 2U};
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges{{0U, 3U}};
+    std::vector<std::uint32_t> sub_mats{0U};
+    nlohmann::json submeshes_json = nlohmann::json::array({
+        nlohmann::json{
+            {"name", "MatA"},
+            {"first_index", 0U},
+            {"index_count", 3U},
+            {"material_index", 0U},
+            {"material", "materials/mat_a.vcrmaterial.json"},
+        },
+    });
+    if (two_materials) {
+        verts.push_back({{1.0F, 1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 1.0F}, {1.0F, 0.0F, 0.0F, 1.0F}});
+        inds.insert(inds.end(), {1U, 3U, 2U});
+        ranges.emplace_back(3U, 3U);
+        sub_mats.push_back(1U);
+        submeshes_json.push_back(nlohmann::json{
+            {"name", "MatB"},
+            {"first_index", 3U},
+            {"index_count", 3U},
+            {"material_index", 1U},
+            {"material", "materials/mat_b.vcrmaterial.json"},
+        });
+    }
+
+    const std::string mesh_rel = "mesh/" + std::string(model_name) + ".vcrmesh";
+    write_bytes_file(pkg / mesh_rel, build_v1_vcrmesh_bytes(verts, inds, ranges, sub_mats));
+
+    nlohmann::json model_json{
+        {"schema", "vcr.asset"},
+        {"version", 1U},
+        {"kind", "model"},
+        {"name", std::string(model_name)},
+        {"mesh", mesh_rel},
+        {"geometry", {
+            {"primitive", "triangles"},
+            {"vertex_count", verts.size()},
+            {"vertex_stride", vcr::cooked_mesh_vertex_stride},
+            {"index_count", inds.size()},
+            {"index_type", "uint32"},
+        }},
+        {"materials", materials_arr},
+        {"submeshes", submeshes_json},
+    };
+    if (extra_lods.is_array() && !extra_lods.empty()) {
+        model_json["lods"] = extra_lods;
+    }
+    if (skinned) {
+        vcr::CookedSkeletonAsset skel;
+        skel.bones.push_back(vcr::SkeletonBone{.name = "root", .parent_index = -1});
+        std::vector<vcr::CookedSkinVertex> skin_verts(verts.size());
+        std::string io_err;
+        REQUIRE_MSG(vcr::write_cooked_skin_file(pkg / "rig.vcrskin", skel, skin_verts, io_err), io_err);
+        vcr::AnimationClip clip;
+        clip.name = "idle";
+        clip.duration_seconds = 0.5F;
+        REQUIRE_MSG(vcr::write_cooked_anim_file(pkg / "idle.vcranim", clip, io_err), io_err);
+        model_json["skeleton"] = "rig.vcrskin";
+        model_json["animations"] = nlohmann::json::array({
+            nlohmann::json{{"name", "idle"}, {"path", "idle.vcranim"}, {"duration_seconds", 0.5F}},
+        });
+    }
+    write_text_file(pkg / (std::string(model_name) + ".vcrasset.json"), model_json.dump(2));
+}
+
+void test_shipping_prebaked_lod_pruning_and_skinned_v1() {
+    const ScopedTempDir temp;
+    vcr::CreateProjectResult created;
+    std::string error;
+    REQUIRE_MSG(vcr::create_project_on_disk(vcr::CreateProjectOptions{
+        .name = "LOD Pruning Ship",
+        .parent_directory = temp.path(),
+        .bundle_runtime = false,
+    }, created, error), error);
+
+    const std::filesystem::path assets_dir = created.project_directory / "assets";
+    write_test_triangle_model(assets_dir, "props/hero_tree_lod1", "hero_tree_lod1", true);
+    write_test_triangle_model(assets_dir, "props/hero_tree_lod2", "hero_tree_lod2", true);
+    const nlohmann::json authored_lods = nlohmann::json::array({
+        {{"model", "props/hero_tree_lod1/hero_tree_lod1.vcrasset.json"}, {"geometric_error", 0.05}},
+        {{"model", "props/hero_tree_lod2/hero_tree_lod2.vcrasset.json"}, {"geometric_error", 0.20}},
+    });
+    write_test_triangle_model(assets_dir, "props/hero_tree", "hero_tree", true, authored_lods);
+    write_test_triangle_model(assets_dir, "chars/hero_rig", "hero_rig", false, nlohmann::json(), true);
+
+    vcr::SceneDocument scene;
+    REQUIRE_MSG(vcr::load_scene_file(assets_dir / "scenes/editor_scene.json", scene, error), error);
+    const vcr::SceneNodeId tree_node = scene.create_node("Hero Tree", vcr::SceneNodeKind::model);
+    REQUIRE(static_cast<bool>(tree_node));
+    scene.node(tree_node)->get().asset_path = "props/hero_tree/hero_tree.vcrasset.json";
+    const vcr::SceneNodeId char_node = scene.create_node("Hero Rig", vcr::SceneNodeKind::model);
+    REQUIRE(static_cast<bool>(char_node));
+    scene.node(char_node)->get().asset_path = "chars/hero_rig/hero_rig.vcrasset.json";
+    REQUIRE_MSG(vcr::save_scene_file(scene, assets_dir / "scenes/editor_scene.json", error), error);
+
+    // Reference LOD2 in a prefab so it stays directly usable even though LOD1 is derivative-only.
+    vcr::SceneDocument prefab_doc;
+    const vcr::SceneNodeId lod2_node = prefab_doc.create_node("LOD2 Prop", vcr::SceneNodeKind::model);
+    REQUIRE(static_cast<bool>(lod2_node));
+    prefab_doc.node(lod2_node)->get().asset_path = "props/hero_tree_lod2/hero_tree_lod2.vcrasset.json";
+    REQUIRE_MSG(vcr::save_prefab_file(
+        prefab_doc, lod2_node, assets_dir, "prefabs/lod2_prop.vcrprefab.json", error), error);
+
+    const std::filesystem::path destination = temp.path() / "shipped_lod_game";
+    vcr::ShipProjectResult shipped;
+    REQUIRE_MSG(vcr::ship_project(created.project_directory, destination, shipped, error), error);
+
+    const std::filesystem::path shipped_assets = destination / "assets";
+    const std::filesystem::path canon_assets = std::filesystem::canonical(shipped_assets);
+    REQUIRE(std::filesystem::is_regular_file(shipped_assets / "content.vcrpak"));
+
+    REQUIRE(vcr::asset_pak_contains(canon_assets, "props/hero_tree/hero_tree.vcrasset.json"));
+    REQUIRE(vcr::asset_pak_contains(canon_assets, "props/hero_tree/mesh/hero_tree.vcrmesh"));
+    REQUIRE(!vcr::asset_pak_contains(canon_assets, "props/hero_tree_lod1/hero_tree_lod1.vcrasset.json"));
+    REQUIRE(!vcr::asset_pak_contains(canon_assets, "props/hero_tree_lod1/mesh/hero_tree_lod1.vcrmesh"));
+    REQUIRE(vcr::asset_pak_contains(canon_assets, "props/hero_tree_lod2/hero_tree_lod2.vcrasset.json"));
+    REQUIRE(vcr::asset_pak_contains(canon_assets, "props/hero_tree_lod2/mesh/hero_tree_lod2.vcrmesh"));
+
+    const auto loaded_tree = vcr::load_cooked_model_asset(
+        shipped_assets, "props/hero_tree/hero_tree.vcrasset.json");
+    REQUIRE_MSG(static_cast<bool>(loaded_tree), loaded_tree ? "" : loaded_tree.error().message);
+    REQUIRE(loaded_tree->prebaked_lods);
+    REQUIRE(!loaded_tree->generate_lods);
+    REQUIRE(loaded_tree->lods.empty());
+    REQUIRE(loaded_tree->submeshes.size() == 2U);
+    REQUIRE(loaded_tree->submeshes[0].lod_count[0] == 3U);
+    REQUIRE(loaded_tree->submeshes[0].lod_count[1] == 3U);
+    REQUIRE(loaded_tree->submeshes[1].lod_count[0] == 3U);
+
+    const auto loaded_lod2 = vcr::load_cooked_model_asset(
+        shipped_assets, "props/hero_tree_lod2/hero_tree_lod2.vcrasset.json");
+    REQUIRE_MSG(static_cast<bool>(loaded_lod2), loaded_lod2 ? "" : loaded_lod2.error().message);
+    REQUIRE(loaded_lod2->prebaked_lods);
+
+    const auto missing_lod1 = vcr::load_cooked_model_asset(
+        shipped_assets, "props/hero_tree_lod1/hero_tree_lod1.vcrasset.json");
+    REQUIRE(!missing_lod1);
+    REQUIRE(missing_lod1.error().code == vcr::CookedModelLoadErrorCode::file_not_found);
+
+    // Skinned models stay v1 with .vcrskin and .vcranim on disk.
+    REQUIRE(std::filesystem::is_regular_file(shipped_assets / "chars/hero_rig/rig.vcrskin"));
+    REQUIRE(std::filesystem::is_regular_file(shipped_assets / "chars/hero_rig/idle.vcranim"));
+    REQUIRE(!std::filesystem::exists(shipped_assets / "chars/hero_rig/hero_rig.vcrasset.json"));
+    REQUIRE(!std::filesystem::exists(shipped_assets / "chars/hero_rig/mesh/hero_rig.vcrmesh"));
+    const auto loaded_rig = vcr::load_cooked_model_asset(
+        shipped_assets, "chars/hero_rig/hero_rig.vcrasset.json");
+    REQUIRE_MSG(static_cast<bool>(loaded_rig), loaded_rig ? "" : loaded_rig.error().message);
+    REQUIRE(!loaded_rig->prebaked_lods);
+    REQUIRE(loaded_rig->is_skinned());
+    REQUIRE(loaded_rig->animations.size() == 1U);
+
+    vcr::invalidate_asset_pak_cache(shipped_assets);
 }
 
 void test_project_bundle_and_icon_workflow() {
@@ -859,6 +1127,7 @@ int main() {
     test_icon_generation_conversion_and_pe_patching();
     test_project_bundle_and_icon_workflow();
     test_shipping_runtime_content_and_rollback();
+    test_shipping_prebaked_lod_pruning_and_skinned_v1();
     test_cpp_module_project_and_manifest_round_trip();
     test_game_module_loader_hardening();
     std::cout << "All project system tests passed.\n";

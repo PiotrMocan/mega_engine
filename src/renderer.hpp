@@ -33,6 +33,7 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -853,6 +854,10 @@ private:
             const std::filesystem::path& asset_root,
             std::string_view relative_path,
             std::string& error);
+    void preload_editor_models_batch(
+        const std::filesystem::path& root,
+        std::span<const std::string> missing_paths,
+        std::unordered_map<std::string, std::string>& out_errors);
     void record_editor_scene_upload(
         VkCommandBuffer command_buffer,
         FrameContext& frame);
@@ -860,6 +865,8 @@ private:
     [[nodiscard]] std::optional<std::uint32_t> publish_editor_model(const PreparedModel &prepared,
                                                                     std::string &error);
     [[nodiscard]] std::optional<std::uint32_t> find_editor_model_asset_index(
+        std::string_view relative_path) const noexcept;
+    [[nodiscard]] std::optional<std::uint32_t> find_editor_texture_asset_index(
         std::string_view relative_path) const noexcept;
     void create_skinning_resources();
     void prepare_skinning_resources_for_frame(FrameContext& frame);
@@ -1265,7 +1272,20 @@ private:
     bool skinning_resources_ready_ = false;
     std::uint64_t skinned_draw_revision_ = 1U;
     std::uint64_t packet_skinned_draw_revision_ = 0U;
+    static constexpr std::uint32_t maximum_editor_model_assets = 1'024U;
+    static constexpr std::uint32_t maximum_editor_texture_assets = 4'096U;
+    static constexpr std::uint32_t maximum_editor_material_descriptors = 4'096U;
+    static constexpr VkDeviceSize maximum_editor_model_gpu_bytes =
+        2ULL * 1024ULL * 1024ULL * 1024ULL;
+    static constexpr VkDeviceSize maximum_single_editor_model_gpu_bytes =
+        512ULL * 1024ULL * 1024ULL;
+    static constexpr VkDeviceSize maximum_editor_texture_gpu_bytes =
+        4ULL * 1024ULL * 1024ULL * 1024ULL;
+    static constexpr VkDeviceSize maximum_single_editor_texture_gpu_bytes =
+        512ULL * 1024ULL * 1024ULL;
     std::vector<EditorTextureAsset> editor_texture_assets_{};
+    std::unordered_map<std::string, std::uint32_t, StringHash, std::equal_to<>>
+        editor_texture_asset_lookup_{};
     std::vector<std::uint32_t> editor_model_sort_scratch_{};
     GpuTexture editor_default_base_color_texture_{};
     GpuTexture editor_default_normal_texture_{};

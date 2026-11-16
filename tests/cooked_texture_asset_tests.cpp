@@ -1,4 +1,5 @@
 #include "cooked_texture_asset.hpp"
+#include "asset_pak.hpp"
 #include "png_encoder.hpp"
 #include "texture_compression.hpp"
 
@@ -7,6 +8,7 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -18,6 +20,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -158,6 +161,421 @@ constexpr std::array<std::uint8_t, 286U> red_jpeg{{
     0x0c, 0x03, 0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00, 0x3f, 0x00, 0x3a,
     0x03, 0x15, 0x4d, 0xff, 0xd9,
 }};
+
+[[nodiscard]] std::vector<std::uint8_t> json_to_bytes(const Json& json) {
+    const std::string text = json.dump(2);
+    return std::vector<std::uint8_t>(text.begin(), text.end());
+}
+
+void append_u32_le_test(
+    std::vector<std::uint8_t>& out,
+    const std::uint32_t value) {
+    out.push_back(static_cast<std::uint8_t>(value & 0xFFU));
+    out.push_back(static_cast<std::uint8_t>((value >> 8U) & 0xFFU));
+    out.push_back(static_cast<std::uint8_t>((value >> 16U) & 0xFFU));
+    out.push_back(static_cast<std::uint8_t>((value >> 24U) & 0xFFU));
+}
+
+void append_u64_le_test(
+    std::vector<std::uint8_t>& out,
+    const std::uint64_t value) {
+    out.push_back(static_cast<std::uint8_t>(value & 0xFFU));
+    out.push_back(static_cast<std::uint8_t>((value >> 8U) & 0xFFU));
+    out.push_back(static_cast<std::uint8_t>((value >> 16U) & 0xFFU));
+    out.push_back(static_cast<std::uint8_t>((value >> 24U) & 0xFFU));
+    out.push_back(static_cast<std::uint8_t>((value >> 32U) & 0xFFU));
+    out.push_back(static_cast<std::uint8_t>((value >> 40U) & 0xFFU));
+    out.push_back(static_cast<std::uint8_t>((value >> 48U) & 0xFFU));
+    out.push_back(static_cast<std::uint8_t>((value >> 56U) & 0xFFU));
+}
+
+void test_asset_pak(const std::filesystem::path& temp_base) {
+    const std::filesystem::path pak_root = temp_base / "pak_only_assets";
+    std::error_code fs_error;
+    std::filesystem::create_directories(pak_root, fs_error);
+    expect(!fs_error, "pak test root directory is created");
+    if (fs_error) {
+        return;
+    }
+    const std::filesystem::path canonical_pak_root =
+        std::filesystem::weakly_canonical(pak_root, fs_error);
+    expect(!fs_error && !canonical_pak_root.empty(),
+           "pak test root canonicalizes");
+
+    vcr::CookedTextureAsset src_bc7{};
+    src_bc7.semantic = vcr::CookedTextureSemantic::base_color;
+    src_bc7.color_space = vcr::CookedTextureColorSpace::srgb;
+    src_bc7.pixel_format = vcr::CookedTexturePixelFormat::rgba8_unorm;
+    src_bc7.width = 6U;
+    src_bc7.height = 5U;
+    src_bc7.row_stride_bytes = 24U;
+    src_bc7.pixels.resize(6U * 5U * 4U);
+    for (std::size_t i = 0U; i < 6U * 5U; ++i) {
+        src_bc7.pixels[i * 4U + 0U] = 40U;
+        src_bc7.pixels[i * 4U + 1U] = 180U;
+        src_bc7.pixels[i * 4U + 2U] = 90U;
+        src_bc7.pixels[i * 4U + 3U] = (i % 2U == 0U) ? 230U : 30U;
+    }
+    std::vector<std::uint8_t> vcrtex_bc7;
+    std::uint32_t mips = 0U;
+    std::string cook_error;
+    expect(
+        vcr::cook_texture_to_vcrtex(
+            src_bc7,
+            0.5F,
+            vcr::CookedTexturePixelFormat::bc7_unorm,
+            vcrtex_bc7,
+            mips,
+            cook_error),
+        "pak BC7 texture cooks cleanly: " + cook_error);
+
+    Json bc7_meta = texture_metadata(
+        "pak_albedo", "textures/albedo.vcrtex", "base_color", "srgb");
+    bc7_meta.erase("decode");
+    bc7_meta["storage"] = "bc7";
+
+    constexpr std::array<std::uint8_t, 8U> png_pixels{
+        0x12U, 0x34U, 0x56U, 0x78U,
+        0x90U, 0xabU, 0xcdU, 0xefU,
+    };
+    const vcr::PngEncodeResult encoded_png =
+        vcr::encode_png_rgba(png_pixels, 2U, 1U);
+    expect(static_cast<bool>(encoded_png), "pak PNG fixture encodes");
+
+    constexpr std::array<std::uint8_t, 8U> raw_pixels{
+        1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U,
+    };
+    Json raw_meta = texture_metadata(
+        "pak_raw", "textures/embedded.rgba8", "normal", "linear");
+    raw_meta.erase("decode");
+    raw_meta["storage"] = "rgba8";
+    raw_meta["dimensions"] = {2U, 1U};
+
+    vcr::AssetPakWriter writer;
+    std::string pak_error;
+    expect(
+        !writer.add_entry("", {}, pak_error) &&
+            !writer.add_entry("../escape.vcrtex", {}, pak_error) &&
+            !writer.add_entry("/leading.vcrtex", {}, pak_error) &&
+            !writer.add_entry("painted\\backslash.vcrtex", {}, pak_error) &&
+            !writer.add_entry("painted/./dot.vcrtex", {}, pak_error) &&
+            !writer.add_entry("painted/trail/", {}, pak_error) &&
+            !writer.add_entry(std::string({'a', '/', 'b', '\0', 'c'}), {}, pak_error),
+        "AssetPakWriter rejects invalid entry paths");
+
+    expect(
+        writer.add_entry(
+            "painted/textures/albedo.vcrtex", vcrtex_bc7, pak_error),
+        "pak BC7 payload entry added: " + pak_error);
+    expect(
+        !writer.add_entry(
+            "painted/textures/albedo.vcrtex", vcrtex_bc7, pak_error),
+        "AssetPakWriter rejects duplicate entry paths");
+    expect(
+        writer.add_entry(
+            "painted/textures/albedo_bc7.vcrtexture.json",
+            json_to_bytes(bc7_meta),
+            pak_error),
+        "pak BC7 metadata entry added: " + pak_error);
+    expect(
+        writer.add_entry(
+            "painted/textures/color.png", encoded_png.bytes, pak_error),
+        "pak PNG payload entry added: " + pak_error);
+    expect(
+        writer.add_entry(
+            "painted/textures/color.vcrtexture.json",
+            json_to_bytes(texture_metadata(
+                "pak_color", "textures/color.png", "emissive", "srgb")),
+            pak_error),
+        "pak PNG metadata entry added: " + pak_error);
+    expect(
+        writer.add_entry(
+            "painted/textures/embedded.rgba8",
+            std::vector<std::uint8_t>(raw_pixels.begin(), raw_pixels.end()),
+            pak_error),
+        "pak raw RGBA8 payload entry added: " + pak_error);
+    expect(
+        writer.add_entry(
+            "painted/textures/embedded.vcrtexture.json",
+            json_to_bytes(raw_meta),
+            pak_error),
+        "pak raw RGBA8 metadata entry added: " + pak_error);
+
+    const std::filesystem::path pak_path =
+        pak_root / vcr::default_asset_pak_filename;
+    expect(
+        writer.write_to_file(pak_path, pak_error),
+        "content.vcrpak writes cleanly: " + pak_error);
+    expect(
+        !std::filesystem::exists(pak_root / "painted"),
+        "no loose asset files exist alongside content.vcrpak");
+
+    expect(
+        vcr::asset_pak_contains(
+            canonical_pak_root, "painted/textures/albedo_bc7.vcrtexture.json") &&
+            vcr::asset_pak_contains(
+                canonical_pak_root, "painted/textures/albedo.vcrtex") &&
+            !vcr::asset_pak_contains(
+                canonical_pak_root, "painted/textures/does_not_exist.vcrtex"),
+        "asset_pak_contains reports packed and missing entries accurately");
+
+    const auto pak_bc7 = vcr::load_cooked_texture_asset(
+        pak_root, "painted/textures/albedo_bc7.vcrtexture.json");
+    expect(
+        static_cast<bool>(pak_bc7),
+        "BC7 .vcrtex loads from content.vcrpak without loose disk files");
+    if (pak_bc7) {
+        expect(
+            pak_bc7->name == "pak_albedo" &&
+                pak_bc7->pixel_format == vcr::CookedTexturePixelFormat::bc7_unorm &&
+                pak_bc7->width == 6U && pak_bc7->height == 5U &&
+                pak_bc7->mip_levels == 3U,
+            "packed BC7 metadata and mip count match");
+        std::vector<std::uint8_t> unpacked;
+        std::string unpack_err;
+        expect(
+            vcr::decode_bc_mip0_to_rgba8(*pak_bc7, unpacked, unpack_err) &&
+                unpacked.size() == 6U * 5U * 4U &&
+                close_byte(unpacked[0U], 40U, 16U) &&
+                close_byte(unpacked[1U], 180U, 16U) &&
+                close_byte(unpacked[3U], 230U, 20U),
+            "packed BC7 mip0 unpacks to expected RGBA values");
+    }
+
+    const auto pak_png = vcr::load_cooked_texture_asset(
+        pak_root, "painted/textures/color.vcrtexture.json");
+    expect(
+        pak_png && pak_png->width == 2U && pak_png->height == 1U &&
+            pak_png->pixels ==
+                std::vector<std::uint8_t>(
+                    png_pixels.begin(), png_pixels.end()),
+        "packed PNG texture decodes from memory identically");
+
+    const auto pak_raw = vcr::load_cooked_texture_asset(
+        pak_root, "painted/textures/embedded.vcrtexture.json");
+    expect(
+        pak_raw && pak_raw->width == 2U && pak_raw->height == 1U &&
+            pak_raw->pixels ==
+                std::vector<std::uint8_t>(
+                    raw_pixels.begin(), raw_pixels.end()),
+        "packed raw RGBA8 texture loads identically");
+
+    expect(
+        vcr::asset_pak_cache_high_water() >= 1U &&
+            vcr::asset_pak_cache_high_water() <= vcr::asset_pak_max_cached_archives,
+        "asset pak cache high-water mark tracks bounded usage");
+
+    {
+        std::atomic<int> concurrent_failures{0};
+        std::vector<std::thread> workers;
+        workers.reserve(4U);
+        for (int t = 0; t < 4; ++t) {
+            workers.emplace_back([&]() {
+                for (int iter = 0; iter < 8; ++iter) {
+                    std::vector<std::uint8_t> bytes;
+                    if (vcr::try_read_asset_pak_file(
+                            canonical_pak_root,
+                            "painted/textures/albedo.vcrtex",
+                            1024ULL * 1024ULL,
+                            bytes) != vcr::AssetPakReadStatus::ok ||
+                        bytes != vcrtex_bc7) {
+                        concurrent_failures.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
+                    const auto tex = vcr::load_cooked_texture_asset(
+                        pak_root, "painted/textures/albedo_bc7.vcrtexture.json");
+                    if (!tex || tex->width != 6U || tex->height != 5U) {
+                        concurrent_failures.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
+                }
+            });
+        }
+        for (auto& worker : workers) {
+            worker.join();
+        }
+        expect(
+            concurrent_failures.load(std::memory_order_relaxed) == 0,
+            "concurrent pak texture reads succeed without data races");
+    }
+
+    vcr::CookedTextureLoadOptions tiny_source{};
+    tiny_source.maximum_source_file_bytes = 1U;
+    const auto pak_source_too_large = vcr::load_cooked_texture_asset(
+        pak_root, "painted/textures/albedo_bc7.vcrtexture.json", tiny_source);
+    expect(
+        !pak_source_too_large &&
+            pak_source_too_large.error().code ==
+                vcr::CookedTextureLoadErrorCode::file_too_large,
+        "packed texture source byte limit returns file_too_large");
+
+    vcr::CookedTextureLoadOptions tiny_meta{};
+    tiny_meta.maximum_metadata_bytes = 1U;
+    const auto pak_meta_too_large = vcr::load_cooked_texture_asset(
+        pak_root, "painted/textures/albedo_bc7.vcrtexture.json", tiny_meta);
+    expect(
+        !pak_meta_too_large &&
+            pak_meta_too_large.error().code ==
+                vcr::CookedTextureLoadErrorCode::file_too_large,
+        "packed texture metadata byte limit returns file_too_large");
+
+    std::vector<std::uint8_t> read_buf;
+    expect(
+        vcr::try_read_asset_pak_file(
+            canonical_pak_root,
+            "painted/textures/albedo.vcrtex",
+            1U,
+            read_buf) == vcr::AssetPakReadStatus::file_too_large,
+        "try_read_asset_pak_file enforces maximum_bytes");
+
+    // Invalidate cache so the archive file handle closes and can be replaced.
+    vcr::invalidate_asset_pak_cache(pak_root);
+    {
+        vcr::AssetPakWriter writer_v2;
+        Json bc7_meta_v2 = bc7_meta;
+        bc7_meta_v2["name"] = "pak_albedo_v2";
+        expect(
+            writer_v2.add_entry(
+                "painted/textures/albedo.vcrtex", vcrtex_bc7, pak_error) &&
+                writer_v2.add_entry(
+                    "painted/textures/albedo_bc7.vcrtexture.json",
+                    json_to_bytes(bc7_meta_v2),
+                    pak_error) &&
+                writer_v2.write_to_file(pak_path, pak_error),
+            "updated content.vcrpak writes cleanly after cache invalidation");
+        const auto reloaded = vcr::load_cooked_texture_asset(
+            pak_root, "painted/textures/albedo_bc7.vcrtexture.json");
+        expect(
+            reloaded && reloaded->name == "pak_albedo_v2",
+            "reloaded texture observes updated archive after cache invalidation");
+    }
+
+    // Corrupt archive header / truncated file rejection.
+    vcr::invalidate_asset_pak_cache(pak_root);
+    expect(
+        write_bytes(
+            pak_path,
+            std::array<std::uint8_t, 12U>{
+                'B', 'A', 'D', 'P', 'A', 'K', 0U, 1U, 2U, 3U, 4U, 5U}),
+        "corrupt short pak fixture is written");
+    expect(
+        vcr::try_read_asset_pak_file(
+            canonical_pak_root,
+            "painted/textures/albedo_bc7.vcrtexture.json",
+            1024ULL * 1024ULL,
+            read_buf) == vcr::AssetPakReadStatus::invalid_archive,
+        "corrupt pak header returns invalid_archive");
+    expect(
+        !vcr::load_cooked_texture_asset(
+            pak_root, "painted/textures/albedo_bc7.vcrtexture.json"),
+        "load_cooked_texture_asset rejects corrupt pak");
+
+    // Corrupt index entry whose payload range exceeds index_offset.
+    {
+        std::vector<std::uint8_t> bad_pak;
+        const std::string bad_entry_path = "a.vcrtex";
+        const std::uint64_t index_offset = 32ULL;
+        const std::uint64_t index_byte_size = 20ULL + bad_entry_path.size();
+        bad_pak.insert(
+            bad_pak.end(),
+            {'V', 'C', 'R', 'P', 'A', 'K', '0', '1'});
+        append_u32_le_test(bad_pak, 1U);
+        append_u32_le_test(bad_pak, 1U);
+        append_u64_le_test(bad_pak, index_offset);
+        append_u64_le_test(bad_pak, index_byte_size);
+        append_u32_le_test(
+            bad_pak, static_cast<std::uint32_t>(bad_entry_path.size()));
+        bad_pak.insert(
+            bad_pak.end(), bad_entry_path.begin(), bad_entry_path.end());
+        append_u64_le_test(bad_pak, 32ULL);
+        append_u64_le_test(bad_pak, 100ULL);
+        vcr::invalidate_asset_pak_cache(pak_root);
+        expect(
+            write_bytes(pak_path, bad_pak),
+            "out-of-bounds payload pak fixture is written");
+        expect(
+            vcr::try_read_asset_pak_file(
+                canonical_pak_root,
+                "a.vcrtex",
+                1024ULL * 1024ULL,
+                read_buf) == vcr::AssetPakReadStatus::invalid_archive,
+            "pak entry exceeding index_offset is rejected");
+    }
+
+    // Unsorted index entries must be rejected.
+    {
+        std::vector<std::uint8_t> unsorted_pak;
+        const std::string p1 = "z.vcrtex";
+        const std::string p2 = "a.vcrtex";
+        const std::uint64_t index_offset = 32ULL;
+        const std::uint64_t index_byte_size =
+            (20ULL + p1.size()) + (20ULL + p2.size());
+        unsorted_pak.insert(
+            unsorted_pak.end(),
+            {'V', 'C', 'R', 'P', 'A', 'K', '0', '1'});
+        append_u32_le_test(unsorted_pak, 1U);
+        append_u32_le_test(unsorted_pak, 2U);
+        append_u64_le_test(unsorted_pak, index_offset);
+        append_u64_le_test(unsorted_pak, index_byte_size);
+        append_u32_le_test(unsorted_pak, static_cast<std::uint32_t>(p1.size()));
+        unsorted_pak.insert(unsorted_pak.end(), p1.begin(), p1.end());
+        append_u64_le_test(unsorted_pak, 32ULL);
+        append_u64_le_test(unsorted_pak, 0ULL);
+        append_u32_le_test(unsorted_pak, static_cast<std::uint32_t>(p2.size()));
+        unsorted_pak.insert(unsorted_pak.end(), p2.begin(), p2.end());
+        append_u64_le_test(unsorted_pak, 32ULL);
+        append_u64_le_test(unsorted_pak, 0ULL);
+        vcr::invalidate_asset_pak_cache(pak_root);
+        expect(
+            write_bytes(pak_path, unsorted_pak),
+            "unsorted pak fixture is written");
+        expect(
+            vcr::try_read_asset_pak_file(
+                canonical_pak_root,
+                "a.vcrtex",
+                1024ULL * 1024ULL,
+                read_buf) == vcr::AssetPakReadStatus::invalid_archive,
+            "unsorted pak index entries are rejected");
+    }
+
+    // Symlink content.vcrpak rejection (when OS permissions allow symlinks).
+    {
+        const std::filesystem::path sym_root = temp_base / "pak_sym_assets";
+        std::filesystem::create_directories(sym_root, fs_error);
+        if (!fs_error) {
+            const std::filesystem::path target_pak =
+                temp_base / "sym_target.vcrpak";
+            vcr::AssetPakWriter sym_writer;
+            expect(
+                sym_writer.add_entry(
+                    "a.vcrtex",
+                    std::vector<std::uint8_t>{1U, 2U, 3U},
+                    pak_error) &&
+                    sym_writer.write_to_file(target_pak, pak_error),
+                "symlink target pak writes cleanly");
+            std::error_code sym_ec;
+            std::filesystem::create_symlink(
+                target_pak,
+                sym_root / vcr::default_asset_pak_filename,
+                sym_ec);
+            if (!sym_ec) {
+                const std::filesystem::path canonical_sym_root =
+                    std::filesystem::weakly_canonical(sym_root, sym_ec);
+                expect(
+                    !sym_ec &&
+                        vcr::try_read_asset_pak_file(
+                            canonical_sym_root,
+                            "a.vcrtex",
+                            1024ULL,
+                            read_buf) == vcr::AssetPakReadStatus::symbolic_link,
+                    "symbolic link content.vcrpak is rejected");
+            }
+        }
+    }
+
+    // Clear all cached archive handles before TemporaryDirectory cleanup.
+    vcr::invalidate_asset_pak_cache();
+}
 
 } // namespace
 
@@ -603,6 +1021,8 @@ int main() {
                 loaded_bc4->mip_levels == 4U,
             "BC4 .vcrtex loads cleanly");
     }
+
+    test_asset_pak(temporary.path());
 
     if (failures != 0) {
         std::cerr << failures << " cooked texture test(s) failed\n";

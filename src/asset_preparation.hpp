@@ -9,7 +9,9 @@
 #include <glm/vec3.hpp>
 #include <mutex>
 #include <span>
+#include <string>
 #include <thread>
+#include <vector>
 
 namespace vcr {
 inline constexpr std::size_t maximum_prepared_asset_bytes = 512ULL * 1024 * 1024;
@@ -38,6 +40,22 @@ struct PreparedModel {
 // entries live until renderer shutdown; masked base colors still decode for OMM.
 [[nodiscard]] PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,
     std::span<const std::string> resident_textures = {});
+
+struct BatchPreparedAssets {
+    std::vector<PreparedTexture> shared_textures{};
+    std::vector<PreparedAlphaMap> shared_alpha_maps{};
+    std::vector<PreparedModel> models{};
+};
+
+// Prepares a batch of models for cold scene loading using a bounded local
+// worker pool (running inline on the caller when model_paths.size() == 1).
+// Deduplicates shared textures and RT alpha maps across valid models in the
+// batch so each unique texture decodes at most once.
+[[nodiscard]] BatchPreparedAssets prepare_model_assets_batch(
+    const std::filesystem::path& root,
+    std::span<const std::string> model_paths,
+    std::span<const std::string> resident_textures = {},
+    std::span<const std::string> resident_rt_alpha_maps = {});
 
 // Precomputes CPU RGBA8 mipmap levels into `entry.mip_chain_rgba` and
 // `entry.mip_byte_offsets` when `base` has partial/cutout alpha (leaving fully

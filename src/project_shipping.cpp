@@ -1,8 +1,11 @@
 #include "project_system.hpp"
 
+#include "asset_pak.hpp"
+#include "asset_preparation.hpp"
 #include "cooked_audio_asset.hpp"
 #include "cooked_model_asset.hpp"
 #include "cooked_texture_asset.hpp"
+#include "model_lod.hpp"
 #include "texture_compression.hpp"
 #include "cutscene_sequencer.hpp"
 #include "game_overlay.hpp"
@@ -18,11 +21,16 @@
 #include <atomic>
 #include <chrono>
 #include <cwctype>
+#include <exception>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <system_error>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace vcr {
 namespace {
@@ -173,12 +181,424 @@ struct PendingTextureCook {
     Json doc{};
 };
 
+struct PendingModelCook {
+    std::filesystem::path rel{};
+    std::string name{};
+    Json doc{};
+};
+
+struct PendingMaterialEntry {
+    std::string key{};
+    Json doc{};
+};
+
+struct DiskMeshEntry {
+    std::filesystem::path source_path{};
+    std::string key{};
+};
+
+struct CookedModelOutput {
+    std::string json_key{};
+    std::vector<std::uint8_t> json_bytes{};
+    bool has_cooked_mesh = false;
+    std::string mesh_key{};
+    std::vector<std::uint8_t> mesh_bytes{};
+    std::vector<std::pair<std::string, float>> alpha_cutoffs{};
+};
+
+struct CookedTextureOutput {
+    std::string json_key{};
+    std::vector<std::uint8_t> json_bytes{};
+    std::string vcrtex_key{};
+    std::vector<std::uint8_t> vcrtex_bytes{};
+};
+
+class PakCacheInvalidator final {
+public:
+    explicit PakCacheInvalidator(std::filesystem::path root) noexcept
+        : root_(std::move(root)) {}
+    ~PakCacheInvalidator() noexcept {
+        if (!root_.empty()) {
+            invalidate_asset_pak_cache(root_);
+        }
+    }
+    PakCacheInvalidator(const PakCacheInvalidator&) = delete;
+    PakCacheInvalidator& operator=(const PakCacheInvalidator&) = delete;
+
+private:
+    std::filesystem::path root_{};
+};
+
+[[nodiscard]] std::vector<std::uint8_t> json_to_bytes(const Json& doc) {
+    const std::string text = doc.dump();
+    return std::vector<std::uint8_t>(text.begin(), text.end());
+}
+
+[[nodiscard]] bool read_binary_file_bytes(
+    const std::filesystem::path& file,
+    std::vector<std::uint8_t>& out_bytes,
+    std::string& error) {
+    std::error_code ec;
+    const std::uintmax_t size = std::filesystem::file_size(file, ec);
+    if (ec ||
+        size > (std::numeric_limits<std::size_t>::max)() ||
+        size > static_cast<std::uintmax_t>((std::numeric_limits<std::streamsize>::max)())) {
+        error = "Unable to query shipping mesh size: " + utf8(file);
+        return false;
+    }
+    out_bytes.resize(static_cast<std::size_t>(size));
+    std::ifstream stream(file, std::ios::binary);
+    if (!stream) {
+        error = "Unable to open shipping mesh: " + utf8(file);
+        return false;
+    }
+    if (!out_bytes.empty()) {
+        stream.read(
+            reinterpret_cast<char*>(out_bytes.data()),
+            static_cast<std::streamsize>(out_bytes.size()));
+    }
+    if (!stream || stream.peek() != std::ifstream::traits_type::eof()) {
+        error = "Unable to read complete shipping mesh: " + utf8(file);
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] bool is_safe_relative_asset_path(
+    const std::filesystem::path& relative) {
+    return !relative.empty() &&
+        !relative.has_root_path() &&
+        !relative.has_root_name() &&
+        !relative.has_root_directory() &&
+        std::ranges::none_of(
+            relative, [](const auto& part) { return part == ".."; });
+}
+
+void collect_model_references_in_json(
+    const Json& doc,
+    std::unordered_set<std::string>& out_models) {
+    if (doc.is_string()) {
+        const auto& str = doc.get_ref<const std::string&>();
+        if (str.ends_with(".vcrasset.json")) {
+            const std::filesystem::path rel = from_utf8(str);
+            if (is_safe_relative_asset_path(rel)) {
+                out_models.insert(utf8(rel.lexically_normal()));
+            }
+        }
+    } else if (doc.is_structured()) {
+        for (const auto& value : doc) {
+            collect_model_references_in_json(value, out_models);
+        }
+    }
+}
+
+[[nodiscard]] std::optional<std::string> resolve_model_mesh_key(
+    const PendingModelCook& item) {
+    const auto mesh_it = item.doc.find("mesh");
+    if (mesh_it == item.doc.end() || !mesh_it->is_string()) {
+        return std::nullopt;
+    }
+    const std::string& ref = mesh_it->get_ref<const std::string&>();
+    if (ref.empty()) {
+        return std::nullopt;
+    }
+    const std::filesystem::path authored = from_utf8(ref);
+    if (!is_safe_relative_asset_path(authored)) {
+        return std::nullopt;
+    }
+    return utf8((item.rel.parent_path() / authored).lexically_normal());
+}
+
+void repack_contiguous_lod0_indices(CookedModelAsset& model) {
+    std::uint64_t expected_first = 0U;
+    bool already_contiguous = true;
+    for (const CookedModelSubmesh& submesh : model.submeshes) {
+        if (submesh.first_index != expected_first ||
+            submesh.lod_first[0U] != expected_first ||
+            submesh.lod_count[0U] != submesh.index_count) {
+            already_contiguous = false;
+            break;
+        }
+        expected_first += submesh.index_count;
+    }
+    if (already_contiguous) {
+        return;
+    }
+    std::vector<std::uint32_t> packed;
+    packed.reserve(model.indices.size());
+    for (CookedModelSubmesh& submesh : model.submeshes) {
+        const auto new_first = static_cast<std::uint32_t>(packed.size());
+        const auto src_first = static_cast<std::size_t>(submesh.lod_first[0U]);
+        const auto src_count = static_cast<std::size_t>(submesh.lod_count[0U]);
+        packed.insert(
+            packed.end(),
+            model.indices.begin() + static_cast<std::ptrdiff_t>(src_first),
+            model.indices.begin() + static_cast<std::ptrdiff_t>(src_first + src_count));
+        submesh.lod_first[0U] = new_first;
+        submesh.first_index = new_first;
+        submesh.index_count = submesh.lod_count[0U];
+    }
+    for (std::size_t level = 1U; level < model_lod_count; ++level) {
+        for (CookedModelSubmesh& submesh : model.submeshes) {
+            const std::uint32_t count = submesh.lod_count[level];
+            if (count == 0U) {
+                submesh.lod_first[level] = submesh.lod_first[0U];
+                continue;
+            }
+            const auto new_first = static_cast<std::uint32_t>(packed.size());
+            const auto src_first = static_cast<std::size_t>(submesh.lod_first[level]);
+            const auto src_count = static_cast<std::size_t>(count);
+            packed.insert(
+                packed.end(),
+                model.indices.begin() + static_cast<std::ptrdiff_t>(src_first),
+                model.indices.begin() + static_cast<std::ptrdiff_t>(src_first + src_count));
+            submesh.lod_first[level] = new_first;
+        }
+    }
+    model.indices = std::move(packed);
+}
+
+[[nodiscard]] bool cook_exported_model(
+    const std::filesystem::path& root,
+    const PendingModelCook& item,
+    CookedModelOutput& out,
+    std::string& local_error) {
+    try {
+        auto loaded = load_cooked_model_asset(root, item.rel);
+        if (!loaded) {
+            local_error =
+                "Shipping model cook failed for '" + item.name + "': " +
+                loaded.error().message;
+            return false;
+        }
+        CookedModelAsset model = std::move(loaded).value();
+        for (const auto& material : model.materials) {
+            if ((material.coverage & material_coverage_alpha_mask_bit) == 0U ||
+                !material.base_color_texture.has_value()) {
+                continue;
+            }
+            const std::uint32_t packed_cutoff = material.coverage >> 16U;
+            const float cutoff = packed_cutoff > 0U
+                ? static_cast<float>(packed_cutoff) / 65535.0F
+                : 0.5F;
+            out.alpha_cutoffs.emplace_back(
+                utf8(material.base_color_texture->lexically_normal()),
+                cutoff);
+        }
+        if (model.is_skinned() || item.doc.contains("skeleton")) {
+            out.json_key = item.name;
+            out.json_bytes = json_to_bytes(item.doc);
+            out.has_cooked_mesh = false;
+            return true;
+        }
+
+        if (!model.prebaked_lods) {
+            if (model.lods.empty()) {
+                prepare_model_lods(model);
+            } else {
+                std::vector<CookedModelAsset> levels(model.lods.size());
+                std::size_t geometry_bytes =
+                    model.vertices.size() * sizeof(CookedModelVertex) +
+                    model.indices.size() * sizeof(std::uint32_t);
+                constexpr std::size_t geometry_budget =
+                    maximum_prepared_asset_bytes - 512U;
+                for (std::size_t lod_idx = 0U; lod_idx < levels.size(); ++lod_idx) {
+                    if (geometry_bytes > geometry_budget) {
+                        local_error =
+                            "Shipping model cook failed for '" + item.name +
+                            "': Authored LOD exceeds the 512 MiB geometry budget.";
+                        return false;
+                    }
+                    const std::size_t remaining = geometry_budget - geometry_bytes;
+                    CookedModelLoadOptions lod_options;
+                    lod_options.maximum_mesh_file_bytes = remaining;
+                    lod_options.maximum_vertices = (std::min)(
+                        lod_options.maximum_vertices,
+                        static_cast<std::uint64_t>(remaining / sizeof(CookedModelVertex)));
+                    lod_options.maximum_indices = (std::min)(
+                        lod_options.maximum_indices,
+                        static_cast<std::uint64_t>(remaining / sizeof(std::uint32_t)));
+                    auto lod = load_cooked_model_asset(
+                        root, model.lods[lod_idx].model, lod_options);
+                    if (!lod) {
+                        local_error =
+                            "Shipping model cook failed for '" + item.name +
+                            "': Authored LOD: " + lod.error().message;
+                        return false;
+                    }
+                    if (!lod->lods.empty()) {
+                        local_error =
+                            "Shipping model cook failed for '" + item.name +
+                            "': Authored LOD cannot reference further LODs.";
+                        return false;
+                    }
+                    geometry_bytes +=
+                        lod->vertices.size() * sizeof(CookedModelVertex) +
+                        lod->indices.size() * sizeof(std::uint32_t);
+                    levels[lod_idx] = std::move(lod).value();
+                }
+                prepare_authored_model_lods(model, levels, geometry_budget);
+            }
+            optimize_model_geometry(model);
+        }
+
+        repack_contiguous_lod0_indices(model);
+        std::string serialize_error;
+        if (!serialize_prebaked_vcrmesh_v2(model, out.mesh_bytes, serialize_error)) {
+            local_error =
+                "Shipping model serialize failed for '" + item.name + "': " +
+                serialize_error;
+            return false;
+        }
+
+        Json doc = item.doc;
+        doc["prebaked_lods"] = true;
+        doc["generate_lods"] = false;
+        doc.erase("lods");
+        doc["geometry"]["vertex_count"] = model.vertices.size();
+        doc["geometry"]["index_count"] = model.indices.size();
+
+        const auto materials_it = doc.find("materials");
+        if (materials_it == doc.end() || !materials_it->is_array()) {
+            local_error =
+                "Shipping model metadata missing materials array: " + item.name;
+            return false;
+        }
+        bool can_update_in_place =
+            doc.contains("submeshes") && doc["submeshes"].is_array() &&
+            doc["submeshes"].size() == model.submeshes.size();
+        if (can_update_in_place) {
+            for (std::size_t s = 0U; s < model.submeshes.size(); ++s) {
+                const Json& sub_doc = doc["submeshes"][s];
+                if (!sub_doc.is_object()) {
+                    can_update_in_place = false;
+                    break;
+                }
+                const auto mat_idx_it = sub_doc.find("material_index");
+                if (mat_idx_it == sub_doc.end()) {
+                    can_update_in_place = false;
+                    break;
+                }
+                std::uint64_t existing_mat_idx = 0U;
+                if (mat_idx_it->is_number_unsigned()) {
+                    existing_mat_idx = mat_idx_it->get<std::uint64_t>();
+                } else if (mat_idx_it->is_number_integer()) {
+                    const auto signed_val = mat_idx_it->get<std::int64_t>();
+                    if (signed_val < 0) {
+                        can_update_in_place = false;
+                        break;
+                    }
+                    existing_mat_idx = static_cast<std::uint64_t>(signed_val);
+                } else {
+                    can_update_in_place = false;
+                    break;
+                }
+                if (existing_mat_idx != model.submeshes[s].material_index) {
+                    can_update_in_place = false;
+                    break;
+                }
+            }
+        }
+        if (can_update_in_place) {
+            for (std::size_t s = 0U; s < model.submeshes.size(); ++s) {
+                doc["submeshes"][s]["first_index"] = model.submeshes[s].lod_first[0U];
+                doc["submeshes"][s]["index_count"] = model.submeshes[s].lod_count[0U];
+            }
+        } else {
+            Json new_submeshes = Json::array();
+            for (const CookedModelSubmesh& submesh : model.submeshes) {
+                if (submesh.material_index >= materials_it->size()) {
+                    local_error =
+                        "Shipping model submesh material index out of range: " + item.name;
+                    return false;
+                }
+                new_submeshes.push_back(Json{
+                    {"name", submesh.name},
+                    {"first_index", submesh.lod_first[0U]},
+                    {"index_count", submesh.lod_count[0U]},
+                    {"material_index", submesh.material_index},
+                    {"material", materials_it->at(submesh.material_index)},
+                });
+            }
+            doc["submeshes"] = std::move(new_submeshes);
+        }
+
+        out.json_key = item.name;
+        out.json_bytes = json_to_bytes(doc);
+        out.mesh_key = utf8(model.mesh_relative_path.lexically_normal());
+        out.has_cooked_mesh = true;
+        return true;
+    } catch (const std::exception& exception) {
+        local_error =
+            "Shipping model cook failed for '" + item.name + "': " +
+            exception.what();
+        return false;
+    }
+}
+
+template <typename Fn>
+[[nodiscard]] bool run_shipping_parallel(
+    const std::size_t item_count,
+    Fn&& fn,
+    std::string& error) {
+    if (item_count == 0U) {
+        return true;
+    }
+    const unsigned hw_threads = std::thread::hardware_concurrency();
+    const std::size_t worker_count = (std::min)(
+        item_count,
+        (std::max)(std::size_t{1U}, static_cast<std::size_t>(hw_threads == 0U ? 4U : hw_threads)));
+    if (worker_count <= 1U) {
+        std::string local_error;
+        for (std::size_t idx = 0U; idx < item_count; ++idx) {
+            if (!fn(idx, local_error)) {
+                error = std::move(local_error);
+                return false;
+            }
+        }
+        return true;
+    }
+    std::atomic<std::size_t> next_index{0U};
+    std::vector<std::string> worker_errors(worker_count);
+    {
+        std::vector<std::jthread> workers;
+        workers.reserve(worker_count);
+        for (std::size_t worker_id = 0U; worker_id < worker_count; ++worker_id) {
+            workers.emplace_back([&, worker_id]() {
+                std::string local_error;
+                for (;;) {
+                    const std::size_t idx =
+                        next_index.fetch_add(1U, std::memory_order_relaxed);
+                    if (idx >= item_count) {
+                        return;
+                    }
+                    if (!fn(idx, local_error)) {
+                        worker_errors[worker_id] = std::move(local_error);
+                        next_index.store(item_count, std::memory_order_relaxed);
+                        return;
+                    }
+                }
+            });
+        }
+    }
+    for (const auto& worker_err : worker_errors) {
+        if (!worker_err.empty()) {
+            error = worker_err;
+            return false;
+        }
+    }
+    return true;
+}
+
 [[nodiscard]] bool copy_game_content(
     const std::filesystem::path& root, const std::filesystem::path& target,
     std::size_t& textures, std::string& error) {
     std::size_t file_count = 0U;
     std::vector<PendingTextureCook> pending_textures;
-    std::vector<std::filesystem::path> models;
+    std::vector<PendingModelCook> pending_models;
+    std::vector<PendingMaterialEntry> pending_materials;
+    std::vector<DiskMeshEntry> disk_meshes;
+    std::unordered_set<std::string> directly_used_models;
     std::vector<std::filesystem::path> scenes;
     std::vector<std::filesystem::path> fonts;
     std::vector<std::filesystem::path> localizations;
@@ -196,10 +616,11 @@ struct PendingTextureCook {
         }
         if (!entry.is_regular_file()) continue;
         const auto rel = entry.path().lexically_relative(root);
-        const auto name = utf8(rel);
+        const auto name = utf8(rel.lexically_normal());
         const auto ext = utf8(rel.extension());
         const bool texture = name.ends_with(".vcrtexture.json");
         const bool model = name.ends_with(".vcrasset.json");
+        const bool material = name.ends_with(".vcrmaterial.json");
         const bool audio = name.ends_with(".vcraudio.json");
         const bool scene = *rel.begin() == "scenes" && ext == ".json";
         const bool config = *rel.begin() == "config" && ext == ".json";
@@ -212,10 +633,11 @@ struct PendingTextureCook {
         const bool navmesh = name.ends_with(".vcrnav.json");
         const bool behavior_tree = name.ends_with(".vcrbt.json");
         const bool font = name.ends_with(".vcrfont.json");
-        const bool typed_asset_metadata = texture || model || audio || scene ||
+        const bool prefab = name.ends_with(".vcrprefab.json") ||
+            (*rel.begin() == "prefabs" && ext == ".json");
+        const bool typed_asset_metadata = texture || model || material || audio || scene ||
             localization || dialogue || cutscene || navmesh ||
-            behavior_tree || font ||
-            name.ends_with(".vcrmaterial.json") || name.ends_with(".vcrprefab.json") ||
+            behavior_tree || font || prefab ||
             name.ends_with(".vcrcue.json");
         const bool metadata = typed_asset_metadata || config;
         if (ext == ".wav" || ext == ".ogg" || ext == ".flac") {
@@ -227,8 +649,13 @@ struct PendingTextureCook {
                 return false;
             }
             copy_runtime_file(entry.path(), target / rel);
-        } else if (ext == ".vcrmesh" || ext == ".vcrskin" || ext == ".vcranim") {
+        } else if (ext == ".vcrskin" || ext == ".vcranim") {
             copy_runtime_file(entry.path(), target / rel);
+        } else if (ext == ".vcrmesh") {
+            disk_meshes.push_back(DiskMeshEntry{
+                .source_path = entry.path(),
+                .key = name,
+            });
         } else if (metadata) {
             Json doc;
             if (!read_json(entry.path(), doc, error, config && !typed_asset_metadata)) {
@@ -244,6 +671,25 @@ struct PendingTextureCook {
                 pending_textures.push_back(PendingTextureCook{
                     .rel = rel,
                     .name = name,
+                    .doc = std::move(doc),
+                });
+                continue;
+            } else if (model) {
+                if (doc.is_object()) {
+                    doc.erase("source");
+                }
+                pending_models.push_back(PendingModelCook{
+                    .rel = rel,
+                    .name = name,
+                    .doc = std::move(doc),
+                });
+                continue;
+            } else if (material) {
+                if (doc.is_object()) {
+                    doc.erase("source");
+                }
+                pending_materials.push_back(PendingMaterialEntry{
+                    .key = name,
                     .doc = std::move(doc),
                 });
                 continue;
@@ -293,131 +739,244 @@ struct PendingTextureCook {
                 if (!regular_unlinked_file(root, img_rel, error)) return false;
                 copy_runtime_file(root / img_rel, target / img_rel);
                 fonts.push_back(rel);
-            } else if (scene || config || name.ends_with(".vcrcue.json") ||
-                       name.ends_with(".vcrprefab.json")) {
+            } else if (scene || config || name.ends_with(".vcrcue.json") || prefab) {
                 if (!copy_audio_references(doc, root, target, error)) return false;
+                if (prefab) {
+                    collect_model_references_in_json(doc, directly_used_models);
+                }
             } else {
                 doc.erase("source");
             }
             if (!write_json(target / rel, doc, error)) return false;
-            if (model) models.push_back(rel);
             if (scene) scenes.push_back(rel);
         }
     }
+
+    for (const auto& scene : scenes) {
+        SceneDocument loaded;
+        if (!load_scene_file(target / scene, loaded, error)) return false;
+        std::vector<SceneNodeRecord> nodes;
+        loaded.build_node_records(nodes);
+        for (const auto& node : nodes) {
+            if (node.value.kind == SceneNodeKind::model && !node.value.asset_path.empty()) {
+                const std::filesystem::path asset_rel = from_utf8(node.value.asset_path);
+                if (is_safe_relative_asset_path(asset_rel)) {
+                    directly_used_models.insert(utf8(asset_rel.lexically_normal()));
+                }
+            }
+        }
+    }
+
+    std::unordered_set<std::string> non_skinned_lod_children;
+    std::unordered_set<std::string> skinned_lod_children;
+    for (const auto& item : pending_models) {
+        const bool has_skeleton = item.doc.contains("skeleton");
+        const auto lods_it = item.doc.find("lods");
+        if (lods_it == item.doc.end() || !lods_it->is_array()) {
+            continue;
+        }
+        for (const auto& lod : *lods_it) {
+            if (!lod.is_object()) continue;
+            const auto model_it = lod.find("model");
+            if (model_it == lod.end() || !model_it->is_string()) continue;
+            const std::string& ref = model_it->get_ref<const std::string&>();
+            if (ref.empty()) continue;
+            const std::filesystem::path lod_rel = from_utf8(ref);
+            if (!is_safe_relative_asset_path(lod_rel)) continue;
+            const std::string lod_key = utf8(lod_rel.lexically_normal());
+            if (has_skeleton) {
+                skinned_lod_children.insert(lod_key);
+            } else {
+                non_skinned_lod_children.insert(lod_key);
+            }
+        }
+    }
+
+    std::unordered_set<std::string> derivative_only_lods;
+    for (const std::string& child_key : non_skinned_lod_children) {
+        if (!directly_used_models.contains(child_key) &&
+            !skinned_lod_children.contains(child_key)) {
+            derivative_only_lods.insert(child_key);
+        }
+    }
+
+    std::vector<PendingModelCook> exported_models;
+    exported_models.reserve(pending_models.size());
+    std::unordered_set<std::string> exported_mesh_keys;
+    std::unordered_set<std::string> candidate_excluded_mesh_keys;
+    for (auto& item : pending_models) {
+        if (derivative_only_lods.contains(item.name)) {
+            if (auto mesh_key = resolve_model_mesh_key(item)) {
+                candidate_excluded_mesh_keys.insert(std::move(*mesh_key));
+            }
+        } else {
+            if (auto mesh_key = resolve_model_mesh_key(item)) {
+                exported_mesh_keys.insert(std::move(*mesh_key));
+            }
+            exported_models.push_back(std::move(item));
+        }
+    }
+    std::unordered_set<std::string> excluded_mesh_keys;
+    for (const std::string& mesh_key : candidate_excluded_mesh_keys) {
+        if (!exported_mesh_keys.contains(mesh_key)) {
+            excluded_mesh_keys.insert(mesh_key);
+        }
+    }
+
+    std::vector<CookedModelOutput> cooked_models(exported_models.size());
+    if (!run_shipping_parallel(
+            exported_models.size(),
+            [&](const std::size_t idx, std::string& local_error) {
+                return cook_exported_model(
+                    root, exported_models[idx], cooked_models[idx], local_error);
+            },
+            error)) {
+        return false;
+    }
+
+    std::unordered_map<std::string, float> alpha_cutoffs;
+    for (const auto& cooked_out : cooked_models) {
+        for (const auto& [tex_key, cutoff] : cooked_out.alpha_cutoffs) {
+            const auto [it, inserted] = alpha_cutoffs.try_emplace(tex_key, cutoff);
+            if (!inserted) {
+                it->second = (std::min)(it->second, cutoff);
+            }
+        }
+    }
+
+    std::vector<CookedTextureOutput> cooked_textures(pending_textures.size());
     if (!pending_textures.empty()) {
-        std::unordered_map<std::string, float> alpha_cutoffs;
-        for (const auto& model : models) {
-            const auto loaded = load_cooked_model_asset(root, model);
-            if (!loaded) {
-                continue;
-            }
-            for (const auto& material : loaded->materials) {
-                if ((material.coverage & material_coverage_alpha_mask_bit) == 0U ||
-                    !material.base_color_texture.has_value()) {
-                    continue;
-                }
-                const std::uint32_t packed_cutoff = material.coverage >> 16U;
-                const float cutoff = packed_cutoff > 0U
-                    ? static_cast<float>(packed_cutoff) / 65535.0F
-                    : 0.5F;
-                const auto key = material.base_color_texture->lexically_normal().generic_string();
-                const auto [it, inserted] = alpha_cutoffs.try_emplace(key, cutoff);
-                if (!inserted) {
-                    it->second = std::min(it->second, cutoff);
-                }
-            }
-        }
-        // Create all texture target directories before worker threads run so
-        // concurrent writes never race on directory creation.
-        for (const auto& item : pending_textures) {
-            std::filesystem::create_directories((target / item.rel).parent_path());
-        }
-        const unsigned hw_threads = std::thread::hardware_concurrency();
-        const std::size_t worker_count = std::min<std::size_t>(
-            pending_textures.size(),
-            std::max<std::size_t>(1U, hw_threads == 0U ? 4U : hw_threads));
-        std::atomic<std::size_t> next_index{0U};
-        std::vector<std::string> worker_errors(worker_count);
-        {
-            std::vector<std::jthread> workers;
-            workers.reserve(worker_count);
-            for (std::size_t worker_id = 0U; worker_id < worker_count; ++worker_id) {
-                workers.emplace_back([&, worker_id]() {
-                    std::vector<std::uint8_t> vcrtex_bytes;
-                    std::string local_error;
-                    for (;;) {
-                        const std::size_t idx = next_index.fetch_add(1U, std::memory_order_relaxed);
-                        if (idx >= pending_textures.size()) {
-                            return;
-                        }
-                        const auto& item = pending_textures[idx];
-                        const auto cooked = load_cooked_texture_asset(root, item.rel);
-                        if (!cooked) {
-                            worker_errors[worker_id] =
-                                "Texture cook failed for '" + item.name + "': " + cooked.error().message;
-                            next_index.store(pending_textures.size(), std::memory_order_relaxed);
-                            return;
-                        }
-                        const auto tex_key = item.rel.lexically_normal().generic_string();
-                        const auto cutoff_it = alpha_cutoffs.find(tex_key);
-                        const float alpha_cutoff =
-                            cutoff_it != alpha_cutoffs.end() ? cutoff_it->second : 0.0F;
-                        const CookedTexturePixelFormat target_format =
-                            select_shipped_texture_format(cooked->semantic);
-                        std::uint32_t mip_levels = 0U;
-                        if (!cook_texture_to_vcrtex(
-                                *cooked,
-                                alpha_cutoff,
-                                target_format,
-                                vcrtex_bytes,
-                                mip_levels,
-                                local_error)) {
-                            worker_errors[worker_id] =
-                                "Texture cook failed for '" + item.name + "': " + local_error;
-                            next_index.store(pending_textures.size(), std::memory_order_relaxed);
-                            return;
-                        }
-                        auto payload = item.rel;
-                        payload += ".vcrtex";
-                        auto package = item.rel.parent_path();
-                        if (package.filename() == "textures") package = package.parent_path();
-                        Json doc = item.doc;
-                        doc["source"] = utf8(payload.lexically_relative(package));
-                        doc.erase("decode");
-                        doc["storage"] = target_format == CookedTexturePixelFormat::bc4_unorm
-                            ? "bc4"
-                            : "bc7";
-                        doc["dimensions"] = {cooked->width, cooked->height};
-                        doc["mip_levels"] = mip_levels;
-                        if (!write_bytes(target / payload,
-                                reinterpret_cast<const char*>(vcrtex_bytes.data()),
-                                vcrtex_bytes.size(), local_error) ||
-                            !write_json(target / item.rel, doc, local_error)) {
-                            worker_errors[worker_id] = std::move(local_error);
-                            next_index.store(pending_textures.size(), std::memory_order_relaxed);
-                            return;
-                        }
+        if (!run_shipping_parallel(
+                pending_textures.size(),
+                [&](const std::size_t idx, std::string& local_error) {
+                    const auto& item = pending_textures[idx];
+                    const auto cooked = load_cooked_texture_asset(root, item.rel);
+                    if (!cooked) {
+                        local_error =
+                            "Texture cook failed for '" + item.name + "': " +
+                            cooked.error().message;
+                        return false;
                     }
-                });
-            }
-        }
-        for (const auto& worker_err : worker_errors) {
-            if (!worker_err.empty()) {
-                error = worker_err;
-                return false;
-            }
+                    const auto tex_key = utf8(item.rel.lexically_normal());
+                    const auto cutoff_it = alpha_cutoffs.find(tex_key);
+                    const float alpha_cutoff =
+                        cutoff_it != alpha_cutoffs.end() ? cutoff_it->second : 0.0F;
+                    const CookedTexturePixelFormat target_format =
+                        select_shipped_texture_format(cooked->semantic);
+                    std::uint32_t mip_levels = 0U;
+                    CookedTextureOutput& out = cooked_textures[idx];
+                    if (!cook_texture_to_vcrtex(
+                            *cooked,
+                            alpha_cutoff,
+                            target_format,
+                            out.vcrtex_bytes,
+                            mip_levels,
+                            local_error)) {
+                        local_error =
+                            "Texture cook failed for '" + item.name + "': " + local_error;
+                        return false;
+                    }
+                    auto payload = item.rel;
+                    payload += ".vcrtex";
+                    auto package = item.rel.parent_path();
+                    if (package.filename() == "textures") {
+                        package = package.parent_path();
+                    }
+                    const std::filesystem::path source_rel =
+                        package.empty() ? payload : payload.lexically_relative(package);
+                    Json doc = item.doc;
+                    doc["source"] = utf8(source_rel);
+                    doc.erase("decode");
+                    doc["storage"] = target_format == CookedTexturePixelFormat::bc4_unorm
+                        ? "bc4"
+                        : "bc7";
+                    doc["dimensions"] = {cooked->width, cooked->height};
+                    doc["mip_levels"] = mip_levels;
+                    out.json_key = tex_key;
+                    out.json_bytes = json_to_bytes(doc);
+                    out.vcrtex_key = utf8(payload.lexically_normal());
+                    return true;
+                },
+                error)) {
+            return false;
         }
         textures += pending_textures.size();
     }
+
+    AssetPakWriter pak_writer;
+    for (const auto& mat : pending_materials) {
+        if (!pak_writer.add_entry(mat.key, json_to_bytes(mat.doc), error)) {
+            return false;
+        }
+    }
+    for (auto& tex_out : cooked_textures) {
+        if (!pak_writer.add_entry(
+                std::move(tex_out.json_key), std::move(tex_out.json_bytes), error) ||
+            !pak_writer.add_entry(
+                std::move(tex_out.vcrtex_key), std::move(tex_out.vcrtex_bytes), error)) {
+            return false;
+        }
+    }
+    std::unordered_map<std::string, std::vector<std::uint8_t>> emitted_cooked_meshes;
+    for (auto& model_out : cooked_models) {
+        if (!pak_writer.add_entry(
+                std::move(model_out.json_key), std::move(model_out.json_bytes), error)) {
+            return false;
+        }
+        if (model_out.has_cooked_mesh) {
+            const auto [existing_it, inserted] = emitted_cooked_meshes.try_emplace(
+                model_out.mesh_key, model_out.mesh_bytes);
+            if (inserted) {
+                if (!pak_writer.add_entry(
+                        std::move(model_out.mesh_key),
+                        std::move(model_out.mesh_bytes),
+                        error)) {
+                    return false;
+                }
+            } else if (existing_it->second != model_out.mesh_bytes) {
+                error =
+                    "Multiple exported models produce conflicting cooked meshes for '" +
+                    model_out.mesh_key + "'.";
+                return false;
+            }
+        }
+    }
+    for (const auto& disk_mesh : disk_meshes) {
+        if (emitted_cooked_meshes.contains(disk_mesh.key) ||
+            excluded_mesh_keys.contains(disk_mesh.key)) {
+            continue;
+        }
+        std::vector<std::uint8_t> mesh_bytes;
+        if (!read_binary_file_bytes(disk_mesh.source_path, mesh_bytes, error)) {
+            return false;
+        }
+        if (!pak_writer.add_entry(disk_mesh.key, std::move(mesh_bytes), error)) {
+            return false;
+        }
+    }
+
+    if (!pak_writer.write_to_file(target / default_asset_pak_filename, error)) {
+        return false;
+    }
+    invalidate_asset_pak_cache(target);
+    const PakCacheInvalidator target_pak_guard(target);
+
     // Validate against exported content, so accidentally excluded dependencies
     // cannot be satisfied by files left in the authoring project.
-    for (const auto& model : models) {
-        const auto loaded = load_cooked_model_asset(target, model);
+    for (const auto& model : exported_models) {
+        const auto loaded = load_cooked_model_asset(target, model.rel);
         if (!loaded) {
-            error = "Shipping model validation failed for '" + utf8(model) + "': " +
+            error = "Shipping model validation failed for '" + model.name + "': " +
                 loaded.error().message;
             return false;
         }
+    }
+    std::error_code canon_ec;
+    const std::filesystem::path canonical_target =
+        std::filesystem::weakly_canonical(target, canon_ec);
+    if (canon_ec || canonical_target.empty()) {
+        error = "Unable to canonicalize shipping assets directory: " + utf8(target);
+        return false;
     }
     for (const auto& scene : scenes) {
         SceneDocument loaded;
@@ -425,8 +984,18 @@ struct PendingTextureCook {
         std::vector<SceneNodeRecord> nodes;
         loaded.build_node_records(nodes);
         for (const auto& node : nodes) {
-            if (node.value.kind == SceneNodeKind::model &&
-                !regular_unlinked_file(target, from_utf8(node.value.asset_path), error)) return false;
+            if (node.value.kind == SceneNodeKind::model) {
+                const std::filesystem::path asset_rel = from_utf8(node.value.asset_path);
+                const std::string normalized_asset_path =
+                    utf8(asset_rel.lexically_normal());
+                const bool in_pak =
+                    is_safe_relative_asset_path(asset_rel) &&
+                    asset_pak_contains(canonical_target, normalized_asset_path);
+                if (!in_pak &&
+                    !regular_unlinked_file(target, asset_rel, error)) {
+                    return false;
+                }
+            }
             if (node.npc_ai.has_value()) {
                 const std::string_view bt_path =
                     node.npc_ai->behavior_tree_path_view();
@@ -583,7 +1152,9 @@ bool ship_project(
         SceneDocument startup;
         if (!load_scene_file(staging_path / "assets" / from_utf8(manifest.startup_scene), startup, error)) return false;
         const auto executable_name = bundled.executable_path.filename();
+        invalidate_asset_pak_cache(staging_path / "assets");
         staging.publish(destination);
+        invalidate_asset_pak_cache(destination / "assets");
         output.output_directory = destination;
         output.executable_path = destination / executable_name;
         output.cooked_textures = textures;

@@ -1,4 +1,5 @@
 #include "cooked_texture_asset.hpp"
+#include "asset_pak.hpp"
 #include "texture_compression.hpp"
 
 #include <ImfRgbaFile.h>
@@ -19,6 +20,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -252,28 +254,126 @@ read_file(
     return std::nullopt;
 }
 
+[[nodiscard]] std::string path_to_generic_utf8(
+    const std::filesystem::path& path) {
+    const std::u8string text = path.generic_u8string();
+    return std::string(text.begin(), text.end());
+}
+
+[[nodiscard]] std::filesystem::path path_from_utf8(
+    const std::string_view text) {
+    return std::filesystem::path(
+        std::u8string(text.begin(), text.end()));
+}
+
+[[nodiscard]] CookedTextureLoadError map_pak_error(
+    const AssetPakReadStatus status,
+    std::string message,
+    const std::filesystem::path& path) {
+    CookedTextureLoadErrorCode code = CookedTextureLoadErrorCode::io_error;
+    switch (status) {
+        case AssetPakReadStatus::symbolic_link:
+            code = CookedTextureLoadErrorCode::symbolic_link;
+            break;
+        case AssetPakReadStatus::file_too_large:
+            code = CookedTextureLoadErrorCode::file_too_large;
+            break;
+        case AssetPakReadStatus::io_error:
+        case AssetPakReadStatus::invalid_archive:
+            code = CookedTextureLoadErrorCode::io_error;
+            break;
+        case AssetPakReadStatus::not_found:
+            code = CookedTextureLoadErrorCode::file_not_found;
+            break;
+        case AssetPakReadStatus::ok:
+            code = CookedTextureLoadErrorCode::io_error;
+            break;
+    }
+    return CookedTextureLoadError{
+        .code = code,
+        .message = std::move(message),
+        .path = path,
+    };
+}
+
 [[nodiscard]] std::optional<CookedTextureLoadError>
-read_metadata(
-    const ResolvedAssetFile& file,
-    Json& output) {
-    std::vector<std::uint8_t> bytes;
-    if (auto error = read_file(file, bytes)) {
+read_asset_bytes_pak_or_disk(
+    const std::filesystem::path& canonical_root,
+    const std::filesystem::path& relative_path,
+    const std::uintmax_t maximum_bytes,
+    std::vector<std::uint8_t>& out_bytes,
+    std::filesystem::path& out_normalized_relative,
+    std::filesystem::path& out_diagnostic_path) {
+    if (path_escapes_root(relative_path)) {
+        return CookedTextureLoadError{
+            .code = CookedTextureLoadErrorCode::invalid_path,
+            .message = "Texture asset reference escapes the asset root.",
+            .path = relative_path,
+        };
+    }
+
+    const std::filesystem::path normalized = relative_path.lexically_normal();
+    const std::string pak_key = path_to_generic_utf8(normalized);
+    std::string pak_error;
+    const AssetPakReadStatus pak_status = try_read_asset_pak_file(
+        canonical_root,
+        pak_key,
+        maximum_bytes,
+        out_bytes,
+        &pak_error);
+    if (pak_status == AssetPakReadStatus::ok) {
+        out_normalized_relative = normalized;
+        out_diagnostic_path = canonical_root / normalized;
+        return std::nullopt;
+    }
+    if (pak_status != AssetPakReadStatus::not_found) {
+        const std::filesystem::path diag_path =
+            pak_status == AssetPakReadStatus::file_too_large
+            ? (canonical_root / normalized)
+            : (canonical_root / default_asset_pak_filename);
+        return map_pak_error(
+            pak_status,
+            pak_error.empty()
+                ? "Unable to read packed texture asset."
+                : std::move(pak_error),
+            diag_path);
+    }
+
+    ResolvedAssetFile resolved;
+    if (auto error = resolve_asset_file(
+            canonical_root,
+            relative_path,
+            maximum_bytes,
+            resolved)) {
         return error;
     }
+    if (auto error = read_file(resolved, out_bytes)) {
+        return error;
+    }
+    out_normalized_relative = std::move(resolved.relative);
+    out_diagnostic_path = std::move(resolved.absolute);
+    return std::nullopt;
+}
+
+[[nodiscard]] std::optional<CookedTextureLoadError>
+parse_metadata_bytes(
+    const std::vector<std::uint8_t>& bytes,
+    const std::filesystem::path& diagnostic_path,
+    Json& output) {
     try {
         output = Json::parse(bytes.begin(), bytes.end());
     } catch (const Json::exception&) {
         return CookedTextureLoadError{
             .code = CookedTextureLoadErrorCode::invalid_json,
             .message = "Texture metadata is not valid JSON.",
-            .path = file.absolute,
+            .path = diagnostic_path,
         };
     }
     if (!output.is_object()) {
         return CookedTextureLoadError{
             .code = CookedTextureLoadErrorCode::invalid_json,
             .message = "Texture metadata root must be an object.",
-            .path = file.absolute,
+            .path = diagnostic_path,
         };
     }
     return std::nullopt;
@@ -440,21 +540,18 @@ parse_color_space(const std::string_view value) {
         working_bytes <= options.maximum_working_bytes;
 }
 
-[[nodiscard]] CookedTextureLoadResult decode_stbi(
+[[nodiscard]] CookedTextureLoadResult decode_stbi_bytes(
     CookedTextureAsset asset,
-    const ResolvedAssetFile& source,
+    const std::span<const std::uint8_t> encoded,
+    const std::filesystem::path& diagnostic_path,
     const CookedTextureLoadOptions& options) {
-    if (source.size >
+    if (static_cast<std::uintmax_t>(encoded.size()) >
         static_cast<std::uintmax_t>(
             std::numeric_limits<int>::max())) {
         return fail(
             CookedTextureLoadErrorCode::file_too_large,
             "JPEG/PNG source is too large for the pinned decoder.",
-            source.absolute);
-    }
-    std::vector<std::uint8_t> encoded;
-    if (auto error = read_file(source, encoded)) {
-        return CookedTextureLoadResult(std::move(*error));
+            diagnostic_path);
     }
     int decoded_width = 0;
     int decoded_height = 0;
@@ -469,7 +566,7 @@ parse_color_space(const std::string_view value) {
         return fail(
             CookedTextureLoadErrorCode::decode_failed,
             "JPEG/PNG header is invalid or unsupported.",
-            source.absolute);
+            diagnostic_path);
     }
     std::uint64_t pixel_count = 0U;
     std::uint64_t output_bytes = 0U;
@@ -483,20 +580,20 @@ parse_color_space(const std::string_view value) {
         return fail(
             CookedTextureLoadErrorCode::limit_exceeded,
             "Decoded JPEG/PNG dimensions exceed configured limits.",
-            source.absolute);
+            diagnostic_path);
     }
     std::uint64_t double_output_bytes = 0U;
     std::uint64_t peak_working_bytes = 0U;
     if (!checked_multiply(output_bytes, 2U, double_output_bytes) ||
         !checked_add(
             double_output_bytes,
-            static_cast<std::uint64_t>(source.size),
+            static_cast<std::uint64_t>(encoded.size()),
             peak_working_bytes) ||
         peak_working_bytes > options.maximum_working_bytes) {
         return fail(
             CookedTextureLoadErrorCode::limit_exceeded,
             "Encoded and decoded JPEG/PNG storage exceeds configured limits.",
-            source.absolute);
+            diagnostic_path);
     }
 
     const int expected_width = decoded_width;
@@ -515,14 +612,14 @@ parse_color_space(const std::string_view value) {
             reason != nullptr
                 ? "Unable to decode JPEG/PNG: " + std::string(reason)
                 : "Unable to decode JPEG/PNG.",
-            source.absolute);
+            diagnostic_path);
     }
     if (decoded_width != expected_width ||
         decoded_height != expected_height) {
         return fail(
             CookedTextureLoadErrorCode::decode_failed,
             "JPEG/PNG dimensions changed during decode.",
-            source.absolute);
+            diagnostic_path);
     }
     asset.width = static_cast<std::uint32_t>(decoded_width);
     asset.height = static_cast<std::uint32_t>(decoded_height);
@@ -533,11 +630,12 @@ parse_color_space(const std::string_view value) {
     return CookedTextureLoadResult(std::move(asset));
 }
 
-[[nodiscard]] CookedTextureLoadResult decode_raw_rgba8(
+[[nodiscard]] CookedTextureLoadResult decode_raw_rgba8_bytes(
     CookedTextureAsset asset,
-    const ResolvedAssetFile& source,
+    std::vector<std::uint8_t> source_bytes,
     const std::uint64_t width,
     const std::uint64_t height,
+    const std::filesystem::path& diagnostic_path,
     const CookedTextureLoadOptions& options) {
     std::uint64_t pixel_count = 0U;
     std::uint64_t output_bytes = 0U;
@@ -551,17 +649,15 @@ parse_color_space(const std::string_view value) {
         return fail(
             CookedTextureLoadErrorCode::limit_exceeded,
             "Raw RGBA8 dimensions exceed configured limits.",
-            source.absolute);
+            diagnostic_path);
     }
-    if (source.size != output_bytes) {
+    if (static_cast<std::uint64_t>(source_bytes.size()) != output_bytes) {
         return fail(
             CookedTextureLoadErrorCode::decode_failed,
             "Raw RGBA8 byte count does not match its dimensions.",
-            source.absolute);
+            diagnostic_path);
     }
-    if (auto error = read_file(source, asset.pixels)) {
-        return CookedTextureLoadResult(std::move(*error));
-    }
+    asset.pixels = std::move(source_bytes);
     asset.width = static_cast<std::uint32_t>(width);
     asset.height = static_cast<std::uint32_t>(height);
     asset.row_stride_bytes = asset.width * 4U;
@@ -754,16 +850,20 @@ parse_color_space(const std::string_view value) {
             validate_asset_root(asset_root, canonical_root)) {
         return CookedTextureLoadResult(std::move(*error));
     }
-    ResolvedAssetFile metadata_file;
-    if (auto error = resolve_asset_file(
+    std::vector<std::uint8_t> metadata_bytes;
+    std::filesystem::path metadata_relative;
+    std::filesystem::path metadata_diag_path;
+    if (auto error = read_asset_bytes_pak_or_disk(
             canonical_root,
             texture_metadata_relative_path,
             options.maximum_metadata_bytes,
-            metadata_file)) {
+            metadata_bytes,
+            metadata_relative,
+            metadata_diag_path)) {
         return CookedTextureLoadResult(std::move(*error));
     }
     const std::string metadata_filename =
-        metadata_file.relative.filename().string();
+        metadata_relative.filename().string();
     constexpr std::string_view metadata_suffix =
         ".vcrtexture.json";
     if (metadata_filename.size() <= metadata_suffix.size() ||
@@ -774,18 +874,19 @@ parse_color_space(const std::string_view value) {
         return fail(
             CookedTextureLoadErrorCode::invalid_path,
             "Texture metadata must use .vcrtexture.json.",
-            metadata_file.relative);
+            metadata_relative);
     }
 
     Json metadata;
-    if (auto error = read_metadata(metadata_file, metadata)) {
+    if (auto error = parse_metadata_bytes(
+            metadata_bytes, metadata_diag_path, metadata)) {
         return CookedTextureLoadResult(std::move(*error));
     }
     if (!validate_common_metadata(metadata)) {
         return fail(
             CookedTextureLoadErrorCode::unsupported_schema,
             "Texture metadata schema, version, or kind is invalid.",
-            metadata_file.absolute);
+            metadata_diag_path);
     }
 
     std::string name;
@@ -804,7 +905,7 @@ parse_color_space(const std::string_view value) {
         return fail(
             CookedTextureLoadErrorCode::invalid_json,
             "Texture metadata fields are missing or invalid.",
-            metadata_file.absolute);
+            metadata_diag_path);
     }
 
     std::string decode;
@@ -818,12 +919,11 @@ parse_color_space(const std::string_view value) {
     const bool compressed_bc4 = has_storage && storage == "bc4";
     const bool cooked_storage = raw_rgba8 || compressed_bc7 || compressed_bc4;
 
-
     if (deferred == cooked_storage || (has_storage && !cooked_storage)) {
         return fail(
             CookedTextureLoadErrorCode::unsupported_schema,
             "Texture metadata must select deferred decode, raw RGBA8, or BC7/BC4 storage.",
-            metadata_file.absolute);
+            metadata_diag_path);
     }
     const auto semantic = parse_semantic(usage);
     const auto parsed_color_space = parse_color_space(color_space);
@@ -831,7 +931,7 @@ parse_color_space(const std::string_view value) {
         return fail(
             CookedTextureLoadErrorCode::unsupported_schema,
             "Texture usage or color space is unsupported.",
-            metadata_file.absolute);
+            metadata_diag_path);
     }
     if ((*semantic == CookedTextureSemantic::base_color ||
          *semantic == CookedTextureSemantic::emissive) &&
@@ -839,7 +939,7 @@ parse_color_space(const std::string_view value) {
         return fail(
             CookedTextureLoadErrorCode::unsupported_schema,
             "Color textures must declare the sRGB color space.",
-            metadata_file.absolute);
+            metadata_diag_path);
     }
     if (*semantic != CookedTextureSemantic::unspecified &&
         *semantic != CookedTextureSemantic::base_color &&
@@ -848,10 +948,11 @@ parse_color_space(const std::string_view value) {
         return fail(
             CookedTextureLoadErrorCode::unsupported_schema,
             "Data textures must declare the linear color space.",
-            metadata_file.absolute);
+            metadata_diag_path);
     }
 
-    const std::filesystem::path authored_source(source_reference);
+    const std::filesystem::path authored_source =
+        path_from_utf8(source_reference);
     if (path_escapes_root(authored_source)) {
         return fail(
             CookedTextureLoadErrorCode::invalid_path,
@@ -859,47 +960,80 @@ parse_color_space(const std::string_view value) {
             authored_source);
     }
     std::filesystem::path package_directory =
-        metadata_file.relative.parent_path();
+        metadata_relative.parent_path();
     if (package_directory.filename() == "textures") {
         package_directory = package_directory.parent_path();
     }
     const std::filesystem::path source_relative =
         (package_directory / authored_source).lexically_normal();
-    ResolvedAssetFile source_file;
-    if (auto error = resolve_asset_file(
-            canonical_root,
-            source_relative,
-            options.maximum_source_file_bytes,
-            source_file)) {
-        return CookedTextureLoadResult(std::move(*error));
-    }
-
-    CookedTextureAsset asset{
-        .metadata_relative_path = metadata_file.relative,
-        .source_relative_path = source_file.relative,
-        .name = std::move(name),
-        .semantic = *semantic,
-        .color_space = *parsed_color_space,
-    };
     const std::string extension =
-        lowercase_extension(source_file.relative);
-    if (compressed_bc7 || compressed_bc4) {
-        if (extension != ".vcrtex") {
+        lowercase_extension(source_relative);
+
+    if (extension == ".exr") {
+        ResolvedAssetFile source_file;
+        if (auto error = resolve_asset_file(
+                canonical_root,
+                source_relative,
+                options.maximum_source_file_bytes,
+                source_file)) {
+            return CookedTextureLoadResult(std::move(*error));
+        }
+        if (compressed_bc7 || compressed_bc4) {
             return fail(
                 CookedTextureLoadErrorCode::unsupported_format,
                 "Compressed BC7/BC4 textures must reference a .vcrtex file.",
                 source_file.relative);
         }
-        std::vector<std::uint8_t> file_bytes;
-        if (auto error = read_file(source_file, file_bytes)) {
-            return CookedTextureLoadResult(std::move(*error));
+        if (raw_rgba8) {
+            return fail(
+                CookedTextureLoadErrorCode::invalid_json,
+                "Raw RGBA8 texture dimensions or source extension is invalid.",
+                metadata_diag_path);
+        }
+        CookedTextureAsset asset{
+            .metadata_relative_path = metadata_relative,
+            .source_relative_path = source_file.relative,
+            .name = std::move(name),
+            .semantic = *semantic,
+            .color_space = *parsed_color_space,
+        };
+        return decode_exr(
+            std::move(asset), source_file, options);
+    }
+
+    std::vector<std::uint8_t> source_bytes;
+    std::filesystem::path resolved_source_relative;
+    std::filesystem::path source_diag_path;
+    if (auto error = read_asset_bytes_pak_or_disk(
+            canonical_root,
+            source_relative,
+            options.maximum_source_file_bytes,
+            source_bytes,
+            resolved_source_relative,
+            source_diag_path)) {
+        return CookedTextureLoadResult(std::move(*error));
+    }
+
+    CookedTextureAsset asset{
+        .metadata_relative_path = metadata_relative,
+        .source_relative_path = resolved_source_relative,
+        .name = std::move(name),
+        .semantic = *semantic,
+        .color_space = *parsed_color_space,
+    };
+    if (compressed_bc7 || compressed_bc4) {
+        if (extension != ".vcrtex") {
+            return fail(
+                CookedTextureLoadErrorCode::unsupported_format,
+                "Compressed BC7/BC4 textures must reference a .vcrtex file.",
+                resolved_source_relative);
         }
         const CookedTexturePixelFormat expected_format = compressed_bc7
             ? CookedTexturePixelFormat::bc7_unorm
             : CookedTexturePixelFormat::bc4_unorm;
         std::string vcrtex_error;
         if (!decode_vcrtex_bytes(
-                file_bytes,
+                source_bytes,
                 expected_format,
                 options,
                 asset,
@@ -907,7 +1041,7 @@ parse_color_space(const std::string_view value) {
             return fail(
                 CookedTextureLoadErrorCode::decode_failed,
                 std::move(vcrtex_error),
-                source_file.absolute);
+                source_diag_path);
         }
         return CookedTextureLoadResult(std::move(asset));
     }
@@ -920,7 +1054,7 @@ parse_color_space(const std::string_view value) {
             return fail(
                 CookedTextureLoadErrorCode::invalid_json,
                 "Raw RGBA8 texture dimensions or source extension is invalid.",
-                metadata_file.absolute);
+                metadata_diag_path);
         }
         std::uint64_t width = 0U;
         std::uint64_t height = 0U;
@@ -929,28 +1063,25 @@ parse_color_space(const std::string_view value) {
             return fail(
                 CookedTextureLoadErrorCode::invalid_json,
                 "Raw RGBA8 dimensions are invalid.",
-                metadata_file.absolute);
+                metadata_diag_path);
         }
-        return decode_raw_rgba8(
+        return decode_raw_rgba8_bytes(
             std::move(asset),
-            source_file,
+            std::move(source_bytes),
             width,
             height,
+            source_diag_path,
             options);
     }
     if (extension == ".jpg" || extension == ".jpeg" ||
         extension == ".png") {
-        return decode_stbi(
-            std::move(asset), source_file, options);
-    }
-    if (extension == ".exr") {
-        return decode_exr(
-            std::move(asset), source_file, options);
+        return decode_stbi_bytes(
+            std::move(asset), source_bytes, source_diag_path, options);
     }
     return fail(
         CookedTextureLoadErrorCode::unsupported_format,
         "Only JPEG, PNG, and OpenEXR texture sources are supported.",
-        source_file.relative);
+        resolved_source_relative);
 }
 
 } // namespace

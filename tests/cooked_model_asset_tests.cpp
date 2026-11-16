@@ -1070,6 +1070,352 @@ int main() {
                      CookedModelLoadErrorCode::invalid_material),
            "gpu_grass rejects transparent blend coverage");
 
+    // Prebaked v2 .vcrmesh round-trip, validation, and LOD0-only collision proxy:
+    {
+        Fixture prebaked_fx = create_fixture(asset_root, "prebaked_v2");
+        const float pos_inf = std::numeric_limits<float>::infinity();
+        const float neg_inf = -std::numeric_limits<float>::infinity();
+        const float qnan = std::numeric_limits<float>::quiet_NaN();
+
+        vcr::CookedModelAsset prebaked;
+        prebaked.vertices = {
+            // Submesh 0 LOD0 quad (0..3)
+            vcr::CookedModelVertex{{0.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 0.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
+            vcr::CookedModelVertex{{1.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 0.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
+            vcr::CookedModelVertex{{1.0F, 1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 1.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
+            vcr::CookedModelVertex{{0.0F, 1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 1.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
+            // Submesh 1 LOD0 quad (4..7)
+            vcr::CookedModelVertex{{2.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 0.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
+            vcr::CookedModelVertex{{3.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 0.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
+            vcr::CookedModelVertex{{3.0F, 1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 1.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
+            vcr::CookedModelVertex{{2.0F, 1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 1.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
+            // Vertices used exclusively by appended LOD1..3 triangles (8..10)
+            vcr::CookedModelVertex{{500.0F, 500.0F, 500.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 0.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
+            vcr::CookedModelVertex{{501.0F, 500.0F, 500.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 0.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
+            vcr::CookedModelVertex{{500.0F, 501.0F, 500.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 1.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
+        };
+        prebaked.indices = {
+            // Submesh 0 LOD0 [0, 6)
+            0U, 1U, 2U, 0U, 2U, 3U,
+            // Submesh 1 LOD0 [6, 12)
+            4U, 5U, 6U, 4U, 6U, 7U,
+            // Submesh 0 LOD1 [12, 15), LOD2 [15, 18), LOD3 [18, 21)
+            8U, 9U, 10U,
+            8U, 9U, 10U,
+            8U, 9U, 10U,
+            // Submesh 1 LOD1 [21, 24), LOD2 [24, 27), LOD3 empty at 27
+            8U, 9U, 10U,
+            4U, 5U, 6U,
+        };
+        prebaked.submeshes = {
+            vcr::CookedModelSubmesh{
+                .first_index = 0U,
+                .index_count = 6U,
+                .material_index = 0U,
+                .name = "sub0",
+                .lod_first = {0U, 12U, 15U, 18U},
+                .lod_count = {6U, 3U, 3U, 3U},
+                .lod_error = {0.0F, 0.015F, 0.045F, 0.12F},
+            },
+            vcr::CookedModelSubmesh{
+                .first_index = 6U,
+                .index_count = 6U,
+                .material_index = 0U,
+                .name = "sub1",
+                .lod_first = {6U, 21U, 24U, 27U},
+                .lod_count = {6U, 3U, 3U, 0U},
+                .lod_error = {0.0F, 0.02F, 0.06F, pos_inf},
+            },
+        };
+
+        std::vector<std::uint8_t> v2_bytes;
+        std::string serialize_error;
+        const bool serialized = vcr::serialize_prebaked_vcrmesh_v2(
+            prebaked, v2_bytes, serialize_error);
+        expect(serialized && serialize_error.empty() &&
+                   v2_bytes.size() == (40U + 2U * 72U + 11U * 48U + 27U * 4U),
+               "serialize_prebaked_vcrmesh_v2 emits exact v2 header, 72B submeshes, vertices, and indices");
+
+        prebaked_fx.metadata["prebaked_lods"] = true;
+        prebaked_fx.metadata["generate_lods"] = false;
+        prebaked_fx.metadata["lods"] = Json::array();
+        prebaked_fx.metadata["geometry"]["vertex_count"] = prebaked.vertices.size();
+        prebaked_fx.metadata["geometry"]["index_count"] = prebaked.indices.size();
+        prebaked_fx.metadata["submeshes"] = Json::array({
+            Json{
+                {"name", "sub0"},
+                {"first_index", 0U},
+                {"index_count", 6U},
+                {"material_index", 0U},
+                {"material", "materials/0_painted.vcrmaterial.json"},
+            },
+            Json{
+                {"name", "sub1"},
+                {"first_index", 6U},
+                {"index_count", 6U},
+                {"material_index", 0U},
+                {"material", "materials/0_painted.vcrmaterial.json"},
+            },
+        });
+        expect(write_bytes(prebaked_fx.mesh_absolute, std::as_bytes(std::span{v2_bytes})) &&
+                   write_json(prebaked_fx.metadata_absolute, prebaked_fx.metadata),
+               "prebaked v2 model fixture written");
+
+        const auto prebaked_loaded = vcr::load_cooked_model_asset(
+            asset_root, prebaked_fx.metadata_relative);
+        expect(static_cast<bool>(prebaked_loaded),
+               "valid prebaked v2 model loads");
+        if (prebaked_loaded) {
+            expect(prebaked_loaded->prebaked_lods && !prebaked_loaded->generate_lods,
+                   "prebaked_lods and generate_lods flags round-trip");
+            expect(prebaked_loaded->vertices.size() == 11U &&
+                       prebaked_loaded->indices == prebaked.indices,
+                   "v2 bulk-copied vertices and indices match input");
+            expect(prebaked_loaded->submeshes.size() == 2U &&
+                       prebaked_loaded->submeshes[0U].lod_first ==
+                           std::array<std::uint32_t, 4U>{0U, 12U, 15U, 18U} &&
+                       prebaked_loaded->submeshes[0U].lod_count ==
+                           std::array<std::uint32_t, 4U>{6U, 3U, 3U, 3U} &&
+                       prebaked_loaded->submeshes[0U].lod_error ==
+                           std::array<float, 4U>{0.0F, 0.015F, 0.045F, 0.12F},
+                   "submesh 0 prebaked LOD0..3 ranges and errors are preserved");
+            expect(prebaked_loaded->submeshes[1U].lod_first ==
+                           std::array<std::uint32_t, 4U>{6U, 21U, 24U, 27U} &&
+                       prebaked_loaded->submeshes[1U].lod_count ==
+                           std::array<std::uint32_t, 4U>{6U, 3U, 3U, 0U} &&
+                       prebaked_loaded->submeshes[1U].lod_error[0U] == 0.0F &&
+                       prebaked_loaded->submeshes[1U].lod_error[1U] == 0.02F &&
+                       prebaked_loaded->submeshes[1U].lod_error[2U] == 0.06F &&
+                       std::isinf(prebaked_loaded->submeshes[1U].lod_error[3U]) &&
+                       prebaked_loaded->submeshes[1U].lod_error[3U] > 0.0F,
+                   "submesh 1 preserves LOD0..3 ranges and +inf error for empty LOD3");
+            expect(prebaked_loaded->collision.submesh_boxes.size() == 2U,
+                   "prebaked model synthesizes LOD0 submesh collision boxes");
+            expect(prebaked_loaded->collision.triangle_indices ==
+                       std::vector<std::uint32_t>(
+                           prebaked.indices.begin(), prebaked.indices.begin() + 12),
+                   "collision proxy samples LOD0 triangles only and excludes LOD1..3");
+            bool all_proxy_tris_lod0 = true;
+            for (const std::uint32_t tri_idx : prebaked_loaded->collision.triangle_indices) {
+                if (tri_idx >= prebaked_loaded->collision.triangle_positions.size() ||
+                    prebaked_loaded->collision.triangle_positions[tri_idx][0U] >= 10.0F) {
+                    all_proxy_tris_lod0 = false;
+                }
+            }
+            expect(all_proxy_tris_lod0,
+                   "collision proxy never references LOD1..3-only vertices");
+        }
+
+        // Verify downsampled (>16384 tris) collision proxy path also excludes LOD1..3:
+        {
+            Fixture dense_fx = create_fixture(asset_root, "prebaked_dense_proxy");
+            vcr::CookedModelAsset dense;
+            dense.vertices = {
+                vcr::CookedModelVertex{{0.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 0.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
+                vcr::CookedModelVertex{{1.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 0.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
+                vcr::CookedModelVertex{{0.0F, 1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 1.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
+                vcr::CookedModelVertex{{500.0F, 500.0F, 500.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 0.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
+                vcr::CookedModelVertex{{501.0F, 500.0F, 500.0F}, {0.0F, 0.0F, 1.0F}, {1.0F, 0.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
+                vcr::CookedModelVertex{{500.0F, 501.0F, 500.0F}, {0.0F, 0.0F, 1.0F}, {0.0F, 1.0F}, {1.0F, 0.0F, 0.0F, 1.0F}},
+            };
+            constexpr std::size_t lod0_tris = vcr::maximum_cooked_collision_triangles + 1U;
+            constexpr std::uint32_t lod0_idx_count =
+                static_cast<std::uint32_t>(lod0_tris * 3U);
+            dense.indices.reserve(lod0_idx_count + 3U);
+            for (std::size_t t = 0U; t < lod0_tris; ++t) {
+                dense.indices.push_back(0U);
+                dense.indices.push_back(1U);
+                dense.indices.push_back(2U);
+            }
+            dense.indices.push_back(3U);
+            dense.indices.push_back(4U);
+            dense.indices.push_back(5U);
+            dense.submeshes = {
+                vcr::CookedModelSubmesh{
+                    .first_index = 0U,
+                    .index_count = lod0_idx_count,
+                    .material_index = 0U,
+                    .name = "dense_sub",
+                    .lod_first = {0U, lod0_idx_count, lod0_idx_count, lod0_idx_count},
+                    .lod_count = {lod0_idx_count, 3U, 0U, 0U},
+                    .lod_error = {0.0F, 0.05F, pos_inf, pos_inf},
+                },
+            };
+            std::vector<std::uint8_t> dense_bytes;
+            std::string dense_err;
+            expect(vcr::serialize_prebaked_vcrmesh_v2(dense, dense_bytes, dense_err),
+                   "dense prebaked v2 mesh serialized");
+            dense_fx.metadata["prebaked_lods"] = true;
+            dense_fx.metadata["generate_lods"] = false;
+            dense_fx.metadata["geometry"]["vertex_count"] = dense.vertices.size();
+            dense_fx.metadata["geometry"]["index_count"] = dense.indices.size();
+            dense_fx.metadata["submeshes"][0U]["name"] = "dense_sub";
+            dense_fx.metadata["submeshes"][0U]["index_count"] = lod0_idx_count;
+            expect(write_bytes(dense_fx.mesh_absolute, std::as_bytes(std::span{dense_bytes})) &&
+                       write_json(dense_fx.metadata_absolute, dense_fx.metadata),
+                   "dense prebaked v2 fixture written");
+            const auto dense_loaded = vcr::load_cooked_model_asset(
+                asset_root, dense_fx.metadata_relative);
+            bool dense_lod0_only = static_cast<bool>(dense_loaded) &&
+                dense_loaded->collision.triangle_indices.size() ==
+                    vcr::maximum_cooked_collision_triangles * 3U;
+            if (dense_lod0_only) {
+                for (const std::uint32_t idx : dense_loaded->collision.triangle_indices) {
+                    if (idx >= dense_loaded->collision.triangle_positions.size() ||
+                        dense_loaded->collision.triangle_positions[idx][0U] >= 10.0F) {
+                        dense_lod0_only = false;
+                        break;
+                    }
+                }
+            }
+            expect(dense_lod0_only,
+                   "downsampled collision proxy samples LOD0 only and excludes appended LOD1");
+        }
+
+        // Mismatched prebaked_lods vs v1/v2 binary and invalid metadata flags:
+        {
+            Json mismatch_json = prebaked_fx.metadata;
+            mismatch_json["prebaked_lods"] = false;
+            expect(write_json(prebaked_fx.metadata_absolute, mismatch_json) &&
+                       has_error(vcr::load_cooked_model_asset(
+                                     asset_root, prebaked_fx.metadata_relative),
+                                 CookedModelLoadErrorCode::invalid_mesh),
+                   "v2 mesh with prebaked_lods == false is rejected with invalid_mesh");
+
+            mismatch_json.erase("prebaked_lods");
+            expect(write_json(prebaked_fx.metadata_absolute, mismatch_json) &&
+                       has_error(vcr::load_cooked_model_asset(
+                                     asset_root, prebaked_fx.metadata_relative),
+                                 CookedModelLoadErrorCode::invalid_mesh),
+                   "v2 mesh with omitted prebaked_lods is rejected with invalid_mesh");
+
+            mismatch_json = prebaked_fx.metadata;
+            mismatch_json["generate_lods"] = true;
+            expect(write_json(prebaked_fx.metadata_absolute, mismatch_json) &&
+                       has_error(vcr::load_cooked_model_asset(
+                                     asset_root, prebaked_fx.metadata_relative),
+                                 CookedModelLoadErrorCode::invalid_json),
+                   "prebaked_lods == true with generate_lods == true is rejected");
+
+            mismatch_json.erase("generate_lods");
+            expect(write_json(prebaked_fx.metadata_absolute, mismatch_json) &&
+                       has_error(vcr::load_cooked_model_asset(
+                                     asset_root, prebaked_fx.metadata_relative),
+                                 CookedModelLoadErrorCode::invalid_json),
+                   "prebaked_lods == true with defaulted generate_lods == true is rejected");
+
+            mismatch_json = prebaked_fx.metadata;
+            mismatch_json["lods"] = Json::array({
+                {{"model", valid.metadata_relative.generic_string()}, {"geometric_error", 0.05}},
+                {{"model", valid.metadata_relative.generic_string()}, {"geometric_error", 0.2}},
+            });
+            expect(write_json(prebaked_fx.metadata_absolute, mismatch_json) &&
+                       has_error(vcr::load_cooked_model_asset(
+                                     asset_root, prebaked_fx.metadata_relative),
+                                 CookedModelLoadErrorCode::invalid_json),
+                   "prebaked_lods == true with non-empty lods array is rejected");
+
+            mismatch_json = prebaked_fx.metadata;
+            mismatch_json["prebaked_lods"] = "true";
+            expect(write_json(prebaked_fx.metadata_absolute, mismatch_json) &&
+                       has_error(vcr::load_cooked_model_asset(
+                                     asset_root, prebaked_fx.metadata_relative),
+                                 CookedModelLoadErrorCode::invalid_json),
+                   "non-boolean prebaked_lods is rejected");
+
+            // v1 binary with prebaked_lods == true must fail with invalid_mesh:
+            Fixture v1_with_prebaked = create_fixture(asset_root, "v1_with_prebaked_flag");
+            v1_with_prebaked.metadata["prebaked_lods"] = true;
+            v1_with_prebaked.metadata["generate_lods"] = false;
+            expect(write_json(v1_with_prebaked.metadata_absolute, v1_with_prebaked.metadata) &&
+                       has_error(vcr::load_cooked_model_asset(
+                                     asset_root, v1_with_prebaked.metadata_relative),
+                                 CookedModelLoadErrorCode::invalid_mesh),
+                   "v1 mesh with prebaked_lods == true is rejected with invalid_mesh");
+        }
+
+        // Corrupt v2 LOD record checks & bulk-copy finite vertex check:
+        {
+            // Restore valid metadata for prebaked_fx
+            expect(write_json(prebaked_fx.metadata_absolute, prebaked_fx.metadata),
+                   "prebaked metadata restored");
+            // Submesh 0 record begins at byte 40:
+            // lod_first[4] at 40 + 24 = 64, lod_count[4] at 40 + 40 = 80, lod_error[4] at 40 + 56 = 96.
+            const auto write_u32_at = [](std::vector<std::uint8_t>& buf, const std::size_t off, const std::uint32_t v) {
+                buf[off + 0U] = static_cast<std::uint8_t>(v & 0xFFU);
+                buf[off + 1U] = static_cast<std::uint8_t>((v >> 8U) & 0xFFU);
+                buf[off + 2U] = static_cast<std::uint8_t>((v >> 16U) & 0xFFU);
+                buf[off + 3U] = static_cast<std::uint8_t>((v >> 24U) & 0xFFU);
+            };
+            const auto check_corrupt_v2 = [&](const std::size_t offset, const std::uint32_t value, const std::string_view msg) {
+                std::vector<std::uint8_t> bad = v2_bytes;
+                write_u32_at(bad, offset, value);
+                expect(write_bytes(prebaked_fx.mesh_absolute, std::as_bytes(std::span{bad})) &&
+                           has_error(vcr::load_cooked_model_asset(
+                                         asset_root, prebaked_fx.metadata_relative),
+                                     CookedModelLoadErrorCode::invalid_mesh),
+                       msg);
+            };
+            check_corrupt_v2(80U + 4U, 4U, "v2 rejects lod_count not divisible by 3");
+            check_corrupt_v2(64U + 4U, 25U, "v2 rejects lod_first + lod_count past index buffer");
+            check_corrupt_v2(96U + 0U, std::bit_cast<std::uint32_t>(0.1F), "v2 rejects non-zero lod_error[0]");
+            check_corrupt_v2(96U + 4U, std::bit_cast<std::uint32_t>(pos_inf), "v2 rejects +inf lod_error when lod_count > 0");
+            // Submesh 1 is at 40 + 72 = 112; lod_error[3] is at 112 + 56 + 12 = 180 (lod_count[3] == 0):
+            check_corrupt_v2(180U, std::bit_cast<std::uint32_t>(-0.5F), "v2 rejects negative lod_error when lod_count == 0");
+            check_corrupt_v2(180U, std::bit_cast<std::uint32_t>(neg_inf), "v2 rejects -inf lod_error when lod_count == 0");
+            check_corrupt_v2(180U, std::bit_cast<std::uint32_t>(qnan), "v2 rejects NaN lod_error when lod_count == 0");
+
+            // Bulk-copy vertex finite check in v1:
+            Fixture nan_v1 = create_fixture(asset_root, "nan_v1_vertex");
+            const std::array<TestVertex, 3U> nan_verts{{
+                TestVertex{.position = {0.0F, qnan, 0.0F}},
+                TestVertex{},
+                TestVertex{},
+            }};
+            const std::array<std::uint32_t, 3U> nan_idx{0U, 1U, 2U};
+            expect(write_bytes(nan_v1.mesh_absolute, make_mesh(nan_verts, nan_idx, one_submesh)) &&
+                       has_error(vcr::load_cooked_model_asset(asset_root, nan_v1.metadata_relative),
+                                 CookedModelLoadErrorCode::invalid_mesh),
+                   "bulk-copy v1 parse_mesh rejects non-finite vertex attributes");
+        }
+
+        // serialize_prebaked_vcrmesh_v2 validation failures:
+        {
+            std::vector<std::uint8_t> tmp_bytes{1U, 2U, 3U};
+            std::string tmp_err;
+
+            auto bad_vert = prebaked;
+            bad_vert.vertices[0U].normal[1U] = qnan;
+            expect(!vcr::serialize_prebaked_vcrmesh_v2(bad_vert, tmp_bytes, tmp_err) &&
+                       tmp_bytes.empty() && !tmp_err.empty(),
+                   "serialize_prebaked_vcrmesh_v2 rejects non-finite vertex");
+
+            auto bad_idx = prebaked;
+            bad_idx.indices.back() = 99U;
+            expect(!vcr::serialize_prebaked_vcrmesh_v2(bad_idx, tmp_bytes, tmp_err) &&
+                       tmp_bytes.empty() && !tmp_err.empty(),
+                   "serialize_prebaked_vcrmesh_v2 rejects out-of-range index");
+
+            auto bad_lod_mod = prebaked;
+            bad_lod_mod.submeshes[0U].lod_count[1U] = 2U;
+            expect(!vcr::serialize_prebaked_vcrmesh_v2(bad_lod_mod, tmp_bytes, tmp_err) &&
+                       tmp_bytes.empty() && !tmp_err.empty(),
+                   "serialize_prebaked_vcrmesh_v2 rejects lod_count not divisible by 3");
+
+            auto bad_lod_inf = prebaked;
+            bad_lod_inf.submeshes[0U].lod_error[1U] = pos_inf;
+            expect(!vcr::serialize_prebaked_vcrmesh_v2(bad_lod_inf, tmp_bytes, tmp_err) &&
+                       tmp_bytes.empty() && !tmp_err.empty(),
+                   "serialize_prebaked_vcrmesh_v2 rejects +inf error on non-empty LOD");
+
+            auto bad_lod0_err = prebaked;
+            bad_lod0_err.submeshes[0U].lod_error[0U] = 0.01F;
+            expect(!vcr::serialize_prebaked_vcrmesh_v2(bad_lod0_err, tmp_bytes, tmp_err) &&
+                       tmp_bytes.empty() && !tmp_err.empty(),
+                   "serialize_prebaked_vcrmesh_v2 rejects non-zero lod_error[0]");
+        }
+    }
+
     if (failures != 0) {
         std::cerr << failures << " cooked model test(s) failed\n";
         return 1;

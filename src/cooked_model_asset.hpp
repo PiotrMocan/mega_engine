@@ -16,6 +16,7 @@ namespace vcr {
 
 inline constexpr std::uint32_t cooked_model_schema_version = 1U;
 inline constexpr std::uint32_t cooked_mesh_binary_version = 1U;
+inline constexpr std::uint32_t cooked_mesh_prebaked_binary_version = 2U;
 inline constexpr std::uint32_t cooked_mesh_vertex_stride = 48U;
 inline constexpr std::size_t model_lod_count = 4U;
 
@@ -42,7 +43,7 @@ struct CookedModelSubmesh {
     std::uint32_t material_index = 0U;
     std::string name{};
     std::optional<float> authored_geometric_error{};
-    // Runtime-prepared index ranges; the versioned cooked file stays LOD0.
+    // Runtime-prepared or prebaked (v2) index ranges.
     std::array<std::uint32_t, model_lod_count> lod_first{};
     std::array<std::uint32_t, model_lod_count> lod_count{};
     std::array<float, model_lod_count> lod_error{};
@@ -135,6 +136,7 @@ struct CookedModelAsset {
     std::vector<CookedAnimationReference> animation_refs{};
     std::vector<AnimationClip> animations{};
     bool generate_lods = true;
+    bool prebaked_lods = false;
 
     [[nodiscard]] bool is_skinned() const noexcept {
         return !skeleton.empty() &&
@@ -228,5 +230,12 @@ struct CookedModelLoadOptions {
     const std::filesystem::path& asset_root,
     const std::filesystem::path& model_metadata_relative_path,
     const CookedModelLoadOptions& options = {});
+
+// Serializes a model's prebaked LOD0..3 index ranges, geometric errors,
+// vertices, and indices into the v2 little-endian .vcrmesh binary format.
+[[nodiscard]] bool serialize_prebaked_vcrmesh_v2(
+    const CookedModelAsset& model,
+    std::vector<std::uint8_t>& out_bytes,
+    std::string& out_error);
 
 } // namespace vcr

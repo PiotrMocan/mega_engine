@@ -50,6 +50,16 @@ struct Vertex {
     float normal[3];
 };
 
+[[nodiscard]] std::filesystem::path sdl_base_directory() {
+    const char* const base_path = SDL_GetBasePath();
+    if (base_path == nullptr) {
+        fatal(SDL_GetError());
+    }
+    const std::string_view sv(base_path);
+    return std::filesystem::path(
+        std::u8string_view(reinterpret_cast<const char8_t*>(sv.data()), sv.size()));
+}
+
 [[nodiscard]] std::filesystem::path resolve_engine_shader_path(
     const std::filesystem::path& base_dir,
     const std::filesystem::path& relative_path) {
@@ -85,19 +95,6 @@ struct Vertex {
 }
 
 #if VCR_EDITOR_ENABLED
-inline constexpr std::uint32_t maximum_editor_model_assets = 1'024U;
-inline constexpr std::uint32_t maximum_editor_texture_assets = 4'096U;
-inline constexpr std::uint32_t maximum_editor_material_descriptors = 4'096U;
-inline constexpr VkDeviceSize maximum_editor_model_gpu_bytes =
-    2ULL * 1024ULL * 1024ULL * 1024ULL;
-inline constexpr VkDeviceSize maximum_single_editor_model_gpu_bytes =
-    512ULL * 1024ULL * 1024ULL;
-inline constexpr VkDeviceSize maximum_editor_texture_gpu_bytes =
-    // Full vegetation set plus landscape; accounting reserves 2x base RGBA
-    // bytes per texture, including mipmaps. This is still a bounded cache.
-    4ULL * 1024ULL * 1024ULL * 1024ULL;
-inline constexpr VkDeviceSize maximum_single_editor_texture_gpu_bytes =
-    512ULL * 1024ULL * 1024ULL;
 inline constexpr std::size_t maximum_editor_scene_instances =
     static_cast<std::size_t>(max_scene_nodes) + 1U;
 #endif
@@ -799,6 +796,7 @@ void Renderer::initialize(VulkanContext &context, SDL_Window *window,
     editor_model_assets_.reserve(64U);
     editor_model_asset_lookup_.reserve(64U);
     editor_texture_assets_.reserve(128U);
+    editor_texture_asset_lookup_.reserve(128U);
     game_ui_pending_vertices_.reserve(game_ui_max_vertices);
     editor_model_draws_.reserve(max_scene_nodes);
     transparent_model_draw_indices_.reserve(max_scene_nodes);
@@ -1281,12 +1279,9 @@ void Renderer::create_editor_material_resources() {
 std::optional<std::uint32_t> Renderer::find_or_load_editor_texture(const PreparedTexture &prepared,
                                                                    std::string &error) {
     const auto &cache_key = prepared.path;
-    for (std::uint32_t index = 0U;
-         index < editor_texture_assets_.size();
-         ++index) {
-        if (editor_texture_assets_[index].relative_path == cache_key) {
-            return index;
-        }
+    if (const auto existing = find_editor_texture_asset_index(cache_key);
+        existing.has_value()) {
+        return existing;
     }
     if (editor_texture_assets_.size() >= maximum_editor_texture_assets) {
         error =
@@ -1469,10 +1464,13 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_texture(const Prepare
         cache_key,
         precomputed_mips);
 
+    const auto texture_index =
+        static_cast<std::uint32_t>(editor_texture_assets_.size());
     editor_texture_assets_.push_back(std::move(gpu_texture));
+    editor_texture_asset_lookup_.emplace(
+        editor_texture_assets_[texture_index].relative_path, texture_index);
     editor_texture_gpu_bytes_ += gpu_bytes;
-    return static_cast<std::uint32_t>(
-        editor_texture_assets_.size() - 1U);
+    return texture_index;
 }
 
 std::optional<VkDescriptorSet>
@@ -1664,6 +1662,19 @@ std::optional<std::uint32_t> Renderer::find_editor_model_asset_index(
     if (const auto it = editor_model_asset_lookup_.find(relative_path);
         it != editor_model_asset_lookup_.end() &&
         it->second < editor_model_assets_.size()) {
+        return it->second;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::uint32_t> Renderer::find_editor_texture_asset_index(
+    const std::string_view relative_path) const noexcept {
+    if (relative_path.empty()) {
+        return std::nullopt;
+    }
+    if (const auto it = editor_texture_asset_lookup_.find(relative_path);
+        it != editor_texture_asset_lookup_.end() &&
+        it->second < editor_texture_assets_.size()) {
         return it->second;
     }
     return std::nullopt;
@@ -2737,11 +2748,12 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
                 }
                 std::string texture_error;
                 const auto key = reference->lexically_normal().generic_string();
-                const auto resident = std::ranges::find_if(editor_texture_assets_,
-                    [&](const auto& texture) { return texture.relative_path == key; });
-                if (resident != editor_texture_assets_.end()) {
-                    if (resident->semantic == expected_semantic && resident->color_space == expected_color_space) {
-                        destination = static_cast<std::uint32_t>(resident - editor_texture_assets_.begin());
+                if (const auto resident_index = find_editor_texture_asset_index(key);
+                    resident_index.has_value()) {
+                    const EditorTextureAsset& resident = editor_texture_assets_[*resident_index];
+                    if (resident.semantic == expected_semantic &&
+                        resident.color_space == expected_color_space) {
+                        destination = *resident_index;
                     } else {
                         std::cerr << "warning: model '" << relative_path
                                   << "' has a texture semantic/color-space mismatch in '"
@@ -2884,10 +2896,9 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
                     prepared.textures, [&](const auto &t) { return t.path == key; });
                 if (found != prepared.textures.end() && found->texture)
                     gi_albedo = found->average_linear;
-                else if (const auto resident = std::ranges::find_if(editor_texture_assets_,
-                             [&](const auto& t) { return t.relative_path == key; });
-                         resident != editor_texture_assets_.end())
-                    gi_albedo = resident->average_linear;
+                else if (const auto resident_index = find_editor_texture_asset_index(key);
+                         resident_index.has_value())
+                    gi_albedo = editor_texture_assets_[*resident_index].average_linear;
             }
         }
         std::uint32_t gi_first = 0, gi_count = 0;
@@ -3228,6 +3239,25 @@ bool Renderer::update_editor_scene(
                 view.models[rhs].asset_path;
         });
 
+    std::unordered_map<std::string, std::string> batch_load_errors;
+    if (!async_assets_ && !editor_model_sort_scratch_.empty()) {
+        std::vector<std::string> missing_paths;
+        std::string_view prev_path;
+        for (const std::uint32_t model_idx : editor_model_sort_scratch_) {
+            const std::string_view path = view.models[model_idx].asset_path;
+            if (path.empty() || path == prev_path) {
+                continue;
+            }
+            prev_path = path;
+            if (!find_editor_model_asset_index(path).has_value()) {
+                missing_paths.emplace_back(path);
+            }
+        }
+        if (missing_paths.size() >= 2U) {
+            preload_editor_models_batch(asset_root, missing_paths, batch_load_errors);
+        }
+    }
+
     std::size_t group_begin = 0U;
     while (group_begin < editor_model_sort_scratch_.size()) {
         std::size_t group_end = group_begin + 1U;
@@ -3242,8 +3272,19 @@ bool Renderer::update_editor_scene(
         }
 
         std::string load_error;
-        const auto asset_index = find_or_load_editor_model(
-            asset_root, asset_path, load_error);
+        std::optional<std::uint32_t> asset_index;
+        bool batch_failed = false;
+        if (!batch_load_errors.empty()) {
+            if (const auto err_it = batch_load_errors.find(std::string(asset_path));
+                err_it != batch_load_errors.end()) {
+                load_error = err_it->second;
+                batch_failed = true;
+            }
+        }
+        if (!batch_failed) {
+            asset_index = find_or_load_editor_model(
+                asset_root, asset_path, load_error);
+        }
         if (!asset_index) {
             if (error.empty()) {
                 error = std::move(load_error);
@@ -3563,6 +3604,7 @@ void Renderer::reset_editor_asset_cache() {
     editor_model_asset_lookup_.clear();
     prev_committed_runtime_revision_ = 0U;
     editor_texture_assets_.clear();
+    editor_texture_asset_lookup_.clear();
     editor_model_gpu_bytes_ = 0U;
     editor_texture_gpu_bytes_ = 0U;
     editor_material_descriptor_count_ = 0U;
@@ -4237,14 +4279,12 @@ void Renderer::create_sky_texture() {
             "with linear filtering.");
     }
 
-    const char* const base_path = SDL_GetBasePath();
-    if (base_path == nullptr) {
-        fatal(SDL_GetError());
-    }
     const std::filesystem::path texture_path = resolve_engine_core_asset_path(
-        std::filesystem::path(base_path), "sky_clouds.png");
-    const std::string texture_path_string = texture_path.string();
-    SdlSurface source(SDL_LoadPNG(texture_path_string.c_str()));
+        sdl_base_directory(), "sky_clouds.png");
+    const auto texture_u8 = texture_path.u8string();
+    const std::string texture_path_utf8(
+        reinterpret_cast<const char*>(texture_u8.data()), texture_u8.size());
+    SdlSurface source(SDL_LoadPNG(texture_path_utf8.c_str()));
     if (!source) {
         std::cerr << "Unable to load sky texture: " << texture_path << '\n';
         fatal(SDL_GetError());
@@ -4498,13 +4538,9 @@ void Renderer::create_anti_aliasing_resources() {
                 VK_FORMAT_FEATURE_TRANSFER_DST_BIT,
             "SMAA search lookup");
 
-        const char* const base_path = SDL_GetBasePath();
-        if (base_path == nullptr) {
-            fatal(SDL_GetError());
-        }
         const std::filesystem::path smaa_asset_path =
             resolve_engine_core_asset_path(
-                std::filesystem::path(base_path), "smaa");
+                sdl_base_directory(), "smaa");
         constexpr std::uint32_t area_width = 160U;
         constexpr std::uint32_t area_height = 560U;
         constexpr std::uint32_t search_width = 66U;
@@ -4962,6 +4998,7 @@ void Renderer::destroy_scene_resources() noexcept {
     editor_model_assets_.clear();
     editor_model_asset_lookup_.clear();
     editor_texture_assets_.clear();
+    editor_texture_asset_lookup_.clear();
     editor_default_displacement_texture_.destroy();
     editor_default_metallic_roughness_texture_.destroy();
     editor_default_normal_texture_.destroy();
@@ -6760,12 +6797,8 @@ void Renderer::update_frame_uniform(
 }
 
 ShaderModule Renderer::load_shader(const std::filesystem::path& path) const {
-    const char* base_path = SDL_GetBasePath();
-    if (base_path == nullptr) {
-        fatal(SDL_GetError());
-    }
     const auto full_path = resolve_engine_shader_path(
-        std::filesystem::path(base_path), path);
+        sdl_base_directory(), path);
 
     std::ifstream input(full_path, std::ios::binary | std::ios::ate);
     if (!input) {

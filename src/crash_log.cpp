@@ -260,7 +260,93 @@ const char* seh_exception_name(const DWORD code) noexcept {
     case EXCEPTION_PRIV_INSTRUCTION: return "EXCEPTION_PRIV_INSTRUCTION";
     case EXCEPTION_SINGLE_STEP: return "EXCEPTION_SINGLE_STEP";
     case EXCEPTION_STACK_OVERFLOW: return "EXCEPTION_STACK_OVERFLOW";
+    case 0xE06D7363UL: return "MSVC_CXX_EXCEPTION";
     default: return "UNKNOWN_SEH_EXCEPTION";
+    }
+}
+
+void try_extract_msvc_cxx_exception(
+    const EXCEPTION_POINTERS* info,
+    char* out_type,
+    const std::size_t out_type_size,
+    char* out_what,
+    const std::size_t out_what_size) noexcept {
+    out_type[0] = '\0';
+    out_what[0] = '\0';
+    if (info == nullptr || info->ExceptionRecord == nullptr) {
+        return;
+    }
+    const auto* rec = info->ExceptionRecord;
+    if (rec->ExceptionCode != 0xE06D7363UL || rec->NumberParameters < 4 ||
+        rec->ExceptionInformation[0] != 0x19930520ULL) {
+        return;
+    }
+    const auto obj_addr = static_cast<std::uintptr_t>(rec->ExceptionInformation[1]);
+    const auto throw_info_addr = static_cast<std::uintptr_t>(rec->ExceptionInformation[2]);
+    const auto image_base = static_cast<std::uintptr_t>(rec->ExceptionInformation[3]);
+    if (obj_addr == 0 || throw_info_addr == 0 || image_base == 0) {
+        return;
+    }
+
+    __try {
+        struct MsvcTypeDescriptor {
+            const void* pVFTable;
+            void* spare;
+            char name[1];
+        };
+        struct MsvcPMD {
+            int mdisp;
+            int pdisp;
+            int vdisp;
+        };
+        struct MsvcCatchableType {
+            unsigned int properties;
+            unsigned int pType;
+            MsvcPMD thisDisplacement;
+            int sizeOrOffset;
+            unsigned int copyFunction;
+        };
+        struct MsvcCatchableTypeArray {
+            int nCatchableTypes;
+            unsigned int arrayOfCatchableTypes[1];
+        };
+        struct MsvcThrowInfo {
+            unsigned int attributes;
+            unsigned int pmfnUnwind;
+            unsigned int pForwardCompat;
+            unsigned int pCatchableTypeArray;
+        };
+
+        const auto* throw_info =
+            reinterpret_cast<const MsvcThrowInfo*>(throw_info_addr);
+        if (throw_info->pCatchableTypeArray == 0) {
+            return;
+        }
+        const auto* type_array = reinterpret_cast<const MsvcCatchableTypeArray*>(
+            image_base + throw_info->pCatchableTypeArray);
+        const int count = type_array->nCatchableTypes;
+        if (count <= 0 || count > 32) {
+            return;
+        }
+        for (int i = 0; i < count; ++i) {
+            const auto* ct = reinterpret_cast<const MsvcCatchableType*>(
+                image_base + type_array->arrayOfCatchableTypes[i]);
+            const auto* td = reinterpret_cast<const MsvcTypeDescriptor*>(
+                image_base + ct->pType);
+            if (i == 0 && td->name[0] != '\0') {
+                copy_cstr(out_type, out_type_size, td->name);
+            }
+            if (std::strcmp(td->name, ".?AVexception@std@@") == 0) {
+                const auto* ex = reinterpret_cast<const std::exception*>(
+                    obj_addr + static_cast<std::ptrdiff_t>(ct->thisDisplacement.mdisp));
+                const char* what_str = ex->what();
+                if (what_str != nullptr) {
+                    copy_cstr(out_what, out_what_size, what_str);
+                }
+                break;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 }
 
@@ -395,6 +481,20 @@ std::filesystem::path write_crash_log_impl(
             writer.append_sv("ExceptionAddress: ");
             append_address_module(writer, info->ExceptionRecord->ExceptionAddress);
             writer.append_sv("\n");
+            if (code == 0xE06D7363UL) {
+                std::array<char, 256> cxx_type{};
+                std::array<char, 1024> cxx_what{};
+                try_extract_msvc_cxx_exception(
+                    info,
+                    cxx_type.data(), cxx_type.size(),
+                    cxx_what.data(), cxx_what.size());
+                if (cxx_type[0] != '\0') {
+                    writer.append_fmt("CxxExceptionType: %s\n", cxx_type.data());
+                }
+                if (cxx_what[0] != '\0') {
+                    writer.append_fmt("CxxExceptionWhat: %s\n", cxx_what.data());
+                }
+            }
         }
     }
     append_stack_trace_windows(writer);
