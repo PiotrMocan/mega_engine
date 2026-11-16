@@ -77,14 +77,16 @@ void copy_runtime_file(const std::filesystem::path& source, const std::filesyste
 }
 
 [[nodiscard]] bool read_json(
-    const std::filesystem::path& file, Json& doc, std::string& error) {
+    const std::filesystem::path& file, Json& doc, std::string& error,
+    const bool allow_array = false) {
     if (std::filesystem::file_size(file) > maximum_scene_file_bytes) {
         error = "Shipping metadata exceeds the size limit: " + utf8(file);
         return false;
     }
     std::ifstream stream(file, std::ios::binary);
     doc = Json::parse(stream, nullptr, false);
-    if (!stream || doc.is_discarded() || !doc.is_object()) {
+    const bool valid_root = doc.is_object() || (allow_array && doc.is_array());
+    if (!stream || doc.is_discarded() || !valid_root) {
         error = "Invalid shipping metadata: " + utf8(file);
         return false;
     }
@@ -199,11 +201,12 @@ private:
         const bool navmesh = name.ends_with(".vcrnav.json");
         const bool behavior_tree = name.ends_with(".vcrbt.json");
         const bool font = name.ends_with(".vcrfont.json");
-        const bool metadata = texture || model || audio || scene || config ||
+        const bool typed_asset_metadata = texture || model || audio || scene ||
             localization || dialogue || cutscene || navmesh ||
             behavior_tree || font ||
             name.ends_with(".vcrmaterial.json") || name.ends_with(".vcrprefab.json") ||
             name.ends_with(".vcrcue.json");
+        const bool metadata = typed_asset_metadata || config;
         if (ext == ".wav" || ext == ".ogg" || ext == ".flac") {
             // Game DLLs can build audio paths dynamically. JSON references do
             // not describe that dependency graph, so retain every runtime clip.
@@ -217,10 +220,14 @@ private:
             copy_runtime_file(entry.path(), target / rel);
         } else if (metadata) {
             Json doc;
-            if (!read_json(entry.path(), doc, error)) return false;
-            // Import provenance is editor data, not a runtime dependency.
-            for (const char* key : {"source_file", "source_path", "import_settings", "importer"}) {
-                doc.erase(key);
+            if (!read_json(entry.path(), doc, error, config && !typed_asset_metadata)) {
+                return false;
+            }
+            if (doc.is_object()) {
+                // Import provenance is editor data, not a runtime dependency.
+                for (const char* key : {"source_file", "source_path", "import_settings", "importer"}) {
+                    doc.erase(key);
+                }
             }
             if (texture) {
                 const auto cooked = load_cooked_texture_asset(root, rel);

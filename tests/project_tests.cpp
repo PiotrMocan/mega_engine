@@ -451,6 +451,7 @@ void test_shipping_runtime_content_and_rollback() {
     write_text_file(project / "assets/unused.png", "unreferenced image");
     write_text_file(project / "assets/saves/private.vcrsave.json", "save data");
     write_text_file(project / "assets/config/input_bindings.json", "{}");
+    write_text_file(project / "assets/config/cast.json", R"([{"slug":"hero","height":1.78}])");
     // Game modules construct paths at runtime; no JSON references this clip.
     const auto audio_path = project / "assets/audio/from_code.wav";
     std::filesystem::create_directories(audio_path.parent_path());
@@ -499,6 +500,7 @@ void test_shipping_runtime_content_and_rollback() {
     REQUIRE(!std::filesystem::exists(destination / "assets/unused.png"));
     REQUIRE(!std::filesystem::exists(destination / "assets/saves"));
     REQUIRE(std::filesystem::is_regular_file(destination / "assets/config/input_bindings.json"));
+    REQUIRE(std::filesystem::is_regular_file(destination / "assets/config/cast.json"));
     const auto texture_rel = "starter/flat_plane/textures/grid_floor.vcrtexture.json";
     const auto texture = vcr::load_cooked_texture_asset(destination / "assets", texture_rel);
     REQUIRE_MSG(static_cast<bool>(texture), texture ? "" : texture.error().message);
@@ -521,6 +523,11 @@ void test_shipping_runtime_content_and_rollback() {
     REQUIRE(!vcr::ship_project(project, failed, shipped, error));
     REQUIRE(error.find("Texture cook failed") != std::string::npos);
     REQUIRE(!std::filesystem::exists(failed));
+    write_text_file(project / "assets/config/cast.json", "\"scalar\"");
+    const auto invalid_config = temp.path() / "invalid_config_export";
+    REQUIRE(!vcr::ship_project(project, invalid_config, shipped, error));
+    REQUIRE(error.find("Invalid shipping metadata") != std::string::npos);
+    REQUIRE(!std::filesystem::exists(invalid_config));
     for (const auto& entry : std::filesystem::directory_iterator(temp.path())) {
         REQUIRE(entry.path().filename().string().find(".shipping-") == std::string::npos);
     }
