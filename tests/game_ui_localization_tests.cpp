@@ -245,6 +245,9 @@ void test_ui_scaler_anchors_and_world_projection() {
     REQUIRE(close_to(front.screen_px.x, 960.0F, 2.0F));
     REQUIRE(close_to(front.screen_px.y, 540.0F, 2.0F));
 
+    REQUIRE(vcr::project_world_to_screen(
+        cam_pos + cam_fwd * 2'000.0F, vp, {1920.0F, 1080.0F}).has_value());
+
     const vcr::WorldScreenProjection behind = vcr::project_world_indicator(
         {0.0F, 2.0F, 25.0F}, cam_pos, vp, {1920.0F, 1080.0F}, 48.0F, true);
     REQUIRE(!behind.in_front);

@@ -779,7 +779,7 @@ int main() {
                    close_to(depth(reversed, vcr::camera_far), 0, 1e-7),
                "reverse-Z maps near to one and far to zero");
         float previous = 1.0F;
-        for (float distance : {0.2F, 1.0F, 10.0F, 100.0F, 400.0F}) {
+        for (float distance : {0.2F, 1.0F, 10.0F, 100.0F, 400.0F, 500.0F, 2'000.0F, 4'999.0F}) {
             const float value = depth(reversed, distance);
             expect(value > 0 && value < previous, "reverse-Z is monotonic");
             previous = value;

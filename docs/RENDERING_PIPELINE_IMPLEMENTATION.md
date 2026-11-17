@@ -87,8 +87,11 @@ overwrite до первого чтения. SMAA edge clear сохраняетс
 может discard. Проверка должна выявлять зависимость от старого содержимого
 attachment, а не только сравнивать один удачный кадр.
 
-**E02, `depth-range`.** Near/far planes и CPU/GPU projection используют один
-контракт: near → 1, far → 0, clear 0, сравнения GREATER/GREATER_EQUAL. Проверить
+**E02, `depth-range`.** Камеры игры и редактора используют диапазон от 0,1 м до 5 км.
+В CPU/GPU projection ближняя плоскость соответствует глубине 1, дальняя — 0.
+Буфер глубины очищается значением 0, сравнения GREATER/GREATER_EQUAL.
+Для кластерного освещения диапазон слоёв глубины определяется положением и
+радиусом действия источников относительно камеры. Проверить
 sky, frustum/occlusion, motion, FSR flags и inputs, reconstruction, будущие
 depth reductions. Shadow-map convention учитывается отдельно. Fixture: пары
 почти копланарных поверхностей на 0.11, 1, 100, 300 и 499 м, пересечение near

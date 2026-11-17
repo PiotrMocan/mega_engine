@@ -11,7 +11,7 @@
 namespace vcr {
 
 inline constexpr float camera_near = 0.1F;
-inline constexpr float camera_far = 500.0F;
+inline constexpr float camera_far = 5'000.0F;
 inline constexpr float camera_vertical_fov = 65.0F;
 inline constexpr float minimum_camera_vertical_fov = 10.0F;
 inline constexpr float maximum_camera_vertical_fov = 140.0F;

@@ -1,13 +1,42 @@
 #include "punctual_light.hpp"
+#include "camera_projection.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 #include <glm/common.hpp>
 #include <glm/geometric.hpp>
 #include <glm/trigonometric.hpp>
 
 namespace vcr {
+
+glm::vec2 clustered_light_depth_range(
+    std::span<const GpuPunctualLight> lights, const glm::mat4& view) noexcept {
+    const glm::vec3 forward{-view[0][2], -view[1][2], -view[2][2]};
+    const glm::vec3 abs_forward = glm::abs(forward);
+    float nearest = camera_far;
+    float farthest = camera_near;
+    for (const auto& light : lights) {
+        const glm::vec3 position{light.position_range};
+        const float depth = glm::dot(forward, position) - view[3][2];
+        // CPU and GPU can round the view transform differently at large world coordinates.
+        const float magnitude = glm::dot(abs_forward, glm::abs(position)) + std::abs(view[3][2]);
+        if (!std::isfinite(magnitude)) {
+            return {camera_near, camera_far};
+        }
+        const float radius = light.position_range.w +
+            8.0F * std::numeric_limits<float>::epsilon() * magnitude;
+        if (depth + radius >= camera_near && depth - radius <= camera_far) {
+            nearest = std::min(nearest, depth - radius);
+            farthest = std::max(farthest, depth + radius);
+        }
+    }
+    // Keep the logarithmic interval wide enough for small lights far from the camera.
+    nearest = std::max(camera_near, nearest * 0.99F);
+    farthest = std::min(camera_far, farthest * 1.01F);
+    return nearest < farthest ? glm::vec2{nearest, farthest} : glm::vec2{camera_near, camera_far};
+}
 
 bool valid_punctual_light(const PunctualLight& light, const PunctualLightType type) noexcept {
     const bool color_valid = std::isfinite(light.color.x) && std::isfinite(light.color.y) &&

@@ -1,4 +1,6 @@
 #include "lighting.hpp"
+#include "camera_projection.hpp"
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +30,28 @@ int main() {
                    gi_cache_capacity(gi_max_triangles, gi_triangle_cache_limit + 1ULL, large_range) == 0 &&
                    gi_cache_capacity(0, 1, sizeof(GiTriangle)-1) == 0,
                "GI cache rejects overflow, hard-budget exhaustion and undersized buffers");
+    }
+    {
+        // Look along +X from a translated origin. Distances are view-space
+        // depths; point and spot ranges must include their whole spheres.
+        const glm::vec3 eye{10, 2, -5};
+        const glm::mat4 view = glm::lookAtRH(eye, eye + glm::vec3{1, 0, 0}, {0, 1, 0});
+        std::array lights{
+            GpuPunctualLight{.position_range = {110, 0, 0, 10}},
+            GpuPunctualLight{.position_range = {2'010, 0, 0, 20}, .direction_type = {1, 0, 0, 1}},
+            GpuPunctualLight{.position_range = {-200, 0, 0, 10}},
+        };
+        const auto range = clustered_light_depth_range(lights, view);
+        expect(range.x > camera_near && range.x <= 90 && range.y >= 2'020 && range.y < camera_far,
+               "cluster slices cover near and distant lights in front of a rotated camera");
+        lights[0].position_range = {10, 0, 0, 5};
+        lights[1].position_range = {camera_far + 10, 0, 0, 20};
+        const glm::vec2 full_range{camera_near, camera_far};
+        expect(clustered_light_depth_range(lights, view) == full_range,
+               "lights crossing either camera plane retain their visible influence");
+        expect(clustered_light_depth_range({}, view) == full_range &&
+                   clustered_light_depth_range(std::span{lights}.last(1), view) == full_range,
+               "empty and fully clipped light sets keep a valid logarithmic range");
     }
     {
         const PunctualLight point{.color = {1.0F, 0.5F, 0.25F},

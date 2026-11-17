@@ -1,5 +1,7 @@
 #pragma once
 
+#include "camera_projection.hpp"
+
 #include <glm/mat4x4.hpp>
 #include <glm/vec2.hpp>
 #include <glm/vec3.hpp>
@@ -180,9 +182,9 @@ void build_game_ui_font_atlas(
     glm::vec3 camera_forward,
     glm::vec3 camera_up,
     float aspect,
-    float near_plane = 0.1F,
-    float far_plane = 500.0F,
-    float vertical_fov_deg = 65.0F) noexcept;
+    float near_plane = camera_near,
+    float far_plane = camera_far,
+    float vertical_fov_deg = camera_vertical_fov) noexcept;
 
 struct WorldScreenProjection {
     glm::vec2 screen_px{0.0F, 0.0F};

@@ -569,9 +569,16 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
     glm::mat4 projection = camera_projection(
         aspect, camera_near, camera_far, vertical_fov_degrees_);
     projection[1][1] *= -1.0F;
+    if (local_backend == LocalLightBackend::clustered &&
+        (local_lights_changed || u.camera_view != view)) {
+        // Distribute depth slices across the lights' influence volumes in this view.
+        const auto depths = clustered_light_depth_range(local_lights_, view);
+        u.cluster_projection.z = depths.x;
+        u.cluster_projection.w = depths.y;
+    }
     u.camera_view = view;
-    u.cluster_projection = glm::vec4(
-        projection[0][0], projection[1][1], camera_near, camera_far);
+    u.cluster_projection.x = projection[0][0];
+    u.cluster_projection.y = projection[1][1];
     u.cluster_viewport = glm::vec4(
         static_cast<float>(viewport_width), static_cast<float>(viewport_height),
         1.0F / static_cast<float>(viewport_width),

@@ -2,9 +2,11 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string_view>
 
 #include <glm/mat4x4.hpp>
+#include <glm/vec2.hpp>
 #include <glm/vec3.hpp>
 #include <glm/vec4.hpp>
 
@@ -72,6 +74,9 @@ struct alignas(16) GpuPunctualLight {
 };
 
 static_assert(sizeof(GpuPunctualLight) == 64U);
+
+[[nodiscard]] glm::vec2 clustered_light_depth_range(
+    std::span<const GpuPunctualLight> lights, const glm::mat4& view) noexcept;
 
 [[nodiscard]] bool valid_punctual_light(
     const PunctualLight& light,
