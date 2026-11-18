@@ -180,6 +180,9 @@ try {
     if ($state.arena.mode -ne "lod_lineup") {
         throw "Expected arena.mode == 'lod_lineup', got '$($state.arena.mode)'"
     }
+    if ([int]$state.arena.submitted_instances -ne 6 -or $state.report.triangles.Count -ne 6) {
+        throw "Expected six preview models and six LOD budgets."
+    }
     if ([int]$state.paint_brush.stroke_count -ne 1) {
         throw "Expected stroke_count == 1, got $($state.paint_brush.stroke_count)"
     }
@@ -193,6 +196,10 @@ try {
     $exportPayload = $exportCall.content[0].text | ConvertFrom-Json
     if (-not (Test-Path -LiteralPath $exportPayload.lod0_model_file)) {
         throw "Missing exported .vcrasset.json: $($exportPayload.lod0_model_file)"
+    }
+    $model = Get-Content -Raw -LiteralPath $exportPayload.lod0_model_file | ConvertFrom-Json
+    if ($model.lods.Count -ne 5 -or $model.detail_aa -ne 'coverage') {
+        throw "Exported asset requires five LOD references and filtered coverage."
     }
     if (-not (Test-Path -LiteralPath $exportPayload.recipe_file)) {
         throw "Missing exported .vcrveg.json: $($exportPayload.recipe_file)"
@@ -220,7 +227,7 @@ try {
         if ([int]$metricsJson.frames_rendered -ge 2 -and
             [double]$metricsJson.one_second_average_fps -gt 0.0 -and
             [double]$metricsJson.cpu_frame_ms -gt 0.0 -and
-            [int]$metricsJson.visibility.submitted -ge 4) {
+            [int]$metricsJson.visibility.submitted -ge 6) {
             break
         }
         Start-Sleep -Milliseconds 50
@@ -228,7 +235,7 @@ try {
     if ([int]$metricsJson.frames_rendered -lt 2 -or
         [double]$metricsJson.one_second_average_fps -le 0.0 -or
         [double]$metricsJson.cpu_frame_ms -le 0.0 -or
-        [int]$metricsJson.visibility.submitted -lt 4) {
+        [int]$metricsJson.visibility.submitted -lt 6) {
         throw "Unexpected metrics after arena update: frames=$($metricsJson.frames_rendered) fps=$($metricsJson.one_second_average_fps) cpu_ms=$($metricsJson.cpu_frame_ms) submitted=$($metricsJson.visibility.submitted)"
     }
 

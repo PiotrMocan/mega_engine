@@ -1,4 +1,5 @@
 #pragma once
+#include "model_lod_limits.hpp"
 
 #include "scene_document.hpp"
 #include "scene_visibility.hpp"
@@ -70,7 +71,7 @@ struct VisibilitySettings {
 };
 struct VisibilityStatistics {
     std::uint32_t submitted = 0, visible = 0, frustum_rejected = 0, occlusion_rejected = 0;
-    std::array<std::uint32_t, 4> lod_instances{};
+    std::array<std::uint32_t, model_lod_count> lod_instances{};
     std::uint64_t triangles = 0, packet_revision = 0;
 };
 } // namespace vcr

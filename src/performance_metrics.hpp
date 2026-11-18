@@ -1,4 +1,5 @@
 #pragma once
+#include "model_lod_limits.hpp"
 #include "lighting.hpp"
 #include "tone_mapping.hpp"
 #include "exposure.hpp"
@@ -299,7 +300,7 @@ struct BenchmarkResult {
     std::uint32_t local_light_overflow_clusters = 0;
     std::uint32_t local_light_dropped = 0;
     std::uint32_t visible_instances = 0, frustum_rejected = 0, occlusion_rejected = 0;
-    std::array<std::uint32_t, 4> lod_instances{};
+    std::array<std::uint32_t, model_lod_count> lod_instances{};
     bool frustum_culling = true, occlusion_culling = true, lod = true, dynamic_shadows = true,
          animated = false;
     bool animated_camera = false;

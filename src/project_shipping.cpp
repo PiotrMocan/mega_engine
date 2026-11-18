@@ -394,7 +394,7 @@ void repack_contiguous_lod0_indices(CookedModelAsset& model) {
 
         if (!model.prebaked_lods) {
             if (model.lods.empty()) {
-                prepare_model_lods(model);
+                prepare_model_lods(model, root);
             } else {
                 std::vector<CookedModelAsset> levels(model.lods.size());
                 std::size_t geometry_bytes =
@@ -437,14 +437,14 @@ void repack_contiguous_lod0_indices(CookedModelAsset& model) {
                         lod->indices.size() * sizeof(std::uint32_t);
                     levels[lod_idx] = std::move(lod).value();
                 }
-                prepare_authored_model_lods(model, levels, geometry_budget);
+                prepare_authored_model_lods(model, levels, geometry_budget, root);
             }
             optimize_model_geometry(model);
         }
 
         repack_contiguous_lod0_indices(model);
         std::string serialize_error;
-        if (!serialize_prebaked_vcrmesh_v2(model, out.mesh_bytes, serialize_error)) {
+        if (!serialize_prebaked_vcrmesh(model, out.mesh_bytes, serialize_error)) {
             local_error =
                 "Shipping model serialize failed for '" + item.name + "': " +
                 serialize_error;

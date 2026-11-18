@@ -1757,15 +1757,15 @@ Renderer::RenderedNodeDiagnostics Renderer::inspect_rendered_node(
     if (diag.has_model_draw) {
         const std::size_t group_idx = 2U + draw_index;
         if (group_idx < visibility_groups_.size() &&
-            group_idx * 4U + 3U < visibility_commands_.size()) {
+            (group_idx + 1U) * model_lod_count <= visibility_commands_.size()) {
             const VisibilityGroup& grp = visibility_groups_[group_idx];
             diag.has_visibility_group = true;
             diag.group_vertex_offset = static_cast<std::int32_t>(grp.range.z);
             diag.group_force_lod0 = grp.range.w;
             diag.group_lod_counts = grp.counts;
-            for (std::size_t lod = 0U; lod < 4U; ++lod) {
+            for (std::size_t lod = 0U; lod < model_lod_count; ++lod) {
                 const VkDrawIndexedIndirectCommand& cmd =
-                    visibility_commands_[group_idx * 4U + lod];
+                    visibility_commands_[group_idx * model_lod_count + lod];
                 diag.indirect_vertex_offsets[lod] = cmd.vertexOffset;
                 diag.indirect_index_counts[lod] = cmd.indexCount;
             }
@@ -2694,6 +2694,8 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
     gpu_asset.bounds = Bounds{(minimum + maximum) * 0.5F, (maximum - minimum) * 0.5F};
     gpu_asset.collision = std::move(model.collision);
     gpu_asset.relative_path = relative_path;
+    gpu_asset.detail_aa = model.detail_aa;
+    gpu_asset.skinned_lods = model.skinned_lods && model.lods.empty();
     const glm::vec3 dimensions = maximum - minimum;
     const float largest_dimension = std::max(
         dimensions.x, std::max(dimensions.y, dimensions.z));
@@ -3235,8 +3237,9 @@ bool Renderer::update_editor_scene(
         [&view](
             const std::uint32_t lhs,
             const std::uint32_t rhs) {
-            return view.models[lhs].asset_path <
-                view.models[rhs].asset_path;
+            const auto& a = view.models[lhs];
+            const auto& b = view.models[rhs];
+            return a.asset_path == b.asset_path ? a.detail_aa < b.detail_aa : a.asset_path < b.asset_path;
         });
 
     std::unordered_map<std::string, std::string> batch_load_errors;
@@ -3258,13 +3261,16 @@ bool Renderer::update_editor_scene(
         }
     }
 
+    has_local_aa_draws_ = false;
     std::size_t group_begin = 0U;
     while (group_begin < editor_model_sort_scratch_.size()) {
         std::size_t group_end = group_begin + 1U;
         const std::string_view asset_path =
             view.models[
                 editor_model_sort_scratch_[group_begin]].asset_path;
+        const auto detail_aa = view.models[editor_model_sort_scratch_[group_begin]].detail_aa;
         while (group_end < editor_model_sort_scratch_.size() &&
+               view.models[editor_model_sort_scratch_[group_end]].detail_aa == detail_aa &&
                view.models[
                    editor_model_sort_scratch_[group_end]].asset_path ==
                        asset_path) {
@@ -3313,6 +3319,10 @@ bool Renderer::update_editor_scene(
         }
 
         for (const EditorModelSubmesh& submesh : asset.submeshes) {
+            const bool local_aa = detail_aa == ObjectAntiAliasing::coverage ||
+                (detail_aa == ObjectAntiAliasing::asset && asset.detail_aa);
+            const auto draw_coverage = local_aa ? submesh.coverage | material_coverage_detail_aa_bit : submesh.coverage;
+            has_local_aa_draws_ |= local_aa;
             if (submesh.material.model == MaterialModel::gpu_grass)
                 gpu_grass_instances_ += static_cast<std::uint32_t>(instance_count);
             const std::uint32_t first_instance =
@@ -3358,7 +3368,7 @@ bool Renderer::update_editor_scene(
                             static_cast<std::uint32_t>(editor_model_draws_.size()));
                     }
                     editor_model_draws_.push_back(EditorModelDraw{
-                        .coverage = submesh.coverage,
+                        .coverage = draw_coverage,
                         .material_descriptor_set = submesh.material_descriptor_set,
                         .tessellation = submesh.tessellation,
                         .tessellation_uv_bounds = submesh.tessellation_uv_bounds,
@@ -3380,7 +3390,7 @@ bool Renderer::update_editor_scene(
                         static_cast<std::uint32_t>(editor_model_draws_.size()));
                 }
                 editor_model_draws_.push_back(EditorModelDraw{
-                    .coverage = submesh.coverage,
+                    .coverage = draw_coverage,
                     .material_descriptor_set = submesh.material_descriptor_set,
                     .tessellation = submesh.tessellation,
                     .tessellation_uv_bounds = submesh.tessellation_uv_bounds,
@@ -3727,7 +3737,7 @@ void Renderer::record_editor_scene_upload(
     const VkDeviceSize byte_count =
         static_cast<VkDeviceSize>(scene_packet_.size()) * sizeof(RuntimeGpuInstance);
     const auto indices = std::as_bytes(std::span{visible_indices_});
-    constexpr VkDeviceSize index_offset = 8U * sizeof(std::uint32_t);
+    constexpr VkDeviceSize index_offset = visibility_header_bytes;
     if (byte_count > frame.scene_instance_buffer.size() ||
         byte_count > frame.scene_upload_buffer.size() ||
         indices.size() > frame.scene_upload_buffer.size() - byte_count ||
@@ -5857,7 +5867,7 @@ void Renderer::record_shadow_map(VkCommandBuffer command_buffer, FrameContext &f
                             cascade_indirect_base +
                             (draw_index + 2U) * model_lod_count *
                                 sizeof(VkDrawIndexedIndirectCommand);
-                        if (tessellated_draw || draw.uses_skinned_pool) {
+                        if (tessellated_draw || (draw.uses_skinned_pool && !asset.skinned_lods)) {
                             vkCmdDrawIndexedIndirect(
                                 command_buffer, frame.visibility.shadow_indirect.handle(),
                                 group_base, 1U, sizeof(VkDrawIndexedIndirectCommand));
@@ -6928,6 +6938,11 @@ void Renderer::create_pipeline() {
     const VkBool32 gi_compiled = gi_provisioned_ ? VK_TRUE : VK_FALSE;
     const VkSpecializationMapEntry gi_entry{0, 0, sizeof(gi_compiled)};
     const VkSpecializationInfo gi_specialization{1, &gi_entry, sizeof(gi_compiled), &gi_compiled};
+    const std::array<VkBool32, 2> coverage_constants{gi_compiled, VK_TRUE};
+    const std::array<VkSpecializationMapEntry, 2> coverage_entries{gi_entry,
+        VkSpecializationMapEntry{8U, sizeof(VkBool32), sizeof(VkBool32)}};
+    const VkSpecializationInfo coverage_specialization{
+        2U, coverage_entries.data(), sizeof(coverage_constants), coverage_constants.data()};
     VkFormatProperties terrain_normal_format_properties{};
     vkGetPhysicalDeviceFormatProperties(
         context_->physical_device(),
@@ -8024,7 +8039,7 @@ void Renderer::create_pipeline() {
     VkPipelineRenderingCreateInfo spatial_rendering_info = aa_rendering_info;
     spatial_rendering_info.colorAttachmentCount = 1U;
     const auto create_aa_geometry_pipeline =
-        [this, &gi_specialization, &pipeline_info, &aa_rendering_info, &aa_color_blend,
+        [this, &gi_specialization, &coverage_specialization, &pipeline_info, &aa_rendering_info, &aa_color_blend,
          &spatial_rendering_info, &color_blend, &create_prepass_variants,
          &patch_input_assembly, &tessellation_state, &cached_shader, &model_dynamic_state,
          &create_graphics_pipelines](
@@ -8083,7 +8098,7 @@ void Renderer::create_pipeline() {
                     .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
                     .module = fragment,
                     .pName = "main",
-                    .pSpecializationInfo = &gi_specialization,
+                    .pSpecializationInfo = alpha_to_coverage ? &coverage_specialization : &gi_specialization,
                 };
             VkGraphicsPipelineCreateInfo info = pipeline_info;
             VkPipelineMultisampleStateCreateInfo sample_state =
@@ -10439,7 +10454,7 @@ void Renderer::record_commands(
                         editor_model_assets_[draw.asset_index];
                     const auto& submesh = asset.submeshes[draw.submesh_index];
                     if (interleave_masked_lods) {
-                        if (tessellated_draw || draw.uses_skinned_pool) {
+                        if (tessellated_draw || (draw.uses_skinned_pool && !asset.skinned_lods)) {
                             if (lod_band > 0U) return;
                         } else if (submesh.lod_count[lod_band] == 0U) {
                             return;
@@ -10453,10 +10468,13 @@ void Renderer::record_commands(
                             desired_pipeline);
                         state.pipeline = desired_pipeline;
                     }
+                    const auto coverage = (draw.coverage & material_coverage_detail_aa_bit) &&
+                        anti_aliasing_.method == AntiAliasingMethod::off && motion_blur_mode_actual() == MotionBlurMode::off
+                        ? draw.coverage | material_coverage_local_resolve_bit : draw.coverage;
                     vkCmdPushConstants(
                         command_buffer, pipeline_layout_,
                         VK_SHADER_STAGE_FRAGMENT_BIT, 12U,
-                        sizeof(draw.coverage), &draw.coverage);
+                        sizeof(coverage), &coverage);
                     if (draw.material_descriptor_set != state.material_set) {
                         vkCmdBindDescriptorSets(
                             command_buffer,
@@ -10535,12 +10553,12 @@ void Renderer::record_commands(
                             sizeof(VkDrawIndexedIndirectCommand);
                         if (interleave_masked_lods) {
                             const std::size_t active_lod =
-                                (tessellated_draw || draw.uses_skinned_pool) ? 0U : lod_band;
+                                (tessellated_draw || (draw.uses_skinned_pool && !asset.skinned_lods)) ? 0U : lod_band;
                             vkCmdDrawIndexedIndirect(
                                 command_buffer, frame.visibility.indirect.handle(),
                                 group_base + active_lod * sizeof(VkDrawIndexedIndirectCommand),
                                 1U, sizeof(VkDrawIndexedIndirectCommand));
-                        } else if (tessellated_draw || draw.uses_skinned_pool) {
+                        } else if (tessellated_draw || (draw.uses_skinned_pool && !asset.skinned_lods)) {
                             vkCmdDrawIndexedIndirect(
                                 command_buffer, frame.visibility.indirect.handle(),
                                 group_base, 1U, sizeof(VkDrawIndexedIndirectCommand));
@@ -11091,7 +11109,7 @@ void Renderer::record_commands(
         is_temporal_smaa(anti_aliasing_)
             ? 2U | (smaa_t2x_history_valid_ ? 1U : 0U) |
                   ((smaa_t2x_phase_ & 1U) != 0U ? 4U : 0U)
-            : 0U,
+            : (has_local_aa_draws_ && anti_aliasing_.method == AntiAliasingMethod::off && !motion_blur_active ? 8U : 0U),
         lighting_settings_.dynamic && mode_ != RunMode::instancing
             ? static_cast<std::uint32_t>(tone_mapper_) : 0U,
         static_cast<std::uint32_t>(exposure_mode_actual()),
@@ -11321,7 +11339,7 @@ void Renderer::record_commands(
 
     if (anti_aliasing_.method == AntiAliasingMethod::off &&
         (!lighting_settings_.dynamic || mode_ == RunMode::instancing) &&
-        !subsurface_active && !motion_blur_active && !atmospheric_fog_active) {
+        !subsurface_active && !motion_blur_active && !atmospheric_fog_active && (!has_local_aa_draws_ || mode_ == RunMode::instancing)) {
 #if VCR_EDITOR_ENABLED
         hiz_valid_ = false;
 #endif

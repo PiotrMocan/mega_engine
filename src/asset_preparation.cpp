@@ -73,7 +73,7 @@ using TransparentStringIndexMap =
     auto model = std::move(loaded).value();
     if (!model.prebaked_lods) {
         if (model.lods.empty()) {
-            prepare_model_lods(model);
+            prepare_model_lods(model, result.root);
         } else {
             std::vector<CookedModelAsset> levels(model.lods.size());
             std::size_t geometry_bytes = model.vertices.size() * sizeof(CookedModelVertex) +
@@ -104,7 +104,7 @@ using TransparentStringIndexMap =
                                   lod->indices.size() * sizeof(std::uint32_t);
                 levels[i] = std::move(lod).value();
             }
-            prepare_authored_model_lods(model, levels, geometry_budget);
+            prepare_authored_model_lods(model, levels, geometry_budget, result.root);
         }
         optimize_model_geometry(model);
     }

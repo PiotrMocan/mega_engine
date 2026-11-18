@@ -4,6 +4,8 @@ const uint kMaterialAlphaMaskBit = 1u;
 const uint kMaterialTwoSidedBit = 2u;
 const uint kMaterialAlphaBlendBit = 8u;
 const uint kMaterialGlassBit = 16u;
+const uint kMaterialDetailAaBit = 32u;
+const uint kMaterialLocalResolveBit = 64u;
 const uint kMaterialTransparentMask = kMaterialAlphaBlendBit | kMaterialGlassBit;
 
 bool materialIsTransparent(uint coverage)

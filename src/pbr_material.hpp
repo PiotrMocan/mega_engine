@@ -63,6 +63,11 @@ struct PbrMaterial {
     float subsurface_strength = 0.0F;
 };
 
+[[nodiscard]] constexpr bool is_vegetation_material(const PbrMaterial& material) noexcept {
+    return material.model == MaterialModel::gpu_grass ||
+           material.subsurface_profile == SubsurfaceProfile::foliage;
+}
+
 static_assert(sizeof(PbrMaterial) == 48U);
 static_assert(offsetof(PbrMaterial, metallic) == 16U);
 static_assert(offsetof(PbrMaterial, roughness) == 20U);

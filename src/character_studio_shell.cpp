@@ -985,9 +985,6 @@ void CharacterStudioShell::initialize_gui(
     studio_lighting.hour = 13.0;
     studio_lighting.sky_intensity = 0.48F;
 
-    AntiAliasingSettings studio_aa{};
-    studio_aa.method = AntiAliasingMethod::smaa;
-
     renderer_.initialize(
         context_,
         window_.handle,
@@ -995,7 +992,7 @@ void CharacterStudioShell::initialize_gui(
         RunMode::scene,
         1U,
         0U,
-        studio_aa,
+        AntiAliasingSettings{},
         !args.screenshot_path.empty(),
         true,
         true,
@@ -1306,7 +1303,7 @@ void CharacterStudioShell::rebuild_preview_assets(bool full_gpu_reload) {
 }
 
 void CharacterStudioShell::update_orbit_camera() noexcept {
-    orbit_distance_ = std::clamp(orbit_distance_, 0.35F, 6.5F);
+    orbit_distance_ = std::clamp(orbit_distance_, 0.35F, 128.0F);
     orbit_elevation_ = std::clamp(orbit_elevation_, -1.25F, 1.35F);
 
     const float cos_el = std::cos(orbit_elevation_);
@@ -1770,7 +1767,7 @@ bool CharacterStudioShell::render_gui_frame(
     }
     ImGui::SameLine();
     ImGui::TextDisabled(
-        "| %zu verts / %zu tris / %zu submeshes",
+        "| Source: %zu verts / %zu tris / %zu submeshes",
         preview_mesh_.vertices.size(),
         preview_mesh_.indices.size() / 3U,
         preview_mesh_.submeshes.size());
@@ -2221,23 +2218,21 @@ void CharacterStudioShell::draw_viewport_panel(
     if (gpu_ms >= 0.0) {
         std::snprintf(
             hud_buf, sizeof(hud_buf),
-            "%.0f FPS | CPU %.2f ms | GPU %.2f ms | %zu verts / %zu tris / %zu bones%s%s",
+            "%.0f FPS | CPU %.2f ms | GPU %.2f ms | %llu drawn tris / %zu bones%s%s",
             vp_fps,
             cpu_ms,
             gpu_ms,
-            preview_mesh_.vertices.size(),
-            preview_mesh_.indices.size() / 3U,
+            static_cast<unsigned long long>(renderer_.visibility_statistics().triangles),
             preview_mesh_.skeleton.bones.size(),
             last_hover_hit_ ? " | Hit: " : "",
             last_hover_hit_ ? to_token(last_hover_hit_->target).data() : "");
     } else {
         std::snprintf(
             hud_buf, sizeof(hud_buf),
-            "%.0f FPS | CPU %.2f ms | %zu verts / %zu tris / %zu bones%s%s",
+            "%.0f FPS | CPU %.2f ms | %llu drawn tris / %zu bones%s%s",
             vp_fps,
             cpu_ms,
-            preview_mesh_.vertices.size(),
-            preview_mesh_.indices.size() / 3U,
+            static_cast<unsigned long long>(renderer_.visibility_statistics().triangles),
             preview_mesh_.skeleton.bones.size(),
             last_hover_hit_ ? " | Hit: " : "",
             last_hover_hit_ ? to_token(last_hover_hit_->target).data() : "");
@@ -2374,13 +2369,17 @@ void CharacterStudioShell::process_mcp_commands(
                 {{"name", "ai_generate_full_character"}, {"description", "Generate full character spec via AI"}},
             })}});
         } else if (call_name == "get_character_summary") {
-            send_ok(character_summary_json(
-                package_,
-                character_path_,
-                project_directory_,
-                preview_mesh_,
-                active_workspace_,
-                last_cook_verified_));
+            auto summary = character_summary_json(package_, character_path_, project_directory_,
+                preview_mesh_, active_workspace_, last_cook_verified_);
+            const auto& vis = renderer_.visibility_statistics();
+            summary["preview_render"] = Json{
+                {"camera_distance", orbit_distance_},
+                {"drawn_triangles", vis.triangles},
+                {"lod_instances", vis.lod_instances},
+                {"global_aa", to_token(renderer_.anti_aliasing().method)},
+                {"resident_models", renderer_.resident_editor_model_count()},
+            };
+            send_ok(summary);
         } else if (call_name == "list_project_characters") {
             refresh_project_characters();
             Json chars_arr = Json::array();

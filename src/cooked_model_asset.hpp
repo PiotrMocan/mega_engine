@@ -1,4 +1,5 @@
 #pragma once
+#include "model_lod_limits.hpp"
 
 #include "pbr_material.hpp"
 #include "skeletal_animation.hpp"
@@ -18,13 +19,15 @@ inline constexpr std::uint32_t cooked_model_schema_version = 1U;
 inline constexpr std::uint32_t cooked_mesh_binary_version = 1U;
 inline constexpr std::uint32_t cooked_mesh_prebaked_binary_version = 2U;
 inline constexpr std::uint32_t cooked_mesh_vertex_stride = 48U;
-inline constexpr std::size_t model_lod_count = 4U;
+inline constexpr std::uint32_t cooked_mesh_extended_lod_version = 3U;
 
 inline constexpr std::uint32_t material_coverage_alpha_mask_bit = 1U;
 inline constexpr std::uint32_t material_coverage_two_sided_bit = 2U;
 inline constexpr std::uint32_t material_coverage_packed_ao_bit = 4U;
 inline constexpr std::uint32_t material_coverage_alpha_blend_bit = 8U;
 inline constexpr std::uint32_t material_coverage_glass_bit = 16U;
+inline constexpr std::uint32_t material_coverage_detail_aa_bit = 32U;
+inline constexpr std::uint32_t material_coverage_local_resolve_bit = 64U;
 inline constexpr std::uint32_t material_coverage_transparent_mask =
     material_coverage_alpha_blend_bit | material_coverage_glass_bit;
 
@@ -43,7 +46,7 @@ struct CookedModelSubmesh {
     std::uint32_t material_index = 0U;
     std::string name{};
     std::optional<float> authored_geometric_error{};
-    // Runtime-prepared or prebaked (v2) index ranges.
+    // Runtime-prepared or prebaked (v2/v3) index ranges.
     std::array<std::uint32_t, model_lod_count> lod_first{};
     std::array<std::uint32_t, model_lod_count> lod_count{};
     std::array<float, model_lod_count> lod_error{};
@@ -135,6 +138,9 @@ struct CookedModelAsset {
     std::vector<CookedSkinVertex> skin_vertices{};
     std::vector<CookedAnimationReference> animation_refs{};
     std::vector<AnimationClip> animations{};
+    bool vegetation = false;
+    bool detail_aa = false;
+    bool skinned_lods = false;
     bool generate_lods = true;
     bool prebaked_lods = false;
 
@@ -231,9 +237,8 @@ struct CookedModelLoadOptions {
     const std::filesystem::path& model_metadata_relative_path,
     const CookedModelLoadOptions& options = {});
 
-// Serializes a model's prebaked LOD0..3 index ranges, geometric errors,
-// vertices, and indices into the v2 little-endian .vcrmesh binary format.
-[[nodiscard]] bool serialize_prebaked_vcrmesh_v2(
+// Emit the compact v2 record for up to four levels, or v3 for an extended chain.
+[[nodiscard]] bool serialize_prebaked_vcrmesh(
     const CookedModelAsset& model,
     std::vector<std::uint8_t>& out_bytes,
     std::string& out_error);

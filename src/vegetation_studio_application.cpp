@@ -94,7 +94,7 @@ void check_veg_imgui_vk_result(const VkResult result) {
     case VegArenaMode::hero_single:
         return "Hero x1";
     case VegArenaMode::lod_lineup:
-        return "LOD x4";
+        return "LOD x6";
     case VegArenaMode::grove_100:
         return "Grove 100";
     case VegArenaMode::forest_2500:
@@ -130,7 +130,7 @@ void check_veg_imgui_vk_result(const VkResult result) {
     case VegArenaMode::hero_single:
         return 1U;
     case VegArenaMode::lod_lineup:
-        return 4U;
+        return model_lod_count;
     case VegArenaMode::grove_100:
         return 100U;
     case VegArenaMode::forest_2500:
@@ -1078,8 +1078,8 @@ void VegetationStudioApplication::update_arena_scene_if_dirty() {
         break;
     }
     case VegArenaMode::lod_lineup: {
-        for (std::uint32_t i = 0U; i < 4U; ++i) {
-            const float x = (static_cast<float>(i) - 1.5F) * auto_step;
+        for (std::uint32_t i = 0U; i < model_lod_count; ++i) {
+            const float x = (static_cast<float>(i) - 0.5F * static_cast<float>(model_lod_count - 1U)) * auto_step;
             push_instance(
                 glm::vec3(x, 0.0F, 0.0F),
                 0.0F,
@@ -1087,7 +1087,7 @@ void VegetationStudioApplication::update_arena_scene_if_dirty() {
                 preview_lod_relative_paths_[i],
                 i);
         }
-        half_span = auto_step * 2.5F + 6.0F;
+        half_span = auto_step * (0.5F * static_cast<float>(model_lod_count + 1U)) + 6.0F;
         break;
     }
     case VegArenaMode::grove_100:
@@ -2236,7 +2236,7 @@ void VegetationStudioApplication::draw_top_bar() {
     };
     constexpr std::array<const char*, 5U> kArenaShortLabels{
         "Hero",
-        "LOD x4",
+        "LOD x6",
         "Grove",
         "2.5K",
         "10K",
@@ -2656,8 +2656,8 @@ void VegetationStudioApplication::draw_viewport_panel() {
         const float w = std::max({b.extent.x * 2.0F, b.extent.z * 2.0F, 1.0F});
         const float step = std::max(arena_spacing_, w * 1.15F + 0.8F);
         const float top_y = b.center.y + b.extent.y + 0.35F;
-        for (std::uint32_t i = 0U; i < 4U; ++i) {
-            const float x = (static_cast<float>(i) - 1.5F) * step;
+        for (std::uint32_t i = 0U; i < model_lod_count; ++i) {
+            const float x = (static_cast<float>(i) - 0.5F * static_cast<float>(model_lod_count - 1U)) * step;
             if (const auto sp = project_world_to_screen(
                     camera_,
                     renderer_.vertical_fov_degrees(),
@@ -2905,7 +2905,7 @@ void VegetationStudioApplication::draw_bottom_panel() {
             ImGui::TableSetupColumn("Submeshes");
             ImGui::TableSetupColumn("Geom Error");
             ImGui::TableHeadersRow();
-            for (std::size_t i = 0U; i < 4U; ++i) {
+            for (std::size_t i = 0U; i < model_lod_count; ++i) {
                 ImGui::TableNextRow();
                 std::array<char, 24U> buf{};
                 ImGui::TableSetColumnIndex(0);

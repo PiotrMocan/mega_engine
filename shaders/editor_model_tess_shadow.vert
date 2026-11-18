@@ -1,5 +1,6 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
+#include "visibility_layout.glsl"
 #include "pbr_material.glsl"
 
 layout(set = 0, binding = 0, std140) uniform FrameUniforms
@@ -27,7 +28,7 @@ layout(set = 0, binding = 1, std430) readonly buffer InstanceBuffer
 };
 layout(set = 0, binding = 5, std430) readonly buffer VisibilityBuffer
 {
-    uint visibilityCounters[8];
+    uint visibilityCounters[kVisibilityCounters];
     uint visibleIndices[];
 };
 layout(location = 0) in vec3 inPosition;

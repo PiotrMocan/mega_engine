@@ -1,5 +1,6 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
+#include "visibility_layout.glsl"
 #include "lod_fade.glsl"
 #include "lod_scale.glsl"
 layout(local_size_x=128) in;
@@ -19,12 +20,11 @@ struct Instance {
     vec4 previous0,previous1,previous2;
 };
 struct Source { vec4 center,extent; };
-struct Group { uvec4 range,counts,firsts; vec4 errors; };
 struct Draw { uint indexCount,instanceCount,firstIndex; int vertexOffset; uint firstInstance; };
 layout(set=0,binding=1,std430) readonly buffer Instances { Instance instances[]; };
 layout(set=0,binding=2,std430) readonly buffer Sources { Source sources[]; };
 layout(set=0,binding=3,std430) readonly buffer Groups { Group groups[]; };
-layout(set=0,binding=4,std430) buffer Visible { uint counters[8]; uint indices[]; };
+layout(set=0,binding=4,std430) buffer Visible { uint counters[kVisibilityCounters]; uint indices[]; };
 layout(set=0,binding=5,std430) buffer Commands { Draw draws[]; };
 // Four uint lanes per source: previous/current/progress bits/initialized.
 // Pattern off reads/writes only lane 0, retaining the old 4-byte traffic.
@@ -150,7 +150,7 @@ uint classify(uint id,out uint groupIndex,out uint lod,out uint depthBin) {
             abs(dot(rowY,vec4(center,1)))+dot(abs(rowY.xyz),extent));
         vec2 maximumPixels=maximumClip/(config.guardError.xy*(1-config.guardError.xy));
         float projectedPixels=config.cameraPixels.w+max(maximumPixels.x,maximumPixels.y)/distance;
-        for (uint i=1;i<4;++i) {
+        for (uint i=1;i<kModelLods;++i) {
             float budget=config.guardError.z*(i>history.y ? .8:1);
             // Positive authored error permits intentional empty geometry. Built-in
             // cube/ground groups and absent LOD slots have non-positive errors.
@@ -184,17 +184,17 @@ uint classify(uint id,out uint groupIndex,out uint lod,out uint depthBin) {
     if(pattern==0u) lodHistory[id*4u]=lod; else storeHistory(id,history);
     return 0;
 }
-shared uint localCounts[8];
-shared uint reservations[4];
+shared uint localCounts[kVisibilityCounters];
+shared uint reservations[kModelLods];
 #ifdef VCR_VISIBILITY_BINNED
-shared uint localBinCounts[64];
-shared uint binReservations[64];
+shared uint localBinCounts[kModelLods*kDepthBins];
+shared uint binReservations[kModelLods*kDepthBins];
 #endif
 void main() {
     uint lane=gl_LocalInvocationID.x,id=gl_GlobalInvocationID.x;
-    if (lane<8) localCounts[lane]=0;
+    if (lane<kVisibilityCounters) localCounts[lane]=0;
 #ifdef VCR_VISIBILITY_BINNED
-    if (lane<64u) localBinCounts[lane]=0u;
+    if (lane<kModelLods*kDepthBins) localBinCounts[lane]=0u;
 #endif
     barrier();
     uint groupIndex=0,lod=0,depthBin=0,offset=0,oldOffset=0;
@@ -223,11 +223,11 @@ void main() {
 #endif
             triangles+=groups[groupIndex].counts[history.x]/3u;
         }
-        atomicAdd(localCounts[6],1); // Unique sources, independent of dual draws.
-        atomicAdd(localCounts[7],triangles);
+        atomicAdd(localCounts[kModelLods+2u],1); // Unique sources, independent of dual draws.
+        atomicAdd(localCounts[kModelLods+3u],triangles);
     }
-    else if (result==1) atomicAdd(localCounts[4],1);
-    else if (result==2) atomicAdd(localCounts[5],1);
+    else if (result==1) atomicAdd(localCounts[kModelLods+0u],1);
+    else if (result==2) atomicAdd(localCounts[kModelLods+1u],1);
     barrier();
     // Sources are contiguous and sorted by draw group. Usually a whole
     // workgroup shares one draw; reserve once per LOD/bin instead of serializing
@@ -236,30 +236,30 @@ void main() {
     uint commonGroup=uint(sources[first].center.w);
     bool homogeneous=commonGroup==uint(sources[min(first+127,config.flags.x-1)].center.w);
 #ifdef VCR_VISIBILITY_BINNED
-    if (homogeneous && lane<64u && localBinCounts[lane]>0u) {
+    if (homogeneous && lane<kModelLods*kDepthBins && localBinCounts[lane]>0u) {
         uint bLod=lane/kDepthBins;
         uint bBin=lane-bLod*kDepthBins;
-        uint cmd=commonGroup*4u+bLod;
+        uint cmd=commonGroup*kModelLods+bLod;
         binReservations[lane]=atomicAdd(indices[kBinCountsBase+cmd*kDepthBins+bBin],localBinCounts[lane]);
     }
 #else
-    if (homogeneous && lane<4 && localCounts[lane]>0) {
-        reservations[lane]=atomicAdd(draws[commonGroup*4+lane].instanceCount,localCounts[lane]);
+    if (homogeneous && lane<kModelLods && localCounts[lane]>0) {
+        reservations[lane]=atomicAdd(draws[commonGroup*kModelLods+lane].instanceCount,localCounts[lane]);
     }
 #endif
     if (lane==0) {
-        atomicAdd(counters[0],localCounts[6]);
-        atomicAdd(counters[1],localCounts[4]); atomicAdd(counters[2],localCounts[5]);
-        atomicAdd(counters[3],localCounts[0]); atomicAdd(counters[4],localCounts[1]);
-        atomicAdd(counters[5],localCounts[2]); atomicAdd(counters[7],localCounts[3]);
-        atomicAdd(counters[6],localCounts[7]);
+        atomicAdd(counters[0],localCounts[kModelLods+2u]);
+        atomicAdd(counters[1],localCounts[kModelLods+0u]); atomicAdd(counters[2],localCounts[kModelLods+1u]);
+        atomicAdd(counters[3],localCounts[kModelLods+3u]);
     }
+    if (lane < kModelLods && localCounts[lane] != 0u)
+        atomicAdd(counters[4u + lane],localCounts[lane]);
     barrier();
 #ifdef VCR_VISIBILITY_BINNED
     if (id < config.flags.x) {
         uint scratchOffset = kScratchBase + id * 4u;
         if (result == 0u) {
-            uint commandIndex = groupIndex * 4u + lod;
+            uint commandIndex = groupIndex * kModelLods + lod;
             uint binOffset = homogeneous
                 ? binReservations[lod * kDepthBins + depthBin] + offset
                 : atomicAdd(indices[kBinCountsBase + commandIndex * kDepthBins + depthBin], 1u);
@@ -267,10 +267,10 @@ void main() {
             uint token = fading
                 ? lodToken(id, uintBitsToFloat(history.z), false, pattern) : id;
             uint header = 1u | (depthBin << 1u) | (commandIndex << 5u)
-                | (fading ? (1u << 21u) : 0u) | ((history.x & 3u) << 22u);
+                | (fading ? (1u << 21u) : 0u) | ((history.x & 7u) << 22u);
             uint oldBinOffset = 0u;
             if (fading) {
-                uint oldCommand = groupIndex * 4u + history.x;
+                uint oldCommand = groupIndex * kModelLods + history.x;
                 oldBinOffset = homogeneous
                     ? binReservations[history.x * kDepthBins + depthBin] + oldOffset
                     : atomicAdd(indices[kBinCountsBase + oldCommand * kDepthBins + depthBin], 1u);
@@ -285,13 +285,13 @@ void main() {
     }
 #else
     if (result==0) {
-        uint commandIndex=groupIndex*4+lod;
+        uint commandIndex=groupIndex*kModelLods+lod;
         offset=homogeneous ? reservations[lod]+offset : atomicAdd(draws[commandIndex].instanceCount,1);
         uint pattern = (config.flags.w >> 1u) & 3u;
         indices[draws[commandIndex].firstInstance+offset]=fading
             ? lodToken(id,uintBitsToFloat(history.z),false,pattern) : id;
         if (fading) {
-            uint oldCommand=groupIndex*4+history.x;
+            uint oldCommand=groupIndex*kModelLods+history.x;
             oldOffset=homogeneous ? reservations[history.x]+oldOffset : atomicAdd(draws[oldCommand].instanceCount,1);
             indices[draws[oldCommand].firstInstance+oldOffset]=lodToken(id,uintBitsToFloat(history.z),true,pattern);
         }

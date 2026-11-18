@@ -15,24 +15,37 @@ constexpr VkDeviceSize commands_offset = groups_offset + group_capacity * sizeof
 constexpr VkDeviceSize command_capacity =
     group_capacity * model_lod_count * sizeof(VkDrawIndexedIndirectCommand);
 constexpr VkDeviceSize shadow_command_capacity =
-    VkDeviceSize{max_shadow_draw_groups} * 16ULL * sizeof(VkDrawIndexedIndirectCommand);
+    VkDeviceSize{max_shadow_draw_groups} * 4ULL * model_lod_count * sizeof(VkDrawIndexedIndirectCommand);
 constexpr std::size_t visibility_depth_bins = 16ULL;
 constexpr std::size_t max_binned_commands =
     std::size_t{max_shadow_draw_groups} * model_lod_count;
-constexpr std::size_t bin_counts_uint_offset = 20ULL * source_capacity;
+constexpr std::size_t bin_counts_uint_offset = 5ULL * model_lod_count * source_capacity;
 constexpr std::size_t scratch_uint_offset =
     bin_counts_uint_offset + max_binned_commands * visibility_depth_bins;
 constexpr VkDeviceSize visible_capacity =
-    32ULL +
-    (20ULL * source_capacity + max_binned_commands * visibility_depth_bins +
+    visibility_header_bytes +
+    (5ULL * model_lod_count * source_capacity + max_binned_commands * visibility_depth_bins +
      4ULL * source_capacity) *
         sizeof(std::uint32_t);
 static_assert(source_capacity == 100'001ULL,
               "Update kMaxSceneSources in shaders/visibility_bins_common.glsl");
-static_assert(max_binned_commands == 4096ULL * 4ULL,
+static_assert(max_binned_commands == 4096ULL * 6ULL,
               "Update kMaxBinnedCommands in shaders/visibility_bins_common.glsl");
 static_assert(visibility_depth_bins == 16ULL,
               "Update kDepthBins in shaders/visibility_bins_common.glsl");
+
+VisibilityGroup model_visibility_group(
+    const std::array<std::uint32_t, model_lod_count>& counts,
+    const std::array<std::uint32_t, model_lod_count>& firsts,
+    const std::array<float, model_lod_count>& errors, bool skinned) noexcept {
+    VisibilityGroup group{};
+    for (std::size_t i = 0; i < (skinned ? 1U : model_lod_count); ++i) {
+        group.counts[i] = counts[i];
+        group.firsts[i] = firsts[i];
+        group.errors[i] = std::isfinite(errors[i]) ? errors[i] : (counts[i] ? 0.0F : -1.0F);
+    }
+    return group;
+}
 
 void barrier(VkCommandBuffer command, VkBuffer buffer, VkPipelineStageFlags2 src,
              VkAccessFlags2 src_access, VkPipelineStageFlags2 dst, VkAccessFlags2 dst_access,
@@ -336,7 +349,7 @@ void Renderer::create_gpu_visibility() {
                       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, "GPU shadow visibility uniforms");
         mapped_buffer(f.staging, commands_offset + command_capacity,
                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT, "GPU visibility static upload");
-        mapped_buffer(f.readback, 32, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        mapped_buffer(f.readback, visibility_header_bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                       "GPU visibility statistics", true);
         f.dirty_records.reserve(source_capacity);
         f.dirty_flags.resize(source_capacity, 0);
@@ -804,11 +817,11 @@ void Renderer::record_shadow_visibility(VkCommandBuffer command, FrameContext &f
     f.shadow_uniform.write(std::as_bytes(std::span{&shadow_uniforms, 1}));
 
     const VkDeviceSize cmd_bytes =
-        VkDeviceSize{group_count} * 16ULL * sizeof(VkDrawIndexedIndirectCommand);
+        VkDeviceSize{group_count} * 4ULL * model_lod_count * sizeof(VkDrawIndexedIndirectCommand);
     const VkDeviceSize shadow_visible_offset =
-        32ULL + 4ULL * VkDeviceSize{source_count} * sizeof(std::uint32_t);
+        visibility_header_bytes + model_lod_count * VkDeviceSize{source_count} * sizeof(std::uint32_t);
     const VkDeviceSize shadow_visible_bytes =
-        16ULL * VkDeviceSize{source_count} * sizeof(std::uint32_t);
+        4ULL * model_lod_count * VkDeviceSize{source_count} * sizeof(std::uint32_t);
 
     barrier(command, f.shadow_indirect.handle(), VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
             VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -818,7 +831,7 @@ void Renderer::record_shadow_visibility(VkCommandBuffer command, FrameContext &f
     vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE,
                             shadow_visibility_pipeline_layout_.get(), 0U, 1U,
                             &f.shadow_descriptor, 0U, nullptr);
-    vkCmdDispatch(command, (group_count * 16U + 63U) / 64U, 1U, 1U);
+    vkCmdDispatch(command, (group_count * 4U * static_cast<std::uint32_t>(model_lod_count) + 63U) / 64U, 1U, 1U);
 
     barrier(command, f.shadow_indirect.handle(), VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -848,52 +861,28 @@ void Renderer::build_gpu_visibility_scene(std::uint32_t plane_count, std::uint32
     visibility_groups_.clear();
     visibility_commands_.clear();
     const auto count = static_cast<std::uint32_t>(scene_metadata_.size());
-    const auto sanitize_error = [](std::uint32_t lod_indices, float err) {
-        return std::isfinite(err) ? err : (lod_indices > 0U ? 0.0F : -1.0F);
-    };
     const auto group = [&](std::uint32_t first, std::uint32_t instances,
-                           std::int32_t vertex_offset, bool force_lod0, glm::uvec4 counts,
-                           glm::uvec4 firsts, glm::vec4 errors) {
+                           std::int32_t vertex_offset, bool force_lod0, VisibilityGroup data) {
         const auto g = static_cast<std::uint32_t>(visibility_groups_.size());
-        visibility_groups_.push_back(
-            {{first, instances, static_cast<std::uint32_t>(vertex_offset), force_lod0 ? 1U : 0U},
-             counts,
-             firsts,
-             errors});
+        data.range = {first, instances, static_cast<std::uint32_t>(vertex_offset), force_lod0 ? 1U : 0U};
+        visibility_groups_.push_back(data);
         for (auto i = first; i < first + instances; ++i) {
             const auto &bounds = scene_metadata_[i].local_bounds;
             visibility_sources_[i] = {{bounds.center, float(g)}, {bounds.extent, 0}};
         }
-        for (glm::length_t lod = 0; lod < 4; ++lod) {
-            visibility_commands_.push_back({counts[lod], 0U, firsts[lod], vertex_offset,
+        for (std::size_t lod = 0; lod < model_lod_count; ++lod) {
+            visibility_commands_.push_back({data.counts[lod], 0U, data.firsts[lod], vertex_offset,
                                             first + static_cast<unsigned>(lod) * count});
         }
     };
-    group(0, editor_ground_count_, plane_vertex, false, {plane_count, 0, 0, 0},
-          {plane_first, 0, 0, 0}, {0.0F, -1.0F, -1.0F, -1.0F});
-    group(editor_ground_count_, editor_cube_count_, 0, false, {cube_count, 0, 0, 0}, {},
-          {0.0F, -1.0F, -1.0F, -1.0F});
+    group(0, editor_ground_count_, plane_vertex, false, {.counts = {plane_count}, .firsts = {plane_first}});
+    group(editor_ground_count_, editor_cube_count_, 0, false, {.counts = {cube_count}});
     for (const auto &draw : editor_model_draws_) {
         const auto &mesh = editor_model_assets_[draw.asset_index].submeshes[draw.submesh_index];
         const bool tessellated = model_tessellation_enabled_ && draw.tessellation.enabled();
-        const bool skinned = draw.uses_skinned_pool;
+        const bool skinned = draw.uses_skinned_pool && !editor_model_assets_[draw.asset_index].skinned_lods;
         group(draw.first_instance, draw.instance_count, draw.vertex_offset, tessellated || skinned,
-              skinned
-                  ? glm::uvec4{mesh.lod_count[0], 0U, 0U, 0U}
-                  : glm::uvec4{
-                        mesh.lod_count[0], mesh.lod_count[1], mesh.lod_count[2], mesh.lod_count[3]},
-              skinned
-                  ? glm::uvec4{mesh.lod_first[0], 0U, 0U, 0U}
-                  : glm::uvec4{
-                        mesh.lod_first[0], mesh.lod_first[1], mesh.lod_first[2], mesh.lod_first[3]},
-              skinned
-                  ? glm::vec4{
-                        sanitize_error(mesh.lod_count[0], mesh.lod_error[0]), -1.0F, -1.0F, -1.0F}
-                  : glm::vec4{
-                        sanitize_error(mesh.lod_count[0], mesh.lod_error[0]),
-                        sanitize_error(mesh.lod_count[1], mesh.lod_error[1]),
-                        sanitize_error(mesh.lod_count[2], mesh.lod_error[2]),
-                        sanitize_error(mesh.lod_count[3], mesh.lod_error[3])});
+              model_visibility_group(mesh.lod_count, mesh.lod_first, mesh.lod_error, skinned));
     }
     std::fill(node_record_heads_.begin(), node_record_heads_.end(), UINT32_MAX);
     node_record_next_.assign(count, UINT32_MAX);
@@ -933,42 +922,22 @@ void Renderer::build_gpu_visibility_scene(std::uint32_t plane_count, std::uint32
 void Renderer::sync_gpu_visibility_skinned_draws() noexcept {
     if (visibility_pipeline_.get() == VK_NULL_HANDLE ||
         visibility_groups_.size() != 2U + editor_model_draws_.size() ||
-        visibility_commands_.size() != visibility_groups_.size() * 4U) {
+        visibility_commands_.size() != visibility_groups_.size() * model_lod_count) {
         return;
     }
-    const auto sanitize_error = [](std::uint32_t lod_indices, float err) {
-        return std::isfinite(err) ? err : (lod_indices > 0U ? 0.0F : -1.0F);
-    };
     const auto count = static_cast<std::uint32_t>(scene_metadata_.size());
     for (std::size_t d = 0U; d < editor_model_draws_.size(); ++d) {
         const auto &draw = editor_model_draws_[d];
         const auto &mesh = editor_model_assets_[draw.asset_index].submeshes[draw.submesh_index];
         const bool tessellated = model_tessellation_enabled_ && draw.tessellation.enabled();
-        const bool skinned = draw.uses_skinned_pool;
+        const bool skinned = draw.uses_skinned_pool && !editor_model_assets_[draw.asset_index].skinned_lods;
         VisibilityGroup &grp = visibility_groups_[2U + d];
+        grp = model_visibility_group(mesh.lod_count, mesh.lod_first, mesh.lod_error, skinned);
         grp.range = {draw.first_instance, draw.instance_count,
                      static_cast<std::uint32_t>(draw.vertex_offset),
                      (tessellated || skinned) ? 1U : 0U};
-        grp.counts =
-            skinned
-                ? glm::uvec4{mesh.lod_count[0], 0U, 0U, 0U}
-                : glm::uvec4{mesh.lod_count[0], mesh.lod_count[1], mesh.lod_count[2],
-                             mesh.lod_count[3]};
-        grp.firsts =
-            skinned
-                ? glm::uvec4{mesh.lod_first[0], 0U, 0U, 0U}
-                : glm::uvec4{mesh.lod_first[0], mesh.lod_first[1], mesh.lod_first[2],
-                             mesh.lod_first[3]};
-        grp.errors =
-            skinned
-                ? glm::vec4{sanitize_error(mesh.lod_count[0], mesh.lod_error[0]), -1.0F, -1.0F,
-                            -1.0F}
-                : glm::vec4{sanitize_error(mesh.lod_count[0], mesh.lod_error[0]),
-                            sanitize_error(mesh.lod_count[1], mesh.lod_error[1]),
-                            sanitize_error(mesh.lod_count[2], mesh.lod_error[2]),
-                            sanitize_error(mesh.lod_count[3], mesh.lod_error[3])};
-        const std::size_t cmd_base = (2U + d) * 4U;
-        for (glm::length_t lod = 0; lod < 4; ++lod) {
+        const std::size_t cmd_base = (2U + d) * model_lod_count;
+        for (std::size_t lod = 0; lod < model_lod_count; ++lod) {
             visibility_commands_[cmd_base + static_cast<std::size_t>(lod)] = {
                 grp.counts[lod], 0U, grp.firsts[lod], draw.vertex_offset,
                 draw.first_instance + static_cast<unsigned>(lod) * count};
@@ -1305,22 +1274,22 @@ void Renderer::record_gpu_visibility(VkCommandBuffer command, FrameContext &fram
 
     const auto commands_bytes = visibility_commands_.size() * sizeof(VkDrawIndexedIndirectCommand);
     const VkDeviceSize main_visible_bytes =
-        32ULL + 4ULL * VkDeviceSize{scene_metadata_.size()} * sizeof(std::uint32_t);
+        visibility_header_bytes + model_lod_count * VkDeviceSize{scene_metadata_.size()} * sizeof(std::uint32_t);
     const bool binned =
         visibility_settings_.coarse_front_to_back &&
         !scene_metadata_.empty() && !visibility_commands_.empty() &&
         visibility_groups_.size() <= max_shadow_draw_groups;
     const VkDeviceSize bin_counts_byte_offset =
-        32ULL + bin_counts_uint_offset * sizeof(std::uint32_t);
+        visibility_header_bytes + bin_counts_uint_offset * sizeof(std::uint32_t);
     const VkDeviceSize bin_counts_bytes =
         VkDeviceSize{visibility_commands_.size()} * visibility_depth_bins * sizeof(std::uint32_t);
     const VkDeviceSize scratch_byte_offset =
-        32ULL + scratch_uint_offset * sizeof(std::uint32_t);
+        visibility_header_bytes + scratch_uint_offset * sizeof(std::uint32_t);
     const VkDeviceSize scratch_bytes =
         4ULL * VkDeviceSize{scene_metadata_.size()} * sizeof(std::uint32_t);
     const VkBufferCopy commands{commands_offset, 0, commands_bytes};
     vkCmdCopyBuffer(command, f.staging.handle(), f.indirect.handle(), 1, &commands);
-    vkCmdFillBuffer(command, f.visible.handle(), 0, 32, 0);
+    vkCmdFillBuffer(command, f.visible.handle(), 0, visibility_header_bytes, 0);
     if (binned) {
         vkCmdFillBuffer(command, f.visible.handle(), bin_counts_byte_offset, bin_counts_bytes, 0);
     }
@@ -1398,7 +1367,7 @@ void Renderer::record_gpu_visibility(VkCommandBuffer command, FrameContext &fram
     barrier(command, f.indirect.handle(), VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
             VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT, 0U, commands_bytes);
-    const VkBufferCopy counters{0, 0, 32};
+    const VkBufferCopy counters{0, 0, visibility_header_bytes};
     vkCmdCopyBuffer(command, f.visible.handle(), f.readback.handle(), 1, &counters);
     barrier(command, f.readback.handle(), VK_PIPELINE_STAGE_2_TRANSFER_BIT,
             VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT,
@@ -1419,17 +1388,17 @@ void Renderer::read_gpu_visibility(FrameContext &frame) {
         return;
     }
     // The frame fence has already completed. No GPU wait or allocation here.
-    const auto bytes = f.readback.read_completed_bytes(32);
-    std::array<std::uint32_t, 8> counters{};
-    std::memcpy(counters.data(), bytes.data(), 32);
+    const auto bytes = f.readback.read_completed_bytes(visibility_header_bytes);
+    std::array<std::uint32_t, 4U + model_lod_count> counters{};
+    std::memcpy(counters.data(), bytes.data(), sizeof(counters));
     auto &stats = visibility_statistics_;
     stats = {};
     stats.submitted = f.statistics_sources;
     stats.visible = counters[0];
     stats.frustum_rejected = counters[1];
     stats.occlusion_rejected = counters[2];
-    stats.lod_instances = {counters[3], counters[4], counters[5], counters[7]};
-    stats.triangles = counters[6];
+    std::copy_n(counters.begin() + 4, model_lod_count, stats.lod_instances.begin());
+    stats.triangles = counters[3];
     stats.packet_revision = packet_revision_;
     assert(stats.visible + stats.frustum_rejected + stats.occlusion_rejected == stats.submitted);
 }

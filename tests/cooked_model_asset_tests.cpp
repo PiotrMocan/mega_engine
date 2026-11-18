@@ -976,6 +976,10 @@ int main() {
     const auto masked = vcr::load_cooked_model_asset(asset_root, foliage.metadata_relative);
     expect(masked && masked->materials[0].coverage == ((16384U << 16U) | 3U),
            "masked two-sided coverage survives cooked load");
+    foliage.material["name"] = "MI_Clasters_Grass 123";
+    expect(write_json(foliage.material_absolute, foliage.material), "legacy masked grass material written");
+    const auto legacy_grass = vcr::load_cooked_model_asset(asset_root, foliage.metadata_relative);
+    expect(legacy_grass && legacy_grass->vegetation, "legacy masked grass opts into vegetation defaults");
     foliage.material["occlusion_in_metallic_roughness"] = true;
     expect(write_json(foliage.material_absolute, foliage.material), "packed occlusion material written");
     const auto with_ao = vcr::load_cooked_model_asset(asset_root, foliage.metadata_relative);
@@ -1130,11 +1134,11 @@ int main() {
 
         std::vector<std::uint8_t> v2_bytes;
         std::string serialize_error;
-        const bool serialized = vcr::serialize_prebaked_vcrmesh_v2(
+        const bool serialized = vcr::serialize_prebaked_vcrmesh(
             prebaked, v2_bytes, serialize_error);
         expect(serialized && serialize_error.empty() &&
                    v2_bytes.size() == (40U + 2U * 72U + 11U * 48U + 27U * 4U),
-               "serialize_prebaked_vcrmesh_v2 emits exact v2 header, 72B submeshes, vertices, and indices");
+               "serialize_prebaked_vcrmesh emits exact v2 header, 72B submeshes, vertices, and indices");
 
         prebaked_fx.metadata["prebaked_lods"] = true;
         prebaked_fx.metadata["generate_lods"] = false;
@@ -1173,16 +1177,16 @@ int main() {
                    "v2 bulk-copied vertices and indices match input");
             expect(prebaked_loaded->submeshes.size() == 2U &&
                        prebaked_loaded->submeshes[0U].lod_first ==
-                           std::array<std::uint32_t, 4U>{0U, 12U, 15U, 18U} &&
+                           std::array<std::uint32_t, vcr::model_lod_count>{0U, 12U, 15U, 18U} &&
                        prebaked_loaded->submeshes[0U].lod_count ==
-                           std::array<std::uint32_t, 4U>{6U, 3U, 3U, 3U} &&
+                           std::array<std::uint32_t, vcr::model_lod_count>{6U, 3U, 3U, 3U} &&
                        prebaked_loaded->submeshes[0U].lod_error ==
-                           std::array<float, 4U>{0.0F, 0.015F, 0.045F, 0.12F},
+                           std::array<float, vcr::model_lod_count>{0.0F, 0.015F, 0.045F, 0.12F, pos_inf, pos_inf},
                    "submesh 0 prebaked LOD0..3 ranges and errors are preserved");
             expect(prebaked_loaded->submeshes[1U].lod_first ==
-                           std::array<std::uint32_t, 4U>{6U, 21U, 24U, 27U} &&
+                           std::array<std::uint32_t, vcr::model_lod_count>{6U, 21U, 24U, 27U} &&
                        prebaked_loaded->submeshes[1U].lod_count ==
-                           std::array<std::uint32_t, 4U>{6U, 3U, 3U, 0U} &&
+                           std::array<std::uint32_t, vcr::model_lod_count>{6U, 3U, 3U, 0U} &&
                        prebaked_loaded->submeshes[1U].lod_error[0U] == 0.0F &&
                        prebaked_loaded->submeshes[1U].lod_error[1U] == 0.02F &&
                        prebaked_loaded->submeshes[1U].lod_error[2U] == 0.06F &&
@@ -1205,6 +1209,26 @@ int main() {
             expect(all_proxy_tris_lod0,
                    "collision proxy never references LOD1..3-only vertices");
         }
+
+        // A v3 record carries both extra levels, including intentional removal.
+        auto extended = prebaked;
+        auto& extended_mesh = extended.submeshes[0];
+        extended_mesh.lod_first[4] = 18U;
+        extended_mesh.lod_count[4] = 3U;
+        extended_mesh.lod_error[4] = 0.25F;
+        extended_mesh.lod_error[5] = 0.5F;
+        std::vector<std::uint8_t> v3_bytes;
+        expect(vcr::serialize_prebaked_vcrmesh(extended, v3_bytes, serialize_error) &&
+                   v3_bytes.size() == v2_bytes.size() + 48U &&
+                   write_bytes(prebaked_fx.mesh_absolute, std::as_bytes(std::span{v3_bytes})),
+               "six-level prebaked mesh stores two extra ranges per section");
+        const auto v3_loaded = vcr::load_cooked_model_asset(asset_root, prebaked_fx.metadata_relative);
+        expect(v3_loaded && v3_loaded->submeshes[0].lod_first == extended_mesh.lod_first &&
+                   v3_loaded->submeshes[0].lod_count == extended_mesh.lod_count &&
+                   v3_loaded->submeshes[0].lod_error == extended_mesh.lod_error,
+               "v3 round-trips the added geometry and intentional removal");
+        expect(write_bytes(prebaked_fx.mesh_absolute, std::as_bytes(std::span{v2_bytes})),
+               "restore the legacy binary for corruption tests");
 
         // Verify downsampled (>16384 tris) collision proxy path also excludes LOD1..3:
         {
@@ -1243,7 +1267,7 @@ int main() {
             };
             std::vector<std::uint8_t> dense_bytes;
             std::string dense_err;
-            expect(vcr::serialize_prebaked_vcrmesh_v2(dense, dense_bytes, dense_err),
+            expect(vcr::serialize_prebaked_vcrmesh(dense, dense_bytes, dense_err),
                    "dense prebaked v2 mesh serialized");
             dense_fx.metadata["prebaked_lods"] = true;
             dense_fx.metadata["generate_lods"] = false;
@@ -1379,40 +1403,40 @@ int main() {
                    "bulk-copy v1 parse_mesh rejects non-finite vertex attributes");
         }
 
-        // serialize_prebaked_vcrmesh_v2 validation failures:
+        // serialize_prebaked_vcrmesh validation failures:
         {
             std::vector<std::uint8_t> tmp_bytes{1U, 2U, 3U};
             std::string tmp_err;
 
             auto bad_vert = prebaked;
             bad_vert.vertices[0U].normal[1U] = qnan;
-            expect(!vcr::serialize_prebaked_vcrmesh_v2(bad_vert, tmp_bytes, tmp_err) &&
+            expect(!vcr::serialize_prebaked_vcrmesh(bad_vert, tmp_bytes, tmp_err) &&
                        tmp_bytes.empty() && !tmp_err.empty(),
-                   "serialize_prebaked_vcrmesh_v2 rejects non-finite vertex");
+                   "serialize_prebaked_vcrmesh rejects non-finite vertex");
 
             auto bad_idx = prebaked;
             bad_idx.indices.back() = 99U;
-            expect(!vcr::serialize_prebaked_vcrmesh_v2(bad_idx, tmp_bytes, tmp_err) &&
+            expect(!vcr::serialize_prebaked_vcrmesh(bad_idx, tmp_bytes, tmp_err) &&
                        tmp_bytes.empty() && !tmp_err.empty(),
-                   "serialize_prebaked_vcrmesh_v2 rejects out-of-range index");
+                   "serialize_prebaked_vcrmesh rejects out-of-range index");
 
             auto bad_lod_mod = prebaked;
             bad_lod_mod.submeshes[0U].lod_count[1U] = 2U;
-            expect(!vcr::serialize_prebaked_vcrmesh_v2(bad_lod_mod, tmp_bytes, tmp_err) &&
+            expect(!vcr::serialize_prebaked_vcrmesh(bad_lod_mod, tmp_bytes, tmp_err) &&
                        tmp_bytes.empty() && !tmp_err.empty(),
-                   "serialize_prebaked_vcrmesh_v2 rejects lod_count not divisible by 3");
+                   "serialize_prebaked_vcrmesh rejects lod_count not divisible by 3");
 
             auto bad_lod_inf = prebaked;
             bad_lod_inf.submeshes[0U].lod_error[1U] = pos_inf;
-            expect(!vcr::serialize_prebaked_vcrmesh_v2(bad_lod_inf, tmp_bytes, tmp_err) &&
+            expect(!vcr::serialize_prebaked_vcrmesh(bad_lod_inf, tmp_bytes, tmp_err) &&
                        tmp_bytes.empty() && !tmp_err.empty(),
-                   "serialize_prebaked_vcrmesh_v2 rejects +inf error on non-empty LOD");
+                   "serialize_prebaked_vcrmesh rejects +inf error on non-empty LOD");
 
             auto bad_lod0_err = prebaked;
             bad_lod0_err.submeshes[0U].lod_error[0U] = 0.01F;
-            expect(!vcr::serialize_prebaked_vcrmesh_v2(bad_lod0_err, tmp_bytes, tmp_err) &&
+            expect(!vcr::serialize_prebaked_vcrmesh(bad_lod0_err, tmp_bytes, tmp_err) &&
                        tmp_bytes.empty() && !tmp_err.empty(),
-                   "serialize_prebaked_vcrmesh_v2 rejects non-zero lod_error[0]");
+                   "serialize_prebaked_vcrmesh rejects non-zero lod_error[0]");
         }
     }
 

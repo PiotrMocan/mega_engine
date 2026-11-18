@@ -3,6 +3,7 @@
 #include "fog.hpp"
 #include "exposure.hpp"
 #include "lighting_settings.hpp"
+#include "lod_transition.hpp"
 #include "ocean_settings.hpp"
 #include "pbr_material.hpp"
 #include "punctual_light.hpp"
@@ -66,11 +67,14 @@ struct SceneTransform {
     friend bool operator==(const SceneTransform&, const SceneTransform&) = default;
 };
 
+enum class ObjectAntiAliasing : std::uint8_t { asset, off, coverage };
+
 struct SceneNode {
     std::string name;
     // UTF-8 generic path to a .vcrasset.json file, relative to the
     // editor's assets root. Required only for model nodes.
     std::string asset_path;
+    ObjectAntiAliasing detail_aa = ObjectAntiAliasing::asset;
     SceneTransform transform{};
     PbrMaterial material{};
     PunctualLight light{};
@@ -138,6 +142,7 @@ struct SceneModelInstance {
     // mutating the document.
     std::string_view asset_path{};
     SceneNodeId id{};
+    ObjectAntiAliasing detail_aa = ObjectAntiAliasing::asset;
 };
 
 struct ScenePunctualLight {
@@ -179,6 +184,7 @@ public:
     SceneNodeId startup_camera{};
     std::optional<LightingSettings> lighting{};
     std::optional<ToneMapper> tone_mapper{};
+    std::optional<LodFadePattern> lod_fade{};
     std::optional<ExposureSettings> exposure{};
     std::optional<SubsurfaceMode> subsurface{};
     std::optional<FogSettings> fog{};

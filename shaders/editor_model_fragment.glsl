@@ -20,6 +20,8 @@ layout(early_fragment_tests) in;
 layout(early_fragment_tests) in;
 #endif
 
+layout(constant_id = 8) const bool useAlphaToCoverage = false;
+
 // Locations 0..5 (non-temporal) and 0..7 (temporal) intentionally match
 // scene.frag / scene_aa.frag's vertex interface.
 layout(location = 0) in vec3 inWorldNormal;
@@ -70,7 +72,7 @@ vec3 safeNormalize(vec3 value, vec3 fallback)
     return value * inversesqrt(lengthSquared);
 }
 
-vec3 sampleWorldNormal(vec2 uvDx, vec2 uvDy)
+vec3 sampleWorldNormal(vec2 uvDx, vec2 uvDy, bool foliage, out float mapVariance)
 {
     const vec3 geometricNormal =
         safeNormalize(inWorldNormal, vec3(0.0, 1.0, 0.0));
@@ -98,9 +100,13 @@ vec3 sampleWorldNormal(vec2 uvDx, vec2 uvDy)
         dot(unorientedBitangent, inWorldBitangent) < 0.0
         ? -unorientedBitangent
         : unorientedBitangent;
-    const vec3 tangentNormal = safeNormalize(
-        textureGrad(materialNormalTexture, inUv, uvDx, uvDy).xyz * 2.0 - 1.0,
-        vec3(0.0, 0.0, 1.0));
+    const vec3 filtered = textureGrad(materialNormalTexture, inUv, uvDx, uvDy).xyz * 2.0 - 1.0;
+    // A short mip-filtered vector represents many unresolved leaf normals.
+    // Restore the lost angular variance to the lighting lobe instead of
+    // amplifying a nearly cancelled direction into a full-strength highlight.
+    mapVariance = foliage ? clamp(1.0 - dot(filtered, filtered), 0.0, 1.0) : 0.0;
+    const vec3 tangentNormal = safeNormalize(mix(filtered, vec3(0, 0, 1), mapVariance),
+                                             vec3(0.0, 0.0, 1.0));
     return materialFaceNormal(pushConstants.padding, safeNormalize(
         tangent * tangentNormal.x
         + bitangent * tangentNormal.y
@@ -113,6 +119,9 @@ void main()
     // Derivatives after nonuniform discard are undefined. All material maps
     // share authored UVs and surface/tangent variance gradients must execute
     // before any coverage discard so helper invocations remain valid.
+    float hairFootprint = 0.0;
+    if (inMaterialModel == 4u)
+        hairFootprint = length(vec2(dFdx(inMaterialParameters.w), dFdy(inMaterialParameters.w)));
     const vec2 rawUvDx = dFdx(inUv);
     const vec2 rawUvDy = dFdy(inUv);
     const vec3 dWorldDx = dFdx(inWorldPosition);
@@ -120,11 +129,15 @@ void main()
     const bool inUnitUv =
         inUv.x >= 0.0 && inUv.x <= 1.0 &&
         inUv.y >= 0.0 && inUv.y <= 1.0;
+    // On a minified leaf card a large UV derivative is the real pixel footprint.
+    // Use the same gradients as the cutout depth and shadow passes.
+    const bool filteredDetail = (pushConstants.padding & kMaterialDetailAaBit) != 0u;
+    const bool correctWrap = !filteredDetail && (pushConstants.padding & kMaterialAlphaMaskBit) == 0u;
     const bool wrapJumpX =
-        inUnitUv && dot(dWorldDx, dWorldDx) < 0.01 &&
+        correctWrap && inUnitUv && dot(dWorldDx, dWorldDx) < 0.01 &&
         (abs(rawUvDx.x) > 0.50 || abs(rawUvDx.y) > 0.50);
     const bool wrapJumpY =
-        inUnitUv && dot(dWorldDy, dWorldDy) < 0.01 &&
+        correctWrap && inUnitUv && dot(dWorldDy, dWorldDy) < 0.01 &&
         (abs(rawUvDy.x) > 0.50 || abs(rawUvDy.y) > 0.50);
     vec2 uvDx = wrapJumpX
         ? (wrapJumpY
@@ -158,29 +171,42 @@ void main()
             const vec3 dTdy = dFdy(preFiberTangent);
             hairTanVar = min(dot(dTdx, dTdx) + dot(dTdy, dTdy), 0.30);
         } else {
-            surfaceNormal = sampleWorldNormal(uvDx, uvDy);
+            float mapVariance;
+            surfaceNormal = sampleWorldNormal(uvDx, uvDy, filteredDetail, mapVariance);
             const vec3 dNdx = dFdx(surfaceNormal);
             const vec3 dNdy = dFdy(surfaceNormal);
-            normVar = min(dot(dNdx, dNdx) + dot(dNdy, dNdy), 0.25);
+            normVar = min(dot(dNdx, dNdx) + dot(dNdy, dNdy) + mapVariance, 0.25);
         }
     }
 
-#if !defined(VCR_OPAQUE_EARLY_Z) && !defined(VCR_TRANSPARENT_PASS)
-    if (!lodKeep(inLodToken, uvec2(gl_FragCoord.xy))) discard;
-#endif
     const vec4 sampledBaseColor =
         textureGrad(materialBaseColorTexture, inUv, uvDx, uvDy);
     const vec4 baseColor = sampledBaseColor * inBaseColor;
+    float cutoutCoverage = baseColor.a;
+    if (useAlphaToCoverage && (pushConstants.padding & kMaterialAlphaMaskBit) != 0u) {
+        // MSAA samples represent coverage of the authored isocontour. Raw
+        // atlas opacity can be low across an entire opaque needle or leaf.
+        const float cutoff = float(pushConstants.padding >> 16u) / 65535.0;
+        cutoutCoverage = clamp(0.5 + (baseColor.a - cutoff) / max(fwidth(baseColor.a), 1.0 / 255.0), 0.0, 1.0);
+    }
 #if !defined(VCR_OPAQUE_EARLY_Z) && !defined(VCR_TRANSPARENT_PASS)
+    if (!lodKeep(inLodToken, uvec2(gl_FragCoord.xy))) discard;
     if (!materialKeepsAlpha(pushConstants.padding, baseColor.a)) discard;
 #endif
 
     const float kHairOpaqueCoreThreshold = 0.78;
     float strandCoverage = clamp(baseColor.a, 0.0, 1.0);
-    if (inMaterialModel == 4u && abs(inMaterialParameters.w) > 0.001) {
+    if (inMaterialModel == 4u) {
         const float edgeS = clamp(inMaterialParameters.w, -1.0, 1.0);
         const float cyl = sqrt(max(1.0 - edgeS * edgeS, 0.0));
-        strandCoverage = clamp(baseColor.a * mix(0.38, 1.0, cyl), 0.0, 1.0);
+        // Thin ribbons already spread their optical coverage over a minimum
+        // raster width in the vertex shader. Taper that footprint to zero at
+        // the edges to avoid a step when a sample enters or leaves the ribbon.
+        // 1.30 * integral(1-s*s) matches the resolved cylinder profile area.
+        const float filtered = 1.30 * (1.0 - edgeS * edgeS);
+        const float profile = mix(mix(0.38, 1.0, cyl), filtered,
+                                  filteredDetail ? smoothstep(0.5, 1.35, hairFootprint) : 0.0);
+        strandCoverage = clamp(baseColor.a * profile, 0.0, 1.0);
     }
 #if !defined(VCR_OPAQUE_EARLY_Z) && !defined(VCR_TRANSPARENT_PASS)
     if (inMaterialModel == 4u && strandCoverage < kHairOpaqueCoreThreshold) discard;
@@ -289,9 +315,11 @@ void main()
     outColor = vec4(premulRgb, effectiveAlpha);
 #endif
 #else
-    const float opaqueOutputAlpha =
+    // Negative HDR alpha is reserved for selected visible surfaces on the 1x
+    // spatial path. MSAA alpha-to-coverage and temporal inputs keep normal alpha.
+    const float opaqueOutputAlpha = (pushConstants.padding & kMaterialLocalResolveBit) != 0u ? -1.0 :
         (inMaterialModel != 4u && (pushConstants.padding & kMaterialAlphaMaskBit) != 0u)
-            ? baseColor.a
+            ? cutoutCoverage
             : 1.0;
     writeLitSurface(
         lightingComponents.diffuse, lightingComponents.specular + emittedRadiance,

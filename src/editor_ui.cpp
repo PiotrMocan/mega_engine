@@ -3356,6 +3356,12 @@ void EditorUi::build_inspector(
         if (node.kind == SceneNodeKind::model) {
             ui_kit_.property_row("Asset");
             ImGui::TextWrapped("%s", node.asset_path.c_str());
+            ui_kit_.property_row("Detail AA");
+            int selected = static_cast<int>(node.detail_aa);
+            if (ImGui::Combo("##ObjectDetailAA", &selected, "Asset default\0Off\0Filtered coverage\0")) {
+                node.detail_aa = static_cast<ObjectAntiAliasing>(selected);
+                changed = true;
+            }
         }
         ui_kit_.end_property_grid();
     }
@@ -12168,8 +12174,12 @@ void EditorUi::build_performance(
     }
     if (ImGui::BeginCombo("Model LOD fade", to_token(renderer.lod_fade_pattern()).data())) {
         for (const auto pattern : {LodFadePattern::off, LodFadePattern::bayer4, LodFadePattern::bayer8}) {
-            if (ImGui::Selectable(to_token(pattern).data(), renderer.lod_fade_pattern() == pattern))
-                static_cast<void>(renderer.set_lod_fade(pattern, renderer.lod_fade_seconds()));
+            if (ImGui::Selectable(to_token(pattern).data(), renderer.lod_fade_pattern() == pattern) &&
+                pattern != renderer.lod_fade_pattern() && renderer.set_lod_fade(pattern, renderer.lod_fade_seconds())) {
+                checkpoint_scene(scene);
+                scene.lod_fade = pattern;
+                scene.mark_content_changed();
+            }
         }
         ImGui::EndCombo();
     }
@@ -12290,8 +12300,9 @@ void EditorUi::build_performance(
                 renderer.visibility_backend());
     ImGui::Text("Rejected: %u frustum, %u occlusion", visible.frustum_rejected,
                 visible.occlusion_rejected);
-    ImGui::Text("LOD instances: %u / %u / %u / %u", visible.lod_instances[0],
-                visible.lod_instances[1], visible.lod_instances[2], visible.lod_instances[3]);
+    ImGui::Text("LOD instances: %u / %u / %u / %u / %u / %u", visible.lod_instances[0],
+                visible.lod_instances[1], visible.lod_instances[2], visible.lod_instances[3],
+                visible.lod_instances[4], visible.lod_instances[5]);
     ImGui::Text("GPU culling %.3f ms, shadows %.3f ms\nGPU postprocess %.3f ms, display %.3f ms, exposure %.3f ms, SSS %.3f ms, motion blur %.3f ms, depth prepass %.3f ms",
                 performance.average.gpu_visibility_ms, performance.average.gpu_shadow_ms,
                 performance.average.gpu_postprocess_ms, performance.average.gpu_display_ms,

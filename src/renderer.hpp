@@ -537,9 +537,9 @@ public:
         bool has_visibility_group = false;
         std::int32_t group_vertex_offset = 0;
         std::uint32_t group_force_lod0 = 0U;
-        glm::uvec4 group_lod_counts{};
-        std::array<std::int32_t, 4> indirect_vertex_offsets{};
-        std::array<std::uint32_t, 4> indirect_index_counts{};
+        std::array<std::uint32_t, model_lod_count> group_lod_counts{};
+        std::array<std::int32_t, model_lod_count> indirect_vertex_offsets{};
+        std::array<std::uint32_t, model_lod_count> indirect_index_counts{};
     };
     [[nodiscard]] RenderedNodeDiagnostics inspect_rendered_node(SceneNodeId id) const noexcept;
     [[nodiscard]] std::uint64_t runtime_transform_revision() const noexcept {
@@ -630,6 +630,8 @@ private:
 
     struct EditorModelAsset {
         std::string relative_path{};
+        bool detail_aa = false;
+        bool skinned_lods = false;
         GpuBuffer vertex_buffer{};
         GpuBuffer index_buffer{};
         GpuBuffer skin_vertex_buffer{};
@@ -907,6 +909,7 @@ private:
     MotionBlurSettings motion_blur_settings_{};
     DepthPrepass depth_prepass_ = DepthPrepass::off;
     bool depth_prepass_override_ = false;
+    bool has_local_aa_draws_ = false;
     LodFadePattern lod_fade_pattern_ = LodFadePattern::off;
     float lod_fade_seconds_ = 0.25F;
     bool lighting_paused_ = false;

@@ -587,9 +587,8 @@ else()
     endif()
 endif()
 
-# Explicit offline asset step. LOD meshes share materials and are compacted;
-# ordinary scene loading reads the prepared four-level chain without simplifying.
-add_executable(vcr_asset_lod_cooker EXCLUDE_FROM_ALL
+# Project preparation scripts use this tool from a normal Windows build.
+add_executable(vcr_asset_lod_cooker
     tools/asset_lod_cooker.cpp
 )
 target_link_libraries(vcr_asset_lod_cooker PRIVATE

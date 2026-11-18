@@ -124,7 +124,7 @@ bool test_all_presets_and_lods() {
             return false;
         }
 
-        for (std::size_t lod = 0U; lod < 4U; ++lod) {
+        for (std::size_t lod = 0U; lod < vcr::model_lod_count; ++lod) {
             const CookedModelAsset& m = asset.lod_models[lod];
             if (!expect(
                     !m.vertices.empty() && !m.indices.empty() &&
@@ -142,8 +142,10 @@ bool test_all_presets_and_lods() {
         if (!expect(
                 asset.report.triangles[0U] > asset.report.triangles[1U] &&
                 asset.report.triangles[1U] > asset.report.triangles[2U] &&
-                asset.report.triangles[2U] > asset.report.triangles[3U],
-                "Preset '" + preset.id + "' triangles must decrease strictly across LOD0..LOD3.")) {
+                asset.report.triangles[2U] > asset.report.triangles[3U] &&
+                asset.report.triangles[3U] > asset.report.triangles[4U] &&
+                asset.report.triangles[4U] > asset.report.triangles[5U],
+                "Preset '" + preset.id + "' triangles must decrease strictly across LOD0..LOD5.")) {
             return false;
         }
 
@@ -189,8 +191,8 @@ bool test_all_presets_and_lods() {
         }
 
         // Verify geometry attributes across LOD0..LOD3
-        std::array<double, 4U> foliage_areas{};
-        for (std::size_t lod = 0U; lod < 4U; ++lod) {
+        std::array<double, vcr::model_lod_count> foliage_areas{};
+        for (std::size_t lod = 0U; lod < vcr::model_lod_count; ++lod) {
             const CookedModelAsset& m = asset.lod_models[lod];
             for (const CookedModelMaterial& mat : m.materials) {
                 if (!expect(
@@ -337,7 +339,7 @@ bool test_gpu_grass_validation() {
                     std::string(id) + " must report uses_gpu_grass=true and has_grass_textures=true.")) {
                 return false;
             }
-            for (std::size_t lod = 0U; lod < 4U; ++lod) {
+            for (std::size_t lod = 0U; lod < vcr::model_lod_count; ++lod) {
                 const CookedModelAsset& m = asset.lod_models[lod];
                 for (const CookedModelSubmesh& sm : m.submeshes) {
                     const bool grass_ok = validate_gpu_grass_submesh(m.vertices, m.indices, sm, error);
@@ -481,7 +483,7 @@ bool test_export_import_and_preview_round_trip() {
             "load_cooked_model_asset failed for palm: " + loaded_palm.error().message)) {
         return false;
     }
-    if (!expect(loaded_palm->lods.size() == 3U, "Expected 3 LOD references on exported palm.")) {
+    if (!expect(loaded_palm->lods.size() == vcr::model_lod_count - 1U, "Expected 5 LOD references on exported palm.")) {
         return false;
     }
 
@@ -558,20 +560,20 @@ bool test_export_import_and_preview_round_trip() {
         }
     }
 
-    std::array<std::string, 4U> preview_rels{};
+    std::array<std::string, vcr::model_lod_count> preview_rels{};
     const bool preview_ok = export_vegetation_preview_package(
         palm_asset, preview_root, preview_rels, error);
     if (!expect(preview_ok, "Preview package export failed: " + error)) {
         return false;
     }
-    for (std::size_t i = 0U; i < 4U; ++i) {
+    for (std::size_t i = 0U; i < vcr::model_lod_count; ++i) {
         const CookedModelLoadResult pr =
             load_cooked_model_asset(preview_root, preview_rels[i]);
         if (!expect(static_cast<bool>(pr), "Preview LOD load failed: " + pr.error().message)) {
             return false;
         }
         if (i == 0U) {
-            if (!expect(pr->lods.size() == 3U, "Preview slot 0 must expose 3 LOD references.")) {
+            if (!expect(pr->lods.size() == vcr::model_lod_count - 1U, "Preview slot 0 must expose 5 LOD references.")) {
                 return false;
             }
         } else {

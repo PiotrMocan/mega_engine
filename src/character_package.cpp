@@ -6981,6 +6981,8 @@ bool cook_character_package_to_project(
         {"name", slug},
         {"source", source_rel},
         {"source_format", "vcrchar"},
+        {"skinned_lods", true},
+        {"detail_aa", "coverage"},
         {"mesh", mesh_rel},
         {"skeleton", skin_rel},
         {"animations", std::move(anims_array)},

@@ -79,8 +79,10 @@ void state_tests(Checks& check) {
     advance_lod_fade(state, 3, 0.25F, 0.5F, true, false);
     check.expect(near(weight(state, 2), .5) && near(weight(state, 3), .5),
                  "LOD2 to LOD3 half-duration reaches 50/50 weights");
-    advance_lod_fade(state, 4, 0.0F, 1.0F, false, false);
-    check.expect(state.current == 0 && state.previous == 0, "out-of-range LOD4 clamps to LOD0");
+    advance_lod_fade(state, 5, 0.0F, 1.0F, true, true);
+    check.expect(state.current == 5 && state.previous == 5, "coarsest LOD is reachable");
+    advance_lod_fade(state, 6, 0.0F, 1.0F, false, false);
+    check.expect(state.current == 0 && state.previous == 0, "out-of-range LOD6 clamps to LOD0");
     advance_lod_fade(state, 0xffffffffU, 0.0F, 1.0F, false, false);
     check.expect(state.current == 0 && state.previous == 0, "invalid target clamps to LOD0");
 

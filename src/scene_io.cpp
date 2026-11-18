@@ -847,6 +847,14 @@ bool save_scene_file(
         }
         metadata["lighting"] = lighting_json(*scene.lighting);
     }
+    if (scene.lod_fade) {
+        const auto token = to_token(*scene.lod_fade);
+        if (!parse_lod_fade_pattern(token)) {
+            error = "Scene LOD fade pattern is invalid.";
+            return false;
+        }
+        metadata["lod_fade"] = token;
+    }
     if (scene.tone_mapper) {
         if (*scene.tone_mapper != ToneMapper::reinhard &&
             *scene.tone_mapper != ToneMapper::gt7) {
@@ -951,6 +959,8 @@ bool save_scene_file(
             : Json(record.parent_record_index);
         if (node.kind == SceneNodeKind::model) {
             encoded["asset_path"] = node.asset_path;
+            if (node.detail_aa != ObjectAntiAliasing::asset)
+                encoded["detail_aa"] = node.detail_aa == ObjectAntiAliasing::coverage ? "coverage" : "off";
         }
         if (node.kind == SceneNodeKind::ocean) {
             encoded["ocean"] = ocean_json(node.ocean);
@@ -1171,6 +1181,15 @@ bool load_scene_file(
             if (!kind) {
                 error = "Scene node kind is unknown.";
                 return false;
+            }
+            ObjectAntiAliasing detail_aa = ObjectAntiAliasing::asset;
+            if (const auto aa = encoded.find("detail_aa"); aa != encoded.end()) {
+                if (*kind != SceneNodeKind::model || !aa->is_string() || (*aa != "off" && *aa != "coverage" && *aa != "asset")) {
+                    error = "Unknown object detail_aa setting.";
+                    return false;
+                }
+                if (*aa == "off") detail_aa = ObjectAntiAliasing::off;
+                if (*aa == "coverage") detail_aa = ObjectAntiAliasing::coverage;
             }
             std::string asset_path;
             if (*kind == SceneNodeKind::model) {
@@ -1665,6 +1684,7 @@ bool load_scene_file(
             node->get().light = light;
             node->get().ocean = ocean;
             node->get().asset_path = std::move(asset_path);
+            node->get().detail_aa = detail_aa;
             ids.push_back(id);
         }
         if (root.contains("startup_camera")) {
@@ -1697,6 +1717,13 @@ bool load_scene_file(
                 return false;
             }
             loaded.lighting = settings;
+        }
+        if (const auto fade = root.find("lod_fade"); fade != root.end()) {
+            if (!fade->is_string() ||
+                !(loaded.lod_fade = parse_lod_fade_pattern(fade->get_ref<const std::string&>()))) {
+                error = "Scene LOD fade pattern is invalid.";
+                return false;
+            }
         }
         if (root.contains("tone_mapper")) {
             if (!root["tone_mapper"].is_string()) {

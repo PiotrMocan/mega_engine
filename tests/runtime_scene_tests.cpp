@@ -288,8 +288,8 @@ void authored_lod_tests() {
                prepared.submeshes.size() == 2, "authored geometry aggregates per material");
     const auto &metal = prepared.submeshes[0];
     const auto &detail = prepared.submeshes[1];
-    expect(metal.lod_count == std::array<std::uint32_t, 4>{6, 3, 3, 3} && metal.lod_error[3] > metal.lod_error[2] &&
-               detail.lod_count == std::array<std::uint32_t, 4>{3, 3, 0, 0} && std::isfinite(detail.lod_error[3]),
+    expect(metal.lod_count == std::array<std::uint32_t, vcr::model_lod_count>{6, 3, 3, 3} && metal.lod_error[3] > metal.lod_error[2] &&
+               detail.lod_count == std::array<std::uint32_t, vcr::model_lod_count>{3, 3, 0, 0} && std::isfinite(detail.lod_error[3]),
            "legacy authored assets receive a fourth LOD while preserving intentional material removal");
     const auto &shifted = prepared.vertices[prepared.indices[metal.lod_first[1]]];
     expect(shifted.position[1] == .05F &&
@@ -322,9 +322,28 @@ void authored_lod_tests() {
         four_level.lods.push_back({"lod3.vcrasset.json", .4F});
         const std::array full_chain{levels[0], levels[1], levels[1]};
         vcr::prepare_authored_model_lods(four_level, full_chain, 4096);
-        expect(four_level.submeshes[0].lod_count == std::array<std::uint32_t, 4>{6,3,3,3} &&
+        expect(four_level.submeshes[0].lod_count == std::array<std::uint32_t, vcr::model_lod_count>{6,3,3,3} &&
                    four_level.submeshes[0].lod_error[3] == .4F,
                "explicit LOD0..LOD3 chain loads all four authored ranges");
+    }
+    {
+        auto plant = base;
+        plant.vegetation = true;
+        vcr::prepare_authored_model_lods(plant, levels, 4096);
+        expect(plant.submeshes[0].lod_count.back() == 3 && plant.submeshes[1].lod_count.back() == 0 &&
+               plant.submeshes[0].lod_error.back() > plant.submeshes[0].lod_error[3],
+               "authored vegetation keeps material removal and extends the artist's chain to LOD5");
+        auto old_cook = base;
+        old_cook.vegetation = true;
+        old_cook.metadata_relative_path = "plant.vcrasset.json";
+        auto cooked_levels = levels;
+        for (std::size_t i = 0; i < levels.size(); ++i) {
+            old_cook.lods[i].model = "plant_LOD" + std::to_string(i + 1U) + ".vcrasset.json";
+            for (auto& part : cooked_levels[i].submeshes) part.authored_geometric_error = 0.1F;
+        }
+        vcr::prepare_authored_model_lods(old_cook, cooked_levels, 4096);
+        expect(old_cook.submeshes.size() == base.submeshes.size() && old_cook.submeshes[1].lod_count.back() == 3,
+               "old cooker chain recovers a missing far section from source-quality vegetation");
     }
     auto bad_levels = levels;
     bad_levels[1].materials[0].name = "unknown";
@@ -408,7 +427,7 @@ int main() {
         vcr::prepare_model_lods(grass);
         vcr::optimize_model_geometry(grass);
         std::string error;
-        expect(grass.submeshes[0].lod_count == std::array<std::uint32_t, 4>{96,96,96,96} &&
+        expect(grass.submeshes[0].lod_count == std::array<std::uint32_t, vcr::model_lod_count>{96,96,96,96,96,96} &&
             vcr::validate_gpu_grass_submesh(grass.vertices, grass.indices, grass.submeshes[0], error),
             "generic LOD preparation preserves procedural grass encoding across remapping");
     }
@@ -663,7 +682,7 @@ int main() {
                "foliage LOD0 preserves disconnected alpha-masked cards bit-exact");
         expect(cards.lod_count[0] >= cards.lod_count[1] && cards.lod_count[1] >= cards.lod_count[2] &&
                    cards.lod_count[2] >= cards.lod_count[3] && cards.lod_count[3] > 0U,
-               "all four foliage LOD ranges stay valid even at the minimum card topology");
+               "all foliage LOD ranges stay valid even at the minimum card topology");
         for (unsigned level = 1; level < vcr::model_lod_count; ++level) {
             std::array<bool,64> surviving{};
             for (unsigned i = 0; i < cards.lod_count[level]; ++i)
@@ -806,7 +825,8 @@ int main() {
         expect(crown_mesh.lod_count[0] > crown_mesh.lod_count[1] &&
                    crown_mesh.lod_count[1] > crown_mesh.lod_count[2] &&
                    crown_mesh.lod_count[2] > crown_mesh.lod_count[3] &&
-                   crown_mesh.lod_count[3] > 0U &&
+                   crown_mesh.lod_count[3] > crown_mesh.lod_count[4] &&
+                   crown_mesh.lod_count[4] > crown_mesh.lod_count[5] && crown_mesh.lod_count[5] > 0U &&
                    crown_mesh.lod_count[1] <= static_cast<std::uint32_t>(micro_lod0_indices.size() * 0.40) &&
                    crown_mesh.lod_count[2] <= static_cast<std::uint32_t>(micro_lod0_indices.size() * 0.16) &&
                    crown_mesh.lod_count[3] <= static_cast<std::uint32_t>(micro_lod0_indices.size() * 0.08),
@@ -823,6 +843,41 @@ int main() {
                            v.position[axis] <= crown_max[axis] + 1.0e-5F,
                        "micro-card LOD scaling stays strictly inside LOD0 bounds");
             }
+        }
+    }
+    {
+        vcr::CookedModelAsset tuft;
+        tuft.materials.emplace_back().factors.subsurface_profile = vcr::SubsurfaceProfile::foliage;
+        for (unsigned blade = 0; blade < 32; ++blade) {
+            const float x = static_cast<float>(blade) * 0.1F;
+            const auto first = static_cast<std::uint32_t>(tuft.vertices.size());
+            for (const auto [dx, y] : std::array<std::pair<float, float>, 5>{
+                     {{-0.005F, 0}, {0.005F, 0}, {-0.003F, 0.15F}, {0.003F, 0.15F}, {0, 0.25F}}}) {
+                tuft.vertices.push_back({.position = {x + dx, y, 0}});
+            }
+            for (const unsigned corner : {0, 1, 2, 1, 3, 2, 2, 3, 4})
+                tuft.indices.push_back(first + corner);
+        }
+        tuft.submeshes.push_back({.index_count = tuft.indices.size()});
+        vcr::prepare_model_lods(tuft);
+        const auto& part = tuft.submeshes.front();
+        const auto area = [&](std::size_t level) {
+            float sum = 0;
+            for (unsigned i = 0; i < part.lod_count[level]; i += 3) {
+                const auto first = part.lod_first[level] + i;
+                const auto& a = tuft.vertices[tuft.indices[first]].position;
+                const auto& b = tuft.vertices[tuft.indices[first + 1]].position;
+                const auto& c = tuft.vertices[tuft.indices[first + 2]].position;
+                sum += 0.5F * std::abs((b[0]-a[0])*(c[1]-a[1]) - (c[0]-a[0])*(b[1]-a[1]));
+            }
+            return sum;
+        };
+        const float base_area = area(0);
+        for (std::size_t level = 1; level < vcr::model_lod_count; ++level) {
+            expect(part.lod_count[level] < part.lod_count[level - 1] &&
+                   part.lod_count[level] % 9 == 0, "grass LOD retains complete three-triangle blades");
+            expect(area(level) > 0.85F * base_area && area(level) < 1.01F * base_area,
+                   "grass LOD preserves the projected area of the original tuft");
         }
     }
     {

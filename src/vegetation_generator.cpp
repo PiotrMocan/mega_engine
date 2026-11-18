@@ -1229,8 +1229,10 @@ void append_palm_frond_geometry(
     glm::vec3 side_base = safe_normalize(glm::cross(horiz_dir, crown_up), glm::vec3(0.0F, 0.0F, 1.0F));
 
     const float frond_len = spec.half_extent * 2.0F * spec.length_ratio;
-    const float max_half_w = spec.half_extent * 0.42F;
-    const std::uint32_t segs = (lod == 0U) ? 11U : ((lod == 1U) ? 7U : ((lod == 2U) ? 5U : 3U));
+    constexpr std::array<float, model_lod_count> width_scale{1.0F, 1.0F, 1.0F, 1.0F, 1.35F, 1.65F};
+    const float max_half_w = spec.half_extent * 0.42F * width_scale[lod];
+    constexpr std::array<std::uint32_t, model_lod_count> segment_counts{11, 7, 5, 3, 2, 2};
+    const auto segs = segment_counts[lod];
     const bool detailed_profile = (lod <= 1U);
 
     // Evaluate centerline curve: ballistic launch along launch_dir transitioning into gravity droop
@@ -3028,10 +3030,10 @@ void build_broadleaf_tree_lod(
     std::vector<FoliageClusterSpec>& out_clusters) {
     Pcg32 rng(recipe.seed);
     const BotanicalSpecies species = classify_botanical_species(recipe);
-    constexpr std::array<std::uint32_t, 4U> kTrunkSegs{12U, 8U, 6U, 4U};
-    constexpr std::array<std::uint32_t, 4U> kTrunkSteps{12U, 8U, 6U, 4U};
-    constexpr std::array<std::uint32_t, 4U> kBranchSegs{7U, 5U, 4U, 3U};
-    constexpr std::array<std::uint32_t, 4U> kBranchSteps{6U, 4U, 3U, 2U};
+    constexpr std::array<std::uint32_t, model_lod_count> kTrunkSegs{12U, 8U, 6U, 4U, 3U, 3U};
+    constexpr std::array<std::uint32_t, model_lod_count> kTrunkSteps{12U, 8U, 6U, 4U, 3U, 2U};
+    constexpr std::array<std::uint32_t, model_lod_count> kBranchSegs{7U, 5U, 4U, 3U, 3U, 3U};
+    constexpr std::array<std::uint32_t, model_lod_count> kBranchSteps{6U, 4U, 3U, 2U, 2U, 1U};
 
     const std::uint32_t trunk_steps = kTrunkSteps[lod];
     const float trunk_top_frac = (species == BotanicalSpecies::silver_birch) ? 0.82F
@@ -3074,7 +3076,7 @@ void build_broadleaf_tree_lod(
         bark_mesh.append_tube_strip(twin_pts, twin_rad, std::max(4U, kTrunkSegs[lod] - 2U), 1.4F, 0.0F, 0.0F, 0.10F, 4U, 2.0F);
     }
 
-    const std::uint32_t branches = (lod == 3U) ? std::max(2U, recipe.primary_branches / 2U)
+    const std::uint32_t branches = (lod >= 3U) ? std::max(2U, recipe.primary_branches / 2U)
                                                 : ((lod == 2U) ? std::max(3U, (recipe.primary_branches * 2U) / 3U)
                                                                : recipe.primary_branches);
     const std::uint32_t max_levels = (lod <= 1U) ? recipe.branch_levels : ((lod == 2U) ? std::min(recipe.branch_levels, 2U) : 1U);
@@ -3147,10 +3149,10 @@ void build_conifer_tree_lod(
     Pcg32 rng(recipe.seed);
     const BotanicalSpecies species = classify_botanical_species(recipe);
     const bool is_pine = (species == BotanicalSpecies::nordic_pine);
-    constexpr std::array<std::uint32_t, 4U> kTrunkSegs{10U, 8U, 5U, 4U};
-    constexpr std::array<std::uint32_t, 4U> kTrunkSteps{14U, 9U, 6U, 4U};
-    constexpr std::array<std::uint32_t, 4U> kLimbSegs{5U, 4U, 3U, 3U};
-    constexpr std::array<std::uint32_t, 4U> kLimbSteps{5U, 4U, 3U, 2U};
+    constexpr std::array<std::uint32_t, model_lod_count> kTrunkSegs{10U, 8U, 5U, 4U, 3U, 3U};
+    constexpr std::array<std::uint32_t, model_lod_count> kTrunkSteps{14U, 9U, 6U, 4U, 3U, 2U};
+    constexpr std::array<std::uint32_t, model_lod_count> kLimbSegs{5U, 4U, 3U, 3U, 3U, 3U};
+    constexpr std::array<std::uint32_t, model_lod_count> kLimbSteps{5U, 4U, 3U, 2U, 2U, 1U};
 
     const std::uint32_t trunk_steps = kTrunkSteps[lod];
     const glm::vec3 lean_dir(std::cos(rng.range(0.0F, kTwoPi)), 0.0F, std::sin(rng.range(0.0F, kTwoPi)));
@@ -3188,7 +3190,7 @@ void build_conifer_tree_lod(
         }
     }
 
-    const std::uint32_t whorls = (lod == 3U) ? std::max(3U, recipe.whorl_count / 3U)
+    const std::uint32_t whorls = (lod >= 3U) ? std::max(3U, recipe.whorl_count / 3U)
                                              : ((lod == 2U) ? std::max(4U, (recipe.whorl_count * 3U) / 5U)
                                                             : ((lod == 1U) ? std::max(5U, (recipe.whorl_count * 4U) / 5U) : recipe.whorl_count));
     const std::uint32_t cols = (lod == 0U) ? 2U : 1U;
@@ -3402,8 +3404,8 @@ void build_palm_tree_lod(
     Pcg32 rng(recipe.seed);
     const BotanicalSpecies species = classify_botanical_species(recipe);
     const bool is_date = (species == BotanicalSpecies::date_palm);
-    constexpr std::array<std::uint32_t, 4U> kTrunkSegs{12U, 9U, 6U, 4U};
-    constexpr std::array<std::uint32_t, 4U> kTrunkSteps{20U, 14U, 9U, 5U};
+    constexpr std::array<std::uint32_t, model_lod_count> kTrunkSegs{12U, 9U, 6U, 4U, 3U, 3U};
+    constexpr std::array<std::uint32_t, model_lod_count> kTrunkSteps{20U, 14U, 9U, 5U, 3U, 2U};
 
     const std::uint32_t trunk_steps = kTrunkSteps[lod];
     const float crown_height = recipe.height_meters * 0.85F;
@@ -3487,7 +3489,8 @@ void build_palm_tree_lod(
     }
 
     const float spare_mul = (recipe.foliage_mode == VegetationFoliageMode::sparse) ? 0.58F : 1.0F;
-    const float lod_mul = (lod == 0U) ? 1.0F : ((lod == 1U) ? 0.80F : ((lod == 2U) ? 0.62F : 0.46F));
+    constexpr std::array<float, model_lod_count> frond_ratios{1.0F, 0.80F, 0.62F, 0.46F, 0.41F, 0.34F};
+    const float lod_mul = frond_ratios[lod];
     const std::uint32_t active_fronds = std::clamp(
         static_cast<std::uint32_t>(std::lround(static_cast<float>(recipe.frond_count) * spare_mul * lod_mul)),
         6U,
@@ -3585,8 +3588,8 @@ void build_bush_lod(
     Pcg32 rng(recipe.seed);
     const BotanicalSpecies species = classify_botanical_species(recipe);
     const bool is_scrub = (species == BotanicalSpecies::arid_scrub);
-    constexpr std::array<std::uint32_t, 4U> kStemSegs{6U, 5U, 4U, 3U};
-    constexpr std::array<std::uint32_t, 4U> kStemSteps{6U, 4U, 3U, 2U};
+    constexpr std::array<std::uint32_t, model_lod_count> kStemSegs{6U, 5U, 4U, 3U, 3U, 3U};
+    constexpr std::array<std::uint32_t, model_lod_count> kStemSteps{6U, 4U, 3U, 2U, 2U, 1U};
 
     const std::uint32_t stems = std::max(4U, (lod >= 2U) ? (recipe.primary_branches / 2U + 2U) : recipe.primary_branches);
     const float density_mul = (recipe.foliage_mode == VegetationFoliageMode::sparse ? 0.44F : 1.0F) * recipe.foliage_density;
@@ -3686,7 +3689,8 @@ void build_grass_tuft_lod(
     const float mode_mul = (recipe.foliage_mode == VegetationFoliageMode::bare)
         ? 0.25F
         : ((recipe.foliage_mode == VegetationFoliageMode::sparse) ? 0.52F : 1.0F);
-    const float lod_mul = (lod == 0U) ? 1.0F : ((lod == 1U) ? 0.68F : ((lod == 2U) ? 0.46F : 0.30F));
+    constexpr std::array<float, model_lod_count> blade_ratios{1.0F, 0.68F, 0.46F, 0.30F, 0.19F, 0.11F};
+    const float lod_mul = blade_ratios[lod];
     const std::uint32_t lod_boost_segs = (lod == 0U) ? 5U : ((lod == 1U) ? 4U : ((lod == 2U) ? 2U : 1U));
     constexpr float lod_boost = 1.0F;
 
@@ -3842,10 +3846,11 @@ void build_gpu_grass_patch_lod(
     const float mode_mul = (recipe.foliage_mode == VegetationFoliageMode::bare)
         ? 0.22F
         : ((recipe.foliage_mode == VegetationFoliageMode::sparse) ? 0.52F : 1.0F);
-    const float lod_mul = (lod == 0U) ? 1.0F : recipe.lod_keep_ratios[lod - 1U];
+    const float lod_mul = (lod == 0U) ? 1.0F : (lod <= 3U ? recipe.lod_keep_ratios[lod - 1U] :
+        recipe.lod_keep_ratios[2] * (lod == 4U ? 0.46F : 0.20F));
     const std::uint32_t active_blades = std::clamp(
         static_cast<std::uint32_t>(std::lround(static_cast<float>(max_blades) * mode_mul * lod_mul)),
-        8U,
+        lod <= 3U ? 8U : (lod == 4U ? 4U : 2U),
         max_gpu_grass_blades_per_patch);
     const std::uint32_t segs = (lod == 0U) ? 4U : ((lod == 1U) ? 3U : ((lod == 2U) ? 2U : 1U));
 
@@ -4187,7 +4192,7 @@ void build_gpu_grass_patch_lod(
     const CookedModelAsset& model,
     const bool include_lods_and_collision,
     const std::string_view lod0_relative_dir,
-    const std::array<float, 3U>& lod_errors,
+    const std::array<float, model_lod_count>& lod_errors,
     std::filesystem::path& out_model_file,
     std::filesystem::path& out_mesh_file,
     std::string& error) {
@@ -4225,6 +4230,8 @@ void build_gpu_grass_patch_lod(
          }},
     };
     asset_json["generate_lods"] = false;
+    asset_json["vegetation"] = true;
+    asset_json["detail_aa"] = "coverage";
 
     Json mats_json = Json::array();
     for (const auto& mat : model.materials) {
@@ -4246,12 +4253,12 @@ void build_gpu_grass_patch_lod(
 
     if (include_lods_and_collision) {
         Json lods_json = Json::array();
-        for (std::size_t li = 1U; li <= 3U; ++li) {
+        for (std::size_t li = 1U; li < model_lod_count; ++li) {
             const std::string lod_ref = std::string(lod0_relative_dir) + "/" +
                                         std::string(stem) + "_lod" + std::to_string(li) + ".vcrasset.json";
             lods_json.push_back(Json{
                 {"model", lod_ref},
-                {"geometric_error", lod_errors[li - 1U]},
+                {"geometric_error", lod_errors[li]},
             });
         }
         asset_json["lods"] = std::move(lods_json);
@@ -5062,7 +5069,7 @@ bool generate_vegetation_asset(
 
     if (recipe.archetype == VegetationArchetype::grass_patch_gpu) {
         glm::vec3 avg_tint_srgb = recipe.leaf_base_srgb;
-        for (std::uint32_t lod = 0U; lod < 4U; ++lod) {
+        for (std::uint32_t lod = 0U; lod < model_lod_count; ++lod) {
             MeshAccumulator mesh{};
             glm::vec3 lod_tint{};
             build_gpu_grass_patch_lod(
@@ -5106,8 +5113,8 @@ bool generate_vegetation_asset(
         out_asset.has_grass_textures = true;
     } else {
         const BotanicalSpecies species = classify_botanical_species(recipe);
-        std::array<MeshAccumulator, 4U> bark_meshes{};
-        std::array<std::vector<FoliageClusterSpec>, 4U> lod_clusters{};
+        std::array<MeshAccumulator, model_lod_count> bark_meshes{};
+        std::array<std::vector<FoliageClusterSpec>, model_lod_count> lod_clusters{};
         std::vector<FoliageClusterSpec> all_clusters{};
 
         const bool canopy_card_archetype =
@@ -5118,7 +5125,7 @@ bool generate_vegetation_asset(
         const float k2 = std::clamp(std::max(0.32F, recipe.lod_keep_ratios[1]), 0.25F, k1 - 0.05F);
         const float k3 = std::clamp(std::max(0.18F, recipe.lod_keep_ratios[2]), 0.14F, k2 - 0.05F);
 
-        for (std::uint32_t lod = 0U; lod < 4U; ++lod) {
+        for (std::uint32_t lod = 0U; lod < model_lod_count; ++lod) {
             std::vector<FoliageClusterSpec> unused_bark_lod_clusters{};
             std::vector<FoliageClusterSpec>& cluster_sink =
                 (canopy_card_archetype && lod > 0U) ? unused_bark_lod_clusters : lod_clusters[lod];
@@ -5153,7 +5160,8 @@ bool generate_vegetation_asset(
                 } else if (!lod_clusters[0].empty()) {
                     // Stratified sampling from LOD0 preserves 3D crown volume and quadrant coverage.
                     const std::size_t n0 = lod_clusters[0].size();
-                    const float keep = (lod == 1U) ? k1 : ((lod == 2U) ? k2 : k3);
+                    const std::array<float, model_lod_count> ratios{1.0F, k1, k2, k3, k3 * 0.46F, k3 * 0.20F};
+                    const float keep = ratios[lod];
                     const std::size_t lo_n = std::min<std::size_t>(n0, 4U);
                     const std::size_t max_less = (n0 > lod) ? (n0 - lod) : 1U;
                     const std::size_t hi_n = std::max<std::size_t>(lo_n, max_less);
@@ -5186,7 +5194,7 @@ bool generate_vegetation_asset(
                 std::array<AtlasTileStyle, 8U> palm_tiles{};
                 build_tile_palette<8U>(all_clusters, palm_tiles);
                 std::size_t cursor = 0U;
-                for (std::uint32_t lod = 0U; lod < 4U; ++lod) {
+                for (std::uint32_t lod = 0U; lod < model_lod_count; ++lod) {
                     for (auto& c : lod_clusters[lod]) {
                         c.tile_index = all_clusters[cursor++].tile_index;
                     }
@@ -5203,7 +5211,7 @@ bool generate_vegetation_asset(
                 std::array<AtlasTileStyle, 16U> sprig_tiles{};
                 build_tile_palette<16U>(all_clusters, sprig_tiles);
                 std::size_t cursor = 0U;
-                for (std::uint32_t lod = 0U; lod < 4U; ++lod) {
+                for (std::uint32_t lod = 0U; lod < model_lod_count; ++lod) {
                     for (auto& c : lod_clusters[lod]) {
                         c.tile_index = all_clusters[cursor++].tile_index;
                     }
@@ -5233,7 +5241,7 @@ bool generate_vegetation_asset(
             out_asset.has_bark_textures = true;
         }
 
-        for (std::uint32_t lod = 0U; lod < 4U; ++lod) {
+        for (std::uint32_t lod = 0U; lod < model_lod_count; ++lod) {
             CookedModelAsset& model = out_asset.lod_models[lod];
             model.generate_lods = false;
             MeshAccumulator combined{};
@@ -5262,11 +5270,11 @@ bool generate_vegetation_asset(
                         const float actual_keep =
                             static_cast<float>(lod_clusters[lod].size()) /
                             static_cast<float>(std::max<std::size_t>(1U, lod_clusters[0].size()));
-                        constexpr std::array<float, 4U> kTargetArea{1.0F, 0.96F, 0.90F, 0.82F};
+                        constexpr std::array<float, model_lod_count> kTargetArea{1.0F, 0.96F, 0.90F, 0.82F, 0.80F, 0.78F};
                         size_boost = std::clamp(
-                            std::sqrt(kTargetArea[lod] / std::max(0.08F, actual_keep)),
+                            std::sqrt(kTargetArea[lod] / std::max(0.012F, actual_keep)),
                             1.12F,
-                            2.25F);
+                            lod <= 3U ? 2.25F : 5.0F);
                     } else {
                         size_boost = (lod == 1U) ? 1.35F : ((lod == 2U) ? 1.75F : 2.20F);
                     }
@@ -5305,11 +5313,13 @@ bool generate_vegetation_asset(
         recipe.lod_geometric_errors[0],
         recipe.lod_geometric_errors[1],
         recipe.lod_geometric_errors[2],
+        recipe.lod_geometric_errors[2] * 2.1F,
+        recipe.lod_geometric_errors[2] * 4.3F,
     };
 
     std::uint64_t total_verts = 0U;
     std::uint64_t total_indices = 0U;
-    for (std::uint32_t lod = 0U; lod < 4U; ++lod) {
+    for (std::uint32_t lod = 0U; lod < model_lod_count; ++lod) {
         const auto& m = out_asset.lod_models[lod];
         rep.vertices[lod] = static_cast<std::uint32_t>(m.vertices.size());
         rep.triangles[lod] = static_cast<std::uint32_t>(m.indices.size() / 3U);
@@ -5522,7 +5532,7 @@ bool export_vegetation_package(
     }
 
     const std::string rel_dir_generic = path_to_generic_utf8(rel_dir);
-    for (std::size_t lod = 0U; lod < 4U; ++lod) {
+    for (std::size_t lod = 0U; lod < model_lod_count; ++lod) {
         const std::string stem = (lod == 0U) ? slug : (slug + "_lod" + std::to_string(lod));
         if (!write_cooked_model_files(
                 package_dir,
@@ -5530,7 +5540,7 @@ bool export_vegetation_package(
                 asset.lod_models[lod],
                 lod == 0U,
                 rel_dir_generic,
-                asset.recipe.lod_geometric_errors,
+                asset.report.geometric_errors,
                 out_summary.model_files[lod],
                 out_summary.mesh_files[lod],
                 error)) {
@@ -5597,7 +5607,7 @@ bool export_vegetation_package(
 bool export_vegetation_preview_package(
     const GeneratedVegetationAsset& asset,
     const std::filesystem::path& preview_asset_root,
-    std::array<std::string, 4U>& out_lod_relative_paths,
+    std::array<std::string, model_lod_count>& out_lod_relative_paths,
     std::string& error) {
     VegetationExportSummary main_summary{};
     if (!export_vegetation_package(asset, preview_asset_root, "preview", main_summary, error)) {
@@ -5606,9 +5616,9 @@ bool export_vegetation_preview_package(
     const std::string slug = sanitize_vegetation_slug(asset.recipe.asset_slug);
     const std::string base = "preview/" + slug + "/";
     out_lod_relative_paths[0] = main_summary.lod0_relative_path;
-    out_lod_relative_paths[1] = base + slug + "_lod1.vcrasset.json";
-    out_lod_relative_paths[2] = base + slug + "_lod2.vcrasset.json";
-    out_lod_relative_paths[3] = base + slug + "_lod3.vcrasset.json";
+    for (std::size_t level = 1; level < model_lod_count; ++level) {
+        out_lod_relative_paths[level] = base + slug + "_lod" + std::to_string(level) + ".vcrasset.json";
+    }
     return true;
 }
 
@@ -5621,7 +5631,7 @@ bool open_vegetation_package(
     const std::string filename = path_to_generic_utf8(recipe_or_asset_path.filename());
     if (filename.ends_with(".vcrasset.json")) {
         std::string stem = filename.substr(0U, filename.size() - std::string_view(".vcrasset.json").size());
-        for (const std::string_view suffix : {"_lod1", "_lod2", "_lod3"}) {
+        for (const std::string_view suffix : {"_lod1", "_lod2", "_lod3", "_lod4", "_lod5"}) {
             if (stem.ends_with(suffix)) {
                 stem.resize(stem.size() - suffix.size());
                 break;

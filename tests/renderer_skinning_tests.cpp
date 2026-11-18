@@ -330,6 +330,10 @@ void write_skinned_hero_asset(
          }},
     };
     require(write_json(dir / "hero.vcrasset.json", metadata), "write hero.vcrasset.json");
+    Json studio = metadata;
+    studio["skinned_lods"] = true;
+    studio["detail_aa"] = "coverage";
+    require(write_json(dir / "studio.vcrasset.json", studio), "write studio skinned fixture");
 }
 
 [[nodiscard]] vcr::TransformRows make_rows(
@@ -599,7 +603,7 @@ void run() {
                     "pre-pose char_2 is unskinned with offset 0");
             if (is_gpu) {
                 require(d2.has_visibility_group && d2.group_force_lod0 == 0U &&
-                            d2.group_lod_counts.y > 0U && d2.indirect_index_counts[1] > 0U,
+                            d2.group_lod_counts[1] > 0U && d2.indirect_index_counts[1] > 0U,
                         "pre-pose GPU visibility group has multi-LOD chains for char_2");
             }
             require(renderer.set_runtime_transform(mover, t1), "pre-pose set_runtime_transform(mover, t1)");
@@ -652,9 +656,9 @@ void run() {
                             diags[idx].group_vertex_offset == expected_offset &&
                             diags[idx].indirect_vertex_offsets[0] == expected_offset &&
                             diags[idx].group_force_lod0 == 1U &&
-                            diags[idx].group_lod_counts.y == 0U &&
-                            diags[idx].group_lod_counts.z == 0U &&
-                            diags[idx].group_lod_counts.w == 0U &&
+                            diags[idx].group_lod_counts[1] == 0U &&
+                            diags[idx].group_lod_counts[2] == 0U &&
+                            diags[idx].group_lod_counts[3] == 0U &&
                             diags[idx].indirect_index_counts[1] == 0U &&
                             diags[idx].indirect_index_counts[2] == 0U &&
                             diags[idx].indirect_index_counts[3] == 0U,
@@ -733,7 +737,7 @@ void run() {
                     d2_d.draw_vertex_offset == static_cast<std::int32_t>(hero_vertex_count),
                 "char_2 compacts from offset 100 to 50");
         if (is_gpu) {
-            require(d1_d.group_force_lod0 == 0U && d1_d.group_lod_counts.y > 0U &&
+            require(d1_d.group_force_lod0 == 0U && d1_d.group_lod_counts[1] > 0U &&
                         d1_d.indirect_index_counts[1] > 0U,
                     "removed char_1 restores multi-LOD GPU visibility group");
             require(d2_d.group_vertex_offset == static_cast<std::int32_t>(hero_vertex_count) &&
@@ -785,6 +789,24 @@ void run() {
         render_frames(2U);
         require(renderer.inspect_rendered_node(mover).packet_current == t0,
                 "editor Stop restores authored transform T0");
+    }
+
+    if (renderer.gpu_visibility_available()) {
+        constexpr std::string_view model_path = "hero/studio.vcrasset.json";
+        doc.node(char_2)->get().asset_path = model_path;
+        doc.mark_content_changed();
+        const auto studio_view = doc.build_render_view(cube_instances, model_instances, light_instances);
+        std::string error;
+        require(renderer.update_editor_scene(studio_view, temp_assets.path(), error), "load studio LOD fixture: " + error);
+        const auto pose = make_pose(glm::vec3(0.0F, 0.2F, 0.0F));
+        renderer.set_skinned_model_pose(char_2, model_path, pose);
+        render_frames(3U);
+        const auto diag = renderer.inspect_rendered_node(char_2);
+        require(diag.uses_skinned_pool && diag.has_visibility_group && !diag.group_force_lod0 &&
+                diag.indirect_index_counts.back() > 0U &&
+                diag.indirect_vertex_offsets.back() == diag.draw_vertex_offset,
+                "studio character has a skinned LOD5 indirect draw with the current pose offset");
+        renderer.clear_skinned_model_poses();
     }
 
     // G. Forward transparent dielectric glass blending (no Bayer screen-door checkerboard).

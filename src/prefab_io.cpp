@@ -891,6 +891,8 @@ bool save_prefab_file(
             }
             if (node.kind == SceneNodeKind::model) {
                 encoded["asset_path"] = node.asset_path;
+                if (node.detail_aa != ObjectAntiAliasing::asset)
+                    encoded["detail_aa"] = node.detail_aa == ObjectAntiAliasing::coverage ? "coverage" : "off";
             }
             if (node.kind == SceneNodeKind::ocean) {
                 encoded["ocean"] = ocean_json(node.ocean);
@@ -1144,6 +1146,15 @@ bool instantiate_prefab_file(
                 parent_index = static_cast<std::uint32_t>(p);
             }
 
+            ObjectAntiAliasing detail_aa = ObjectAntiAliasing::asset;
+            if (const auto aa = encoded.find("detail_aa"); aa != encoded.end()) {
+                if (*kind != SceneNodeKind::model || !aa->is_string() || (*aa != "off" && *aa != "coverage" && *aa != "asset")) {
+                    error = "Unknown object detail_aa setting.";
+                    return false;
+                }
+                if (*aa == "off") detail_aa = ObjectAntiAliasing::off;
+                if (*aa == "coverage") detail_aa = ObjectAntiAliasing::coverage;
+            }
             std::string asset_path;
             if (*kind == SceneNodeKind::model) {
                 if (!encoded.contains("asset_path") ||
@@ -1460,6 +1471,7 @@ bool instantiate_prefab_file(
                 .value = SceneNode{
                     .name = name,
                     .asset_path = std::move(asset_path),
+                    .detail_aa = detail_aa,
                     .transform = SceneTransform{
                         .translation = {
                             translation[0], translation[1], translation[2]},

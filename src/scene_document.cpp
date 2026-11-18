@@ -1415,6 +1415,7 @@ SceneRenderView SceneDocument::build_render_view(
                 .model_row_2 = matrix_row(world_matrix, 2),
                 .asset_path = slot.value.asset_path,
                 .id = id_for_index(index),
+                .detail_aa = slot.value.detail_aa,
             });
         }
         index = traversal_next(index, depth, true);

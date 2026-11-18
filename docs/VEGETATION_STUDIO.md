@@ -10,7 +10,7 @@ Standalone procedural vegetation authoring, 3D foliage painting, LOD optimizatio
 
 | Archetype (`VegetationArchetype`) | Built-in Presets | Notes |
 | --- | --- | --- |
-| `grass_patch_gpu` | `meadow_fescue_gpu`, `steppe_dry_grass_gpu` | GPU-animated blade patches validated with `validate_gpu_grass_submesh` across LOD0–LOD3 |
+| `grass_patch_gpu` | `meadow_fescue_gpu`, `steppe_dry_grass_gpu` | GPU-animated blade patches validated with `validate_gpu_grass_submesh` across LOD0–LOD5 |
 | `grass_tuft` | `wild_fern_tuft`, `wetland_reed_clump` | Ground tufted herbaceous clusters and wetland reeds |
 | `bush` | `forest_hazel_bush`, `arid_scrub_bush` | Multi-stem branching woody shrubs |
 | `broadleaf_tree` | `silver_birch`, `ancient_oak`, `autumn_maple`, `winter_bare_oak` | Recursive branching crowns, full/sparse/bare foliage states |
@@ -21,22 +21,22 @@ Standalone procedural vegetation authoring, 3D foliage painting, LOD optimizatio
 
 - **Seasonal / Foliage Variations**: Switch instantly between `full`, `sparse`, and `bare` crown states (`bare` strips foliage submeshes while keeping bark skeleton intact).
 - **Interactive 3D Crown Painting & Pruning**: Arm the 3D brush in `Hero x1` arena to raycast onto plant clusters and paint spherical strokes (`tint`, `autumn`, `dry`, or `prune_bare`). Strokes persist inside `.vcrveg.json` sidecar recipes and round-trip losslessly.
-- **Photorealistic & Procedural PBR Atlases**: Composites the botanical cutout & seamless bark library in `assets/vegetation/` (`foliage_{birch,oak,shrub,conifer,palm}.png`, `bark_{birch,oak,pine,shrub,palm}.png`, with procedural fallback if absent) into `1024×1024` (`256/512/1024/2048` configurable) 4×4 botanical sprig & 1×8 horizontal palm frond PBR sets (`foliage_atlas` sRGB + alpha dilation, `foliage_normal`, `foliage_orm` with packed AO in `R`, gloss-calibrated roughness in `G`), `512×512` (`128..1024`) seamless bark PBR sets (`bark_albedo`, `bark_normal`, `bark_orm`), and `256×256` GPU grass blade PBR sets (`grass_albedo`, `grass_normal`, `grass_orm`), previewed live inside Vulkan UI thumbnails (`UiTexturePreview`). Supports explicit `bark_style` / `foliage_style` texture overrides and independent `foliage_gloss` (`0..1` controlling dielectric `ior` and leaf/grass roughness) alongside coverage-preserving alpha-cutout mipmaps and volume-conserving `LOD0`–`LOD3` canopy decimation.
+- **Photorealistic & Procedural PBR Atlases**: Composites the botanical cutout & seamless bark library in `assets/vegetation/` (`foliage_{birch,oak,shrub,conifer,palm}.png`, `bark_{birch,oak,pine,shrub,palm}.png`, with procedural fallback if absent) into `1024×1024` (`256/512/1024/2048` configurable) 4×4 botanical sprig & 1×8 horizontal palm frond PBR sets (`foliage_atlas` sRGB + alpha dilation, `foliage_normal`, `foliage_orm` with packed AO in `R`, gloss-calibrated roughness in `G`), `512×512` (`128..1024`) seamless bark PBR sets (`bark_albedo`, `bark_normal`, `bark_orm`), and `256×256` GPU grass blade PBR sets (`grass_albedo`, `grass_normal`, `grass_orm`), previewed live inside Vulkan UI thumbnails (`UiTexturePreview`). Supports explicit `bark_style` / `foliage_style` texture overrides and independent `foliage_gloss` (`0..1` controlling dielectric `ior` and leaf/grass roughness) alongside coverage-preserving alpha-cutout mipmaps and volume-conserving `LOD0`–`LOD5` canopy decimation.
 - **5 Scalability Arenas**:
   - `hero_single` (1 hero plant, interactive 3D crown painting)
-  - `lod_lineup` (LOD0–LOD3 displayed simultaneously side by side regardless of camera distance)
+  - `lod_lineup` (LOD0–LOD5 displayed simultaneously side by side regardless of camera distance)
   - `grove_100` (100 trees/patches, automatic 4-LOD switching + frustum/occlusion culling)
   - `forest_2500` (2,500 instances stress arena)
   - `meadow_10000` (10,000 instances high-density stress arena)
-- **Optimization Budget Lab**: Tracks LOD0–LOD3 vertices/triangles/submeshes/geometric error, packed vs float vertex memory savings, RGBA texture budget, alpha overdraw estimate, budget grade (`A`–`D`), real-time FPS / 1% low / CPU & GPU ms timings, and resident GPU memory.
+- **Optimization Budget Lab**: Tracks LOD0–LOD5 vertices/triangles/submeshes/geometric error, packed vs float vertex memory savings, RGBA texture budget, alpha overdraw estimate, budget grade (`A`–`D`), real-time FPS / 1% low / CPU & GPU ms timings, and resident GPU memory.
 
 ## Cooked Package Output Format
 
 Exporting `<slug>` to `<project_dir>/assets/<category_subdir>/<slug>/` (or via `--out-asset-root <dir>`) produces:
 
 - `<slug>.vcrveg.json` — lossless procedural recipe + paint strokes sidecar (`schema: vcr.vegetation_recipe`)
-- `<slug>.vcrasset.json`, `<slug>_lod1.vcrasset.json`, `<slug>_lod2.vcrasset.json`, `<slug>_lod3.vcrasset.json`
-- `<slug>.vcrmesh`, `<slug>_lod1.vcrmesh`, `<slug>_lod2.vcrmesh`, `<slug>_lod3.vcrmesh`
+- `<slug>.vcrasset.json`, `<slug>_lod1.vcrasset.json`, `<slug>_lod2.vcrasset.json`, `<slug>_lod3.vcrasset.json`, `<slug>_lod4.vcrasset.json`, `<slug>_lod5.vcrasset.json`
+- `<slug>.vcrmesh`, `<slug>_lod1.vcrmesh`, `<slug>_lod2.vcrmesh`, `<slug>_lod3.vcrmesh`, `<slug>_lod4.vcrmesh`, `<slug>_lod5.vcrmesh`
 - `materials/bark.vcrmaterial.json`, `materials/foliage.vcrmaterial.json` (and/or `materials/grass_blade.vcrmaterial.json`) with `occlusion_in_metallic_roughness: true`
 - `textures/*.vcrtexture.json` + `.png` PBR texture sets (`bark_albedo/normal/orm`, `foliage_atlas/normal/orm`, `grass_albedo/normal/orm`)
 

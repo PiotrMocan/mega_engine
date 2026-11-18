@@ -783,9 +783,10 @@ void EditorApplication::initialize(const CliOptions& options) {
             options.depth_prepass, options.depth_prepass_override)) {
         fatal("Invalid depth prepass mode");
     }
-    if (!renderer_.set_lod_fade(options.lod_fade, options.lod_fade_seconds)) {
+    if (!renderer_.set_lod_fade(resolve_scene_lod_fade(options, scene_.lod_fade), options.lod_fade_seconds)) {
         fatal("Invalid model LOD fade settings");
     }
+
 
     VisibilitySettings visibility{options.frustum_culling, options.occlusion_culling, options.lod,
                                   options.dynamic_shadows};
@@ -928,6 +929,9 @@ void EditorApplication::main_loop() {
                 ? std::optional<double>(options_.camera_z) : std::nullopt);
         }
         if (ui_.consume_scene_replaced()) {
+            if (!renderer_.set_lod_fade(resolve_scene_lod_fade(options_, scene_.lod_fade), options_.lod_fade_seconds))
+                fatal("Scene LOD fade pattern is invalid.");
+
             if (!renderer_.set_exposure_settings(resolve_scene_exposure(options_, scene_.exposure)))
                 fatal("Scene exposure settings are invalid.");
             if (!renderer_.set_lighting_settings(resolve_scene_lighting(options_, scene_.lighting)))

@@ -39,10 +39,10 @@ vcr::CookedModelAsset load(const std::filesystem::path &root, const std::filesys
     return std::move(result).value();
 }
 Json describe(const vcr::CookedModelAsset &model, const std::filesystem::path &path) {
-    std::array<std::uint64_t,4> triangles{};
-    std::array<float,4> errors{};
+    std::array<std::uint64_t,vcr::model_lod_count> triangles{};
+    std::array<float,vcr::model_lod_count> errors{};
     for (const auto &mesh : model.submeshes) {
-        for (std::size_t i = 0; i < 4; ++i) {
+        for (std::size_t i = 0; i < vcr::model_lod_count; ++i) {
             triangles[i] += mesh.lod_count[i] / 3;
             errors[i] = std::max(errors[i], mesh.lod_error[i]);
         }
@@ -50,16 +50,17 @@ Json describe(const vcr::CookedModelAsset &model, const std::filesystem::path &p
     return {{"asset",path.generic_string()},{"triangles",triangles},{"errors",errors},
             {"geometry_bytes",model.vertices.size()*48+model.indices.size()*4}};
 }
-void cook(const std::filesystem::path &root, const std::filesystem::path &path) {
-    auto model = load(root,path);
+void cook(const std::filesystem::path &root, const std::filesystem::path &path, vcr::CookedModelAsset model) {
+    if (model.is_skinned() || model.prebaked_lods)
+        throw std::runtime_error("Offline LOD cooking requires a static source mesh: " + path.string());
     model.generate_lods = true;
-    vcr::prepare_model_lods(model);
+    vcr::prepare_model_lods(model, root);
     auto metadata = read_json(root/path);
     auto name = path.filename().string();
     name.resize(name.size()-std::string_view(".vcrasset.json").size());
     Json references = Json::array();
     float previous_error = 0;
-    for (std::size_t level = 1; level < 4; ++level) {
+    for (std::size_t level = 1; level < vcr::model_lod_count; ++level) {
         std::vector<vcr::CookedModelVertex> vertices;
         std::vector<std::uint32_t> indices, remap(model.vertices.size(),missing);
         Json sections = Json::array();
@@ -126,30 +127,60 @@ void cook(const std::filesystem::path &root, const std::filesystem::path &path) 
         references.push_back({{"model",lod_relative.generic_string()},{"geometric_error",error}});
         previous_error = error;
     }
+    if (model.vegetation && !metadata.contains("detail_aa")) metadata["detail_aa"] = "coverage";
     metadata["generate_lods"] = true;
     metadata["lods"] = references;
     write_json(root/path,metadata);
     std::cout << describe(model,path).dump() << std::endl;
 }
+// Recognize derivatives from older cooker versions. Hand-authored chains keep
+// their own budgets and material sections unless explicitly passed to "cook".
+bool generated_chain(const std::filesystem::path& root, const std::filesystem::path& path,
+                     const vcr::CookedModelAsset& model) {
+    const auto stem = path.stem().stem().string();
+    for (std::size_t i = 0; i < model.lods.size(); ++i) {
+        const auto expected = path.parent_path() / (stem + "_LOD" + std::to_string(i + 1U) + ".vcrasset.json");
+        if (model.lods[i].model != expected) return false;
+        const auto metadata = read_json(root / expected);
+        if (!std::ranges::all_of(metadata.at("submeshes"), [](const auto& part) {
+                return part.contains("geometric_error");
+            })) return false;
+    }
+    return true;
+}
+
 void inspect(const std::filesystem::path &root, const std::filesystem::path &path) {
     auto model = load(root,path);
-    if (model.lods.empty()) vcr::prepare_model_lods(model);
+    if (model.prebaked_lods) {
+        std::cout << describe(model, path).dump() << std::endl;
+        return;
+    }
+    if (model.lods.empty()) vcr::prepare_model_lods(model, root);
     else {
         std::vector<vcr::CookedModelAsset> levels;
         for (const auto &reference : model.lods) levels.push_back(load(root,reference.model));
-        vcr::prepare_authored_model_lods(model,levels,geometry_budget);
+        vcr::prepare_authored_model_lods(model,levels,geometry_budget,root);
     }
     std::cout << describe(model,path).dump() << std::endl;
 }
 }
 int main(int argc,char **argv) {
     try {
-        if (argc < 4 || (std::string_view(argv[1]) != "cook" && std::string_view(argv[1]) != "inspect"))
-            throw std::runtime_error("Usage: vcr_asset_lod_cooker cook|inspect ASSET_ROOT MODEL...");
+        const std::string_view command = argc >= 2 ? argv[1] : "";
+        if (argc < 4 || (command != "cook" && command != "inspect" && command != "cook-vegetation"))
+            throw std::runtime_error("Usage: vcr_asset_lod_cooker cook|inspect|cook-vegetation ASSET_ROOT MODEL...");
         const std::filesystem::path root(argv[2]);
         for (int i = 3; i < argc; ++i) {
-            if (std::string_view(argv[1]) == "cook") cook(root,argv[i]);
-            else inspect(root,argv[i]);
+            const std::filesystem::path path(argv[i]);
+            if (command == "inspect") {
+                inspect(root, path);
+                continue;
+            }
+            auto model = load(root, path);
+            if (command == "cook-vegetation" && (!model.vegetation || !model.generate_lods ||
+                model.is_skinned() || model.prebaked_lods || !generated_chain(root, path, model))) continue;
+            cook(root, path, std::move(model));
+            if (command == "cook-vegetation") inspect(root, path);
         }
         return 0;
     } catch (const std::exception &error) {

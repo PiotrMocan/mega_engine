@@ -1,4 +1,5 @@
 #pragma once
+#include "model_lod_limits.hpp"
 #include "gpu_buffer.hpp"
 #include "scene_visibility.hpp"
 #include <glm/glm.hpp>
@@ -9,14 +10,18 @@
 namespace vcr {
 inline constexpr std::uint32_t max_shadow_draw_groups = 4096U;
 
+// Four aggregate counters followed by the per-level histogram, shared with GLSL.
+inline constexpr VkDeviceSize visibility_header_bytes = (4U + model_lod_count) * sizeof(std::uint32_t);
+
 struct alignas(16) VisibilitySource {
     glm::vec4 center{}, extent{};
 };
 struct alignas(16) VisibilityGroup {
     glm::uvec4 range{};
-    glm::uvec4 counts{};
-    glm::uvec4 firsts{};
-    glm::vec4 errors{};
+    std::array<std::uint32_t, model_lod_count> counts{};
+    std::array<std::uint32_t, model_lod_count> firsts{};
+    std::array<float, model_lod_count> errors{};
+    std::array<std::uint32_t, 2> std430_padding{};
 };
 struct alignas(16) VisibilityUniforms {
     glm::mat4 view_projection{1};
@@ -34,7 +39,7 @@ struct alignas(16) ShadowVisibilityUniforms {
     glm::uvec4 config{}; // x: source_count, y: group_count, z: cascade_mask, w: lod_enabled
     glm::vec4 params{};  // x: lod_pixel_error
 };
-static_assert(sizeof(VisibilitySource) == 32 && sizeof(VisibilityGroup) == 64);
+static_assert(sizeof(VisibilitySource) == 32 && sizeof(VisibilityGroup) == 96);
 static_assert(offsetof(VisibilityUniforms, grid) == 288);
 static_assert(sizeof(ShadowVisibilityUniforms) == 432);
 struct GpuVisibilityFrame {

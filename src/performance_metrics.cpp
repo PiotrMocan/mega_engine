@@ -580,6 +580,8 @@ std::string benchmark_result_to_json(const BenchmarkResult& result) {
     integer("lod1_instances", result.lod_instances[1]);
     integer("lod2_instances", result.lod_instances[2]);
     integer("lod3_instances", result.lod_instances[3]);
+    integer("lod4_instances", result.lod_instances[4]);
+    integer("lod5_instances", result.lod_instances[5]);
     const auto boolean = [&](std::string_view key, bool value) {
         append_key(output, key);
         output += value ? "true,\n" : "false,\n";

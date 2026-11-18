@@ -1,5 +1,6 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
+#include "visibility_layout.glsl"
 #include "lod_scale.glsl"
 
 layout(local_size_x = 128) in;
@@ -22,12 +23,6 @@ struct Source {
     vec4 extent;
 };
 
-struct Group {
-    uvec4 range;
-    uvec4 counts;
-    uvec4 firsts;
-    vec4 errors;
-};
 
 struct Draw {
     uint indexCount;
@@ -40,11 +35,11 @@ struct Draw {
 layout(set = 0, binding = 1, std430) readonly buffer Instances { Instance instances[]; };
 layout(set = 0, binding = 2, std430) readonly buffer Sources { Source sources[]; };
 layout(set = 0, binding = 3, std430) readonly buffer Groups { Group groups[]; };
-layout(set = 0, binding = 4, std430) buffer Visible { uint counters[8]; uint indices[]; };
+layout(set = 0, binding = 4, std430) buffer Visible { uint counters[kVisibilityCounters]; uint indices[]; };
 layout(set = 0, binding = 5, std430) buffer ShadowCommands { Draw draws[]; };
 
-shared uint localCounts[4][4];
-shared uint reservations[4][4];
+shared uint localCounts[4][kModelLods];
+shared uint reservations[4][kModelLods];
 
 void main() {
     const uint lane = gl_LocalInvocationID.x;
@@ -53,8 +48,8 @@ void main() {
     const uint groupCount = shadowConfig.config.y;
     const uint cascadeMask = shadowConfig.config.z;
 
-    if (lane < 16u) {
-        localCounts[lane >> 2u][lane & 3u] = 0u;
+    if (lane < 4u * kModelLods) {
+        localCounts[lane / kModelLods][lane % kModelLods] = 0u;
     }
     barrier();
 
@@ -102,7 +97,7 @@ void main() {
             if (allowLod) {
                 const float ppm = shadowConfig.cascadePixelsPerMeter[c];
                 const float budget = shadowConfig.params.x;
-                for (uint i = 1u; i < 4u; ++i) {
+                for (uint i = 1u; i < kModelLods; ++i) {
                     if (!isinf(group.errors[i]) &&
                         (group.counts[i] > 0u || group.errors[i] > 0.0) &&
                         group.errors[i] * scale * ppm <= budget) {
@@ -123,13 +118,13 @@ void main() {
     const uint commonGroup = uint(sources[first].center.w);
     const bool homogeneous =
         commonGroup == uint(sources[min(first + 127u, sourceCount - 1u)].center.w);
-    if (homogeneous && lane < 16u) {
-        const uint c = lane >> 2u;
-        const uint l = lane & 3u;
+    if (homogeneous && lane < 4u * kModelLods) {
+        const uint c = lane / kModelLods;
+        const uint l = lane % kModelLods;
         const uint count = localCounts[c][l];
         if (count > 0u) {
             reservations[c][l] = atomicAdd(
-                draws[(c * groupCount + commonGroup) * 4u + l].instanceCount, count);
+                draws[(c * groupCount + commonGroup) * kModelLods + l].instanceCount, count);
         }
     }
     barrier();
@@ -140,11 +135,11 @@ void main() {
                 continue;
             }
             const uint l = chosenLod[c];
-            const uint commandIndex = (c * groupCount + groupIndex) * 4u + l;
+            const uint commandIndex = (c * groupCount + groupIndex) * kModelLods + l;
             const uint dst = homogeneous
                 ? reservations[c][l] + localOffset[c]
                 : atomicAdd(draws[commandIndex].instanceCount, 1u);
-            const uint firstInstance = (4u + c * 4u + l) * sourceCount + group.range.x;
+            const uint firstInstance = ((1u + c) * kModelLods + l) * sourceCount + group.range.x;
             indices[firstInstance + dst] = id;
         }
     }

@@ -103,6 +103,7 @@ struct CliOptions {
     bool depth_prepass_override = false;
     ModelVertexFormat model_vertex_format = ModelVertexFormat::automatic;
     LodFadePattern lod_fade = LodFadePattern::off;
+    bool lod_fade_override = false;
     MotionBlurSettings motion_blur{};
     LocalLightBackend local_light_backend = LocalLightBackend::automatic;
     float lod_fade_seconds = 0.25F;
@@ -141,6 +142,8 @@ struct CliOptions {
 
 [[nodiscard]] LightingSettings resolve_scene_lighting(
     const CliOptions &options, const std::optional<LightingSettings> &authored) noexcept;
+[[nodiscard]] LodFadePattern resolve_scene_lod_fade(
+    const CliOptions& options, std::optional<LodFadePattern> authored) noexcept;
 [[nodiscard]] ToneMapper resolve_scene_tone_mapper(
     const CliOptions& options, std::optional<ToneMapper> authored) noexcept;
 [[nodiscard]] ExposureSettings resolve_scene_exposure(

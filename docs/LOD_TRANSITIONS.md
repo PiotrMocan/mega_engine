@@ -5,8 +5,14 @@ Debug/Release/ASan и CTest 7/7 пройдены. GPU numeric gate прошёл 
 4194304 complementary pixel pairs, 131072 quantized roundtrips, 49620 strict
 encoder и source-mask cases, 1024 plain-off pixels; ошибок validation/ASan и
 live GPU allocations нет. Debug CPU/GPU runtime coverage дал по 38/38 успешных
-сравнений: 26 exact и 12 FSR smoke. Default `off` сохраняется до появления
-подходящего authored LOD контента и выбора quality preset.
+сравнений: 26 exact и 12 FSR smoke.
+
+Метод сглаживания кадра задаётся настройками рендера. SMAA T2x обрабатывает весь кадр.
+Для отдельных моделей и узлов доступно локальное сглаживание мелких деталей. Значение
+`detail_aa: "coverage"` включает его, `"off"` выключает. Узел без собственной
+настройки наследует значение модели. В инспекторе модели это поле называется
+**Detail AA**. При выключенном полноэкранном AA фильтр сглаживает только границы
+отмеченных поверхностей. Параметр сцены `lod_fade` отдельно управляет переходами.
 
 `--lod-fade off|bayer4|bayer8` и `--lod-fade-seconds 0.05..2` управляют
 переходами обычных authored model batches. Начальная длительность 0.25 s.

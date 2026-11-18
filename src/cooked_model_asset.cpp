@@ -40,7 +40,6 @@ static_assert(sizeof(std::uint32_t) == 4U);
 constexpr std::string_view asset_schema = "vcr.asset";
 constexpr std::size_t mesh_header_bytes = 40U;
 constexpr std::size_t mesh_submesh_v1_bytes = 24U;
-constexpr std::size_t mesh_submesh_v2_bytes = 72U;
 constexpr std::array<std::byte, 8U> mesh_magic{
     static_cast<std::byte>('V'),
     static_cast<std::byte>('C'),
@@ -1143,7 +1142,7 @@ parse_mesh(
         !cursor.read_u32(submesh_count) ||
         !cursor.read_u32(reserved) ||
         (version != cooked_mesh_binary_version &&
-         version != cooked_mesh_prebaked_binary_version) ||
+         version != cooked_mesh_prebaked_binary_version && version != cooked_mesh_extended_lod_version) ||
         stride != cooked_mesh_vertex_stride || reserved != 0U) {
         return CookedModelLoadError{
             .code = CookedModelLoadErrorCode::invalid_mesh,
@@ -1173,10 +1172,9 @@ parse_mesh(
         };
     }
 
-    const std::uint64_t submesh_record_bytes =
-        version == cooked_mesh_prebaked_binary_version
-            ? mesh_submesh_v2_bytes
-            : mesh_submesh_v1_bytes;
+    const std::size_t stored_levels = version == cooked_mesh_extended_lod_version
+        ? model_lod_count : (version == cooked_mesh_prebaked_binary_version ? 4U : 0U);
+    const std::uint64_t submesh_record_bytes = mesh_submesh_v1_bytes + stored_levels * 12U;
     std::uint64_t expected_size = mesh_header_bytes;
     std::uint64_t component_size = 0U;
     if (!checked_multiply(
@@ -1214,8 +1212,9 @@ parse_mesh(
                 .path = out_mesh_diag_path,
             };
         }
-        if (version == cooked_mesh_prebaked_binary_version) {
-            for (std::uint32_t& lod_first : submesh.lod_first) {
+        if (stored_levels != 0U) {
+            submesh.lod_error.fill(std::numeric_limits<float>::infinity());
+            for (std::uint32_t& lod_first : std::span{submesh.lod_first}.first(stored_levels)) {
                 if (!cursor.read_u32(lod_first)) {
                     return CookedModelLoadError{
                         .code = CookedModelLoadErrorCode::invalid_mesh,
@@ -1224,7 +1223,7 @@ parse_mesh(
                     };
                 }
             }
-            for (std::uint32_t& lod_count : submesh.lod_count) {
+            for (std::uint32_t& lod_count : std::span{submesh.lod_count}.first(stored_levels)) {
                 if (!cursor.read_u32(lod_count)) {
                     return CookedModelLoadError{
                         .code = CookedModelLoadErrorCode::invalid_mesh,
@@ -1233,7 +1232,7 @@ parse_mesh(
                     };
                 }
             }
-            for (float& lod_error : submesh.lod_error) {
+            for (float& lod_error : std::span{submesh.lod_error}.first(stored_levels)) {
                 if (!cursor.read_f32_bits(lod_error)) {
                     return CookedModelLoadError{
                         .code = CookedModelLoadErrorCode::invalid_mesh,
@@ -1676,6 +1675,21 @@ CookedModelLoadResult load_cooked_model_asset(
     CookedModelAsset asset{
         .metadata_relative_path = model_relative,
     };
+    if (const auto setting = metadata.find("skinned_lods"); setting != metadata.end()) {
+        if (!setting->is_boolean())
+            return fail(CookedModelLoadErrorCode::invalid_json, "skinned_lods must be boolean.", model_diag_path);
+        asset.skinned_lods = setting->get<bool>();
+    }
+    if (const auto aa = metadata.find("detail_aa"); aa != metadata.end()) {
+        if (!aa->is_string() || (*aa != "coverage" && *aa != "off"))
+            return fail(CookedModelLoadErrorCode::invalid_json, "Unknown asset detail_aa setting.", model_diag_path);
+        asset.detail_aa = *aa == "coverage";
+    }
+    if (const auto vegetation = metadata.find("vegetation"); vegetation != metadata.end()) {
+        if (!vegetation->is_boolean())
+            return fail(CookedModelLoadErrorCode::invalid_json, "vegetation must be boolean.", model_diag_path);
+        asset.vegetation = vegetation->get<bool>();
+    }
     if (const auto setting = metadata.find("generate_lods"); setting != metadata.end()) {
         if (!setting->is_boolean()) {
             return fail(CookedModelLoadErrorCode::invalid_json,
@@ -1691,9 +1705,9 @@ CookedModelLoadResult load_cooked_model_asset(
         asset.prebaked_lods = prebaked->get<bool>();
     }
     if (const auto lods = metadata.find("lods"); lods != metadata.end()) {
-        if (!lods->is_array() || (!lods->empty() && lods->size() != 2 && lods->size() != 3)) {
+        if (!lods->is_array() || (!lods->empty() && (lods->size() < 2 || lods->size() >= model_lod_count))) {
             return fail(CookedModelLoadErrorCode::invalid_json,
-                        "Authored lods must be empty or contain LOD1/LOD2 with optional LOD3.",
+                        "Authored lods must be empty or contain LOD1/LOD2 and up to LOD5.",
                         model_diag_path);
         }
         float previous_error = 0;
@@ -1833,7 +1847,7 @@ CookedModelLoadResult load_cooked_model_asset(
     }
     asset.mesh_relative_path = std::move(resolved_mesh_relative);
     const bool mesh_is_prebaked =
-        (mesh_version == cooked_mesh_prebaked_binary_version);
+        (mesh_version != cooked_mesh_binary_version);
     if (mesh_is_prebaked != asset.prebaked_lods) {
         return fail(
             CookedModelLoadErrorCode::invalid_mesh,
@@ -1928,6 +1942,10 @@ CookedModelLoadResult load_cooked_model_asset(
             submesh.lod_first = binary.lod_first;
             submesh.lod_count = binary.lod_count;
             submesh.lod_error = binary.lod_error;
+            for (std::size_t level = 1; level < model_lod_count; ++level) {
+                if (submesh.lod_count[level] == 0 && submesh.lod_error[level] == 0.0F)
+                    submesh.lod_error[level] = std::numeric_limits<float>::infinity();
+            }
         }
         asset.submeshes.push_back(std::move(submesh));
     }
@@ -2093,10 +2111,36 @@ CookedModelLoadResult load_cooked_model_asset(
         }
     }
 
+    if (!metadata.contains("vegetation")) {
+        // Older imports can carry a standard cutout material with a descriptive
+        // name and no subsurface profile. Match whole words to avoid e.g. "street".
+        const auto foliage_name = [](std::string name) {
+            for (char& ch : name) {
+                if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+                else if (ch < 'a' || ch > 'z') ch = ' ';
+            }
+            constexpr auto words = std::to_array<std::string_view>({
+                "grass", "leaves", "leaf", "foliage", "needles", "fern", "pine",
+                "spruce", "tree", "bush", "shrub", "branch", "palm", "birch", "oak",
+            });
+            for (std::string_view rest{name}; !rest.empty();) {
+                const auto end = rest.find(' ');
+                if (std::ranges::find(words, rest.substr(0, end)) != words.end()) return true;
+                if (end == rest.npos) break;
+                rest.remove_prefix(end + 1U);
+            }
+            return false;
+        };
+        asset.vegetation = std::ranges::any_of(asset.materials, [&](const auto& material) {
+            return is_vegetation_material(material.factors) ||
+                ((material.coverage & material_coverage_alpha_mask_bit) != 0U &&
+                 (foliage_name(material.name) || foliage_name(model_relative.filename().string())));
+        });
+    }
     return CookedModelLoadResult(std::move(asset));
 }
 
-bool serialize_prebaked_vcrmesh_v2(
+bool serialize_prebaked_vcrmesh(
     const CookedModelAsset& model,
     std::vector<std::uint8_t>& out_bytes,
     std::string& out_error) {
@@ -2161,12 +2205,20 @@ bool serialize_prebaked_vcrmesh_v2(
         }
     }
 
+    const bool extended = std::ranges::any_of(model.submeshes, [](const auto& part) {
+        for (std::size_t level = 4U; level < model_lod_count; ++level) {
+            if (part.lod_count[level] || (std::isfinite(part.lod_error[level]) && part.lod_error[level] > 0))
+                return true;
+        }
+        return false;
+    });
+    const std::size_t stored_levels = extended ? model_lod_count : 4U;
     const std::uint64_t submesh_count = model.submeshes.size();
     const std::uint64_t index_count = model.indices.size();
     std::uint64_t total_bytes = mesh_header_bytes;
     std::uint64_t component_bytes = 0U;
     if (!checked_multiply(
-            submesh_count, mesh_submesh_v2_bytes, component_bytes) ||
+            submesh_count, mesh_submesh_v1_bytes + stored_levels * 12U, component_bytes) ||
         !checked_add(total_bytes, component_bytes, total_bytes) ||
         !checked_multiply(
             static_cast<std::uint64_t>(vertex_count),
@@ -2180,7 +2232,7 @@ bool serialize_prebaked_vcrmesh_v2(
         !checked_add(total_bytes, component_bytes, total_bytes) ||
         total_bytes > std::numeric_limits<std::size_t>::max() ||
         total_bytes > out_bytes.max_size()) {
-        out_error = "Serialized v2 mesh byte size overflows.";
+        out_error = "Serialized prebaked mesh byte size overflows.";
         return false;
     }
 
@@ -2199,7 +2251,7 @@ bool serialize_prebaked_vcrmesh_v2(
     for (const std::byte magic_byte : mesh_magic) {
         out_bytes.push_back(std::to_integer<std::uint8_t>(magic_byte));
     }
-    append_u32(cooked_mesh_prebaked_binary_version);
+    append_u32(extended ? cooked_mesh_extended_lod_version : cooked_mesh_prebaked_binary_version);
     append_u32(cooked_mesh_vertex_stride);
     append_u64(static_cast<std::uint64_t>(vertex_count));
     append_u64(index_count);
@@ -2211,13 +2263,13 @@ bool serialize_prebaked_vcrmesh_v2(
         append_u64(submesh.index_count);
         append_u32(submesh.material_index);
         append_u32(0U);
-        for (const std::uint32_t lod_first : submesh.lod_first) {
+        for (const std::uint32_t lod_first : std::span{submesh.lod_first}.first(stored_levels)) {
             append_u32(lod_first);
         }
-        for (const std::uint32_t lod_count : submesh.lod_count) {
+        for (const std::uint32_t lod_count : std::span{submesh.lod_count}.first(stored_levels)) {
             append_u32(lod_count);
         }
-        for (const float lod_error : submesh.lod_error) {
+        for (const float lod_error : std::span{submesh.lod_error}.first(stored_levels)) {
             append_u32(std::bit_cast<std::uint32_t>(lod_error));
         }
     }

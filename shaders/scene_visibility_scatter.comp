@@ -1,5 +1,6 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
+#include "visibility_layout.glsl"
 layout(local_size_x=128) in;
 layout(set=0,binding=0,std140) uniform VisibilityUniforms {
     mat4 viewProjection;
@@ -11,7 +12,7 @@ layout(set=0,binding=0,std140) uniform VisibilityUniforms {
     uvec4 flags;
     vec4 grid[144];
 } config;
-layout(set=0,binding=4,std430) buffer Visible { uint counters[8]; uint indices[]; };
+layout(set=0,binding=4,std430) buffer Visible { uint counters[kVisibilityCounters]; uint indices[]; };
 
 #include "visibility_bins_common.glsl"
 
@@ -30,8 +31,8 @@ void main() {
     indices[dst] = token;
 
     if ((header & (1u << 21u)) != 0u) {
-        uint oldLod = (header >> 22u) & 3u;
-        uint oldCommand = (commandIndex & ~3u) | oldLod;
+        uint oldLod = (header >> 22u) & 7u;
+        uint oldCommand = commandIndex - commandIndex % kModelLods + oldLod;
         uint oldBinOffset = indices[scratchOffset + 3u];
         uint oldDst = indices[kBinCountsBase + oldCommand * kDepthBins + depthBin] + oldBinOffset;
         indices[oldDst] = token | (1u << 29u);

@@ -385,6 +385,7 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
                 return result;
             }
             result.options.lod_fade = *pattern;
+            result.options.lod_fade_override = true;
             continue;
         }
         if (argument.name == "--lod-fade-seconds") {
@@ -1104,6 +1105,11 @@ LightingSettings resolve_scene_lighting(
     return result;
 }
 
+LodFadePattern resolve_scene_lod_fade(
+    const CliOptions& options, std::optional<LodFadePattern> authored) noexcept {
+    return options.lod_fade_override ? options.lod_fade : authored.value_or(options.lod_fade);
+}
+
 ToneMapper resolve_scene_tone_mapper(
     const CliOptions& options, const std::optional<ToneMapper> authored) noexcept {
     return options.tone_mapper_override || !authored
@@ -1207,7 +1213,7 @@ std::string cli_usage(std::string_view executable_name) {
                   "  --exposure-darken-seconds N    Bright-scene time constant (default: .25)\n"
                   "  --grading MODE          off, trilinear, tetrahedral (default: off)\n"
                   "  --grading-lut-size N    Identity/reference LUT: 32 or 64 (default: 32)\n"
-                  "  --lod-fade PATTERN      Model LOD: off, bayer4, bayer8 (default: off)\n"
+                  "  --lod-fade PATTERN      Model LOD: off, bayer4, bayer8 (default: scene or off)\n"
                   "  --lod-fade-seconds SEC  Model LOD transition: 0.05..2 (default: 0.25)\n"
                   "  --smaa-quality MODE     low, medium, high, or ultra\n"
                   "  --smaa-mode MODE        1x or t2x (default: 1x)\n"

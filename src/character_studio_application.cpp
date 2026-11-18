@@ -1967,6 +1967,7 @@ void CharacterStudioApplication::print_cli_help() const {
         << "  --tab <gen|outfit|act|cook> Initial workspace tab (also --workspace)\n"
         << "  --smoke-frames <N>        Run N Vulkan GUI frames and exit cleanly\n"
         << "  --screenshot <png>        Capture Vulkan viewport PNG and exit\n"
+        << "  --camera-distance <m>     Preview orbit distance (0.35..128 m)\n"
         << "  --focus-face              Start camera framed closely on the face\n"
         << "  --mcp-stdio               Enable JSON-RPC 2.0 MCP server on stdin/stdout\n\n"
         << "Headless CLI Options (--cli / --dry-run):\n"

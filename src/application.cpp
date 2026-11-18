@@ -250,9 +250,10 @@ void Application::initialize(const CliOptions& options) {
     if (!renderer_.set_depth_prepass(options.depth_prepass, options.depth_prepass_override)) {
         fatal("Invalid depth prepass mode");
     }
-    if (!renderer_.set_lod_fade(options.lod_fade, options.lod_fade_seconds)) {
+    if (!renderer_.set_lod_fade(resolve_scene_lod_fade(options, scene_.lod_fade), options.lod_fade_seconds)) {
         fatal("Invalid model LOD fade settings");
     }
+
     if (!options.benchmark) {
         input_actions_.set_hardware_polling_enabled(true);
         if (const auto root = find_runtime_asset_root(options.project_path)) {
@@ -2370,7 +2371,7 @@ void Application::finish_benchmark() {
     result.msaa_resident_bytes = renderer_.msaa_resident_bytes();
     result.depth_prepass_requested = to_token(options_.depth_prepass);
     result.depth_prepass_actual = to_token(renderer_.depth_prepass_actual());
-    result.lod_fade_requested = to_token(options_.lod_fade);
+    result.lod_fade_requested = to_token(renderer_.lod_fade_pattern());
     result.lod_fade_actual = to_token(renderer_.lod_fade_actual());
     result.lod_fade_seconds_requested = options_.lod_fade_seconds;
     result.lod_fade_seconds_actual = renderer_.lod_fade_seconds();

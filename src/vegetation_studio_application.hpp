@@ -175,7 +175,7 @@ private:
     VegetationRecipe recipe_{};
     GeneratedVegetationAsset current_asset_{};
     ScopedTempPreviewDir preview_temp_dir_{};
-    std::array<std::string, 4U> preview_lod_relative_paths_{};
+    std::array<std::string, model_lod_count> preview_lod_relative_paths_{};
     std::vector<SceneModelInstance> arena_models_{};
     VegArenaMode arena_mode_ = VegArenaMode::hero_single;
     float arena_spacing_ = 4.2F;

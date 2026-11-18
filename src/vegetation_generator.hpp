@@ -125,10 +125,10 @@ struct VegetationPresetInfo {
 };
 
 struct VegetationOptimizationReport {
-    std::array<std::uint32_t, 4U> vertices{};
-    std::array<std::uint32_t, 4U> triangles{};
-    std::array<std::uint32_t, 4U> submeshes{};
-    std::array<float, 4U> geometric_errors{0.0F, 0.035F, 0.095F, 0.22F};
+    std::array<std::uint32_t, model_lod_count> vertices{};
+    std::array<std::uint32_t, model_lod_count> triangles{};
+    std::array<std::uint32_t, model_lod_count> submeshes{};
+    std::array<float, model_lod_count> geometric_errors{0.0F, 0.035F, 0.095F, 0.22F, 0.46F, 0.95F};
     std::uint64_t float_vertex_bytes_total = 0U;
     std::uint64_t packed_vertex_bytes_total = 0U;
     std::uint64_t texture_rgba_bytes_total = 0U;
@@ -142,7 +142,7 @@ struct VegetationOptimizationReport {
 
 struct GeneratedVegetationAsset {
     VegetationRecipe recipe{};
-    std::array<CookedModelAsset, 4U> lod_models{};
+    std::array<CookedModelAsset, model_lod_count> lod_models{};
     IconRgbaImage bark_albedo{};
     IconRgbaImage bark_normal{};
     IconRgbaImage bark_orm{};
@@ -168,8 +168,8 @@ struct VegetationExportSummary {
     std::filesystem::path lod0_model_file{};
     std::string lod0_relative_path{};
     std::string recipe_relative_path{};
-    std::array<std::filesystem::path, 4U> model_files{};
-    std::array<std::filesystem::path, 4U> mesh_files{};
+    std::array<std::filesystem::path, model_lod_count> model_files{};
+    std::array<std::filesystem::path, model_lod_count> mesh_files{};
     std::vector<std::filesystem::path> material_files{};
     std::vector<std::filesystem::path> texture_files{};
 };
@@ -220,7 +220,7 @@ struct ProjectVegetationEntry {
     VegetationRecipe& out_recipe,
     std::string& error);
 
-/// Deterministically generates LOD0..LOD3 meshes, procedural textures, collision boxes,
+/// Deterministically generates LOD0..LOD5 meshes, procedural textures, collision boxes,
 /// and optimization metrics for the supplied vegetation recipe.
 [[nodiscard]] bool generate_vegetation_asset(
     const VegetationRecipe& recipe,
@@ -238,13 +238,11 @@ struct ProjectVegetationEntry {
     VegetationExportSummary& out_summary,
     std::string& error);
 
-/// Exports standalone individual `preview_lod0..preview_lod3.vcrasset.json` files inside
-/// a temporary preview package so an LOD lineup arena can display all 4 exact LOD levels
-/// simultaneously regardless of camera distance.
+/// Returns the main asset with its full chain followed by individual authored LODs.
 [[nodiscard]] bool export_vegetation_preview_package(
     const GeneratedVegetationAsset& asset,
     const std::filesystem::path& preview_asset_root,
-    std::array<std::string, 4U>& out_lod_relative_paths,
+    std::array<std::string, model_lod_count>& out_lod_relative_paths,
     std::string& error);
 
 [[nodiscard]] bool open_vegetation_package(
