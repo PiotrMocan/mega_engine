@@ -25,6 +25,8 @@ inline constexpr std::uint32_t character_body_bone_count = 38U;
 inline constexpr std::uint32_t character_face_bone_count = 12U;
 inline constexpr std::uint32_t character_total_bone_count = 50U;
 inline constexpr std::uint32_t character_default_texture_size = 1024U;
+inline constexpr std::uint32_t maximum_character_sculpt_samples = 2048U;
+inline constexpr std::uint32_t maximum_character_paint_samples = 4096U;
 
 enum class CharacterRole : std::uint8_t {
     npc = 0U,
@@ -214,6 +216,12 @@ struct SculptStrokeRecord {
     bool mirror_x = true;
 };
 
+struct CharacterSkinPaintFootprint {
+    glm::vec3 bind_center{};
+    float radius_m = 0.045F;
+    bool mirror_x = false;
+};
+
 struct CharacterPaintStroke {
     CharacterPaintTarget target = CharacterPaintTarget::outfit_primary;
     CharacterPaintMode mode = CharacterPaintMode::color;
@@ -223,6 +231,7 @@ struct CharacterPaintStroke {
     float strength = 0.85F;
     glm::vec4 color{0.88F, 0.22F, 0.18F, 1.0F};
     bool mirror_u = false;
+    std::optional<CharacterSkinPaintFootprint> skin_surface{};
 };
 
 struct CharacterGroomSettings {
@@ -232,6 +241,9 @@ struct CharacterGroomSettings {
     float clumping = 0.35F;     // Attraction toward compatible guides, [0, 1].
     float flyaways = 0.15F;     // Fraction/strength of loose fibers, [0, 1].
     float part = 0.25F;        // Lateral part position, [-1, 1].
+    glm::vec3 tip_color_srgb{0.74F, 0.48F, 0.28F};
+    float tip_dye_strength = 0.0F;
+    float tip_dye_start = 0.5F; // Fraction of strand length before the gradient starts.
 };
 
 [[nodiscard]] CharacterGroomSettings sanitize_character_groom_settings(
@@ -411,6 +423,7 @@ struct CharacterCookOptions {
     bool generate_prefabs = true;
     bool generate_localization = true;
     bool overwrite_existing = true;
+    bool verify_before_publish = false;
 };
 
 struct CharacterCookReport {
@@ -527,6 +540,18 @@ void evaluate_character_preview_pose(
     const std::filesystem::path& project_directory,
     const CharacterCookOptions& options,
     CharacterCookReport& out_report,
+    std::string& error);
+
+struct CharacterPreviewGeometry {
+    CharacterMeshBuildResult mesh;
+    std::vector<AnimationClip> clips;
+};
+
+[[nodiscard]] bool cook_character_preview(
+    const CharacterPackage& package,
+    const std::filesystem::path& preview_directory,
+    CharacterCookReport& report,
+    CharacterPreviewGeometry& geometry,
     std::string& error);
 
 [[nodiscard]] std::vector<std::filesystem::path> discover_project_character_packages(

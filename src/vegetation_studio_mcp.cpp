@@ -365,6 +365,10 @@ std::mutex g_stdout_write_mutex;
         true));
 
     tools.push_back(make_tool_entry(
+        "veg.undo_paint", "Undo the last crown brush gesture or clear.", object_schema(), false, false));
+    tools.push_back(make_tool_entry(
+        "veg.redo_paint", "Restore the last undone crown brush gesture or clear.", object_schema(), false, false));
+    tools.push_back(make_tool_entry(
         "veg.set_arena",
         "Switch the live preview arena (hero_single, lod_lineup, grove_100, forest_2500, meadow_10000) and optional spacing.",
         object_schema(
@@ -453,7 +457,7 @@ std::mutex g_stdout_write_mutex;
 }
 
 [[nodiscard]] bool is_known_tool(const std::string_view name) noexcept {
-    static constexpr std::array<std::string_view, 15U> kKnownTools{
+    static constexpr std::array<std::string_view, 17U> kKnownTools{
         "veg.list_presets",
         "veg.get_state",
         "veg.apply_preset",
@@ -461,6 +465,8 @@ std::mutex g_stdout_write_mutex;
         "veg.randomize_seed",
         "veg.paint_foliage",
         "veg.clear_paint",
+        "veg.undo_paint",
+        "veg.redo_paint",
         "veg.set_arena",
         "veg.set_camera",
         "veg.export_to_project",

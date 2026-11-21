@@ -1,4 +1,5 @@
 #include "vfx_json.hpp"
+#include "native_asset_path.hpp"
 #include "prefab_io.hpp"
 #include "scene_component_json.hpp"
 
@@ -591,7 +592,7 @@ template <std::size_t Size>
     }
     std::error_code fs_err;
     const std::filesystem::path canonical_root =
-        std::filesystem::weakly_canonical(asset_root, fs_err);
+        weakly_canonical_asset_path(asset_root, fs_err);
     if (fs_err ||
         !std::filesystem::is_directory(canonical_root, fs_err) ||
         fs_err) {
@@ -635,7 +636,7 @@ template <std::size_t Size>
     }
 
     const std::filesystem::path resolved =
-        std::filesystem::weakly_canonical(canonical_root / rel_path, fs_err);
+        weakly_canonical_asset_path(canonical_root / rel_path, fs_err);
     if (fs_err) {
         error = "Unable to resolve prefab path.";
         return false;

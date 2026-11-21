@@ -217,154 +217,32 @@ void write_le_u32(std::uint8_t* dst, const std::uint32_t value) noexcept {
     return scale;
 }
 
-void downsample_rgba8_mip(
-    const std::vector<std::uint8_t>& prev_rgba8,
-    const std::vector<float>& prev_linear_rgb,
-    const std::vector<float>& prev_alpha,
-    const std::uint32_t prev_w,
-    const std::uint32_t prev_h,
-    const std::uint32_t cur_w,
-    const std::uint32_t cur_h,
-    const std::uint32_t level,
-    const CookedTextureSemantic semantic,
-    const bool is_srgb,
-    const bool has_alpha,
-    const bool apply_coverage_scaling,
-    const double base_coverage,
-    const float alpha_cutoff,
-    std::vector<float>& out_linear_rgb,
-    std::vector<float>& out_alpha,
-    std::vector<std::uint8_t>& out_rgba8) {
-    const std::size_t cur_texels = static_cast<std::size_t>(cur_w) * cur_h;
-    out_linear_rgb.assign(cur_texels * 3U, 0.0F);
-    out_alpha.assign(cur_texels, 1.0F);
-    out_rgba8.resize(cur_texels * 4U);
+[[nodiscard]] bool tightly_packed_rgba8(const CookedTextureAsset& base) noexcept {
+    const std::uint64_t row = static_cast<std::uint64_t>(base.width) * 4U;
+    return base.pixel_format == CookedTexturePixelFormat::rgba8_unorm && row && base.height &&
+        (base.row_stride_bytes == 0U || base.row_stride_bytes == row) &&
+        row <= std::numeric_limits<std::size_t>::max() / base.height &&
+        base.pixels.size() == row * base.height;
+}
 
-    const auto& lut = srgb_to_linear_lut();
-    const bool is_normal = semantic == CookedTextureSemantic::normal;
+struct FilterAxis {
+    std::uint32_t first;
+    std::uint32_t count;
+    std::array<float, 3> weights;
+};
 
-    for (std::uint32_t dy = 0U; dy < cur_h; ++dy) {
-        const std::uint32_t sy0 = std::min(dy * 2U, prev_h - 1U);
-        const std::uint32_t sy1 = std::min(dy * 2U + 1U, prev_h - 1U);
-        for (std::uint32_t dx = 0U; dx < cur_w; ++dx) {
-            const std::uint32_t sx0 = std::min(dx * 2U, prev_w - 1U);
-            const std::uint32_t sx1 = std::min(dx * 2U + 1U, prev_w - 1U);
-            const std::array<std::size_t, 4U> src_indices = {
-                static_cast<std::size_t>(sy0) * prev_w + sx0,
-                static_cast<std::size_t>(sy0) * prev_w + sx1,
-                static_cast<std::size_t>(sy1) * prev_w + sx0,
-                static_cast<std::size_t>(sy1) * prev_w + sx1,
-            };
-
-            const std::size_t dst_idx = static_cast<std::size_t>(dy) * cur_w + dx;
-            if (is_normal) {
-                float nx = 0.0F;
-                float ny = 0.0F;
-                float nz = 0.0F;
-                float sum_a = 0.0F;
-                for (const std::size_t si : src_indices) {
-                    const std::size_t b = si * 4U;
-                    nx += (static_cast<float>(prev_rgba8[b + 0U]) / 255.0F) * 2.0F - 1.0F;
-                    ny += (static_cast<float>(prev_rgba8[b + 1U]) / 255.0F) * 2.0F - 1.0F;
-                    nz += (static_cast<float>(prev_rgba8[b + 2U]) / 255.0F) * 2.0F - 1.0F;
-                    sum_a += static_cast<float>(prev_rgba8[b + 3U]) / 255.0F;
-                }
-                const float len = std::sqrt(nx * nx + ny * ny + nz * nz);
-                if (len > 1.0e-6F) {
-                    nx /= len;
-                    ny /= len;
-                    nz /= len;
-                } else {
-                    nx = 0.0F;
-                    ny = 0.0F;
-                    nz = 1.0F;
-                }
-                out_rgba8[dst_idx * 4U + 0U] = float_to_unorm8(nx * 0.5F + 0.5F);
-                out_rgba8[dst_idx * 4U + 1U] = float_to_unorm8(ny * 0.5F + 0.5F);
-                out_rgba8[dst_idx * 4U + 2U] = float_to_unorm8(nz * 0.5F + 0.5F);
-                out_rgba8[dst_idx * 4U + 3U] = float_to_unorm8(0.25F * sum_a);
-                continue;
-            }
-
-            float raw_r = 0.0F;
-            float raw_g = 0.0F;
-            float raw_b = 0.0F;
-            float raw_a = 0.0F;
-            float sum_r = 0.0F;
-            float sum_g = 0.0F;
-            float sum_b = 0.0F;
-            for (const std::size_t si : src_indices) {
-                const float a = has_alpha
-                    ? prev_alpha[si]
-                    : (static_cast<float>(prev_rgba8[si * 4U + 3U]) / 255.0F);
-                float sr = 0.0F;
-                float sg = 0.0F;
-                float sb = 0.0F;
-                if (level == 1U || !has_alpha) {
-                    const std::size_t b = si * 4U;
-                    if (is_srgb) {
-                        sr = lut[prev_rgba8[b + 0U]];
-                        sg = lut[prev_rgba8[b + 1U]];
-                        sb = lut[prev_rgba8[b + 2U]];
-                    } else {
-                        sr = static_cast<float>(prev_rgba8[b + 0U]) / 255.0F;
-                        sg = static_cast<float>(prev_rgba8[b + 1U]) / 255.0F;
-                        sb = static_cast<float>(prev_rgba8[b + 2U]) / 255.0F;
-                    }
-                } else {
-                    sr = prev_linear_rgb[si * 3U + 0U];
-                    sg = prev_linear_rgb[si * 3U + 1U];
-                    sb = prev_linear_rgb[si * 3U + 2U];
-                }
-                raw_r += sr;
-                raw_g += sg;
-                raw_b += sb;
-                raw_a += a;
-                sum_r += sr * a;
-                sum_g += sg * a;
-                sum_b += sb * a;
-            }
-            const float avg_a = 0.25F * raw_a;
-            out_alpha[dst_idx] = avg_a;
-            float out_r = 0.25F * raw_r;
-            float out_g = 0.25F * raw_g;
-            float out_b = 0.25F * raw_b;
-            if (has_alpha && raw_a > 1.0e-5F) {
-                const float inv_a = 1.0F / raw_a;
-                out_r = sum_r * inv_a;
-                out_g = sum_g * inv_a;
-                out_b = sum_b * inv_a;
-            }
-            out_linear_rgb[dst_idx * 3U + 0U] = out_r;
-            out_linear_rgb[dst_idx * 3U + 1U] = out_g;
-            out_linear_rgb[dst_idx * 3U + 2U] = out_b;
-            if (is_srgb) {
-                out_rgba8[dst_idx * 4U + 0U] = float_to_unorm8(linear_to_srgb_channel(out_r));
-                out_rgba8[dst_idx * 4U + 1U] = float_to_unorm8(linear_to_srgb_channel(out_g));
-                out_rgba8[dst_idx * 4U + 2U] = float_to_unorm8(linear_to_srgb_channel(out_b));
-            } else {
-                out_rgba8[dst_idx * 4U + 0U] = float_to_unorm8(out_r);
-                out_rgba8[dst_idx * 4U + 1U] = float_to_unorm8(out_g);
-                out_rgba8[dst_idx * 4U + 2U] = float_to_unorm8(out_b);
-            }
-            if (!has_alpha) {
-                out_rgba8[dst_idx * 4U + 3U] = float_to_unorm8(avg_a);
-            }
-        }
-    }
-
-    if (has_alpha && !is_normal) {
-        const float scale = apply_coverage_scaling
-            ? compute_coverage_alpha_scale(out_alpha, level, base_coverage, alpha_cutoff)
-            : 1.0F;
-        for (std::size_t i = 0U; i < cur_texels; ++i) {
-            out_rgba8[i * 4U + 3U] = float_to_unorm8(out_alpha[i] * scale);
-        }
-    }
+FilterAxis mip_filter_axis(std::uint32_t size, std::uint32_t dest) noexcept {
+    if (size == 1U) return {0U, 1U, {1.0F}};
+    if (size % 2U == 0U) return {2U * dest, 2U, {0.5F, 0.5F}};
+    // For 2n+1 -> n the footprint covers parts of both outside texels.
+    const std::uint32_t n = size / 2U;
+    const float inv = 1.0F / static_cast<float>(size);
+    return {2U * dest, 3U, {static_cast<float>(n - dest) * inv,
+        static_cast<float>(n) * inv, static_cast<float>(dest + 1U) * inv}};
 }
 
 void encode_bc_mip_level(
-    const std::vector<std::uint8_t>& rgba8,
+    std::span<const std::uint8_t> rgba8,
     const std::uint32_t width,
     const std::uint32_t height,
     const CookedTexturePixelFormat format,
@@ -584,6 +462,84 @@ bool decode_ktx2_bytes(std::span<const std::uint8_t> bytes, const CookedTextureL
     return true;
 }
 
+void visit_filtered_texture_mips(const CookedTextureAsset& base, const float alpha_cutoff,
+    const TextureMipSink& write_mip) {
+    const auto levels = compute_full_mip_levels(base.width, base.height);
+    if (levels <= 1U || !tightly_packed_rgba8(base)) return;
+    const bool srgb = base.color_space == CookedTextureColorSpace::srgb;
+    const bool partial_alpha = has_partial_alpha(base.pixels);
+    // Normal XYZ encodes a vector. Its average length carries subpixel variance
+    // for the lighting shader. Its alpha is an independent data channel.
+    const bool color_alpha = partial_alpha && base.semantic != CookedTextureSemantic::normal;
+    const bool masked = color_alpha && alpha_cutoff > 0.F && alpha_cutoff <= 1.F;
+    const auto& lut = srgb_to_linear_lut();
+    std::size_t covered = 0;
+    if (masked) {
+        for (std::size_t i = 3; i < base.pixels.size(); i += 4)
+            covered += static_cast<float>(base.pixels[i]) / 255.F >= alpha_cutoff;
+    }
+    const auto base_texels = base.pixels.size() / 4U;
+    const double coverage = static_cast<double>(covered) / static_cast<double>(base_texels);
+    std::vector<std::array<float, 4>> previous, next;
+    std::vector<std::uint8_t> encoded;
+    std::vector<float> alpha_for_coverage;
+    std::uint32_t width = base.width, height = base.height;
+    for (std::uint32_t level = 1; level < levels; ++level) {
+        const auto w = std::max(1U, width / 2U), h = std::max(1U, height / 2U);
+        const std::size_t count = static_cast<std::size_t>(w) * h;
+        next.resize(count);
+        encoded.resize(count * 4U);
+        const bool adjust_coverage = covered > 0 && covered < base_texels;
+        if (adjust_coverage) alpha_for_coverage.resize(count);
+        for (std::uint32_t y = 0; y < h; ++y) {
+            const auto fy = mip_filter_axis(height, y);
+            for (std::uint32_t x = 0; x < w; ++x) {
+                const auto fx = mip_filter_axis(width, x);
+                std::array<float, 4> sum{};
+                std::array<float, 3> premultiplied{};
+                for (std::uint32_t j = 0; j < fy.count; ++j) {
+                    const std::size_t row = (static_cast<std::size_t>(fy.first) + j) * width;
+                    for (std::uint32_t i = 0; i < fx.count; ++i) {
+                        const auto index = row + fx.first + i;
+                        std::array<float, 4> sample{};
+                        if (level == 1U) {
+                            const auto* pixel = base.pixels.data() + 4U * index;
+                            for (std::size_t c = 0; c < 3; ++c)
+                                sample[c] = srgb ? lut[pixel[c]] : static_cast<float>(pixel[c]) / 255.F;
+                            sample[3] = static_cast<float>(pixel[3]) / 255.F;
+                        } else {
+                            sample = previous[index];
+                        }
+                        const float weight = fx.weights[i] * fy.weights[j];
+                        for (std::size_t c = 0; c < 4; ++c) sum[c] += weight * sample[c];
+                        if (color_alpha) {
+                            for (std::size_t c = 0; c < 3; ++c)
+                                premultiplied[c] += weight * sample[3] * sample[c];
+                        }
+                    }
+                }
+                const auto index = static_cast<std::size_t>(y) * w + x;
+                for (std::size_t c = 0; c < 3; ++c) {
+                    if (color_alpha && sum[3] > 1.e-6F) sum[c] = premultiplied[c] / sum[3];
+                    encoded[4U * index + c] = float_to_unorm8(srgb ? linear_to_srgb_channel(sum[c]) : sum[c]);
+                }
+                next[index] = sum;
+                encoded[4U * index + 3] = float_to_unorm8(sum[3]);
+                if (adjust_coverage) alpha_for_coverage[index] = sum[3];
+            }
+        }
+        if (adjust_coverage) {
+            const auto scale = compute_coverage_alpha_scale(alpha_for_coverage, level, coverage, alpha_cutoff);
+            for (std::size_t i = 0; i < count; ++i)
+                encoded[4U * i + 3] = float_to_unorm8(alpha_for_coverage[i] * scale);
+        }
+        write_mip(level, w, h, encoded);
+        previous.swap(next);
+        width = w;
+        height = h;
+    }
+}
+
 bool cook_texture_to_vcrtex(
     const CookedTextureAsset& rgba8_mip0,
     const float alpha_cutoff,
@@ -599,16 +555,8 @@ bool cook_texture_to_vcrtex(
         out_error = "Target texture format must be block-compressed.";
         return false;
     }
-    if (rgba8_mip0.pixel_format != CookedTexturePixelFormat::rgba8_unorm ||
-        rgba8_mip0.width == 0U || rgba8_mip0.height == 0U) {
-        out_error = "Source texture for compression must be valid RGBA8.";
-        return false;
-    }
-    const std::uint64_t expected_rgba =
-        static_cast<std::uint64_t>(rgba8_mip0.width) *
-        static_cast<std::uint64_t>(rgba8_mip0.height) * 4ULL;
-    if (rgba8_mip0.pixels.size() != expected_rgba) {
-        out_error = "Source RGBA8 buffer size does not match dimensions.";
+    if (!tightly_packed_rgba8(rgba8_mip0)) {
+        out_error = "Compression requires a tightly packed RGBA8 base level.";
         return false;
     }
     if (target_format == CookedTexturePixelFormat::bc4_unorm &&
@@ -657,75 +605,11 @@ bool cook_texture_to_vcrtex(
         rgba8_mip0.color_space,
         out_vcrtex_bytes.data() + vcrtex_header_bytes + mip_offsets[0]);
 
-    if (mip_levels > 1U) {
-        const bool is_srgb = rgba8_mip0.color_space == CookedTextureColorSpace::srgb;
-        const bool partial_alpha = has_partial_alpha(rgba8_mip0.pixels);
-        const bool preserve_cutoff_coverage =
-            partial_alpha && std::isfinite(alpha_cutoff) && alpha_cutoff > 0.0F && alpha_cutoff <= 1.0F;
-        std::size_t c0_count = 0U;
-        const std::size_t mip0_texels = rgba8_mip0.pixels.size() / 4U;
-        std::vector<float> prev_alpha;
-        if (partial_alpha) {
-            prev_alpha.resize(mip0_texels);
-            for (std::size_t i = 0U; i < mip0_texels; ++i) {
-                const float a = static_cast<float>(rgba8_mip0.pixels[i * 4U + 3U]) / 255.0F;
-                prev_alpha[i] = a;
-                if (preserve_cutoff_coverage && a >= alpha_cutoff) {
-                    ++c0_count;
-                }
-            }
-        }
-        const double base_coverage = preserve_cutoff_coverage
-            ? static_cast<double>(c0_count) / static_cast<double>(mip0_texels)
-            : 0.0;
-        const bool apply_coverage_scaling =
-            preserve_cutoff_coverage && c0_count > 0U && c0_count < mip0_texels;
-
-        std::vector<std::uint8_t> prev_rgba8 = rgba8_mip0.pixels;
-        std::vector<float> prev_linear_rgb;
-        std::vector<std::uint8_t> cur_rgba8;
-        std::vector<float> cur_linear_rgb;
-        std::vector<float> cur_alpha;
-        std::uint32_t prev_w = rgba8_mip0.width;
-        std::uint32_t prev_h = rgba8_mip0.height;
-
-        for (std::uint32_t level = 1U; level < mip_levels; ++level) {
-            const std::uint32_t cur_w = std::max(1U, prev_w >> 1U);
-            const std::uint32_t cur_h = std::max(1U, prev_h >> 1U);
-            downsample_rgba8_mip(
-                prev_rgba8,
-                prev_linear_rgb,
-                prev_alpha,
-                prev_w,
-                prev_h,
-                cur_w,
-                cur_h,
-                level,
-                rgba8_mip0.semantic,
-                is_srgb,
-                partial_alpha,
-                apply_coverage_scaling,
-                base_coverage,
-                alpha_cutoff,
-                cur_linear_rgb,
-                cur_alpha,
-                cur_rgba8);
-
-            encode_bc_mip_level(
-                cur_rgba8,
-                cur_w,
-                cur_h,
-                target_format,
-                rgba8_mip0.color_space,
+    visit_filtered_texture_mips(rgba8_mip0, alpha_cutoff,
+        [&](std::uint32_t level, std::uint32_t w, std::uint32_t h, std::span<const std::uint8_t> texels) {
+            encode_bc_mip_level(texels, w, h, target_format, rgba8_mip0.color_space,
                 out_vcrtex_bytes.data() + vcrtex_header_bytes + mip_offsets[level]);
-
-            prev_w = cur_w;
-            prev_h = cur_h;
-            prev_rgba8.swap(cur_rgba8);
-            prev_linear_rgb.swap(cur_linear_rgb);
-            prev_alpha.swap(cur_alpha);
-        }
-    }
+        });
 
     out_mip_levels = mip_levels;
     return true;
@@ -909,6 +793,16 @@ bool decode_bc_mip0_to_rgba8(
                         pixels[i].g = count > 1 ? byte(channels[i*count+1]) : 0;
                         pixels[i].b = count > 2 ? byte(channels[i*count+2]) : 0;
                         pixels[i].a = 255;
+                        if (count == 2 && texture.semantic == CookedTextureSemantic::normal) {
+                            const bool signed_xy = texture.pixel_format == F::bc5_snorm;
+                            const float x = signed_xy ? channels[i*2] : channels[i*2] * 2.F - 1.F;
+                            const float y = signed_xy ? channels[i*2+1] : channels[i*2+1] * 2.F - 1.F;
+                            const float length2 = x*x + y*y;
+                            const float scale = 0.5F / std::sqrt(std::max(1.F, length2));
+                            pixels[i].r = byte(0.5F + x * scale);
+                            pixels[i].g = byte(0.5F + y * scale);
+                            pixels[i].b = byte(0.5F + 0.5F * std::sqrt(std::max(0.F, 1.F - length2)));
+                        }
                     }
                 }
             }

@@ -1,4 +1,5 @@
 #include "cooked_model_asset.hpp"
+#include "native_asset_path.hpp"
 #include "asset_pak.hpp"
 #include "gpu_grass.hpp"
 
@@ -144,7 +145,7 @@ validate_asset_root(
         };
     }
     canonical_root =
-        std::filesystem::weakly_canonical(asset_root, error);
+        weakly_canonical_asset_path(asset_root, error);
     if (error || canonical_root.empty()) {
         return CookedModelLoadError{
             .code = CookedModelLoadErrorCode::invalid_asset_root,
@@ -197,7 +198,7 @@ resolve_asset_file(
     }
 
     const std::filesystem::path canonical =
-        std::filesystem::weakly_canonical(current, error);
+        weakly_canonical_asset_path(current, error);
     if (error || !path_is_within(canonical, canonical_root)) {
         return CookedModelLoadError{
             .code = CookedModelLoadErrorCode::invalid_path,

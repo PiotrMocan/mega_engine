@@ -51,7 +51,7 @@ layout(location = 14) flat in uint inSubsurfaceProfile;
 layout(location = 15) flat in float inSubsurfaceStrength;
 
 // Base color uses an sRGB image view so Vulkan performs the transfer-function
-// decode. Normal data must use a linear UNORM image view.
+// decode. Normal maps use linear views, including signed BC5.
 layout(set = 1, binding = 0) uniform sampler2D materialBaseColorTexture;
 layout(set = 1, binding = 1) uniform sampler2D materialNormalTexture;
 // Linear glTF data: G roughness, B metallic; white preserves scalar factors.
@@ -59,7 +59,8 @@ layout(set = 1, binding = 2) uniform sampler2D materialMetallicRoughnessTexture;
 layout(set = 1, binding = 4) uniform sampler2D materialEmissiveTexture;
 layout(set = 1, binding = 5, std140) uniform MaterialEmission
 {
-    vec4 emissiveFactor;
+    vec3 emissiveFactor;
+    float normalXYEncoding; // RGB = 0, unsigned XY = 1, signed XY = -1.
 } materialEmission;
 
 vec3 safeNormalize(vec3 value, vec3 fallback)
@@ -100,7 +101,12 @@ vec3 sampleWorldNormal(vec2 uvDx, vec2 uvDy, bool foliage, out float mapVariance
         dot(unorientedBitangent, inWorldBitangent) < 0.0
         ? -unorientedBitangent
         : unorientedBitangent;
-    const vec3 filtered = textureGrad(materialNormalTexture, inUv, uvDx, uvDy).xyz * 2.0 - 1.0;
+    const vec3 sampleValue = textureGrad(materialNormalTexture, inUv, uvDx, uvDy).xyz;
+    vec3 filtered = sampleValue * 2.0 - 1.0;
+    if (materialEmission.normalXYEncoding != 0.0) {
+        const vec2 xy = materialEmission.normalXYEncoding > 0.0 ? filtered.xy : sampleValue.xy;
+        filtered = vec3(xy, sqrt(max(0.0, 1.0 - dot(xy, xy))));
+    }
     // A short mip-filtered vector represents many unresolved leaf normals.
     // Restore the lost angular variance to the lighting lobe instead of
     // amplifying a nearly cancelled direction into a full-strength highlight.

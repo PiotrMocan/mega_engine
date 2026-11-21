@@ -789,6 +789,31 @@ void run() {
         render_frames(2U);
         require(renderer.inspect_rendered_node(mover).packet_current == t0,
                 "editor Stop restores authored transform T0");
+
+        auto preview = vcr::prepare_model_asset(temp_assets.path(), std::string(doc.node(char_2)->get().asset_path));
+        require(preview.model.has_value(), "prepare studio model before touching resident resources");
+        preview.textures.emplace_back().error = "missing preview texture";
+        require(!renderer.replace_editor_preview_model(preview, stop_err) &&
+                    stop_err.find("missing preview texture") != std::string::npos &&
+                    renderer.inspect_rendered_node(char_2).has_model_draw,
+                "an incomplete preview keeps the current scene drawable");
+        preview.textures.pop_back();
+        require(renderer.replace_editor_preview_model(preview, stop_err), "upload prepared preview: " + stop_err);
+        require(renderer.update_editor_scene(authored_view, temp_assets.path(), stop_err),
+                "restore authored instances using the prepared preview: " + stop_err);
+        render_frames(2U);
+        require(renderer.inspect_rendered_node(char_2).has_model_draw, "prepared preview binds to the scene");
+
+        renderer.reset_editor_asset_cache();
+        render_frames(3U);
+        require(renderer.editor_scene_needs_sync() && renderer.instance_count() == 0U &&
+                    renderer.triangle_count() == 0U && !renderer.inspect_rendered_node(char_2).has_model_draw,
+                "cache reset leaves a drawable empty scene until the next submission");
+        require(renderer.update_editor_scene(authored_view, temp_assets.path(), stop_err),
+                "resubmit the same authored revision after cache reset: " + stop_err);
+        render_frames(2U);
+        require(renderer.inspect_rendered_node(char_2).has_model_draw,
+                "the model renders again after the assets are reloaded");
     }
 
     if (renderer.gpu_visibility_available()) {

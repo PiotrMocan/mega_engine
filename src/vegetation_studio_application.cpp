@@ -5,6 +5,7 @@
 #include "runtime_assets.hpp"
 #include "runtime_scene.hpp"
 #include "scene_visibility.hpp"
+#include "studio_brush_controls.hpp"
 #include "vulkan_common.hpp"
 #include "window_icon_sdl.hpp"
 
@@ -202,82 +203,18 @@ void check_veg_imgui_vk_result(const VkResult result) {
     return std::filesystem::current_path(ec);
 }
 
-[[nodiscard]] bool ray_sphere_hit(
-    const glm::vec3 origin,
-    const glm::vec3 direction,
-    const glm::vec3 center,
-    const float radius,
-    float& out_distance) noexcept {
-    if (radius <= 0.001F) {
-        return false;
-    }
-    const glm::vec3 oc = origin - center;
-    const float b = glm::dot(oc, direction);
-    const float c = glm::dot(oc, oc) - radius * radius;
-    const float disc = b * b - c;
-    if (disc < 0.0F) {
-        return false;
-    }
-    const float sqrt_d = std::sqrt(disc);
-    float t = -b - sqrt_d;
-    if (t < 0.05F) {
-        t = -b + sqrt_d;
-    }
-    if (t < 0.05F) {
-        return false;
-    }
-    out_distance = t;
-    return true;
-}
-
-[[nodiscard]] std::optional<glm::vec3> raycast_plant_crown(
-    const glm::vec3 origin,
-    const glm::vec3 direction,
-    const GeneratedVegetationAsset& asset) noexcept {
-    float best_t = (std::numeric_limits<float>::max)();
-    bool hit = false;
-
-    const std::size_t count = std::min(
-        asset.foliage_cluster_centers.size(),
-        asset.foliage_cluster_radii.size());
-    for (std::size_t i = 0U; i < count; ++i) {
-        float t = 0.0F;
-        const float r = std::max(asset.foliage_cluster_radii[i], 0.18F);
-        if (ray_sphere_hit(origin, direction, asset.foliage_cluster_centers[i], r, t) &&
-            t < best_t) {
-            best_t = t;
-            hit = true;
-        }
-    }
-
-    if (!hit) {
-        if (const auto box_t = ray_bounds_intersection(origin, direction, asset.bounds)) {
-            if (*box_t >= 0.05F) {
-                best_t = *box_t;
-                hit = true;
-            }
-        }
-    }
-
-    if (!hit) {
-        return std::nullopt;
-    }
-    return origin + direction * best_t;
-}
-
 [[nodiscard]] glm::vec3 compute_viewport_ray(
     const FlyCamera& camera,
     const float fov_degrees,
     const ImVec2 mouse_pos,
     const ImVec2 img_min,
-    const ImVec2 img_max) noexcept {
+    const ImVec2 img_max, const float aspect) noexcept {
     const float width = (std::max)(1.0F, img_max.x - img_min.x);
     const float height = (std::max)(1.0F, img_max.y - img_min.y);
     const float u = std::clamp((mouse_pos.x - img_min.x) / width, 0.0F, 1.0F);
     const float v = std::clamp((mouse_pos.y - img_min.y) / height, 0.0F, 1.0F);
     const float ndc_x = u * 2.0F - 1.0F;
     const float ndc_y_up = 1.0F - v * 2.0F;
-    const float aspect = width / height;
     const float half_tan = std::tan(glm::radians(fov_degrees) * 0.5F);
     const glm::vec3 dir =
         camera.forward() +
@@ -292,10 +229,9 @@ void check_veg_imgui_vk_result(const VkResult result) {
     const float fov_degrees,
     const glm::vec3 world_pos,
     const ImVec2 img_min,
-    const ImVec2 img_max) noexcept {
+    const ImVec2 img_max, const float aspect) noexcept {
     const float width = (std::max)(1.0F, img_max.x - img_min.x);
     const float height = (std::max)(1.0F, img_max.y - img_min.y);
-    const float aspect = width / height;
     const float half_tan = std::tan(glm::radians(fov_degrees) * 0.5F);
     if (half_tan <= 1.0e-5F || aspect <= 1.0e-5F) {
         return std::nullopt;
@@ -925,21 +861,21 @@ void VegetationStudioApplication::upload_preview_textures() {
     }
     VK_CHECK(vkResetCommandPool(context_.device(), preview_upload_pool_.get(), 0U));
     std::string error;
-    if (current_asset_.has_foliage_textures && current_asset_.foliage_atlas.valid()) {
+    if (current_asset().has_foliage_textures && current_asset().foliage_atlas.valid()) {
         if (!foliage_preview_.upload(
                 context_,
                 preview_upload_pool_.get(),
-                current_asset_.foliage_atlas,
+                current_asset().foliage_atlas,
                 "VegStudio_FoliageAtlas",
                 error,
                 imgui_vulkan_initialized_)) {
             set_status("Foliage preview upload failed: " + error, EditorTone::warning);
         }
-    } else if (current_asset_.has_grass_textures && current_asset_.grass_albedo.valid()) {
+    } else if (current_asset().has_grass_textures && current_asset().grass_albedo.valid()) {
         if (!foliage_preview_.upload(
                 context_,
                 preview_upload_pool_.get(),
-                current_asset_.grass_albedo,
+                current_asset().grass_albedo,
                 "VegStudio_GrassAlbedo",
                 error,
                 imgui_vulkan_initialized_)) {
@@ -949,11 +885,11 @@ void VegetationStudioApplication::upload_preview_textures() {
         foliage_preview_.destroy(imgui_vulkan_initialized_);
     }
 
-    if (current_asset_.has_bark_textures && current_asset_.bark_albedo.valid()) {
+    if (current_asset().has_bark_textures && current_asset().bark_albedo.valid()) {
         if (!bark_preview_.upload(
                 context_,
                 preview_upload_pool_.get(),
-                current_asset_.bark_albedo,
+                current_asset().bark_albedo,
                 "VegStudio_BarkAlbedo",
                 error,
                 imgui_vulkan_initialized_)) {
@@ -992,34 +928,102 @@ void VegetationStudioApplication::synchronize_renderer_textures() {
     }
 }
 
+bool VegetationStudioApplication::export_current_recipe(
+    const std::filesystem::path& asset_root, std::string_view category,
+    VegetationExportSummary& summary, std::string& error) const {
+    if (current_asset().recipe == recipe_ && !current_asset().lod_models.front().vertices.empty())
+        return export_vegetation_package(current_asset(), asset_root, category, summary, error);
+    // The artist may export while a preview rebuild is pending or after it failed.
+    GeneratedVegetationAsset generated;
+    return generate_vegetation_asset(recipe_, generated, error) &&
+        export_vegetation_package(generated, asset_root, category, summary, error);
+}
+
 void VegetationStudioApplication::rebuild_vegetation_assets(const bool frame_camera) {
+    brush_preview_worker_.invalidate();
+    brush_preview_.reset();
+    brush_dragging_ = false;
+    has_last_stroke_center_ = false;
+    preview_dirty_ = false;
     recipe_ = sanitize_vegetation_recipe(recipe_);
     copy_to_buffer(slug_buf_, recipe_.asset_slug);
     copy_to_buffer(display_name_buf_, recipe_.display_name);
 
+    BakedPreview preview;
+    bake_preview(recipe_, preview_temp_dir_.assets_dir(), preview);
+    if (!preview.error.empty()) {
+        preview_error_ = std::move(preview.error);
+        set_status(preview_error_, EditorTone::danger);
+        return;
+    }
+    install_preview(std::move(preview), frame_camera);
+}
+
+void VegetationStudioApplication::bake_preview(const VegetationRecipe& recipe,
+    const std::filesystem::path& assets, BakedPreview& preview) {
     std::string error;
-    if (!generate_vegetation_asset(recipe_, current_asset_, error)) {
-        set_status("Generation failed: " + error, EditorTone::danger);
-        preview_dirty_ = false;
-        return;
+    GeneratedVegetationAsset asset;
+    if (!generate_vegetation_asset(recipe, asset, error)) {
+        preview.error = "Generation failed: " + error;
+    } else if (!preview.surface.build(std::move(asset), error)) {
+        preview.error = "Brush geometry failed: " + error;
+    } else if (!export_vegetation_preview_package(preview.surface.asset(), assets, preview.lod_paths, error)) {
+        preview.error = "Preview export failed: " + error;
     }
+}
 
-    if (!export_vegetation_preview_package(
-            current_asset_,
-            preview_temp_dir_.assets_dir(),
-            preview_lod_relative_paths_,
-            error)) {
-        set_status("Preview export failed: " + error, EditorTone::danger);
-        preview_dirty_ = false;
-        return;
+void VegetationStudioApplication::bake_brush_preview(const VegetationRecipe& recipe, BakedPreview& preview,
+    std::stop_token stop) {
+    if (stop.stop_requested() || !preview.directory.create(preview.error)) return;
+    bake_preview(recipe, preview.directory.assets_dir(), preview);
+    if (preview.error.empty() && !stop.stop_requested()) {
+        preview.prepared = prepare_model_asset(preview.directory.assets_dir(), preview.lod_paths.front());
+        if (!preview.prepared.model) preview.error = preview.prepared.error;
     }
+}
 
+void VegetationStudioApplication::update_brush_preview() {
+    if (!brush_dragging_ && brush_preview_.dirty() && brush_preview_worker_.pending())
+        brush_preview_worker_.invalidate();
+    if (auto result = brush_preview_worker_.take()) {
+        if (!brush_preview_.dirty() || brush_dragging_) {
+            if (result->error.empty()) {
+                install_preview(std::move(*result), false);
+            } else if (!brush_preview_.dirty()) {
+                brush_preview_.reset();
+                preview_error_ = std::move(result->error);
+                set_status(preview_error_, EditorTone::danger);
+            }
+        }
+    }
+    if (!brush_preview_worker_.busy() && brush_preview_.due(brush_dragging_)) {
+        brush_preview_worker_.submit(recipe_);
+        brush_preview_.submitted();
+        preview_error_.clear();
+    }
+}
+
+void VegetationStudioApplication::install_preview(BakedPreview&& preview, const bool frame_camera) {
     // `reset_editor_asset_cache` calls `vkDeviceWaitIdle`, making command pool reset
     // and ImGui texture descriptor replacement completely free of in-flight hazards.
-    renderer_.reset_editor_asset_cache();
+    if (!preview.directory.root().empty()) {
+        if (!renderer_.replace_editor_preview_model(preview.prepared, preview_error_)) {
+            arena_scene_dirty_ = true;
+            if (!brush_preview_.dirty()) brush_preview_.reset();
+            set_status("Preview upload failed: " + preview_error_, EditorTone::danger);
+            return;
+        }
+        preview_temp_dir_ = std::move(preview.directory);
+        brush_preview_.published();
+    } else {
+        renderer_.reset_editor_asset_cache();
+    }
+    current_surface_ = std::move(preview.surface);
+    displayed_paint_surface_ = false;
+    preview_lod_relative_paths_ = std::move(preview.lod_paths);
+    preview_error_.clear();
     upload_preview_textures();
 
-    preview_dirty_ = false;
     arena_scene_dirty_ = true;
 
     if (frame_camera) {
@@ -1033,12 +1037,13 @@ void VegetationStudioApplication::rebuild_vegetation_assets(const bool frame_cam
     }
     set_status(
         "Generated " + recipe_.display_name + " [Grade " +
-            current_asset_.report.budget_grade + ", LOD0 " +
-            std::to_string(current_asset_.report.triangles[0U]) + " tris]",
-        tone_for_budget_grade(current_asset_.report.budget_grade));
+            current_asset().report.budget_grade + ", LOD0 " +
+            std::to_string(current_asset().report.triangles[0U]) + " tris]",
+        tone_for_budget_grade(current_asset().report.budget_grade));
 }
 
 void VegetationStudioApplication::update_arena_scene_if_dirty() {
+    displayed_paint_surface_ = false;
     VisibilitySettings vis = renderer_.visibility_settings();
     vis.lod = (arena_mode_ != VegArenaMode::lod_lineup);
     vis.frustum = true;
@@ -1046,7 +1051,7 @@ void VegetationStudioApplication::update_arena_scene_if_dirty() {
     renderer_.set_visibility_settings(vis);
 
     arena_models_.clear();
-    const Bounds& b = current_asset_.bounds;
+    const Bounds& b = current_asset().bounds;
     const float footprint_dim =
         std::max({b.extent.x * 2.0F, b.extent.z * 2.0F, 1.0F});
     const float auto_step = std::max(arena_spacing_, footprint_dim * 1.15F + 0.8F);
@@ -1157,7 +1162,7 @@ void VegetationStudioApplication::update_arena_scene_if_dirty() {
 }
 
 void VegetationStudioApplication::frame_camera_to_arena() noexcept {
-    const Bounds& b = current_asset_.bounds;
+    const Bounds& b = current_asset().bounds;
     const float h = std::max(b.extent.y * 2.0F, 0.8F);
     const float w = std::max({b.extent.x * 2.0F, b.extent.z * 2.0F, 0.8F});
     const float step = std::max(arena_spacing_, w * 1.15F + 0.8F);
@@ -1299,6 +1304,8 @@ void VegetationStudioApplication::main_loop() {
         if (preview_dirty_) {
             rebuild_vegetation_assets(false);
             rebuilt_this_frame = true;
+        } else {
+            update_brush_preview();
         }
         if (arena_scene_dirty_) {
             update_arena_scene_if_dirty();
@@ -1325,6 +1332,13 @@ void VegetationStudioApplication::main_loop() {
         complete_mcp_screenshot();
 
         if (rendered) {
+            displayed_camera_ = camera_;
+            displayed_fov_ = renderer_.vertical_fov_degrees();
+            const auto extent = renderer_.render_extent();
+            displayed_aspect_ = static_cast<float>(extent.width) / std::max(1.0F, static_cast<float>(extent.height));
+            displayed_wind_seconds_ = renderer_.gpu_grass_wind_seconds();
+            displayed_paint_surface_ = arena_mode_ == VegArenaMode::hero_single && !arena_scene_dirty_ &&
+                !renderer_.visibility_settings().lod && renderer_.resident_editor_model_count() > 0;
             const auto frame_end = std::chrono::steady_clock::now();
             timings.cpu_frame_ms = std::max(
                 0.001,
@@ -1447,33 +1461,33 @@ void VegetationStudioApplication::handle_viewport_painting(
     const ImVec2 img_max,
     const bool viewport_hovered) {
     last_brush_hit_.reset();
-    if (!paint_brush_enabled_ || !viewport_hovered ||
+    const bool just_clicked = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) || just_clicked) {
+        has_last_stroke_center_ = false;
+        brush_dragging_ = false;
+    }
+    if (!paint_brush_enabled_ || !viewport_hovered || !displayed_paint_surface_ || preview_dirty_ ||
+        recipe_.asset_slug != current_asset().recipe.asset_slug || recipe_.seed != current_asset().recipe.seed ||
         arena_mode_ != VegArenaMode::hero_single) {
         return;
     }
 
+    if (just_clicked && !rmb_looking_ && !mmb_panning_) brush_dragging_ = true;
     const ImGuiIO& io = ImGui::GetIO();
-    const glm::vec3 ray_dir = compute_viewport_ray(
-        camera_,
-        renderer_.vertical_fov_degrees(),
-        io.MousePos,
-        img_min,
-        img_max);
-    last_brush_hit_ = raycast_plant_crown(camera_.position(), ray_dir, current_asset_);
-    if (!last_brush_hit_.has_value()) {
-        return;
-    }
+    const glm::vec3 ray_dir = compute_viewport_ray(displayed_camera_, displayed_fov_, io.MousePos,
+        img_min, img_max, displayed_aspect_);
+    const float near_distance = camera_near / glm::dot(ray_dir, displayed_camera_.forward());
+    const auto hit_surface = current_surface_.pick(displayed_camera_.position() + near_distance * ray_dir,
+        ray_dir, displayed_wind_seconds_);
+    if (!hit_surface || !hit_surface->paintable) return;
+    last_brush_hit_ = hit_surface->visible_position;
 
-    if (const auto screen_pt = project_world_to_screen(
-            camera_,
-            renderer_.vertical_fov_degrees(),
-            *last_brush_hit_,
-            img_min,
-            img_max)) {
-        const float dist = std::max(glm::length(*last_brush_hit_ - camera_.position()), 0.5F);
+    if (const auto screen_pt = project_world_to_screen(displayed_camera_, displayed_fov_, *last_brush_hit_,
+            img_min, img_max, displayed_aspect_)) {
+        const float dist = glm::dot(*last_brush_hit_ - displayed_camera_.position(), displayed_camera_.forward());
         const float height_px = std::max(img_max.y - img_min.y, 1.0F);
         const float px_per_meter =
-            height_px / (2.0F * dist * std::tan(glm::radians(renderer_.vertical_fov_degrees()) * 0.5F));
+            height_px / (2.0F * dist * std::tan(glm::radians(displayed_fov_) * 0.5F));
         const float screen_radius = std::clamp(brush_radius_ * px_per_meter, 8.0F, 140.0F);
         const ImU32 ring_col =
             brush_mode_ == VegetationPaintMode::prune_bare
@@ -1488,31 +1502,31 @@ void VegetationStudioApplication::handle_viewport_painting(
         dl->AddCircleFilled(*screen_pt, 3.5F, ring_col);
     }
 
-    if (!rmb_looking_ && !mmb_panning_ && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-        const glm::vec3 hit = *last_brush_hit_;
-        const bool just_clicked = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+    if (!rmb_looking_ && !mmb_panning_ && brush_dragging_) {
+        const glm::vec3 hit = hit_surface->reference_position;
         const float min_step = std::max(brush_radius_ * 0.30F, 0.12F);
         const bool moved_far_enough =
             !has_last_stroke_center_ ||
             glm::length(hit - last_stroke_center_) >= min_step;
         if (just_clicked || moved_far_enough) {
-            if (recipe_.paint_strokes.size() >= maximum_vegetation_paint_strokes) {
-                recipe_.paint_strokes.erase(recipe_.paint_strokes.begin());
-            }
-            recipe_.paint_strokes.push_back(VegetationPaintStroke{
+            const VegetationPaintStroke sample{
                 .local_center = hit,
                 .radius = brush_radius_,
                 .strength = brush_strength_,
                 .falloff = brush_falloff_,
                 .mode = brush_mode_,
                 .tint_srgb = brush_color_srgb_,
-            });
+            };
+            if (!paint_history_.append(recipe_.paint_strokes, sample, maximum_vegetation_paint_strokes,
+                    has_last_stroke_center_)) {
+                if (just_clicked) set_status("Crown paint limit reached. Undo a stroke or clear paint to continue.",
+                    EditorTone::warning);
+                return;
+            }
             last_stroke_center_ = hit;
             has_last_stroke_center_ = true;
-            preview_dirty_ = true;
+            brush_preview_.record(*hit_surface);
         }
-    } else if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-        has_last_stroke_center_ = false;
     }
 }
 
@@ -1569,6 +1583,8 @@ void VegetationStudioApplication::execute_mcp_command(const VegMcpCommand& cmd) 
             push_mcp_response(std::move(resp));
             return;
         }
+        paint_history_.reset();
+        has_last_stroke_center_ = false;
         recipe_ = preset->recipe;
         if (args.contains("seed") && args["seed"].is_number_unsigned()) {
             recipe_.seed = args["seed"].get<std::uint32_t>();
@@ -1591,6 +1607,14 @@ void VegetationStudioApplication::execute_mcp_command(const VegMcpCommand& cmd) 
             push_mcp_response(std::move(resp));
             return;
         }
+        if (const auto strokes = patch.find("paint_strokes"); strokes != patch.end() &&
+            (!strokes->is_array() || strokes->size() > maximum_vegetation_paint_strokes ||
+             !std::ranges::all_of(*strokes, [](const Json& stroke) { return stroke.is_object(); }))) {
+            resp.error = "paint_strokes must be an array of up to " +
+                std::to_string(maximum_vegetation_paint_strokes) + " paint samples.";
+            push_mcp_response(std::move(resp));
+            return;
+        }
         Json merged = serialize_vegetation_recipe_json(recipe_);
         for (const auto& [k, v] : patch.items()) {
             if (v.is_object() && merged.contains(k) && merged[k].is_object()) {
@@ -1608,7 +1632,12 @@ void VegetationStudioApplication::execute_mcp_command(const VegMcpCommand& cmd) 
             push_mcp_response(std::move(resp));
             return;
         }
-        recipe_ = sanitize_vegetation_recipe(std::move(next));
+        next = sanitize_vegetation_recipe(std::move(next));
+        if (next.paint_strokes != recipe_.paint_strokes) {
+            paint_history_.reset();
+            has_last_stroke_center_ = false;
+        }
+        recipe_ = std::move(next);
         rebuild_vegetation_assets(false);
         update_arena_scene_if_dirty();
         resp.ok = true;
@@ -1673,10 +1702,12 @@ void VegetationStudioApplication::execute_mcp_command(const VegMcpCommand& cmd) 
             }
             stroke.tint_srgb = glm::clamp(col, glm::vec3(0.0F), glm::vec3(1.0F));
         }
-        if (recipe_.paint_strokes.size() >= maximum_vegetation_paint_strokes) {
-            recipe_.paint_strokes.erase(recipe_.paint_strokes.begin());
+        if (!paint_history_.append(recipe_.paint_strokes, stroke, maximum_vegetation_paint_strokes, false)) {
+            resp.error = "Crown paint sample limit reached.";
+            push_mcp_response(std::move(resp));
+            return;
         }
-        recipe_.paint_strokes.push_back(stroke);
+        has_last_stroke_center_ = false;
         rebuild_vegetation_assets(false);
         update_arena_scene_if_dirty();
         resp.ok = true;
@@ -1688,12 +1719,17 @@ void VegetationStudioApplication::execute_mcp_command(const VegMcpCommand& cmd) 
         return;
     }
 
-    if (tool == "veg.clear_paint") {
-        recipe_.paint_strokes.clear();
-        rebuild_vegetation_assets(false);
-        update_arena_scene_if_dirty();
+    if (tool == "veg.clear_paint" || tool == "veg.undo_paint" || tool == "veg.redo_paint") {
+        auto& layer = recipe_.paint_strokes;
+        const bool changed = tool == "veg.undo_paint" ? paint_history_.undo(layer)
+            : tool == "veg.redo_paint" ? paint_history_.redo(layer) : paint_history_.clear(layer);
+        if (changed) {
+            has_last_stroke_center_ = false;
+            rebuild_vegetation_assets(false);
+            update_arena_scene_if_dirty();
+        }
         resp.ok = true;
-        resp.payload = Json{{"state", build_state_json()}};
+        resp.payload = Json{{"changed", changed}, {"state", build_state_json()}};
         push_mcp_response(std::move(resp));
         return;
     }
@@ -1786,8 +1822,7 @@ void VegetationStudioApplication::execute_mcp_command(const VegMcpCommand& cmd) 
             resolve_project_assets_root(project_dir);
         VegetationExportSummary summary{};
         std::string export_err;
-        if (!export_vegetation_package(
-                current_asset_, asset_root, subdir, summary, export_err)) {
+        if (!export_current_recipe(asset_root, subdir, summary, export_err)) {
             resp.error = export_err;
             push_mcp_response(std::move(resp));
             return;
@@ -1832,6 +1867,8 @@ void VegetationStudioApplication::execute_mcp_command(const VegMcpCommand& cmd) 
             push_mcp_response(std::move(resp));
             return;
         }
+        paint_history_.reset();
+        has_last_stroke_center_ = false;
         recipe_ = sanitize_vegetation_recipe(std::move(loaded));
         rebuild_vegetation_assets(true);
         update_arena_scene_if_dirty();
@@ -2003,7 +2040,7 @@ void VegetationStudioApplication::push_mcp_response(VegMcpResponse response) {
 }
 
 nlohmann::json VegetationStudioApplication::build_state_json() const {
-    const VegetationOptimizationReport& rep = current_asset_.report;
+    const VegetationOptimizationReport& rep = current_asset().report;
     Json export_json = nullptr;
     if (last_export_.has_value()) {
         export_json = Json{
@@ -2015,9 +2052,11 @@ nlohmann::json VegetationStudioApplication::build_state_json() const {
     }
     return Json{
         {"recipe", serialize_vegetation_recipe_json(recipe_)},
+        {"preview", {{"pending", preview_dirty_ || brush_preview_.dirty() || brush_preview_worker_.pending()},
+                     {"error", preview_error_}}},
         {"bounds", Json{
-            {"center", Json::array({current_asset_.bounds.center.x, current_asset_.bounds.center.y, current_asset_.bounds.center.z})},
-            {"extent", Json::array({current_asset_.bounds.extent.x, current_asset_.bounds.extent.y, current_asset_.bounds.extent.z})},
+            {"center", Json::array({current_asset().bounds.center.x, current_asset().bounds.center.y, current_asset().bounds.center.z})},
+            {"extent", Json::array({current_asset().bounds.extent.x, current_asset().bounds.extent.y, current_asset().bounds.extent.z})},
         }},
         {"report", Json{
             {"vertices", rep.vertices},
@@ -2056,6 +2095,8 @@ nlohmann::json VegetationStudioApplication::build_state_json() const {
             {"strength", brush_strength_},
             {"falloff", brush_falloff_},
             {"stroke_count", recipe_.paint_strokes.size()},
+            {"can_undo", paint_history_.can_undo(recipe_.paint_strokes)},
+            {"can_redo", paint_history_.can_redo()},
         }},
         {"target_project_dir", path_to_utf8(target_project_dir_)},
         {"last_export", std::move(export_json)},
@@ -2181,6 +2222,8 @@ void VegetationStudioApplication::draw_top_bar() {
                 preset.category.c_str(),
                 preset.label.c_str());
             if (ImGui::Selectable(item_buf.data(), selected)) {
+                paint_history_.reset();
+                has_last_stroke_center_ = false;
                 recipe_ = preset.recipe;
                 preview_dirty_ = true;
                 frame_camera_to_arena();
@@ -2277,8 +2320,7 @@ void VegetationStudioApplication::draw_top_bar() {
             const std::filesystem::path asset_root =
                 resolve_project_assets_root(target_project_dir_);
             VegetationExportSummary summary{};
-            if (export_vegetation_package(
-                    current_asset_,
+            if (export_current_recipe(
                     asset_root,
                     category_subdir_buf_.data(),
                     summary,
@@ -2308,7 +2350,7 @@ void VegetationStudioApplication::draw_top_bar() {
         grade_buf.data(),
         grade_buf.size(),
         "Grade %s | %.0f FPS",
-        current_asset_.report.budget_grade.c_str(),
+        current_asset().report.budget_grade.c_str(),
         bar_fps);
     ImGui::SameLine(0.0F, 8.0F);
     const float badge_w = ImGui::CalcTextSize(grade_buf.data()).x + 15.0F;
@@ -2317,7 +2359,7 @@ void VegetationStudioApplication::draw_top_bar() {
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail_w - badge_w);
     }
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 5.0F);
-    ui_kit_.badge(grade_buf.data(), tone_for_budget_grade(current_asset_.report.budget_grade));
+    ui_kit_.badge(grade_buf.data(), tone_for_budget_grade(current_asset().report.budget_grade));
 
     ImGui::End();
 }
@@ -2595,7 +2637,24 @@ void VegetationStudioApplication::draw_viewport_panel() {
 
     const float frame_dt = ImGui::GetIO().DeltaTime;
     update_camera_controls(frame_dt, vp_hovered, vp_focused);
-    handle_viewport_painting(img_min, img_max, vp_hovered);
+    const bool image_hovered = vp_hovered && viewport_texture_ != VK_NULL_HANDLE &&
+        ImGui::IsMouseHoveringRect(img_min, img_max);
+    const bool edit_surface = arena_mode_ == VegArenaMode::hero_single && paint_brush_enabled_;
+    const bool use_distance_lod = arena_mode_ != VegArenaMode::lod_lineup && !edit_surface;
+    auto visibility = renderer_.visibility_settings();
+    if (visibility.lod != use_distance_lod) {
+        visibility.lod = use_distance_lod;
+        renderer_.set_visibility_settings(visibility);
+    }
+    handle_viewport_painting(img_min, img_max, image_hovered);
+    if (arena_mode_ == VegArenaMode::hero_single) {
+        ImDrawList* const draw = ImGui::GetWindowDrawList();
+        brush_preview_.draw_pending([&](const VegetationSurfaceHit& hit) {
+            const auto point = hit.position_at(displayed_wind_seconds_);
+            if (const auto screen = project_world_to_screen(displayed_camera_, displayed_fov_, point, img_min, img_max, displayed_aspect_))
+                draw->AddCircleFilled(*screen, 2.5F, IM_COL32(255, 200, 70, 210));
+        });
+    }
 
     std::array<char, 160U> hud_buf{};
     std::snprintf(
@@ -2652,7 +2711,7 @@ void VegetationStudioApplication::draw_viewport_panel() {
     ui_kit_.viewport_badge(perf_pos, perf_hud.data(), perf_tone);
 
     if (arena_mode_ == VegArenaMode::lod_lineup) {
-        const Bounds& b = current_asset_.bounds;
+        const Bounds& b = current_asset().bounds;
         const float w = std::max({b.extent.x * 2.0F, b.extent.z * 2.0F, 1.0F});
         const float step = std::max(arena_spacing_, w * 1.15F + 0.8F);
         const float top_y = b.center.y + b.extent.y + 0.35F;
@@ -2663,14 +2722,14 @@ void VegetationStudioApplication::draw_viewport_panel() {
                     renderer_.vertical_fov_degrees(),
                     glm::vec3(x, top_y, 0.0F),
                     img_min,
-                    img_max)) {
+                    img_max, displayed_aspect_)) {
                 std::array<char, 48U> lod_buf{};
                 std::snprintf(
                     lod_buf.data(),
                     lod_buf.size(),
                     "LOD%u: %u tris",
                     i,
-                    current_asset_.report.triangles[i]);
+                    current_asset().report.triangles[i]);
                 ui_kit_.viewport_badge(
                     ImVec2(sp->x - 44.0F, sp->y - 12.0F),
                     lod_buf.data(),
@@ -2734,14 +2793,8 @@ void VegetationStudioApplication::draw_right_panel() {
         recipe_.paint_strokes.size(),
         maximum_vegetation_paint_strokes);
     ImGui::TextDisabled("%s", stroke_buf.data());
-    ImGui::SameLine(0.0F, 8.0F);
-    if (ImGui::SmallButton("Undo Stroke") && !recipe_.paint_strokes.empty()) {
-        recipe_.paint_strokes.pop_back();
-        preview_dirty_ = true;
-    }
-    ImGui::SameLine(0.0F, 6.0F);
-    if (ImGui::SmallButton("Clear Paint") && !recipe_.paint_strokes.empty()) {
-        recipe_.paint_strokes.clear();
+    if (draw_studio_brush_controls(paint_history_, recipe_.paint_strokes, "Clear Paint")) {
+        has_last_stroke_center_ = false;
         preview_dirty_ = true;
     }
 
@@ -2753,12 +2806,12 @@ void VegetationStudioApplication::draw_right_panel() {
                 : ((recipe_.archetype == VegetationArchetype::grass_patch_gpu)
                     ? "Grass Blade PBR"
                     : "Sprig Atlas 4x4");
-        const std::uint32_t tex_w = current_asset_.has_grass_textures
-            ? current_asset_.grass_albedo.width
-            : current_asset_.foliage_atlas.width;
-        const std::uint32_t tex_h = current_asset_.has_grass_textures
-            ? current_asset_.grass_albedo.height
-            : current_asset_.foliage_atlas.height;
+        const std::uint32_t tex_w = current_asset().has_grass_textures
+            ? current_asset().grass_albedo.width
+            : current_asset().foliage_atlas.width;
+        const std::uint32_t tex_h = current_asset().has_grass_textures
+            ? current_asset().grass_albedo.height
+            : current_asset().foliage_atlas.height;
         ImGui::BeginGroup();
         ImGui::TextDisabled("%s (%ux%u)", foliage_kind, tex_w, tex_h);
         ImGui::Image(foliage_preview_.imgui_id(), ImVec2(112.0F, 112.0F));
@@ -2769,8 +2822,8 @@ void VegetationStudioApplication::draw_right_panel() {
         ImGui::BeginGroup();
         ImGui::TextDisabled(
             "Bark Albedo (%ux%u)",
-            current_asset_.bark_albedo.width,
-            current_asset_.bark_albedo.height);
+            current_asset().bark_albedo.width,
+            current_asset().bark_albedo.height);
         ImGui::Image(bark_preview_.imgui_id(), ImVec2(112.0F, 112.0F));
         ImGui::EndGroup();
     }
@@ -2836,8 +2889,7 @@ void VegetationStudioApplication::draw_right_panel() {
             set_status("Target project directory is empty.", EditorTone::warning);
         } else {
             VegetationExportSummary summary{};
-            if (export_vegetation_package(
-                    current_asset_,
+            if (export_current_recipe(
                     resolve_project_assets_root(target_project_dir_),
                     category_subdir_buf_.data(),
                     summary,
@@ -2870,6 +2922,8 @@ void VegetationStudioApplication::draw_right_panel() {
                     VegetationRecipe loaded{};
                     std::string load_err;
                     if (open_vegetation_package(e.recipe_absolute_path, loaded, load_err)) {
+                        paint_history_.reset();
+                        has_last_stroke_center_ = false;
                         recipe_ = sanitize_vegetation_recipe(std::move(loaded));
                         rebuild_vegetation_assets(true);
                         update_arena_scene_if_dirty();
@@ -2887,7 +2941,7 @@ void VegetationStudioApplication::draw_right_panel() {
 
 void VegetationStudioApplication::draw_bottom_panel() {
     ImGui::Begin("LOD & Perf Lab");
-    const VegetationOptimizationReport& rep = current_asset_.report;
+    const VegetationOptimizationReport& rep = current_asset().report;
 
     if (ImGui::BeginTable("VegMainPerfSplit", 2, ImGuiTableFlags_SizingStretchProp)) {
         ImGui::TableSetupColumn("LODTableCol", ImGuiTableColumnFlags_WidthStretch, 0.52F);
@@ -3078,6 +3132,7 @@ void VegetationStudioApplication::set_status(std::string text, const EditorTone 
 }
 
 void VegetationStudioApplication::shutdown() noexcept {
+    brush_preview_worker_.stop();
     mcp_control_.quit_requested.store(true, std::memory_order_release);
     mcp_control_.notify_response_available();
     mcp_server_.stop();

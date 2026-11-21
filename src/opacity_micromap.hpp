@@ -16,24 +16,24 @@
 namespace vcr {
 
 [[nodiscard]] inline float sample_rgba8_alpha_repeat_bilinear(
-    const CookedTextureAsset& texture,
+    std::span<const std::uint8_t> pixels, std::uint32_t width, std::uint32_t height,
+    std::size_t row_stride,
     const float u,
     const float v) noexcept {
-    if (texture.width == 0U || texture.height == 0U || texture.pixels.empty()) {
+    if (width == 0 || height == 0 || width > INT32_MAX / 2 || height > INT32_MAX / 2 ||
+        !std::isfinite(u) || !std::isfinite(v)) {
         return 1.0F;
     }
-    const std::size_t stride = texture.row_stride_bytes >= texture.width * 4U
-        ? static_cast<std::size_t>(texture.row_stride_bytes)
-        : static_cast<std::size_t>(texture.width) * 4ULL;
-    if (texture.pixels.size() < stride * static_cast<std::size_t>(texture.height - 1U) +
-            static_cast<std::size_t>(texture.width) * 4ULL) {
+    const std::size_t row = std::size_t{width} * 4;
+    const std::size_t stride = std::max(row_stride, row);
+    if (pixels.size() < row || height - 1U > (pixels.size() - row) / stride) {
         return 1.0F;
     }
 
     const float u_wrapped = u - std::floor(u);
     const float v_wrapped = v - std::floor(v);
-    const float fx = u_wrapped * static_cast<float>(texture.width) - 0.5F;
-    const float fy = v_wrapped * static_cast<float>(texture.height) - 0.5F;
+    const float fx = u_wrapped * static_cast<float>(width) - 0.5F;
+    const float fy = v_wrapped * static_cast<float>(height) - 0.5F;
     const int x0_raw = static_cast<int>(std::floor(fx));
     const int y0_raw = static_cast<int>(std::floor(fy));
     const float tx = fx - static_cast<float>(x0_raw);
@@ -45,15 +45,15 @@ namespace vcr {
         return static_cast<std::uint32_t>(r < 0 ? r + m : r);
     };
 
-    const std::uint32_t x0 = wrap_coord(x0_raw, texture.width);
-    const std::uint32_t x1 = wrap_coord(x0_raw + 1, texture.width);
-    const std::uint32_t y0 = wrap_coord(y0_raw, texture.height);
-    const std::uint32_t y1 = wrap_coord(y0_raw + 1, texture.height);
+    const std::uint32_t x0 = wrap_coord(x0_raw, width);
+    const std::uint32_t x1 = wrap_coord(x0_raw + 1, width);
+    const std::uint32_t y0 = wrap_coord(y0_raw, height);
+    const std::uint32_t y1 = wrap_coord(y0_raw + 1, height);
 
     const auto fetch_alpha = [&](const std::uint32_t x, const std::uint32_t y) noexcept -> float {
         const std::size_t offset =
             static_cast<std::size_t>(y) * stride + static_cast<std::size_t>(x) * 4ULL + 3ULL;
-        return static_cast<float>(texture.pixels[offset]) * (1.0F / 255.0F);
+        return static_cast<float>(pixels[offset]) * (1.0F / 255.0F);
     };
 
     const float a00 = fetch_alpha(x0, y0);
@@ -63,6 +63,11 @@ namespace vcr {
     const float top = a00 + (a10 - a00) * tx;
     const float bottom = a01 + (a11 - a01) * tx;
     return top + (bottom - top) * ty;
+}
+
+[[nodiscard]] inline float sample_rgba8_alpha_repeat_bilinear(
+    const CookedTextureAsset& texture, float u, float v) noexcept {
+    return sample_rgba8_alpha_repeat_bilinear(texture.pixels, texture.width, texture.height, texture.row_stride_bytes, u, v);
 }
 
 // Bakes an 8x8 (64-bit) software opacity micromap per triangle for alpha-masked

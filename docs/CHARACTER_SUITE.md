@@ -11,7 +11,7 @@ All character workflows live in a single native executable (`vulkan_character_st
 | **1. Anatomy & Groom** | `gen` / `anatomy` / `1` | Full-character AI generator, body AI, gender (`female`/`male`), archetype, stature morphs, micro-sculpt brush (Add/Subtract/Smooth/Flatten) via triangle-exact raycast, skin & eye PBR controls, strand-groom hair & stubble parameters |
 | **2. Wardrobe & Paint** | `outfit` / `wardrobe` / `paint` / `2` | Wardrobe stylist AI, layered garments (top, bottom, footwear, studio underwear, cape, pauldrons, gloves, belt), fabric presets & 4-slot palette, 3D surface Vertex Paint brush (`Albedo`/`Roughness`/`Metallic`), interior-body occlusion culling toggle |
 | **3. Acting, Voice & Dialogue** | `act` / `acting` / `dialogue` / `3` | Acting AI, locomotion & temperament controls, procedural keyframe clip inspector (`idle`, `walk`, `run`, `greet`, `alert`), FACS facial expression preview (`neutral`, `friendly`, `suspicious`, `happy`, `angry`, `focused`), bilingual EN/RU formant voice synthesizer + real-time SDL audio playback & WAV export, branching dialogue node & choice editor |
-| **4. Cook & Verify** | `cook` / `export` / `verify` / `4` | Live package dependency & topology summary, texture resolution selector (`256`/`512`/`1024`), selective output toggles (`--no-voice`, `--no-prefabs`, `--no-loc`), atomic publish into `<project>/assets/` (`.vcrmodel`, `.vcrmat.json`, textures, `.vcrcanim.json`, `.vcraudio`, `.vcrdlg.json`, `.vcrprefab.json`, `loc_en`/`loc_ru`), and loader round-trip verification (`VERIFIED`) |
+| **4. Cook & Verify** | `cook` / `export` / `verify` / `4` | Live package dependency & topology summary, texture resolution selector (`256`/`512`/`1024`), selective output toggles (`--no-voice`, `--no-prefabs`, `--no-loc`), publish into `<project>/assets/` (model, materials, textures, animation clips, voice, dialogue, prefabs and localization), and loader round-trip verification (`VERIFIED`) |
 
 ## Quick Launch
 
@@ -22,12 +22,25 @@ scripts\run_character_studio_windows.cmd --project . --character characters\lyra
 Shortcuts in the GUI:
 - `1`–`4`: Switch workspace tab (`Anatomy & Groom`, `Wardrobe & Paint`, `Acting, Voice & Dialogue`, `Cook & Verify`)
 - `Ctrl+S`: Save `.vcrchar.json`
+- `Ctrl+Z` undoes the last brush gesture in the active sculpt or paint workspace. `Ctrl+Y` or `Ctrl+Shift+Z` redoes it. Clear is also reversible. The studio remembers 32 gestures per layer. On reopening a package each saved dab can be removed individually.
 - `Ctrl+N`: Create New Character modal
 - `F`: Frame camera on full body (`--focus-face` frames the face)
 - `G`: Toggle ground grid
 - `Space`: Play/Pause shared clip playback
 
 Studio top-bar controls also expose **Project Character Selector**, **Refresh**, **New**, **Save**, **Cook & Verify**, unsaved-change protection on character switching, and shared bottom transport (`Play/Pause`, `Bind Pose`, clip selector, camera reset).
+
+Sculpt supports 2,048 samples per character and surface paint supports 4,096. Both use the same limits as the package format. Editing or switching characters during background AI generation keeps the newer work. The status bar reports a discarded result.
+
+You can paint or sculpt while an animation is playing or paused. The brush picks the nearest triangle in the displayed pose. Paint follows its material and UVs. Sculpt edits use the corresponding point and surface normal on the reference mesh, so the edit follows the character when the pose changes. Hovering the viewport with a brush enabled shows the full-resolution editing surface.
+
+With `3D brush on skin` enabled, `Skin Radius (m)` sets the dab size on the reference mesh. A dab continues across UV seams and leaves distant body parts untouched even where their texture islands are adjacent. `Mirror Skin Across X` also paints the opposite side of the character. Ctrl-drag restores the original skin color, normal and material response under the brush. The saved UV anchors the dab when body proportions or sculpt edits change.
+
+Clothing, hair, existing UV strokes and the explicit UV skin mode use `UV Radius` and `Mirror U`. These brushes paint the material texture, including repeated or neighboring UV islands within the dab.
+
+During a drag, gold dots follow the edited surface while the studio bakes the mesh and 1024-pixel textures in the background. Long gestures update the model as bakes finish. Releasing the button submits any remaining edits. Save and Cook use the current brush strokes even while the viewport is catching up. MCP reports this in `get_character_summary.preview_render.pending`, with bake failures in `preview_render.error`.
+
+**Cook & Verify** loads the staged model, textures, audio, dialogue, localization and prefabs through the engine loaders before publishing them. A failed replacement restores the previous cooked outputs as a set. If the studio exits during publication, exporting the same character again first restores the previous set. Each character has its own writer lock. Its temporary files and recovery journal live beside the project's asset root. A multi-file update completes when the cook reports success. A failed preview cook keeps the previous model resident in the viewport.
 
 ## Headless CLI (`--cli` / `--dry-run`)
 
@@ -58,6 +71,9 @@ They are also available as CLI and GUI preview flags. Existing packages use the 
 | Hair Clumping | `--hair-clumping` / `hair_clumping` | 0–1 attraction toward compatible guides | 0.35 |
 | Hair Flyaways | `--hair-flyaways` / `hair_flyaways` | 0–1 loose-fiber amount for bob/ponytail scalp | 0.15 |
 | Hair Part | `--hair-part` / `hair_part` | −1–1 lateral bob part position | 0.25 |
+| Tip Dye Color | `--hair-tip-color` / `hair_tip_color` | sRGB hex on the CLI, RGB triple in the package | warm amber |
+| Tip Dye Strength | `--hair-tip-dye` / `hair_tip_dye` | 0–1 pigment blend at scalp strand tips | 0 |
+| Tip Dye Start | `--hair-tip-start` / `hair_tip_start` | 0–0.95 fraction of strand length before the gradient begins | 0.5 |
 
 Slider changes rebuild the preview on release. Lower density reduces emitted scalp geometry;
 brows, lashes and beard retain their own budgets and deterministic random streams.
@@ -81,3 +97,4 @@ the controls above do not constitute an AAA quality certification or a measured 
 Pass `--mcp-stdio` to expose JSON-RPC 2.0 MCP tools on stdin/stdout (`serverInfo.name = "vulkan_character_studio"`), including:
 - Workspace & project management: `list_project_characters`, `load_character`, `new_character`, `set_workspace_tab`, `cook_character`, `get_character_summary`, `save_character`, `request_quit`
 - AI generators: `ai_generate_full_character`, `ai_generate_body`, `ai_generate_outfit`, `ai_generate_acting`
+- `edit_brush_history` takes `layer` (`sculpt` or `paint`) and `action` (`undo`, `redo` or `clear`). The result includes the sample count and availability of undo and redo.

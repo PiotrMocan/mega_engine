@@ -2,6 +2,7 @@
 
 #include "character_ai_bridge.hpp"
 #include "character_package.hpp"
+#include "studio_brush_controls.hpp"
 
 #include <glm/geometric.hpp>
 #include <imgui.h>
@@ -197,7 +198,10 @@ void CharacterStudioApplication::sync_preview_brush(
         shell.set_preview_brush(sculpt_radius_, sculpt_enabled_);
         break;
     case CharacterStudioWorkspace::wardrobe_paint:
-        shell.set_preview_brush(paint_radius_uv_ * 1.4F, paint_enabled_);
+        shell.set_preview_brush(paint_radius_uv_ * 1.4F, paint_enabled_,
+            paint_skin_in_3d_ && (paint_auto_target_ || paint_pinned_target_ == CharacterPaintTarget::skin)
+                ? paint_skin_radius_m_ : 0.0F,
+            paint_skin_in_3d_ && !paint_auto_target_ && paint_pinned_target_ == CharacterPaintTarget::skin);
         break;
     case CharacterStudioWorkspace::acting_dialogue:
     case CharacterStudioWorkspace::cook_export:
@@ -207,6 +211,8 @@ void CharacterStudioApplication::sync_preview_brush(
 }
 
 void CharacterStudioApplication::on_package_loaded(const CharacterPackage& package) {
+    sculpt_history_.reset();
+    paint_history_.reset();
     copy_to_buf(name_buf_.data(), name_buf_.size(), package.identity.display_name);
     copy_to_buf(slug_buf_.data(), slug_buf_.size(), package.identity.slug);
     if (!package.identity.prompt.empty()) {
@@ -260,14 +266,14 @@ void CharacterStudioApplication::handle_viewport_interaction(
             has_last_stroke_pos_ = false;
             return;
         }
-        if (!sculpt_enabled_ || !ctx.hit || !ctx.hit->hit) {
+        if (!sculpt_enabled_ || !ctx.hit) {
             return;
         }
         if (!ctx.left_clicked && !ctx.left_down) {
             return;
         }
         if (!ctx.left_clicked && has_last_stroke_pos_ &&
-            glm::length(ctx.hit->position - last_stroke_pos_) < 0.022F) {
+            glm::length(ctx.hit->bind_position - last_stroke_pos_) < 0.022F) {
             return;
         }
 
@@ -282,41 +288,44 @@ void CharacterStudioApplication::handle_viewport_interaction(
         const float mag = 0.018F * sculpt_strength_;
         switch (active_brush) {
         case SculptBrushKind::inflate:
-            disp = ctx.hit->normal * mag;
+            disp = ctx.hit->bind_normal * mag;
             break;
         case SculptBrushKind::deflate:
-            disp = -ctx.hit->normal * mag;
+            disp = -ctx.hit->bind_normal * mag;
             break;
         case SculptBrushKind::grab:
-            disp = has_last_stroke_pos_
-                ? glm::normalize(ctx.hit->position - last_stroke_pos_ + glm::vec3(1e-5F)) * mag
-                : ctx.hit->normal * (mag * 0.4F);
+            disp = !ctx.left_clicked && has_last_stroke_pos_
+                ? glm::normalize(ctx.hit->bind_position - last_stroke_pos_ + glm::vec3(1e-5F)) * mag
+                : ctx.hit->bind_normal * (mag * 0.4F);
             break;
         case SculptBrushKind::smooth:
         case SculptBrushKind::flatten:
-            disp = -ctx.hit->normal * (mag * 0.25F);
+            disp = -ctx.hit->bind_normal * (mag * 0.25F);
             break;
         }
 
         SculptStrokeRecord rec{};
         rec.brush = active_brush;
-        rec.local_center = ctx.hit->position;
+        rec.local_center = ctx.hit->bind_position;
         rec.displacement = disp;
         rec.radius = sculpt_radius_;
         rec.strength = sculpt_strength_;
         rec.mirror_x = sculpt_mirror_x_;
 
         CharacterPackage& pkg = shell.package();
-        if (pkg.sculpt_strokes.size() < 256U) {
-            pkg.sculpt_strokes.push_back(rec);
-            last_stroke_pos_ = ctx.hit->position;
+        if (sculpt_history_.append(pkg.sculpt_strokes, rec, maximum_character_sculpt_samples,
+                !ctx.left_clicked && has_last_stroke_pos_)) {
+            last_stroke_pos_ = ctx.hit->bind_position;
             has_last_stroke_pos_ = true;
             actions.mark_dirty = true;
-            actions.rebuild_preview = true;
+            shell.request_brush_preview(ctx.hit->anchor);
             actions.status_message = "Sculpt stroke (" +
                 std::string(to_token(active_brush)) + ") #" +
                 std::to_string(pkg.sculpt_strokes.size());
             actions.status_tone = EditorTone::info;
+        } else if (ctx.left_clicked || !has_last_stroke_pos_) {
+            actions.status_message = "Sculpt sample limit reached. Undo a stroke or clear sculpt to continue.";
+            actions.status_tone = EditorTone::warning;
         }
         break;
     }
@@ -325,21 +334,28 @@ void CharacterStudioApplication::handle_viewport_interaction(
             has_last_uv_ = false;
             return;
         }
-        if (!paint_enabled_ || !ctx.hit || !ctx.hit->hit) {
+        if (!paint_enabled_ || !ctx.hit) {
             return;
         }
         if (!ctx.left_clicked && !ctx.left_down) {
             return;
         }
-        if (!ctx.left_clicked && has_last_uv_ &&
-            glm::length(ctx.hit->uv - last_uv_) < 0.015F) {
+        CharacterPaintStroke stroke{};
+        stroke.target = paint_auto_target_ ? ctx.hit->visible.target : paint_pinned_target_;
+        const bool use_surface = paint_skin_in_3d_ && stroke.target == CharacterPaintTarget::skin;
+        if (use_surface && !ctx.hit->paintable_skin) {
+            if (ctx.left_clicked) actions.status_message = "Pick exposed skin for the 3D skin brush.";
             return;
         }
-
-        CharacterPaintStroke stroke{};
-        stroke.target = paint_auto_target_ ? ctx.hit->target : paint_pinned_target_;
+        if (!ctx.left_clicked && has_last_uv_ && stroke.target == last_paint_target_ && use_surface == last_paint_in_3d_) {
+            const bool close = use_surface ?
+                glm::distance(ctx.hit->bind_position, last_paint_center_) < paint_skin_radius_m_ * 0.25F :
+                glm::distance(ctx.hit->visible.uv, last_uv_) < 0.015F;
+            if (close) return;
+        }
+        if (use_surface) stroke.skin_surface = CharacterSkinPaintFootprint{ctx.hit->bind_position, paint_skin_radius_m_, paint_mirror_x_};
         stroke.mode = ctx.ctrl_down ? CharacterPaintMode::erase : paint_mode_;
-        stroke.uv = ctx.hit->uv;
+        stroke.uv = ctx.hit->visible.uv;
         stroke.radius = paint_radius_uv_;
         stroke.hardness = paint_hardness_;
         stroke.strength = paint_strength_;
@@ -347,23 +363,29 @@ void CharacterStudioApplication::handle_viewport_interaction(
         stroke.mirror_u = paint_mirror_u_;
 
         CharacterPackage& pkg = shell.package();
-        if (pkg.paint_strokes.size() < 512U) {
-            pkg.paint_strokes.push_back(stroke);
-            last_uv_ = ctx.hit->uv;
+        if (paint_history_.append(pkg.paint_strokes, stroke, maximum_character_paint_samples,
+                !ctx.left_clicked && has_last_uv_)) {
+            last_uv_ = ctx.hit->visible.uv;
+            last_paint_center_ = ctx.hit->bind_position;
+            last_paint_target_ = stroke.target;
+            last_paint_in_3d_ = use_surface;
             has_last_uv_ = true;
             actions.mark_dirty = true;
-            actions.rebuild_preview = true;
+            shell.request_brush_preview(ctx.hit->anchor);
             actions.status_message = "Painted " +
                 std::string(to_token(stroke.target)) + " (" +
                 std::string(to_token(stroke.mode)) + ") #" +
                 std::to_string(pkg.paint_strokes.size());
             actions.status_tone = EditorTone::info;
+        } else if (ctx.left_clicked || !has_last_uv_) {
+            actions.status_message = "Paint sample limit reached. Undo a stroke or clear paint to continue.";
+            actions.status_tone = EditorTone::warning;
         }
         break;
     }
     case CharacterStudioWorkspace::acting_dialogue:
-        if (ctx.left_clicked && ctx.hit && ctx.hit->hit) {
-            if (ctx.hit->position.y > shell.package().body.height_meters * 0.78F) {
+        if (ctx.left_clicked && ctx.hit) {
+            if (ctx.hit->bind_position.y > shell.package().body.height_meters * 0.78F) {
                 shell.focus_camera_face();
                 actions.status_message = "Focused 12-bone facial rig.";
                 actions.status_tone = EditorTone::info;
@@ -561,15 +583,10 @@ void CharacterStudioApplication::draw_anatomy_left(
     ImGui::SliderFloat("Brush Strength", &sculpt_strength_, 0.1F, 1.5F, "%.2f");
     ImGui::Checkbox("Mirror X", &sculpt_mirror_x_);
     ImGui::TextDisabled("Hold Shift = Smooth, Ctrl = Deflate");
+    ImGui::TextDisabled("Sculpt samples: %zu / %u", pkg.sculpt_strokes.size(), maximum_character_sculpt_samples);
 
-    if (ImGui::Button("Undo Stroke") && !pkg.sculpt_strokes.empty()) {
-        pkg.sculpt_strokes.pop_back();
-        actions.mark_dirty = true;
-        actions.rebuild_preview = true;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Clear Sculpt") && !pkg.sculpt_strokes.empty()) {
-        pkg.sculpt_strokes.clear();
+    if (draw_studio_brush_controls(sculpt_history_, pkg.sculpt_strokes, "Clear Sculpt")) {
+        has_last_stroke_pos_ = false;
         actions.mark_dirty = true;
         actions.rebuild_preview = true;
     }
@@ -692,6 +709,10 @@ void CharacterStudioApplication::draw_anatomy_right(
     face_slider("Hair Width", &pkg.wardrobe.groom.width, 0.5F, 1.5F);
     face_slider("Hair Clumping", &pkg.wardrobe.groom.clumping);
     face_slider("Hair Flyaways", &pkg.wardrobe.groom.flyaways);
+    if (ImGui::ColorEdit3("Tip Dye Color", &pkg.wardrobe.groom.tip_color_srgb.x)) actions.mark_dirty = true;
+    if (ImGui::IsItemDeactivatedAfterEdit()) actions.rebuild_preview = true;
+    face_slider("Tip Dye Strength", &pkg.wardrobe.groom.tip_dye_strength);
+    face_slider("Tip Dye Start", &pkg.wardrobe.groom.tip_dye_start, 0.F, 0.95F);
     face_slider("Hair Part", &pkg.wardrobe.groom.part, -1.0F, 1.0F);
     ImGui::TextWrapped("Density controls scalp geometry cost. Changes apply when the slider is released.");
     if (ImGui::Checkbox("Studio Underwear", &pkg.wardrobe.studio_underwear)) {
@@ -903,20 +924,25 @@ void CharacterStudioApplication::draw_wardrobe_right(
             ImGui::EndCombo();
         }
     }
-    ImGui::SliderFloat("UV Radius", &paint_radius_uv_, 0.01F, 0.18F, "%.3f");
+    if (paint_auto_target_ || paint_pinned_target_ == CharacterPaintTarget::skin) {
+        ImGui::Checkbox("3D brush on skin", &paint_skin_in_3d_);
+        if (paint_skin_in_3d_) {
+            const float label_width = ImGui::CalcTextSize("Skin Radius (m)").x + ImGui::GetStyle().ItemInnerSpacing.x;
+            ImGui::SetNextItemWidth(std::max(40.0F, ImGui::GetContentRegionAvail().x - label_width));
+            ImGui::SliderFloat("Skin Radius (m)", &paint_skin_radius_m_, 0.002F, 0.5F, "%.3f", ImGuiSliderFlags_Logarithmic);
+            ImGui::Checkbox("Mirror Skin Across X", &paint_mirror_x_);
+        }
+    }
+    const bool uv_brush = paint_auto_target_ || paint_pinned_target_ != CharacterPaintTarget::skin || !paint_skin_in_3d_;
+    if (uv_brush) ImGui::SliderFloat("UV Radius", &paint_radius_uv_, 0.01F, 0.18F, "%.3f");
     ImGui::SliderFloat("Hardness", &paint_hardness_, 0.05F, 1.0F, "%.2f");
     ImGui::SliderFloat("Strength", &paint_strength_, 0.05F, 1.0F, "%.2f");
     ImGui::ColorEdit4("Paint Color", &paint_color_.x);
-    ImGui::Checkbox("Mirror U", &paint_mirror_u_);
+    if (uv_brush) ImGui::Checkbox("Mirror U", &paint_mirror_u_);
+    ImGui::TextDisabled("Paint samples: %zu / %u", pkg.paint_strokes.size(), maximum_character_paint_samples);
 
-    if (ImGui::Button("Undo Paint") && !pkg.paint_strokes.empty()) {
-        pkg.paint_strokes.pop_back();
-        actions.mark_dirty = true;
-        actions.rebuild_preview = true;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Clear Paint") && !pkg.paint_strokes.empty()) {
-        pkg.paint_strokes.clear();
+    if (draw_studio_brush_controls(paint_history_, pkg.paint_strokes, "Clear Paint")) {
+        has_last_uv_ = false;
         actions.mark_dirty = true;
         actions.rebuild_preview = true;
     }
@@ -1698,6 +1724,24 @@ int CharacterStudioApplication::run_cli(const CharacterStudioCliArgs& args) {
             mutated = true;
         }
     }
+    if (const auto v = args.find_option("hair-tip-color")) {
+        if (const auto value = parse_hex_rgb(*v)) {
+            pkg.wardrobe.groom.tip_color_srgb = *value;
+            mutated = true;
+        }
+    }
+    if (const auto v = args.find_option("hair-tip-dye")) {
+        if (const auto value = parse_finite_float(*v)) {
+            pkg.wardrobe.groom.tip_dye_strength = *value;
+            mutated = true;
+        }
+    }
+    if (const auto v = args.find_option("hair-tip-start")) {
+        if (const auto value = parse_finite_float(*v)) {
+            pkg.wardrobe.groom.tip_dye_start = *value;
+            mutated = true;
+        }
+    }
     if (const auto v = args.find_option("hair-part")) {
         if (const auto value = parse_finite_float(*v)) {
             pkg.wardrobe.groom.part = *value;
@@ -1897,6 +1941,7 @@ int CharacterStudioApplication::run_cli(const CharacterStudioCliArgs& args) {
             opts.generate_localization = false;
         }
         opts.overwrite_existing = true;
+        opts.verify_before_publish = verify;
 
         CharacterCookReport report{};
         if (!cook_character_package_to_project(
@@ -1904,11 +1949,6 @@ int CharacterStudioApplication::run_cli(const CharacterStudioCliArgs& args) {
             std::cerr << "vulkan_character_studio: cook failed: " << err << "\n";
             return 1;
         }
-        if (verify && !verify_cooked_character_outputs(args.project_directory, report, err)) {
-            std::cerr << "vulkan_character_studio: verification failed: " << err << "\n";
-            return 1;
-        }
-
         if (json_out) {
             std::cout << Json{
                 {"status", "ok"},
@@ -1985,6 +2025,7 @@ void CharacterStudioApplication::print_cli_help() const {
         << "  --top / --bottom / --footwear / --hair / --material / --secondary-material\n"
         << "  --primary-color / --secondary-color / --accent-color / --footwear-color / --hair-color\n"
         << "  --hair-density <0.15..1.5> / --hair-length <0.6..1.4> / --hair-width <0.5..1.5>\n"
+        << "  --hair-tip-color <RRGGBB> / --hair-tip-dye <0..1> / --hair-tip-start <0..0.95>\n"
         << "  --hair-clumping <0..1> / --hair-flyaways <0..1> / --hair-part <-1..1>\n"
         << "  --cape / --no-cape / --belt / --no-belt / --gloves / --no-gloves\n"
         << "  --pauldrons / --no-pauldrons / --beard / --no-beard / --studio-underwear / --no-studio-underwear\n"
@@ -2005,7 +2046,7 @@ bool CharacterStudioApplication::handle_mcp_custom_method(
     CharacterPackage& package,
     const OllamaBridgeConfig& ollama,
     std::string& out_result_json,
-    bool& out_rebuild_preview,
+    CharacterDocumentChange& out_change,
     std::string& out_error) {
     Json p = Json::object();
     try {
@@ -2014,6 +2055,35 @@ bool CharacterStudioApplication::handle_mcp_custom_method(
         }
     } catch (...) {}
 
+    if (method == "edit_brush_history") {
+        if (!p.is_object() || !p.contains("layer") || !p["layer"].is_string() ||
+            !p.contains("action") || !p["action"].is_string()) {
+            out_error = "A brush layer and action are required.";
+            return false;
+        }
+        const auto& layer = p["layer"].get_ref<const std::string&>();
+        const auto& action = p["action"].get_ref<const std::string&>();
+        if ((layer != "sculpt" && layer != "paint") ||
+            (action != "undo" && action != "redo" && action != "clear")) {
+            out_error = "Use layer sculpt or paint and action undo, redo or clear.";
+            return false;
+        }
+        const auto edit = [&](auto& history, auto& samples, bool& has_last) {
+            const bool changed = action == "undo" ? history.undo(samples)
+                : action == "redo" ? history.redo(samples) : history.clear(samples);
+            if (changed) {
+                has_last = false;
+                out_change = CharacterDocumentChange::brush_layer;
+                dry_run_valid_ = false;
+                dry_run_summary_.clear();
+            }
+            out_result_json = Json{{"changed", changed}, {"sample_count", samples.size()},
+                {"can_undo", history.can_undo(samples)}, {"can_redo", history.can_redo()}}.dump();
+        };
+        if (layer == "sculpt") edit(sculpt_history_, package.sculpt_strokes, has_last_stroke_pos_);
+        else edit(paint_history_, package.paint_strokes, has_last_uv_);
+        return true;
+    }
     if (method == "ai_generate_body") {
         const std::string prompt = p.value("prompt", std::string{"balanced wanderer"});
         const std::uint64_t seed = p.value("seed", package.identity.seed);
@@ -2028,7 +2098,7 @@ bool CharacterStudioApplication::handle_mcp_custom_method(
                 sanitize_character_package(package);
             }
         }
-        out_rebuild_preview = true;
+        out_change = CharacterDocumentChange::replace_package;
         out_result_json = Json{
             {"used_ollama", res.used_ollama},
             {"summary", res.summary},
@@ -2045,7 +2115,7 @@ bool CharacterStudioApplication::handle_mcp_custom_method(
             out_error = res.diagnostic;
             return false;
         }
-        out_rebuild_preview = true;
+        out_change = CharacterDocumentChange::replace_package;
         out_result_json = Json{
             {"used_ollama", res.used_ollama},
             {"summary", res.summary},
@@ -2061,7 +2131,7 @@ bool CharacterStudioApplication::handle_mcp_custom_method(
             out_error = res.diagnostic;
             return false;
         }
-        out_rebuild_preview = true;
+        out_change = CharacterDocumentChange::replace_package;
         out_result_json = Json{
             {"used_ollama", res.used_ollama},
             {"summary", res.summary},
@@ -2080,7 +2150,7 @@ bool CharacterStudioApplication::handle_mcp_custom_method(
             out_error = res.diagnostic;
             return false;
         }
-        out_rebuild_preview = true;
+        out_change = CharacterDocumentChange::replace_package;
         out_result_json = Json{
             {"used_ollama", res.used_ollama},
             {"summary", res.summary},

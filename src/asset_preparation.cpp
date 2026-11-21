@@ -1,5 +1,6 @@
 #include "asset_preparation.hpp"
 #include "job_system.hpp"
+#include "texture_compression.hpp"
 #include "model_lod.hpp"
 #include "gpu_grass.hpp"
 #include "opacity_micromap.hpp"
@@ -38,13 +39,6 @@ using TransparentStringIndexMap =
         : std::pow((clamped + 0.055F) / 1.055F, 2.4F);
 }
 
-[[nodiscard]] float linear_to_srgb_channel(const float c) noexcept {
-    const float clamped = std::clamp(c, 0.0F, 1.0F);
-    return clamped <= 0.0031308F
-        ? clamped * 12.92F
-        : 1.055F * std::pow(clamped, 1.0F / 2.4F) - 0.055F;
-}
-
 [[nodiscard]] const std::array<float, 256>& srgb_to_linear_lut() noexcept {
     static const std::array<float, 256> lut = []() {
         std::array<float, 256> table{};
@@ -54,11 +48,6 @@ using TransparentStringIndexMap =
         return table;
     }();
     return lut;
-}
-
-[[nodiscard]] std::uint8_t float_to_unorm8(const float v) noexcept {
-    const float clamped = std::clamp(v, 0.0F, 1.0F);
-    return static_cast<std::uint8_t>(std::clamp(std::lround(clamped * 255.0F), 0L, 255L));
 }
 
 [[nodiscard]] bool prepare_model_geometry(PreparedModel &result, CookedModelAsset &out_model) {
@@ -201,7 +190,7 @@ void build_texture_mip_chain(
     if (base.width <= 1U && base.height <= 1U) {
         return;
     }
-    if (base.width == 0U || base.height == 0U ||
+    if (base.pixel_format != CookedTexturePixelFormat::rgba8_unorm || base.width == 0U || base.height == 0U ||
         base.width > std::numeric_limits<std::size_t>::max() / 4U / base.height) {
         return;
     }
@@ -210,7 +199,7 @@ void build_texture_mip_chain(
     const std::size_t mip0_bytes = mip0_texels * 4U;
     if (mip0_texels == 0U ||
         base.pixels.size() != mip0_bytes ||
-        (base.row_stride_bytes != 0U && base.row_stride_bytes != base.width * 4U)) {
+        (base.row_stride_bytes != 0U && base.row_stride_bytes != static_cast<std::size_t>(base.width) * 4U)) {
         return;
     }
 
@@ -234,23 +223,6 @@ void build_texture_mip_chain(
     if (mip_levels < 2U) {
         return;
     }
-
-    const bool preserve_cutoff_coverage =
-        std::isfinite(alpha_cutoff) && alpha_cutoff > 0.0F && alpha_cutoff <= 1.0F;
-    std::size_t c0_count = 0U;
-    if (preserve_cutoff_coverage) {
-        for (std::size_t i = 0U; i < mip0_texels; ++i) {
-            const float alpha = static_cast<float>(base.pixels[i * 4U + 3U]) / 255.0F;
-            if (alpha >= alpha_cutoff) {
-                ++c0_count;
-            }
-        }
-    }
-    const double c0 = preserve_cutoff_coverage
-        ? static_cast<double>(c0_count) / static_cast<double>(mip0_texels)
-        : 0.0;
-    const bool apply_coverage_scaling =
-        preserve_cutoff_coverage && c0_count > 0U && c0_count < mip0_texels;
 
     std::size_t total_bytes = 0U;
     std::uint32_t lw = base.width;
@@ -291,198 +263,14 @@ void build_texture_mip_chain(
     entry.mip_byte_offsets.push_back(0U);
     std::copy(base.pixels.begin(), base.pixels.end(), entry.mip_chain_rgba.begin());
 
-    const bool is_srgb = (base.color_space == CookedTextureColorSpace::srgb);
-    const auto &srgb_lut = srgb_to_linear_lut();
-
-    std::vector<float> prev_raw_alpha(mip0_texels);
-    for (std::size_t i = 0U; i < mip0_texels; ++i) {
-        prev_raw_alpha[i] = static_cast<float>(base.pixels[i * 4U + 3U]) / 255.0F;
-    }
-    std::vector<float> prev_linear_rgb;
-
-    std::uint32_t prev_w = base.width;
-    std::uint32_t prev_h = base.height;
-    std::size_t write_offset = mip0_bytes;
-
-    for (std::uint32_t lvl = 1U; lvl < mip_levels; ++lvl) {
-        const std::uint32_t cur_w = std::max(1U, prev_w >> 1U);
-        const std::uint32_t cur_h = std::max(1U, prev_h >> 1U);
-        const std::size_t cur_texels =
-            static_cast<std::size_t>(cur_w) * static_cast<std::size_t>(cur_h);
-        entry.mip_byte_offsets.push_back(write_offset);
-
-        std::vector<float> cur_raw_alpha(cur_texels, 0.0F);
-        std::vector<float> cur_linear_rgb(cur_texels * 3U, 0.0F);
-        for (std::uint32_t y = 0U; y < cur_h; ++y) {
-            const std::uint32_t sy0 = std::min(prev_h - 1U, y * 2U);
-            const std::uint32_t sy1 = std::min(prev_h - 1U, y * 2U + 1U);
-            for (std::uint32_t x = 0U; x < cur_w; ++x) {
-                const std::uint32_t sx0 = std::min(prev_w - 1U, x * 2U);
-                const std::uint32_t sx1 = std::min(prev_w - 1U, x * 2U + 1U);
-
-                const std::size_t idx00 = static_cast<std::size_t>(sy0) * prev_w + sx0;
-                const std::size_t idx10 = static_cast<std::size_t>(sy0) * prev_w + sx1;
-                const std::size_t idx01 = static_cast<std::size_t>(sy1) * prev_w + sx0;
-                const std::size_t idx11 = static_cast<std::size_t>(sy1) * prev_w + sx1;
-
-                const std::array<std::size_t, 4U> ids{idx00, idx10, idx01, idx11};
-                float sum_a = 0.0F;
-                float sum_r = 0.0F;
-                float sum_g = 0.0F;
-                float sum_b = 0.0F;
-                float raw_r = 0.0F;
-                float raw_g = 0.0F;
-                float raw_b = 0.0F;
-                for (const std::size_t sidx : ids) {
-                    const float pa = prev_raw_alpha[sidx];
-                    float lr = 0.0F;
-                    float lg = 0.0F;
-                    float lb = 0.0F;
-                    if (lvl == 1U) {
-                        const std::size_t b = sidx * 4U;
-                        const std::uint8_t br = base.pixels[b + 0U];
-                        const std::uint8_t bg = base.pixels[b + 1U];
-                        const std::uint8_t bb = base.pixels[b + 2U];
-                        if (is_srgb) {
-                            lr = srgb_lut[br];
-                            lg = srgb_lut[bg];
-                            lb = srgb_lut[bb];
-                        } else {
-                            constexpr float inv_255 = 1.0F / 255.0F;
-                            lr = static_cast<float>(br) * inv_255;
-                            lg = static_cast<float>(bg) * inv_255;
-                            lb = static_cast<float>(bb) * inv_255;
-                        }
-                    } else {
-                        const std::size_t rgb_idx = sidx * 3U;
-                        lr = prev_linear_rgb[rgb_idx + 0U];
-                        lg = prev_linear_rgb[rgb_idx + 1U];
-                        lb = prev_linear_rgb[rgb_idx + 2U];
-                    }
-                    sum_a += pa;
-                    sum_r += lr * pa;
-                    sum_g += lg * pa;
-                    sum_b += lb * pa;
-                    raw_r += lr;
-                    raw_g += lg;
-                    raw_b += lb;
-                }
-
-                const std::size_t dst_idx = static_cast<std::size_t>(y) * cur_w + x;
-                cur_raw_alpha[dst_idx] = 0.25F * sum_a;
-
-                float out_r = 0.0F;
-                float out_g = 0.0F;
-                float out_b = 0.0F;
-                if (sum_a > 1.0e-4F) {
-                    const float inv_a = 1.0F / sum_a;
-                    out_r = sum_r * inv_a;
-                    out_g = sum_g * inv_a;
-                    out_b = sum_b * inv_a;
-                } else {
-                    out_r = 0.25F * raw_r;
-                    out_g = 0.25F * raw_g;
-                    out_b = 0.25F * raw_b;
-                }
-                const std::size_t dst_rgb_idx = dst_idx * 3U;
-                cur_linear_rgb[dst_rgb_idx + 0U] = out_r;
-                cur_linear_rgb[dst_rgb_idx + 1U] = out_g;
-                cur_linear_rgb[dst_rgb_idx + 2U] = out_b;
-
-                const std::size_t out_b_idx = write_offset + dst_idx * 4U;
-                if (is_srgb) {
-                    entry.mip_chain_rgba[out_b_idx + 0U] =
-                        float_to_unorm8(linear_to_srgb_channel(out_r));
-                    entry.mip_chain_rgba[out_b_idx + 1U] =
-                        float_to_unorm8(linear_to_srgb_channel(out_g));
-                    entry.mip_chain_rgba[out_b_idx + 2U] =
-                        float_to_unorm8(linear_to_srgb_channel(out_b));
-                } else {
-                    entry.mip_chain_rgba[out_b_idx + 0U] = float_to_unorm8(out_r);
-                    entry.mip_chain_rgba[out_b_idx + 1U] = float_to_unorm8(out_g);
-                    entry.mip_chain_rgba[out_b_idx + 2U] = float_to_unorm8(out_b);
-                }
-            }
-        }
-
-        float scale = 1.0F;
-        if (apply_coverage_scaling) {
-            std::size_t nonzero_count = 0U;
-            for (const float a : cur_raw_alpha) {
-                if (a > 1.0e-6F) {
-                    ++nonzero_count;
-                }
-            }
-            if (nonzero_count > 0U) {
-                const double max_achievable =
-                    static_cast<double>(nonzero_count) / static_cast<double>(cur_texels);
-                const double raw_target =
-                    (lvl >= 3U) ? std::min(1.0, std::max(c0, c0 * 1.03)) : c0;
-                const double target_cov = std::min(raw_target, max_achievable);
-
-                const auto eval_coverage =
-                    [&](const float s) -> std::pair<std::size_t, double> {
-                    std::size_t pass_count = 0U;
-                    for (const float a : cur_raw_alpha) {
-                        const std::uint8_t q = float_to_unorm8(a * s);
-                        if (static_cast<float>(q) / 255.0F >= alpha_cutoff) {
-                            ++pass_count;
-                        }
-                    }
-                    return {pass_count,
-                            static_cast<double>(pass_count) / static_cast<double>(cur_texels)};
-                };
-
-                float lo = 0.0F;
-                float hi = 1.0F;
-                while (hi < 1024.0F && eval_coverage(hi).second < target_cov) {
-                    lo = hi;
-                    hi *= 2.0F;
-                }
-                for (int iter = 0; iter < 18; ++iter) {
-                    const float mid = 0.5F * (lo + hi);
-                    if (eval_coverage(mid).second < target_cov) {
-                        lo = mid;
-                    } else {
-                        hi = mid;
-                    }
-                }
-                const float mid = 0.5F * (lo + hi);
-                const auto [pass_lo, cov_lo] = eval_coverage(lo);
-                const auto [pass_mid, cov_mid] = eval_coverage(mid);
-                const auto [pass_hi, cov_hi] = eval_coverage(hi);
-
-                scale = hi;
-                double best_err = std::abs(cov_hi - target_cov);
-                std::size_t best_pass = pass_hi;
-                const auto consider = [&](const float cand_s,
-                                          const std::size_t cand_pass,
-                                          const double cand_cov) {
-                    if (cand_pass == 0U && best_pass > 0U) {
-                        return;
-                    }
-                    const double err = std::abs(cand_cov - target_cov);
-                    if ((best_pass == 0U && cand_pass > 0U) || err < best_err) {
-                        scale = cand_s;
-                        best_err = err;
-                        best_pass = cand_pass;
-                    }
-                };
-                consider(mid, pass_mid, cov_mid);
-                consider(lo, pass_lo, cov_lo);
-            }
-        }
-        for (std::size_t i = 0U; i < cur_texels; ++i) {
-            entry.mip_chain_rgba[write_offset + i * 4U + 3U] =
-                float_to_unorm8(cur_raw_alpha[i] * scale);
-        }
-
-        prev_w = cur_w;
-        prev_h = cur_h;
-        write_offset += cur_texels * 4U;
-        prev_raw_alpha = std::move(cur_raw_alpha);
-        prev_linear_rgb = std::move(cur_linear_rgb);
-    }
+    std::size_t offset = mip0_bytes;
+    visit_filtered_texture_mips(base, alpha_cutoff,
+        [&](std::uint32_t, std::uint32_t, std::uint32_t, std::span<const std::uint8_t> texels) {
+            entry.mip_byte_offsets.push_back(offset);
+            std::copy(texels.begin(), texels.end(), entry.mip_chain_rgba.data() + offset);
+            offset += texels.size();
+        });
+    assert(offset == total_bytes);
 }
 
 PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,

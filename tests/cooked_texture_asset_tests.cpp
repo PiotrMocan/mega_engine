@@ -1,6 +1,7 @@
 #include "cooked_texture_asset.hpp"
 #include "asset_pak.hpp"
 #include "png_encoder.hpp"
+#include "native_asset_path.hpp"
 #include "texture_compression.hpp"
 
 #include <ImfHeader.h>
@@ -428,8 +429,9 @@ void test_asset_pak(const std::filesystem::path& temp_base) {
             read_buf) == vcr::AssetPakReadStatus::file_too_large,
         "try_read_asset_pak_file enforces maximum_bytes");
 
-    // Invalidate cache so the archive file handle closes and can be replaced.
-    vcr::invalidate_asset_pak_cache(pak_root);
+    // Invalidating through the extended Windows spelling must close the
+    // same handle that was opened through the normal path.
+    vcr::invalidate_asset_pak_cache(vcr::extended_windows_path(canonical_pak_root));
     {
         vcr::AssetPakWriter writer_v2;
         Json bc7_meta_v2 = bc7_meta;
@@ -1022,6 +1024,70 @@ int main() {
             "BC4 .vcrtex loads cleanly");
     }
 
+    {
+        vcr::CookedTextureAsset base;
+        base.width = 5;
+        base.height = 3;
+        base.color_space = vcr::CookedTextureColorSpace::linear;
+        base.semantic = vcr::CookedTextureSemantic::data;
+        for (unsigned y = 0; y < 3; ++y) {
+            for (unsigned x = 0; x < 5; ++x) {
+                base.pixels.insert(base.pixels.end(), {static_cast<std::uint8_t>(x == 4 ? 255 : 0),
+                    static_cast<std::uint8_t>(y == 2 ? 255 : 0), 0, 255});
+            }
+        }
+        unsigned visits = 0;
+        vcr::visit_filtered_texture_mips(base, 0.F, [&](auto level, auto, auto, auto texels) {
+            ++visits;
+            if (level == 2) expect(texels[0] == 51 && texels[1] == 85,
+                "Both odd image borders must contribute their exact area to the final mip");
+        });
+        expect(visits == 2, "5x3 produces two lower mips");
+        base.width = 2;
+        base.height = 1;
+        base.semantic = vcr::CookedTextureSemantic::normal;
+        // Two unit normals with opposite X and Z=0.6. Their unnormalized mean has length 0.6.
+        base.pixels = {230,128,204,0, 25,128,204,255};
+        std::vector<std::uint8_t> container;
+        std::uint32_t levels{};
+        std::string normal_error;
+        vcr::CookedTextureAsset cooked;
+        expect(vcr::cook_texture_to_vcrtex(base, 0.5F, vcr::CookedTexturePixelFormat::bc7_unorm,
+                container, levels, normal_error) &&
+            vcr::decode_vcrtex_bytes(container, vcr::CookedTexturePixelFormat::bc7_unorm, {}, cooked, normal_error),
+            "Normal-variance fixture must pass through the Shipping codec");
+        if (cooked.mip_byte_offsets.size() == 2) {
+            cooked.pixels.erase(cooked.pixels.begin(), cooked.pixels.begin() + cooked.mip_byte_offsets[1]);
+            cooked.width = cooked.height = cooked.mip_levels = 1;
+            cooked.mip_byte_offsets = {0};
+            std::vector<std::uint8_t> pixel;
+            expect(vcr::decode_bc_mip0_to_rgba8(cooked, pixel, normal_error) && pixel.size() == 4 &&
+                std::abs(int(pixel[0]) - 128) < 4 && std::abs(int(pixel[2]) - 204) < 4 &&
+                std::abs(int(pixel[3]) - 128) < 4, "BC7 normal mips must retain variance and independent alpha");
+        } else expect(false, "Missing filtered normal mip");
+    }
+
+    {
+        for (const bool signed_xy : {false, true}) {
+            vcr::CookedTextureAsset bc5;
+            bc5.semantic = vcr::CookedTextureSemantic::normal;
+            bc5.pixel_format = signed_xy ? vcr::CookedTexturePixelFormat::bc5_snorm
+                                         : vcr::CookedTexturePixelFormat::bc5;
+            bc5.width = bc5.height = 4;
+            bc5.mip_levels = 1;
+            bc5.mip_byte_offsets = {0};
+            bc5.pixels.resize(16);
+            // BC4 endpoints selected by zero indices. X=-0.6, Y=0.
+            bc5.pixels[0] = signed_xy ? static_cast<std::uint8_t>(-76) : 51;
+            bc5.pixels[8] = signed_xy ? 0 : 128;
+            std::vector<std::uint8_t> pixels;
+            std::string bc5_error;
+            expect(vcr::decode_bc_mip0_to_rgba8(bc5, pixels, bc5_error) && pixels.size() == 64 &&
+                close_byte(pixels[0], 51, 1) && close_byte(pixels[1], 128, 1) &&
+                close_byte(pixels[2], 230, 1) && pixels[3] == 255,
+                "BC5 tangent normals preserve negative X and reconstruct positive Z");
+        }
+    }
     {
         // BC1, two mip levels in KTX2's smallest-first physical order.
         const std::array<std::uint8_t,12> magic{0xab,'K','T','X',' ','2','0',0xbb,13,10,26,10};

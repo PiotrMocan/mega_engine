@@ -23,6 +23,11 @@
 #include <iostream>
 #include <limits>
 #include <utility>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <Windows.h>
+#endif
 
 namespace vcr {
 namespace {
@@ -175,6 +180,21 @@ void apply_cli_preview_wardrobe_overrides(
     if (const auto v = args.find_option("hair-flyaways")) {
         if (const auto value = parse_finite_float(*v)) {
             pkg.wardrobe.groom.flyaways = *value;
+        }
+    }
+    if (const auto v = args.find_option("hair-tip-color")) {
+        if (const auto value = parse_hex_rgb(*v)) {
+            pkg.wardrobe.groom.tip_color_srgb = *value;
+        }
+    }
+    if (const auto v = args.find_option("hair-tip-dye")) {
+        if (const auto value = parse_finite_float(*v)) {
+            pkg.wardrobe.groom.tip_dye_strength = *value;
+        }
+    }
+    if (const auto v = args.find_option("hair-tip-start")) {
+        if (const auto value = parse_finite_float(*v)) {
+            pkg.wardrobe.groom.tip_dye_start = *value;
         }
     }
     if (const auto v = args.find_option("hair-part")) {
@@ -755,6 +775,7 @@ int CharacterStudioShell::run(
         return tool.run_cli(args);
     }
 
+    if (args.mcp_stdio) original_stdout_buffer_ = std::ref(*std::cout.rdbuf(std::cerr.rdbuf()));
     initialize_gui(args, tool);
 
     auto prev_clock = std::chrono::steady_clock::now();
@@ -808,13 +829,17 @@ int CharacterStudioShell::run(
         }
         bool cooked_before_ui = false;
         if (preview_rebuild_requested_) {
-            rebuild_preview_assets(true);
+            rebuild_preview_assets();
             preview_rebuild_requested_ = false;
+            cooked_before_ui = true;
+        } else {
+            cooked_before_ui = update_brush_preview();
+        }
+        if (cooked_before_ui) {
             renderer_.reset_metrics();
             ui_metrics_ = PerformanceSnapshot{};
             frame_begin = std::chrono::steady_clock::now();
             prev_clock = frame_begin;
-            cooked_before_ui = true;
         }
 
         const auto view = preview_scene_.build_render_view(
@@ -829,7 +854,7 @@ int CharacterStudioShell::run(
             submitted_scene_revision_ = view.revision;
         }
 
-        if (preview_node_id_ && !preview_mesh_.skeleton.bones.empty()) {
+        if (preview_node_id_ && !preview_mesh().skeleton.bones.empty()) {
             FacialPreviewParams effective_facial = preview_facial_;
             if (active_speech_) {
                 const VisemeKeyframe vk = sample_viseme_track(
@@ -841,14 +866,14 @@ int CharacterStudioShell::run(
                     std::max(effective_facial.upper_lip_raise, vk.upper_lip_raise);
             }
             if (bind_pose_override_) {
-                set_bind_pose(preview_mesh_.skeleton, preview_pose_);
+                set_bind_pose(preview_mesh().skeleton, preview_pose_);
                 apply_facial_preview_pose(
-                    preview_mesh_.skeleton, effective_facial, preview_pose_);
+                    preview_mesh().skeleton, effective_facial, preview_pose_);
                 recompute_skeleton_pose_matrices(
-                    preview_mesh_.skeleton, preview_pose_);
+                    preview_mesh().skeleton, preview_pose_);
             } else {
                 evaluate_character_preview_pose(
-                    preview_mesh_.skeleton,
+                    preview_mesh().skeleton,
                     preview_clips_,
                     preview_clip_name_,
                     preview_time_,
@@ -868,7 +893,7 @@ int CharacterStudioShell::run(
         ++rendered_frames_;
 
         if (!screenshot_output_path_.empty()) {
-            const std::size_t expected_textures = preview_mesh_.submeshes.size() * 3U;
+            const std::size_t expected_textures = preview_mesh().submeshes.size() * 3U;
             const bool assets_ready =
                 rendered_frames_ >= 12U &&
                 renderer_.resident_editor_model_count() > 0U &&
@@ -1070,7 +1095,7 @@ void CharacterStudioShell::initialize_gui(
     }
     preview_node_id_ = preview_scene_.create_node("CharacterPreview", SceneNodeKind::model);
 
-    rebuild_preview_assets(true);
+    rebuild_preview_assets();
     preview_rebuild_requested_ = false;
     if (args.focus_face) {
         focus_camera_face();
@@ -1145,6 +1170,7 @@ void CharacterStudioShell::initialize_gui(
 
 void CharacterStudioShell::shutdown_gui() noexcept {
     running_ = false;
+    brush_preview_worker_.stop();
     stop_mcp_reader();
     ai_thread_.request_stop();
     if (ai_thread_.joinable()) {
@@ -1180,6 +1206,10 @@ void CharacterStudioShell::shutdown_gui() noexcept {
         sdl_initialized_ = false;
     }
     preview_temp_dir_.reset();
+    if (original_stdout_buffer_) {
+        std::cout.rdbuf(&original_stdout_buffer_->get());
+        original_stdout_buffer_.reset();
+    }
 }
 
 void CharacterStudioShell::initialize_vulkan_imgui() {
@@ -1266,40 +1296,83 @@ void CharacterStudioShell::synchronize_renderer_textures() {
     }
 }
 
-void CharacterStudioShell::rebuild_preview_assets(bool full_gpu_reload) {
+void CharacterStudioShell::bake_brush_preview(const CharacterPackage& package, BakedPreview& preview,
+    std::stop_token stop) {
+    if (!stop.stop_requested() && preview.directory.create("vcr_character_brush", preview.error) &&
+        cook_character_preview(package, preview.directory.dir, preview.report, preview.geometry, preview.error) &&
+        !stop.stop_requested() && preview.surface.build(std::move(preview.geometry.mesh), preview.error) &&
+        !stop.stop_requested()) {
+        preview.prepared = prepare_model_asset(preview.directory.dir / "assets",
+            preview.report.model_asset_relative.generic_string());
+        if (!preview.prepared.model) preview.error = preview.prepared.error;
+    }
+}
+
+bool CharacterStudioShell::update_brush_preview() {
+    bool installed = false;
+    if (!left_mouse_dragging_tool_ && brush_preview_.dirty() && brush_preview_worker_.pending())
+        brush_preview_worker_.invalidate();
+    if (auto result = brush_preview_worker_.take()) {
+        if (!brush_preview_.dirty() || left_mouse_dragging_tool_) {
+            if (result->error.empty()) {
+                install_preview(std::move(*result));
+                installed = preview_error_.empty();
+            } else if (!brush_preview_.dirty()) {
+                brush_preview_.reset();
+                preview_error_ = std::move(result->error);
+                set_status("Preview bake error: " + preview_error_, EditorTone::danger);
+            }
+        }
+    }
+    if (!brush_preview_worker_.busy() && brush_preview_.due(left_mouse_dragging_tool_)) {
+        brush_preview_worker_.submit(package_);
+        brush_preview_.submitted();
+        preview_error_.clear();
+    }
+    return installed;
+}
+
+void CharacterStudioShell::rebuild_preview_assets() {
+    brush_preview_worker_.invalidate();
+    brush_preview_.reset();
+    left_mouse_dragging_tool_ = false;
     sanitize_character_package(package_);
-    preview_mesh_ = build_character_mesh(package_);
-    preview_clips_ = generate_character_animation_clips(package_, preview_mesh_.skeleton);
-    set_bind_pose(preview_mesh_.skeleton, preview_pose_);
-
-    if (!full_gpu_reload || preview_temp_dir_.dir.empty()) {
+    BakedPreview preview;
+    if (!cook_character_preview(package_, preview_temp_dir_.dir, preview.report,
+            preview.geometry, preview_error_) ||
+        !preview.surface.build(std::move(preview.geometry.mesh), preview_error_)) {
+        set_status("Preview bake error: " + preview_error_, EditorTone::danger);
         return;
     }
+    install_preview(std::move(preview));
+}
 
-    renderer_.reset_editor_asset_cache();
-
-    CharacterCookOptions opts{};
-    opts.texture_resolution = 1024U;
-    opts.bake_voice_lines = false;
-    opts.generate_prefabs = false;
-    opts.generate_localization = false;
-    opts.overwrite_existing = true;
-
-    CharacterCookReport preview_report{};
-    std::string cook_err;
-    if (!cook_character_package_to_project(
-            package_, preview_temp_dir_.dir, opts, preview_report, cook_err)) {
-        set_status("Preview bake error: " + cook_err, EditorTone::danger);
-        return;
+void CharacterStudioShell::install_preview(BakedPreview&& preview) {
+    if (!preview.directory.dir.empty()) {
+        if (!renderer_.replace_editor_preview_model(preview.prepared, preview_error_)) {
+            submitted_scene_revision_ = 0U;
+            if (!brush_preview_.dirty()) brush_preview_.reset();
+            set_status("Preview upload failed: " + preview_error_, EditorTone::danger);
+            return;
+        }
+        preview_temp_dir_ = std::move(preview.directory);
+        brush_preview_.published();
+    } else {
+        renderer_.reset_editor_asset_cache();
     }
-
-    preview_model_rel_ = preview_report.model_asset_relative.generic_string();
+    preview_model_rel_ = preview.report.model_asset_relative.generic_string();
     if (auto node = preview_scene_.node(preview_node_id_)) {
         node->get().asset_path = preview_model_rel_;
         node->get().transform = SceneTransform{};
     }
     preview_scene_.mark_content_changed();
     submitted_scene_revision_ = 0U;
+    preview_matches_document_ = true;
+    preview_error_.clear();
+    preview_surface_ = std::move(preview.surface);
+    displayed_surface_valid_ = false;
+    preview_clips_ = std::move(preview.geometry.clips);
+    set_bind_pose(preview_mesh().skeleton, preview_pose_);
 }
 
 void CharacterStudioShell::update_orbit_camera() noexcept {
@@ -1332,11 +1405,11 @@ void CharacterStudioShell::focus_camera_face() noexcept {
     static_cast<void>(renderer_.set_vertical_fov_degrees(34.0F));
     const float h = std::clamp(package_.body.height_meters, 1.2F, 2.5F);
     glm::vec3 target(0.0F, h * 0.905F, 0.03F);
-    if (preview_mesh_.skeleton.bones.size() > 44U) {
+    if (preview_mesh().skeleton.bones.size() > 44U) {
         const glm::vec3 eye_l = glm::vec3(
-            glm::inverse(preview_mesh_.skeleton.bones[43].inverse_bind_matrix)[3]);
+            glm::inverse(preview_mesh().skeleton.bones[43].inverse_bind_matrix)[3]);
         const glm::vec3 eye_r = glm::vec3(
-            glm::inverse(preview_mesh_.skeleton.bones[44].inverse_bind_matrix)[3]);
+            glm::inverse(preview_mesh().skeleton.bones[44].inverse_bind_matrix)[3]);
         const glm::vec3 eye_mid = 0.5F * (eye_l + eye_r);
         if (std::isfinite(eye_mid.y) && eye_mid.y > 0.5F) {
             target = eye_mid + glm::vec3(0.0F, -0.015F, 0.010F);
@@ -1398,6 +1471,7 @@ void CharacterStudioShell::enqueue_ai_generation(
         return;
     }
     set_status("AI generating: " + description + "...", EditorTone::info);
+    ai_source_revision_ = package_revision_;
     CharacterPackage snapshot = package_;
     const OllamaBridgeConfig cfg = ollama_;
     ai_thread_ = std::jthread([this, cfg, snapshot = std::move(snapshot), fn = std::move(worker_fn)](
@@ -1453,8 +1527,14 @@ void CharacterStudioShell::poll_ai_completion(ICharacterStudioTool& tool) {
         set_status("AI error: " + gen_res.diagnostic, EditorTone::danger);
         return;
     }
+    if (ai_source_revision_ != package_revision_) {
+        set_status("AI result discarded because the character was edited or switched during generation.",
+            EditorTone::warning);
+        return;
+    }
     package_ = std::move(gen_pkg);
-    package_dirty_ = true;
+    preview_matches_document_ = false;
+    mark_package_dirty();
     preview_rebuild_requested_ = true;
     tool.on_package_loaded(package_);
     set_status(
@@ -1523,6 +1603,8 @@ bool CharacterStudioShell::load_character_file(
     }
     stop_speech_preview();
     package_ = std::move(loaded);
+    preview_matches_document_ = false;
+    ++package_revision_;
     character_path_ = path;
     package_dirty_ = false;
     last_cook_report_.reset();
@@ -1542,8 +1624,9 @@ void CharacterStudioShell::apply_new_character(
     stop_speech_preview();
     sanitize_character_package(pkg);
     package_ = std::move(pkg);
+    preview_matches_document_ = false;
     character_path_ = path;
-    package_dirty_ = true;
+    mark_package_dirty();
     last_cook_report_.reset();
     last_cook_verified_ = false;
     preview_rebuild_requested_ = true;
@@ -1557,9 +1640,20 @@ bool CharacterStudioShell::save_character_as_slug(
     const std::string_view slug,
     std::string& error) {
     const std::string clean_slug = sanitize_character_slug(slug);
+    const auto original_path = character_path_;
+    const auto original_slug = package_.identity.slug;
     package_.identity.slug = clean_slug.empty() ? package_.identity.slug : clean_slug;
     character_path_ = default_character_package_path(project_directory_, package_.identity.slug);
-    return save_character(error);
+    if (!save_character(error)) {
+        character_path_ = original_path;
+        package_.identity.slug = original_slug;
+        return false;
+    }
+    if (character_path_ != original_path || package_.identity.slug != original_slug) {
+        ++package_revision_;
+        preview_rebuild_requested_ = true;
+    }
+    return true;
 }
 
 bool CharacterStudioShell::save_character(std::string& error) {
@@ -1586,21 +1680,14 @@ bool CharacterStudioShell::cook_to_project_with_options(
         return false;
     }
 
+    auto cook_options = opts;
+    cook_options.verify_before_publish = verify_after_cook;
     CharacterCookReport report{};
     if (!cook_character_package_to_project(
-            package_, project_directory_, opts, report, error)) {
+            package_, project_directory_, cook_options, report, error)) {
         last_cook_verified_ = false;
         set_status("Cook failed: " + error, EditorTone::danger);
         return false;
-    }
-
-    if (verify_after_cook) {
-        if (!verify_cooked_character_outputs(project_directory_, report, error)) {
-            last_cook_report_ = report;
-            last_cook_verified_ = false;
-            set_status("Cook verify failed: " + error, EditorTone::danger);
-            return false;
-        }
     }
 
     last_cook_report_ = report;
@@ -1768,9 +1855,9 @@ bool CharacterStudioShell::render_gui_frame(
     ImGui::SameLine();
     ImGui::TextDisabled(
         "| Source: %zu verts / %zu tris / %zu submeshes",
-        preview_mesh_.vertices.size(),
-        preview_mesh_.indices.size() / 3U,
-        preview_mesh_.submeshes.size());
+        preview_mesh().vertices.size(),
+        preview_mesh().indices.size() / 3U,
+        preview_mesh().submeshes.size());
     ImGui::SameLine();
     tool.draw_bottom_panel(*this, actions);
     ImGui::Separator();
@@ -1783,22 +1870,16 @@ bool CharacterStudioShell::render_gui_frame(
     ImDrawData* const draw_data = ImGui::GetDrawData();
 
     if (actions.mark_dirty) {
-        package_dirty_ = true;
+        mark_package_dirty();
     }
     if (!actions.status_message.empty()) {
         set_status(actions.status_message, actions.status_tone);
     }
     bool cooked_in_actions = false;
     if (actions.rebuild_preview) {
-        if (left_mouse_dragging_tool_) {
-            // Fast interactive CPU mesh rebuild while dragging; GPU reloads cleanly on release.
-            rebuild_preview_assets(false);
-            preview_rebuild_requested_ = true;
-        } else {
-            rebuild_preview_assets(true);
-            preview_rebuild_requested_ = false;
-            cooked_in_actions = true;
-        }
+        rebuild_preview_assets();
+        preview_rebuild_requested_ = false;
+        cooked_in_actions = true;
     }
     if (actions.save_package) {
         std::string err;
@@ -1821,6 +1902,14 @@ bool CharacterStudioShell::render_gui_frame(
 
     FrameTimings timings{};
     if (renderer_.draw_frame(timings, camera_.view_matrix(), draw_data)) {
+        displayed_surface_valid_ = preview_matches_document_ && submitted_scene_revision_ != 0 &&
+            renderer_.resident_editor_model_count() != 0;
+        if (displayed_surface_valid_) {
+            displayed_camera_ = camera_;
+            displayed_fov_ = renderer_.vertical_fov_degrees();
+            displayed_bones_ = renderer_.skinning_active_node_count() ? preview_pose_.bone_count : 0;
+            std::copy_n(preview_pose_.skin_matrices.begin(), displayed_bones_, displayed_skin_.begin());
+        }
         const auto frame_end = std::chrono::steady_clock::now();
         timings.cpu_frame_ms = std::max(
             0.001,
@@ -2106,6 +2195,13 @@ void CharacterStudioShell::draw_viewport_panel(
     const ImVec2 img_max = ImGui::GetItemRectMax();
     const bool hovered = ImGui::IsItemHovered();
     const ImGuiIO& io = ImGui::GetIO();
+    // Brush coordinates refer to the authored surface. Keep distance LOD for browsing.
+    const bool use_distance_lod = !(preview_brush_visible_ && (hovered || left_mouse_dragging_tool_));
+    auto visibility = renderer_.visibility_settings();
+    if (visibility.lod != use_distance_lod) {
+        visibility.lod = use_distance_lod;
+        renderer_.set_visibility_settings(visibility);
+    }
 
     if (hovered) {
         if (std::abs(io.MouseWheel) > 0.001F) {
@@ -2130,34 +2226,27 @@ void CharacterStudioShell::draw_viewport_panel(
     vp_ctx.shift_down = io.KeyShift;
     vp_ctx.ctrl_down = io.KeyCtrl;
 
-    if (hovered) {
+    const auto current_skin = renderer_.skinning_active_node_count() ?
+        preview_pose_.active_skin_matrices() : std::span<const glm::mat4>{};
+    if (hovered && displayed_surface_valid_ && preview_matches_document_ && !preview_rebuild_requested_) {
         const auto ray = compute_viewport_ray(
-            io.MousePos, img_min, img_max, camera_, renderer_.vertical_fov_degrees());
+            io.MousePos, img_min, img_max, displayed_camera_, displayed_fov_);
         if (ray) {
             vp_ctx.ray_origin = ray->origin;
             vp_ctx.ray_direction = ray->direction;
-            const CharacterRaycastHit hit = raycast_character_mesh(
-                preview_mesh_, ray->origin, ray->direction);
-            if (hit.hit) {
-                vp_ctx.hit = hit;
-                last_hover_hit_ = hit;
-            } else {
-                last_hover_hit_.reset();
-            }
+            vp_ctx.hit = preview_surface_.pick(ray->origin, ray->direction,
+                std::span(displayed_skin_).first(displayed_bones_));
         }
         vp_ctx.left_clicked = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
-        vp_ctx.left_down = ImGui::IsMouseDown(ImGuiMouseButton_Left);
         if (vp_ctx.left_clicked) {
             left_mouse_dragging_tool_ = true;
         }
-    } else {
-        last_hover_hit_.reset();
+        vp_ctx.left_down = left_mouse_dragging_tool_ && ImGui::IsMouseDown(ImGuiMouseButton_Left);
     }
 
     if (left_mouse_dragging_tool_ && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
         vp_ctx.left_released = true;
         left_mouse_dragging_tool_ = false;
-        preview_rebuild_requested_ = true;
     }
 
     if (vp_ctx.left_clicked || vp_ctx.left_down || vp_ctx.left_released) {
@@ -2165,24 +2254,30 @@ void CharacterStudioShell::draw_viewport_panel(
     }
 
     ImDrawList* const dl = ImGui::GetWindowDrawList();
-    if (last_hover_hit_ && last_hover_hit_->hit &&
-        preview_brush_visible_ && preview_brush_radius_ > 0.0F) {
-        const glm::vec3 p = last_hover_hit_->position;
+    brush_preview_.draw_pending([&](const CharacterSurfaceAnchor& anchor) {
+        const glm::vec3 point = anchor.position(current_skin);
+        if (const auto screen = project_world_to_screen(point, camera_, renderer_.vertical_fov_degrees(), img_min, img_max))
+            dl->AddCircleFilled(*screen, 2.5F, IM_COL32(255, 200, 70, 210));
+    });
+    const bool paint_skin = vp_ctx.hit && preview_skin_radius_m_ > 0.0F &&
+        (preview_skin_only_ || vp_ctx.hit->visible.target == CharacterPaintTarget::skin);
+    if (vp_ctx.hit && preview_brush_visible_ && preview_brush_radius_ > 0.0F && (!paint_skin || vp_ctx.hit->paintable_skin)) {
+        const glm::vec3 p = vp_ctx.hit->anchor.position(current_skin);
         const auto s_center = project_world_to_screen(
             p, camera_, renderer_.vertical_fov_degrees(), img_min, img_max);
         if (s_center) {
-            const float px_radius = std::clamp(
-                (preview_brush_radius_ / std::max(last_hover_hit_->distance, 0.25F)) *
-                    static_cast<float>(vp_h) * 0.85F,
-                4.0F,
-                140.0F);
+            const float radius = paint_skin ? preview_skin_radius_m_ : preview_brush_radius_;
+            const float depth = glm::dot(p - camera_.position(), camera_.forward());
+            const float focal_px = static_cast<float>(vp_h) * 0.5F /
+                std::tan(glm::radians(renderer_.vertical_fov_degrees()) * 0.5F);
+            const float px_radius = std::clamp(radius * focal_px / std::max(depth, 0.01F), 1.0F, float(vp_h));
             dl->AddCircle(*s_center, px_radius, IM_COL32(255, 200, 70, 220), 24, 1.8F);
         }
     }
 
     if (show_skeleton_overlay_ &&
-        preview_pose_.bone_count == preview_mesh_.skeleton.bones.size()) {
-        for (std::size_t bi = 0U; bi < preview_mesh_.skeleton.bones.size(); ++bi) {
+        preview_pose_.bone_count == preview_mesh().skeleton.bones.size()) {
+        for (std::size_t bi = 0U; bi < preview_mesh().skeleton.bones.size(); ++bi) {
             const glm::vec3 joint(preview_pose_.model_space[bi][3]);
             const auto sp = project_world_to_screen(
                 joint, camera_, renderer_.vertical_fov_degrees(), img_min, img_max);
@@ -2192,7 +2287,7 @@ void CharacterStudioShell::draw_viewport_panel(
             const bool is_face = bi >= character_body_bone_count;
             const ImU32 col = is_face ? IM_COL32(255, 130, 210, 230) : IM_COL32(90, 230, 175, 220);
             dl->AddCircleFilled(*sp, is_face ? 3.2F : 4.2F, col);
-            const std::int32_t parent = preview_mesh_.skeleton.bones[bi].parent_index;
+            const std::int32_t parent = preview_mesh().skeleton.bones[bi].parent_index;
             if (parent >= 0 && static_cast<std::uint32_t>(parent) < preview_pose_.bone_count) {
                 const glm::vec3 p_joint(preview_pose_.model_space[static_cast<std::size_t>(parent)][3]);
                 if (const auto sp_parent = project_world_to_screen(
@@ -2223,9 +2318,9 @@ void CharacterStudioShell::draw_viewport_panel(
             cpu_ms,
             gpu_ms,
             static_cast<unsigned long long>(renderer_.visibility_statistics().triangles),
-            preview_mesh_.skeleton.bones.size(),
-            last_hover_hit_ ? " | Hit: " : "",
-            last_hover_hit_ ? to_token(last_hover_hit_->target).data() : "");
+            preview_mesh().skeleton.bones.size(),
+            vp_ctx.hit ? " | Hit: " : "",
+            vp_ctx.hit ? to_token(vp_ctx.hit->visible.target).data() : "");
     } else {
         std::snprintf(
             hud_buf, sizeof(hud_buf),
@@ -2233,9 +2328,9 @@ void CharacterStudioShell::draw_viewport_panel(
             vp_fps,
             cpu_ms,
             static_cast<unsigned long long>(renderer_.visibility_statistics().triangles),
-            preview_mesh_.skeleton.bones.size(),
-            last_hover_hit_ ? " | Hit: " : "",
-            last_hover_hit_ ? to_token(last_hover_hit_->target).data() : "");
+            preview_mesh().skeleton.bones.size(),
+            vp_ctx.hit ? " | Hit: " : "",
+            vp_ctx.hit ? to_token(vp_ctx.hit->visible.target).data() : "");
     }
     const EditorTone hud_tone = vp_fps >= 60.0
         ? EditorTone::success
@@ -2275,6 +2370,7 @@ void CharacterStudioShell::start_mcp_reader() {
     mcp_reader_thread_ = std::jthread([this](std::stop_token st) {
         std::string line;
         while (!st.stop_requested() && std::getline(std::cin, line)) {
+            if (st.stop_requested()) break;
             if (line.empty()) {
                 continue;
             }
@@ -2287,8 +2383,14 @@ void CharacterStudioShell::start_mcp_reader() {
 void CharacterStudioShell::stop_mcp_reader() noexcept {
     mcp_reader_thread_.request_stop();
     if (mcp_reader_thread_.joinable()) {
-        // detach cleanly if blocked on synchronous stdin read on shutdown
-        mcp_reader_thread_.detach();
+#ifdef _WIN32
+        // The reader may start its blocking read just after checking the stop
+        // token. Retry cancellation until the thread leaves the read loop.
+        const auto thread = mcp_reader_thread_.native_handle();
+        while (WaitForSingleObject(thread, 10) == WAIT_TIMEOUT)
+            CancelSynchronousIo(thread);
+#endif
+        mcp_reader_thread_.join();
     }
 }
 
@@ -2361,6 +2463,11 @@ void CharacterStudioShell::process_mcp_commands(
                 {{"name", "new_character"}, {"description", "Create a new character template in memory"}},
                 {{"name", "set_workspace_tab"}, {"description", "Switch active workspace (gen|outfit|act|cook)"}},
                 {{"name", "save_character"}, {"description", "Save .vcrchar.json package"}},
+                {{"name", "edit_brush_history"}, {"description", "Undo, redo or clear the sculpt or paint layer"},
+                 {"inputSchema", {{"type","object"}, {"properties",{
+                    {"layer", {{"type","string"}, {"enum",{"sculpt","paint"}}}},
+                    {"action", {{"type","string"}, {"enum",{"undo","redo","clear"}}}}}},
+                    {"required",{"layer","action"}}}}},
                 {{"name", "cook_character"}, {"description", "Cook and verify package into project assets/"}},
                 {{"name", "request_quit"}, {"description", "Close studio cleanly"}},
                 {{"name", "ai_generate_body"}, {"description", "Generate body proportions, face & skin via AI"}},
@@ -2370,9 +2477,11 @@ void CharacterStudioShell::process_mcp_commands(
             })}});
         } else if (call_name == "get_character_summary") {
             auto summary = character_summary_json(package_, character_path_, project_directory_,
-                preview_mesh_, active_workspace_, last_cook_verified_);
+                preview_mesh(), active_workspace_, last_cook_verified_);
             const auto& vis = renderer_.visibility_statistics();
             summary["preview_render"] = Json{
+                {"pending", preview_rebuild_requested_ || brush_preview_.dirty() || brush_preview_worker_.pending()},
+                {"error", preview_error_},
                 {"camera_distance", orbit_distance_},
                 {"drawn_triangles", vis.triangles},
                 {"lod_instances", vis.lod_instances},
@@ -2479,19 +2588,22 @@ void CharacterStudioShell::process_mcp_commands(
         } else {
             std::string custom_result_str;
             std::string custom_err;
-            bool need_rebuild = false;
+            auto change = CharacterDocumentChange::none;
             if (tool.handle_mcp_custom_method(
                     call_name,
                     call_args.dump(),
                     package_,
                     ollama_,
                     custom_result_str,
-                    need_rebuild,
+                    change,
                     custom_err)) {
-                if (need_rebuild) {
-                    package_dirty_ = true;
+                if (change != CharacterDocumentChange::none) {
+                    mark_package_dirty();
                     actions.rebuild_preview = true;
-                    tool.on_package_loaded(package_);
+                    if (change == CharacterDocumentChange::replace_package) {
+                        preview_matches_document_ = false;
+                        tool.on_package_loaded(package_);
+                    }
                 }
                 Json parsed = Json::object();
                 try {

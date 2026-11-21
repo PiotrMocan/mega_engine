@@ -1,6 +1,7 @@
 #include "character_ai_bridge.hpp"
 #include "character_package.hpp"
 #include "character_strand_groom.hpp"
+#include "character_surface_picker.hpp"
 #include "character_wardrobe.hpp"
 #include "cooked_audio_asset.hpp"
 #include "cooked_model_asset.hpp"
@@ -208,6 +209,167 @@ bool test_50_bone_mesh_sculpt_paint_raycast_and_occlusion() {
     return true;
 }
 
+bool test_skin_paint_across_uv_seams() {
+    vcr::CharacterMeshBuildResult mesh;
+    auto patch = [&](float world_x, float world_y, float u, float v) {
+        const auto first = static_cast<std::uint32_t>(mesh.vertices.size());
+        for (unsigned i = 0; i < 4; ++i) {
+            const float x = float(i & 1), y = float(i >> 1);
+            vcr::CookedModelVertex vertex{};
+            vertex.position = {world_x + x * 0.1F, world_y + y * 0.1F, 0.0F};
+            vertex.texcoord = {u + x * 0.15F, 1.0F - (v + y * 0.2F)};
+            mesh.vertices.push_back(vertex);
+        }
+        for (unsigned i : {0U, 1U, 2U, 2U, 1U, 3U}) mesh.indices.push_back(first + i);
+    };
+    patch(0.4F, 1, 0.15F, 0.3F);   // Wrist left of a UV seam.
+    patch(0.5F, 1, 0.65F, 0.3F);   // Physically adjoining skin on a distant island.
+    patch(0.4F, 0.1F, 0.305F, 0.3F); // Shin on the immediately adjacent UV island.
+    patch(-0.5F, 1, 0.2F, 0.7F);   // Opposite wrist on an asymmetric chart.
+    mesh.submeshes.push_back({.name = "skin", .paint_target = vcr::CharacterPaintTarget::skin,
+        .index_count = static_cast<std::uint32_t>(mesh.indices.size())});
+    auto recipe = vcr::make_default_character_package("seam", "Seam");
+    const auto bake = [&] { return vcr::bake_character_textures(recipe, mesh, 128).front(); };
+    const auto clean = bake();
+    auto changed = [&](const auto& image, float u, float v) {
+        const auto off = (static_cast<unsigned>(v * 128) * 128 + static_cast<unsigned>(u * 128)) * 4;
+        return !std::equal(image.base_color_rgba.begin() + off, image.base_color_rgba.begin() + off + 4,
+            clean.base_color_rgba.begin() + off);
+    };
+    vcr::CharacterPaintStroke brush{.target = vcr::CharacterPaintTarget::skin, .uv = {0.285F, 0.4F},
+        .radius = 0.07F, .hardness = 1, .strength = 1, .color = {0,1,0,1}};
+    recipe.paint_strokes.push_back(brush);
+    const auto legacy = bake();
+    VCR_EXPECT(changed(legacy, 0.32F, 0.4F) && !changed(legacy, 0.67F, 0.4F),
+        "Legacy UV brush must retain texture-space behavior");
+    recipe.paint_strokes.back().skin_surface = vcr::CharacterSkinPaintFootprint{{0.49F, 1.05F, 0}, 0.045F, false};
+    const auto surface = bake();
+    VCR_EXPECT(changed(surface, 0.285F, 0.4F) && changed(surface, 0.67F, 0.4F) &&
+        !changed(surface, 0.32F, 0.4F) && !changed(surface, 0.215F, 0.8F),
+        "A surface dab must cross its physical seam and spare the shin and opposite wrist");
+    recipe.paint_strokes.back().skin_surface->mirror_x = true;
+    const auto mirrored = bake();
+    VCR_EXPECT(changed(mirrored, 0.215F, 0.8F) && !changed(mirrored, 0.32F, 0.4F),
+        "Surface mirroring must use character X on asymmetric UV charts");
+    ScopedTempDir tmp("vcr_skin_paint");
+    std::string error;
+    const auto path = tmp.dir / "seam.vcrchar.json";
+    VCR_EXPECT(vcr::save_character_package_file(path, recipe, error), error);
+    vcr::CharacterPackage loaded;
+    VCR_EXPECT(vcr::load_character_package_file(path, loaded, error), error);
+    VCR_EXPECT(loaded.paint_strokes.size() == 1 && loaded.paint_strokes[0].skin_surface &&
+        loaded.paint_strokes[0].skin_surface->mirror_x &&
+        loaded.paint_strokes[0].skin_surface->bind_center == glm::vec3(0.49F, 1.05F, 0) &&
+        loaded.paint_strokes[0].skin_surface->radius_m == 0.045F, "Persist the skin projection in the native recipe");
+    recipe = std::move(loaded);
+    // A body morph moves both wrists in Y. The UV anchor must move with them.
+    for (auto& vertex : mesh.vertices) vertex.position[1] += 0.7F;
+    const auto morphed = bake();
+    VCR_EXPECT(morphed.base_color_rgba == mirrored.base_color_rgba, "Follow a morphed surface after reopening");
+    recipe.paint_strokes.back().mode = vcr::CharacterPaintMode::erase;
+    const auto erased = bake();
+    VCR_EXPECT(erased.base_color_rgba == clean.base_color_rgba && erased.normal_rgba == clean.normal_rgba &&
+        erased.metallic_roughness_rgba == clean.metallic_roughness_rgba, "Erasing clean skin must preserve its PBR maps");
+    auto& top = recipe.paint_strokes.front();
+    top.uv = glm::vec2(36.5F, 51.5F) / 128.0F;
+    top.mode = vcr::CharacterPaintMode::metallic_accent;
+    auto scar = top;
+    scar.mode = vcr::CharacterPaintMode::scar;
+    recipe.paint_strokes.push_back(scar);
+    const auto marked = bake();
+    auto erase = scar;
+    erase.mode = vcr::CharacterPaintMode::erase;
+    recipe.paint_strokes.push_back(erase);
+    const auto restored = bake();
+    const std::size_t center = (51 * 128 + 36) * 4;
+    const auto same_texel = [&](const auto& a, const auto& b) {
+        return std::equal(a.begin() + center, a.begin() + center + 4, b.begin() + center);
+    };
+    VCR_EXPECT(!same_texel(marked.metallic_roughness_rgba, clean.metallic_roughness_rgba) &&
+        same_texel(restored.metallic_roughness_rgba, clean.metallic_roughness_rgba) &&
+        same_texel(restored.normal_rgba, clean.normal_rgba) && same_texel(restored.base_color_rgba, clean.base_color_rgba),
+        "An opaque surface eraser must restore all procedural channels after overlapping strokes");
+    return true;
+}
+
+bool test_animated_surface_picker() {
+    vcr::CharacterMeshBuildResult mesh;
+    mesh.skeleton.bones.resize(2);
+    // Two sheets traverse multiple spatial groups. Their depth order changes
+    // under animation and the foreground triangles blend both joints.
+    for (unsigned layer = 0; layer < 2; ++layer) {
+        const auto start = static_cast<std::uint32_t>(mesh.indices.size());
+        for (unsigned y = 0; y < 25; ++y) {
+            for (unsigned x = 0; x < 45; ++x) {
+                for (unsigned k = 0; k < 3; ++k) {
+                    vcr::CookedModelVertex vertex{};
+                    vertex.position = {float(x) + float(k == 1), float(y) + float(k == 2), float(layer)};
+                    vertex.texcoord = {float(k == 1), float(k == 2)};
+                    mesh.indices.push_back(static_cast<std::uint32_t>(mesh.vertices.size()));
+                    mesh.vertices.push_back(vertex);
+                    vcr::CookedSkinVertex skin;
+                    const float weight = layer ? 0.25F * static_cast<float>(k + 1) : 0.0F;
+                    skin.joints = {0, 1, 0, 0};
+                    skin.weights = {1.0F - weight, weight, 0, 0};
+                    mesh.skin_vertices.push_back(skin);
+                }
+            }
+        }
+        mesh.submeshes.push_back({.paint_target = layer ? vcr::CharacterPaintTarget::outfit_primary :
+            vcr::CharacterPaintTarget::skin, .first_index = start,
+            .index_count = static_cast<std::uint32_t>(mesh.indices.size()) - start});
+    }
+    vcr::CharacterSurfacePicker picker;
+    std::string error;
+    VCR_EXPECT(picker.build(mesh, error), error);
+    const glm::vec3 direction{0, 0, -1};
+    const glm::vec3 origin{0.2F, 0.3F, 4.0F};
+    auto anchor = picker.pick(origin, direction, {});
+    VCR_EXPECT(anchor && anchor->visible.target == vcr::CharacterPaintTarget::outfit_primary,
+        "Bind pose must pick nearest material");
+    VCR_EXPECT(glm::distance(anchor->bind_position, glm::vec3(0.2F, 0.3F, 1.0F)) < 1e-5F &&
+        glm::distance(anchor->bind_normal, glm::vec3(0, 0, 1)) < 1e-5F, "Bind-space point and normal");
+    for (float depth : {-4.0F, 0.5F}) {
+        std::array<glm::mat4, 2> palette{glm::mat4(1), glm::mat4(1)};
+        palette[1][0] = {0.7F, 0.12F, 0.06F, 0};
+        palette[1][3] = {0.45F, -0.15F, depth, 1};
+        auto deformed = mesh;
+        for (std::size_t i = 0; i < deformed.vertices.size(); ++i) {
+            const auto& p = mesh.vertices[i].position;
+            const glm::vec4 v{p[0], p[1], p[2], 1};
+            const float w = mesh.skin_vertices[i].weights[1];
+            const auto world = (1.0F - w) * v + w * (palette[1] * v);
+            deformed.vertices[i].position = {world.x, world.y, world.z};
+        }
+        const auto p = [&](std::uint32_t i) {
+            const auto& pos = deformed.vertices[i].position;
+            return glm::vec3(pos[0], pos[1], pos[2]);
+        };
+        const auto first = mesh.submeshes[1].first_index;
+        const auto expected = 0.5F * p(first) + 0.2F * p(first + 1) + 0.3F * p(first + 2);
+        VCR_EXPECT(glm::distance(anchor->anchor.position(palette), expected) < 1e-5F,
+            "A pending stroke must follow each of its triangle's independently skinned corners");
+        for (unsigned n = 0; n < 80; ++n) {
+            const glm::vec3 from{float((n * 31) % 47) + 0.21F, float((n * 13) % 27) + 0.32F, 8};
+            const auto truth = vcr::raycast_character_mesh(deformed, from, direction);
+            const auto picked = picker.pick(from, direction, palette);
+            VCR_EXPECT(picked.has_value() == truth.hit, "Posed bounds must retain all visible faces");
+            if (picked) {
+                VCR_EXPECT(picked->visible.triangle_index == truth.triangle_index &&
+                    picked->visible.target == truth.target && glm::distance(picked->visible.uv, truth.uv) < 1e-4F &&
+                    glm::distance(picked->visible.position, truth.position) < 1e-4F &&
+                    glm::distance(picked->anchor.position(palette), truth.position) < 1e-4F,
+                    "Accelerated posed pick must agree with exhaustive deformed triangles");
+            }
+        }
+        VCR_EXPECT(!picker.pick(origin, direction, std::span(palette).first(1)), "Reject mismatched palette");
+    }
+    mesh.indices.back() = UINT32_MAX;
+    VCR_EXPECT(!picker.build(std::move(mesh), error) && !error.empty() && picker.pick(origin, direction, {}),
+        "A malformed replacement must preserve the previously published surface");
+    return true;
+}
+
 bool test_clips_facial_rig_and_bilingual_voice_synth() {
     vcr::CharacterPackage pkg = vcr::make_default_character_package("actor_test", "Actor");
     const auto mesh = vcr::build_character_mesh(pkg);
@@ -242,6 +404,9 @@ bool test_clips_facial_rig_and_bilingual_voice_synth() {
 
 bool test_offline_ai_and_full_cook_roundtrip() {
     ScopedTempDir tmp("vcr_char_cook_rt");
+    // The staged texture names exceed MAX_PATH in a nested production project.
+    const auto project_dir = tmp.dir / "worldbuilding-team/production/characters/gallery-iteration";
+
     vcr::CharacterPackage pkg = vcr::make_default_character_package("cyrus", "Cyrus");
 
     vcr::OllamaBridgeConfig cfg{};
@@ -255,12 +420,13 @@ bool test_offline_ai_and_full_cook_roundtrip() {
 
     vcr::CharacterCookOptions opts{};
     opts.texture_resolution = 128U; // Fast CI verification bake
+    opts.verify_before_publish = true;
     vcr::CharacterCookReport report{};
     std::string err;
-    VCR_EXPECT(vcr::cook_character_package_to_project(pkg, tmp.dir, opts, report, err), err);
+    VCR_EXPECT(vcr::cook_character_package_to_project(pkg, project_dir, opts, report, err), err);
     VCR_EXPECT(report.cooked_file_count >= 15U, "Must publish complete set of cooked assets");
 
-    const std::filesystem::path asset_root = tmp.dir / "assets";
+    const std::filesystem::path asset_root = project_dir / "assets";
     const auto model_res = vcr::load_cooked_model_asset(asset_root, report.model_asset_relative);
     VCR_EXPECT(static_cast<bool>(model_res), model_res.error().message);
     VCR_EXPECT(model_res.value().skeleton.bones.size() == vcr::character_total_bone_count,
@@ -308,6 +474,20 @@ bool test_offline_ai_and_full_cook_roundtrip() {
     VCR_EXPECT(vcr::instantiate_prefab_file(
         player_scene, asset_root, report.player_prefab_relative.generic_string(),
         vcr::PrefabInstantiateOptions{}, p_res, err), err);
+    const auto source = asset_root / report.model_asset_relative.parent_path() / "source" /
+        (report.character_slug + ".vcrchar.json");
+    const auto original_name = pkg.identity.display_name;
+    pkg.identity.display_name = "Revised character";
+    std::ifstream locked_translation(asset_root / report.loc_ru_relative);
+    vcr::CharacterCookReport failed;
+    VCR_EXPECT(locked_translation.is_open() &&
+        !vcr::cook_character_package_to_project(pkg, project_dir, opts, failed, err),
+        "A locked localization must reject the complete cook.");
+    locked_translation.close();
+    vcr::CharacterPackage restored;
+    VCR_EXPECT(failed.model_asset_relative.empty() && vcr::load_character_package_file(source, restored, err) &&
+        restored.identity.display_name == original_name && vcr::verify_cooked_character_outputs(project_dir, report, err),
+        "A failed sidecar update must restore the complete previous character.");
     return true;
 }
 
@@ -472,8 +652,32 @@ bool test_groom_root_masks_controls_and_region_stability() {
     const auto forbidden = vcr::build_character_strand_groom_mesh(in);
     VCR_EXPECT(forbidden.scalp_strand_count == 0U, "No fallback may populate forbidden scalp zones");
 
+    const glm::vec3 natural_color{0.19F, 0.13F, 0.09F};
+    const auto natural = vcr::bake_character_strand_groom_textures(in, natural_color, 0.F, {}, 64, 64);
+    in.settings.tip_color_srgb = {0.12F, 0.75F, 1.F};
+    in.settings.tip_dye_strength = 1.F;
+    in.settings.tip_dye_start = 0.6F;
+    const auto dyed = vcr::bake_character_strand_groom_textures(in, natural_color, 0.F, {}, 64, 64);
+    for (unsigned y = 0; y < 64U; ++y) {
+        for (unsigned x = 0; x < 64U; ++x) {
+            const auto b = (y * 64U + x) * 4U;
+            if (y < 38U || x >= 45U) {
+                VCR_EXPECT(std::equal(natural.base_color_rgba.begin() + b, natural.base_color_rgba.begin() + b + 4,
+                    dyed.base_color_rgba.begin() + b), "Tip dye must preserve roots, brows, lashes and beard");
+            } else if (y == 63U) {
+                VCR_EXPECT(dyed.base_color_rgba[b + 2] > natural.base_color_rgba[b + 2] + 100,
+                    "Dyed scalp tips must pick up the authored pigment");
+            }
+        }
+    }
+    VCR_EXPECT(natural.metallic_roughness_rgba == dyed.metallic_roughness_rgba,
+        "Coloring the tips must preserve the cuticle roughness and groom AO");
+
     auto pkg = vcr::make_default_character_package("groom_controls", "Groom Controls");
     pkg.wardrobe.groom = {0.4F, 1.2F, 0.8F, 0.7F, 0.0F, -0.5F};
+    pkg.wardrobe.groom.tip_color_srgb = in.settings.tip_color_srgb;
+    pkg.wardrobe.groom.tip_dye_strength = 1.F;
+    pkg.wardrobe.groom.tip_dye_start = 0.6F;
     ScopedTempDir tmp("vcr_groom_controls");
     std::string error;
     const auto path = tmp.dir / "groom.vcrchar.json";
@@ -482,7 +686,8 @@ bool test_groom_root_masks_controls_and_region_stability() {
     VCR_EXPECT(vcr::load_character_package_file(path, loaded, error), error);
     const auto& g = loaded.wardrobe.groom;
     VCR_EXPECT(g.density == 0.4F && g.length == 1.2F && g.width == 0.8F &&
-        g.clumping == 0.7F && g.flyaways == 0.0F && g.part == -0.5F,
+        g.clumping == 0.7F && g.flyaways == 0.0F && g.part == -0.5F &&
+        g.tip_color_srgb == in.settings.tip_color_srgb && g.tip_dye_strength == 1.F && g.tip_dye_start == 0.6F,
         "All groom controls must survive save/load");
     loaded.wardrobe.groom = {std::numeric_limits<float>::quiet_NaN(), 100.0F, -1.0F,
         std::numeric_limits<float>::infinity(), -5.0F, 50.0F};
@@ -2373,6 +2578,8 @@ bool test_production_wardrobe_geometry_materials_and_uv_isolation() {
 } // namespace
 
 int main() {
+    if (!test_skin_paint_across_uv_seams()) return 1;
+    if (!test_animated_surface_picker()) return 1;
     if (!test_groom_root_masks_controls_and_region_stability()) {
         return 10;
     }

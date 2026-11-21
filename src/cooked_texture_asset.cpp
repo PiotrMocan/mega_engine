@@ -1,4 +1,5 @@
 #include "cooked_texture_asset.hpp"
+#include "native_asset_path.hpp"
 #include "asset_pak.hpp"
 #include "texture_compression.hpp"
 
@@ -129,7 +130,7 @@ validate_asset_root(
         };
     }
     canonical_root =
-        std::filesystem::weakly_canonical(asset_root, error);
+        weakly_canonical_asset_path(asset_root, error);
     if (error || canonical_root.empty()) {
         return CookedTextureLoadError{
             .code = CookedTextureLoadErrorCode::invalid_asset_root,
@@ -183,7 +184,7 @@ resolve_asset_file(
     }
 
     const std::filesystem::path canonical =
-        std::filesystem::weakly_canonical(current, error);
+        weakly_canonical_asset_path(current, error);
     if (error || !path_is_within(canonical, canonical_root)) {
         return CookedTextureLoadError{
             .code = CookedTextureLoadErrorCode::invalid_path,

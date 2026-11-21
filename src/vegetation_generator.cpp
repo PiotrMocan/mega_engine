@@ -2,11 +2,13 @@
 
 #include "cooked_texture_asset.hpp"
 #include "gpu_grass.hpp"
+#include "job_system.hpp"
 #include "model_lod.hpp"
 #include "pbr_material.hpp"
 #include "png_encoder.hpp"
 #include "runtime_assets.hpp"
 #include "subsurface.hpp"
+#include "studio_asset_publication.hpp"
 
 #include <glm/common.hpp>
 #include <glm/ext/scalar_constants.hpp>
@@ -371,15 +373,9 @@ private:
     }
     std::filesystem::rename(temp_path, target_path, ec);
     if (ec) {
-        std::error_code remove_ec;
-        std::filesystem::remove(target_path, remove_ec);
-        ec.clear();
-        std::filesystem::rename(temp_path, target_path, ec);
-        if (ec) {
-            std::filesystem::remove(temp_path, remove_ec);
-            error = "Failed to finalize output file: " + ec.message();
-            return false;
-        }
+        error = "Failed to finalize output file: " + ec.message();
+        std::filesystem::remove(temp_path, ec);
+        return false;
     }
     return true;
 }
@@ -2521,7 +2517,7 @@ void generate_bark_textures(
             const float u = static_cast<float>(x) / static_cast<float>(res);
             float h = 0.5F;
             float crevice_ao = 1.0F;
-            float rough_mod = recipe.bark_roughness;
+            float roughness_detail = 0.0F;
             glm::vec3 col = recipe.bark_color_srgb;
 
             if (bark_photo.valid()) {
@@ -2532,7 +2528,7 @@ void generate_bark_textures(
                 col = glm::clamp(recipe.bark_color_srgb * ratio, glm::vec3(0.02F), glm::vec3(0.98F));
                 h = lum;
                 crevice_ao = glm::clamp(0.45F + 0.65F * lum, 0.35F, 1.0F);
-                rough_mod = glm::clamp(recipe.bark_roughness + (0.5F - lum) * 0.18F, minimum_pbr_roughness, 1.0F);
+                roughness_detail = (0.5F - lum) * 0.18F;
             } else if (birch_style) {
                 const float paper = smooth_value_noise_periodic(u, v, 8, 32, recipe.seed + 11U);
                 const float lenticel = smooth_value_noise_periodic(u, v, 4, 64, recipe.seed + 37U);
@@ -2542,7 +2538,7 @@ void generate_bark_textures(
                                       std::clamp((smooth_value_noise_periodic(u, v, 3, 6, recipe.seed + 5U) - 0.55F) * 3.0F, 0.0F, 1.0F);
                 h = 0.68F + 0.14F * paper - 0.34F * band - 0.48F * fissure;
                 crevice_ao = 1.0F - 0.42F * band - 0.50F * fissure;
-                rough_mod = glm::mix(0.84F, 1.0F, std::max(band, fissure));
+                roughness_detail = 0.16F * std::max(band, fissure);
                 col = glm::mix(recipe.bark_color_srgb * (0.86F + 0.20F * paper), glm::vec3(0.14F, 0.12F, 0.11F), std::clamp(band * 0.85F + fissure, 0.0F, 0.92F));
             } else if (pine_style) {
                 // Scots pine flaking cinnamon-red bark plates with dark deep seams
@@ -2552,7 +2548,7 @@ void generate_bark_textures(
                 const float furrow = std::clamp((0.14F - plate_edge) * 6.5F, 0.0F, 1.0F);
                 h = 0.25F + 0.55F * std::clamp(plate_edge * 2.2F, 0.0F, 1.0F) + 0.16F * grain - 0.35F * furrow;
                 crevice_ao = 1.0F - 0.62F * furrow;
-                rough_mod = glm::mix(0.80F, 1.0F, furrow);
+                roughness_detail = 0.20F * furrow;
                 const glm::vec3 plate_c = glm::mix(recipe.bark_color_srgb, glm::vec3(0.56F, 0.29F, 0.15F), 0.55F) * (0.85F + 0.28F * grain);
                 col = glm::mix(plate_c, glm::vec3(0.12F, 0.09F, 0.07F), furrow * 0.85F);
             } else if (date_palm_style) {
@@ -2567,7 +2563,7 @@ void generate_bark_textures(
                 const float fiber = smooth_value_noise_periodic(u, v, 32, 16, recipe.seed + 53U);
                 h = 0.22F + 0.62F * diamond + 0.16F * fiber;
                 crevice_ao = 0.42F + 0.58F * diamond;
-                rough_mod = glm::mix(1.0F, 0.86F, diamond);
+                roughness_detail = 0.14F * (1.0F - diamond);
                 col = recipe.bark_color_srgb * (0.58F + 0.52F * diamond + 0.16F * fiber);
             } else if (coconut_palm_style) {
                 const float ring_phase = v * 10.0F + 0.18F * std::sin(u * kTwoPi * 2.0F);
@@ -2577,7 +2573,7 @@ void generate_bark_textures(
                 const float mottle = smooth_value_noise_periodic(u, v, 6, 8, recipe.seed + 61U);
                 h = 0.30F + 0.46F * step + 0.24F * fiber;
                 crevice_ao = 0.54F + 0.46F * step;
-                rough_mod = glm::mix(0.98F, 0.84F, mottle);
+                roughness_detail = 0.14F * (1.0F - mottle);
                 col = recipe.bark_color_srgb * (0.68F + 0.38F * step + 0.14F * fiber);
                 col = glm::mix(col, col * glm::vec3(1.12F, 1.10F, 1.05F), mottle * 0.28F);
             } else {
@@ -2589,7 +2585,7 @@ void generate_bark_textures(
                 h = r1 * 0.56F + r2 * 0.28F + grain * 0.16F;
                 const float groove = std::clamp((0.48F - h) * 1.85F, 0.0F, 1.0F);
                 crevice_ao = 1.0F - 0.62F * groove;
-                rough_mod = glm::mix(0.84F, 1.0F, groove);
+                roughness_detail = 0.16F * groove;
                 col = recipe.bark_color_srgb * (0.76F + 0.44F * h - 0.46F * groove);
                 if (species == BotanicalSpecies::ancient_oak || species == BotanicalSpecies::hazel_shrub) {
                     const float moss = std::clamp((smooth_value_noise_periodic(u, v, 5, 5, recipe.seed + 83U) - 0.66F) * 3.0F, 0.0F, 1.0F) * (1.0F - groove);
@@ -2605,7 +2601,7 @@ void generate_bark_textures(
             out_albedo.pixels[idx + 3U] = 255U;
 
             out_orm.pixels[idx + 0U] = to_unorm8(std::clamp(crevice_ao, 0.32F, 1.0F));
-            out_orm.pixels[idx + 1U] = to_unorm8(std::clamp(rough_mod, minimum_pbr_roughness, 1.0F));
+            out_orm.pixels[idx + 1U] = to_unorm8(std::clamp(recipe.bark_roughness + roughness_detail, minimum_pbr_roughness, 1.0F));
             out_orm.pixels[idx + 2U] = 0U;
             out_orm.pixels[idx + 3U] = 255U;
         }
@@ -2722,14 +2718,14 @@ void generate_grass_textures(
     }
 }
 
-[[nodiscard]] CookedModelMaterial make_bark_material(const VegetationRecipe& recipe) {
+[[nodiscard]] CookedModelMaterial make_bark_material() {
     CookedModelMaterial mat{};
     mat.relative_path = "materials/bark.vcrmaterial.json";
     mat.name = "bark";
     mat.factors = PbrMaterial{
         .base_color = glm::vec4(1.0F, 1.0F, 1.0F, 1.0F),
         .metallic = 0.0F,
-        .roughness = std::max(minimum_pbr_roughness, recipe.bark_roughness),
+        .roughness = 1.0F, // Absolute roughness is already baked into ORM green.
         .ambient_occlusion = 1.0F,
         .reserved = 0.0F,
         .ior = 1.5F,
@@ -4143,7 +4139,7 @@ void build_gpu_grass_patch_lod(
     const std::string_view usage,
     const std::string_view color_space,
     const IconRgbaImage& image,
-    std::vector<std::filesystem::path>& out_written,
+    std::array<std::filesystem::path, 2>& out_written,
     std::string& error) {
     if (!image.valid()) {
         error = "Cannot write invalid procedural vegetation texture image.";
@@ -4181,8 +4177,7 @@ void build_gpu_grass_patch_lod(
         return false;
     }
 
-    out_written.push_back(png_path);
-    out_written.push_back(meta_path);
+    out_written = {png_path, meta_path};
     return true;
 }
 
@@ -4241,6 +4236,10 @@ void build_gpu_grass_patch_lod(
 
     Json submeshes_json = Json::array();
     for (const auto& sm : model.submeshes) {
+        if (sm.material_index >= model.materials.size()) {
+            error = "Vegetation submesh refers to a missing material.";
+            return false;
+        }
         Json sm_json = Json::object();
         sm_json["name"] = sm.name;
         sm_json["first_index"] = sm.first_index;
@@ -5248,7 +5247,7 @@ bool generate_vegetation_asset(
 
             if (any_bark && !bark_meshes[lod].indices.empty()) {
                 const std::uint32_t mat_idx = static_cast<std::uint32_t>(model.materials.size());
-                model.materials.push_back(make_bark_material(recipe));
+                model.materials.push_back(make_bark_material());
                 const std::uint64_t first_idx = combined.indices.size();
                 combined.vertices = bark_meshes[lod].vertices;
                 combined.indices = bark_meshes[lod].indices;
@@ -5388,30 +5387,16 @@ bool generate_vegetation_asset(
     return true;
 }
 
-bool export_vegetation_package(
+static bool write_vegetation_package(
     const GeneratedVegetationAsset& asset,
     const std::filesystem::path& asset_root,
-    const std::string_view category_subdir,
+    const std::filesystem::path& rel_dir,
     VegetationExportSummary& out_summary,
     std::string& error) {
     error.clear();
     out_summary = VegetationExportSummary{};
-    if (asset_root.empty()) {
-        error = "Asset root path cannot be empty.";
-        return false;
-    }
     std::error_code ec;
-    std::filesystem::create_directories(asset_root, ec);
-    if (ec) {
-        error = "Failed to prepare target asset root: " + ec.message();
-        return false;
-    }
-
     const std::string slug = sanitize_vegetation_slug(asset.recipe.asset_slug);
-    const std::filesystem::path rel_dir =
-        category_subdir.empty()
-            ? std::filesystem::path("models/vegetation") / slug
-            : std::filesystem::path(category_subdir) / slug;
     const std::filesystem::path package_dir = asset_root / rel_dir;
     std::filesystem::create_directories(package_dir, ec);
     if (ec) {
@@ -5419,102 +5404,38 @@ bool export_vegetation_package(
         return false;
     }
 
-    // Export procedural textures
+    struct TextureOutput {
+        std::string_view stem, usage, color_space;
+        const IconRgbaImage& image;
+        std::array<std::filesystem::path, 2> files{};
+        std::string error{};
+        bool written = false;
+    };
+    std::vector<TextureOutput> textures;
+    textures.reserve(9);
     if (asset.has_bark_textures) {
-        if (!write_cooked_texture_files(
-                package_dir,
-                "bark_albedo",
-                "base_color",
-                "srgb",
-                asset.bark_albedo,
-                out_summary.texture_files,
-                error)) {
-            return false;
-        }
-        if (!write_cooked_texture_files(
-                package_dir,
-                "bark_normal",
-                "normal",
-                "linear",
-                asset.bark_normal,
-                out_summary.texture_files,
-                error)) {
-            return false;
-        }
-        if (!write_cooked_texture_files(
-                package_dir,
-                "bark_orm",
-                "metallic_roughness",
-                "linear",
-                asset.bark_orm,
-                out_summary.texture_files,
-                error)) {
-            return false;
-        }
+        textures.push_back({"bark_albedo", "base_color", "srgb", asset.bark_albedo});
+        textures.push_back({"bark_normal", "normal", "linear", asset.bark_normal});
+        textures.push_back({"bark_orm", "metallic_roughness", "linear", asset.bark_orm});
     }
     if (asset.has_foliage_textures) {
-        if (!write_cooked_texture_files(
-                package_dir,
-                "foliage_atlas",
-                "base_color",
-                "srgb",
-                asset.foliage_atlas,
-                out_summary.texture_files,
-                error)) {
-            return false;
-        }
-        if (!write_cooked_texture_files(
-                package_dir,
-                "foliage_normal",
-                "normal",
-                "linear",
-                asset.foliage_normal,
-                out_summary.texture_files,
-                error)) {
-            return false;
-        }
-        if (!write_cooked_texture_files(
-                package_dir,
-                "foliage_orm",
-                "metallic_roughness",
-                "linear",
-                asset.foliage_orm,
-                out_summary.texture_files,
-                error)) {
-            return false;
-        }
+        textures.push_back({"foliage_atlas", "base_color", "srgb", asset.foliage_atlas});
+        textures.push_back({"foliage_normal", "normal", "linear", asset.foliage_normal});
+        textures.push_back({"foliage_orm", "metallic_roughness", "linear", asset.foliage_orm});
     }
     if (asset.has_grass_textures) {
-        if (!write_cooked_texture_files(
-                package_dir,
-                "grass_albedo",
-                "base_color",
-                "srgb",
-                asset.grass_albedo,
-                out_summary.texture_files,
-                error)) {
-            return false;
-        }
-        if (!write_cooked_texture_files(
-                package_dir,
-                "grass_normal",
-                "normal",
-                "linear",
-                asset.grass_normal,
-                out_summary.texture_files,
-                error)) {
-            return false;
-        }
-        if (!write_cooked_texture_files(
-                package_dir,
-                "grass_orm",
-                "metallic_roughness",
-                "linear",
-                asset.grass_orm,
-                out_summary.texture_files,
-                error)) {
-            return false;
-        }
+        textures.push_back({"grass_albedo", "base_color", "srgb", asset.grass_albedo});
+        textures.push_back({"grass_normal", "normal", "linear", asset.grass_normal});
+        textures.push_back({"grass_orm", "metallic_roughness", "linear", asset.grass_orm});
+    }
+    parallel_for_jobs(textures.size(), [&](const std::size_t i) {
+        auto& tex = textures[i];
+        tex.written = write_cooked_texture_files(package_dir, tex.stem, tex.usage,
+            tex.color_space, tex.image, tex.files, tex.error);
+    });
+    for (const auto& tex : textures) {
+        if (!tex.written) { error = tex.error; return false; }
+        out_summary.texture_files.insert(out_summary.texture_files.end(), tex.files.begin(), tex.files.end());
     }
 
     // Export unique materials used across LODs
@@ -5523,7 +5444,11 @@ bool export_vegetation_package(
         unique_materials[path_to_generic_utf8(mat.relative_path)] = mat;
     }
     for (const auto& [rel_path, mat] : unique_materials) {
-        const std::filesystem::path mat_abs = package_dir / std::filesystem::path(rel_path);
+        if (!StudioAssetPublication::valid_relative_path(rel_path)) {
+            error = "Invalid generated vegetation material path.";
+            return false;
+        }
+        const std::filesystem::path mat_abs = (package_dir / std::filesystem::path(rel_path)).make_preferred();
         const Json mat_json = build_material_json(mat);
         if (!write_text_atomic(mat_abs, mat_json.dump(2), error)) {
             return false;
@@ -5565,7 +5490,8 @@ bool export_vegetation_package(
     // Validate full engine cooked model & texture contracts immediately
     CookedModelLoadResult loaded = load_cooked_model_asset(asset_root, out_summary.lod0_relative_path);
     if (!loaded) {
-        error = "Exported vegetation failed engine validation: " + loaded.error().message;
+        error = "Exported vegetation failed engine validation at " + path_to_generic_utf8(loaded.error().path) +
+            ": " + loaded.error().message;
         return false;
     }
     if (asset.has_bark_textures) {
@@ -5601,6 +5527,51 @@ bool export_vegetation_package(
             }
         }
     }
+    return true;
+}
+
+bool export_vegetation_package(
+    const GeneratedVegetationAsset& asset,
+    const std::filesystem::path& asset_root,
+    const std::string_view category_subdir,
+    VegetationExportSummary& out_summary,
+    std::string& error) {
+    error.clear();
+    out_summary = {};
+    const auto category = category_subdir.empty() ? std::filesystem::path("models/vegetation") :
+        std::filesystem::path(std::u8string(category_subdir.begin(), category_subdir.end()));
+    const auto package = (category / sanitize_vegetation_slug(asset.recipe.asset_slug)).make_preferred();
+    StudioAssetPublication publication;
+    if (asset_root.empty()) { error = "Asset root path cannot be empty."; return false; }
+    if (!publication.begin(asset_root, package, error)) return false;
+    VegetationExportSummary staged;
+    const auto& staging_root = publication.staging_root();
+    if (!write_vegetation_package(asset, staging_root, package, staged, error)) return false;
+
+    std::array<std::string, model_lod_count - 1U> lod_errors;
+    parallel_for_jobs(lod_errors.size(), [&](const std::size_t index) {
+        const auto lod = index + 1U;
+        const auto model = load_cooked_model_asset(staging_root, staged.model_files[lod].lexically_relative(staging_root));
+        if (!model) lod_errors[index] = "Vegetation LOD" + std::to_string(lod) + " validation failed: " + model.error().message;
+    });
+    for (const auto& message : lod_errors) {
+        if (!message.empty()) { error = message; return false; }
+    }
+    std::vector<std::filesystem::path> entries;
+    const auto publish_path = [&](std::filesystem::path& path) {
+        entries.push_back(path.lexically_relative(staging_root));
+        path = asset_root / entries.back();
+    };
+    for (auto& path : staged.texture_files) publish_path(path);
+    for (auto& path : staged.material_files) publish_path(path);
+    for (auto& path : staged.mesh_files) publish_path(path);
+    for (auto& path : staged.model_files) publish_path(path);
+    publish_path(staged.recipe_file);
+    staged.asset_root = asset_root;
+    staged.package_directory = asset_root / package;
+    staged.lod0_model_file = staged.model_files.front();
+    if (!publication.commit(entries, error)) return false;
+    out_summary = std::move(staged);
     return true;
 }
 

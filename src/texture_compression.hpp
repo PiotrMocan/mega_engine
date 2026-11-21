@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string>
 #include <vector>
@@ -29,6 +30,13 @@ inline constexpr std::size_t vcrtex_header_bytes = 40U;
     CookedTexturePixelFormat format,
     std::vector<std::size_t>& out_offsets,
     std::uint64_t& out_total_bytes);
+
+// Visits each lower mip synchronously in descending size. Input is validated, tightly
+// packed RGBA8. The texel span is valid only for the duration of the callback.
+using TextureMipSink = std::function<void(std::uint32_t level, std::uint32_t width,
+    std::uint32_t height, std::span<const std::uint8_t> texels)>;
+void visit_filtered_texture_mips(const CookedTextureAsset& base, float alpha_cutoff,
+    const TextureMipSink& write_mip);
 
 /// Generates mipmaps and encodes an RGBA8 texture into a `.vcrtex` BC7/BC4 container.
 [[nodiscard]] bool cook_texture_to_vcrtex(

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "character_studio_shell.hpp"
+#include "studio_brush_history.hpp"
 
 #include <glm/vec2.hpp>
 #include <glm/vec3.hpp>
@@ -51,7 +52,7 @@ public:
         CharacterPackage& package,
         const OllamaBridgeConfig& ollama,
         std::string& out_result_json,
-        bool& out_rebuild_preview,
+        CharacterDocumentChange& out_change,
         std::string& out_error) override;
 
 private:
@@ -115,6 +116,7 @@ private:
     float sculpt_strength_ = 0.65F;
     bool sculpt_mirror_x_ = true;
     bool has_last_stroke_pos_ = false;
+    StudioBrushHistory<SculptStrokeRecord> sculpt_history_{};
     glm::vec3 last_stroke_pos_{0.0F};
 
     // Workspace 2: Wardrobe & 3D PBR Paint
@@ -124,12 +126,19 @@ private:
     CharacterPaintTarget paint_pinned_target_ = CharacterPaintTarget::outfit_primary;
     bool paint_auto_target_ = true;
     float paint_radius_uv_ = 0.045F;
+    bool paint_skin_in_3d_ = true;
+    float paint_skin_radius_m_ = 0.045F;
+    bool paint_mirror_x_ = false;
     float paint_hardness_ = 0.78F;
     float paint_strength_ = 0.85F;
     glm::vec4 paint_color_{0.88F, 0.28F, 0.16F, 1.0F};
     bool paint_mirror_u_ = false;
     bool has_last_uv_ = false;
+    StudioBrushHistory<CharacterPaintStroke> paint_history_{};
     glm::vec2 last_uv_{0.0F};
+    glm::vec3 last_paint_center_{};
+    CharacterPaintTarget last_paint_target_{};
+    bool last_paint_in_3d_ = false;
 
     // Workspace 3: Acting, Voice & Dialogue
     bool sync_facial_from_package_requested_ = true;

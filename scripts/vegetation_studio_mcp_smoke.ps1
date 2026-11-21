@@ -118,7 +118,7 @@ try {
     }
     Send-Notification -Method "notifications/initialized"
 
-    # 2. tools/list -> assert all 15 tools
+    # 2. tools/list
     $toolsRes = Invoke-Mcp -Id 2 -Method "tools/list" -Params @{}
     $expectedTools = @(
         "veg.list_presets",
@@ -128,6 +128,8 @@ try {
         "veg.randomize_seed",
         "veg.paint_foliage",
         "veg.clear_paint",
+        "veg.undo_paint",
+        "veg.redo_paint",
         "veg.set_arena",
         "veg.set_camera",
         "veg.export_to_project",
@@ -143,8 +145,8 @@ try {
             throw "Missing MCP tool in tools/list: $tool"
         }
     }
-    if ($actualNames.Count -ne 15) {
-        throw "Expected 15 tools, got $($actualNames.Count)"
+    if ($actualNames.Count -ne $expectedTools.Count) {
+        throw "Unexpected number of tools: $($actualNames.Count)"
     }
 
     # 3. veg.list_presets
@@ -166,6 +168,23 @@ try {
         center = @(0.0, 5.5, 0.0)
         radius = 2.0
         strength = 0.9
+    }
+
+    $clear = (Call-Tool -Id 51 -Name "veg.clear_paint" -Arguments @{}).content[0].text | ConvertFrom-Json
+    $undo = (Call-Tool -Id 52 -Name "veg.undo_paint" -Arguments @{}).content[0].text | ConvertFrom-Json
+    $redo = (Call-Tool -Id 53 -Name "veg.redo_paint" -Arguments @{}).content[0].text | ConvertFrom-Json
+    $restore = (Call-Tool -Id 54 -Name "veg.undo_paint" -Arguments @{}).content[0].text | ConvertFrom-Json
+    if (!$clear.changed -or $clear.state.paint_brush.stroke_count -ne 0 -or
+        !$undo.state.paint_brush.can_redo -or $undo.state.paint_brush.stroke_count -ne 1 -or
+        $redo.state.paint_brush.stroke_count -ne 0 -or $restore.state.paint_brush.stroke_count -ne 1) {
+        throw "Clear/Undo/Redo did not restore the painted crown."
+    }
+    $oversized = Invoke-Mcp -Id 55 -Method "tools/call" -Params @{
+        name = "veg.set_recipe"
+        arguments = @{ paint_strokes = (@(@{}) * 257) }
+    }
+    if (!$oversized.isError -or $oversized.content[0].text -notmatch '256') {
+        throw "An oversized crown paint layer must be rejected before changing the recipe."
     }
 
     # 6. veg.set_arena
@@ -270,7 +289,7 @@ try {
         throw "Vulkan validation errors detected in stderr:`n$stderrText"
     }
 
-    Write-Output "vegetation_studio_mcp_smoke.ps1 PASSED (15 tools, fps=$([math]::Round([double]$metricsJson.one_second_average_fps, 1)), LOD lineup submitted=$($metricsJson.visibility.submitted), PNG $($bytes.Length) bytes, exit 0)."
+    Write-Output "vegetation_studio_mcp_smoke.ps1 PASSED ($($actualNames.Count) tools, fps=$([math]::Round([double]$metricsJson.one_second_average_fps, 1)), LOD lineup submitted=$($metricsJson.visibility.submitted), PNG $($bytes.Length) bytes, exit 0)."
 }
 finally {
     if (-not $proc.HasExited) {

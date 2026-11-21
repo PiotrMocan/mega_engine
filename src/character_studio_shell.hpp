@@ -2,13 +2,15 @@
 
 #include "audio_engine.hpp"
 #include "character_ai_bridge.hpp"
-#include "character_package.hpp"
+#include "character_surface_picker.hpp"
 #include "editor_ui_kit.hpp"
 #include "fly_camera.hpp"
 #include "performance_metrics.hpp"
 #include "renderer.hpp"
 #include "scene_document.hpp"
 #include "skeletal_animation.hpp"
+#include "studio_brush_preview.hpp"
+#include "studio_preview_worker.hpp"
 #include "vulkan_context.hpp"
 
 #include <SDL3/SDL.h>
@@ -24,6 +26,7 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <iosfwd>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -100,10 +103,12 @@ struct ViewportInteractionContext {
     bool left_released = false;
     bool shift_down = false;
     bool ctrl_down = false;
-    std::optional<CharacterRaycastHit> hit{};
+    std::optional<CharacterSurfaceHit> hit{};
     glm::vec3 ray_origin{0.0F};
     glm::vec3 ray_direction{0.0F, 0.0F, -1.0F};
 };
+
+enum class CharacterDocumentChange { none, brush_layer, replace_package };
 
 struct CharacterToolFrameActions {
     bool rebuild_preview = false;
@@ -157,7 +162,7 @@ public:
         CharacterPackage& /*package*/,
         const OllamaBridgeConfig& /*ollama*/,
         std::string& /*out_result_json*/,
-        bool& /*out_rebuild_preview*/,
+        CharacterDocumentChange& /*out_change*/,
         std::string& out_error) {
         out_error = "Unsupported MCP method for this character studio tool.";
         return false;
@@ -188,7 +193,7 @@ public:
     [[nodiscard]] CharacterPackage& package() noexcept { return package_; }
     [[nodiscard]] const CharacterPackage& package() const noexcept { return package_; }
     [[nodiscard]] const CharacterMeshBuildResult& preview_mesh() const noexcept {
-        return preview_mesh_;
+        return preview_surface_.mesh();
     }
     [[nodiscard]] const std::vector<AnimationClip>& preview_clips() const noexcept {
         return preview_clips_;
@@ -258,8 +263,9 @@ public:
     void set_bind_pose_override(bool enabled) noexcept { bind_pose_override_ = enabled; }
     [[nodiscard]] bool bind_pose_override() const noexcept { return bind_pose_override_; }
 
-    void mark_package_dirty() noexcept { package_dirty_ = true; }
+    void mark_package_dirty() noexcept { ++package_revision_; package_dirty_ = true; }
     void request_preview_rebuild() noexcept { preview_rebuild_requested_ = true; }
+    void request_brush_preview(const CharacterSurfaceAnchor& anchor) noexcept { brush_preview_.record(anchor); }
     void reset_dock_layout() noexcept { dock_layout_initialized_ = false; }
     void set_show_skeleton_overlay(bool enabled) noexcept {
         show_skeleton_overlay_ = enabled;
@@ -267,8 +273,10 @@ public:
     [[nodiscard]] bool show_skeleton_overlay() const noexcept {
         return show_skeleton_overlay_;
     }
-    void set_preview_brush(float radius, bool visible) noexcept {
+    void set_preview_brush(float radius, bool visible, float skin_radius_m = 0.0F, bool skin_only = false) noexcept {
         preview_brush_radius_ = radius;
+        preview_skin_radius_m_ = skin_radius_m;
+        preview_skin_only_ = skin_only;
         preview_brush_visible_ = visible;
     }
     void set_preview_brush_radius(float radius) noexcept {
@@ -343,7 +351,8 @@ private:
     void register_viewport_texture();
     void unregister_viewport_texture() noexcept;
 
-    void rebuild_preview_assets(bool full_gpu_reload);
+    void rebuild_preview_assets();
+    bool update_brush_preview();
     void update_orbit_camera() noexcept;
     void handle_sdl_event(
         const SDL_Event& event,
@@ -388,6 +397,17 @@ private:
         void reset() noexcept;
         std::filesystem::path dir{};
     };
+
+    struct BakedPreview {
+        ScopedTempPreviewDir directory;
+        CharacterCookReport report;
+        CharacterPreviewGeometry geometry;
+        CharacterSurfacePicker surface;
+        PreparedModel prepared;
+        std::string error;
+    };
+    static void bake_brush_preview(const CharacterPackage& package, BakedPreview& preview, std::stop_token stop);
+    void install_preview(BakedPreview&& preview);
 
     struct ScopedSdlWindow final {
         SDL_Window* handle = nullptr;
@@ -442,11 +462,17 @@ private:
     int new_char_role_ = 0;
 
     CharacterPackage package_{};
-    CharacterMeshBuildResult preview_mesh_{};
+    CharacterSurfacePicker preview_surface_;
     std::vector<AnimationClip> preview_clips_{};
     SkeletonPose preview_pose_{};
     bool package_dirty_ = false;
+    std::uint64_t package_revision_ = 0;
+    std::uint64_t ai_source_revision_ = 0; // Both revisions belong to the UI thread.
     bool preview_rebuild_requested_ = true;
+    bool preview_matches_document_ = false;
+    StudioBrushPreviewTrail<CharacterSurfaceAnchor> brush_preview_;
+    StudioPreviewWorker<CharacterPackage, BakedPreview> brush_preview_worker_{bake_brush_preview};
+    std::string preview_error_;
 
     SceneDocument preview_scene_{};
     SceneNodeId preview_node_id_{};
@@ -473,7 +499,12 @@ private:
     float speech_elapsed_ = 0.0F;
     AudioVoiceHandle speech_voice_{};
     bool left_mouse_dragging_tool_ = false;
-    std::optional<CharacterRaycastHit> last_hover_hit_{};
+    // Match pointer input to the last submitted image, including camera navigation.
+    std::array<glm::mat4, max_skeleton_bones> displayed_skin_{};
+    std::size_t displayed_bones_ = 0;
+    FlyCamera displayed_camera_{};
+    float displayed_fov_ = 40.0F;
+    bool displayed_surface_valid_ = false;
 
     // Status & performance metrics
     std::string status_message_{"Ready."};
@@ -490,6 +521,8 @@ private:
     bool dock_layout_initialized_ = false;
     bool show_skeleton_overlay_ = false;
     float preview_brush_radius_ = 0.08F;
+    float preview_skin_radius_m_ = 0.0F;
+    bool preview_skin_only_ = false;
     bool preview_brush_visible_ = false;
 
     // Background AI (Ollama) worker
@@ -506,6 +539,7 @@ private:
 
     // Optional --mcp-stdio worker
     bool mcp_stdio_enabled_ = false;
+    std::optional<std::reference_wrapper<std::streambuf>> original_stdout_buffer_{};
     std::mutex mcp_mutex_{};
     std::deque<PendingMcpCommand> mcp_queue_{};
     std::jthread mcp_reader_thread_{};

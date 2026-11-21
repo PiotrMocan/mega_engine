@@ -20,12 +20,13 @@ Standalone procedural vegetation authoring, 3D foliage painting, LOD optimizatio
 ## Key Studio Workflows
 
 - **Seasonal / Foliage Variations**: Switch instantly between `full`, `sparse`, and `bare` crown states (`bare` strips foliage submeshes while keeping bark skeleton intact).
-- **Interactive 3D Crown Painting & Pruning**: Arm the 3D brush in `Hero x1` arena to raycast onto plant clusters and paint spherical strokes (`tint`, `autumn`, `dry`, or `prune_bare`). Strokes persist inside `.vcrveg.json` sidecar recipes and round-trip losslessly.
+- **Interactive 3D Crown Painting & Pruning**: In `Hero x1`, enable the brush to edit at LOD0. Click a leaf to center a spherical tint, autumn, dry, or pruning stroke on its surface. Cutouts in the leaf atlas let the brush reach foliage behind them. A click on bark or in an empty gap leaves the recipe intact. On GPU grass, the brush follows the animated blade and saves the center in its resting pose, so reopening the recipe reproduces the same edit. Brush radius and falloff control which nearby clusters or blades are affected.
 - **Photorealistic & Procedural PBR Atlases**: Composites the botanical cutout & seamless bark library in `assets/vegetation/` (`foliage_{birch,oak,shrub,conifer,palm}.png`, `bark_{birch,oak,pine,shrub,palm}.png`, with procedural fallback if absent) into `1024×1024` (`256/512/1024/2048` configurable) 4×4 botanical sprig & 1×8 horizontal palm frond PBR sets (`foliage_atlas` sRGB + alpha dilation, `foliage_normal`, `foliage_orm` with packed AO in `R`, gloss-calibrated roughness in `G`), `512×512` (`128..1024`) seamless bark PBR sets (`bark_albedo`, `bark_normal`, `bark_orm`), and `256×256` GPU grass blade PBR sets (`grass_albedo`, `grass_normal`, `grass_orm`), previewed live inside Vulkan UI thumbnails (`UiTexturePreview`). Supports explicit `bark_style` / `foliage_style` texture overrides and independent `foliage_gloss` (`0..1` controlling dielectric `ior` and leaf/grass roughness) alongside coverage-preserving alpha-cutout mipmaps and volume-conserving `LOD0`–`LOD5` canopy decimation.
+- **Bark Roughness** sets the base value baked into the green ORM channel. Furrows and photographic grain add local variation. Regenerate an existing recipe to update its maps and material together.
 - **5 Scalability Arenas**:
   - `hero_single` (1 hero plant, interactive 3D crown painting)
   - `lod_lineup` (LOD0–LOD5 displayed simultaneously side by side regardless of camera distance)
-  - `grove_100` (100 trees/patches, automatic 4-LOD switching + frustum/occlusion culling)
+  - `grove_100` (100 trees or patches with distance-based LOD selection and frustum/occlusion culling)
   - `forest_2500` (2,500 instances stress arena)
   - `meadow_10000` (10,000 instances high-density stress arena)
 - **Optimization Budget Lab**: Tracks LOD0–LOD5 vertices/triangles/submeshes/geometric error, packed vs float vertex memory savings, RGBA texture budget, alpha overdraw estimate, budget grade (`A`–`D`), real-time FPS / 1% low / CPU & GPU ms timings, and resident GPU memory.
@@ -41,6 +42,8 @@ Exporting `<slug>` to `<project_dir>/assets/<category_subdir>/<slug>/` (or via `
 - `textures/*.vcrtexture.json` + `.png` PBR texture sets (`bark_albedo/normal/orm`, `foliage_atlas/normal/orm`, `grass_albedo/normal/orm`)
 
 Both `vulkan_vegetation_studio` and `vulkan_editor` open `.vcrasset.json` / `.vcrveg.json` natively via `load_cooked_model_asset`, `load_cooked_texture_asset`, `open_vegetation_package`, and `list_project_vegetation_assets`.
+
+Export stages the recipe, materials, textures and all six LODs beside the asset root. It loads each model and texture through the engine before updating the project. Existing scene references keep their paths. A failed replacement restores the previous outputs and preserves other files in the package folder. If a studio process exits during publication, the next export to the same package recovers the interrupted update. Other instances can export different packages at the same time. If rebuilding the preview fails, the viewport keeps its last model. `veg.get_state` exposes `preview.pending` and `preview.error`. Export uses the current recipe even when the viewport still shows the previous one.
 
 ## CLI & Agent Usage
 
@@ -59,7 +62,14 @@ build\windows-debug\bin\vulkan_vegetation_studio.exe --smoke-frames 20 --validat
 build\windows-debug\bin\vulkan_vegetation_studio.exe --mcp-stdio --validation
 ```
 
-## MCP Tools (`15` tools)
+The crown brush groups one drag into one undo step. Use `Ctrl+Z` to undo and
+`Ctrl+Y` or `Ctrl+Shift+Z` to redo. Clear Paint can be undone. The studio keeps
+32 recent gestures. Samples from a reopened recipe can be undone individually.
+At the 256-sample limit the current painting stays intact.
+
+Gold dots mark recent crown picks while the studio generates the six LODs and textures in the background. The viewport updates during long drags and finishes the last edits on release. Export uses the current recipe, including dabs whose preview is still baking. `veg.get_state` reports the bake status in `preview.pending` and `preview.error`.
+
+## MCP Tools (17 tools)
 
 1. `veg.list_presets` — List all 14 built-in presets across the 6 archetypes.
 2. `veg.get_state` — Return active `recipe`, `bounds`, `report`, `arena`, `camera`, `lighting`, `paint_brush`, and `metrics`.
@@ -76,3 +86,5 @@ build\windows-debug\bin\vulkan_vegetation_studio.exe --mcp-stdio --validation
 13. `render.get_metrics` — Live FPS, 1% low, CPU/GPU timings, culling statistics, and resident VRAM.
 14. `capture.screenshot` — Capture the Vulkan frame as inline PNG `ImageContent` and optional PNG file.
 15. `engine.quit` — Cleanly shut down the studio.
+16. `veg.undo_paint` — Undo a brush gesture or restore a cleared crown.
+17. `veg.redo_paint` — Reapply the last undone brush edit.

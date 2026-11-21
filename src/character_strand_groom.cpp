@@ -2110,6 +2110,10 @@ BakedPbrTextureSet bake_character_strand_groom_textures(
         srgb_to_linear(hair_color.y),
         srgb_to_linear(hair_color.z));
 
+    const auto settings = sanitize_character_groom_settings(inputs.settings);
+    const glm::vec3 dye_linear(srgb_to_linear(settings.tip_color_srgb.r),
+        srgb_to_linear(settings.tip_color_srgb.g), srgb_to_linear(settings.tip_color_srgb.b));
+
     // Precompute per-column AO & roughness samples along 6 points per clump
     for (std::uint32_t x = 0U; x < w; ++x) {
         const float u = (static_cast<float>(x) + 0.5F) / static_cast<float>(w);
@@ -2179,6 +2183,11 @@ BakedPbrTextureSet bake_character_strand_groom_textures(
             // Root-to-tip melanin gradient (slightly darker root, gentle warm sheen mid, delicate light tip)
             const float tip_lift = 1.0F + 0.14F * smoothstep_local(v, 0.45F, 1.0F);
             glm::vec3 rgb_lin = col_pigment * (glm::mix(is_brow ? 0.94F : 0.68F, 1.0F, smoothstep_local(v, 0.0F, 0.25F)) * tip_lift);
+
+            if (cid < kBrowClumpBase && settings.tip_dye_strength > 0.F) {
+                const float blend = settings.tip_dye_strength * smoothstep_local(v, settings.tip_dye_start, 1.F);
+                rgb_lin = glm::mix(rgb_lin, dye_linear * melanin_var, blend);
+            }
 
             // Apply any user paint strokes targeted at hair
             for (const CharacterPaintStroke& stroke : paint_strokes) {

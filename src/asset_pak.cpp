@@ -1,4 +1,5 @@
 #include "asset_pak.hpp"
+#include "native_asset_path.hpp"
 
 #include <algorithm>
 #include <array>
@@ -155,17 +156,21 @@ void append_u64_le(
         return {};
     }
     std::string key = path_to_utf8(root.lexically_normal());
-    while (key.size() > 1U && key.back() == '/' &&
-           !(key.size() == 3U && key[1] == ':')) {
-        key.pop_back();
-    }
 #if defined(_WIN32)
     for (char& ch : key) {
         if (ch >= 'A' && ch <= 'Z') {
             ch = static_cast<char>(ch - 'A' + 'a');
         }
     }
+    // Normal and extended Windows spellings share one archive and one
+    // invalidation key. File IO still uses the caller's canonical path.
+    if (key.starts_with("//?/unc/")) key.replace(0, 8, "//");
+    else if (key.starts_with("//?/") && key.size() >= 6 && key[5] == ':') key.erase(0, 4);
 #endif
+    while (key.size() > 1U && key.back() == '/' &&
+           !(key.size() == 3U && key[1] == ':')) {
+        key.pop_back();
+    }
     return key;
 }
 
@@ -1188,7 +1193,7 @@ void invalidate_asset_pak_cache(const std::filesystem::path& asset_root) {
         key_raw = normalize_root_key(asset_root);
         std::error_code ec;
         const std::filesystem::path canon =
-            std::filesystem::weakly_canonical(asset_root, ec);
+            weakly_canonical_asset_path(asset_root, ec);
         if (!ec && !canon.empty()) {
             key_canon = normalize_root_key(canon);
         }

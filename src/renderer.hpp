@@ -491,6 +491,9 @@ public:
         std::optional<std::uint32_t> coverage = std::nullopt) noexcept;
     void invalidate_editor_scene() noexcept;
     void reset_editor_asset_cache();
+    // Preview studios own the scene and submit on this thread. CPU decoding and
+    // LOD preparation can finish on a worker before replacing the resident model.
+    [[nodiscard]] bool replace_editor_preview_model(const PreparedModel& prepared, std::string& error);
     [[nodiscard]] bool prepare_editor_viewport(VkExtent2D extent);
     [[nodiscard]] VkImageView editor_viewport_image_view() const noexcept {
         return editor_viewport_.color.view();
@@ -874,6 +877,8 @@ private:
         VkCommandBuffer command_buffer,
         FrameContext& frame);
     [[nodiscard]] std::vector<std::string> resident_editor_texture_paths() const;
+    [[nodiscard]] std::optional<std::uint32_t> upload_editor_model_sync(const PreparedModel& prepared,
+        std::string& error);
     [[nodiscard]] std::optional<std::uint32_t> publish_editor_model(const PreparedModel &prepared,
                                                                     std::string &error);
     [[nodiscard]] std::optional<std::uint32_t> find_editor_model_asset_index(

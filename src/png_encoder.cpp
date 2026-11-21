@@ -14,6 +14,16 @@ constexpr std::array<std::uint8_t, 8> png_signature{
 };
 constexpr std::size_t maximum_raw_bytes = 256U * 1024U * 1024U;
 constexpr std::uint32_t adler_modulus = 65'521U;
+constexpr auto crc32_table = [] {
+    std::array<std::uint32_t, 256> table{};
+    for (std::uint32_t i = 0; i < table.size(); ++i) {
+        auto crc = i;
+        for (unsigned bit = 0; bit < 8; ++bit)
+            crc = (crc >> 1U) ^ ((crc & 1U) ? 0xedb8'8320U : 0U);
+        table[i] = crc;
+    }
+    return table;
+}();
 
 void append_u32_be(
     std::vector<std::uint8_t>& output,
@@ -28,12 +38,7 @@ void append_u32_be(
     const std::span<const std::uint8_t> bytes) noexcept {
     std::uint32_t crc = 0xffff'ffffU;
     for (const std::uint8_t byte : bytes) {
-        crc ^= byte;
-        for (std::uint32_t bit = 0; bit < 8U; ++bit) {
-            const std::uint32_t mask =
-                0U - static_cast<std::uint32_t>(crc & 1U);
-            crc = (crc >> 1U) ^ (0xedb8'8320U & mask);
-        }
+        crc = (crc >> 8U) ^ crc32_table[(crc ^ byte) & 0xffU];
     }
     return ~crc;
 }

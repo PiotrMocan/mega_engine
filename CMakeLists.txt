@@ -462,11 +462,15 @@ set(VCR_ENGINE_CORE_SOURCES
     src/navigation.cpp
     src/npc_ai.cpp
     src/character_package.cpp
+    src/character_surface_picker.cpp
+    src/character_paint_projection.cpp
+    src/studio_asset_publication.cpp
     src/character_strand_groom.cpp
     src/character_wardrobe_mesh.cpp
     src/character_wardrobe_textures.cpp
     src/character_ai_bridge.cpp
     src/vegetation_generator.cpp
+    src/vegetation_surface_picker.cpp
     src/asset_pak.cpp
     src/crash_log.cpp
 )

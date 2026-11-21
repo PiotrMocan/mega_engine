@@ -7,8 +7,11 @@
 #include "project_system.hpp"
 #include "renderer.hpp"
 #include "scene_document.hpp"
+#include "studio_brush_history.hpp"
+#include "studio_brush_preview.hpp"
+#include "studio_preview_worker.hpp"
 #include "ui_texture_preview.hpp"
-#include "vegetation_generator.hpp"
+#include "vegetation_surface_picker.hpp"
 #include "vegetation_studio_mcp.hpp"
 #include "vulkan_context.hpp"
 
@@ -105,7 +108,21 @@ private:
     void unregister_viewport_texture() noexcept;
     void upload_preview_textures();
     void synchronize_renderer_textures();
+    [[nodiscard]] bool export_current_recipe(const std::filesystem::path& asset_root, std::string_view category,
+        VegetationExportSummary& summary, std::string& error) const;
     void rebuild_vegetation_assets(bool frame_camera = false);
+    struct BakedPreview {
+        ScopedTempPreviewDir directory;
+        VegetationSurfacePicker surface;
+        PreparedModel prepared;
+        std::array<std::string, model_lod_count> lod_paths;
+        std::string error;
+    };
+    static void bake_preview(const VegetationRecipe& recipe, const std::filesystem::path& assets,
+        BakedPreview& preview);
+    static void bake_brush_preview(const VegetationRecipe& recipe, BakedPreview& preview, std::stop_token stop);
+    void install_preview(BakedPreview&& preview, bool frame_camera);
+    void update_brush_preview();
     void update_arena_scene_if_dirty();
     void frame_camera_to_arena() noexcept;
 
@@ -173,7 +190,12 @@ private:
     bool save_manual_screenshot_ = false;
 
     VegetationRecipe recipe_{};
-    GeneratedVegetationAsset current_asset_{};
+    StudioBrushHistory<VegetationPaintStroke> paint_history_{};
+    VegetationSurfacePicker current_surface_{};
+    const GeneratedVegetationAsset& current_asset() const noexcept { return current_surface_.asset(); }
+    FlyCamera displayed_camera_{};
+    float displayed_fov_ = 60.0F, displayed_aspect_ = 1.0F, displayed_wind_seconds_ = 0.0F;
+    bool displayed_paint_surface_ = false;
     ScopedTempPreviewDir preview_temp_dir_{};
     std::array<std::string, model_lod_count> preview_lod_relative_paths_{};
     std::vector<SceneModelInstance> arena_models_{};
@@ -181,6 +203,9 @@ private:
     float arena_spacing_ = 4.2F;
     std::uint64_t arena_scene_revision_ = 0U;
     bool preview_dirty_ = true;
+    StudioBrushPreviewTrail<VegetationSurfaceHit> brush_preview_;
+    StudioPreviewWorker<VegetationRecipe, BakedPreview> brush_preview_worker_{bake_brush_preview};
+    std::string preview_error_;
     bool arena_scene_dirty_ = true;
     bool sun_gi_dirty_ = false;
     float sun_hour_ = 10.5F;
@@ -195,6 +220,7 @@ private:
     std::optional<glm::vec3> last_brush_hit_{};
     glm::vec3 last_stroke_center_{0.0F};
     bool has_last_stroke_center_ = false;
+    bool brush_dragging_ = false;
 
     std::filesystem::path target_project_dir_{};
     std::array<char, 512U> target_project_buf_{};

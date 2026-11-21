@@ -1,16 +1,19 @@
 #include "character_package.hpp"
+#include "character_paint_projection.hpp"
 
 #include "character_strand_groom.hpp"
 #include "character_wardrobe.hpp"
 #include "cooked_audio_asset.hpp"
 #include "cooked_texture_asset.hpp"
 #include "game_ui_runtime.hpp"
+#include "job_system.hpp"
 #include "localization.hpp"
 #include "png_encoder.hpp"
 #include "prefab_io.hpp"
 #include "runtime_assets.hpp"
 #include "scene_components.hpp"
 #include "scene_document.hpp"
+#include "studio_asset_publication.hpp"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/constants.hpp>
@@ -27,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <sstream>
@@ -48,8 +52,6 @@ namespace {
 
 using Json = nlohmann::json;
 
-constexpr std::uint32_t max_sculpt_strokes = 2048U;
-constexpr std::uint32_t max_paint_strokes = 4096U;
 constexpr std::uint32_t max_dialogue_nodes = 64U;
 constexpr std::uint32_t max_dialogue_choices_per_node = 4U;
 
@@ -267,8 +269,8 @@ void write_f32_le(std::ostream& os, const float value) {
             return false;
         }
     }
-    const std::filesystem::path temp_path =
-        path.string() + ".tmp_vcrchar";
+    std::filesystem::path temp_path = path;
+    temp_path += ".tmp_vcrchar";
     {
         std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
         if (!out) {
@@ -1873,6 +1875,9 @@ CharacterGroomSettings sanitize_character_groom_settings(CharacterGroomSettings 
     g.clumping = clamp_finite(g.clumping, 0.0F, 1.0F, 0.35F);
     g.flyaways = clamp_finite(g.flyaways, 0.0F, 1.0F, 0.15F);
     g.part = clamp_finite(g.part, -1.0F, 1.0F, 0.25F);
+    g.tip_color_srgb = clamp_vec3_color(g.tip_color_srgb, CharacterGroomSettings{}.tip_color_srgb);
+    g.tip_dye_strength = clamp_finite(g.tip_dye_strength, 0.F, 1.F, 0.F);
+    g.tip_dye_start = clamp_finite(g.tip_dye_start, 0.F, 0.95F, 0.5F);
     return g;
 }
 
@@ -1915,8 +1920,8 @@ void sanitize_character_package(CharacterPackage& p) noexcept {
     b.age_wear = clamp_finite(b.age_wear, 0.0F, 1.0F, 0.12F);
     b.lip_tint = clamp_finite(b.lip_tint, 0.0F, 1.0F, 0.35F);
 
-    if (p.sculpt_strokes.size() > max_sculpt_strokes) {
-        p.sculpt_strokes.resize(max_sculpt_strokes);
+    if (p.sculpt_strokes.size() > maximum_character_sculpt_samples) {
+        p.sculpt_strokes.resize(maximum_character_sculpt_samples);
     }
     for (SculptStrokeRecord& s : p.sculpt_strokes) {
         s.radius = clamp_finite(s.radius, 0.015F, 0.65F, 0.08F);
@@ -1934,8 +1939,8 @@ void sanitize_character_package(CharacterPackage& p) noexcept {
     w.bottom_thickness = clamp_finite(w.bottom_thickness, 0.005F, 0.040F, 0.014F);
     w.wear_and_tear = clamp_finite(w.wear_and_tear, 0.0F, 1.0F, 0.15F);
 
-    if (p.paint_strokes.size() > max_paint_strokes) {
-        p.paint_strokes.resize(max_paint_strokes);
+    if (p.paint_strokes.size() > maximum_character_paint_samples) {
+        p.paint_strokes.resize(maximum_character_paint_samples);
     }
     for (CharacterPaintStroke& pt : p.paint_strokes) {
         pt.uv.x = clamp_finite(pt.uv.x, 0.0F, 1.0F, 0.5F);
@@ -1944,6 +1949,15 @@ void sanitize_character_package(CharacterPackage& p) noexcept {
         pt.hardness = clamp_finite(pt.hardness, 0.05F, 1.0F, 0.75F);
         pt.strength = clamp_finite(pt.strength, 0.01F, 1.0F, 0.85F);
         pt.color = clamp_vec4_color(pt.color, {0.88F, 0.22F, 0.18F, 1.0F});
+        if (pt.skin_surface) {
+            auto& shape = *pt.skin_surface;
+            if (pt.target != CharacterPaintTarget::skin || !std::isfinite(shape.bind_center.x) ||
+                !std::isfinite(shape.bind_center.y) || !std::isfinite(shape.bind_center.z)) {
+                pt.skin_surface.reset();
+            } else {
+                shape.radius_m = clamp_finite(shape.radius_m, 0.002F, 0.5F, 0.045F);
+            }
+        }
     }
 
     p.voice.pitch_hz = clamp_finite(p.voice.pitch_hz, 70.0F, 340.0F, 135.0F);
@@ -2165,7 +2179,7 @@ bool load_character_package_file(
              "occlude_covered_body", "studio_underwear", "primary_color",
              "secondary_color", "accent_color", "footwear_color",
              "hair_color", "hair_density", "hair_length", "hair_width", "hair_clumping",
-             "hair_flyaways", "hair_part", "top_thickness", "bottom_thickness", "wear_and_tear"});
+             "hair_flyaways", "hair_part", "hair_tip_color", "hair_tip_dye", "hair_tip_start", "top_thickness", "bottom_thickness", "wear_and_tear"});
         if (const auto ts = parse_top_garment_style(w.value("top_style", "none"))) {
             pkg.wardrobe.top_style = *ts;
         }
@@ -2202,6 +2216,10 @@ bool load_character_package_file(
         pkg.wardrobe.groom.clumping = w.value("hair_clumping", pkg.wardrobe.groom.clumping);
         pkg.wardrobe.groom.flyaways = w.value("hair_flyaways", pkg.wardrobe.groom.flyaways);
         pkg.wardrobe.groom.part = w.value("hair_part", pkg.wardrobe.groom.part);
+        if (w.contains("hair_tip_color"))
+            (void)read_vec3_json(w["hair_tip_color"], pkg.wardrobe.groom.tip_color_srgb);
+        pkg.wardrobe.groom.tip_dye_strength = w.value("hair_tip_dye", pkg.wardrobe.groom.tip_dye_strength);
+        pkg.wardrobe.groom.tip_dye_start = w.value("hair_tip_start", pkg.wardrobe.groom.tip_dye_start);
         pkg.wardrobe.top_thickness = w.value("top_thickness", pkg.wardrobe.top_thickness);
         pkg.wardrobe.bottom_thickness = w.value("bottom_thickness", pkg.wardrobe.bottom_thickness);
         pkg.wardrobe.wear_and_tear = w.value("wear_and_tear", pkg.wardrobe.wear_and_tear);
@@ -2224,6 +2242,15 @@ bool load_character_package_file(
             st.strength = pt.value("strength", st.strength);
             if (pt.contains("color")) (void)read_vec4_json(pt["color"], st.color);
             st.mirror_u = pt.value("mirror_u", st.mirror_u);
+            if (const auto shape = pt.find("skin_surface"); shape != pt.end() && shape->is_object()) {
+                CharacterSkinPaintFootprint footprint;
+                const auto center = shape->find("bind_center");
+                if (center != shape->end() && read_vec3_json(*center, footprint.bind_center)) {
+                    footprint.radius_m = shape->value("radius_m", footprint.radius_m);
+                    footprint.mirror_x = shape->value("mirror_x", false);
+                    st.skin_surface = footprint;
+                }
+            }
             pkg.paint_strokes.push_back(st);
         }
     }
@@ -2383,6 +2410,9 @@ bool save_character_package_file(
         {"hair_clumping", p.wardrobe.groom.clumping},
         {"hair_flyaways", p.wardrobe.groom.flyaways},
         {"hair_part", p.wardrobe.groom.part},
+        {"hair_tip_color", vec3_to_json(p.wardrobe.groom.tip_color_srgb)},
+        {"hair_tip_dye", p.wardrobe.groom.tip_dye_strength},
+        {"hair_tip_start", p.wardrobe.groom.tip_dye_start},
         {"top_thickness", p.wardrobe.top_thickness},
         {"bottom_thickness", p.wardrobe.bottom_thickness},
         {"wear_and_tear", p.wardrobe.wear_and_tear},
@@ -2401,6 +2431,11 @@ bool save_character_package_file(
             {"color", vec4_to_json(pt.color)},
             {"mirror_u", pt.mirror_u},
         });
+        if (pt.skin_surface) {
+            paint_json.back()["skin_surface"] = {
+                {"bind_center", vec3_to_json(pt.skin_surface->bind_center)},
+                {"radius_m", pt.skin_surface->radius_m}, {"mirror_x", pt.skin_surface->mirror_x}};
+        }
     }
 
     Json acting_json{
@@ -4319,6 +4354,7 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
             }
         }
 
+        const CharacterPaintProjection projection(mesh, sub, slot_strokes, res);
         BakedPbrTextureSet set{};
         set.slot_name = sub.name;
         set.target = sub.paint_target;
@@ -4342,7 +4378,10 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
             srgb_to_linear_channel(pkg.body.face.eye_color.g),
             srgb_to_linear_channel(pkg.body.face.eye_color.b));
 
-        for (std::uint32_t y = 0U; y < res; ++y) {
+        // Each row owns disjoint pixels in all three maps. Stroke blending
+        // remains in authored order inside each pixel.
+        parallel_for_jobs(res, [&](const std::size_t row) {
+            const auto y = static_cast<std::uint32_t>(row);
             const float v = (static_cast<float>(y) + 0.5F) * inv_res;
             for (std::uint32_t x = 0U; x < res; ++x) {
                 const float u = (static_cast<float>(x) + 0.5F) * inv_res;
@@ -4726,22 +4765,38 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
                 }
 
                 // Apply user/AI paint strokes targeting this slot (painted decals, camo, scars, tattoos)
-                for (const CharacterPaintStroke& ps : slot_strokes) {
-                    const int mirrors = ps.mirror_u ? 2 : 1;
+                const auto clean_color = col, clean_normal = nrm;
+                const float clean_roughness = roughness, clean_metallic = metallic;
+                for (const auto index : projection.candidates(x, y)) {
+                    const auto& ps = slot_strokes[index];
+                    const int mirrors = !ps.skin_surface && ps.mirror_u ? 2 : 1;
                     for (int m = 0; m < mirrors; ++m) {
                         const float pu = (m == 1) ? (1.0F - ps.uv.x) : ps.uv.x;
-                        const float dist = std::hypot(u - pu, v - ps.uv.y);
-                        if (dist >= ps.radius) {
-                            continue;
+                        float norm_d;
+                        glm::vec3 surface_delta{};
+                        if (ps.skin_surface) {
+                            surface_delta = projection.offset(index, x, y, ps.skin_surface->mirror_x);
+                            const float squared = glm::dot(surface_delta, surface_delta);
+                            const float radius = ps.skin_surface->radius_m;
+                            if (!(squared < radius * radius)) continue;
+                            norm_d = std::sqrt(squared) / radius;
+                        } else {
+                            const float dist = std::hypot(u - pu, v - ps.uv.y);
+                            if (dist >= ps.radius) continue;
+                            norm_d = dist / ps.radius;
                         }
-                        const float norm_d = dist / ps.radius;
                         const float edge = 1.0F - std::pow(norm_d, 1.0F + ps.hardness * 3.0F);
                         const float alpha = std::clamp(edge * ps.strength * ps.color.a, 0.0F, 1.0F);
                         const glm::vec3 p_lin(
                             srgb_to_linear_channel(ps.color.r),
                             srgb_to_linear_channel(ps.color.g),
                             srgb_to_linear_channel(ps.color.b));
-                        if (ps.mode == CharacterPaintMode::erase) {
+                        if (ps.mode == CharacterPaintMode::erase && ps.skin_surface) {
+                            col = glm::mix(col, clean_color, alpha);
+                            nrm = glm::mix(nrm, clean_normal, alpha);
+                            roughness = glm::mix(roughness, clean_roughness, alpha);
+                            metallic = glm::mix(metallic, clean_metallic, alpha);
+                        } else if (ps.mode == CharacterPaintMode::erase) {
                             const glm::vec3 fallback_lin(
                                 srgb_to_linear_channel(sub.material.base_color.r),
                                 srgb_to_linear_channel(sub.material.base_color.g),
@@ -4749,8 +4804,10 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
                             col = glm::mix(col, fallback_lin, alpha);
                         } else if (ps.mode == CharacterPaintMode::scar) {
                             col = glm::mix(col, glm::vec3(0.45F, 0.16F, 0.14F), alpha * 0.85F);
-                            const glm::vec3 delta = glm::normalize(glm::vec3(
-                                (u - pu) * 18.0F, (v - ps.uv.y) * 18.0F, 1.0F));
+                            const glm::vec2 slope = ps.skin_surface ?
+                                projection.tangent_offset(surface_delta, x, y) / ps.skin_surface->radius_m :
+                                glm::vec2(u - pu, v - ps.uv.y) * 18.0F;
+                            const glm::vec3 delta = glm::normalize(glm::vec3(slope, 1.0F));
                             nrm = glm::normalize(glm::mix(nrm, delta, alpha));
                             roughness = glm::mix(roughness, 0.36F, alpha);
                         } else if (ps.mode == CharacterPaintMode::metallic_accent) {
@@ -4780,7 +4837,7 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
                 set.metallic_roughness_rgba[off + 2U] = float_to_unorm8(std::clamp(metallic, 0.0F, 1.0F));
                 set.metallic_roughness_rgba[off + 3U] = 255U;
             }
-        }
+        }, res < 128U ? 1U : 8U);
 
         outputs.push_back(std::move(set));
     }
@@ -6594,7 +6651,8 @@ bool write_cooked_mesh_file(
             return false;
         }
     }
-    const std::filesystem::path temp = path.string() + ".tmp_vcrmesh";
+    std::filesystem::path temp = path;
+    temp += ".tmp_vcrmesh";
     {
         std::ofstream out(temp, std::ios::binary | std::ios::trunc);
         if (!out) {
@@ -6659,7 +6717,8 @@ bool write_pcm_wav_file(
     }
     const std::uint32_t sr = std::clamp(sample_rate, 8000U, 96000U);
     const auto data_bytes = static_cast<std::uint32_t>(mono_pcm.size() * 2U);
-    const std::filesystem::path temp = path.string() + ".tmp_wav";
+    std::filesystem::path temp = path;
+    temp += ".tmp_wav";
     {
         std::ofstream out(temp, std::ios::binary | std::ios::trunc);
         if (!out) {
@@ -6706,85 +6765,63 @@ bool write_pcm_wav_file(
     return true;
 }
 
-bool cook_character_package_to_project(
+static bool cook_character_package(
     const CharacterPackage& input_pkg,
     const std::filesystem::path& project_directory,
     const CharacterCookOptions& options,
     CharacterCookReport& out_report,
+    std::optional<std::reference_wrapper<CharacterPreviewGeometry>> preview,
     std::string& error) {
     error.clear();
     out_report = CharacterCookReport{};
     CharacterPackage pkg = input_pkg;
     sanitize_character_package(pkg);
     const std::string& slug = pkg.identity.slug;
-    out_report.character_slug = slug;
-
-    const std::filesystem::path asset_root = project_directory / "assets";
+    CharacterCookReport report;
+    report.character_slug = slug;
+    const auto model_directory = std::filesystem::path("characters") / slug;
+    const auto project_assets = project_directory / "assets";
+    StudioAssetPublication publication;
+    if (!publication.begin(project_assets, model_directory, error)) return false;
     std::error_code ec;
-    std::filesystem::create_directories(asset_root / "characters", ec);
-    if (ec) {
-        error = "Cannot create project assets/characters directory: " + ec.message();
-        return false;
-    }
-
-    const std::uint64_t stamp = static_cast<std::uint64_t>(
-        std::chrono::steady_clock::now().time_since_epoch().count());
-    const std::filesystem::path staging_dir =
-        asset_root / "characters" / (".staging_" + slug + "_" + std::to_string(stamp));
-    const std::filesystem::path final_dir = asset_root / "characters" / slug;
-    const std::filesystem::path backup_dir =
-        asset_root / "characters" / (".backup_" + slug + "_" + std::to_string(stamp));
-
-    if (!options.overwrite_existing && std::filesystem::exists(final_dir, ec)) {
+    if (!options.overwrite_existing && std::filesystem::exists(project_assets / model_directory, ec)) {
         error = "Character asset directory already exists and overwrite is disabled.";
         return false;
     }
-
-    std::filesystem::create_directories(staging_dir / "source", ec);
-    std::filesystem::create_directories(staging_dir / "mesh", ec);
-    std::filesystem::create_directories(staging_dir / "materials", ec);
-    std::filesystem::create_directories(staging_dir / "textures", ec);
-    std::filesystem::create_directories(staging_dir / "animations", ec);
-    if (ec) {
-        error = "Failed to create character staging subdirectories.";
-        std::filesystem::remove_all(staging_dir, ec);
-        return false;
-    }
-
+    if (ec) { error = "Cannot inspect character destination: " + ec.message(); return false; }
+    const auto& asset_root = publication.staging_root();
+    const auto staging_dir = asset_root / model_directory;
     // Save source snapshot of the .vcrchar.json inside source/<slug>.vcrchar.json
     const std::string source_rel = "source/" + slug + ".vcrchar.json";
-    if (!save_character_package_file(staging_dir / source_rel, pkg, error)) {
-        std::filesystem::remove_all(staging_dir, ec);
+    if (!save_character_package_file((staging_dir / source_rel).make_preferred(), pkg, error)) {
         return false;
     }
-    ++out_report.cooked_file_count;
+    ++report.cooked_file_count;
 
     // 1. Build 50-bone skeleton + mesh + textures
-    const CharacterMeshBuildResult mesh = build_character_mesh(pkg);
+    CharacterMeshBuildResult mesh = build_character_mesh(pkg);
     if (mesh.vertices.empty() || mesh.indices.empty() || mesh.submeshes.empty()) {
         error = "Procedural character mesh produced zero geometry.";
-        std::filesystem::remove_all(staging_dir, ec);
         return false;
     }
     const auto baked_textures = bake_character_textures(
         pkg, mesh, options.texture_resolution);
 
-    out_report.vertex_count = static_cast<std::uint32_t>(mesh.vertices.size());
-    out_report.triangle_count = static_cast<std::uint32_t>(mesh.indices.size() / 3U);
-    out_report.bone_count = static_cast<std::uint32_t>(mesh.skeleton.bones.size());
-    out_report.submesh_count = static_cast<std::uint32_t>(mesh.submeshes.size());
+    report.vertex_count = static_cast<std::uint32_t>(mesh.vertices.size());
+    report.triangle_count = static_cast<std::uint32_t>(mesh.indices.size() / 3U);
+    report.bone_count = static_cast<std::uint32_t>(mesh.skeleton.bones.size());
+    report.submesh_count = static_cast<std::uint32_t>(mesh.submeshes.size());
 
     // 2. Write .vcrmesh and .vcrskin
     const std::string mesh_rel = "mesh/" + slug + ".vcrmesh";
     const std::string skin_rel = "mesh/" + slug + ".vcrskin";
     if (!write_cooked_mesh_file(
-            staging_dir / mesh_rel, mesh.vertices, mesh.indices, mesh.submeshes, error) ||
+            (staging_dir / mesh_rel).make_preferred(), mesh.vertices, mesh.indices, mesh.submeshes, error) ||
         !write_cooked_skin_file(
-            staging_dir / skin_rel, mesh.skeleton, mesh.skin_vertices, error)) {
-        std::filesystem::remove_all(staging_dir, ec);
+            (staging_dir / skin_rel).make_preferred(), mesh.skeleton, mesh.skin_vertices, error)) {
         return false;
     }
-    out_report.cooked_file_count += 2U;
+    report.cooked_file_count += 2U;
 
     // 3. Write textures (PNG + .vcrtexture.json) & materials (.vcrmaterial.json)
     Json materials_array = Json::array();
@@ -6815,7 +6852,7 @@ bool cook_character_package_to_project(
                         "': " + png.error;
                     return false;
                 }
-                if (!write_bytes_file_atomic(staging_dir / png_rel, png.bytes, error)) {
+                if (!write_bytes_file_atomic((staging_dir / png_rel).make_preferred(), png.bytes, error)) {
                     return false;
                 }
                 const Json tj{
@@ -6833,16 +6870,15 @@ bool cook_character_package_to_project(
                     {"height", bt.height},
                 };
                 if (!write_text_file_atomic(
-                        staging_dir / json_rel, tj.dump(2) + "\n", error)) {
+                        (staging_dir / json_rel).make_preferred(), tj.dump(2) + "\n", error)) {
                     return false;
                 }
-                out_report.cooked_file_count += 2U;
+                report.cooked_file_count += 2U;
                 return true;
             };
             if (!write_tex_pair(bc_png_rel, bc_tex_rel, slot + "_base_color", "base_color", "srgb", bt.base_color_rgba) ||
                 !write_tex_pair(nrm_png_rel, nrm_tex_rel, slot + "_normal", "normal", "linear", bt.normal_rgba) ||
                 !write_tex_pair(mr_png_rel, mr_tex_rel, slot + "_mr", "metallic_roughness", "linear", bt.metallic_roughness_rgba)) {
-                std::filesystem::remove_all(staging_dir, ec);
                 return false;
             }
         }
@@ -6885,11 +6921,10 @@ bool cook_character_package_to_project(
             mat_json["double_sided"] = false;
         }
         if (!write_text_file_atomic(
-                staging_dir / mat_rel, mat_json.dump(2) + "\n", error)) {
-            std::filesystem::remove_all(staging_dir, ec);
+                (staging_dir / mat_rel).make_preferred(), mat_json.dump(2) + "\n", error)) {
             return false;
         }
-        ++out_report.cooked_file_count;
+        ++report.cooked_file_count;
 
         materials_array.push_back(mat_rel);
         submesh_array.push_back(Json{
@@ -6925,7 +6960,6 @@ bool cook_character_package_to_project(
                     speech.mono_pcm,
                     speech.sample_rate,
                     error)) {
-                std::filesystem::remove_all(staging_dir, ec);
                 return false;
             }
             const Json aud_json{
@@ -6938,12 +6972,11 @@ bool cook_character_package_to_project(
             };
             if (!write_text_file_atomic(
                     voice_dir / aud_name, aud_json.dump(2) + "\n", error)) {
-                std::filesystem::remove_all(staging_dir, ec);
                 return false;
             }
             staged_audio_rel.push_back(
                 std::filesystem::path("audio") / "voices" / slug / aud_name);
-            out_report.cooked_file_count += 2U;
+            report.cooked_file_count += 2U;
 
             if (!speech.facial_clip.tracks.empty()) {
                 clips.push_back(speech.facial_clip);
@@ -6955,17 +6988,16 @@ bool cook_character_package_to_project(
     for (const AnimationClip& clip : clips) {
         const std::string clip_slug = sanitize_character_slug(clip.name);
         const std::string anim_rel = "animations/" + clip_slug + ".vcranim";
-        if (!write_cooked_anim_file(staging_dir / anim_rel, clip, error)) {
-            std::filesystem::remove_all(staging_dir, ec);
+        if (!write_cooked_anim_file((staging_dir / anim_rel).make_preferred(), clip, error)) {
             return false;
         }
-        ++out_report.cooked_file_count;
+        ++report.cooked_file_count;
         anims_array.push_back(Json{
             {"name", clip.name},
             {"path", anim_rel},
             {"duration_seconds", clip.duration_seconds},
         });
-        out_report.animation_clips_relative.push_back(
+        report.animation_clips_relative.push_back(
             std::filesystem::path("characters") / slug / anim_rel);
     }
 
@@ -7020,42 +7052,14 @@ bool cook_character_package_to_project(
         {"coordinate_space", "rigged_root_space"},
     };
     if (!write_text_file_atomic(
-            staging_dir / asset_json_rel, model_json.dump(2) + "\n", error)) {
-        std::filesystem::remove_all(staging_dir, ec);
+            (staging_dir / asset_json_rel).make_preferred(), model_json.dump(2) + "\n", error)) {
         return false;
     }
-    ++out_report.cooked_file_count;
+    ++report.cooked_file_count;
 
-    // 7. Atomically promote staging_dir -> final_dir
-    bool had_existing = false;
-    if (std::filesystem::exists(final_dir, ec)) {
-        had_existing = true;
-        std::filesystem::rename(final_dir, backup_dir, ec);
-        if (ec) {
-            error = "Unable to rotate existing character directory '" +
-                    utf8_from_path(final_dir) + "': " + ec.message();
-            std::filesystem::remove_all(staging_dir, ec);
-            return false;
-        }
-    }
-    std::filesystem::rename(staging_dir, final_dir, ec);
-    if (ec) {
-        error = "Unable to publish staged character directory '" +
-                utf8_from_path(final_dir) + "': " + ec.message();
-        std::error_code revert_ec;
-        if (had_existing) {
-            std::filesystem::rename(backup_dir, final_dir, revert_ec);
-        }
-        std::filesystem::remove_all(staging_dir, revert_ec);
-        return false;
-    }
-    if (had_existing) {
-        std::filesystem::remove_all(backup_dir, ec);
-    }
-
-    out_report.model_asset_relative =
+    report.model_asset_relative =
         std::filesystem::path("characters") / slug / asset_json_rel;
-    out_report.audio_assets_relative = std::move(staged_audio_rel);
+    report.audio_assets_relative = std::move(staged_audio_rel);
 
     // 8. Publish Dialogue Graph (.vcrdlg.json) compatible with GameUiRuntime
     {
@@ -7094,8 +7098,8 @@ bool cook_character_package_to_project(
                 asset_root / dlg_rel, dlg_json.dump(2) + "\n", error)) {
             return false;
         }
-        out_report.dialogue_relative = dlg_rel;
-        ++out_report.cooked_file_count;
+        report.dialogue_relative = dlg_rel;
+        ++report.cooked_file_count;
     }
 
     // 9. Publish Localization (.vcrloc.json EN & RU)
@@ -7137,16 +7141,16 @@ bool cook_character_package_to_project(
             !write_text_file_atomic(asset_root / ru_rel, ru_doc.dump(2) + "\n", error)) {
             return false;
         }
-        out_report.loc_en_relative = en_rel;
-        out_report.loc_ru_relative = ru_rel;
-        out_report.cooked_file_count += 2U;
+        report.loc_en_relative = en_rel;
+        report.loc_ru_relative = ru_rel;
+        report.cooked_file_count += 2U;
     }
 
     // 10. Publish NPC & Player Prefabs (.vcrprefab.json)
     if (options.generate_prefabs) {
         std::filesystem::create_directories(asset_root / "prefabs", ec);
         const std::string asset_rel_str =
-            out_report.model_asset_relative.generic_string();
+            report.model_asset_relative.generic_string();
 
         const auto build_and_save_prefab = [&](const bool is_player,
                                                const std::string& prefab_rel) -> bool {
@@ -7204,12 +7208,47 @@ bool cook_character_package_to_project(
             !build_and_save_prefab(true, ply_rel)) {
             return false;
         }
-        out_report.npc_prefab_relative = npc_rel;
-        out_report.player_prefab_relative = ply_rel;
-        out_report.cooked_file_count += 2U;
+        report.npc_prefab_relative = npc_rel;
+        report.player_prefab_relative = ply_rel;
+        report.cooked_file_count += 2U;
     }
 
+    if (options.verify_before_publish &&
+        !verify_cooked_character_outputs(asset_root.parent_path(), report, error)) return false;
+
+    std::vector<std::filesystem::path> entries{model_directory};
+    for (const auto& audio : report.audio_assets_relative) {
+        if (std::ranges::find(entries, audio) != entries.end()) continue;
+        auto wav = audio;
+        wav.replace_extension().replace_extension(".wav");
+        entries.push_back(wav);
+        entries.push_back(audio);
+    }
+    for (const auto& sidecar : {report.dialogue_relative, report.loc_en_relative,
+             report.loc_ru_relative, report.npc_prefab_relative, report.player_prefab_relative}) {
+        if (!sidecar.empty()) entries.push_back(sidecar);
+    }
+    if (!publication.commit(entries, error)) return false;
+    out_report = std::move(report);
+    if (preview) preview->get() = {std::move(mesh), std::move(clips)};
     return true;
+}
+
+bool cook_character_package_to_project(const CharacterPackage& package,
+    const std::filesystem::path& project_directory, const CharacterCookOptions& options,
+    CharacterCookReport& report, std::string& error) {
+    return cook_character_package(package, project_directory, options, report, std::nullopt, error);
+}
+
+bool cook_character_preview(const CharacterPackage& package,
+    const std::filesystem::path& preview_directory, CharacterCookReport& report,
+    CharacterPreviewGeometry& geometry, std::string& error) {
+    CharacterCookOptions options;
+    options.texture_resolution = 1024U;
+    options.bake_voice_lines = false;
+    options.generate_prefabs = false;
+    options.generate_localization = false;
+    return cook_character_package(package, preview_directory, options, report, geometry, error);
 }
 
 bool verify_cooked_character_outputs(

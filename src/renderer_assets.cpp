@@ -146,6 +146,30 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_model(const std::file
         error = prepared.error;
         return {};
     }
+    return upload_editor_model_sync(prepared, error);
+}
+
+bool Renderer::replace_editor_preview_model(const PreparedModel& prepared, std::string& error) {
+    error.clear();
+    if (!prepared.model || async_assets_ || !initialized() || !authored_scene_enabled_) {
+        error = prepared.error.empty() ? "Prepared preview requires a synchronous authored scene." : prepared.error;
+        return false;
+    }
+    for (const auto& texture : prepared.textures) {
+        if (!texture.texture) {
+            error = texture.path + ": " + texture.error;
+            return false;
+        }
+    }
+    reset_editor_asset_cache();
+    if (upload_editor_model_sync(prepared, error)) return true;
+    // Drop partial GPU resources before the caller resubmits its previous scene.
+    reset_editor_asset_cache();
+    return false;
+}
+
+std::optional<std::uint32_t> Renderer::upload_editor_model_sync(const PreparedModel& prepared,
+    std::string& error) {
     if (!reserve_rt_model_metadata(prepared, error)) return {};
     asset_upload_.begin(*context_, prepared.upload_bytes + gi_model_upload_bytes(prepared));
     auto index = publish_editor_model(prepared, error);

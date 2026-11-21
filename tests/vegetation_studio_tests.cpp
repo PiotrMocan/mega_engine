@@ -3,7 +3,9 @@
 #include "cooked_texture_asset.hpp"
 #include "gpu_grass.hpp"
 #include "model_lod.hpp"
+#include "studio_brush_history.hpp"
 #include "vegetation_generator.hpp"
+#include "vegetation_surface_picker.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -14,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <set>
 #include <string>
@@ -80,6 +83,81 @@ bool materials_equal(
             a[i].coverage != b[i].coverage) {
             return false;
         }
+    }
+    return true;
+}
+
+bool test_visible_brush_surface() {
+    // An asymmetric atlas distinguishes repeat addressing, bilinear filtering and the render-time V flip.
+    GeneratedVegetationAsset asset;
+    asset.foliage_atlas = {2, 2, std::vector<std::uint8_t>(16, 0)};
+    asset.foliage_atlas.pixels[3] = 255;
+    auto& model = asset.lod_models.front();
+    model.materials.resize(3);
+    model.materials[0].coverage = 3U | (32768U << 16U);
+    model.materials[1] = model.materials[0];
+    model.materials[1].factors.base_color.a = 0.2F;
+    const auto add = [&](float x, float z, float u, float v, std::uint32_t slot) {
+        const auto first = static_cast<std::uint32_t>(model.vertices.size());
+        for (const auto offset : {glm::vec2(-1,-1), glm::vec2(1,-1), glm::vec2(0,1)}) {
+            model.vertices.push_back({.position = {x + offset.x, offset.y, z}, .texcoord = {u, v}});
+            model.indices.push_back(static_cast<std::uint32_t>(model.indices.size()));
+        }
+        model.submeshes.push_back({.first_index = first, .index_count = 3, .material_index = slot});
+    };
+    add(0, 2, 0.25F, 0.25F, 0);  // transparent row
+    add(0, 1, 1.25F, 0.75F, 1);  // material alpha below cutoff
+    add(0, 0, 1.40F, 0.75F, 0);  // wrapped bilinear alpha 0.7
+    add(3, 2, 0.50F, 0.75F, 0);  // alpha 0.5 is just below cutoff
+    add(6, 2, 0, 0, 2);          // one-sided bark in front of a leaf
+    add(6, 1, 0.25F, 0.75F, 0);
+    VegetationSurfacePicker picker;
+    std::string error;
+    if (!expect(picker.build(std::move(asset), error), error)) return false;
+    const auto front = picker.pick({0,0,4}, {0,0,-2}, 0);
+    const auto back = picker.pick({0,0,-1}, {0,0,1}, 0);
+    const auto bark = picker.pick({6,0,4}, {0,0,-1}, 0);
+    const auto behind_bark = picker.pick({6,0,1.5F}, {0,0,1}, 0);
+    if (!expect(front && front->paintable && front->first_index == 6 && front->reference_position == glm::vec3(0) &&
+        back && back->first_index == 6 && bark && !bark->paintable && !behind_bark &&
+        !picker.pick({3,0,4}, {0,0,-1}, 0), "Leaf mask filtering, backfaces and bark occlusion")) return false;
+    GeneratedVegetationAsset invalid;
+    invalid.lod_models.front().submeshes.push_back({.index_count = 3});
+    if (!expect(!picker.build(std::move(invalid), error) && picker.pick({0,0,4}, {0,0,-1}, 0).has_value(),
+        "A failed index rebuild preserves the resident surface")) return false;
+
+    GeneratedVegetationAsset grass;
+    auto& blades = grass.lod_models.front();
+    blades.materials.emplace_back().factors.model = MaterialModel::gpu_grass;
+    blades.materials.front().coverage = 2;
+    constexpr std::array<float, 3> heights{0.6F, 0.6F, 1};
+    constexpr std::array<GpuGrassCorner, 3> corners{GpuGrassCorner::left_edge, GpuGrassCorner::right_edge,
+        GpuGrassCorner::center_tip};
+    constexpr std::array<float, 3> sides{0,1,0.5F};
+    constexpr std::uint32_t blade = 13;
+    const auto points = [&](float wind) {
+        std::array<glm::vec3, 3> p{};
+        for (std::size_t i = 0; i < p.size(); ++i)
+            p[i] = evaluate_gpu_grass_blade(blade, sides[i], heights[i], wind).position;
+        return p;
+    };
+    const auto centroid = [](const auto& p) { return (p[0] + p[1] + p[2]) / 3.0F; };
+    const auto rest = points(0);
+    for (std::size_t i = 0; i < rest.size(); ++i) {
+        const auto p = rest[i];
+        blades.vertices.push_back({.position = {p.x,p.y,p.z}, .texcoord = encode_gpu_grass_uv(blade, corners[i], heights[i])});
+        blades.indices.push_back(static_cast<std::uint32_t>(i));
+    }
+    blades.submeshes.push_back({.index_count = 3});
+    if (!expect(picker.build(std::move(grass), error), error)) return false;
+    for (float wind : {0.0F, 0.25F, 1.0F, 27.0F, 300.0F}) {
+        const auto p = points(wind);
+        const auto normal = glm::normalize(glm::cross(p[1] - p[0], p[2] - p[0]));
+        const auto hit = picker.pick(centroid(p) + normal, -normal, wind);
+        if (!expect(hit && hit->paintable && glm::distance(hit->visible_position, centroid(p)) < 1e-5F &&
+            glm::distance(hit->reference_position, centroid(rest)) < 1e-5F &&
+            glm::distance(hit->position_at(47.0F), centroid(points(47.0F))) < 1e-5F,
+            "A grass hit retains its position on the animated triangle across wind phases")) return false;
     }
     return true;
 }
@@ -446,7 +524,7 @@ bool test_foliage_variations_and_painting() {
 
 bool test_export_import_and_preview_round_trip() {
     ScopedTempDir tmp("vcr_veg_tests");
-    const std::filesystem::path asset_root = tmp.path / "project" / "assets";
+    const auto asset_root = tmp.path / "worldbuilding-team/production/environment/seasonal-variants/project/assets";
     const std::filesystem::path preview_root = tmp.path / "preview_assets";
     std::string error;
 
@@ -620,7 +698,29 @@ bool test_export_import_and_preview_round_trip() {
             found_grass = true;
         }
     }
-    return expect(found_palm && found_grass, "Did not find both exported packages in scan.");
+    if (!expect(found_palm && found_grass, "Did not find both exported packages in scan.")) return false;
+
+    // The recipe is the last file installed. A sharing violation there must
+    // also undo earlier replacements and remove newly installed grass files.
+    grass_asset.recipe.asset_slug = palm_asset.recipe.asset_slug;
+    const auto custom = palm_summary.package_directory / "artist-notes.txt";
+    std::ofstream(custom) << "Keep these notes";
+    VegetationExportSummary replacement;
+    {
+        std::ifstream lock(palm_summary.recipe_file);
+        if (!expect(lock.is_open() && !export_vegetation_package(grass_asset, asset_root,
+                "models/vegetation", replacement, error), "A locked recipe must fail publication.")) return false;
+    }
+    const auto restored = load_cooked_model_asset(asset_root, palm_summary.lod0_relative_path);
+    if (!expect(replacement.model_files.front().empty() && restored &&
+            vertices_equal(restored->vertices, loaded_palm->vertices) &&
+            !std::filesystem::exists(palm_summary.package_directory / "textures/grass_normal.png"),
+            "A failed replacement left mixed palm and grass outputs.")) return false;
+    if (!expect(export_vegetation_package(grass_asset, asset_root, "models/vegetation", replacement, error), error))
+        return false;
+    const auto updated = load_cooked_model_asset(asset_root, palm_summary.lod0_relative_path);
+    return expect(updated && vertices_equal(updated->vertices, loaded_grass->vertices) &&
+        std::filesystem::is_regular_file(custom), "Retry must publish grass at the same scene reference and keep artist files.");
 }
 
 bool test_gloss_styles_and_mip_coverage() {
@@ -636,6 +736,8 @@ bool test_gloss_styles_and_mip_coverage() {
     matte_r.bark_resolution = 256U;
     VegetationRecipe glossy_r = matte_r;
     glossy_r.foliage_gloss = 0.90F;
+    matte_r.bark_roughness = 0.72F;
+    glossy_r.bark_roughness = 0.32F;
 
     GeneratedVegetationAsset matte_asset{};
     GeneratedVegetationAsset glossy_asset{};
@@ -671,6 +773,12 @@ bool test_gloss_styles_and_mip_coverage() {
         }
         return n > 0U ? (sum / static_cast<double>(n)) : 1.0;
     };
+    const auto& bark_materials = glossy_asset.lod_models[0].materials;
+    const auto bark = std::ranges::find_if(bark_materials, [](const auto& m) { return m.name == "bark"; });
+    if (!expect(bark != bark_materials.end() && bark->factors.roughness == 1.F &&
+            std::abs(mean_orm_roughness(matte_asset.bark_orm) -
+                mean_orm_roughness(glossy_asset.bark_orm) - 0.40) < 0.005,
+            "Bark ORM must follow the authored roughness exactly once.")) return false;
     const double matte_rough = mean_orm_roughness(matte_asset.foliage_orm);
     const double glossy_rough = mean_orm_roughness(glossy_asset.foliage_orm);
     if (!expect(
@@ -766,6 +874,26 @@ bool test_gloss_styles_and_mip_coverage() {
 } // namespace
 
 int main() {
+    {
+        StudioBrushHistory<int> history;
+        std::vector<int> layer{8}; // A dab from a reopened recipe.
+        if (!expect(history.append(layer, 1, 4, false) && history.append(layer, 2, 4, true) &&
+                history.append(layer, 3, 4, false) && !history.append(layer, 4, 4, false) &&
+                layer == std::vector<int>{8,1,2,3}, "A full layer retains every accepted dab.")) return 1;
+        if (!expect(history.undo(layer) && layer == std::vector<int>{8,1,2} &&
+                history.undo(layer) && layer == std::vector<int>{8} &&
+                history.redo(layer) && layer == std::vector<int>{8,1,2},
+                "Undo and redo must group each drag independently.")) return 1;
+        if (!expect(history.clear(layer) && layer.empty() && !history.can_redo() &&
+                !history.clear(layer) && history.undo(layer) && layer == std::vector<int>{8,1,2} &&
+                history.redo(layer) && layer.empty(), "Clear must be reversible as one edit.")) return 1;
+        history.reset();
+        layer = {12,13};
+        if (!expect(!history.can_redo() && history.undo(layer) && layer == std::vector<int>{12} &&
+                history.redo(layer) && layer == std::vector<int>{12,13},
+                "A reopened recipe supports individual dabs without reviving another document.")) return 1;
+    }
+    if (!test_visible_brush_surface()) return 1;
     if (!test_all_presets_and_lods()) {
         return 1;
     }

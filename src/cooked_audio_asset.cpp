@@ -1,4 +1,5 @@
 #include "cooked_audio_asset.hpp"
+#include "native_asset_path.hpp"
 
 #include "scene_components.hpp"
 
@@ -75,7 +76,7 @@ using Json = nlohmann::json;
             return false;
         }
     }
-    out_resolved = std::filesystem::weakly_canonical(walk, fs_err);
+    out_resolved = weakly_canonical_asset_path(walk, fs_err);
     if (fs_err ||
         !std::filesystem::is_regular_file(out_resolved, fs_err) ||
         fs_err) {
@@ -235,7 +236,7 @@ bool resolve_sandboxed_audio_file(
         return false;
     }
     const std::filesystem::path canonical_root =
-        std::filesystem::weakly_canonical(asset_root, fs_err);
+        weakly_canonical_asset_path(asset_root, fs_err);
     if (fs_err ||
         !std::filesystem::is_directory(canonical_root, fs_err) ||
         fs_err) {

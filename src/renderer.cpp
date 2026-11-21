@@ -1482,8 +1482,13 @@ Renderer::create_editor_material_descriptor(
         editor_material_emissive_stride_ * editor_material_descriptor_count_;
     // The new region shares neither a descriptor nor a noncoherent memory atom
     // with an existing GPU reader. No published record is overwritten.
+    // BC5 supplies tangent-space XY. Vulkan returns signed samples directly for SNORM.
+    float normal_xy_encoding = 0.0F;
+    if (normal.format() == VK_FORMAT_BC5_UNORM_BLOCK) normal_xy_encoding = 1.0F;
+    if (normal.format() == VK_FORMAT_BC5_SNORM_BLOCK) normal_xy_encoding = -1.0F;
+    const glm::vec4 material_factors{glm::vec3(emissive_factor), normal_xy_encoding};
     editor_material_emissive_factors_.write(
-        std::as_bytes(std::span{&emissive_factor, 1U}), factor_offset);
+        std::as_bytes(std::span{&material_factors, 1U}), factor_offset);
     const VkDescriptorBufferInfo emission_info{
         .buffer = editor_material_emissive_factors_.handle(),
         .offset = factor_offset,
@@ -3163,7 +3168,7 @@ bool Renderer::update_editor_scene(
     std::string& error) {
     error.clear();
     if (!authored_scene_enabled_ ||
-        view.revision == editor_scene_revision_) {
+        (view.revision != 0U && view.revision == editor_scene_revision_)) {
         return true;
     }
     if (view.local_lights_overflow ||
@@ -3742,6 +3747,12 @@ void Renderer::reset_editor_asset_cache() {
         lighting_statistics_.mesh_bytes = sizeof(GiTriangle) * voxel_triangle_count_;
     }
     create_skinning_resources();
+    // A studio can draw between dropping its assets and submitting the next
+    // preview. Publish an empty snapshot through the normal CPU/GPU scene path.
+    std::string scene_error;
+    if (!update_editor_scene(SceneRenderView{}, {}, scene_error)) {
+        fatal("Failed to clear the editor scene after asset cache reset: " + scene_error);
+    }
     invalidate_editor_scene();
     if (async_assets_) {
         asset_preparation_.start();

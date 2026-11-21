@@ -14,6 +14,8 @@
 #include "sublevel_streaming.hpp"
 #include "job_system.hpp"
 #include "scene_io.hpp"
+#include "studio_brush_preview.hpp"
+#include "studio_preview_worker.hpp"
 #include "temporal_coordinates.hpp"
 #include "camera_projection.hpp"
 
@@ -29,6 +31,7 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <semaphore>
 #include <string>
 #include <thread>
 #include <utility>
@@ -58,6 +61,59 @@ bool close_to(const double value, const double expected, const double epsilon) {
 } // namespace
 
 int main() {
+    {
+        vcr::StudioBrushPreview brush;
+        const auto start = vcr::StudioBrushPreview::Clock::now();
+        for (unsigned i = 0; i < 100; ++i)
+            brush.record(glm::vec3(float(i)), start + std::chrono::microseconds(i));
+        expect(!brush.due(true, start) && brush.due(false, start) &&
+            brush.due(true, start + std::chrono::milliseconds(75)), "release or a bounded delay schedules latest brush edits");
+        unsigned count = 0;
+        brush.draw_pending([&](glm::vec3 p) { expect(p.x == float(36 + count++), "bounded pick trail order"); });
+        expect(count == 64, "pick trail retains the last 64 pending dabs");
+        brush.submitted();
+        brush.record(glm::vec3(100), start);
+        brush.published();
+        count = 0;
+        brush.draw_pending([&](glm::vec3 p) { ++count; expect(p.x == 100, "newer pick survives older publication"); });
+        expect(count == 1 && brush.dirty(), "only displayed dabs retire");
+        brush.reset();
+        expect(!brush.dirty(), "switching documents clears brush state");
+    }
+    {
+        std::binary_semaphore gate{0};
+        struct Request { int revision; std::reference_wrapper<std::binary_semaphore> gate; };
+        struct Result { int revision{}; std::string error; };
+        vcr::StudioPreviewWorker<Request, Result> worker([](const Request& r, Result& result, std::stop_token) {
+            r.gate.get().acquire();
+            if (r.revision == 3) throw std::runtime_error("preview failed");
+            result.revision = r.revision;
+        });
+        auto finish = [&] {
+            gate.release();
+            std::optional<Result> result;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (worker.busy() && std::chrono::steady_clock::now() < deadline) {
+                result = worker.take();
+                if (worker.busy()) std::this_thread::yield();
+            }
+            expect(!worker.busy(), "worker returned the mailbox to UI ownership");
+            return result;
+        };
+        Request request{1, gate};
+        worker.submit(request);
+        worker.invalidate();
+        expect(!worker.pending() && !worker.take() && !finish(), "document replacement discards in-flight result");
+        request.revision = 2;
+        worker.submit(request);
+        request.revision = 3;
+        const auto result = finish();
+        expect(result && result->revision == 2, "worker owns an immutable snapshot");
+        worker.submit(request);
+        const auto failure = finish();
+        expect(failure && failure->error == "preview failed", "worker delivers bake errors");
+        worker.stop();
+    }
     {
         std::array<std::atomic<unsigned>, 97> visits{};
         vcr::parallel_for_jobs(visits.size(), [&](std::size_t i) { ++visits[i]; });
@@ -1606,6 +1662,10 @@ int main() {
                 png.bytes[24] == 8U &&
                 png.bytes[25] == 6U,
             "PNG IHDR dimensions and RGBA color type");
+        constexpr std::array<std::uint8_t, 4> ihdr_crc{0xf4, 0x22, 0x7f, 0x8a};
+        expect(png.bytes.size() >= 33U &&
+            std::equal(ihdr_crc.begin(), ihdr_crc.end(), png.bytes.begin() + 29),
+            "PNG IHDR uses the standard IEEE CRC-32");
         const auto invalid = vcr::encode_png_rgba(pixels, 0, 1);
         expect(
             !static_cast<bool>(invalid),
