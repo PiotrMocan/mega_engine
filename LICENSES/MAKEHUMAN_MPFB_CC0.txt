@@ -24,3 +24,19 @@ Note:
   assets/character_templates/human_female.vcrcharbase and
   assets/character_templates/human_male.vcrcharbase template files. No GPLv3
   Python addon code from MPFB2 is included in this repository.
+
+Character Studio portrait textures — CC0 1.0 Universal
+
+  female_complexion.png contains normalized pigment and lip detail from
+  CutOff3D's Indian Female Skin (indian_skin2e.png), in the Skins 01 CC0 pack.
+  https://static.makehumancommunity.org/assets/assetpacks/skins01.html
+
+  male_complexion.png contains normalized pigment from Mindfront's Male
+  African Middleage skin. Both complexion atlases use tangent-normal and
+  surface detail from the same skin's _NRM and _SPEC maps in Skins 02 CC0.
+  The atlases retain the head UV layout and store a separate eyelid mask.
+  https://static.makehumancommunity.org/assets/assetpacks/skins02.html
+
+  eye_stroma.png derives from eyes/materials/green_eye.png in the MakeHuman
+  system assets. Its iris is reprojected and masked for per-character tinting.
+  https://static.makehumancommunity.org/assets/assetpacks/makehuman_system_assets.html

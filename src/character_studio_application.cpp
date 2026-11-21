@@ -78,8 +78,9 @@ void copy_to_buf(char* dst, const std::size_t dst_size, const std::string_view s
     case 1:
         return 512U;
     case 2:
-    default:
         return 1024U;
+    default:
+        return character_default_texture_size;
     }
 }
 
@@ -1393,8 +1394,8 @@ void CharacterStudioApplication::draw_cook_left(
     ImGui::TextWrapped("%s", shell.character_path().generic_string().c_str());
 
     ImGui::Separator();
-    static constexpr std::array<const char*, 3U> res_labels{"256 px", "512 px", "1024 px"};
-    ImGui::Combo("Texture Resolution", &cook_tex_res_idx_, res_labels.data(), 3);
+    static constexpr std::array<const char*, 4U> res_labels{"256 px", "512 px", "1024 px", "2048 px skin"};
+    ImGui::Combo("Texture Resolution", &cook_tex_res_idx_, res_labels.data(), static_cast<int>(res_labels.size()));
     ImGui::Checkbox("Bake Formant Voice WAVs", &cook_bake_voice_);
     ImGui::Checkbox("Generate NPC & Player Prefabs", &cook_generate_prefabs_);
     ImGui::Checkbox("Generate EN / RU Localization", &cook_generate_localization_);
@@ -2033,7 +2034,7 @@ void CharacterStudioApplication::print_cli_help() const {
         << "  --add-node <id:sp:en[:ru]> Append bilingual dialogue node\n"
         << "  --export-wav <path>       Synthesize first dialogue node to PCM WAV\n"
         << "  --cook                    Publish cooked assets into <project>/assets/\n"
-        << "  --tex-res <N>             Baked texture resolution: 256|512|1024 (default 1024)\n"
+        << "  --tex-res <N>             Texture resolution: 256|512|1024|2048 (default 2048 skin, other slots up to 1024)\n"
         << "  --no-voice / --no-prefabs / --no-loc\n"
         << "  --verify                  Cook & reload outputs via engine loaders to verify integrity\n"
         << "  --dry-run                 Validate package + build mesh without writing files\n"

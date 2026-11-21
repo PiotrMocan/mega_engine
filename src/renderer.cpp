@@ -4331,7 +4331,8 @@ void Renderer::create_sky_texture() {
     }
 
     const std::filesystem::path texture_path = resolve_engine_core_asset_path(
-        sdl_base_directory(), "sky_clouds.png");
+        sdl_base_directory(), sky_panorama_ == SkyPanorama::portrait_studio
+            ? "character_templates/portrait_studio.png" : "sky_clouds.png");
     const auto texture_u8 = texture_path.u8string();
     const std::string texture_path_utf8(
         reinterpret_cast<const char*>(texture_u8.data()), texture_u8.size());
@@ -6896,6 +6897,12 @@ void Renderer::update_frame_uniform(
         uniforms.sun_direction_intensity = lighting_uniforms_.sun_direction_intensity;
         uniforms.sun_color_sky_yaw = lighting_uniforms_.sun_color;
         uniforms.sky_ambient = glm::vec4(glm::vec3(lighting_uniforms_.sky_zenith) * 0.4F, 1);
+    } else if (sky_panorama_ == SkyPanorama::portrait_studio) {
+        // The panorama stores linear radiance divided by 16 before sRGB encoding.
+        // This keeps the panel reflections bright while metering diffuse fill independently.
+        constexpr float panorama_gain = 16.0F;
+        uniforms.sky_ambient = glm::vec4(glm::vec3(0.29F, 0.30F, 0.33F) / panorama_gain, panorama_gain);
+        uniforms.sun_color_sky_yaw.w = 0.0F;
     }
     // Authored vertex shaders interpret X as the visibility-indirection flag.
     // Legacy instancing retains the identity quaternion.

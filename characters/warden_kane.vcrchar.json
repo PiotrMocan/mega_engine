@@ -31,10 +31,10 @@
       "eye_spacing": 0.5,
       "head_scale": 1.0,
       "jaw_width": 0.5,
-      "lip_fullness": 1.0,
-      "mouth_width": 1.0,
-      "nose_length": 0.28999999165534973,
-      "nose_width": 0.2800000011920929
+      "lip_fullness": 0.550000011920929,
+      "mouth_width": 0.5199999809265137,
+      "nose_length": 0.5099999904632568,
+      "nose_width": 0.5099999904632568
     },
     "freckles": 0.07999999821186066,
     "gender": "male",
@@ -173,6 +173,13 @@
     "hair_length": 1.0,
     "hair_part": 0.25,
     "hair_style": "short_crop",
+    "hair_tip_color": [
+      0.7400000095367432,
+      0.47999998927116394,
+      0.2800000011920929
+    ],
+    "hair_tip_dye": 0.0,
+    "hair_tip_start": 0.5,
     "hair_width": 1.0,
     "has_beard": true,
     "has_belt": false,

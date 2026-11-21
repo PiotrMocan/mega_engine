@@ -428,7 +428,7 @@ private:
     SDL_WindowID main_window_id_ = 0U;
 
     VulkanContext context_{};
-    Renderer renderer_{};
+    Renderer renderer_{SkyPanorama::portrait_studio};
     AudioEngine audio_{};
     EditorUiKit ui_kit_{};
     bool imgui_initialized_ = false;
@@ -469,6 +469,7 @@ private:
     std::uint64_t package_revision_ = 0;
     std::uint64_t ai_source_revision_ = 0; // Both revisions belong to the UI thread.
     bool preview_rebuild_requested_ = true;
+    bool frame_loaded_character_ = false;
     bool preview_matches_document_ = false;
     StudioBrushPreviewTrail<CharacterSurfaceAnchor> brush_preview_;
     StudioPreviewWorker<CharacterPackage, BakedPreview> brush_preview_worker_{bake_brush_preview};
@@ -476,6 +477,7 @@ private:
 
     SceneDocument preview_scene_{};
     SceneNodeId preview_node_id_{};
+    SceneNodeId studio_light_rig_{};
     std::string preview_model_rel_{};
     std::uint64_t submitted_scene_revision_ = 0U;
     std::vector<SceneGpuInstance> scene_instances_{};

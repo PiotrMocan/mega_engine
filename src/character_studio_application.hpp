@@ -152,7 +152,7 @@ private:
     std::vector<ChoiceEditBuffers> choice_bufs_{};
 
     // Workspace 4: Cook & Verify
-    int cook_tex_res_idx_ = 2;
+    int cook_tex_res_idx_ = 3;
     bool cook_bake_voice_ = true;
     bool cook_generate_prefabs_ = true;
     bool cook_generate_localization_ = true;

@@ -1,5 +1,6 @@
 #include "character_ai_bridge.hpp"
 #include "character_package.hpp"
+#include "character_paint_projection.hpp"
 #include "character_strand_groom.hpp"
 #include "character_surface_picker.hpp"
 #include "character_wardrobe.hpp"
@@ -247,6 +248,17 @@ bool test_skin_paint_across_uv_seams() {
     VCR_EXPECT(changed(surface, 0.285F, 0.4F) && changed(surface, 0.67F, 0.4F) &&
         !changed(surface, 0.32F, 0.4F) && !changed(surface, 0.215F, 0.8F),
         "A surface dab must cross its physical seam and spare the shin and opposite wrist");
+    {
+        constexpr unsigned size = 2048;
+        const vcr::CharacterPaintProjection portrait(mesh, mesh.submeshes.front(), recipe.paint_strokes, size);
+        const unsigned wrist_x = static_cast<unsigned>(0.67F * size);
+        const unsigned y = static_cast<unsigned>(0.4F * size);
+        const auto candidates = portrait.candidates(wrist_x, y);
+        VCR_EXPECT(candidates.size() == 1 && candidates.front() == 0 &&
+            glm::length(portrait.offset(0, wrist_x, y, false)) < 0.045F &&
+            portrait.candidates(static_cast<unsigned>(0.34F * size), y).empty(),
+            "A 2K portrait bake must find the other side of the seam and exclude the distant shin");
+    }
     recipe.paint_strokes.back().skin_surface->mirror_x = true;
     const auto mirrored = bake();
     VCR_EXPECT(changed(mirrored, 0.215F, 0.8F) && !changed(mirrored, 0.32F, 0.4F),

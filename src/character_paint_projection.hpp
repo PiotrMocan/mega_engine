@@ -13,13 +13,13 @@ public:
 
     [[nodiscard]] std::span<const std::uint16_t> candidates(std::uint32_t x, std::uint32_t y) const noexcept {
         if (tiles_.empty()) return {};
-        return tiles_[(y / tile_size) * columns_ + x / tile_size];
+        return tiles_[(y / tile_size_) * columns_ + x / tile_size_];
     }
     [[nodiscard]] glm::vec3 offset(std::size_t stroke, std::uint32_t x, std::uint32_t y, bool mirror) const noexcept;
     [[nodiscard]] glm::vec2 tangent_offset(glm::vec3 offset, std::uint32_t x, std::uint32_t y) const noexcept;
 
 private:
-    static constexpr std::uint32_t tile_size = 16;
+    std::uint32_t tile_size_;
     std::uint32_t resolution_;
     std::size_t columns_;
     std::vector<std::vector<std::uint16_t>> tiles_;

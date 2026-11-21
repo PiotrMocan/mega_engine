@@ -1,0 +1,12 @@
+{
+  "schema": "vcr.asset",
+  "version": 1,
+  "kind": "texture",
+  "name": "female_complexion",
+  "source": "female_complexion.png",
+  "usage": "unspecified",
+  "color_space": "linear",
+  "decode": "deferred",
+  "width": 1024,
+  "height": 1024
+}

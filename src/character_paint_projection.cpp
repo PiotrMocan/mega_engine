@@ -52,10 +52,11 @@ void fill_gutter(std::vector<glm::vec3>& positions, std::uint32_t resolution) {
 
 CharacterPaintProjection::CharacterPaintProjection(const CharacterMeshBuildResult& mesh,
     const CharacterSubmeshBuild& sub, std::span<const CharacterPaintStroke> strokes,
-    std::uint32_t resolution) : resolution_(resolution), columns_(0) {
+    std::uint32_t resolution) : tile_size_(resolution > 1024U ? 32U : 16U), resolution_(resolution), columns_(0) {
     static_assert(maximum_character_paint_samples <= UINT16_MAX);
-    if (strokes.empty() || strokes.size() > maximum_character_paint_samples || resolution == 0 || resolution > 1024) return;
-    columns_ = (resolution + tile_size - 1) / tile_size;
+    if (strokes.empty() || strokes.size() > maximum_character_paint_samples ||
+        resolution == 0 || resolution > character_default_texture_size) return;
+    columns_ = (resolution + tile_size_ - 1) / tile_size_;
     tiles_.resize(columns_ * columns_);
     const float scale = static_cast<float>(resolution);
     const auto pixel = [&](float uv) {
@@ -74,7 +75,7 @@ CharacterPaintProjection::CharacterPaintProjection(const CharacterMeshBuildResul
             if (!shape) continue;
             centers_[s] = shape->bind_center;
             const auto uv = strokes[s].uv;
-            anchors[pixel(uv.y) / tile_size * columns_ + pixel(uv.x) / tile_size].push_back(
+            anchors[pixel(uv.y) / tile_size_ * columns_ + pixel(uv.x) / tile_size_].push_back(
                 {static_cast<std::uint16_t>(s), shape->bind_center});
         }
 
@@ -110,8 +111,8 @@ CharacterPaintProjection::CharacterPaintProjection(const CharacterMeshBuildResul
             };
             const auto lo = glm::min(uv[0], glm::min(uv[1], uv[2])), hi = glm::max(uv[0], glm::max(uv[1], uv[2]));
             const auto x0 = pixel(lo.x), y0 = pixel(lo.y), x1 = pixel(hi.x), y1 = pixel(hi.y);
-            for (auto ty = y0 / tile_size; ty <= y1 / tile_size; ++ty) {
-                for (auto tx = x0 / tile_size; tx <= x1 / tile_size; ++tx) {
+            for (auto ty = y0 / tile_size_; ty <= y1 / tile_size_; ++ty) {
+                for (auto tx = x0 / tile_size_; tx <= x1 / tile_size_; ++tx) {
                     for (const auto& anchor : anchors[ty * columns_ + tx]) {
                         const auto s = anchor.stroke;
                         glm::vec3 p{};
@@ -133,8 +134,8 @@ CharacterPaintProjection::CharacterPaintProjection(const CharacterMeshBuildResul
 
     for (std::uint32_t ty = 0; ty < columns_; ++ty) {
         for (std::uint32_t tx = 0; tx < columns_; ++tx) {
-            const auto x0 = tx * tile_size, y0 = ty * tile_size;
-            const auto x1 = std::min(resolution, x0 + tile_size), y1 = std::min(resolution, y0 + tile_size);
+            const auto x0 = tx * tile_size_, y0 = ty * tile_size_;
+            const auto x1 = std::min(resolution, x0 + tile_size_), y1 = std::min(resolution, y0 + tile_size_);
             WorldBox box;
             if (surface) {
                 for (auto y = y0; y < y1; ++y) {

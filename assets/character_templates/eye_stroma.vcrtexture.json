@@ -1,0 +1,12 @@
+{
+  "schema": "vcr.asset",
+  "version": 1,
+  "kind": "texture",
+  "name": "eye_stroma",
+  "source": "eye_stroma.png",
+  "usage": "base_color",
+  "color_space": "srgb",
+  "decode": "deferred",
+  "width": 512,
+  "height": 512
+}

@@ -489,6 +489,8 @@ struct HumanBaseTemplate {
     std::array<TemplatePart, template_part_count> parts{};
     std::vector<std::uint8_t> skin_mask_rgba{};
     std::vector<std::uint8_t> skin_detail_rgba{};
+    std::vector<std::uint8_t> complexion_rgba{};
+    std::vector<std::uint8_t> eye_rgba{};
     std::array<std::vector<std::uint16_t>, template_landmark_chain_count> landmark_chains{};
 };
 
@@ -767,6 +769,21 @@ private:
     return true;
 }
 
+[[nodiscard]] std::vector<std::uint8_t> load_portrait_map(
+    const std::filesystem::path& directory, const char* filename, const std::uint32_t size) {
+    CookedTextureLoadOptions limits{};
+    limits.maximum_source_file_bytes = 8U * 1024U * 1024U;
+    limits.maximum_dimension = size;
+    limits.maximum_pixels = static_cast<std::uint64_t>(size) * size;
+    auto result = load_cooked_texture_asset(directory, filename, limits);
+    if (!result || result->pixel_format != CookedTexturePixelFormat::rgba8_unorm ||
+        result->width != size || result->height != size ||
+        result->pixels.size() != limits.maximum_pixels * 4U) {
+        return {};
+    }
+    return std::move(result->pixels);
+}
+
 [[nodiscard]] const HumanBaseTemplate* get_human_base_template(
     const CharacterGender gender) {
     static std::mutex cache_mutex{};
@@ -791,6 +808,11 @@ private:
     if (!load_human_base_template_file(*path, gender, tpl)) {
         return nullptr;
     }
+    // Optional for installations with older base assets. Decode once, off the render path.
+    const auto complexion_name = gender == CharacterGender::female
+        ? "female_complexion.vcrtexture.json" : "male_complexion.vcrtexture.json";
+    tpl.complexion_rgba = load_portrait_map(path->parent_path(), complexion_name, 1024U);
+    tpl.eye_rgba = load_portrait_map(path->parent_path(), "eye_stroma.vcrtexture.json", 512U);
     cache[slot] = std::move(tpl);
     loaded[slot] = true;
     return &cache[slot];
@@ -3441,11 +3463,8 @@ void emit_subdivided_body_part(
         glm::vec3 pos{0.0F};
         glm::vec3 nrm{0.0F, 1.0F, 0.0F};
         CookedSkinVertex skin{};
-        std::uint32_t weld_slot = 0U;
     };
 
-    const std::uint32_t v_start = static_cast<std::uint32_t>(mb.vertices.size());
-    const std::uint32_t i_start = static_cast<std::uint32_t>(mb.indices.size());
     const std::size_t kept_tris = kept_corner_indices.size() / 3U;
 
     std::vector<std::uint32_t> corner_to_mesh(
@@ -3454,10 +3473,6 @@ void emit_subdivided_body_part(
     welded_edges.reserve(kept_tris * 2U);
     std::unordered_map<std::uint64_t, std::uint32_t> corner_mid_to_mesh;
     corner_mid_to_mesh.reserve(kept_tris * 2U);
-    std::vector<std::uint32_t> mesh_v_weld_slot;
-    mesh_v_weld_slot.reserve(kept_tris * 2U + part.corners.size());
-
-    std::uint32_t next_weld_slot = static_cast<std::uint32_t>(positions.size());
 
     const auto get_corner_vertex = [&](const std::uint32_t ic) -> std::uint32_t {
         if (corner_to_mesh[ic] != (std::numeric_limits<std::uint32_t>::max)()) {
@@ -3469,7 +3484,6 @@ void emit_subdivided_body_part(
             positions[c.vid], welded_normals[c.vid], remap_body_corner_uv(c),
             skin_weights[c.vid], target, out_v);
         corner_to_mesh[ic] = out_v;
-        mesh_v_weld_slot.push_back(static_cast<std::uint32_t>(c.vid));
         return out_v;
     };
 
@@ -3506,7 +3520,9 @@ void emit_subdivided_body_part(
             const glm::vec3 n_mid = glm::length(n_sum) > 1.0e-6F ? glm::normalize(n_sum) : na;
             const CookedSkinVertex sk_mid =
                 lerp_skin_vertex(skin_weights[v_lo], skin_weights[v_hi], 0.5F);
-            WeldedEdgeInfo info{p_mid, n_mid, sk_mid, next_weld_slot++};
+            // Shade the smooth surface defined by the original welded normals;
+            // the four planar child triangles only approximate its curvature.
+            WeldedEdgeInfo info{p_mid, n_mid, sk_mid};
             w_it = welded_edges.emplace(v_key, info).first;
         }
 
@@ -3516,7 +3532,6 @@ void emit_subdivided_body_part(
             w_it->second.pos, w_it->second.nrm, uv_mid,
             w_it->second.skin, target, out_v);
         corner_mid_to_mesh.emplace(corner_key, out_v);
-        mesh_v_weld_slot.push_back(w_it->second.weld_slot);
         return out_v;
     };
 
@@ -3554,28 +3569,6 @@ void emit_subdivided_body_part(
         mb.indices.push_back(e20);
     }
 
-    // Recompute smooth area-weighted normals per welded 3D vertex slot (crack-free across UV seams)
-    std::vector<glm::vec3> weld_normals(next_weld_slot, glm::vec3(0.0F));
-    for (std::size_t ii = i_start; ii + 2U < mb.indices.size(); ii += 3U) {
-        const std::uint32_t ia = mb.indices[ii + 0U];
-        const std::uint32_t ib = mb.indices[ii + 1U];
-        const std::uint32_t ic = mb.indices[ii + 2U];
-        const glm::vec3 pa(mb.vertices[ia].position[0], mb.vertices[ia].position[1], mb.vertices[ia].position[2]);
-        const glm::vec3 pb(mb.vertices[ib].position[0], mb.vertices[ib].position[1], mb.vertices[ib].position[2]);
-        const glm::vec3 pc(mb.vertices[ic].position[0], mb.vertices[ic].position[1], mb.vertices[ic].position[2]);
-        const glm::vec3 fn = glm::cross(pb - pa, pc - pa);
-        weld_normals[mesh_v_weld_slot[ia - v_start]] += fn;
-        weld_normals[mesh_v_weld_slot[ib - v_start]] += fn;
-        weld_normals[mesh_v_weld_slot[ic - v_start]] += fn;
-    }
-    for (std::size_t k = 0U; k < mesh_v_weld_slot.size(); ++k) {
-        const glm::vec3& accum = weld_normals[mesh_v_weld_slot[k]];
-        const float len = glm::length(accum);
-        if (len > 1.0e-7F) {
-            const glm::vec3 nn = accum / len;
-            mb.vertices[v_start + k].normal = {nn.x, nn.y, nn.z};
-        }
-    }
 }
 
 void recompute_uv_derivative_tangents_for_submeshes(MeshBuilder& mb) {
@@ -4088,27 +4081,40 @@ CharacterMeshBuildResult build_character_mesh(const CharacterPackage& input_pkg)
 
 namespace {
 
-[[nodiscard]] float worley_pores_2d(
-    const float x,
-    const float y,
-    const std::uint32_t seed) noexcept {
+struct SkinPore {
+    float depth;
+    glm::vec2 normal_xy;
+};
+
+[[nodiscard]] SkinPore sample_skin_pore(
+    const float x, const float y, const float texel_width) noexcept {
     const int gx = static_cast<int>(std::floor(x));
     const int gy = static_cast<int>(std::floor(y));
     float min_d2 = 4.0F;
+    glm::vec2 nearest{};
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
             const auto cx = static_cast<std::uint32_t>(gx + dx + 4096);
             const auto cy = static_cast<std::uint32_t>(gy + dy + 4096);
             const float jx = static_cast<float>(gx + dx) + 0.18F +
-                0.64F * hash_float01(cx, cy, seed);
+                0.64F * hash_float01(cx, cy, 17U);
             const float jy = static_cast<float>(gy + dy) + 0.18F +
-                0.64F * hash_float01(cx, cy, seed ^ 0x9e3779b9U);
+                0.64F * hash_float01(cx, cy, 17U ^ 0x9e3779b9U);
             const float ddx = jx - x;
             const float ddy = jy - y;
-            min_d2 = (std::min)(min_d2, ddx * ddx + ddy * ddy);
+            const float d2 = ddx * ddx + ddy * ddy;
+            if (d2 < min_d2) {
+                min_d2 = d2;
+                nearest = {ddx, -ddy}; // Tangent +V points up the source image.
+            }
         }
     }
-    return std::exp(-min_d2 * 14.0F);
+    // Add the texel footprint's variance to the pore profile. Its analytic slope
+    // shares the center search and fades at lower cook resolutions.
+    constexpr float width_squared = 0.066F;
+    const float k = 1.0F / (width_squared + texel_width * texel_width / 6.0F);
+    const float depth = width_squared * k * std::exp(-min_d2 * k);
+    return {depth, nearest * (-0.09F * k * depth)};
 }
 
 struct SkinUvCell {
@@ -4244,13 +4250,7 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
     const std::uint32_t requested_res) {
     CharacterPackage pkg = input_pkg;
     sanitize_character_package(pkg);
-    const std::uint32_t res = std::clamp(requested_res, 64U, 1024U);
-    std::size_t pixel_count = 0U;
-    std::size_t byte_count = 0U;
-    if (!checked_mul_size(res, res, pixel_count) ||
-        !checked_mul_size(pixel_count, 4U, byte_count)) {
-        return {};
-    }
+    const std::uint32_t skin_res = std::clamp(requested_res, 64U, character_default_texture_size);
 
     const HumanBaseTemplate* const tpl = get_human_base_template(pkg.body.gender);
     bool need_skin_raster = false;
@@ -4267,7 +4267,7 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
         eval = evaluate_human_template(pkg.body, *tpl);
         has_eval = true;
         if (need_skin_raster) {
-            skin_uv_grid = rasterize_body_uv_grid(*tpl, eval, res);
+            skin_uv_grid = rasterize_body_uv_grid(*tpl, eval, skin_res);
         }
     }
 
@@ -4298,6 +4298,8 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
     outputs.reserve(mesh.submeshes.size());
 
     for (const CharacterSubmeshBuild& sub : mesh.submeshes) {
+        const std::uint32_t res = sub.name == "skin" ? skin_res : std::min(skin_res, 1024U);
+        const std::size_t byte_count = static_cast<std::size_t>(res) * res * 4U;
         if (sub.name == "outfit_primary" || sub.name == "outfit_secondary") {
             outputs.push_back(bake_character_wardrobe_textures(pkg, mesh, sub, res));
             continue;
@@ -4373,6 +4375,7 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
             srgb_to_linear_channel(pkg.wardrobe.hair_color.r),
             srgb_to_linear_channel(pkg.wardrobe.hair_color.g),
             srgb_to_linear_channel(pkg.wardrobe.hair_color.b));
+        const auto freckle_seed = static_cast<std::uint32_t>(pkg.identity.seed ^ (pkg.identity.seed >> 32U));
         const glm::vec3 eye_lin(
             srgb_to_linear_channel(pkg.body.face.eye_color.r),
             srgb_to_linear_channel(pkg.body.face.eye_color.g),
@@ -4395,7 +4398,16 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
                     const float dx = (u - 0.5F) * 2.0F;
                     const float dy = (v - 0.5F) * 2.0F;
                     const float rad = std::hypot(dx, dy);
-                    if (rad < 0.152F) {
+                    if (tpl && !tpl->eye_rgba.empty()) {
+                        const glm::vec4 eye = sample_rgba_buffer_bilinear(tpl->eye_rgba, 512U, u, v);
+                        const glm::vec3 reflectance(srgb_to_linear_channel(eye.r),
+                            srgb_to_linear_channel(eye.g), srgb_to_linear_channel(eye.b));
+                        col = reflectance * glm::mix(glm::vec3(1.0F),
+                            glm::vec3(0.07F) + eye_lin * 2.05F, eye.a);
+                        const float stroma = eye.a * smoothstep_f(rad, 0.10F, 0.18F);
+                        nrm = glm::normalize(glm::vec3(-dx * stroma * 0.30F, -dy * stroma * 0.30F, 1.0F));
+                        roughness = glm::mix(0.24F, 0.31F, stroma);
+                    } else if (rad < 0.152F) {
                         const float edge = std::clamp((0.152F - rad) / 0.016F, 0.0F, 1.0F);
                         col = glm::mix(eye_lin * 0.10F, glm::vec3(0.006F, 0.006F, 0.008F), edge);
                         roughness = 0.08F;
@@ -4408,12 +4420,12 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
                                             0.12F * std::sin(ang * 74.0F + (n2 - 0.5F) * 4.0F);
                         const float crypt = 0.86F + 0.22F * n2;
                         const float collarette = 0.84F + 0.28F * std::exp(-std::pow((radial_t - 0.28F) * 4.2F, 2.0F));
-                        const float limbal = std::clamp((0.435F - rad) / 0.085F, 0.06F, 1.0F);
+                        const float limbal = 0.32F + 0.68F * smoothstep_f(0.435F - rad, 0.0F, 0.072F);
                         const glm::vec3 inner_ochre = eye_lin * glm::vec3(1.22F, 0.94F, 0.68F);
                         const glm::vec3 iris_base = glm::mix(
                             inner_ochre, eye_lin * glm::vec3(0.95F, 1.00F, 1.05F),
                             std::clamp(radial_t * 1.4F, 0.0F, 1.0F));
-                        col = iris_base * (fiber * crypt * collarette * limbal);
+                        col = iris_base * (0.72F * fiber * crypt * collarette * limbal);
                         // Concave conical iris stroma normal reaction
                         const float dir_len = (std::max)(rad, 1.0e-4F);
                         const float tilt = 0.18F * (1.0F - radial_t * 0.45F);
@@ -4436,10 +4448,12 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
                         sclera = glm::mix(sclera, glm::vec3(0.66F, 0.34F, 0.32F), vein * 0.26F);
                         sclera = glm::mix(sclera, glm::vec3(0.60F, 0.28F, 0.26F), corner_caruncle * 0.42F);
                         col = sclera;
-                        roughness = 0.14F;
+                        // A translucent limbus softens the junction with the sclera.
+                        col = glm::mix(eye_lin * 0.24F, col, smoothstep_f(rad, 0.435F, 0.475F));
+                        roughness = 0.22F;
                     }
                     // Soft upper and lower eyelid ambient shadow
-                    const float upper_lid_ao = std::clamp(0.50F + (dy + 0.34F) * 0.78F, 0.40F, 1.0F);
+                    const float upper_lid_ao = 0.37F + 0.63F * smoothstep_f(dy, -0.42F, 0.22F);
                     const float lower_lid_ao = std::clamp(1.0F - (std::max)(0.0F, dy - 0.32F) * 0.55F, 0.68F, 1.0F);
                     col *= upper_lid_ao * lower_lid_ao;
                 } else if (sub.name == "skin") {
@@ -4462,10 +4476,8 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
                         }
                     } else {
                         // Worley cellular micro-pores + fine dermal micro-grain
-                        const float pore_scale = is_head ? 210.0F : 140.0F;
-                        const float p_c = worley_pores_2d(u * pore_scale, v * pore_scale, 17U);
-                        const float p_u = worley_pores_2d((u + 0.0008F) * pore_scale, v * pore_scale, 17U);
-                        const float p_v = worley_pores_2d(u * pore_scale, (v + 0.0008F) * pore_scale, 17U);
+                        const float pore_scale = is_head ? 870.0F : 280.0F;
+                        const auto pore = sample_skin_pore(u * pore_scale, v * pore_scale, inv_res * pore_scale);
                         const float grain = value_noise_2d(u * 380.0F, v * 380.0F, 59U) - 0.5F;
                         const float age = (value_noise_2d(u * 26.0F, v * 26.0F, 41U) - 0.5F) * pkg.body.age_wear;
 
@@ -4475,13 +4487,11 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
                             : 0.0F;
                         const float pore_weight = is_head ? (0.45F + 0.55F * t_zone) : 0.35F;
 
-                        col = base_skin_lin * (1.0F - p_c * 0.032F * pore_weight + grain * 0.020F + age * 0.10F);
-                        const float dh_du = -(p_u - p_c) * pore_weight * 0.14F;
-                        const float dh_dv = -(p_v - p_c) * pore_weight * 0.14F;
-                        nrm = glm::normalize(glm::vec3(-dh_du, -dh_dv, 1.0F));
+                        col = base_skin_lin * (1.0F - pore.depth * 0.038F * pore_weight + grain * 0.020F + age * 0.10F);
+                        nrm = glm::normalize(glm::vec3(pore.normal_xy * pore_weight, 1.0F));
                         roughness = std::clamp(
-                            pkg.body.skin_roughness + (is_head ? -0.025F * t_zone : 0.06F) + p_c * 0.05F,
-                            0.44F,
+                            pkg.body.skin_roughness + (is_head ? 0.11F - 0.10F * t_zone : 0.06F) + pore.depth * 0.05F,
+                            0.18F,
                             0.92F);
 
                         // 3D Anatomical Vascular / Melanin Color Zones
@@ -4515,6 +4525,8 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
                             const glm::vec4 mask = sample_skin_mask_bilinear(*tpl, u, v);
                             const glm::vec4 detail = sample_skin_detail_bilinear(*tpl, u, v);
                             const std::uint8_t detail_a = sample_skin_detail_alpha_nearest(*tpl, u, v);
+                            const bool use_portrait = is_head && !tpl->complexion_rgba.empty() &&
+                                u >= 0.75F && v >= 0.25F && v < 0.75F;
 
                             // Baked v2 16-ray AO & discrete mean curvature
                             float detail_ao = detail.r;
@@ -4536,7 +4548,7 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
                             }
 
                             // Vermilion lips with crisp 3D anatomical border + fine sulcus grooves
-                            if (is_head && cell.valid != 0U &&
+                            if (!use_portrait && is_head &&
                                 cell.pos.z > mouth_c.z - 0.015F * hs && mask.r > 0.30F) {
                                 const float lip_slit_y = mouth_c.y + 0.0023F * hs;
                                 const float abs_lx =
@@ -4581,6 +4593,25 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
                                 }
                             }
 
+                            // Both halves cover the same head UV rectangle. Neutral 128 means
+                            // unit pigment gain, a flat tangent normal and zero roughness offset.
+                            if (use_portrait) {
+                                const float tile_u = (u - 0.75F) * 2.0F;
+                                const float tile_v = (v - 0.25F) * 2.0F;
+                                const glm::vec4 pigment = sample_rgba_buffer_bilinear(
+                                    tpl->complexion_rgba, 1024U, tile_u, tile_v);
+                                const glm::vec4 response = sample_rgba_buffer_bilinear(
+                                    tpl->complexion_rgba, 1024U, tile_u + 0.5F, tile_v);
+                                const glm::vec3 gain = glm::vec3(pigment) * (255.0F / 128.0F);
+                                const glm::vec3 surface = glm::vec3(response) * (255.0F / 128.0F) - 1.0F;
+                                col *= gain;
+                                col *= glm::mix(glm::vec3(1.0F), glm::vec3(1.06F, 0.70F, 0.72F), pigment.a * pkg.body.lip_tint);
+                                nrm = glm::normalize(nrm + glm::vec3(glm::vec2(surface) * 0.62F, 0.0F));
+                                roughness = std::clamp(roughness - surface.b * 0.24F, 0.18F, 0.96F);
+                                roughness = glm::mix(roughness, 0.46F, pigment.a);
+                                roughness = glm::mix(roughness, 0.23F, response.a);
+                            }
+
                             // Under-3D-groom soft follicular brow shadow & moist lash tearline
                             if (mask.g > 0.01F) {
                                 const glm::vec3 brow_col = glm::mix(
@@ -4591,7 +4622,7 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
                                 col = glm::mix(col, brow_col, bw);
                                 roughness = glm::mix(roughness, 0.64F, bw);
                             }
-                            if (mask.b > 0.01F) {
+                            if (!use_portrait && mask.b > 0.01F) {
                                 col *= (1.0F - mask.b * 0.38F);
                                 roughness = glm::mix(roughness, 0.28F, mask.b * 0.65F);
                             }
@@ -4599,9 +4630,18 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
                                 const float blush = mask.a * 0.18F;
                                 col = glm::mix(col, base_skin_lin * glm::vec3(1.10F, 0.72F, 0.66F), blush);
                                 if (pkg.body.freckles > 0.02F) {
-                                    const float fdot = hash_float01(x / 2U, y / 2U, 99U);
-                                    if (fdot > 1.0F - pkg.body.freckles * 0.14F * mask.a) {
-                                        col *= glm::vec3(0.66F, 0.54F, 0.46F);
+                                    constexpr float cell_scale = 190.0F;
+                                    const glm::vec2 grid = glm::vec2(u, v) * cell_scale;
+                                    const auto ix = static_cast<std::uint32_t>(grid.x);
+                                    const auto iy = static_cast<std::uint32_t>(grid.y);
+                                    const float chance = hash_float01(ix, iy, freckle_seed);
+                                    if (chance < pkg.body.freckles * mask.a) {
+                                        const glm::vec2 center = 0.25F + 0.5F * glm::vec2(
+                                            hash_float01(ix, iy, 73U), hash_float01(ix, iy, 37U));
+                                        const float distance = glm::length(glm::fract(grid) - center);
+                                        const float aa = std::min(inv_res * cell_scale * 0.5F, 0.20F);
+                                        const float spot = 1.0F - smoothstep_f(distance, 0.15F - aa, 0.21F + aa);
+                                        col *= glm::mix(glm::vec3(1.0F), glm::vec3(0.62F, 0.49F, 0.42F), spot);
                                     }
                                 }
                             }
@@ -4627,7 +4667,7 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
                                     cell.pos, pkg.body.gender, head_c, eye_y, neck_y, hs);
                                 const bool is_short_crop = (pkg.wardrobe.hair_style == HairStyle::short_crop);
                                 const float scalp_w = is_short_crop
-                                    ? (smoothstep_f(hl_w, 0.18F, 0.76F) * 0.68F)
+                                    ? (smoothstep_f(hl_w, 0.04F, 0.88F) * 0.86F)
                                     : (smoothstep_f(hl_w, 0.10F, 0.60F) * 0.92F);
                                 if (scalp_w > 0.005F) {
                                     const glm::vec3 root_tone = is_short_crop
@@ -4651,7 +4691,7 @@ std::vector<BakedPbrTextureSet> bake_character_textures(
                                         hash_float01(x / 2U, y / 2U, 733U) * 0.35F,
                                         0.38F, 0.85F);
                                     const float bw_shaped = bw_3d * bw_3d;
-                                    const float beard_shadow = bw_shaped * (0.22F + 0.16F * pore_stipple);
+                                    const float beard_shadow = bw_shaped * (0.30F + 0.26F * pore_stipple);
                                     const glm::vec3 follicle_tone = glm::mix(
                                         col * 0.58F,
                                         hair_lin * 0.62F + glm::vec3(0.012F, 0.009F, 0.006F),
@@ -7244,7 +7284,7 @@ bool cook_character_preview(const CharacterPackage& package,
     const std::filesystem::path& preview_directory, CharacterCookReport& report,
     CharacterPreviewGeometry& geometry, std::string& error) {
     CharacterCookOptions options;
-    options.texture_resolution = 1024U;
+    options.texture_resolution = character_default_texture_size;
     options.bake_voice_lines = false;
     options.generate_prefabs = false;
     options.generate_localization = false;

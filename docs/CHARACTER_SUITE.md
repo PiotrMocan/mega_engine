@@ -4,14 +4,14 @@ Unified Vulkan 1.3 character creation, wardrobe, surface painting, animation/voi
 
 ## Overview
 
-All character workflows live in a single native executable (`vulkan_character_studio.exe` on Windows) sharing one Vulkan 1.3 PBR/AAA skin + eye + strand-groom viewport, 50-bone skeletal rig preview, and non-destructive `.vcrchar.json` package state:
+All character workflows live in a single native executable (`vulkan_character_studio.exe` on Windows) sharing one Vulkan 1.3 viewport for skin, eyes and strand hair, 50-bone skeletal rig preview, and non-destructive `.vcrchar.json` package state:
 
 | Tab | Workspace (`--tab` / `--workspace`) | Capabilities |
 | :--- | :--- | :--- |
 | **1. Anatomy & Groom** | `gen` / `anatomy` / `1` | Full-character AI generator, body AI, gender (`female`/`male`), archetype, stature morphs, micro-sculpt brush (Add/Subtract/Smooth/Flatten) via triangle-exact raycast, skin & eye PBR controls, strand-groom hair & stubble parameters |
 | **2. Wardrobe & Paint** | `outfit` / `wardrobe` / `paint` / `2` | Wardrobe stylist AI, layered garments (top, bottom, footwear, studio underwear, cape, pauldrons, gloves, belt), fabric presets & 4-slot palette, 3D surface Vertex Paint brush (`Albedo`/`Roughness`/`Metallic`), interior-body occlusion culling toggle |
 | **3. Acting, Voice & Dialogue** | `act` / `acting` / `dialogue` / `3` | Acting AI, locomotion & temperament controls, procedural keyframe clip inspector (`idle`, `walk`, `run`, `greet`, `alert`), FACS facial expression preview (`neutral`, `friendly`, `suspicious`, `happy`, `angry`, `focused`), bilingual EN/RU formant voice synthesizer + real-time SDL audio playback & WAV export, branching dialogue node & choice editor |
-| **4. Cook & Verify** | `cook` / `export` / `verify` / `4` | Live package dependency & topology summary, texture resolution selector (`256`/`512`/`1024`), selective output toggles (`--no-voice`, `--no-prefabs`, `--no-loc`), publish into `<project>/assets/` (model, materials, textures, animation clips, voice, dialogue, prefabs and localization), and loader round-trip verification (`VERIFIED`) |
+| **4. Cook & Verify** | `cook` / `export` / `verify` / `4` | Live package dependency & topology summary, texture resolution selector (`256`/`512`/`1024`/`2048`), selective output toggles (`--no-voice`, `--no-prefabs`, `--no-loc`), publish into `<project>/assets/` (model, materials, textures, animation clips, voice, dialogue, prefabs and localization), and loader round-trip verification (`VERIFIED`) |
 
 ## Quick Launch
 
@@ -24,8 +24,8 @@ Shortcuts in the GUI:
 - `Ctrl+S`: Save `.vcrchar.json`
 - `Ctrl+Z` undoes the last brush gesture in the active sculpt or paint workspace. `Ctrl+Y` or `Ctrl+Shift+Z` redoes it. Clear is also reversible. The studio remembers 32 gestures per layer. On reopening a package each saved dab can be removed individually.
 - `Ctrl+N`: Create New Character modal
-- `F`: Frame camera on full body (`--focus-face` frames the face)
-- `G`: Toggle ground grid
+- `F` frames the full body.
+- `G` frames the face. Anatomy & Groom opens in this view.
 - `Space`: Play/Pause shared clip playback
 
 Studio top-bar controls also expose **Project Character Selector**, **Refresh**, **New**, **Save**, **Cook & Verify**, unsaved-change protection on character switching, and shared bottom transport (`Play/Pause`, `Bind Pose`, clip selector, camera reset).
@@ -38,7 +38,9 @@ With `3D brush on skin` enabled, `Skin Radius (m)` sets the dab size on the refe
 
 Clothing, hair, existing UV strokes and the explicit UV skin mode use `UV Radius` and `Mirror U`. These brushes paint the material texture, including repeated or neighboring UV islands within the dab.
 
-During a drag, gold dots follow the edited surface while the studio bakes the mesh and 1024-pixel textures in the background. Long gestures update the model as bakes finish. Releasing the button submits any remaining edits. Save and Cook use the current brush strokes even while the viewport is catching up. MCP reports this in `get_character_summary.preview_render.pending`, with bake failures in `preview_render.error`.
+During a drag, gold dots follow the edited surface while the studio bakes the mesh and textures in the background. Long gestures update the model as bakes finish. Releasing the button submits any remaining edits. Save and Cook use the current brush strokes even while the viewport is catching up. MCP reports this in `get_character_summary.preview_render.pending`, with bake failures in `preview_render.error`.
+
+The preview and default cook use 2048 × 2048 skin maps. Other materials stay at 1024 or below. The head uses UV-aligned complexion, lip and roughness detail with the recipe’s skin tone. The iris follows the eye color control. The studio light panels appear in reflections as the camera orbits. Cooked materials use the lighting in the destination scene.
 
 **Cook & Verify** loads the staged model, textures, audio, dialogue, localization and prefabs through the engine loaders before publishing them. A failed replacement restores the previous cooked outputs as a set. If the studio exits during publication, exporting the same character again first restores the previous set. Each character has its own writer lock. Its temporary files and recovery journal live beside the project's asset root. A multi-file update completes when the cook reports success. A failed preview cook keeps the previous model resident in the viewport.
 
@@ -56,7 +58,7 @@ Key options:
 - `--tab <gen|outfit|act|cook>` (alias `--workspace`) & `--stage <gen|outfit|act|all>`
 - `--prompt <text>`, `--full-prompt <text>`, `--body-prompt <text>`, `--outfit-prompt <text>`, `--act-prompt <text>`, `--offline` (deterministic offline fallback instead of local Ollama)
 - Morph / identity / wardrobe / acting flags: `--name`, `--role`, `--seed`, `--gender`, `--archetype`, `--height`, `--musculature`, `--skin`, `--top`, `--bottom`, `--footwear`, `--hair`, `--material`, `--secondary-material`, `--primary-color`, `--secondary-color`, `--accent-color`, `--footwear-color`, `--hair-color`, `--[no-]cape`, `--[no-]belt`, `--[no-]gloves`, `--[no-]pauldrons`, `--[no-]beard`, `--[no-]studio-underwear`, `--[no-]occlude-body`, `--temperament`, `--pitch`, `--rate`, `--walk-speed`, `--run-speed`, `--add-node <id:sp:en[:ru]>`
-- Output & verification: `--export-wav <path>`, `--cook`, `--tex-res <256|512|1024>`, `--no-voice`, `--no-prefabs`, `--no-loc`, `--verify`, `--dry-run`, `--json`
+- Output & verification: `--export-wav <path>`, `--cook`, `--tex-res <256|512|1024|2048>`, `--no-voice`, `--no-prefabs`, `--no-loc`, `--verify`, `--dry-run`, `--json`
 
 ### Groom controls
 

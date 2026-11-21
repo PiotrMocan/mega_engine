@@ -1004,11 +1004,10 @@ void CharacterStudioShell::initialize_gui(
     context_.initialize(window_.handle, args.validation);
 
     LightingSettings studio_lighting{};
-    studio_lighting.dynamic = true;
+    studio_lighting.dynamic = false;
     studio_lighting.voxel_gi = false;
     studio_lighting.cycle = false;
     studio_lighting.hour = 13.0;
-    studio_lighting.sky_intensity = 0.48F;
 
     renderer_.initialize(
         context_,
@@ -1017,7 +1016,7 @@ void CharacterStudioShell::initialize_gui(
         RunMode::scene,
         1U,
         0U,
-        AntiAliasingSettings{},
+        AntiAliasingSettings{.method = AntiAliasingMethod::smaa, .smaa_quality = SmaaQuality::medium},
         !args.screenshot_path.empty(),
         true,
         true,
@@ -1062,8 +1061,6 @@ void CharacterStudioShell::initialize_gui(
 
     // Build clean 3-point front portrait studio lighting scene on a slate turntable plinth.
     preview_scene_ = SceneDocument{};
-    const SceneNodeId env_id = preview_scene_.create_node("StudioSky", SceneNodeKind::environment);
-    static_cast<void>(env_id);
     const SceneNodeId floor_id = preview_scene_.create_node("StudioPlinth", SceneNodeKind::ground);
     if (auto n = preview_scene_.node(floor_id)) {
         n->get().transform.translation = glm::vec3(0.0F, -0.025F, 0.0F);
@@ -1072,25 +1069,26 @@ void CharacterStudioShell::initialize_gui(
         n->get().material.roughness = 0.72F;
         n->get().material.metallic = 0.08F;
     }
-    const SceneNodeId key_id = preview_scene_.create_node("StudioKey", SceneNodeKind::point_light);
+    studio_light_rig_ = preview_scene_.create_node("Portrait lights", SceneNodeKind::folder);
+    const SceneNodeId key_id = preview_scene_.create_node("StudioKey", SceneNodeKind::point_light, studio_light_rig_);
     if (auto n = preview_scene_.node(key_id)) {
-        n->get().transform.translation = glm::vec3(1.55F, 1.92F, 2.35F);
-        n->get().light.color = glm::vec3(1.00F, 0.96F, 0.92F);
-        n->get().light.intensity_candela = 18.0F;
+        n->get().transform.translation = glm::vec3(1.35F, 2.80F, 1.55F);
+        n->get().light.color = glm::vec3(1.00F, 0.91F, 0.81F);
+        n->get().light.intensity_candela = 17.0F;
         n->get().light.range = 10.0F;
     }
-    const SceneNodeId fill_id = preview_scene_.create_node("StudioFill", SceneNodeKind::point_light);
+    const SceneNodeId fill_id = preview_scene_.create_node("StudioFill", SceneNodeKind::point_light, studio_light_rig_);
     if (auto n = preview_scene_.node(fill_id)) {
-        n->get().transform.translation = glm::vec3(-1.95F, 1.48F, 2.30F);
-        n->get().light.color = glm::vec3(0.90F, 0.95F, 1.00F);
-        n->get().light.intensity_candela = 7.5F;
+        n->get().transform.translation = glm::vec3(-1.65F, 1.88F, 2.20F);
+        n->get().light.color = glm::vec3(0.74F, 0.84F, 1.00F);
+        n->get().light.intensity_candela = 5.5F;
         n->get().light.range = 10.0F;
     }
-    const SceneNodeId rim_id = preview_scene_.create_node("StudioRim", SceneNodeKind::point_light);
+    const SceneNodeId rim_id = preview_scene_.create_node("StudioRim", SceneNodeKind::point_light, studio_light_rig_);
     if (auto n = preview_scene_.node(rim_id)) {
-        n->get().transform.translation = glm::vec3(-1.15F, 2.25F, -1.45F);
-        n->get().light.color = glm::vec3(0.88F, 0.93F, 1.00F);
-        n->get().light.intensity_candela = 4.2F;
+        n->get().transform.translation = glm::vec3(-1.10F, 2.70F, -0.90F);
+        n->get().light.color = glm::vec3(0.77F, 0.86F, 1.00F);
+        n->get().light.intensity_candela = 13.0F;
         n->get().light.range = 7.5F;
     }
     preview_node_id_ = preview_scene_.create_node("CharacterPreview", SceneNodeKind::model);
@@ -1107,6 +1105,8 @@ void CharacterStudioShell::initialize_gui(
         orbit_azimuth_ = 0.24F;
         orbit_elevation_ = 0.06F;
         update_orbit_camera();
+    } else if (active_workspace_ == CharacterStudioWorkspace::anatomy_groom) {
+        focus_camera_face();
     } else {
         focus_camera_full_body();
     }
@@ -1365,6 +1365,9 @@ void CharacterStudioShell::install_preview(BakedPreview&& preview) {
         node->get().asset_path = preview_model_rel_;
         node->get().transform = SceneTransform{};
     }
+    if (auto rig = preview_scene_.node(studio_light_rig_)) {
+        rig->get().transform.translation.y = package_.body.height_meters - 1.70F;
+    }
     preview_scene_.mark_content_changed();
     submitted_scene_revision_ = 0U;
     preview_matches_document_ = true;
@@ -1373,6 +1376,11 @@ void CharacterStudioShell::install_preview(BakedPreview&& preview) {
     displayed_surface_valid_ = false;
     preview_clips_ = std::move(preview.geometry.clips);
     set_bind_pose(preview_mesh().skeleton, preview_pose_);
+    if (frame_loaded_character_) {
+        if (active_workspace_ == CharacterStudioWorkspace::anatomy_groom) focus_camera_face();
+        else focus_camera_full_body();
+        frame_loaded_character_ = false;
+    }
 }
 
 void CharacterStudioShell::update_orbit_camera() noexcept {
@@ -1416,7 +1424,7 @@ void CharacterStudioShell::focus_camera_face() noexcept {
         }
     }
     orbit_target_ = target;
-    orbit_distance_ = 0.56F;
+    orbit_distance_ = 0.50F * (h / 1.78F) * package_.body.face.head_scale;
     orbit_azimuth_ = 0.16F;
     orbit_elevation_ = 0.04F;
     update_orbit_camera();
@@ -1603,6 +1611,7 @@ bool CharacterStudioShell::load_character_file(
     }
     stop_speech_preview();
     package_ = std::move(loaded);
+    frame_loaded_character_ = true;
     preview_matches_document_ = false;
     ++package_revision_;
     character_path_ = path;
@@ -1624,6 +1633,7 @@ void CharacterStudioShell::apply_new_character(
     stop_speech_preview();
     sanitize_character_package(pkg);
     package_ = std::move(pkg);
+    frame_loaded_character_ = true;
     preview_matches_document_ = false;
     character_path_ = path;
     mark_package_dirty();

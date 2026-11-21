@@ -24,7 +24,8 @@ inline constexpr std::uint32_t character_package_version = 1U;
 inline constexpr std::uint32_t character_body_bone_count = 38U;
 inline constexpr std::uint32_t character_face_bone_count = 12U;
 inline constexpr std::uint32_t character_total_bone_count = 50U;
-inline constexpr std::uint32_t character_default_texture_size = 1024U;
+// The highest preset gives the body UV atlas extra texels for the face.
+inline constexpr std::uint32_t character_default_texture_size = 2048U;
 inline constexpr std::uint32_t maximum_character_sculpt_samples = 2048U;
 inline constexpr std::uint32_t maximum_character_paint_samples = 4096U;
 

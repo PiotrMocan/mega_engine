@@ -61,9 +61,12 @@ struct ScreenshotCapture {
     }
 };
 
+enum class SkyPanorama { clouds, portrait_studio };
+
 class Renderer final {
 public:
     Renderer() = default;
+    explicit Renderer(SkyPanorama panorama) noexcept : sky_panorama_(panorama) {}
     ~Renderer();
 
     Renderer(const Renderer&) = delete;
@@ -1124,6 +1127,7 @@ private:
     std::array<float, 3> terrain_lod_error_{};
     Bounds terrain_bounds_{};
     unsigned terrain_lod_ = 0;
+    SkyPanorama sky_panorama_ = SkyPanorama::clouds;
     GpuTexture sky_texture_{};
     GpuTexture shadow_map_{};
     GpuTexture smaa_area_texture_{};

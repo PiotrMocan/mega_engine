@@ -1,0 +1,12 @@
+{
+  "schema": "vcr.asset",
+  "version": 1,
+  "kind": "texture",
+  "name": "male_complexion",
+  "source": "male_complexion.png",
+  "usage": "unspecified",
+  "color_space": "linear",
+  "decode": "deferred",
+  "width": 1024,
+  "height": 1024
+}

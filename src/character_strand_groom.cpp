@@ -1238,7 +1238,9 @@ void generate_scalp_groom(
     };
 
     auto emit_interpolated_follicle = [&](const RootTriangleSample& foll) {
-        if (!foll.valid || rng.next_float() >= growth_weight(foll.pos)) {
+        if (!foll.valid) return;
+        const float growth = growth_weight(foll.pos);
+        if (rng.next_float() >= growth) {
             return;
         }
         const float abs_rx = std::abs(foll.pos.x - head_c.x);
@@ -1334,7 +1336,7 @@ void generate_scalp_groom(
         }
 
         const float len_scale = (in.hair_style == HairStyle::short_crop)
-            ? glm::mix(1.0F, 0.66F, temple_mask) * rng.next_float(0.92F, 1.08F)
+            ? glm::mix(1.0F, 0.66F, temple_mask) * glm::mix(0.50F, 1.0F, growth) * rng.next_float(0.92F, 1.08F)
             : ((in.hair_style == HairStyle::bob) ? 1.0F : rng.next_float(0.93F, 1.07F));
 
         glm::vec3 d1(0.0F);
@@ -1427,7 +1429,8 @@ void generate_scalp_groom(
         if (in.hair_style == HairStyle::bob) {
             base_hw = 0.00118F * s;
         } else if (in.hair_style == HairStyle::short_crop) {
-            base_hw = glm::mix(0.00068F, 0.00056F, temple_mask) * s;
+            // A cropped hairline transitions from fine, short fibers into full locks.
+            base_hw = glm::mix(0.00019F, 0.00049F, growth) * glm::mix(1.0F, 0.72F, temple_mask) * s;
         } else if (in.hair_style == HairStyle::mohawk) {
             base_hw = (in_crest ? 0.00105F : 0.00072F) * s;
         } else if (in.hair_style == HairStyle::spiky) {
@@ -1597,7 +1600,7 @@ void generate_eyebrow_grooms(
         const std::uint32_t clump_side_base = kBrowClumpBase + static_cast<std::uint32_t>(side) * (kBrowClumpCount / 2U);
         const std::uint32_t side_clumps = kBrowClumpCount / 2U;
         const std::uint32_t strands_per_side = 540U;
-        const float base_brow_half_w = (in.gender == CharacterGender::female ? 0.00029F : 0.00034F) * s;
+        const float base_brow_half_w = (in.gender == CharacterGender::female ? 0.000095F : 0.00012F) * s;
 
         std::array<glm::vec3, 4U> pts{};
         for (std::uint32_t i = 0U; i < strands_per_side; ++i) {
@@ -1621,7 +1624,7 @@ void generate_eyebrow_grooms(
             const glm::vec3 out_skin = safe_normalize(
                 glm::vec3(
                     (spine_p.x - col.cranium_center.x) * 0.55F,
-                    0.10F * s,
+                    0.018F * s,
                     std::max(0.045F * s, spine_p.z - brow_center.z)),
                 glm::vec3(0.0F, 0.1F, 1.0F));
             glm::vec3 up_brow = safe_normalize(glm::cross(out_skin, along) * x_sign, glm::vec3(0.0F, 1.0F, 0.0F));
@@ -1630,7 +1633,7 @@ void generate_eyebrow_grooms(
             }
 
             // Vertical offset across brow thickness [-1..+1]: tapers strongly at head & tail
-            const float base_arch_h = (in.gender == CharacterGender::female ? 0.0078F : 0.0094F) * s;
+            const float base_arch_h = (in.gender == CharacterGender::female ? 0.0046F : 0.0058F) * s;
             const float arch_shape =
                 (0.58F + 0.46F * std::sin(std::clamp(u_norm, 0.0F, 1.0F) * glm::pi<float>() * 0.88F)) *
                 (1.0F - (in.gender == CharacterGender::female ? 0.48F : 0.36F) * u_norm * u_norm);
@@ -1687,7 +1690,18 @@ void generate_eyelash_grooms(
         const float x_sign = (side == 0) ? 1.0F : -1.0F;
         for (int is_lower = 0; is_lower < 2; ++is_lower) {
             const std::size_t chain_idx = static_cast<std::size_t>(is_lower * 2 + side);
-            const auto& chain = in.landmark_chains[chain_idx];
+            // Some template landmarks sit on the inner lid, directly behind a
+            // rim landmark. Following both made the lash strip fold into the eye.
+            std::vector<std::uint16_t> chain;
+            for (const auto vertex : in.landmark_chains[chain_idx]) {
+                if (vertex >= in.body_positions.size()) continue;
+                const auto& p = in.body_positions[vertex];
+                if (!chain.empty() && std::abs(p.x - in.body_positions[chain.back()].x) < 0.0019F * s) {
+                    if (p.z > in.body_positions[chain.back()].z) chain.back() = vertex;
+                } else {
+                    chain.push_back(vertex);
+                }
+            }
             if (chain.size() < 2U) {
                 continue;
             }
@@ -1708,13 +1722,13 @@ void generate_eyelash_grooms(
 
                 // Outer lashes slightly longer & swept laterally temporal (+x_sign * u)
                 const float outer_len = 0.72F + 0.50F * std::sin(u * glm::pi<float>() * 0.82F);
-                const float base_upper = (in.gender == CharacterGender::female) ? 0.0044F : 0.0035F;
+                const float base_upper = (in.gender == CharacterGender::female) ? 0.0062F : 0.0048F;
                 const float len_m = (is_lower == 0)
                     ? (base_upper * outer_len * s * rng.next_float(0.88F, 1.12F))
                     : (0.0019F * outer_len * s * rng.next_float(0.85F, 1.10F));
 
                 const glm::vec3 base_dir = safe_normalize(
-                    glm::vec3(x_sign * (0.18F + 0.34F * u), is_lower ? -0.25F : 0.16F, 0.95F),
+                    glm::vec3(x_sign * (0.18F + 0.34F * u), is_lower ? -0.32F : 0.34F, 0.95F),
                     glm::vec3(0.0F, 0.0F, 1.0F));
                 const glm::vec3 curl_dir(x_sign * 0.14F * u, is_lower ? -0.48F : 0.68F, 0.45F);
 
@@ -1730,7 +1744,7 @@ void generate_eyelash_grooms(
                 const float lash_phase = -0.30F + rng.next_float(-0.22F, 0.22F);
                 if (emit_geometry) {
                     const CookedSkinVertex sk = blend_skin_pair(in.body_skin[v0], in.body_skin[v1], lt);
-                    const float w = (is_lower == 0 ? 0.00029F : 0.00018F) * s;
+                    const float w = (is_lower == 0 ? 0.000095F : 0.000065F) * s;
                     emit_twisted_ribbon_strand(
                         pts, cid, w, 0.16F, lash_phase,
                         0.20F, eye_c, sk, nullptr, out);
@@ -1880,8 +1894,8 @@ void generate_beard_groom(
             (std::abs(sample.pos.x - in.mouth_center.x) < 0.026F * s &&
              sample.pos.y < in.mouth_center.y + 0.012F * s);
         const float beard_len = (core_beard
-            ? rng.next_float(0.0033F, 0.0047F)
-            : rng.next_float(0.0024F, 0.0038F) * (0.52F + 0.48F * zw)) * fiber_s;
+            ? rng.next_float(0.0020F, 0.0035F)
+            : rng.next_float(0.0013F, 0.0028F) * (0.52F + 0.48F * zw)) * fiber_s;
 
         const float x_sign = (sample.pos.x - in.mouth_center.x) >= 0.0F ? 1.0F : -1.0F;
         const glm::vec3 raw_flow = on_mustache
@@ -1892,7 +1906,7 @@ void generate_beard_groom(
             raw_flow - sample.normal * glm::dot(raw_flow, sample.normal),
             glm::vec3(0.0F, -1.0F, 0.0F));
         const glm::vec3 bitang = safe_normalize(glm::cross(sample.normal, base_tang), glm::vec3(1.0F, 0.0F, 0.0F));
-        const glm::vec3 tang = safe_normalize(base_tang + bitang * rng.next_float(-0.14F, 0.14F), base_tang);
+        const glm::vec3 tang = safe_normalize(base_tang + bitang * rng.next_float(-0.39F, 0.39F), base_tang);
 
         pts[0] = sample.pos - sample.normal * (0.00015F * fiber_s);
         for (std::size_t k = 1U; k < 3U; ++k) {
@@ -1907,7 +1921,7 @@ void generate_beard_groom(
         }
         const float twist_step = 0.22F;
         const float twist_phase = -0.22F + rng.next_float(-0.32F, 0.32F);
-        const float half_w = 0.00028F * fiber_s * (0.68F + 0.32F * zw) * rng.next_float(0.86F, 1.14F);
+        const float half_w = 0.000095F * fiber_s * (0.68F + 0.32F * zw) * rng.next_float(0.80F, 1.20F);
         if (emit_geometry) {
             emit_twisted_ribbon_strand(
                 pts, cid, half_w, 0.18F, twist_phase,
@@ -2136,8 +2150,8 @@ BakedPbrTextureSet bake_character_strand_groom_textures(
             col_pigment = glm::min(col_pigment * 0.25F, glm::vec3(0.032F, 0.025F, 0.022F));
         } else if (is_brow) {
             col_pigment = glm::clamp(
-                col_pigment * 2.90F + glm::vec3(0.095F, 0.068F, 0.048F),
-                glm::vec3(0.115F, 0.082F, 0.058F),
+                col_pigment * 0.95F + glm::vec3(0.014F, 0.009F, 0.006F),
+                glm::vec3(0.018F, 0.012F, 0.009F),
                 glm::vec3(0.320F, 0.240F, 0.180F));
         } else if (is_beard) {
             // Subtle natural beard warmth / salt-and-pepper variation at wear > 0.25
