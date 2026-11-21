@@ -842,7 +842,8 @@ void prepare_authored_model_lods(CookedModelAsset &model,
     model.skeleton_relative_path.clear();
 }
 
-void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& asset_root) {
+void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& asset_root,
+                        const ModelLodUvPolicy uv_policy) {
     if (model.vertices.empty() || model.indices.empty()) {
         return;
     }
@@ -871,6 +872,7 @@ void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& as
                                               model.vertices.size(), sizeof(CookedModelVertex));
     constexpr std::array opaque_weights{0.08F, 0.08F, 0.08F, 0.1F, 0.1F};
     constexpr std::array opaque_seam_weights{0.08F, 0.08F, 0.08F, 0.0F, 0.0F};
+    constexpr std::array uv_preserving_weights{0.08F, 0.08F, 0.08F, 2.0F, 2.0F};
     constexpr std::array foliage_weights{0.03F, 0.03F, 0.03F, 0.5F, 0.5F};
     constexpr std::array opaque_ratios{1.0F, 0.45F, 0.19F, 0.075F, 0.027F, 0.009F};
     constexpr std::array opaque_error_limits{0.0F, 0.002F, 0.005F, 0.012F, 0.023F, 0.045F};
@@ -885,6 +887,7 @@ void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& as
     std::vector<unsigned> scratch;
     const bool has_foliage = model.vegetation || (model.metadata_relative_path.empty() &&
         std::ranges::any_of(model.materials, [](const auto& mat) { return is_vegetation_material(mat.factors); }));
+    const bool preserve_mapping = uv_policy == ModelLodUvPolicy::preserve_mapping;
     for (auto &mesh : model.submeshes) {
         const auto first = static_cast<std::uint32_t>(mesh.first_index);
         const auto count = static_cast<std::uint32_t>(mesh.index_count);
@@ -908,7 +911,7 @@ void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& as
             has_foliage &&
             (model.materials[mesh.material_index].coverage & (material_coverage_alpha_mask_bit | material_coverage_transparent_mask)) == 0U &&
             count >= 16U * 9U && count <= 512U * 3U && count % 9U == 0U;
-        if ((alpha_masked && count >= 512U * 3U) || blade_strips) {
+        if (!preserve_mapping && ((alpha_masked && count >= 512U * 3U) || blade_strips)) {
             if (position_ids.empty()) {
                 position_ids = build_position_ids(
                     std::span{model.vertices}.first(original_vertex_count));
@@ -949,10 +952,11 @@ void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& as
                 ? static_cast<std::size_t>(static_cast<double>(count) * foliage_ratios[level])
                 : static_cast<std::size_t>(static_cast<double>(count) * opaque_ratios[level]);
             const auto target = std::max<std::size_t>(12, (raw_target / 3) * 3);
-            const auto &weights = alpha_masked ? foliage_weights : opaque_weights;
-            const float error_limit =
-                alpha_masked ? foliage_error_limits[level] : opaque_error_limits[level];
-            const unsigned options = alpha_masked
+            const auto &weights = preserve_mapping ? uv_preserving_weights
+                : alpha_masked ? foliage_weights : opaque_weights;
+            const float error_limit = preserve_mapping ? 0.001F
+                : alpha_masked ? foliage_error_limits[level] : opaque_error_limits[level];
+            const unsigned options = alpha_masked && !preserve_mapping
                 ? static_cast<unsigned>(meshopt_SimplifyPermissive |
                     (level >= 4U ? meshopt_SimplifyLockBorder : 0))
                 : static_cast<unsigned>(meshopt_SimplifyLockBorder);
@@ -962,7 +966,9 @@ void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& as
                 sizeof(CookedModelVertex), model.vertices.front().normal.data(),
                 sizeof(CookedModelVertex), weights.data(), weights.size(), locks, target,
                 error_limit, options, &error);
-            if (!alpha_masked && (reduced == 0 || reduced > target + 3U)) {
+            // Repeating pavement and atlas surfaces show visible phase shifts if
+            // collapses cross UV seams or UV error is ignored to reach the target.
+            if (!preserve_mapping && !alpha_masked && (reduced == 0 || reduced > target + 3U)) {
                 reduced = meshopt_simplifyWithAttributes(
                     scratch.data(), model.indices.data() + first, count,
                     model.vertices.front().position.data(), model.vertices.size(),

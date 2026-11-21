@@ -50,11 +50,12 @@ Json describe(const vcr::CookedModelAsset &model, const std::filesystem::path &p
     return {{"asset",path.generic_string()},{"triangles",triangles},{"errors",errors},
             {"geometry_bytes",model.vertices.size()*48+model.indices.size()*4}};
 }
-void cook(const std::filesystem::path &root, const std::filesystem::path &path, vcr::CookedModelAsset model) {
+void cook(const std::filesystem::path &root, const std::filesystem::path &path,
+          vcr::CookedModelAsset model, const vcr::ModelLodUvPolicy uv_policy) {
     if (model.is_skinned() || model.prebaked_lods)
         throw std::runtime_error("Offline LOD cooking requires a static source mesh: " + path.string());
     model.generate_lods = true;
-    vcr::prepare_model_lods(model, root);
+    vcr::prepare_model_lods(model, root, uv_policy);
     auto metadata = read_json(root/path);
     auto name = path.filename().string();
     name.resize(name.size()-std::string_view(".vcrasset.json").size());
@@ -167,8 +168,11 @@ void inspect(const std::filesystem::path &root, const std::filesystem::path &pat
 int main(int argc,char **argv) {
     try {
         const std::string_view command = argc >= 2 ? argv[1] : "";
-        if (argc < 4 || (command != "cook" && command != "inspect" && command != "cook-vegetation"))
-            throw std::runtime_error("Usage: vcr_asset_lod_cooker cook|inspect|cook-vegetation ASSET_ROOT MODEL...");
+        if (argc < 4 || (command != "cook" && command != "cook-preserve-uv" &&
+                        command != "inspect" && command != "cook-vegetation"))
+            throw std::runtime_error("Usage: vcr_asset_lod_cooker cook|cook-preserve-uv|inspect|cook-vegetation ASSET_ROOT MODEL...");
+        const auto uv_policy = command == "cook-preserve-uv" ? vcr::ModelLodUvPolicy::preserve_mapping
+                                                             : vcr::ModelLodUvPolicy::standard;
         const std::filesystem::path root(argv[2]);
         for (int i = 3; i < argc; ++i) {
             const std::filesystem::path path(argv[i]);
@@ -179,7 +183,7 @@ int main(int argc,char **argv) {
             auto model = load(root, path);
             if (command == "cook-vegetation" && (!model.vegetation || !model.generate_lods ||
                 model.is_skinned() || model.prebaked_lods || !generated_chain(root, path, model))) continue;
-            cook(root, path, std::move(model));
+            cook(root, path, std::move(model), uv_policy);
             if (command == "cook-vegetation") inspect(root, path);
         }
         return 0;

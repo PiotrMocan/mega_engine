@@ -2,9 +2,12 @@
 #include "cooked_model_asset.hpp"
 #include <span>
 namespace vcr {
+enum class ModelLodUvPolicy { standard, preserve_mapping };
+
 // Cold asset-preparation step, also usable by the background loader. Position,
 // normal/UV seams and submesh borders are preserved; vertices are shared.
-void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& asset_root = {});
+void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& asset_root = {},
+                        ModelLodUvPolicy uv_policy = ModelLodUvPolicy::standard);
 // Lossless cold-path indexing/cache preparation. Coarse LOD vertices are packed
 // first so the frequently drawn distant instances fetch a compact working set.
 void optimize_model_geometry(CookedModelAsset &model);
