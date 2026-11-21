@@ -1,3 +1,4 @@
+#include "vfx_json.hpp"
 #include "prefab_io.hpp"
 #include "scene_component_json.hpp"
 
@@ -39,6 +40,8 @@ using Json = nlohmann::json;
     case SceneNodeKind::point_light: return "point_light";
     case SceneNodeKind::spot_light: return "spot_light";
     case SceneNodeKind::environment: return "environment";
+    case SceneNodeKind::particle_emitter: return "particle_emitter";
+    case SceneNodeKind::projected_decal: return "projected_decal";
     case SceneNodeKind::ocean: return "ocean";
     }
     return "folder";
@@ -50,6 +53,8 @@ using Json = nlohmann::json;
     if (value == "cube") return SceneNodeKind::cube;
     if (value == "model") return SceneNodeKind::model;
     if (value == "ground") return SceneNodeKind::ground;
+    if (value == "particle_emitter") return SceneNodeKind::particle_emitter;
+    if (value == "projected_decal") return SceneNodeKind::projected_decal;
     if (value == "ocean") return SceneNodeKind::ocean;
     if (value == "terrain") return SceneNodeKind::terrain;
     if (value == "camera") return SceneNodeKind::camera;
@@ -894,6 +899,14 @@ bool save_prefab_file(
                 if (node.detail_aa != ObjectAntiAliasing::asset)
                     encoded["detail_aa"] = node.detail_aa == ObjectAntiAliasing::coverage ? "coverage" : "off";
             }
+            if (node.kind == SceneNodeKind::particle_emitter || node.kind == SceneNodeKind::projected_decal) {
+                encoded["vfx"] = encode_vfx(node.vfx, node.kind);
+                VfxSettings checked{};
+                if (!read_vfx(encoded["vfx"], node.kind, checked)) {
+                    error = "Invalid visual effect parameters.";
+                    return false;
+                }
+            }
             if (node.kind == SceneNodeKind::ocean) {
                 encoded["ocean"] = ocean_json(node.ocean);
             }
@@ -1262,6 +1275,11 @@ bool instantiate_prefab_file(
                 }
             }
 
+            VfxSettings vfx{};
+            if (encoded.contains("vfx") && !read_vfx(encoded["vfx"], *kind, vfx)) {
+                error = "Invalid visual effect parameters.";
+                return false;
+            }
             OceanSettings ocean{};
             if (encoded.contains("ocean") &&
                 (*kind != SceneNodeKind::ocean ||
@@ -1482,6 +1500,7 @@ bool instantiate_prefab_file(
                     .material = material,
                     .light = light,
                     .ocean = ocean,
+                    .vfx = vfx,
                     .kind = *kind,
                     .visible = encoded["visible"].get<bool>(),
                     .expanded = encoded["expanded"].get<bool>(),

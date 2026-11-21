@@ -743,6 +743,36 @@ void PhysicsWorld::rebuild_from_scene(
     contacts_.reserve(std::max<std::size_t>(512U, bodies_.size() * 8U));
 }
 
+void PhysicsWorld::refresh_streamed_scene(
+    const SceneDocument& scene, SceneNodeId excluded_node,
+    ModelBoundsProvider bounds, ModelCollisionProvider collision) {
+    auto previous = std::move(bodies_);
+    const float accumulator = accumulator_, interpolation = interpolation_alpha_;
+    rebuild_from_scene(scene, excluded_node, bounds, collision);
+    accumulator_ = accumulator;
+    interpolation_alpha_ = interpolation;
+    for (const Body& saved : previous) {
+        Body* body = find_body_mut(saved.node_id);
+        if (!body || body->node_uuid != saved.node_uuid) continue;
+        // Keep new cooked collision dimensions, but retain the running simulation.
+        static_cast<void>(set_body_motion_type(saved.node_id, saved.motion_type, saved.authored_mass));
+        body->position = saved.position;
+        body->orientation = saved.orientation;
+        body->prev_position = saved.prev_position;
+        body->prev_orientation = saved.prev_orientation;
+        body->linear_velocity = saved.linear_velocity;
+        body->angular_velocity = saved.angular_velocity;
+        body->pending_linear_impulse = saved.pending_linear_impulse;
+        body->pending_angular_impulse = saved.pending_angular_impulse;
+        body->enabled = saved.enabled;
+        body->sleeping = saved.sleeping;
+        body->sleep_timer = saved.sleep_timer;
+        body->had_contact = saved.had_contact;
+        body->kinematic_moved_this_step = saved.kinematic_moved_this_step;
+        update_derived_body_state(*body);
+    }
+}
+
 void PhysicsWorld::push_contact(
     const std::uint32_t idx_a,
     const std::uint32_t idx_b,

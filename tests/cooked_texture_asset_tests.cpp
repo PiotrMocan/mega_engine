@@ -1022,6 +1022,37 @@ int main() {
             "BC4 .vcrtex loads cleanly");
     }
 
+    {
+        // BC1, two mip levels in KTX2's smallest-first physical order.
+        const std::array<std::uint8_t,12> magic{0xab,'K','T','X',' ','2','0',0xbb,13,10,26,10};
+        std::vector<std::uint8_t> bytes(216);
+        std::copy(magic.begin(), magic.end(), bytes.begin());
+        auto field = [&](unsigned offset, std::uint32_t value) {
+            for (unsigned i = 0; i < 4; ++i) bytes[offset+i] = static_cast<std::uint8_t>(value >> (8*i));
+        };
+        field(12,131); field(16,1); field(20,8); field(24,8); field(36,1); field(40,2);
+        field(48,128); field(52,44); field(128,44);
+        field(136,(40U<<16)|2U); field(140,128U | (1U<<8) | (1U<<16));
+        field(144,0x0303); field(148,8); field(156,63U<<16); field(168,0xffffffffU);
+        field(80,184); field(88,32); field(96,32); field(104,176); field(112,8); field(120,8);
+        bytes[176] = 22; bytes[184] = 11;
+        auto meta = texture_metadata("ktx", "textures/test.ktx2", "normal", "linear");
+        meta.erase("decode"); meta["storage"] = "ktx2";
+        expect(write_json(textures / "ktx.vcrtexture.json", meta) && write_bytes(textures / "test.ktx2", bytes),
+            "write KTX2 texture fixture");
+        const auto loaded = vcr::load_cooked_texture_asset(asset_root,"painted/textures/ktx.vcrtexture.json");
+        expect(loaded && loaded->pixel_format == vcr::CookedTexturePixelFormat::bc1_rgb &&
+            loaded->mip_byte_offsets == std::vector<std::size_t>{0,32} && loaded->pixels[0] == 11 &&
+            loaded->pixels[32] == 22, "KTX2 preserves native BC blocks and reorders mip payload");
+        vcr::CookedTextureAsset target;
+        target.color_space = vcr::CookedTextureColorSpace::linear;
+        std::string ktx_error;
+        field(104,184);
+        expect(!vcr::decode_ktx2_bytes(bytes,{},target,ktx_error), "reject overlapping KTX2 mip levels");
+        field(104,176); field(84,0xffffffff);
+        expect(!vcr::decode_ktx2_bytes(bytes,{},target,ktx_error), "reject out-of-range 64-bit KTX2 mip offset");
+    }
+
     test_asset_pak(temporary.path());
 
     if (failures != 0) {

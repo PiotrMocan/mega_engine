@@ -1,6 +1,7 @@
 #include "asset_importer.hpp"
 
 #include "cooked_audio_asset.hpp"
+#include "cooked_texture_asset.hpp"
 #include "pbr_material.hpp"
 #include "skeletal_animation.hpp"
 
@@ -701,6 +702,22 @@ commit_import(ImportContext& context) {
     return std::move(context.result);
 }
 
+[[nodiscard]] AssetImportOutcome<void> write_texture_metadata(
+    const ImportContext& context, const std::filesystem::path& metadata_relative,
+    const std::filesystem::path& data_relative, Json& metadata) {
+    const bool ktx = lowercase_extension(data_relative) == ".ktx2";
+    if (ktx) {
+        metadata.erase("decode");
+        metadata["storage"] = "ktx2";
+    }
+    auto written = write_json_file(context.staging_directory / metadata_relative, metadata);
+    if (!written || !ktx) return written;
+    const auto texture = load_cooked_texture_asset(context.staging_directory, metadata_relative);
+    if (!texture) return make_unexpected_asset_import_error(make_error(
+        AssetImportErrorCode::invalid_asset_data, texture.error().message, data_relative));
+    return {};
+}
+
 [[nodiscard]] AssetImportOutcome<AssetImportResult>
 import_image(
     const std::filesystem::path& source,
@@ -719,7 +736,7 @@ import_image(
 
     const std::filesystem::path metadata_relative =
         context.asset_slug + ".vcrtexture.json";
-    const Json metadata{
+    Json metadata{
         {"schema", asset_schema},
         {"version", asset_schema_version},
         {"kind", "texture"},
@@ -731,8 +748,7 @@ import_image(
         {"color_space", "unspecified"},
         {"decode", "deferred"},
     };
-    const auto written = write_json_file(
-        context.staging_directory / metadata_relative, metadata);
+    const auto written = write_texture_metadata(context, metadata_relative, source_relative, metadata);
     if (!written) {
         return make_unexpected_asset_import_error(written.error());
     }
@@ -1425,8 +1441,7 @@ import_material_texture(
     } else {
         metadata["decode"] = "deferred";
     }
-    const auto written = write_json_file(
-        context.staging_directory / metadata_relative, metadata);
+    const auto written = write_texture_metadata(context, metadata_relative, data_relative, metadata);
     if (!written) {
         return make_unexpected_asset_import_error(written.error());
     }
@@ -2891,7 +2906,7 @@ AssetSourceKind classify_asset_source(
     if (extension == ".png" || extension == ".jpg" ||
         extension == ".jpeg" || extension == ".tga" ||
         extension == ".hdr" || extension == ".bmp" ||
-        extension == ".dds" || extension == ".exr") {
+        extension == ".dds" || extension == ".ktx2" || extension == ".exr") {
         return AssetSourceKind::image;
     }
     if (extension == ".wav") {

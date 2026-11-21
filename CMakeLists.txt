@@ -203,6 +203,11 @@ FetchContent_GetProperties(miniaudio)
 if(NOT miniaudio_POPULATED)
     FetchContent_Populate(miniaudio)
 endif()
+FetchContent_Declare(bcdec
+    GIT_REPOSITORY https://github.com/iOrange/bcdec.git
+    GIT_TAG 80859ed3b7afb1c527a2a99d70c61457bea72d0c
+    SOURCE_SUBDIR header_only)
+FetchContent_MakeAvailable(bcdec)
 FetchContent_GetProperties(bc7enc_rdo)
 if(NOT bc7enc_rdo_POPULATED)
     FetchContent_Populate(bc7enc_rdo)
@@ -418,9 +423,12 @@ set(VCR_ENGINE_CORE_SOURCES
     src/icon_system.cpp
     src/model_lod.cpp
     src/asset_preparation.cpp
+    src/job_system.cpp
     src/content_manifest.cpp
     src/scene_uuid.cpp
     src/scene_document.cpp
+    src/scene_history.cpp
+    src/sublevel_streaming.cpp
     src/scene_io.cpp
     src/prefab_io.cpp
     src/punctual_light.cpp
@@ -483,6 +491,7 @@ target_include_directories(vcr_engine PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 target_include_directories(vcr_engine SYSTEM PRIVATE
+    "${bcdec_SOURCE_DIR}"
     "${miniaudio_SOURCE_DIR}"
     "${assimp_SOURCE_DIR}/contrib/stb"
     "${openexr_SOURCE_DIR}/src/lib/OpenEXR"
@@ -502,12 +511,13 @@ target_link_libraries(vcr_engine
         nlohmann_json::nlohmann_json
         Threads::Threads
     PRIVATE
+        Vulkan::Headers
         OpenEXR::OpenEXR
         meshoptimizer
         vcr_bc7enc
 )
 if(WIN32)
-    target_link_libraries(vcr_engine PRIVATE shell32 winhttp)
+    target_link_libraries(vcr_engine PRIVATE shell32 winhttp dbghelp)
 elseif(UNIX AND NOT APPLE)
     target_link_libraries(vcr_engine PRIVATE m dl)
 endif()
@@ -653,6 +663,7 @@ add_executable(vulkan_editor
     src/editor_main.cpp
     src/editor_application.cpp
     src/editor_ui.cpp
+    src/world_surface.cpp
     src/editor_ui_kit.cpp
     src/mcp_server.cpp
     ${VCR_VULKAN_RENDERER_SOURCES}
@@ -767,6 +778,8 @@ function(vcr_configure_executable target editor_enabled)
 endfunction()
 
 vcr_configure_executable(vulkan_cube 1)
+target_compile_definitions(vulkan_cube PRIVATE VCR_GAME_RUNTIME_ONLY=1)
+add_custom_target(Shipping DEPENDS vulkan_cube)
 vcr_configure_executable(vulkan_editor 1)
 vcr_configure_executable(vulkan_project_manager 1)
 vcr_configure_executable(vulkan_icon_tool 1)
@@ -827,7 +840,6 @@ if(WIN32)
 endif()
 target_link_libraries(
     vulkan_cube PRIVATE
-    vcr_imgui
     vcr_window_icon
 )
 target_link_libraries(
@@ -992,6 +1004,7 @@ if(BUILD_TESTING)
     add_test(NAME vcr_core_tests COMMAND vcr_core_tests)
 
     add_executable(vcr_asset_import_tests
+        src/world_surface.cpp
         tests/asset_import_tests.cpp
     )
     target_link_libraries(

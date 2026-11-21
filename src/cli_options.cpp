@@ -494,6 +494,32 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
             result.options.tone_mapper_override = true;
             continue;
         }
+        if (argument.name == "--transparency") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            if (value != "sorted" && value != "wboit") {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.wboit = value == "wboit";
+            continue;
+        }
+        if (argument.name == "--texture-budget-mib") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            if (!parse_u32(value, result.options.texture_budget_mib) || result.options.texture_budget_mib > 4096) {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            continue;
+        }
+        if (argument.name == "--bloom") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            if (value != "off" && value != "on") {
+                result.error = invalid_value(argument.name, value);
+                return result;
+            }
+            result.options.bloom = value == "on";
+            continue;
+        }
         if (argument.name == "--fog") {
             if (!take_value(argument, index, argc, argv, value, result.error)) return result;
             if (value != "off" && value != "height") {
@@ -1190,6 +1216,9 @@ std::string cli_usage(std::string_view executable_name) {
                   "  --mode MODE             scene, instancing,\n"
                   "                          or gpu-saturation\n"
                   "  --aa MODE               off, smaa, fsr3, msaa2x, or msaa4x (default: off)\n"
+                  "  --transparency sorted|wboit  Spatial HDR transparency (default: sorted)\n"
+                  "  --texture-budget-mib N   Texture residency ceiling (0: automatic, maximum 4096)\n"
+                  "  --bloom on|off          HDR highlight glow (default: off)\n"
                   "  --motion-blur MODE      off, camera, objects, all (default: off)\n"
                   "  --motion-blur-quality Q low or high (default: high)\n"
                   "  --motion-blur-shutter S centered or trailing (default: centered)\n"

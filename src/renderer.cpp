@@ -7,6 +7,7 @@
 #include "model_lod.hpp"
 #include "packed_model_vertex.hpp"
 #include "terrain_height.hpp"
+#include "texture_bc_formats.hpp"
 #include "texture_compression.hpp"
 #include "vulkan_common.hpp"
 
@@ -37,7 +38,7 @@
 #include <glm/gtc/quaternion.hpp>
 #include <glm/mat3x3.hpp>
 
-#if VCR_EDITOR_ENABLED
+#if VCR_EDITOR_ENABLED && !defined(VCR_GAME_RUNTIME_ONLY)
 #include <imgui.h>
 #include <imgui_impl_vulkan.h>
 #endif
@@ -910,6 +911,11 @@ void Renderer::shutdown() noexcept {
     authored_scene_triangle_count_ = 0U;
     editor_terrain_visible_ = false;
     editor_sky_visible_ = false;
+    scene_effects_.clear();
+    particle_time_seconds_ = 0;
+    for (auto& buffer : cpu_particle_buffers_) buffer.destroy();
+    particle_seeds_.clear();
+    cpu_particles_.clear();
     editor_ocean_visible_ = false;
     editor_ocean_height_ = 0.0F;
     editor_ocean_ = {};
@@ -1276,6 +1282,20 @@ void Renderer::create_editor_material_resources() {
         "editor default neutral displacement texture");
 }
 
+void Renderer::set_texture_budget(std::uint32_t mib) {
+    VkPhysicalDeviceMemoryProperties properties{};
+    vkGetPhysicalDeviceMemoryProperties(context_->physical_device(), &properties);
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+    vmaGetHeapBudgets(context_->allocator(), budgets.data());
+    VkDeviceSize largest = 0;
+    for (std::uint32_t i = 0; i < properties.memoryHeapCount; ++i) {
+        if ((properties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0)
+            largest = std::max(largest, budgets[i].budget);
+    }
+    texture_budget_ = std::min(maximum_editor_texture_gpu_bytes, largest ? largest / 4 : maximum_editor_texture_gpu_bytes);
+    if (mib) texture_budget_ = std::min(texture_budget_, VkDeviceSize(mib) << 20);
+}
+
 std::optional<std::uint32_t> Renderer::find_or_load_editor_texture(const PreparedTexture &prepared,
                                                                    std::string &error) {
     const auto &cache_key = prepared.path;
@@ -1334,41 +1354,11 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_texture(const Prepare
         return std::nullopt;
     }
 
-    const std::uint64_t base_bytes = texture.pixels.size();
-    if (!block_compressed &&
-        base_bytes > std::numeric_limits<VkDeviceSize>::max() / 2U) {
-        error = "Texture '" + cache_key + "' exceeds the GPU size range.";
+    const VkFormat format = block_compressed ? bc_vk_format(texture.pixel_format, texture.color_space) :
+        (texture.color_space == CookedTextureColorSpace::srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM);
+    if (format == VK_FORMAT_UNDEFINED) {
+        error = "Unsupported color space for compressed texture '" + cache_key + "'.";
         return std::nullopt;
-    }
-    // Uncompressed RGBA8 reserves 2x base bytes for its mip chain; compressed
-    // textures already include every mip level inside `texture.pixels`.
-    const VkDeviceSize gpu_bytes = block_compressed
-        ? static_cast<VkDeviceSize>(base_bytes)
-        : static_cast<VkDeviceSize>(base_bytes * 2U);
-    if (gpu_bytes > maximum_single_editor_texture_gpu_bytes ||
-        editor_texture_gpu_bytes_ >
-            maximum_editor_texture_gpu_bytes - gpu_bytes) {
-        error =
-            "Texture '" + cache_key +
-            "' exceeds the bounded editor GPU texture cache.";
-        return std::nullopt;
-    }
-
-    VkFormat format = VK_FORMAT_UNDEFINED;
-    if (texture.pixel_format == CookedTexturePixelFormat::bc7_unorm) {
-        format = texture.color_space == CookedTextureColorSpace::srgb
-            ? VK_FORMAT_BC7_SRGB_BLOCK
-            : VK_FORMAT_BC7_UNORM_BLOCK;
-    } else if (texture.pixel_format == CookedTexturePixelFormat::bc4_unorm) {
-        if (texture.color_space == CookedTextureColorSpace::srgb) {
-            error = "BC4 texture '" + cache_key + "' cannot use sRGB color space.";
-            return std::nullopt;
-        }
-        format = VK_FORMAT_BC4_UNORM_BLOCK;
-    } else {
-        format = texture.color_space == CookedTextureColorSpace::srgb
-            ? VK_FORMAT_R8G8B8A8_SRGB
-            : VK_FORMAT_R8G8B8A8_UNORM;
     }
     VkFormatProperties properties{};
     vkGetPhysicalDeviceFormatProperties(
@@ -1391,69 +1381,62 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_texture(const Prepare
         ? (texture.mip_levels > 1U)
         : ((properties.optimalTilingFeatures & mip_features) == mip_features);
 
+    std::uint32_t mip_levels = block_compressed ? texture.mip_levels : 1;
+    if (!block_compressed && mipmaps_supported)
+        for (auto size = std::max(texture.width, texture.height); size > 1; size >>= 1) ++mip_levels;
+    const bool precomputed = block_compressed || (mip_levels > 1 && !prepared.mip_chain_rgba.empty() &&
+        prepared.mip_byte_offsets.size() == mip_levels);
+    auto upload_pixels = !block_compressed && precomputed
+        ? std::span<const std::uint8_t>(prepared.mip_chain_rgba) : std::span<const std::uint8_t>(texture.pixels);
+    const auto& offsets = block_compressed ? texture.mip_byte_offsets : prepared.mip_byte_offsets;
+    const auto available = std::min(maximum_single_editor_texture_gpu_bytes,
+        texture_budget_ - std::min(editor_texture_gpu_bytes_, texture_budget_));
+    const auto allocation_bytes = [&](std::uint32_t first_mip) {
+        const auto levels = mip_levels - first_mip;
+        const VkImageCreateInfo image{.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+            .format = format, .extent = {std::max(1U, texture.width >> first_mip), std::max(1U, texture.height >> first_mip), 1},
+            .mipLevels = levels, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                (!block_compressed && levels > 1 ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0U),
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+        const VkDeviceImageMemoryRequirements query{.sType = VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS,
+            .pCreateInfo = &image};
+        VkMemoryRequirements2 requirements{.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+        vkGetDeviceImageMemoryRequirements(context_->device(), &query, &requirements);
+        return requirements.memoryRequirements.size;
+    };
+    std::uint32_t first = 0;
+    VkDeviceSize gpu_bytes = allocation_bytes(first);
+    if (gpu_bytes > available) texture_budget_pressure_ = true;
+    while (precomputed && gpu_bytes > available && first + 1 < mip_levels)
+        gpu_bytes = allocation_bytes(++first);
+    if (gpu_bytes > available) {
+        error = "Texture '" + cache_key + "' exceeds the remaining GPU texture budget.";
+        return std::nullopt;
+    }
+    std::vector<std::size_t> rebased;
+    if (precomputed && first) {
+        upload_pixels = upload_pixels.subspan(offsets[first]);
+        for (std::size_t i = first; i < offsets.size(); ++i) rebased.push_back(offsets[i] - offsets[first]);
+    }
+    mip_levels -= first;
+    const auto precomputed_mips = precomputed && mip_levels > 1
+        ? std::span<const std::size_t>(first ? rebased : offsets) : std::span<const std::size_t>{};
+    const auto width = std::max(1U, texture.width >> first);
+    const auto height = std::max(1U, texture.height >> first);
     EditorTextureAsset gpu_texture{};
     gpu_texture.relative_path = cache_key;
     gpu_texture.semantic = texture.semantic;
     gpu_texture.average_linear = prepared.average_linear;
     gpu_texture.color_space = texture.color_space;
     gpu_texture.gpu_bytes = gpu_bytes;
-    std::uint32_t mip_levels = 1U;
-    if (block_compressed) {
-        mip_levels = texture.mip_levels;
-        if (mip_levels > 1U) {
-            gpu_texture.texture.create_precomputed_mipmapped(
-                *context_,
-                texture.width,
-                texture.height,
-                mip_levels,
-                format,
-                "editor imported material texture");
-        } else {
-            gpu_texture.texture.create(
-                *context_,
-                texture.width,
-                texture.height,
-                format,
-                "editor imported material texture");
-        }
-    } else if (mipmaps_supported) {
-        for (std::uint32_t extent =
-                 std::max(texture.width, texture.height);
-             extent > 1U;
-             extent >>= 1U) {
-            ++mip_levels;
-        }
-        gpu_texture.texture.create_mipmapped(
-            *context_,
-            texture.width,
-            texture.height,
-            mip_levels,
-            format,
-            "editor imported material texture");
+    if (mip_levels == 1) {
+        gpu_texture.texture.create(*context_, width, height, format, "Material texture");
+    } else if (block_compressed) {
+        gpu_texture.texture.create_precomputed_mipmapped(*context_, width, height, mip_levels, format, "BC material texture");
     } else {
-        gpu_texture.texture.create(
-            *context_,
-            texture.width,
-            texture.height,
-            format,
-            "editor imported material texture");
+        gpu_texture.texture.create_mipmapped(*context_, width, height, mip_levels, format, "Material mip chain");
     }
-    const bool use_precomputed_mips = block_compressed
-        ? (mip_levels > 1U)
-        : (mipmaps_supported &&
-           mip_levels > 1U &&
-           !prepared.mip_chain_rgba.empty() &&
-           prepared.mip_byte_offsets.size() == mip_levels);
-    const std::span<const std::uint8_t> upload_pixels = block_compressed
-        ? std::span<const std::uint8_t>{texture.pixels}
-        : (use_precomputed_mips
-              ? std::span<const std::uint8_t>{prepared.mip_chain_rgba}
-              : std::span<const std::uint8_t>{texture.pixels});
-    const std::span<const std::size_t> precomputed_mips = use_precomputed_mips
-        ? (block_compressed
-              ? std::span<const std::size_t>{texture.mip_byte_offsets}
-              : std::span<const std::size_t>{prepared.mip_byte_offsets})
-        : std::span<const std::size_t>{};
     const std::uint32_t upload_element_bytes = block_compressed
         ? texture_block_byte_size(texture.pixel_format)
         : 4U;
@@ -1470,6 +1453,7 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_texture(const Prepare
     editor_texture_asset_lookup_.emplace(
         editor_texture_assets_[texture_index].relative_path, texture_index);
     editor_texture_gpu_bytes_ += gpu_bytes;
+    if (first) ++reduced_textures_;
     return texture_index;
 }
 
@@ -3187,6 +3171,35 @@ bool Renderer::update_editor_scene(
         error = "Scene exceeds the bounded 4096 local-light capacity.";
         return false;
     }
+    if (view.effects.size() > max_scene_effects || (!view.effects.empty() && !fog_supported_)) {
+        error = "VFX requires sampled scene depth and at most 256 visible emitters and projectors.";
+        return false;
+    }
+    unsigned cpu_count = 0, largest_cpu_emitter = 0;
+    for (const auto& effect : view.effects) {
+        if (effect.kind != SceneNodeKind::particle_emitter || !effect.settings.cpu_simulation) continue;
+        const auto count = static_cast<unsigned>(effect.settings.particles);
+        if (count > 4096 || count > max_cpu_particles - cpu_count) { error = "CPU particle capacity exceeded."; return false; }
+        cpu_count += count;
+        largest_cpu_emitter = std::max(largest_cpu_emitter, count);
+    }
+    if (cpu_count) {
+        for (auto& buffer : cpu_particle_buffers_) {
+            if (!buffer) buffer.create(*context_, max_cpu_particles * sizeof(glm::vec4), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                VMA_MEMORY_USAGE_AUTO_PREFER_HOST, VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                VMA_ALLOCATION_CREATE_MAPPED_BIT, "CPU particle instances");
+        }
+        auto random = [](std::uint32_t seed) {
+            seed ^= seed >> 16; seed *= 0x7feb352dU; seed ^= seed >> 15; seed *= 0x846ca68bU;
+            return static_cast<float>(seed >> 8) / 16777216.F;
+        };
+        for (auto i = static_cast<unsigned>(particle_seeds_.size()); i < largest_cpu_emitter; ++i) {
+            const auto seed = i * 5 + 1;
+            const float angle = random(seed+1) * 6.283185F, spread = 0.65F * std::sqrt(random(seed+2));
+            particle_seeds_.emplace_back(std::cos(angle)*spread, 0.5F+random(seed+3), std::sin(angle)*spread, random(seed));
+        }
+        cpu_particles_.resize(cpu_count);
+    }
     const std::size_t ground_count =
         view.has_ground ? 1U : 0U;
     if (view.cubes.size() >
@@ -3242,6 +3255,17 @@ bool Renderer::update_editor_scene(
             return a.asset_path == b.asset_path ? a.detail_aa < b.detail_aa : a.asset_path < b.asset_path;
         });
 
+    // Material descriptors, BLAS alpha tables and textures form one residency group.
+    // Rebuild that group only at a scene boundary when previous assets can be reclaimed.
+    if ((texture_budget_pressure_ || editor_texture_gpu_bytes_ >= texture_budget_ - texture_budget_ / 4) &&
+        std::ranges::any_of(editor_model_assets_, [&](const auto& asset) {
+            return !std::ranges::binary_search(editor_model_sort_scratch_, std::string_view(asset.relative_path), {},
+                [&](std::uint32_t index) { return view.models[index].asset_path; });
+        })) {
+        texture_evictions_ += editor_texture_assets_.size();
+        reset_editor_asset_cache();
+        return update_editor_scene(view, asset_root, error);
+    }
     std::unordered_map<std::string, std::string> batch_load_errors;
     if (!async_assets_ && !editor_model_sort_scratch_.empty()) {
         std::vector<std::string> missing_paths;
@@ -3414,6 +3438,12 @@ bool Renderer::update_editor_scene(
     editor_terrain_visible_ = view.terrain_visible;
     editor_sky_visible_ = view.sky_visible;
     editor_sun_visible_ = view.sun_visible;
+    scene_effects_.clear();
+    for (const auto& effect : view.effects) {
+        if (effect.kind == SceneNodeKind::projected_decal && std::abs(glm::determinant(effect.transform)) < 1e-9F) continue;
+        scene_effects_.push_back({effect, effect.kind == SceneNodeKind::projected_decal
+            ? glm::inverse(effect.transform) : glm::mat4(1.0F)});
+    }
     editor_ocean_visible_ = view.ocean_visible;
     editor_ocean_height_ = view.ocean_height;
     editor_ocean_ = view.ocean;
@@ -3617,9 +3647,9 @@ void Renderer::reset_editor_asset_cache() {
     editor_texture_asset_lookup_.clear();
     editor_model_gpu_bytes_ = 0U;
     editor_texture_gpu_bytes_ = 0U;
+    texture_budget_pressure_ = false;
     editor_material_descriptor_count_ = 0U;
     tessellated_material_count_ = 0U;
-    model_tessellation_enabled_ = false;
     if (editor_material_descriptor_pool_ != VK_NULL_HANDLE) {
         VK_CHECK(vkResetDescriptorPool(
             context_->device(),
@@ -4661,6 +4691,11 @@ void Renderer::detect_msaa_support() {
     fog_supported_ = (sampled_depth & VK_SAMPLE_COUNT_1_BIT) != 0U &&
         (hdr_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) != 0U &&
         (resolve_properties.supportedDepthResolveModes & VK_RESOLVE_MODE_SAMPLE_ZERO_BIT) != 0U;
+    const auto color_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    lens_supported_ = fog_supported_ &&
+        (exact_format_samples(aa_color_format, color_usage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT) &
+            exact_format_samples(aa_color_format, color_usage | VK_IMAGE_USAGE_STORAGE_BIT |
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT) & VK_SAMPLE_COUNT_1_BIT) != 0U;
     VkFormatProperties r32_properties{};
     vkGetPhysicalDeviceFormatProperties(
         context_->physical_device(), VK_FORMAT_R32_SFLOAT, &r32_properties);
@@ -4723,7 +4758,7 @@ void Renderer::create_anti_aliasing_targets() {
             extent.height,
             aa_color_format,
             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                VK_IMAGE_USAGE_SAMPLED_BIT,
+                VK_IMAGE_USAGE_SAMPLED_BIT | (lens_supported_ ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0U),
             VK_IMAGE_ASPECT_COLOR_BIT,
             VK_FILTER_LINEAR,
             "AA scene color");
@@ -4785,8 +4820,8 @@ void Renderer::create_anti_aliasing_targets() {
             extent.height,
             aa_color_format,
             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                VK_IMAGE_USAGE_STORAGE_BIT |
-                VK_IMAGE_USAGE_SAMPLED_BIT,
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                (lens_supported_ ? VK_IMAGE_USAGE_TRANSFER_DST_BIT : 0U),
             VK_IMAGE_ASPECT_COLOR_BIT,
             VK_FILTER_LINEAR,
             "FSR 3 upscaled output");
@@ -6003,11 +6038,8 @@ void Renderer::upload_to_device_texture(
     if (bytes_per_pixel == 0U) {
         fatal("Texture upload bytes-per-pixel must be non-zero.");
     }
-    const bool block_compressed =
-        destination.format() == VK_FORMAT_BC4_UNORM_BLOCK ||
-        destination.format() == VK_FORMAT_BC4_SNORM_BLOCK ||
-        destination.format() == VK_FORMAT_BC7_UNORM_BLOCK ||
-        destination.format() == VK_FORMAT_BC7_SRGB_BLOCK;
+    const bool block_compressed = destination.format() >= VK_FORMAT_BC1_RGB_UNORM_BLOCK &&
+        destination.format() <= VK_FORMAT_BC7_SRGB_BLOCK;
     const auto compute_level_bytes = [&](const std::uint32_t lw, const std::uint32_t lh) -> std::uint64_t {
         if (block_compressed) {
             return ((static_cast<std::uint64_t>(lw) + 3ULL) / 4ULL) *
@@ -6407,11 +6439,125 @@ void Renderer::record_subsurface(
     }
 }
 
-void Renderer::record_fog(
+#if VCR_EDITOR_ENABLED
+void Renderer::draw_scene_effects(VkCommandBuffer command, VkDescriptorSet descriptors, VkExtent2D extent) {
+    struct Push {
+        glm::mat4 transform;
+        glm::vec4 color, parameters, viewport;
+    };
+    static_assert(sizeof(Push) == 112);
+    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, effect_layout_.get(), 0, 1, &descriptors, 0, nullptr);
+    const glm::vec2 size{extent.width, extent.height};
+    const float focal_scale = 1.F / std::tan(glm::radians(vertical_fov_degrees_) * 0.5F);
+    // Project decals onto opaque surfaces first, then composite the particle sprites.
+    std::uint32_t cpu_first = 0;
+    for (auto kind : {SceneNodeKind::projected_decal, SceneNodeKind::particle_emitter}) {
+        const bool emitter = kind == SceneNodeKind::particle_emitter;
+        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            emitter ? particle_pipeline_.get() : decal_pipeline_.get());
+        for (const auto& entry : scene_effects_) {
+            const auto& fx = entry.effect;
+            if (fx.kind != kind) continue;
+            const auto& settings = fx.settings;
+            Push push{emitter ? fx.transform : entry.projector_from_world, fx.color,
+                {settings.lifetime, settings.speed, settings.radius, static_cast<float>(settings.pattern)},
+                {1.F / size.x, 1.F / size.y, focal_scale * size.y / size.x, focal_scale}};
+            VkRect2D scissor{{0, 0}, extent};
+            if (emitter) {
+                push.parameters.w = static_cast<float>(std::fmod(particle_time_seconds_, settings.lifetime));
+            } else {
+                const auto clip = frames_[frame_index_].rendered_view_projection * fx.transform;
+                glm::vec2 lo{1}, hi{-1};
+                for (unsigned i = 0; i < 8; ++i) {
+                    const auto p = clip * glm::vec4((i & 1) ? 0.5F : -0.5F, (i & 2) ? 0.5F : -0.5F,
+                        (i & 4) ? 0.5F : -0.5F, 1);
+                    if (p.w <= 0.001F) { lo = {-1,-1}; hi = {1,1}; break; }
+                    lo = glm::min(lo, glm::vec2(p) / p.w);
+                    hi = glm::max(hi, glm::vec2(p) / p.w);
+                }
+                // One-pixel guard includes jittered raster coverage at the box edges.
+                const glm::ivec2 first = glm::clamp(glm::floor((lo * 0.5F + 0.5F) * size) - 1.F, glm::vec2(0), size);
+                const glm::ivec2 end = glm::clamp(glm::ceil((hi * 0.5F + 0.5F) * size) + 1.F, glm::vec2(0), size);
+                if (end.x <= first.x || end.y <= first.y) continue;
+                scissor = {{first.x, first.y}, {static_cast<unsigned>(end.x-first.x), static_cast<unsigned>(end.y-first.y)}};
+            }
+            vkCmdSetScissor(command, 0, 1, &scissor);
+            vkCmdPushConstants(command, effect_layout_.get(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                0, sizeof(push), &push);
+            const auto count = emitter ? static_cast<unsigned>(settings.particles) : 1U;
+            if (emitter && settings.cpu_simulation) {
+                for (unsigned i = 0; i < count; ++i) {
+                    const auto seed = particle_seeds_[i];
+                    const float phase = glm::fract(push.parameters.w / settings.lifetime + seed.w);
+                    cpu_particles_[cpu_first+i] = glm::vec4(glm::vec3(seed) * (phase * settings.lifetime * settings.speed), phase);
+                }
+                auto& buffer = cpu_particle_buffers_[frame_index_];
+                const VkDeviceSize offset = VkDeviceSize(cpu_first) * sizeof(glm::vec4);
+                buffer.write(std::as_bytes(std::span(cpu_particles_).subspan(cpu_first, count)), offset);
+                const VkBuffer handle = buffer.handle();
+                vkCmdBindVertexBuffers(command, 0, 1, &handle, &offset);
+                vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, cpu_particle_pipeline_.get());
+                cpu_first += count;
+            } else if (emitter) vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, particle_pipeline_.get());
+            vkCmdDraw(command, emitter ? 6 : 3, count, 0, 0);
+        }
+    }
+}
+#endif
+
+#if VCR_EDITOR_ENABLED
+void Renderer::begin_wboit(VkCommandBuffer command, VkExtent2D extent) {
+    auto& aa = anti_aliasing_frames_[frame_index_];
+    const auto target = [&](GpuTexture& texture, VkImageLayout& layout, float clear) {
+        transition_tracked_image(command, texture, layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        return VkRenderingAttachmentInfo{.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = texture.view(),
+            .imageLayout = layout, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = {.color = {{clear, clear, clear, clear}}}};
+    };
+    const std::array attachments{target(aa.fsr_output, aa.fsr_output_layout, 0), target(aa.smaa_weights, aa.weights_layout, 1)};
+    constexpr auto tests = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    transition_tracked_image(command, aa.depth_attachment, aa.depth_attachment_layout, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+        tests, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, tests,
+        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+    const VkRenderingAttachmentInfo depth{.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = aa.depth_attachment.view(), .imageLayout = aa.depth_attachment_layout,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+    const VkRenderingInfo rendering{.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0,0}, extent},
+        .layerCount = 1, .colorAttachmentCount = 2, .pColorAttachments = attachments.data(), .pDepthAttachment = &depth};
+    vkCmdBeginRendering(command, &rendering);
+}
+#endif
+
+void Renderer::record_depth_effect(
     const VkCommandBuffer command_buffer,
     AntiAliasingFrameResources& resources,
-    const VkExtent2D extent) {
-    if (!fog_active()) return;
+    const VkExtent2D extent, const VkPipeline pipeline,
+    const std::span<const std::byte> constants, const bool sample_color) {
+    constexpr auto sampled_stages = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    if (sample_color) {
+        // The current slot's reconstruction target is scratch until SMAA/FSR writes
+        // its new history later in this frame. Previous-frame history is separate.
+        transition_tracked_image(command_buffer, resources.color, resources.color_layout,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sampled_stages | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        transition_tracked_image(command_buffer, resources.fsr_output, resources.fsr_output_layout,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, sampled_stages | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        const VkImageSubresourceLayers layer{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        const VkImageCopy copy{layer, {}, layer, {}, {extent.width, extent.height, 1}};
+        vkCmdCopyImage(command_buffer, resources.color.image(), resources.color_layout,
+            resources.fsr_output.image(), resources.fsr_output_layout, 1, &copy);
+        transition_tracked_image(command_buffer, resources.fsr_output, resources.fsr_output_layout,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    }
     // Fixed-function depth resolve uses COLOR_ATTACHMENT_OUTPUT/COLOR_WRITE,
     // whereas single-sample depth writes use EARLY/LATE_FRAGMENT_TESTS.
     // https://docs.vulkan.org/spec/latest/chapters/renderpass.html#renderpass-resolve-operations
@@ -6427,15 +6573,15 @@ void Renderer::record_fog(
         command_buffer, resources.color, resources.color_layout,
         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
-            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT,
+        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT,
         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
         VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
     const VkRenderingAttachmentInfo attachment{
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
         .imageView = resources.color.view(),
         .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+        .loadOp = sample_color ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD,
         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
     };
     const VkRenderingInfo rendering{
@@ -6445,29 +6591,25 @@ void Renderer::record_fog(
         .colorAttachmentCount = 1U,
         .pColorAttachments = &attachment,
     };
-    const FogPushConstants push{
-        .color_density = glm::vec4(
-            fog_settings_.color[0], fog_settings_.color[1], fog_settings_.color[2],
-            fog_settings_.density),
-        .height_distance = glm::vec4(
-            fog_settings_.base_height, fog_settings_.height_falloff,
-            fog_settings_.start_distance, fog_settings_.maximum_distance),
-        .viewport_opacity = glm::vec4(
-            1.0F / static_cast<float>(extent.width),
-            1.0F / static_cast<float>(extent.height), fog_settings_.maximum_opacity, 0.0F),
-    };
     const VkViewport viewport{0.0F, 0.0F,
         static_cast<float>(extent.width), static_cast<float>(extent.height), 0.0F, 1.0F};
     const VkRect2D scissor{{0, 0}, extent};
     vkCmdBeginRendering(command_buffer, &rendering);
     vkCmdSetViewport(command_buffer, 0U, 1U, &viewport);
     vkCmdSetScissor(command_buffer, 0U, 1U, &scissor);
-    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, fog_pipeline_.get());
-    vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-        post_process_pipeline_layout_, 0U, 1U, &resources.descriptor_set, 0U, nullptr);
-    vkCmdPushConstants(command_buffer, post_process_pipeline_layout_,
-        VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, 0U, sizeof(push), &push);
-    vkCmdDraw(command_buffer, 3U, 1U, 0U, 0U);
+#if VCR_EDITOR_ENABLED
+    if (pipeline == VK_NULL_HANDLE) {
+        draw_scene_effects(command_buffer, resources.descriptor_set, extent);
+    } else
+#endif
+    {
+        vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            post_process_pipeline_layout_, 0U, 1U, &resources.descriptor_set, 0U, nullptr);
+        if (!constants.empty()) vkCmdPushConstants(command_buffer, post_process_pipeline_layout_,
+            VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, 0U, static_cast<std::uint32_t>(constants.size()), constants.data());
+        vkCmdDraw(command_buffer, 3U, 1U, 0U, 0U);
+    }
     vkCmdEndRendering(command_buffer);
     transition_tracked_image(
         command_buffer, resources.color, resources.color_layout,
@@ -7150,7 +7292,7 @@ void Renderer::create_pipeline() {
         .binding = 13U,
         .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
         .descriptorCount = 1U,
-        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
     };
     for (std::uint32_t binding = 14U; binding <= 15U; ++binding) {
         anti_aliasing_bindings[binding] = VkDescriptorSetLayoutBinding{
@@ -7205,6 +7347,15 @@ void Renderer::create_pipeline() {
         &post_process_layout_info,
         nullptr,
         &post_process_pipeline_layout_));
+#if VCR_EDITOR_ENABLED
+    if (fog_supported_) {
+        const VkPushConstantRange effect_range{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 112};
+        VkPipelineLayoutCreateInfo effect_info = post_process_layout_info;
+        effect_info.pPushConstantRanges = &effect_range;
+        VK_CHECK(vkCreatePipelineLayout(context_->device(), &effect_info, nullptr,
+            effect_layout_.put(context_->device(), vkDestroyPipelineLayout)));
+    }
+#endif
     const VkPushConstantRange exposure_push_constants{
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
         .offset = 0U,
@@ -8749,6 +8900,16 @@ void Renderer::create_pipeline() {
                             VK_COLOR_COMPONENT_A_BIT;
                     }
                 }
+                if (std::string_view(fragment_shader).starts_with("editor_model_wboit")) {
+                    auto& sum = attachments[0];
+                    sum.srcColorBlendFactor = sum.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+                    sum.srcAlphaBlendFactor = sum.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+                    auto& reveal = attachments[1];
+                    reveal = sum;
+                    reveal.srcColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+                    reveal.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+                    reveal.colorWriteMask = VK_COLOR_COMPONENT_R_BIT;
+                }
                 blend.pAttachments = attachments.data();
 
                 VkGraphicsPipelineCreateInfo info = base_info;
@@ -8794,6 +8955,25 @@ void Renderer::create_pipeline() {
                         temporal, subsurface, true, samples);
                 }
             };
+        VkFormatProperties reveal_features{};
+        vkGetPhysicalDeviceFormatProperties(context_->physical_device(), smaa_weights_format, &reveal_features);
+        if (fog_supported_ && context_->independent_blend_enabled() &&
+            (reveal_features.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT)) {
+            const std::array formats{aa_color_format, smaa_weights_format};
+            auto rendering = spatial_rendering_info;
+            rendering.colorAttachmentCount = 2;
+            rendering.pColorAttachmentFormats = formats.data();
+            auto info = spatial_sky_info;
+            info.pNext = &rendering;
+            auto blend = *info.pColorBlendState;
+            const std::array attachments{blend.pAttachments[0], blend.pAttachments[0]};
+            blend.attachmentCount = 2;
+            blend.pAttachments = attachments.data();
+            info.pColorBlendState = &blend;
+            create_transparent_pair(transparent_wboit_, info,
+                rt_provisioned_ ? "editor_model_wboit_rt.frag.spv" : "editor_model_wboit.frag.spv",
+                "Weighted blended", false, false);
+        }
         create_transparent_pair(
             transparent_direct_, sky_pipeline_info, transparent_frag_spv,
             "Direct", false, false);
@@ -9029,14 +9209,16 @@ void Renderer::create_pipeline() {
             const std::filesystem::path &fragment_path, const VkFormat output_format,
             const VkPipelineLayout layout,
             const VkPipelineColorBlendAttachmentState &attachment_blend,
-            const VkFormat depth_format, const char *const debug_name) {
+            const VkFormat depth_format, const char *const debug_name,
+            const VkShaderModule vertex_override = VK_NULL_HANDLE,
+            const VkPipelineVertexInputStateCreateInfo* vertex_input_override = nullptr) {
             const VkShaderModule fullscreen_fragment_module =
                 cached_shader(fragment_path);
             const std::array shader_stages{
                 VkPipelineShaderStageCreateInfo{
                     .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                     .stage = VK_SHADER_STAGE_VERTEX_BIT,
-                    .module = fullscreen_vertex_module,
+                    .module = vertex_override ? vertex_override : fullscreen_vertex_module,
                     .pName = "main",
                 },
                 VkPipelineShaderStageCreateInfo{
@@ -9067,7 +9249,7 @@ void Renderer::create_pipeline() {
                 .stageCount =
                     static_cast<std::uint32_t>(shader_stages.size()),
                 .pStages = shader_stages.data(),
-                .pVertexInputState = &sky_vertex_input,
+                .pVertexInputState = vertex_input_override ? vertex_input_override : &sky_vertex_input,
                 .pInputAssemblyState = &input_assembly,
                 .pViewportState = &viewport_state,
                 .pRasterizationState = &fullscreen_rasterization,
@@ -9097,11 +9279,38 @@ void Renderer::create_pipeline() {
         // Fog changes radiance only; preserve scene alpha used by other passes.
         fog_blend_attachment.colorWriteMask =
             VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
+#if VCR_EDITOR_ENABLED
+        if (transparent_wboit_.models.get()) {
+            wboit_composite_ = DeviceObject<VkPipeline>(context_->device(),
+                create_fullscreen_pipeline("wboit_composite.frag.spv", aa_color_format, post_process_pipeline_layout_,
+                    fog_blend_attachment, VK_FORMAT_UNDEFINED, "Composite weighted transparency"), vkDestroyPipeline);
+        }
+        particle_pipeline_ = DeviceObject<VkPipeline>(context_->device(),
+            create_fullscreen_pipeline("particle.frag.spv", aa_color_format, effect_layout_.get(), fog_blend_attachment,
+                VK_FORMAT_UNDEFINED, "Particle billboards", cached_shader("particle.vert.spv")), vkDestroyPipeline);
+        const VkVertexInputBindingDescription binding{0, sizeof(glm::vec4), VK_VERTEX_INPUT_RATE_INSTANCE};
+        const VkVertexInputAttributeDescription attribute{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0};
+        const VkPipelineVertexInputStateCreateInfo input{.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+            .vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = &binding,
+            .vertexAttributeDescriptionCount = 1, .pVertexAttributeDescriptions = &attribute};
+        cpu_particle_pipeline_ = DeviceObject<VkPipeline>(context_->device(),
+            create_fullscreen_pipeline("particle.frag.spv", aa_color_format, effect_layout_.get(), fog_blend_attachment,
+                VK_FORMAT_UNDEFINED, "CPU particle billboards", cached_shader("cpu_particle.vert.spv"), &input), vkDestroyPipeline);
+        decal_pipeline_ = DeviceObject<VkPipeline>(context_->device(),
+            create_fullscreen_pipeline("projected_decal.frag.spv", aa_color_format, effect_layout_.get(), fog_blend_attachment,
+                VK_FORMAT_UNDEFINED, "Projected decals"), vkDestroyPipeline);
+#endif
         fog_pipeline_ = DeviceObject<VkPipeline>(
             context_->device(),
             create_fullscreen_pipeline(
                 "fog.frag.spv", aa_color_format, post_process_pipeline_layout_,
                 fog_blend_attachment, VK_FORMAT_UNDEFINED, "Atmospheric height fog"),
+            vkDestroyPipeline);
+    }
+    if (lens_supported_) {
+        lens_pipeline_ = DeviceObject<VkPipeline>(context_->device(),
+            create_fullscreen_pipeline("camera_lens.frag.spv", aa_color_format, post_process_pipeline_layout_,
+                post_blend_attachment, VK_FORMAT_UNDEFINED, "Camera lens and underwater color"),
             vkDestroyPipeline);
     }
     constexpr std::array<const char*, 4> edge_shader_paths{
@@ -9431,6 +9640,13 @@ void Renderer::destroy_pipeline() noexcept {
     opaque_pipeline_variants_ = {};
     opaque_pipeline_variant_count_ = 0;
 #endif
+#if VCR_EDITOR_ENABLED
+    cpu_particle_pipeline_.reset();
+    particle_pipeline_.reset();
+    decal_pipeline_.reset();
+    effect_layout_.reset();
+#endif
+    lens_pipeline_.reset();
     fog_pipeline_.reset();
     for (std::size_t index = 0U; index < msaa_geometry_.size(); ++index) {
         msaa_geometry_[index] = {};
@@ -9559,6 +9775,8 @@ void Renderer::destroy_pipeline() noexcept {
 #if VCR_EDITOR_ENABLED
     aa_editor_model_pipeline_.reset();
     aa_tessellated_editor_model_pipeline_.reset();
+    transparent_wboit_.reset();
+    wboit_composite_.reset();
     transparent_direct_.reset();
     transparent_spatial_.reset();
     transparent_temporal_.reset();
@@ -9685,6 +9903,7 @@ bool Renderer::draw_frame(
         gpu_grass_elapsed_seconds_ += std::clamp(static_cast<double>(fsr_frame_time_ms_) * 0.001, 0.0, 0.25);
     // Double accumulation avoids frame-rate-dependent loss of small deltas.
 #if VCR_EDITOR_ENABLED
+    if (!scene_effects_.empty() && !lighting_paused_) particle_time_seconds_ += std::clamp(fsr_frame_time_ms_, 0.F, 250.F) * 0.001;
     ocean_time_seconds_ += static_cast<double>(fsr_frame_time_ms_) * 0.001 *
         static_cast<double>(editor_ocean_.wave_speed);
 #endif
@@ -10378,11 +10597,16 @@ void Renderer::record_commands(
             vkCmdSetViewport(command_buffer, 0, 1, &viewport);
             vkCmdSetScissor(command_buffer, 0, 1, &scissor);
         };
+#if VCR_EDITOR_ENABLED
+    wboit_last_frame_ = false;
+#endif
+    bool wboit_recorded = false;
     const auto draw_geometry =
         [this,
          command_buffer,
          &frame,
          &push_constants,
+         &wboit_recorded,
          &set_viewport,
          active_depth_prepass](
             const VkExtent2D extent,
@@ -10906,7 +11130,11 @@ void Renderer::record_commands(
                     }
                 }
                 if (!transparent_draw_order_.empty()) {
-                    std::sort(
+                    if (transparent_pipelines == &transparent_wboit_) {
+                        vkCmdEndRendering(command_buffer);
+                        begin_wboit(command_buffer, extent);
+                        wboit_recorded = wboit_last_frame_ = true;
+                    } else std::sort(
                         transparent_draw_order_.begin(),
                         transparent_draw_order_.end(),
                         [](const TransparentDrawOrderEntry& left,
@@ -11082,7 +11310,23 @@ void Renderer::record_commands(
     const bool editor_frame =
         editor_output_enabled_ && editor_draw_data != nullptr;
 #endif
-    const bool atmospheric_fog_active = fog_active();
+    bool scene_effects_active = false;
+    bool underwater = false;
+#if VCR_EDITOR_ENABLED
+    scene_effects_active = authored_scene_enabled_ && !scene_effects_.empty() && mode_ == RunMode::scene;
+    underwater = authored_scene_enabled_ && editor_ocean_visible_ &&
+        frame.rendered_camera_position.y < editor_ocean_height_;
+#endif
+    const bool lens_active = lens_supported_ && mode_ != RunMode::instancing &&
+        (bloom_enabled_ || camera_focus_state_.active || underwater);
+    bool weighted_transparency = false;
+#if VCR_EDITOR_ENABLED
+    weighted_transparency = use_wboit_ && wboit_composite_.get() && !transparent_model_draw_indices_.empty() &&
+        mode_ == RunMode::scene && !is_msaa(anti_aliasing_.method) && anti_aliasing_.method != AntiAliasingMethod::fsr3 &&
+        !is_temporal_smaa(anti_aliasing_) && motion_blur_mode_actual() == MotionBlurMode::off &&
+        subsurface_mode_actual() != SubsurfaceMode::full_resolution;
+#endif
+    const bool sample_scene_depth = fog_active() || lens_active || scene_effects_active || weighted_transparency;
     const bool motion_blur_active =
         motion_blur_mode_actual() != MotionBlurMode::off;
     const bool motion_blur_before_smaa =
@@ -11339,7 +11583,7 @@ void Renderer::record_commands(
 
     if (anti_aliasing_.method == AntiAliasingMethod::off &&
         (!lighting_settings_.dynamic || mode_ == RunMode::instancing) &&
-        !subsurface_active && !motion_blur_active && !atmospheric_fog_active && (!has_local_aa_draws_ || mode_ == RunMode::instancing)) {
+        !subsurface_active && !motion_blur_active && !sample_scene_depth && (!has_local_aa_draws_ || mode_ == RunMode::instancing)) {
 #if VCR_EDITOR_ENABLED
         hiz_valid_ = false;
 #endif
@@ -11576,7 +11820,7 @@ void Renderer::record_commands(
              hiz_runtime_revision_ != runtime_transforms_.revision() ||
              hiz_document_revision_ != editor_scene_revision_);
 #endif
-        if (!multisampled || atmospheric_fog_active || hiz_build_this_frame) {
+        if (!multisampled || sample_scene_depth || hiz_build_this_frame) {
             transition_tracked_image(
                 command_buffer,
                 aa_resources.depth_attachment,
@@ -11663,19 +11907,19 @@ void Renderer::record_commands(
             .imageView = offscreen_depth_view,
             .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
             .resolveMode = multisampled
-                ? (atmospheric_fog_active
+                ? (sample_scene_depth
                        ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT
                        : (hiz_build_this_frame ? VK_RESOLVE_MODE_MIN_BIT
                                                : VK_RESOLVE_MODE_NONE))
                 : VK_RESOLVE_MODE_NONE,
             .resolveImageView = multisampled &&
-                    (atmospheric_fog_active || hiz_build_this_frame)
+                    (sample_scene_depth || hiz_build_this_frame)
                 ? aa_resources.depth_attachment.view() : VK_NULL_HANDLE,
             .resolveImageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
             .loadOp = active_depth_prepass == DepthPrepass::off
                 ? VK_ATTACHMENT_LOAD_OP_CLEAR
                 : VK_ATTACHMENT_LOAD_OP_LOAD,
-            .storeOp = (atmospheric_fog_active || hiz_build_this_frame) && !multisampled
+            .storeOp = (sample_scene_depth || hiz_build_this_frame) && !multisampled
                 ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
             .clearValue = VkClearValue{.depthStencil = {0.0F, 0}},
         };
@@ -11762,7 +12006,7 @@ void Renderer::record_commands(
                 false,
                 &(multisampled
                     ? transparent_msaa_[sample_index]
-                    : (temporal ? transparent_temporal_ : transparent_spatial_)),
+                    : (temporal ? transparent_temporal_ : weighted_transparency ? transparent_wboit_ : transparent_spatial_)),
                 authored_scene_enabled_
                     ? (temporal ? aa_editor_model_pipeline_ : pipelines.models).get()
                     : (temporal ? aa_scene_pipeline_ : pipelines.scene).get(),
@@ -11822,7 +12066,56 @@ void Renderer::record_commands(
             }
         }
 
-        record_fog(command_buffer, aa_resources, current_render_extent_);
+#if VCR_EDITOR_ENABLED
+        if (wboit_recorded) {
+            const auto finish = [&](GpuTexture& texture, VkImageLayout& layout) {
+                transition_tracked_image(command_buffer, texture, layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            };
+            finish(aa_resources.fsr_output, aa_resources.fsr_output_layout);
+            finish(aa_resources.smaa_weights, aa_resources.weights_layout);
+            record_depth_effect(command_buffer, aa_resources, current_render_extent_, wboit_composite_.get(), {}, false);
+        }
+#endif
+        if (scene_effects_active) {
+            record_depth_effect(command_buffer, aa_resources, current_render_extent_, VK_NULL_HANDLE, {}, false);
+        }
+        if (fog_active()) {
+            const FogPushConstants push{
+                .color_density = glm::vec4(
+                    fog_settings_.color[0], fog_settings_.color[1], fog_settings_.color[2],
+                    fog_settings_.density),
+                .height_distance = glm::vec4(
+                    fog_settings_.base_height, fog_settings_.height_falloff,
+                    fog_settings_.start_distance, fog_settings_.maximum_distance),
+                .viewport_opacity = glm::vec4(
+                    1.0F / static_cast<float>(current_render_extent_.width),
+                    1.0F / static_cast<float>(current_render_extent_.height), fog_settings_.maximum_opacity, 0.0F),
+            };
+            record_depth_effect(command_buffer, aa_resources, current_render_extent_, fog_pipeline_.get(),
+                std::as_bytes(std::span{&push, 1U}), false);
+        }
+        if (lens_active) {
+            const float focal_length = 0.012F / std::tan(glm::radians(vertical_fov_degrees_) * 0.5F);
+            const float focus = std::max(camera_focus_state_.focus_distance_meters, focal_length + 0.001F);
+            const float coc_pixels = camera_focus_state_.active
+                ? focal_length * focal_length * static_cast<float>(current_render_extent_.height) /
+                    (0.048F * std::max(0.7F, camera_focus_state_.aperture_fstop) * (focus - focal_length))
+                : 0.0F;
+            const std::array<glm::vec4, 4> push{{
+                {current_render_extent_.width, current_render_extent_.height, camera_near, camera_far},
+                {focus, coc_pixels, bloom_enabled_ ? 1.0F : 0.0F, underwater ? 1.0F : 0.0F},
+#if VCR_EDITOR_ENABLED
+                {editor_ocean_.color[0], editor_ocean_.color[1], editor_ocean_.color[2], editor_ocean_height_},
+#else
+                {},
+#endif
+                {static_cast<float>(std::fmod(ocean_time_seconds_, 640.0)), 0, 0, 0}
+            }};
+            record_depth_effect(command_buffer, aa_resources, current_render_extent_, lens_pipeline_.get(),
+                std::as_bytes(std::span{push}), true);
+        }
 #if VCR_EDITOR_ENABLED
         if (hiz_build_this_frame) {
             record_hiz_pyramid(command_buffer, frame, aa_resources, current_render_extent_);
@@ -12195,7 +12488,7 @@ void Renderer::record_commands(
 #endif
     }
 
-#if VCR_EDITOR_ENABLED
+#if VCR_EDITOR_ENABLED && !defined(VCR_GAME_RUNTIME_ONLY)
     if (editor_frame) {
         transition_acquired_image(
             command_buffer, swapchain_.images()[image_index]);

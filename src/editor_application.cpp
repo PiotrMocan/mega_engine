@@ -55,6 +55,8 @@ using Json = nlohmann::json;
     case SceneNodeKind::point_light: return "point_light";
     case SceneNodeKind::spot_light: return "spot_light";
     case SceneNodeKind::environment: return "environment";
+    case SceneNodeKind::particle_emitter: return "particle_emitter";
+    case SceneNodeKind::projected_decal: return "projected_decal";
     case SceneNodeKind::ocean: return "ocean";
     case SceneNodeKind::model: return "model";
     }
@@ -776,6 +778,9 @@ void EditorApplication::initialize(const CliOptions& options) {
             resolve_scene_subsurface(options, scene_.subsurface))) {
         fatal("Invalid subsurface mode");
     }
+    renderer_.set_weighted_transparency(options.wboit);
+    renderer_.set_texture_budget(options.texture_budget_mib);
+    if (!renderer_.set_bloom_enabled(options.bloom)) fatal("Bloom is unsupported on this device.");
     if (!renderer_.set_motion_blur_settings(options.motion_blur)) {
         fatal("Invalid motion blur settings for the selected AA mode");
     }
@@ -907,6 +912,7 @@ void EditorApplication::main_loop() {
         }
         ui_.synchronize_renderer(renderer_);
         if (renderer_.poll_assets()) {
+            if (sublevels_.enabled() && ui_.play_state() == EditorPlayState::playing) scene_.mark_content_changed();
             submitted_scene_revision_ = 0;
         }
         if (frame_begin - last_metrics_update_ >= std::chrono::milliseconds(250)) {
@@ -986,6 +992,11 @@ void EditorApplication::main_loop() {
         if (ui_.play_state() == EditorPlayState::edit) {
             ui_.update_sequencer_edit_preview(
                 delta_seconds, scene_, renderer_, camera_);
+        }
+        if (ui_.play_state() == EditorPlayState::playing && sublevels_.enabled()) {
+            std::string error;
+            sublevels_.update(scene_, camera_.position(), error);
+            if (!error.empty()) std::cerr << "Sublevel: " << error << '\n';
         }
         update_scene_snapshot();
         if (ui_.play_state() == EditorPlayState::playing) {
@@ -1097,7 +1108,7 @@ void EditorApplication::bind_game_ui_callbacks() noexcept {
             }
             out_state.sky_enabled = any_sky;
             out_state.exposure_ev = self->renderer_.exposure_settings().compensation_ev;
-            out_state.bloom_enabled = self->ui_bloom_enabled_;
+            out_state.bloom_enabled = self->renderer_.bloom_enabled();
         },
         .cycle_present_mode = [](void* const ud, const int delta) noexcept {
             auto* const self = static_cast<EditorApplication*>(ud);
@@ -1181,7 +1192,7 @@ void EditorApplication::bind_game_ui_callbacks() noexcept {
         },
         .set_bloom_enabled = [](void* const ud, const bool enabled) noexcept {
             auto* const self = static_cast<EditorApplication*>(ud);
-            self->ui_bloom_enabled_ = enabled;
+            static_cast<void>(self->renderer_.set_bloom_enabled(enabled));
         },
         .on_new_game = [](void* const ud) noexcept {
             auto* const self = static_cast<EditorApplication*>(ud);
@@ -1207,6 +1218,7 @@ void EditorApplication::synchronize_gameplay_state() {
 
     if (observed_play_state_ == EditorPlayState::edit &&
         requested_state != EditorPlayState::edit) {
+        sublevels_.configure(ui_.asset_root(), scene_.sublevels);
         gameplay_renderer_bridge_ = make_gameplay_renderer_bridge(renderer_);
         const SkeletalAssetProvider skeletal_provider =
             gameplay_renderer_bridge_.skeletal_provider;
@@ -1290,6 +1302,7 @@ void EditorApplication::synchronize_gameplay_state() {
             nullptr, &gameplay_renderer_bridge_.transform_sink);
         renderer_.snap_runtime_transforms();
     } else if (requested_state == EditorPlayState::edit) {
+        sublevels_.stop();
         pending_gameplay_restart_ = false;
         pending_gameplay_stop_to_edit_ = false;
         gameplay_.stop(

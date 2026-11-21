@@ -58,6 +58,8 @@ enum class SceneNodeKind : std::uint8_t {
     environment,
     model,
     ocean,
+    particle_emitter,
+    projected_decal,
 };
 
 struct SceneTransform {
@@ -69,6 +71,24 @@ struct SceneTransform {
 
 enum class ObjectAntiAliasing : std::uint8_t { asset, off, coverage };
 
+enum class DecalPattern : std::uint8_t { impact, footprint, dirt, puddle };
+struct VfxSettings {
+    int particles = 96;
+    float lifetime = 2.0F;
+    float speed = 1.2F;
+    float radius = 0.08F;
+    DecalPattern pattern = DecalPattern::impact;
+    bool cpu_simulation = false;
+    friend bool operator==(const VfxSettings&, const VfxSettings&) = default;
+};
+inline constexpr std::size_t max_scene_effects = 256;
+struct SceneEffect {
+    glm::mat4 transform{1.0F};
+    glm::vec4 color{1.0F};
+    VfxSettings settings{};
+    SceneNodeKind kind{};
+};
+
 struct SceneNode {
     std::string name;
     // UTF-8 generic path to a .vcrasset.json file, relative to the
@@ -79,9 +99,11 @@ struct SceneNode {
     PbrMaterial material{};
     PunctualLight light{};
     OceanSettings ocean{};
+    VfxSettings vfx{};
     SceneNodeKind kind = SceneNodeKind::folder;
     bool visible = true;
     bool expanded = true;
+    friend bool operator==(const SceneNode&, const SceneNode&) = default;
 };
 
 enum class SceneHierarchyScope : std::uint8_t {
@@ -165,6 +187,7 @@ struct SceneRenderView {
     bool ocean_visible = false;
     float ocean_height = 0.0F;
     OceanSettings ocean{};
+    std::span<const SceneEffect> effects{};
     bool local_lights_overflow = false;
     SceneNodeId ground_id{};
     std::span<const SceneNodeId> cube_ids{};
@@ -176,11 +199,19 @@ struct SceneCameraPose {
     float pitch_radians = 0;
 };
 
+struct SublevelReference {
+    std::string scene_path;
+    glm::vec3 center{};
+    float radius = 64.F;
+    friend bool operator==(const SublevelReference&, const SublevelReference&) = default;
+};
+inline constexpr std::size_t max_sublevels = 64;
 class SceneDocument final {
 public:
     SceneDocument();
 
     // Explicit opt-in preserves legacy documents containing placeholder camera nodes.
+    std::vector<SublevelReference> sublevels{};
     SceneNodeId startup_camera{};
     std::optional<LightingSettings> lighting{};
     std::optional<ToneMapper> tone_mapper{};
@@ -474,6 +505,7 @@ public:
     [[nodiscard]] static SceneDocument make_default();
 
 private:
+    friend class SceneHistoryDelta;
     class DocumentStamp final {
     public:
         DocumentStamp() noexcept;
@@ -539,6 +571,7 @@ private:
     std::vector<Slot> slots_{};
     std::vector<std::uint32_t> free_indices_{};
     std::vector<std::uint32_t> traversal_scratch_{};
+    std::vector<SceneEffect> render_effects_{};
     std::vector<SceneNodeId> render_cube_ids_{};
     std::vector<std::uint32_t> uuid_buckets_{};
     std::size_t uuid_tombstones_ = 0U;

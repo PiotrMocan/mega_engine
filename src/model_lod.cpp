@@ -220,7 +220,7 @@ struct MicroCardComponent {
         auto texture = load_cooked_texture_asset(asset_root, *material.base_color_texture);
         if (texture && texture->pixel_format == CookedTexturePixelFormat::rgba8_unorm) {
             opacity = std::move(texture).value();
-        } else if (texture && texture->pixel_format == CookedTexturePixelFormat::bc7_unorm) {
+        } else if (texture && is_block_compressed_format(texture->pixel_format)) {
             CookedTextureAsset decoded;
             std::string error;
             if (decode_bc_mip0_to_rgba8(*texture, decoded.pixels, error)) {

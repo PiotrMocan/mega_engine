@@ -1,4 +1,6 @@
+#include "world_surface.hpp"
 #include "asset_importer.hpp"
+#include "cooked_texture_asset.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -212,12 +214,46 @@ int main() {
         source_root, filesystem_error);
     std::filesystem::create_directories(
         import_root, filesystem_error);
+    {
+        const std::array<std::uint8_t,12> magic{0xab,'K','T','X',' ','2','0',0xbb,13,10,26,10};
+        std::array<std::uint8_t,160> bytes{};
+        std::copy(magic.begin(),magic.end(),bytes.begin());
+        auto field = [&](std::size_t offset, std::uint32_t value) {
+            std::memcpy(bytes.data()+offset,&value,sizeof(value));
+        };
+        field(12,132); field(16,1); field(20,4); field(24,4); field(36,1); field(40,1);
+        field(48,104); field(52,44); field(80,152); field(88,8); field(96,8);
+        field(104,44); field(112,(40U<<16)|2U); field(116,128U|(1U<<8)|(2U<<16));
+        field(120,0x0303); field(124,8); field(132,63U<<16); field(144,0xffffffffU);
+        const auto source = source_root / "native.ktx2";
+        expect(write_binary(source,std::as_bytes(std::span(bytes))), "write BC1 sRGB import fixture");
+        const auto imported = vcr::import_asset(source,{.asset_root = asset_root});
+        expect(static_cast<bool>(imported), "import KTX2 from the native asset importer");
+        if (imported) {
+            const auto texture = vcr::load_cooked_texture_asset(asset_root,imported->primary_asset);
+            expect(texture && texture->color_space == vcr::CookedTextureColorSpace::srgb &&
+                texture->pixel_format == vcr::CookedTexturePixelFormat::bc1_rgb, "standalone KTX2 inherits native sRGB format");
+        }
+    }
+    {
+        vcr::TerrainCanvas patch;
+        patch.brush(16, 16, 5, 3, -1);
+        patch.brush(16, 16, 5, 0, 2);
+        std::string model, error;
+        expect(vcr::bake_world_surface(asset_root, patch, nullptr, 1, false, model, error), "bake terrain: " + error);
+        vcr::TerrainCanvas reopened;
+        expect(vcr::load_terrain_canvas(asset_root, model, reopened, error) &&
+            reopened.heights == patch.heights && reopened.layers == patch.layers, "reopen painted and sculpted terrain: " + error);
+        const vcr::SplineComponent spline{};
+        expect(vcr::bake_world_surface(asset_root, patch, &spline, 4, true, model, error), "bake river spline: " + error);
+    }
     expect(
         !filesystem_error,
         "source and destination directories are created");
 
     expect(
-        vcr::classify_asset_source("MODEL.FBX") ==
+        vcr::asset_source_is_supported("Packed.KTX2") &&
+            vcr::classify_asset_source("MODEL.FBX") ==
                 AssetSourceKind::model_fbx &&
             vcr::classify_asset_source("mesh.obj") ==
                 AssetSourceKind::model_obj &&

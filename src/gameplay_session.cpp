@@ -841,11 +841,24 @@ bool GameplaySession::update_internal(
             bounds_provider,
             collision_provider,
             true);
-        physics_world_.rebuild_from_scene(
-            scene,
-            player_node_,
-            bounds_provider,
-            collision_provider);
+        if (scene.sublevels.empty()) {
+            physics_world_.rebuild_from_scene(scene, player_node_, bounds_provider, collision_provider);
+        } else {
+            physics_world_.refresh_streamed_scene(scene, player_node_, bounds_provider, collision_provider);
+            // Publishing the authored snapshot replaces renderer and collision transforms.
+            // Restore the live poses of persistent actors, and release retired generations.
+            for (const auto& old : cached_world_nodes_) {
+                if (!scene.valid(old.id)) static_cast<void>(transform_registry_.unregister_node(old.id));
+            }
+            transform_registry_.propagate_hierarchy();
+            const auto& live = transform_registry_.live_world_nodes();
+            for (std::size_t i = 0; i < live.size(); ++i) {
+                const auto id = live.owners()[i];
+                collision_world_.update_collider_transform(id, live.values()[i]);
+                if (transform_sink.apply)
+                    transform_sink.apply(transform_sink.context, id, mat4_to_rows(live.values()[i]));
+            }
+        }
         scene.build_world_nodes(cached_world_nodes_, world_ancestor_scratch_);
         rebuild_world_node_index();
         gameplay_world_.sync_scene(

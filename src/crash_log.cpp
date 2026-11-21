@@ -9,6 +9,7 @@
 #include <cstring>
 #include <ctime>
 #include <exception>
+#include <memory>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -18,6 +19,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <dbghelp.h>
 #endif
 
 namespace vcr {
@@ -27,6 +29,8 @@ constexpr std::size_t kPathBufferSize = 1024;
 constexpr std::size_t kReportBufferSize = 16384;
 
 struct CrashState {
+    // The crash writer owns this buffer while holding write_guard, including on stack overflow.
+    std::array<char, kReportBufferSize> report{};
     std::array<char, 128> app_name{"vcr"};
     std::array<char, 1024> command_line{};
     std::array<char, 1024> last_diagnostic{};
@@ -238,6 +242,24 @@ bool write_file_windows(const wchar_t* path, const char* data, const std::size_t
     return ok != FALSE && written == static_cast<DWORD>(size);
 }
 
+bool write_minidump(const wchar_t* log_path, EXCEPTION_POINTERS* exception) noexcept {
+    std::array<wchar_t, kPathBufferSize> path{};
+    copy_wstr(path.data(), path.size(), log_path);
+    const auto length = std::wcslen(path.data());
+    if (length < 4 || std::wcscmp(path.data() + length - 4, L".log") != 0) return false;
+    copy_wstr(path.data() + length - 4, 5, L".dmp");
+    const HANDLE handle = CreateFileW(path.data(), GENERIC_WRITE, FILE_SHARE_READ,
+        nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    std::unique_ptr<void, decltype(&CloseHandle)> file(handle, CloseHandle);
+    MINIDUMP_EXCEPTION_INFORMATION info{GetCurrentThreadId(), exception, FALSE};
+    if (MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), file.get(),
+            MiniDumpNormal, exception ? &info : nullptr, nullptr, nullptr)) return true;
+    file.reset();
+    DeleteFileW(path.data());
+    return false;
+}
+
 const char* seh_exception_name(const DWORD code) noexcept {
     switch (code) {
     case EXCEPTION_ACCESS_VIOLATION: return "EXCEPTION_ACCESS_VIOLATION";
@@ -423,13 +445,13 @@ void format_timestamp(ReportWriter& writer) noexcept {
 std::filesystem::path write_crash_log_impl(
     const std::string_view category,
     const std::string_view message,
-    const void* seh_pointers_void) noexcept {
+    void* seh_pointers_void, const bool dump = false) noexcept {
     auto& state = crash_state();
     if (state.write_guard.test_and_set(std::memory_order_acq_rel)) {
         return {};
     }
 
-    std::array<char, kReportBufferSize> report{};
+    auto& report = state.report;
     ReportWriter writer{report.data(), report.size(), 0};
 
     writer.append_sv("=== VCR Crash / Fatal Error Log ===\n");
@@ -499,6 +521,14 @@ std::filesystem::path write_crash_log_impl(
     }
     append_stack_trace_windows(writer);
 
+    if (dump) {
+        auto* exception = static_cast<EXCEPTION_POINTERS*>(seh_pointers_void);
+        const bool written = write_minidump(state.primary_log_w.data(), exception) ||
+            write_minidump(state.cwd_log_w.data(), exception) ||
+            write_minidump(state.temp_log_w.data(), exception);
+        writer.append_sv(written ? "Minidump: written\n" : "Minidump: write failed\n");
+    }
+
     std::filesystem::path written_path{};
     if (write_file_windows(state.primary_log_w.data(), report.data(), writer.length)) {
         written_path = std::filesystem::path(state.primary_log_w.data());
@@ -511,6 +541,7 @@ std::filesystem::path write_crash_log_impl(
     return written_path;
 #else
     (void)seh_pointers_void;
+    (void)dump;
     std::filesystem::path written_path{};
     const char* candidates[2] = {state.primary_log.data(), state.cwd_log.data()};
     for (const char* candidate : candidates) {
@@ -541,7 +572,8 @@ std::filesystem::path write_crash_log_impl(
             message = "std::terminate called with unknown active exception";
         }
     }
-    write_crash_log_impl("std::terminate", message, nullptr);
+    write_crash_log_impl("std::terminate", message, nullptr, true);
+    std::signal(SIGABRT, SIG_DFL);
     std::abort();
 }
 
@@ -554,7 +586,7 @@ void signal_handler(const int sig) noexcept {
     case SIGFPE: name = "SIGFPE"; break;
     default: break;
     }
-    write_crash_log_impl("Signal", name, nullptr);
+    write_crash_log_impl("Signal", name, nullptr, true);
     std::signal(sig, SIG_DFL);
     std::raise(sig);
 }
@@ -564,7 +596,7 @@ LONG WINAPI seh_exception_filter(EXCEPTION_POINTERS* exception_info) noexcept {
     write_crash_log_impl(
         "Unhandled SEH Exception",
         "Native hardware/OS exception",
-        exception_info);
+        exception_info, true);
     return EXCEPTION_EXECUTE_HANDLER;
 }
 #endif

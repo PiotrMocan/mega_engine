@@ -1,3 +1,5 @@
+#include "vfx_json.hpp"
+#include "project_system.hpp"
 #include "scene_io.hpp"
 #include "scene_component_json.hpp"
 
@@ -42,6 +44,8 @@ using Json = nlohmann::json;
     case SceneNodeKind::point_light: return "point_light";
     case SceneNodeKind::spot_light: return "spot_light";
     case SceneNodeKind::environment: return "environment";
+    case SceneNodeKind::particle_emitter: return "particle_emitter";
+    case SceneNodeKind::projected_decal: return "projected_decal";
     case SceneNodeKind::ocean: return "ocean";
     }
     return "folder";
@@ -53,6 +57,8 @@ using Json = nlohmann::json;
     if (value == "cube") return SceneNodeKind::cube;
     if (value == "model") return SceneNodeKind::model;
     if (value == "ground") return SceneNodeKind::ground;
+    if (value == "particle_emitter") return SceneNodeKind::particle_emitter;
+    if (value == "projected_decal") return SceneNodeKind::projected_decal;
     if (value == "ocean") return SceneNodeKind::ocean;
     if (value == "terrain") return SceneNodeKind::terrain;
     if (value == "camera") return SceneNodeKind::camera;
@@ -884,6 +890,18 @@ bool save_scene_file(
             {"low_percentile", e.low_percentile}, {"high_percentile", e.high_percentile},
             {"brighten_seconds", e.brighten_seconds}, {"darken_seconds", e.darken_seconds}};
     }
+    if (scene.sublevels.size() > max_sublevels) { error = "Too many sublevels."; return false; }
+    for (auto it = scene.sublevels.begin(); it != scene.sublevels.end(); ++it) {
+        const auto& level = *it;
+        if (std::any_of(scene.sublevels.begin(), it, [&](const auto& other) { return other.scene_path == level.scene_path; }) ||
+            !valid_project_scene_relative_path(level.scene_path) || !std::isfinite(level.radius) ||
+            level.radius <= 0 || level.radius > 100000 || !std::isfinite(level.center.x) ||
+            !std::isfinite(level.center.y) || !std::isfinite(level.center.z)) {
+            error = "Invalid sublevel reference."; return false;
+        }
+        metadata["sublevels"].push_back({{"scene",level.scene_path},{"center",{level.center.x,level.center.y,level.center.z}},
+            {"radius",level.radius}});
+    }
     if (scene.fog) {
         if (!valid_fog_settings(*scene.fog)) {
             error = "Scene fog settings are invalid.";
@@ -961,6 +979,14 @@ bool save_scene_file(
             encoded["asset_path"] = node.asset_path;
             if (node.detail_aa != ObjectAntiAliasing::asset)
                 encoded["detail_aa"] = node.detail_aa == ObjectAntiAliasing::coverage ? "coverage" : "off";
+        }
+        if (node.kind == SceneNodeKind::particle_emitter || node.kind == SceneNodeKind::projected_decal) {
+            encoded["vfx"] = encode_vfx(node.vfx, node.kind);
+            VfxSettings checked{};
+            if (!read_vfx(encoded["vfx"], node.kind, checked)) {
+                error = "Invalid visual effect parameters.";
+                return false;
+            }
         }
         if (node.kind == SceneNodeKind::ocean) {
             encoded["ocean"] = ocean_json(node.ocean);
@@ -1274,6 +1300,11 @@ bool load_scene_file(
                     color[3]},
             };
             PunctualLight light{};
+            VfxSettings vfx{};
+            if (encoded.contains("vfx") && !read_vfx(encoded["vfx"], *kind, vfx)) {
+                error = "Invalid visual effect parameters.";
+                return false;
+            }
             OceanSettings ocean{};
             if (encoded.contains("ocean") &&
                 (*kind != SceneNodeKind::ocean || !read_ocean(encoded["ocean"], ocean))) {
@@ -1683,6 +1714,7 @@ bool load_scene_file(
             node->get().material = material;
             node->get().light = light;
             node->get().ocean = ocean;
+            node->get().vfx = vfx;
             node->get().asset_path = std::move(asset_path);
             node->get().detail_aa = detail_aa;
             ids.push_back(id);
@@ -1779,6 +1811,26 @@ bool load_scene_file(
                 return false;
             }
             loaded.exposure = e;
+        }
+        if (root.contains("sublevels")) {
+            const auto& refs = root["sublevels"];
+            if (!refs.is_array() || refs.size() > max_sublevels) { error = "Invalid sublevel list."; return false; }
+            for (const auto& ref : refs) {
+                SublevelReference level;
+                level.scene_path = ref.at("scene").get<std::string>();
+                level.radius = ref.at("radius").get<float>();
+                const auto& c = ref.at("center");
+                if (!valid_project_scene_relative_path(level.scene_path) || !c.is_array() || c.size() != 3 ||
+                    !std::isfinite(level.radius) || level.radius <= 0 || level.radius > 100000 ||
+                    std::ranges::any_of(loaded.sublevels, [&](const auto& r) { return r.scene_path == level.scene_path; })) {
+                    error = "Invalid or duplicate sublevel reference."; return false;
+                }
+                level.center = {c.at(0).get<float>(),c.at(1).get<float>(),c.at(2).get<float>()};
+                if (!std::isfinite(level.center.x) || !std::isfinite(level.center.y) || !std::isfinite(level.center.z)) {
+                    error = "Invalid sublevel center."; return false;
+                }
+                loaded.sublevels.push_back(std::move(level));
+            }
         }
         if (root.contains("fog")) {
             FogSettings settings;

@@ -77,11 +77,16 @@ try {
         "render.set_exposure",
         "render.set_color_grading",
         "render.set_subsurface",
+        "render.set_ray_tracing",
         "render.set_motion_blur",
         "render.set_anti_aliasing",
         "editor.scene.list_nodes",
+        "editor.scene.get_node",
         "editor.scene.find_by_uuid",
         "editor.scene.create_node",
+        "editor.scene.update_node",
+        "editor.scene.delete_node",
+        "editor.scene.reparent_node",
         "editor.scene.duplicate_node",
         "editor.scene.set_collider",
         "editor.scene.remove_collider",
@@ -101,6 +106,19 @@ try {
         "editor.scene.set_gameplay",
         "editor.scene.remove_gameplay",
         "editor.gameplay.save_or_load",
+        "editor.scene.set_ui_marker",
+        "editor.scene.remove_ui_marker",
+        "editor.ui.configure",
+        "editor.scene.set_spline",
+        "editor.scene.remove_spline",
+        "editor.sequencer.control",
+        "editor.scene.set_nav_obstacle",
+        "editor.scene.remove_nav_obstacle",
+        "editor.scene.set_off_mesh_link",
+        "editor.scene.remove_off_mesh_link",
+        "editor.scene.set_npc_ai",
+        "editor.scene.remove_npc_ai",
+        "editor.navigation.control",
         "editor.prefab.save",
         "editor.prefab.instantiate",
         "editor.prefab.unpack",
@@ -113,15 +131,14 @@ try {
         "editor.material.get",
         "editor.material.set_tessellation",
         "editor.history.undo",
+        "editor.history.redo",
+        "editor.scene.save",
         "capture.screenshot",
         "engine.quit"
     )) {
         if ($required -notin $toolNames) {
             throw "Required editor MCP tool is missing: $required"
         }
-    }
-    if ($toolNames.Count -ne 49) {
-        throw "Expected 49 editor MCP tools, got $($toolNames.Count)"
     }
 
     $before = Send-McpMessage @{

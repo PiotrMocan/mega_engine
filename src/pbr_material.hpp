@@ -61,6 +61,7 @@ struct PbrMaterial {
     MaterialModel model = MaterialModel::standard;
     SubsurfaceProfile subsurface_profile = SubsurfaceProfile::none;
     float subsurface_strength = 0.0F;
+    friend bool operator==(const PbrMaterial&, const PbrMaterial&) = default;
 };
 
 [[nodiscard]] constexpr bool is_vegetation_material(const PbrMaterial& material) noexcept {

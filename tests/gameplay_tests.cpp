@@ -572,6 +572,12 @@ int main() {
             touched_ground && max_rebound_y > 2.8F,
             "high-restitution dynamic sphere rebounds strongly off static ground");
 
+        const auto before_stream = physics.body_state(bouncy_ball);
+        physics.refresh_streamed_scene(scene);
+        const auto after_stream = physics.body_state(bouncy_ball);
+        expect(before_stream && after_stream && after_stream->position == before_stream->position &&
+            after_stream->linear_velocity == before_stream->linear_velocity,
+            "streaming preserves simulated bodies and velocities");
         // Step another 3 seconds so stacked crates settle and sleep:
         for (int frame = 0; frame < 180; ++frame) {
             physics.step(1.0F / 60.0F, static_world);

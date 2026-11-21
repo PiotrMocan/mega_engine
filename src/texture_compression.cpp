@@ -11,6 +11,11 @@
 #ifdef _MSC_VER
 #pragma warning(push, 0)
 #endif
+#include "texture_bc_formats.hpp"
+#define BCDEC_IMPLEMENTATION
+#define BCDEC_BC4BC5_PRECISE
+#define BCDEC_STATIC
+#include <bcdec.h>
 #include <bc7decomp.h>
 #include <bc7enc.h>
 #include <rgbcx.h>
@@ -480,6 +485,105 @@ bool compute_bc_mip_layout(
     return out_total_bytes <= std::numeric_limits<std::size_t>::max();
 }
 
+bool decode_ktx2_bytes(std::span<const std::uint8_t> bytes, const CookedTextureLoadOptions& options,
+    CookedTextureAsset& asset, std::string& error) {
+    constexpr std::array<std::uint8_t, 12> magic{0xab, 'K','T','X',' ','2','0',0xbb,13,10,26,10};
+    if (bytes.size() < 80 || !std::equal(magic.begin(), magic.end(), bytes.begin())) {
+        error = "Invalid KTX2 identifier or truncated header.";
+        return false;
+    }
+    const auto u32 = [&](std::size_t offset) { return read_le_u32(bytes.data() + offset); };
+    const auto u64 = [&](std::size_t offset) {
+        return static_cast<std::uint64_t>(u32(offset)) | (static_cast<std::uint64_t>(u32(offset+4)) << 32);
+    };
+    const auto vk = u32(12), w = u32(20), h = u32(24), levels = u32(40);
+    const std::uint64_t level_index_end = 80ULL + 24ULL * levels;
+    if (!w || !h || w > options.maximum_dimension || h > options.maximum_dimension ||
+        std::uint64_t(w) * h > options.maximum_pixels || u32(16) != 1 || u32(28) || u32(32) ||
+        u32(36) != 1 || !levels || levels > compute_full_mip_levels(w,h) || u32(44) ||
+        u64(64) || u64(72) || level_index_end > bytes.size()) {
+        error = "KTX2 requires a bounded, non-supercompressed 2D BC mip chain.";
+        return false;
+    }
+    const auto entry = std::ranges::find_if(bc_formats, [&](const auto& candidate) {
+        return vk != VK_FORMAT_UNDEFINED && (vk == bc_vk_format(candidate.format, asset.color_space) ||
+            (asset.color_space == CookedTextureColorSpace::unspecified && vk == candidate.srgb));
+    });
+    if (entry == std::end(bc_formats)) {
+        error = "KTX2 VkFormat is unsupported or differs from the declared color space.";
+        return false;
+    }
+    auto range = [&](std::uint64_t offset, std::uint64_t count) {
+        return offset <= bytes.size() && count <= bytes.size() - offset;
+    };
+    const std::size_t dfd = u32(48), dfd_size = u32(52), kvd = u32(56), kvd_size = u32(60);
+    if (dfd < level_index_end || dfd % 4 || dfd_size < 44 || !range(dfd, dfd_size) ||
+        u32(dfd) != dfd_size || (kvd_size == 0 ? kvd != 0 :
+            (kvd % 4 || kvd < std::uint64_t(dfd) + dfd_size || !range(kvd, kvd_size)))) {
+        error = "Invalid KTX2 metadata offsets.";
+        return false;
+    }
+    const auto descriptor = u32(dfd + 8);
+    const auto block_size = descriptor >> 16;
+    if (u32(dfd + 4) != 0 || (descriptor & 65535) != 2 || block_size < 40 ||
+        (block_size - 24) % 16 != 0 || block_size > dfd_size - 4 ||
+        u32(dfd + 16) != 0x0303 || u32(dfd + 20) != texture_block_byte_size(entry->format) ||
+        u32(dfd + 24) != 0) {
+        error = "KTX2 data format descriptor does not describe native 4x4 BC blocks.";
+        return false;
+    }
+    const std::size_t kv_end = std::size_t(kvd) + kvd_size;
+    for (std::size_t pos = kvd; pos < kv_end;) {
+        if (kv_end - pos < 4) { error = "Truncated KTX2 key length."; return false; }
+        const auto length = u32(pos);
+        pos += 4;
+        const auto padded = (std::size_t(length) + 3) & ~std::size_t(3);
+        if (padded > kv_end - pos) { error = "Truncated KTX2 key/value."; return false; }
+        const std::string_view pair(reinterpret_cast<const char*>(bytes.data()+pos), length);
+        const auto key_end = pair.find(char(0));
+        if (key_end == pair.npos || !key_end) { error = "Invalid KTX2 metadata key."; return false; }
+        auto value = pair.substr(key_end+1);
+        if (!value.empty() && !value.back()) value.remove_suffix(1);
+        const auto key = pair.substr(0,key_end);
+        if ((key == "KTXorientation" && value != "rd") || (key == "KTXswizzle" && value != "rgba")) {
+            error = "Unsupported KTX2 image orientation or swizzle.";
+            return false;
+        }
+        pos += padded;
+    }
+    const std::uint64_t metadata_end = kvd_size ? std::uint64_t(kvd) + kvd_size : std::uint64_t(dfd) + dfd_size;
+    std::vector<std::size_t> offsets;
+    std::uint64_t total = 0;
+    if (!compute_bc_mip_layout(w, h, levels, entry->format, offsets, total) || total > options.maximum_decoded_bytes ||
+        bytes.size() > options.maximum_working_bytes || total > options.maximum_working_bytes - bytes.size()) {
+        error = "KTX2 exceeds texture memory limits.";
+        return false;
+    }
+    std::uint64_t previous_offset = bytes.size();
+    for (std::size_t i = 0; i < levels; ++i) {
+        const auto offset = u64(80 + i*24), length = u64(88 + i*24);
+        const auto expected = (i+1 == levels ? total : offsets[i+1]) - offsets[i];
+        if (length != expected || u64(96 + i*24) != expected || offset < metadata_end ||
+            offset % texture_block_byte_size(entry->format) || offset > previous_offset || length > previous_offset-offset) {
+            error = "KTX2 mip size, order or alignment is invalid.";
+            return false;
+        }
+        previous_offset = offset;
+    }
+    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(total));
+    for (std::size_t i = 0; i < levels; ++i)
+        std::memcpy(pixels.data()+offsets[i], bytes.data()+u64(80+i*24), static_cast<std::size_t>(u64(88+i*24)));
+    asset.width = w;
+    asset.height = h;
+    asset.mip_levels = levels;
+    asset.pixel_format = entry->format;
+    asset.color_space = vk == entry->srgb ? CookedTextureColorSpace::srgb : CookedTextureColorSpace::linear;
+    asset.row_stride_bytes = 0;
+    asset.mip_byte_offsets = std::move(offsets);
+    asset.pixels = std::move(pixels);
+    return true;
+}
+
 bool cook_texture_to_vcrtex(
     const CookedTextureAsset& rgba8_mip0,
     const float alpha_cutoff,
@@ -491,7 +595,7 @@ bool cook_texture_to_vcrtex(
     out_mip_levels = 0U;
     out_error.clear();
 
-    if (!is_block_compressed_format(target_format)) {
+    if (target_format != CookedTexturePixelFormat::bc4_unorm && target_format != CookedTexturePixelFormat::bc7_unorm) {
         out_error = "Target texture format must be block-compressed.";
         return false;
     }
@@ -648,6 +752,10 @@ bool decode_vcrtex_bytes(
     }
 
     const std::uint32_t encoded_format = read_le_u32(file_bytes.data() + 8U);
+    if (expected_format != CookedTexturePixelFormat::bc4_unorm && expected_format != CookedTexturePixelFormat::bc7_unorm) {
+        out_error = "Unsupported vcrtex format.";
+        return false;
+    }
     const std::uint32_t expected_code = expected_format == CookedTexturePixelFormat::bc7_unorm
         ? vcrtex_format_bc7
         : vcrtex_format_bc4;
@@ -772,8 +880,37 @@ bool decode_bc_mip0_to_rgba8(
                     out_rgba8.clear();
                     return false;
                 }
-            } else {
+            } else if (texture.pixel_format == CookedTexturePixelFormat::bc4_unorm) {
                 rgbcx::unpack_bc4(block_ptr, bc4_pixels.data(), 4U);
+            } else {
+                using F = CookedTexturePixelFormat;
+                // The compressed source is byte-aligned. The decoder reads aligned machine words.
+                alignas(8) std::array<std::uint8_t, 16> block{};
+                std::memcpy(block.data(), block_ptr, block_bytes);
+                auto* pixels = bc7_pixels.data();
+                if (texture.pixel_format == F::bc1_rgb || texture.pixel_format == F::bc1_rgba) {
+                    bcdec_bc1(block.data(), pixels, 16);
+                    if (texture.pixel_format == F::bc1_rgb) for (auto& p : bc7_pixels) p.a = 255;
+                } else if (texture.pixel_format == F::bc2) bcdec_bc2(block.data(), pixels, 16);
+                else if (texture.pixel_format == F::bc3) bcdec_bc3(block.data(), pixels, 16);
+                else {
+                    std::array<float, 48> channels{};
+                    int count = 3;
+                    if (texture.pixel_format == F::bc4_snorm) {
+                        count = 1;
+                        bcdec_bc4_float(block.data(), channels.data(), 4, 1);
+                    } else if (texture.pixel_format == F::bc5 || texture.pixel_format == F::bc5_snorm) {
+                        count = 2;
+                        bcdec_bc5_float(block.data(), channels.data(), 8, texture.pixel_format == F::bc5_snorm);
+                    } else bcdec_bc6h_float(block.data(), channels.data(), 12, texture.pixel_format == F::bc6h_sfloat);
+                    auto byte = [](float v) { return static_cast<std::uint8_t>(std::clamp(v, 0.F, 1.F) * 255.F + 0.5F); };
+                    for (std::size_t i = 0; i < 16; ++i) {
+                        pixels[i].r = byte(channels[i*count]);
+                        pixels[i].g = count > 1 ? byte(channels[i*count+1]) : 0;
+                        pixels[i].b = count > 2 ? byte(channels[i*count+2]) : 0;
+                        pixels[i].a = 255;
+                    }
+                }
             }
 
             for (std::uint32_t py = 0U; py < 4U; ++py) {
@@ -789,7 +926,7 @@ bool decode_bc_mip0_to_rgba8(
                     const std::size_t dst_off =
                         (static_cast<std::size_t>(y) * texture.width + x) * 4U;
                     const std::size_t local_idx = static_cast<std::size_t>(py) * 4U + px;
-                    if (texture.pixel_format == CookedTexturePixelFormat::bc7_unorm) {
+                    if (texture.pixel_format != CookedTexturePixelFormat::bc4_unorm) {
                         out_rgba8[dst_off + 0U] = bc7_pixels[local_idx].r;
                         out_rgba8[dst_off + 1U] = bc7_pixels[local_idx].g;
                         out_rgba8[dst_off + 2U] = bc7_pixels[local_idx].b;

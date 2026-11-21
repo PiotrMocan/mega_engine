@@ -104,6 +104,9 @@ struct CliOptions {
     ModelVertexFormat model_vertex_format = ModelVertexFormat::automatic;
     LodFadePattern lod_fade = LodFadePattern::off;
     bool lod_fade_override = false;
+    uint32_t texture_budget_mib = 0;
+    bool wboit = false;
+    bool bloom = false;
     MotionBlurSettings motion_blur{};
     LocalLightBackend local_light_backend = LocalLightBackend::automatic;
     float lod_fade_seconds = 0.25F;

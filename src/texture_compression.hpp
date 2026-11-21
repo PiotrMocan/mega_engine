@@ -39,6 +39,9 @@ inline constexpr std::size_t vcrtex_header_bytes = 40U;
     std::uint32_t& out_mip_levels,
     std::string& out_error);
 
+[[nodiscard]] bool decode_ktx2_bytes(std::span<const std::uint8_t> bytes,
+    const CookedTextureLoadOptions& options, CookedTextureAsset& asset, std::string& error);
+
 /// Validates and parses a `.vcrtex` container into `asset` (setting dimensions,
 /// mip offsets, average_linear, and compressed block payload).
 [[nodiscard]] bool decode_vcrtex_bytes(

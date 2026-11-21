@@ -310,6 +310,12 @@ public:
         MotionBlurSettings settings) noexcept;
     [[nodiscard]] bool set_fog_settings(const FogSettings& settings) noexcept;
     [[nodiscard]] const FogSettings& fog_settings() const noexcept { return fog_settings_; }
+    [[nodiscard]] bool bloom_enabled() const noexcept { return bloom_enabled_; }
+    [[nodiscard]] bool set_bloom_enabled(bool enabled) noexcept {
+        if (enabled && !lens_supported_) return false;
+        bloom_enabled_ = enabled;
+        return true;
+    }
     [[nodiscard]] bool fog_supported() const noexcept { return fog_supported_; }
     [[nodiscard]] bool fog_active() const noexcept {
         return fog_supported_ && fog_settings_.enabled &&
@@ -419,6 +425,12 @@ public:
         SceneTransform& recommended_transform,
         std::string& error);
     void enable_async_assets();
+    void set_texture_budget(std::uint32_t mib);
+    bool weighted_transparency_active() const noexcept { return wboit_last_frame_; }
+    VkDeviceSize texture_budget() const noexcept { return texture_budget_; }
+    std::uint64_t texture_evictions() const noexcept { return texture_evictions_; }
+    std::uint64_t reduced_textures() const noexcept { return reduced_textures_; }
+    void set_weighted_transparency(bool enabled) noexcept { use_wboit_ = enabled; }
     // Pump only at the resource/frame boundary, before building draw packets.
     [[nodiscard]] bool poll_assets();
     [[nodiscard]] bool assets_pending() const noexcept {
@@ -782,10 +794,8 @@ private:
     void destroy_anti_aliasing_targets() noexcept;
     void create_display_mapping_resources();
     void destroy_display_mapping_resources() noexcept;
-    void record_fog(
-        VkCommandBuffer command_buffer,
-        AntiAliasingFrameResources& resources,
-        VkExtent2D extent);
+    void record_depth_effect(VkCommandBuffer command_buffer, AntiAliasingFrameResources& resources,
+        VkExtent2D extent, VkPipeline pipeline, std::span<const std::byte> constants, bool sample_color);
     void record_auto_exposure(
         VkCommandBuffer command_buffer,
         FrameContext& frame,
@@ -914,6 +924,8 @@ private:
     float lod_fade_seconds_ = 0.25F;
     bool lighting_paused_ = false;
     bool fog_supported_ = false;
+    bool lens_supported_ = false;
+    bool bloom_enabled_ = false;
     bool hiz_supported_ = false;
     bool hiz_msaa_min_resolve_ = false;
     LightingStatistics lighting_statistics_{};
@@ -926,6 +938,7 @@ private:
     DeviceObject<VkImageView> voxel_storage_view_{};
     DeviceObject<VkPipeline> tonemap_pipeline_{};
     DeviceObject<VkPipeline> fog_pipeline_{};
+    DeviceObject<VkPipeline> lens_pipeline_{};
     DeviceObject<VkPipeline> exposure_histogram_pipeline_{};
     DeviceObject<VkPipeline> exposure_adapt_pipeline_{};
     DeviceObject<VkPipeline> subsurface_horizontal_pipeline_{};
@@ -1051,6 +1064,10 @@ private:
         std::uint32_t draw_index = 0U;
         float distance_sq = 0.0F;
     };
+    TransparentModelPipelines transparent_wboit_{};
+    DeviceObject<VkPipeline> wboit_composite_{};
+    bool use_wboit_ = false, wboit_last_frame_ = false;
+    void begin_wboit(VkCommandBuffer command, VkExtent2D extent);
     TransparentModelPipelines transparent_direct_{};
     TransparentModelPipelines transparent_spatial_{};
     TransparentModelPipelines transparent_temporal_{};
@@ -1300,6 +1317,9 @@ private:
     VkDeviceSize editor_material_emissive_stride_ = 0U;
     VkDeviceSize editor_model_gpu_bytes_ = 0U;
     VkDeviceSize editor_texture_gpu_bytes_ = 0U;
+    VkDeviceSize texture_budget_ = maximum_editor_texture_gpu_bytes;
+    bool texture_budget_pressure_ = false;
+    std::uint64_t texture_evictions_ = 0, reduced_textures_ = 0;
     std::uint32_t editor_material_descriptor_count_ = 0U;
     std::uint32_t tessellated_material_count_ = 0U;
     bool model_tessellation_enabled_ = false;
@@ -1315,6 +1335,18 @@ private:
     bool editor_terrain_visible_ = false;
     bool editor_sky_visible_ = false;
     bool editor_sun_visible_ = false;
+    struct RenderEffect {
+        SceneEffect effect;
+        glm::mat4 projector_from_world{1.F};
+    };
+    std::vector<RenderEffect> scene_effects_{};
+    double particle_time_seconds_ = 0;
+    DeviceObject<VkPipelineLayout> effect_layout_{};
+    DeviceObject<VkPipeline> particle_pipeline_{}, cpu_particle_pipeline_{}, decal_pipeline_{};
+    static constexpr std::uint32_t max_cpu_particles = 65536;
+    std::array<GpuBuffer, max_frames_in_flight> cpu_particle_buffers_{};
+    std::vector<glm::vec4> particle_seeds_{}, cpu_particles_{};
+    void draw_scene_effects(VkCommandBuffer command, VkDescriptorSet descriptors, VkExtent2D extent);
     bool editor_ocean_visible_ = false;
     float editor_ocean_height_ = 0.0F;
     OceanSettings editor_ocean_{};

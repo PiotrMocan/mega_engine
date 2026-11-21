@@ -1,4 +1,5 @@
 #include "asset_preparation.hpp"
+#include "job_system.hpp"
 #include "model_lod.hpp"
 #include "gpu_grass.hpp"
 #include "opacity_micromap.hpp"
@@ -190,37 +191,6 @@ void for_each_material_texture_request(const CookedModelMaterial &material, Fn &
     fn(material.emissive_texture, false, false, 0.0F);
 }
 
-template <typename Fn>
-void run_parallel_indexed(
-    const std::size_t worker_count,
-    const std::size_t item_count,
-    Fn &&fn) {
-    if (item_count == 0U) {
-        return;
-    }
-    const std::size_t effective_workers = std::min(worker_count, item_count);
-    if (effective_workers <= 1U) {
-        for (std::size_t i = 0U; i < item_count; ++i) {
-            fn(i);
-        }
-        return;
-    }
-    std::atomic<std::size_t> next_index{0U};
-    std::vector<std::jthread> workers;
-    workers.reserve(effective_workers);
-    for (std::size_t w = 0U; w < effective_workers; ++w) {
-        workers.emplace_back([&next_index, item_count, &fn]() {
-            for (;;) {
-                const std::size_t index =
-                    next_index.fetch_add(1U, std::memory_order_relaxed);
-                if (index >= item_count) {
-                    return;
-                }
-                fn(index);
-            }
-        });
-    }
-}
 } // namespace
 
 void build_texture_mip_chain(
@@ -675,14 +645,6 @@ BatchPreparedAssets prepare_model_assets_batch(
         return batch;
     }
 
-    const unsigned hw_threads = std::thread::hardware_concurrency();
-    const std::size_t max_workers =
-        std::max<std::size_t>(1U, hw_threads > 1U ? hw_threads - 1U : 1U);
-    const std::size_t worker_count =
-        model_paths.size() == 1U
-            ? 1U
-            : std::min<std::size_t>(model_paths.size(), max_workers);
-
     struct ModelTextureRequest {
         std::filesystem::path reference{};
         std::string key{};
@@ -695,7 +657,7 @@ BatchPreparedAssets prepare_model_assets_batch(
     std::vector<std::vector<ModelTextureRequest>> per_model_tex_reqs(model_paths.size());
 
     // Pass 1: Parallel Geometry & LOD prep into disjoint per-model slots.
-    run_parallel_indexed(worker_count, model_paths.size(), [&](const std::size_t i) {
+    parallel_for_jobs(model_paths.size(), [&](const std::size_t i) {
         PreparedModel &entry = batch.models[i];
         entry.root = root;
         entry.path = model_paths[i];
@@ -730,7 +692,7 @@ BatchPreparedAssets prepare_model_assets_batch(
             entry.model.reset();
             entry.error = e.what();
         }
-    });
+    }, model_paths.size());
 
     // Pass 2: Deduplicate unique texture jobs across all valid models.
     TransparentStringSet resident_tex_set;
@@ -790,7 +752,7 @@ BatchPreparedAssets prepare_model_assets_batch(
     // Pass 3: Parallel Unique Texture Decode, Mipgen & Alpha Pack.
     std::vector<std::optional<PreparedTexture>> tex_results(unique_jobs.size());
     std::vector<std::optional<PreparedAlphaMap>> alpha_results(unique_jobs.size());
-    run_parallel_indexed(worker_count, unique_jobs.size(), [&](const std::size_t j) {
+    parallel_for_jobs(unique_jobs.size(), [&](const std::size_t j) {
         const UniqueTextureJob &job = unique_jobs[j];
         try {
             CookedTextureLoadOptions texture_options;
@@ -845,7 +807,7 @@ BatchPreparedAssets prepare_model_assets_batch(
                 tex_results[j] = std::move(entry);
             }
         }
-    });
+    }, model_paths.size());
 
     TransparentStringSet packed_alpha_keys;
     for (std::size_t j = 0U; j < unique_jobs.size(); ++j) {
@@ -859,7 +821,7 @@ BatchPreparedAssets prepare_model_assets_batch(
     }
 
     // Pass 4: Parallel RT Masked Triangle Bake.
-    run_parallel_indexed(worker_count, batch.models.size(), [&](const std::size_t i) {
+    parallel_for_jobs(batch.models.size(), [&](const std::size_t i) {
         PreparedModel &entry = batch.models[i];
         if (!entry.model) {
             return;
@@ -928,7 +890,7 @@ BatchPreparedAssets prepare_model_assets_batch(
             entry.submesh_rt_alpha_paths.clear();
             entry.submesh_rt_triangles.clear();
         }
-    });
+    }, model_paths.size());
 
     return batch;
 }

@@ -1,4 +1,5 @@
 #include "project_system.hpp"
+#include "job_system.hpp"
 
 #include "asset_pak.hpp"
 #include "asset_preparation.hpp"
@@ -541,53 +542,14 @@ template <typename Fn>
     const std::size_t item_count,
     Fn&& fn,
     std::string& error) {
-    if (item_count == 0U) {
-        return true;
-    }
-    const unsigned hw_threads = std::thread::hardware_concurrency();
-    const std::size_t worker_count = (std::min)(
-        item_count,
-        (std::max)(std::size_t{1U}, static_cast<std::size_t>(hw_threads == 0U ? 4U : hw_threads)));
-    if (worker_count <= 1U) {
+    std::atomic<bool> failed{false};
+    parallel_for_jobs(item_count, [&](const std::size_t index) {
+        if (failed.load(std::memory_order_relaxed)) return;
         std::string local_error;
-        for (std::size_t idx = 0U; idx < item_count; ++idx) {
-            if (!fn(idx, local_error)) {
-                error = std::move(local_error);
-                return false;
-            }
-        }
-        return true;
-    }
-    std::atomic<std::size_t> next_index{0U};
-    std::vector<std::string> worker_errors(worker_count);
-    {
-        std::vector<std::jthread> workers;
-        workers.reserve(worker_count);
-        for (std::size_t worker_id = 0U; worker_id < worker_count; ++worker_id) {
-            workers.emplace_back([&, worker_id]() {
-                std::string local_error;
-                for (;;) {
-                    const std::size_t idx =
-                        next_index.fetch_add(1U, std::memory_order_relaxed);
-                    if (idx >= item_count) {
-                        return;
-                    }
-                    if (!fn(idx, local_error)) {
-                        worker_errors[worker_id] = std::move(local_error);
-                        next_index.store(item_count, std::memory_order_relaxed);
-                        return;
-                    }
-                }
-            });
-        }
-    }
-    for (const auto& worker_err : worker_errors) {
-        if (!worker_err.empty()) {
-            error = worker_err;
-            return false;
-        }
-    }
-    return true;
+        if (!fn(index, local_error) && !failed.exchange(true, std::memory_order_relaxed))
+            error = std::move(local_error);
+    });
+    return !failed.load(std::memory_order_relaxed);
 }
 
 [[nodiscard]] bool copy_game_content(
@@ -755,6 +717,15 @@ template <typename Fn>
     for (const auto& scene : scenes) {
         SceneDocument loaded;
         if (!load_scene_file(target / scene, loaded, error)) return false;
+        for (const auto& reference : loaded.sublevels) {
+            const auto path = from_utf8(reference.scene_path);
+            SceneDocument child;
+            if (!regular_unlinked_file(target, path, error) || !load_scene_file(target / path, child, error)) return false;
+            if (!child.sublevels.empty()) {
+                error = "Nested or cyclic sublevel reference: " + reference.scene_path;
+                return false;
+            }
+        }
         std::vector<SceneNodeRecord> nodes;
         loaded.build_node_records(nodes);
         for (const auto& node : nodes) {
@@ -858,13 +829,27 @@ template <typename Fn>
                         return false;
                     }
                     const auto tex_key = utf8(item.rel.lexically_normal());
+                    CookedTextureOutput& out = cooked_textures[idx];
+                    if (is_block_compressed_format(cooked->pixel_format)) {
+                        // Preserve authored mip levels and signed/HDR formats. Each
+                        // metadata entry owns its package key even if sources coincide.
+                        auto payload = item.rel;
+                        payload += cooked->source_relative_path.extension().native();
+                        auto package = item.rel.parent_path();
+                        if (package.filename() == "textures") package = package.parent_path();
+                        Json doc = item.doc;
+                        doc["source"] = utf8(package.empty() ? payload : payload.lexically_relative(package));
+                        out.json_key = tex_key;
+                        out.json_bytes = json_to_bytes(doc);
+                        out.vcrtex_key = utf8(payload);
+                        return read_binary_file_bytes(root / cooked->source_relative_path, out.vcrtex_bytes, local_error);
+                    }
                     const auto cutoff_it = alpha_cutoffs.find(tex_key);
                     const float alpha_cutoff =
                         cutoff_it != alpha_cutoffs.end() ? cutoff_it->second : 0.0F;
                     const CookedTexturePixelFormat target_format =
                         select_shipped_texture_format(cooked->semantic);
                     std::uint32_t mip_levels = 0U;
-                    CookedTextureOutput& out = cooked_textures[idx];
                     if (!cook_texture_to_vcrtex(
                             *cooked,
                             alpha_cutoff,

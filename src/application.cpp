@@ -198,6 +198,7 @@ void Application::initialize(const CliOptions& options) {
                 scene_,
                 error))
             fatal(error);
+        sublevels_.configure(asset_root->path, scene_.sublevels);
     } else if (resolved_project_root.empty()) {
         if (const auto asset_root = find_runtime_asset_root(options.project_path)) {
             resolved_project_root = asset_root->project_root;
@@ -244,6 +245,9 @@ void Application::initialize(const CliOptions& options) {
             resolve_scene_subsurface(options, scene_.subsurface))) {
         fatal("Invalid subsurface mode");
     }
+    renderer_.set_weighted_transparency(options.wboit);
+    renderer_.set_texture_budget(options.texture_budget_mib);
+    if (!renderer_.set_bloom_enabled(options.bloom)) fatal("Bloom is unsupported on this device.");
     if (!renderer_.set_motion_blur_settings(options.motion_blur)) {
         fatal("Invalid motion blur settings for the selected AA mode");
     }
@@ -524,7 +528,7 @@ void Application::bind_game_ui_callbacks() noexcept {
             }
             out_state.sky_enabled = any_sky;
             out_state.exposure_ev = self->renderer_.exposure_settings().compensation_ev;
-            out_state.bloom_enabled = self->ui_bloom_enabled_;
+            out_state.bloom_enabled = self->renderer_.bloom_enabled();
         },
         .cycle_present_mode = [](void* const ud, const int delta) noexcept {
             auto* const self = static_cast<Application*>(ud);
@@ -625,7 +629,7 @@ void Application::bind_game_ui_callbacks() noexcept {
         },
         .set_bloom_enabled = [](void* const ud, const bool enabled) noexcept {
             auto* const self = static_cast<Application*>(ud);
-            self->ui_bloom_enabled_ = enabled;
+            static_cast<void>(self->renderer_.set_bloom_enabled(enabled));
         },
         .on_new_game = [](void* const ud) noexcept {
             auto* const self = static_cast<Application*>(ud);
@@ -663,6 +667,7 @@ void Application::restart_gameplay_session() {
     SceneRenderView view = scene_.build_render_view(
         scene_instances_, scene_models_, scene_lights_);
     const auto root = find_runtime_asset_root(options_.project_path);
+    if (root) sublevels_.configure(root->path, scene_.sublevels);
     std::string error;
     if (root && !renderer_.update_editor_scene(view, root->path, error)) {
         fatal(error);
@@ -804,7 +809,10 @@ void Application::set_lighting_room_roof(bool enabled) {
         fatal(error);
 }
 void Application::service_assets() {
-    static_cast<void>(renderer_.poll_assets());
+    if (renderer_.poll_assets() && sublevels_.enabled()) {
+        // Collision bounds and meshes can become available after the hierarchy is attached.
+        scene_.mark_content_changed();
+    }
     if (options_.stream_asset.empty() || stream_asset_placed_ || renderer_.assets_pending()) {
         return;
     }
@@ -906,6 +914,16 @@ void Application::main_loop() {
         }
         if (!running_) {
             break;
+        }
+        if (sublevels_.enabled()) {
+            std::string error;
+            if (sublevels_.update(scene_, camera_.position(), error) || renderer_.editor_scene_needs_sync()) {
+                const auto view = scene_.build_render_view(scene_instances_, scene_models_, scene_lights_);
+                std::string asset_error;
+                if (!renderer_.update_editor_scene(view, sublevels_.asset_root(), asset_error) && !asset_error.empty())
+                    std::cerr << "Sublevel asset: " << asset_error << '\n';
+            }
+            if (!error.empty()) std::cerr << "Sublevel: " << error << '\n';
         }
         update_camera(camera_delta_seconds);
         service_assets();
@@ -1611,6 +1629,11 @@ void Application::execute_mcp_command(const McpCommand& command) {
                            {"opacity_micromap_bytes",
                             renderer_.lighting_statistics().opacity_micromap_bytes}}},
                      {"assets_pending", renderer_.assets_pending()},
+                     {"weighted_transparency_active", renderer_.weighted_transparency_active()},
+                     {"texture_budget_bytes", renderer_.texture_budget()},
+                     {"texture_resident_bytes", renderer_.editor_texture_gpu_bytes()},
+                     {"texture_evictions", renderer_.texture_evictions()},
+                     {"textures_reduced", renderer_.reduced_textures()},
                      {"visibility_backend", renderer_.visibility_backend()},
                      {"skinning_active_nodes", renderer_.skinning_active_node_count()},
                      {"runtime_transform_revision", renderer_.runtime_transform_revision()},

@@ -917,12 +917,13 @@ parse_color_space(const std::string_view value) {
     const bool raw_rgba8 = has_storage && storage == "rgba8";
     const bool compressed_bc7 = has_storage && storage == "bc7";
     const bool compressed_bc4 = has_storage && storage == "bc4";
-    const bool cooked_storage = raw_rgba8 || compressed_bc7 || compressed_bc4;
+    const bool ktx2 = has_storage && storage == "ktx2";
+    const bool cooked_storage = raw_rgba8 || compressed_bc7 || compressed_bc4 || ktx2;
 
     if (deferred == cooked_storage || (has_storage && !cooked_storage)) {
         return fail(
             CookedTextureLoadErrorCode::unsupported_schema,
-            "Texture metadata must select deferred decode, raw RGBA8, or BC7/BC4 storage.",
+            "Texture metadata must select deferred decode, raw RGBA8, BC7/BC4 or KTX2 storage.",
             metadata_diag_path);
     }
     const auto semantic = parse_semantic(usage);
@@ -978,7 +979,7 @@ parse_color_space(const std::string_view value) {
                 source_file)) {
             return CookedTextureLoadResult(std::move(*error));
         }
-        if (compressed_bc7 || compressed_bc4) {
+        if (compressed_bc7 || compressed_bc4 || ktx2) {
             return fail(
                 CookedTextureLoadErrorCode::unsupported_format,
                 "Compressed BC7/BC4 textures must reference a .vcrtex file.",
@@ -1021,6 +1022,13 @@ parse_color_space(const std::string_view value) {
         .semantic = *semantic,
         .color_space = *parsed_color_space,
     };
+    if (ktx2) {
+        std::string error;
+        if (extension != ".ktx2" || !decode_ktx2_bytes(source_bytes, options, asset, error))
+            return fail(CookedTextureLoadErrorCode::decode_failed,
+                error.empty() ? "KTX2 storage requires a .ktx2 source." : std::move(error), source_diag_path);
+        return CookedTextureLoadResult(std::move(asset));
+    }
     if (compressed_bc7 || compressed_bc4) {
         if (extension != ".vcrtex") {
             return fail(

@@ -1297,6 +1297,7 @@ SceneRenderView SceneDocument::build_render_view(
     model_output.clear();
     light_output.clear();
     render_cube_ids_.clear();
+    render_effects_.clear();
     render_cube_ids_.reserve(max_scene_nodes);
     SceneNodeId ground_id{};
     SceneGpuInstance ground{};
@@ -1348,6 +1349,11 @@ SceneRenderView SceneDocument::build_render_view(
         const bool world_visible = slot.world_visible;
 
         if (world_visible) {
+            if ((slot.value.kind == SceneNodeKind::particle_emitter || slot.value.kind == SceneNodeKind::projected_decal) &&
+                render_effects_.size() <= max_scene_effects) {
+                // One extra entry signals overflow to the renderer without unbounded storage.
+                render_effects_.push_back({world_matrix, slot.value.material.base_color, slot.value.vfx, slot.value.kind});
+            }
             // One infinite ocean; the first visible, valid node owns its settings.
             if (slot.value.kind == SceneNodeKind::ocean && !ocean_visible &&
                 valid_ocean_settings(slot.value.ocean)) {
@@ -1433,6 +1439,7 @@ SceneRenderView SceneDocument::build_render_view(
         .ocean_visible = ocean_visible,
         .ocean_height = ocean_height,
         .ocean = ocean,
+        .effects = render_effects_,
         .local_lights_overflow = local_lights_overflow,
         .ground_id = ground_id,
         .cube_ids = render_cube_ids_,
@@ -1753,6 +1760,8 @@ std::string_view to_string(const SceneNodeKind kind) noexcept {
     case SceneNodeKind::point_light: return "Point light";
     case SceneNodeKind::spot_light: return "Spot light";
     case SceneNodeKind::environment: return "Environment";
+    case SceneNodeKind::particle_emitter: return "Particle emitter";
+    case SceneNodeKind::projected_decal: return "Projected decal";
     case SceneNodeKind::ocean: return "Ocean";
     }
     return "Unknown";

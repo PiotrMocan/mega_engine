@@ -36,12 +36,12 @@ enum class CookedTexturePixelFormat : std::uint8_t {
     rgba8_unorm,
     bc7_unorm,
     bc4_unorm,
+    bc1_rgb, bc1_rgba, bc2, bc3, bc4_snorm, bc5, bc5_snorm, bc6h_ufloat, bc6h_sfloat,
 };
 
 [[nodiscard]] constexpr bool is_block_compressed_format(
     const CookedTexturePixelFormat format) noexcept {
-    return format == CookedTexturePixelFormat::bc7_unorm ||
-        format == CookedTexturePixelFormat::bc4_unorm;
+    return format >= CookedTexturePixelFormat::bc7_unorm && format <= CookedTexturePixelFormat::bc6h_sfloat;
 }
 
 [[nodiscard]] constexpr std::uint32_t texture_block_byte_size(
@@ -49,8 +49,17 @@ enum class CookedTexturePixelFormat : std::uint8_t {
     switch (format) {
         case CookedTexturePixelFormat::rgba8_unorm:
             return 4U;
+        case CookedTexturePixelFormat::bc2:
+        case CookedTexturePixelFormat::bc3:
+        case CookedTexturePixelFormat::bc5:
+        case CookedTexturePixelFormat::bc5_snorm:
+        case CookedTexturePixelFormat::bc6h_ufloat:
+        case CookedTexturePixelFormat::bc6h_sfloat:
         case CookedTexturePixelFormat::bc7_unorm:
             return 16U;
+        case CookedTexturePixelFormat::bc1_rgb:
+        case CookedTexturePixelFormat::bc1_rgba:
+        case CookedTexturePixelFormat::bc4_snorm:
         case CookedTexturePixelFormat::bc4_unorm:
             return 8U;
     }

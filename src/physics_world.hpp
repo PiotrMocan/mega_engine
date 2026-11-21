@@ -55,6 +55,10 @@ public:
         ModelBoundsProvider model_bounds = {},
         ModelCollisionProvider model_collision = {});
 
+    void refresh_streamed_scene(
+        const SceneDocument& scene, SceneNodeId excluded_node = {},
+        ModelBoundsProvider model_bounds = {}, ModelCollisionProvider model_collision = {});
+
     void step(float delta_seconds, const CollisionWorld& static_world) noexcept;
 
     void apply_character_push(

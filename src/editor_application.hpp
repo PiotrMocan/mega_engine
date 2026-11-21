@@ -1,5 +1,6 @@
 #pragma once
 
+#include "sublevel_streaming.hpp"
 #include "audio_engine.hpp"
 #include "cli_options.hpp"
 #include "editor_ui.hpp"
@@ -75,6 +76,7 @@ private:
     std::unique_ptr<SDL_Window, EditorWindowDeleter> window_{};
     VulkanContext context_{};
     Renderer renderer_{};
+    SublevelStreaming sublevels_{};
     AudioEngine audio_engine_{};
     InputActionSystem input_actions_{};
     EditorUi ui_{};
@@ -104,7 +106,6 @@ private:
     EditorPlayState observed_play_state_ = EditorPlayState::edit;
     std::uint32_t main_window_id_ = 0U;
     bool running_ = false;
-    bool ui_bloom_enabled_ = true;
     bool pending_gameplay_restart_ = false;
     bool pending_gameplay_stop_to_edit_ = false;
     std::vector<SceneHierarchyRow> ui_sky_rows_scratch_{};

@@ -330,7 +330,7 @@ AssetEntryKind AssetBrowser::classify(
         return AssetEntryKind::image;
     }
     if (extension == ".png" || extension == ".jpg" ||
-        extension == ".jpeg" || extension == ".dds" ||
+        extension == ".jpeg" || extension == ".dds" || extension == ".ktx2" ||
         extension == ".tga" || extension == ".hdr" ||
         extension == ".bmp" || extension == ".exr") {
         return AssetEntryKind::image;

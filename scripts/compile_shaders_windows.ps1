@@ -112,6 +112,7 @@ Compile-Shader -Source 'ocean.frag' -Output 'ocean_aa.frag.spv' `
     -ExtraArguments @('-DVCR_SSS_TEMPORAL=1')
 Compile-Shader -Source 'ocean.frag' -Output 'ocean_aa_sss.frag.spv' `
     -ExtraArguments @('-DVCR_SSS_TEMPORAL=1', '-DVCR_SSS_OUTPUT=1')
+Compile-Shader -Source 'editor_model_wboit.frag' -Output 'editor_model_wboit_rt.frag.spv' -ExtraArguments @('-DVCR_RAY_QUERY=1')
 $rayQueryFragmentShaders = @(
     'scene.frag',
     'scene_aa.frag',

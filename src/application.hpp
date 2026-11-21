@@ -1,5 +1,6 @@
 #pragma once
 
+#include "sublevel_streaming.hpp"
 #include "audio_engine.hpp"
 #include "cli_options.hpp"
 #include "fly_camera.hpp"
@@ -72,6 +73,7 @@ private:
     std::unique_ptr<SDL_Window, SdlWindowDeleter> window_{};
     VulkanContext context_{};
     Renderer renderer_{};
+    SublevelStreaming sublevels_{};
     SceneDocument scene_{};
     std::vector<SceneGpuInstance> scene_instances_{};
     std::vector<SceneModelInstance> scene_models_{};
@@ -107,7 +109,6 @@ private:
     bool mouse_captured_ = false;
     bool mouse_left_down_ = false;
     bool mouse_left_pressed_ = false;
-    bool ui_bloom_enabled_ = true;
     bool pending_gameplay_restart_ = false;
     glm::vec2 mouse_pos_px_{-1.0F, -1.0F};
     SceneDocument initial_gameplay_scene_snapshot_{};

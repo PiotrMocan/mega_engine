@@ -658,6 +658,8 @@ struct EditorViewportRay {
     case SceneNodeKind::cube: return EditorIcon::cube;
     case SceneNodeKind::model: return EditorIcon::model;
     case SceneNodeKind::ground: return EditorIcon::ground;
+    case SceneNodeKind::particle_emitter:
+    case SceneNodeKind::projected_decal:
     case SceneNodeKind::ocean: return EditorIcon::ground;
     case SceneNodeKind::terrain: return EditorIcon::terrain;
     case SceneNodeKind::camera: return EditorIcon::camera;
@@ -1791,8 +1793,11 @@ void EditorUi::shutdown() noexcept {
     import_ui_.reset();
     import_worker_.reset();
     asset_import_enabled_ = false;
+    history_baseline_.reset();
     undo_history_.clear();
     redo_history_.clear();
+    additional_selection_.clear();
+    group_anchor_ = {};
     selected_node_ = {};
     pending_delete_ = {};
     pending_duplicate_ = {};
@@ -2078,12 +2083,81 @@ void EditorUi::synchronize_renderer(Renderer& renderer) {
     }
 }
 
+void EditorUi::pick_node(SceneDocument& scene, SceneNodeId id, const bool extend) {
+    if (!extend || !id || !scene.valid(selected_node_)) {
+        static_cast<void>(select_node(scene, id));
+        return;
+    }
+    if (group_anchor_ != selected_node_) additional_selection_.clear();
+    if (id == selected_node_) {
+        if (!additional_selection_.empty()) {
+            selected_node_ = additional_selection_.back();
+            additional_selection_.pop_back();
+        } else selected_node_ = {};
+    } else if (const auto iter = std::ranges::find(additional_selection_, id); iter != additional_selection_.end()) {
+        additional_selection_.erase(iter);
+    } else {
+        additional_selection_.push_back(selected_node_);
+        selected_node_ = id;
+    }
+    group_anchor_ = selected_node_;
+    name_buffer_node_ = {};
+    inspector_edit_snapshot_.reset();
+}
+
+std::vector<SceneNodeId> EditorUi::selection_roots(const SceneDocument& scene) const {
+    std::vector<SceneNodeId> selected;
+    if (!scene.valid(selected_node_)) return selected;
+    if (group_anchor_ == selected_node_) selected = additional_selection_;
+    selected.push_back(selected_node_);
+    std::vector<SceneNodeId> roots;
+    for (const auto id : selected) {
+        if (!scene.valid(id)) continue;
+        auto parent = scene.parent(id);
+        while (parent && std::ranges::find(selected, parent) == selected.end()) parent = scene.parent(parent);
+        if (!parent) roots.push_back(id);
+    }
+    return roots;
+}
+
+void EditorUi::snap_selection(SceneDocument& scene, Renderer& renderer) {
+    const auto roots = selection_roots(scene);
+    SceneDocument receivers(scene);
+    for (auto id : roots) receivers.node(id)->get().visible = false;
+    CollisionWorld world;
+    world.rebuild_from_scene(receivers, {}, {&renderer, [](const void* context, SceneNodeId id) noexcept {
+        return static_cast<const Renderer*>(context)->editor_node_bounds(id);
+    }}, {&renderer, [](const void* context, std::string_view path) noexcept {
+        return static_cast<const Renderer*>(context)->editor_model_collision(path);
+    }});
+    bool changed = false;
+    for (auto id : roots) {
+        auto matrix = scene_world_matrix(scene, id);
+        if (!matrix) continue;
+        const auto bounds = renderer.editor_node_bounds(id);
+        glm::vec3 foot = bounds ? bounds->center : glm::vec3((*matrix)[3]);
+        if (bounds) foot.y -= bounds->extent.y;
+        const auto hit = world.raycast(foot + glm::vec3(0, 0.02F, 0), {0,-1,0}, camera_far);
+        if (!hit || std::abs(hit->point.y - foot.y) < 0.0001F) continue;
+        (*matrix)[3].y += hit->point.y - foot.y;
+        if (const auto transform = scene_local_transform_from_world(scene, id, *matrix)) {
+            if (!changed) checkpoint_scene(scene);
+            scene.node(id)->get().transform = *transform;
+            changed = true;
+        }
+    }
+    if (changed) scene.mark_content_changed();
+    scene_file_status_ = changed ? "Snapped selection to surface." : "No lower surface within snapping range.";
+}
+
 bool EditorUi::select_node(
     SceneDocument& scene,
     const SceneNodeId id) noexcept {
     if (id && !scene.valid(id)) {
         return false;
     }
+    additional_selection_.clear();
+    group_anchor_ = {};
     selected_node_ = id;
     name_buffer_node_ = {};
     inspector_edit_snapshot_.reset();
@@ -2110,13 +2184,24 @@ bool EditorUi::duplicate_selection(
         return false;
     }
     SceneDocument snapshot = scene;
-    const SceneNodeId duplicate = duplicate_scene_subtree(
-        scene, selected_node_, duplicated_nodes, error);
-    if (!duplicate) {
-        return false;
+    std::vector<SceneNodeId> copies;
+    duplicated_nodes = 0;
+    for (const auto root : selection_roots(scene)) {
+        std::uint32_t count = 0;
+        const auto copy = duplicate_scene_subtree(scene, root, count, error);
+        if (!copy) {
+            scene = std::move(snapshot);
+            duplicated_nodes = 0;
+            return false;
+        }
+        copies.push_back(copy);
+        duplicated_nodes += count;
     }
     push_undo_snapshot(std::move(snapshot));
-    static_cast<void>(select_node(scene, duplicate));
+    static_cast<void>(select_node(scene, copies.back()));
+    copies.pop_back();
+    additional_selection_ = std::move(copies);
+    group_anchor_ = selected_node_;
     return true;
 }
 
@@ -2188,7 +2273,8 @@ void EditorUi::begin_frame(
         io.KeyCtrl &&
         !io.WantTextInput) {
         if (ImGui::IsKeyPressed(ImGuiKey_S, false)) {
-            save_requested_ = true;
+            if (io.KeyShift && asset_import_enabled_) save_as_requested_ = true;
+            else if (!io.KeyShift) save_requested_ = true;
         }
         if (ImGui::IsKeyPressed(ImGuiKey_O, false)) {
             open_requested_ = true;
@@ -2436,6 +2522,9 @@ void EditorUi::build_main_menu(
                 editable)) {
             save_requested_ = true;
         }
+        if (ImGui::MenuItem("Save scene as...", "Ctrl+Shift+S", false, editable && asset_import_enabled_)) {
+            save_as_requested_ = true;
+        }
         if (ImGui::MenuItem(
                 "Open scene",
                 "Ctrl+O",
@@ -2603,6 +2692,10 @@ void EditorUi::build_main_menu(
                 editable && has_selection)) {
             pending_delete_ = selected_node_;
         }
+        if (ImGui::MenuItem("Snap selection to surface", nullptr, false, editable && has_selection)) {
+            stop_sequencer_preview(scene, &renderer, &camera);
+            snap_selection(scene, renderer);
+        }
         if (ImGui::MenuItem(
                 "Focus selected",
                 "F",
@@ -2657,6 +2750,20 @@ void EditorUi::build_main_menu(
                 scene.mark_content_changed();
             }
             selected_node_ = cam_node;
+        }
+        for (const auto kind : {SceneNodeKind::particle_emitter, SceneNodeKind::projected_decal}) {
+            const bool emitter = kind == SceneNodeKind::particle_emitter;
+            if (ImGui::MenuItem(emitter ? "Add particle emitter" : "Add projected decal", nullptr,
+                    false, play_state_ == EditorPlayState::edit)) {
+                prepare_scene_edit();
+                checkpoint_scene(scene);
+                selected_node_ = scene.create_node(emitter ? "Particle emitter" : "Projected decal", kind, parent);
+                if (auto node = scene.node(selected_node_)) {
+                    node->get().material.base_color = emitter ? glm::vec4(1, 0.55F, 0.15F, 0.8F) :
+                        glm::vec4(0.12F, 0.075F, 0.04F, 0.82F);
+                    scene.mark_content_changed();
+                }
+            }
         }
         if (ImGui::MenuItem("Add ocean", nullptr, false,
                             play_state_ == EditorPlayState::edit)) {
@@ -3063,7 +3170,8 @@ void EditorUi::build_hierarchy(SceneDocument& scene) {
             SceneNode& node = node_reference->get();
             ImGui::PushID(static_cast<int>(row.id.index));
             ImGui::PushID(static_cast<int>(row.id.generation));
-            const bool selected = selected_node_ == row.id;
+            const bool selected = selected_node_ == row.id || (group_anchor_ == selected_node_ &&
+                std::ranges::find(additional_selection_, row.id) != additional_selection_.end());
             const EditorTreeRowResult row_result =
                 ui_kit_.hierarchy_row(
                     "Node",
@@ -3076,7 +3184,7 @@ void EditorUi::build_hierarchy(SceneDocument& scene) {
                     selected,
                     node.visible);
             if (row_result.selected) {
-                static_cast<void>(select_node(scene, row.id));
+                pick_node(scene, row.id, ImGui::GetIO().KeyCtrl);
             }
             if (row_result.expansion_toggled) {
                 scene.set_expanded(row.id, !node.expanded);
@@ -3474,6 +3582,25 @@ void EditorUi::build_inspector(
                     0.0F, 1.0F, "%.2f");
             }
             ui_kit_.end_property_grid();
+        }
+    }
+    if (node.kind == SceneNodeKind::particle_emitter || node.kind == SceneNodeKind::projected_decal) {
+        const bool emitter = node.kind == SceneNodeKind::particle_emitter;
+        ui_kit_.section_header(EditorIcon::ground, emitter ? "VFX emitter" : "Decal projector");
+        changed |= ImGui::ColorEdit4("Color and opacity", &node.material.base_color.x);
+        if (emitter) {
+            changed |= ImGui::Checkbox("Simulate on CPU", &node.vfx.cpu_simulation);
+            changed |= ImGui::SliderInt("Particles", &node.vfx.particles, 1, 4096, "%d", ImGuiSliderFlags_AlwaysClamp);
+            changed |= ImGui::SliderFloat("Lifetime (s)", &node.vfx.lifetime, 0.05F, 60.0F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+            changed |= ImGui::SliderFloat("Speed (m/s)", &node.vfx.speed, 0, 32, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+            changed |= ImGui::SliderFloat("Radius (m)", &node.vfx.radius, 0.005F, 5, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+        } else {
+            int pattern = static_cast<int>(node.vfx.pattern);
+            constexpr const char* patterns[]{"Impact", "Footprint", "Dirt", "Puddle"};
+            if (ImGui::Combo("Pattern", &pattern, patterns, 4)) {
+                node.vfx.pattern = static_cast<DecalPattern>(pattern);
+                changed = true;
+            }
         }
     }
     if (node.kind == SceneNodeKind::ocean) {
@@ -7144,8 +7271,25 @@ void EditorUi::build_viewport(
                         if (!gizmo_edit_snapshot_) {
                             gizmo_edit_snapshot_ = scene;
                         }
-                        selected->get().transform = *local;
-                        scene.mark_content_changed();
+                        if (group_anchor_ == selected_node_ && !additional_selection_.empty()) {
+                            const auto previous = scene_world_matrix(scene, selected_node_);
+                            const glm::mat4 delta = *world * glm::inverse(*previous);
+                            const auto roots = selection_roots(scene);
+                            std::vector<SceneTransform> transforms;
+                            for (const auto root : roots) {
+                                const auto old = scene_world_matrix(scene, root);
+                                const auto next = old ? scene_local_transform_from_world(scene, root, delta * *old) : std::nullopt;
+                                if (!next) break;
+                                transforms.push_back(*next);
+                            }
+                            if (transforms.size() == roots.size()) {
+                                for (std::size_t i = 0; i < roots.size(); ++i) scene.node(roots[i])->get().transform = transforms[i];
+                                scene.mark_content_changed();
+                            }
+                        } else {
+                            selected->get().transform = *local;
+                            scene.mark_content_changed();
+                        }
                     }
                 } else {
                     asset_error_ =
@@ -7166,8 +7310,7 @@ void EditorUi::build_viewport(
         if (ray) {
             const auto picked = renderer.pick_editor_scene(
                 ray->origin, ray->direction);
-            static_cast<void>(select_node(
-                scene, picked.value_or(SceneNodeId{})));
+            pick_node(scene, picked.value_or(SceneNodeId{}), io.KeyCtrl);
         }
     }
     if (ImGui::BeginDragDropTarget()) {
@@ -7646,6 +7789,78 @@ void EditorUi::build_assets(
     ImGui::End();
 }
 
+void EditorUi::draw_surface_tools(SceneDocument& scene, Renderer& renderer, FlyCamera& camera) {
+    if (!ImGui::CollapsingHeader("Terrain brushes and spline meshes")) return;
+    if (ImGui::Button("New terrain")) { terrain_edit_target_ = {}; terrain_canvas_ = {}; }
+    ImGui::SameLine();
+    if (ImGui::Button("Edit selected terrain")) {
+        const auto node = scene.node(selected_node_);
+        if (node && node->get().kind == SceneNodeKind::model &&
+            load_terrain_canvas(asset_browser_.root(), node->get().asset_path, terrain_canvas_, asset_error_)) {
+            terrain_edit_target_ = *scene.uuid(selected_node_);
+            asset_error_.clear();
+        }
+    }
+    constexpr const char* modes[]{"Raise", "Lower", "Paint"};
+    constexpr const char* materials[]{"Grass", "Earth", "Rock"};
+    ImGui::Combo("Brush", &terrain_brush_mode_, modes, 3);
+    ImGui::SliderFloat("Patch width (m)", &terrain_canvas_.size, 1, 1024, "%.1f", ImGuiSliderFlags_AlwaysClamp);
+    ImGui::SliderFloat("Brush radius (cells)", &terrain_radius_, 1, 12);
+    if (terrain_brush_mode_ == 2) ImGui::Combo("Material layer", &terrain_layer_, materials, 3);
+    else ImGui::SliderFloat("Height rate (m/s)", &terrain_strength_, 0.1F, 32.F);
+
+    const float side = std::clamp(ImGui::GetContentRegionAvail().x, 64.F, 320.F);
+    const auto origin = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("Terrain brush canvas", {side, side});
+    constexpr unsigned n = TerrainCanvas::cells;
+    const float cell = side / n;
+    const auto mouse = ImGui::GetIO().MousePos;
+    if (ImGui::IsItemActive() && ImGui::IsItemHovered()) {
+        terrain_canvas_.brush((mouse.x-origin.x)/cell, (mouse.y-origin.y)/cell, terrain_radius_,
+            (terrain_brush_mode_ == 1 ? -1.F : 1.F) * terrain_strength_ * std::min(ImGui::GetIO().DeltaTime, 0.1F),
+            terrain_brush_mode_ == 2 ? terrain_layer_ : -1);
+    }
+    auto* draw = ImGui::GetWindowDrawList();
+    constexpr std::array<ImVec4, 3> colors{{{0.24F,0.48F,0.17F,1},{0.54F,0.36F,0.22F,1},{0.53F,0.53F,0.57F,1}}};
+    for (unsigned z = 0; z < n; ++z) for (unsigned x = 0; x < n; ++x) {
+        auto c = colors[terrain_canvas_.layers[z*n+x]];
+        const float light = std::clamp(0.85F + (terrain_canvas_.heights[z*(n+1)+x] -
+            terrain_canvas_.heights[(z+1)*(n+1)+x+1])*0.3F, 0.3F, 1.5F);
+        c.x *= light; c.y *= light; c.z *= light;
+        const ImVec2 p{origin.x + x*cell, origin.y + z*cell};
+        draw->AddRectFilled(p, {p.x+cell+0.5F,p.y+cell+0.5F}, ImGui::GetColorU32(c));
+    }
+    if (ImGui::IsItemHovered()) draw->AddCircle(mouse, cell*terrain_radius_, IM_COL32_WHITE);
+    const bool bake_terrain = ImGui::Button("Bake terrain");
+    ImGui::SliderFloat("Spline width (m)", &ribbon_width_, 0.2F, 64.F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+    const auto spline = scene.spline(selected_node_);
+    ImGui::BeginDisabled(!spline);
+    const bool road = ImGui::Button("Bake road");
+    ImGui::SameLine();
+    const bool river = ImGui::Button("Bake river");
+    ImGui::EndDisabled();
+    if (!bake_terrain && !road && !river) return;
+
+    stop_sequencer_preview(scene, &renderer, &camera);
+    const auto source = scene.spline(selected_node_);
+    if (!bake_terrain && !source) return;
+    std::string path;
+    if (!bake_world_surface(asset_browser_.root(), terrain_canvas_, bake_terrain ? nullptr : &source->get(),
+            ribbon_width_, river, path, asset_error_)) return;
+    checkpoint_scene(scene);
+    SceneNodeId id = bake_terrain ? scene.find_by_uuid(terrain_edit_target_) : SceneNodeId{};
+    if (!id) id = scene.create_node(bake_terrain ? "Brush terrain" : river ? "River" : "Road",
+        SceneNodeKind::model, bake_terrain ? SceneNodeId{} : selected_node_);
+    if (auto node = scene.node(id)) {
+        node->get().asset_path = std::move(path);
+        if (!river) static_cast<void>(scene.set_collider(id, ColliderComponent{.shape = ColliderShape::triangle_mesh}));
+        scene.mark_content_changed();
+        if (bake_terrain) terrain_edit_target_ = *scene.uuid(id);
+        static_cast<void>(select_node(scene, id));
+        scene_file_status_ = "Baked " + node->get().asset_path;
+    } else asset_error_ = "Scene node capacity exceeded.";
+}
+
 void EditorUi::build_landscape(
     SceneDocument& scene,
     Renderer& renderer,
@@ -7663,6 +7878,39 @@ void EditorUi::build_landscape(
     const bool editable = play_state_ == EditorPlayState::edit;
     ImGui::BeginDisabled(!editable);
 
+    if (ImGui::CollapsingHeader("Streaming sublevels")) {
+        for (std::size_t i = 0; i < scene.sublevels.size(); ++i) {
+            const auto& level = scene.sublevels[i];
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::TextWrapped("%s  (%.0f m)", level.scene_path.c_str(), level.radius);
+            ImGui::Text("Center  %.1f, %.1f, %.1f", level.center.x, level.center.y, level.center.z);
+            const bool remove = ImGui::SmallButton("Remove");
+            ImGui::PopID();
+            if (remove) {
+                checkpoint_scene(scene);
+                scene.sublevels.erase(scene.sublevels.begin() + static_cast<std::ptrdiff_t>(i));
+                scene.mark_content_changed();
+                break;
+            }
+        }
+        ImGui::InputTextWithHint("Scene", "scenes/level.scene.json", sublevel_path_.data(), sublevel_path_.size());
+        ImGui::DragFloat("Loading radius (m)", &sublevel_radius_, 1.F, 1.F, 100000.F, "%.1f", ImGuiSliderFlags_AlwaysClamp);
+        if (ImGui::Button("Add at camera position")) {
+            std::string path(sublevel_path_.data());
+            std::error_code ec;
+            const auto file = asset_browser_.root() / path_from_utf8(path);
+            if (!valid_project_scene_relative_path(path) || !std::filesystem::is_regular_file(file, ec) ||
+                std::filesystem::equivalent(file, scene_path_, ec) || scene.sublevels.size() == max_sublevels ||
+                std::ranges::any_of(scene.sublevels, [&](const auto& entry) { return entry.scene_path == path; })) {
+                asset_error_ = "Choose another existing scene under scenes/.";
+            } else {
+                checkpoint_scene(scene);
+                scene.sublevels.push_back({std::move(path), camera.position(), sublevel_radius_});
+                scene.mark_content_changed();
+            }
+        }
+    }
+    draw_surface_tools(scene, renderer, camera);
     ui_kit_.section_header(EditorIcon::ground, "Flat terrain");
     if (ui_kit_.begin_property_grid("FlatTerrainProperties")) {
         ui_kit_.property_row("Size X/Z");
@@ -12350,6 +12598,43 @@ void EditorUi::process_file_commands(
     SceneDocument& scene,
     Renderer& renderer,
     FlyCamera& camera) {
+    if (std::exchange(save_as_requested_, false)) {
+        save_as_error_.clear();
+        std::snprintf(save_as_name_.data(), save_as_name_.size(), "%s", path_to_utf8(scene_path_.filename()).c_str());
+        ImGui::OpenPopup("Save scene as");
+    }
+    if (ImGui::BeginPopupModal("Save scene as", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (ImGui::InputText("Filename", save_as_name_.data(), save_as_name_.size())) save_as_error_.clear();
+        if (ImGui::Button("Save")) {
+            const std::string name(save_as_name_.data());
+            if (name.empty() || name == "." || name == ".." || name.back() == '.' ||
+                name.back() == ' ' || name.find_first_of("<>:\"/\\|?*") != std::string::npos ||
+                std::any_of(name.begin(), name.end(), [](unsigned char c) { return c < 32U; })) {
+                save_as_error_ = "Enter a scene filename.";
+            } else {
+                auto target = asset_browser_.root() / "scenes" / path_from_utf8(name);
+                if (target.extension() != ".json") target += ".json";
+                std::error_code ec;
+                if (std::filesystem::exists(target, ec) && target != scene_path_) {
+                    save_as_error_ = "A scene with that name already exists.";
+                } else {
+                    stop_sequencer_preview(scene, &renderer, &camera);
+                    if (save_scene_file(scene, target, save_as_error_)) {
+                        scene_path_ = std::move(target);
+                        scene_file_name_ = path_to_utf8(scene_path_.filename());
+                        saved_content_revision_ = scene.content_revision();
+                        saved_structure_revision_ = scene.structure_revision();
+                        scene_file_status_ = "Saved " + path_to_utf8(scene_path_);
+                        ImGui::CloseCurrentPopup();
+                    }
+                }
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        if (!save_as_error_.empty()) ImGui::TextWrapped("%s", save_as_error_.c_str());
+        ImGui::EndPopup();
+    }
     if (save_requested_) {
         save_requested_ = false;
         if (play_state_ == EditorPlayState::edit) {
@@ -12364,10 +12649,6 @@ void EditorUi::process_file_commands(
                 open_confirmation_requested_ = true;
             } else {
                 stop_sequencer_preview(scene, &renderer, &camera);
-                if (!pending_open_scene_path_.empty()) {
-                    scene_path_ = std::exchange(pending_open_scene_path_, {});
-                    scene_file_name_ = scene_path_.filename().string();
-                }
                 open_scene(scene);
             }
         } else {
@@ -12412,10 +12693,6 @@ void EditorUi::process_file_commands(
                 : target_scene_path.string().c_str());
         if (ImGui::Button("Discard and open")) {
             stop_sequencer_preview(scene, &renderer, &camera);
-            if (!pending_open_scene_path_.empty()) {
-                scene_path_ = std::exchange(pending_open_scene_path_, {});
-                scene_file_name_ = scene_path_.filename().string();
-            }
             open_scene(scene);
             ImGui::CloseCurrentPopup();
         }
@@ -12487,17 +12764,22 @@ void EditorUi::save_scene(SceneDocument& scene) {
 
 void EditorUi::open_scene(SceneDocument& scene) {
     stop_sequencer_preview(scene);
-    if (scene_path_.empty()) {
+    auto target = std::exchange(pending_open_scene_path_, {});
+    if (target.empty()) target = scene_path_;
+    if (target.empty()) {
         scene_file_status_ =
             "Open failed: scene path is unavailable.";
         return;
     }
     SceneDocument loaded;
     std::string error;
-    if (!load_scene_file(scene_path_, loaded, error)) {
+    if (!load_scene_file(target, loaded, error)) {
         scene_file_status_ = "Open failed: " + error;
         return;
     }
+    terrain_edit_target_ = {};
+    scene_path_ = std::move(target);
+    scene_file_name_ = path_to_utf8(scene_path_.filename());
     scene = std::move(loaded);
     pending_model_path_.clear();
     pending_model_name_.clear();
@@ -12508,6 +12790,8 @@ void EditorUi::open_scene(SceneDocument& scene) {
         "Opened " + scene_path_.string();
     scene_replaced_ = true;
     startup_camera_requested_ = true;
+    additional_selection_.clear();
+    group_anchor_ = {};
     selected_node_ = {};
     pending_delete_ = {};
     delete_confirmation_ = {};
@@ -12515,6 +12799,7 @@ void EditorUi::open_scene(SceneDocument& scene) {
     pending_reparent_parent_ = {};
     edit_scene_snapshot_.reset();
     inspector_edit_snapshot_.reset();
+    history_baseline_.reset();
     undo_history_.clear();
     redo_history_.clear();
     play_state_ = EditorPlayState::edit;
@@ -12537,11 +12822,16 @@ bool EditorUi::scene_is_dirty(
             saved_structure_revision_;
 }
 
+void EditorUi::finish_history_entry(const SceneDocument& current) {
+    if (!history_baseline_) return;
+    if (undo_history_.size() == maximum_history_entries) undo_history_.erase(undo_history_.begin());
+    undo_history_.emplace_back(*history_baseline_, current);
+    history_baseline_.reset();
+}
+
 void EditorUi::push_undo_snapshot(SceneDocument snapshot) {
-    if (undo_history_.size() == maximum_history_entries) {
-        undo_history_.erase(undo_history_.begin());
-    }
-    undo_history_.push_back(std::move(snapshot));
+    finish_history_entry(snapshot);
+    history_baseline_ = std::move(snapshot);
     redo_history_.clear();
 }
 
@@ -12549,45 +12839,33 @@ void EditorUi::checkpoint_scene(const SceneDocument& scene) {
     push_undo_snapshot(scene);
 }
 
-bool EditorUi::undo_scene(SceneDocument& scene) {
+bool EditorUi::apply_history(SceneDocument& scene, const bool redo) {
     stop_sequencer_preview(scene);
-    if (play_state_ != EditorPlayState::edit || undo_history_.empty()) {
-        return false;
-    }
-    if (redo_history_.size() == maximum_history_entries) {
-        redo_history_.erase(redo_history_.begin());
-    }
-    redo_history_.push_back(std::move(scene));
-    scene = std::move(undo_history_.back());
-    undo_history_.pop_back();
+    if (play_state_ != EditorPlayState::edit) return false;
+    finish_history_entry(scene);
+    auto& source = redo ? redo_history_ : undo_history_;
+    auto& destination = redo ? undo_history_ : redo_history_;
+    if (source.empty()) return false;
+    auto restored = source.back().restore(scene);
+    SceneHistoryDelta inverse(scene, restored);
+    if (destination.size() == maximum_history_entries) destination.erase(destination.begin());
+    destination.push_back(std::move(inverse));
+    source.pop_back();
+    scene = std::move(restored);
     scene_replaced_ = true;
     inspector_edit_snapshot_.reset();
+    gizmo_edit_snapshot_.reset();
+    additional_selection_.clear();
+    group_anchor_ = {};
     selected_node_ = {};
     hierarchy_revision_ = 0U;
     name_buffer_node_ = {};
-    scene_file_status_ = "Undid scene edit.";
+    scene_file_status_ = redo ? "Redid scene edit." : "Undid scene edit.";
     return true;
 }
 
-bool EditorUi::redo_scene(SceneDocument& scene) {
-    stop_sequencer_preview(scene);
-    if (play_state_ != EditorPlayState::edit || redo_history_.empty()) {
-        return false;
-    }
-    if (undo_history_.size() == maximum_history_entries) {
-        undo_history_.erase(undo_history_.begin());
-    }
-    undo_history_.push_back(std::move(scene));
-    scene = std::move(redo_history_.back());
-    redo_history_.pop_back();
-    scene_replaced_ = true;
-    inspector_edit_snapshot_.reset();
-    selected_node_ = {};
-    hierarchy_revision_ = 0U;
-    name_buffer_node_ = {};
-    scene_file_status_ = "Redid scene edit.";
-    return true;
-}
+bool EditorUi::undo_scene(SceneDocument& scene) { return apply_history(scene, false); }
+bool EditorUi::redo_scene(SceneDocument& scene) { return apply_history(scene, true); }
 
 bool EditorUi::save_scene_external(
     SceneDocument& scene,
@@ -12664,7 +12942,7 @@ void EditorUi::apply_deferred_scene_commands(
     }
     if (play_state_ == EditorPlayState::edit &&
         scene.valid(pending_duplicate_)) {
-        static_cast<void>(select_node(scene, pending_duplicate_));
+        if (pending_duplicate_ != selected_node_) static_cast<void>(select_node(scene, pending_duplicate_));
         std::uint32_t duplicated_nodes = 0U;
         std::string duplicate_error;
         if (!duplicate_selection(
@@ -12686,7 +12964,11 @@ void EditorUi::apply_deferred_scene_commands(
     if (play_state_ == EditorPlayState::edit &&
         pending_delete_) {
         checkpoint_scene(scene);
-        static_cast<void>(scene.destroy_subtree(pending_delete_));
+        if (pending_delete_ == selected_node_) {
+            for (const auto root : selection_roots(scene)) static_cast<void>(scene.destroy_subtree(root));
+            additional_selection_.clear();
+            group_anchor_ = {};
+        } else static_cast<void>(scene.destroy_subtree(pending_delete_));
         if (!scene.valid(selected_node_)) {
             selected_node_ = {};
         }

@@ -10,6 +10,9 @@
 #include "prefab_io.hpp"
 #include "render_fixture_scene.hpp"
 #include "scene_document.hpp"
+#include "scene_history.hpp"
+#include "sublevel_streaming.hpp"
+#include "job_system.hpp"
 #include "scene_io.hpp"
 #include "temporal_coordinates.hpp"
 #include "camera_projection.hpp"
@@ -55,6 +58,35 @@ bool close_to(const double value, const double expected, const double epsilon) {
 } // namespace
 
 int main() {
+    {
+        std::array<std::atomic<unsigned>, 97> visits{};
+        vcr::parallel_for_jobs(visits.size(), [&](std::size_t i) { ++visits[i]; });
+        expect(std::ranges::all_of(visits, [](const auto& n) { return n.load() == 1; }),
+            "worker jobs execute each index exactly once");
+        bool propagated = false;
+        try {
+            vcr::parallel_for_jobs(128, [](std::size_t i) { if (i == 7) throw std::runtime_error("job"); });
+        } catch (const std::runtime_error&) { propagated = true; }
+        expect(propagated, "worker failure propagates after all callbacks join");
+    }
+    {
+        vcr::SceneDocument before;
+        auto root = before.create_node("Root", vcr::SceneNodeKind::folder);
+        auto child = before.create_node("FX", vcr::SceneNodeKind::particle_emitter, root);
+        auto child_uuid = *before.uuid(child);
+        expect(before.set_collider(child, {}), "attach history component");
+        auto after = before;
+        expect(after.destroy_subtree(child), "remove history subtree");
+        auto replacement = after.create_node("Replacement", vcr::SceneNodeKind::cube, root);
+        vcr::SceneHistoryDelta undo(before, after);
+        auto restored = undo.restore(after);
+        expect(restored.find_by_uuid(child_uuid) == child && restored.has_collider(child) &&
+            restored.parent(child) == root && !restored.valid(replacement) &&
+            restored.content_revision() == before.content_revision(), "undo restores generation, UUID and components");
+        auto redone = vcr::SceneHistoryDelta(after, restored).restore(restored);
+        expect(redone.valid(replacement) && !redone.find_by_uuid(child_uuid) &&
+            redone.content_revision() == after.content_revision(), "redo restores reused slot");
+    }
     {
         const char* args[]{"vcr", "--fog=height", "--fog-density", "0.01",
             "--fog-base-height=-20", "--fog-height-falloff=0.1", "--fog-start=25",
@@ -3022,6 +3054,38 @@ int main() {
                 reloaded.prefab_instances().size() ==
                     target_scene.prefab_instances().size(),
             "scene_io round-trips RigidBodyComponent, PrefabInstanceComponent, and triangle_mesh colliders");
+
+        const auto level_root = prefab_dir / "streaming";
+        std::filesystem::create_directories(level_root / "scenes");
+        vcr::SceneDocument cell, host;
+        const auto door = cell.create_node("Gate", vcr::SceneNodeKind::cube);
+        const auto trigger = cell.create_node("Trigger", vcr::SceneNodeKind::folder, door);
+        vcr::GameplayComponent behavior{};
+        behavior.target_node_uuid = *cell.uuid(door);
+        expect(cell.set_gameplay(trigger, behavior), "attach streamed gameplay target");
+        expect(vcr::save_scene_file(cell, level_root / "scenes/cell.json", error), "save streamed cell");
+        host.sublevels.push_back({"scenes/cell.json", {10, 0, 0}, 4.F});
+        expect(vcr::save_scene_file(host, level_root / "scenes/main.json", error) &&
+            vcr::load_scene_file(level_root / "scenes/main.json", host, error) && host.sublevels.size() == 1,
+            "round trip sublevel references");
+        vcr::SublevelStreaming streaming;
+        streaming.configure(level_root, host.sublevels);
+        auto enter = [&] {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!streaming.update(host, {10, 0, 0}, error) && error.empty() &&
+                   std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            std::vector<vcr::SceneNodeRecord> records;
+            host.build_node_records(records);
+            expect(error.empty() && records.size() == 3 && records[2].gameplay &&
+                records[2].gameplay->target_node_uuid == records[1].uuid, "load sublevel and resolve its internal references");
+            return records.size() == 3 ? records[1].uuid : vcr::SceneUuid{};
+        };
+        error.clear();
+        const auto streamed_id = enter();
+        expect(!streaming.update(host, {14.5F,0,0}, error) && host.size() == 3, "sublevel hysteresis");
+        expect(streaming.update(host, {20,0,0}, error) && host.size() == 0, "retire entire streamed subtree");
+        expect(enter() == streamed_id && streamed_id, "stable streamed identity after reentry");
+        streaming.stop();
 
         std::filesystem::remove_all(prefab_dir, fs_err);
     };

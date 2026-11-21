@@ -61,7 +61,7 @@ struct GameUiHostState {
     std::uint32_t shadow_resolution = 2048U;
     bool sky_enabled = true;
     float exposure_ev = 0.0F;
-    bool bloom_enabled = true;
+    bool bloom_enabled = false;
 
     void set_present_mode_label(const std::string_view label) noexcept {
         static_cast<void>(component_detail::set_fixed_cstr(present_mode_label, label));

@@ -47,7 +47,7 @@ struct BatchPreparedAssets {
     std::vector<PreparedModel> models{};
 };
 
-// Prepares a batch of models for cold scene loading using a bounded local
+// Prepares a batch of models for cold scene loading using the shared Windows
 // worker pool (running inline on the caller when model_paths.size() == 1).
 // Deduplicates shared textures and RT alpha maps across valid models in the
 // batch so each unique texture decodes at most once.

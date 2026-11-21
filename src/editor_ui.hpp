@@ -10,6 +10,8 @@
 #include "performance_metrics.hpp"
 #include "prefab_io.hpp"
 #include "scene_document.hpp"
+#include "scene_history.hpp"
+#include "world_surface.hpp"
 #include "vulkan_context.hpp"
 
 #include <SDL3/SDL.h>
@@ -226,7 +228,7 @@ public:
     [[nodiscard]] bool undo_scene(SceneDocument& scene);
     [[nodiscard]] bool redo_scene(SceneDocument& scene);
     [[nodiscard]] bool can_undo() const noexcept {
-        return !undo_history_.empty();
+        return history_baseline_.has_value() || !undo_history_.empty();
     }
     [[nodiscard]] bool can_redo() const noexcept {
         return !redo_history_.empty();
@@ -482,6 +484,9 @@ private:
     bool quit_requested_ = false;
     bool quit_confirmation_requested_ = false;
     bool save_requested_ = false;
+    bool save_as_requested_ = false;
+    std::array<char, 192> save_as_name_{};
+    std::string save_as_error_{};
     bool open_requested_ = false;
     bool open_confirmation_requested_ = false;
     bool import_dialog_requested_ = false;
@@ -489,6 +494,11 @@ private:
     bool startup_camera_requested_ = false;
     std::optional<SavedMaterialUpdate> saved_material_update_{};
 
+    std::vector<SceneNodeId> additional_selection_{};
+    SceneNodeId group_anchor_{};
+    void pick_node(SceneDocument& scene, SceneNodeId id, bool extend);
+    [[nodiscard]] std::vector<SceneNodeId> selection_roots(const SceneDocument& scene) const;
+    void snap_selection(SceneDocument& scene, Renderer& renderer);
     SceneNodeId selected_node_{};
     SceneNodeId pending_delete_{};
     SceneNodeId pending_duplicate_{};
@@ -499,8 +509,10 @@ private:
     std::optional<SceneDocument> inspector_edit_snapshot_{};
     std::optional<SceneDocument> gizmo_edit_snapshot_{};
     static constexpr std::size_t maximum_history_entries = 32U;
-    std::vector<SceneDocument> undo_history_{};
-    std::vector<SceneDocument> redo_history_{};
+    std::optional<SceneDocument> history_baseline_{};
+    std::vector<SceneHistoryDelta> undo_history_{}, redo_history_{};
+    void finish_history_entry(const SceneDocument& current);
+    bool apply_history(SceneDocument& scene, bool redo);
     EditorPlayState play_state_ = EditorPlayState::edit;
     // Resolve the ID on use: ImGui owns and may destroy platform windows.
     SDL_WindowID game_mouse_window_id_ = 0U;
@@ -559,12 +571,19 @@ private:
     float scatter_center_[3]{0.0F, 0.0F, 0.0F};
     float scatter_size_[2]{32.0F, 32.0F};
     float scatter_scale_[2]{0.8F, 1.2F};
+    TerrainCanvas terrain_canvas_{};
+    SceneUuid terrain_edit_target_{};
+    int terrain_brush_mode_ = 0, terrain_layer_ = 0;
+    float terrain_radius_ = 3.F, terrain_strength_ = 4.F, ribbon_width_ = 4.F;
+    void draw_surface_tools(SceneDocument& scene, Renderer& renderer, FlyCamera& camera);
     float flat_ground_size_[2]{64.0F, 64.0F};
     float flat_ground_height_ = 0.0F;
     std::filesystem::path project_root_{};
     std::string project_name_{};
     std::filesystem::path scene_path_{};
     std::filesystem::path pending_open_scene_path_{};
+    std::array<char, 513> sublevel_path_{};
+    float sublevel_radius_ = 64.F;
     std::string scene_file_name_{"editor_scene.json"};
     std::string scene_file_status_{};
     std::uint64_t saved_content_revision_ = 0U;
