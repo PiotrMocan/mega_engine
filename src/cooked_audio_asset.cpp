@@ -123,6 +123,12 @@ public:
         return true;
     }
 
+    [[nodiscard]] bool open(std::span<const unsigned char> bytes, const ma_decoder_config& config) noexcept {
+        reset();
+        initialized_ = ma_decoder_init_memory(bytes.data(), bytes.size(), &config, &decoder_) == MA_SUCCESS;
+        return initialized_;
+    }
+
     void reset() noexcept {
         if (initialized_) {
             ma_decoder_uninit(&decoder_);
@@ -138,6 +144,16 @@ private:
 };
 
 } // namespace
+
+bool read_embedded_mono_audio(std::span<const unsigned char> bytes, std::uint32_t rate,
+                              std::span<float> output) noexcept {
+    const auto config = ma_decoder_config_init(ma_format_f32, 1, rate);
+    ScopedMaDecoder decoder;
+    if (!decoder.open(bytes, config)) return false;
+    ma_uint64 read = 0;
+    return ma_decoder_read_pcm_frames(decoder.get(), output.data(), output.size(), &read) == MA_SUCCESS &&
+           read == output.size();
+}
 
 bool inspect_audio_source_file(
     const std::filesystem::path& source_file,

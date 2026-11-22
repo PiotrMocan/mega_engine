@@ -1,5 +1,6 @@
 #include "editor_application.hpp"
 #include "weather_control.hpp"
+#include "weather_audio.hpp"
 
 #include "asset_browser.hpp"
 #include "editor_scene_tools.hpp"
@@ -1067,6 +1068,7 @@ void EditorApplication::main_loop() {
         renderer_.set_weather(scene_.weather);
         const bool rendered = renderer_.draw_frame(
             timings, camera_.view_matrix(), draw_data);
+        update_storm_audio(renderer_.thunderstorm(), audio_engine_, ui_.play_state() == EditorPlayState::edit);
         if (options_.mcp_stdio) {
             complete_mcp_screenshot();
         }
@@ -1226,6 +1228,10 @@ void EditorApplication::synchronize_gameplay_state() {
     const EditorPlayState requested_state = ui_.play_state();
     if (requested_state == observed_play_state_) {
         return;
+    }
+    if (requested_state == EditorPlayState::edit || observed_play_state_ == EditorPlayState::edit) {
+        renderer_.thunderstorm().reset();
+        audio_engine_.stop_thunder();
     }
 
     if (observed_play_state_ == EditorPlayState::edit &&
@@ -3826,6 +3832,11 @@ void EditorApplication::execute_mcp_command(
         });
         return;
     }
+    case McpCommandType::weather_simulate:
+        renderer_.thunderstorm().set_override(command.enabled);
+        if (!command.enabled) audio_engine_.stop_thunder();
+        succeed("Weather simulation updated", weather_state(scene_, renderer_));
+        return;
     case McpCommandType::weather_get:
         succeed("Weather", weather_state(scene_, renderer_));
         return;

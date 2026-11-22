@@ -68,8 +68,10 @@ struct alignas(16) LightingUniforms {
     glm::vec4 cloud_layer{}; // base, thickness, coverage, density
     glm::vec4 cloud_wind_shadow{}; // advected world X/Z, shadow strength
     glm::vec4 cloud_variation{}; // affected fraction, signed deviation range, vertical bounds in metres (min/max)
+    glm::vec4 cloud_storm{}; // rain buildup, inverse square of glow radius
+    glm::vec4 cloud_flash{}; // world-space discharge center, radiant strength
 };
-static_assert(sizeof(LightingUniforms) == 576);
+static_assert(sizeof(LightingUniforms) == 608);
 static_assert(sizeof(GiTriangle) == 48);
 struct LightingStatistics {
     std::uint64_t shadow_passes = 0, shadow_tiles = 0;

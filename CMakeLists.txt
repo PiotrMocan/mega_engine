@@ -477,7 +477,14 @@ set(VCR_ENGINE_CORE_SOURCES
     src/crash_log.cpp
 )
 
-add_library(vcr_engine SHARED ${VCR_ENGINE_CORE_SOURCES})
+set(VCR_THUNDER_BANK "${CMAKE_CURRENT_SOURCE_DIR}/resources/audio/thunder.flac")
+set(VCR_THUNDER_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/generated/thunder_recordings.cpp")
+add_custom_command(OUTPUT "${VCR_THUNDER_SOURCE}"
+    COMMAND "${CMAKE_COMMAND}" "-DINPUT=${VCR_THUNDER_BANK}" "-DOUTPUT=${VCR_THUNDER_SOURCE}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_thunder.cmake"
+    DEPENDS "${VCR_THUNDER_BANK}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_thunder.cmake"
+    VERBATIM)
+add_library(vcr_engine SHARED ${VCR_ENGINE_CORE_SOURCES} "${VCR_THUNDER_SOURCE}")
 add_library(vcr::engine ALIAS vcr_engine)
 set_source_files_properties(src/miniaudio_impl.c PROPERTIES
     COMPILE_OPTIONS "$<IF:$<C_COMPILER_ID:MSVC>,/W0,-w>"

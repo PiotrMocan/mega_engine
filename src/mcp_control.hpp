@@ -29,6 +29,7 @@ enum class McpCommandType : std::uint8_t {
     lighting_set,
     weather_get,
     weather_set,
+    weather_simulate,
     render_set_shadow_resolution,
     render_set_shadow_cache,
     render_set_tone_mapper,

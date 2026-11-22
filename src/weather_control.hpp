@@ -44,7 +44,11 @@ bool apply_weather_command(const nlohmann::json& request, SceneDocument& scene,
         return false;
     }
     if (change_clock) clock.dynamic = true;
-    if (!change_clock && next == scene.weather) return true;
+    const bool follow_scene = patch.contains("storm") && patch["storm"].contains("enabled");
+    if (!change_clock && next == scene.weather) {
+        if (follow_scene) renderer.thunderstorm().set_override(std::nullopt);
+        return true;
+    }
     if (change_clock && !renderer.set_lighting_settings(clock)) {
         error = "Dynamic daylight is unavailable";
         return false;
@@ -53,6 +57,7 @@ bool apply_weather_command(const nlohmann::json& request, SceneDocument& scene,
     if (change_clock) scene.lighting = clock;
     scene.weather = next;
     renderer.set_weather(next);
+    if (follow_scene) renderer.thunderstorm().set_override(std::nullopt);
     return true;
 }
 
@@ -60,6 +65,10 @@ inline nlohmann::json weather_state(const SceneDocument& scene, const Renderer& 
     auto result = weather_json(scene.weather);
     result["current_clouds"] = weather_json({renderer.current_clouds()})["clouds"];
     result["active"] = renderer.clouds_active();
+    result["current_storm"] = storm_json(renderer.current_storm());
+    result["storm_running"] = renderer.thunderstorm().running();
+    result["discharges"] = renderer.thunderstorm().sequence();
+    result["flash"] = renderer.thunderstorm().light();
     result["hour"] = renderer.lighting_settings().hour;
     result["cycle"] = renderer.lighting_settings().cycle;
     result["day_seconds"] = renderer.lighting_settings().day_seconds;

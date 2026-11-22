@@ -10827,7 +10827,7 @@ bool EditorUi::mcp_sequencer_set_playback(
 
 void EditorUi::build_weather_panel(SceneDocument& scene, Renderer& renderer) {
     if (!weather_panel_open_) return;
-    ImGui::SetNextWindowSize(ImVec2(400, 510), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(410, 720), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Weather", &weather_panel_open_)) {
         auto lighting = renderer.lighting_settings();
         auto weather = scene.weather;
@@ -10848,11 +10848,19 @@ void EditorUi::build_weather_panel(SceneDocument& scene, Renderer& renderer) {
         ImGui::SeparatorText("Volumetric clouds");
         ImGui::BeginDisabled(!renderer.fog_supported());
         bool changed = ImGui::Checkbox("Enable cloud layer", &c.enabled);
-        if (ImGui::Button("Clear")) { c.enabled = true; c.coverage = 0; changed = true; }
+        bool fair_preset = false;
+        if (ImGui::Button("Clear")) { c.coverage = 0; fair_preset = true; }
         ImGui::SameLine();
-        if (ImGui::Button("Scattered")) { c.enabled = true; c.coverage = 0.48F; c.density = 0.85F; changed = true; }
+        if (ImGui::Button("Scattered")) { c.coverage = 0.48F; c.density = 0.85F; fair_preset = true; }
         ImGui::SameLine();
-        if (ImGui::Button("Overcast")) { c.enabled = true; c.coverage = 1; c.density = 2; c.shadow_strength = 1; changed = true; }
+        if (ImGui::Button("Overcast")) { c.coverage = 1; c.density = 2; c.shadow_strength = 1; fair_preset = true; }
+        if (fair_preset) {
+            c.enabled = true;
+            weather.storm.enabled = false;
+            weather.storm.rain_buildup = 0;
+            renderer.thunderstorm().set_override(std::nullopt);
+            changed = true;
+        }
         constexpr auto clamp = ImGuiSliderFlags_AlwaysClamp;
         changed |= ImGui::SliderFloat("Coverage", &c.coverage, 0, 1, "%.2f", clamp);
         changed |= ImGui::SliderFloat("Density", &c.density, 0, 4, "%.2f", clamp);
@@ -10874,6 +10882,33 @@ void EditorUi::build_weather_panel(SceneDocument& scene, Renderer& renderer) {
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("0 degrees moves toward +X, 90 toward +Z.");
         changed |= ImGui::DragFloat("Wind speed", &c.wind_speed, 0.25F, 0, 200, "%.1f m/s", clamp);
         changed |= ImGui::SliderFloat("Shadow strength", &c.shadow_strength, 0, 1, "%.2f", clamp);
+        ImGui::SeparatorText("Rain front and thunderstorm");
+        auto& storm = weather.storm;
+        if (ImGui::Button("Rain front")) {
+            c.enabled = true; c.coverage = 0.70F; c.density = 1.1F; storm.rain_buildup = 0.90F;
+            storm.enabled = false; renderer.thunderstorm().set_override(std::nullopt); changed = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Thunderstorm")) {
+            c.enabled = true; c.coverage = 0.82F; c.density = 1.3F; storm.rain_buildup = 1.0F;
+            storm.enabled = true; renderer.thunderstorm().set_override(std::nullopt); changed = true;
+        }
+        changed |= ImGui::SliderFloat("Rain buildup", &storm.rain_buildup, 0, 1, "%.2f", clamp);
+        if (ImGui::Checkbox("Storm enabled in scene", &storm.enabled)) {
+            renderer.thunderstorm().set_override(std::nullopt); changed = true;
+        }
+        changed |= ImGui::DragFloat("Discharge interval", &storm.interval_seconds, 0.2F, 2, 120, "%.1f s", clamp);
+        changed |= ImGui::SliderFloat("Cloud flash strength", &storm.flash_strength, 0, 1, "%.2f", clamp);
+        changed |= ImGui::SliderFloat("Thunder volume", &storm.thunder_volume, 0, 1, "%.2f", clamp);
+        changed |= ImGui::DragFloat("Thunder duration", &storm.thunder_duration, 0.1F, 0.5F, 15, "%.1f s", clamp);
+        ImGui::BeginDisabled(!c.enabled || c.coverage <= 0 || c.density <= 0 || renderer.thunderstorm().running());
+        if (ImGui::Button("Start simulation")) renderer.thunderstorm().set_override(true);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Stop simulation")) renderer.thunderstorm().set_override(false);
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", renderer.thunderstorm().running() ? "Running" : "Stopped");
+        ImGui::Separator();
         changed |= ImGui::DragFloat("Transition", &weather.transition_seconds, 0.1F, 0, 86400, "%.1f s", clamp);
         ImGui::EndDisabled();
         if (!renderer.fog_supported()) ImGui::TextWrapped("Clouds require sampled scene depth and HDR blending.");

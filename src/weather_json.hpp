@@ -22,10 +22,46 @@ inline constexpr std::array cloud_fields{
     CloudField{"variation_amount", &CloudSettings::variation_amount, 0, 1}
 };
 
+struct StormField {
+    const char* key;
+    float StormSettings::*member;
+    float minimum, maximum;
+};
+inline constexpr std::array storm_fields{
+    StormField{"rain_buildup", &StormSettings::rain_buildup, 0, 1},
+    StormField{"interval_seconds", &StormSettings::interval_seconds, 2, 120},
+    StormField{"flash_strength", &StormSettings::flash_strength, 0, 1},
+    StormField{"thunder_volume", &StormSettings::thunder_volume, 0, 1},
+    StormField{"thunder_duration", &StormSettings::thunder_duration, 0.5F, 15}
+};
+
+inline nlohmann::json storm_json(const StormSettings& settings) {
+    nlohmann::json storm{{"enabled", settings.enabled}};
+    for (const auto& f : storm_fields) storm[f.key] = settings.*f.member;
+    return storm;
+}
+
 inline nlohmann::json weather_json(const WeatherSettings& settings) {
     nlohmann::json clouds{{"enabled", settings.clouds.enabled}};
     for (const auto& f : cloud_fields) clouds[f.key] = settings.clouds.*f.member;
-    return {{"clouds", std::move(clouds)}, {"transition_seconds", settings.transition_seconds}};
+    return {{"clouds", std::move(clouds)}, {"transition_seconds", settings.transition_seconds}, {"storm", storm_json(settings.storm)}};
+}
+
+template<class Settings, class Fields>
+bool read_weather_fields(const nlohmann::json& object, Settings& settings, const Fields& fields) {
+    for (const auto& [key, value] : object.items()) {
+        if (key == "enabled") {
+            if (!value.is_boolean()) return false;
+            settings.enabled = value.get<bool>();
+            continue;
+        }
+        const auto field = std::find_if(fields.begin(), fields.end(), [&](const auto& f) { return key == f.key; });
+        if (field == fields.end() || !value.is_number()) return false;
+        const double x = value.get<double>();
+        if (!(x >= field->minimum && x <= field->maximum)) return false;
+        settings.*(field->member) = static_cast<float>(x);
+    }
+    return true;
 }
 
 // Omitted properties retain their previous values. Invalid patches are atomic.
@@ -37,19 +73,9 @@ inline bool read_weather(const nlohmann::json& source, WeatherSettings& target) 
             if (!value.is_number() || value.get<double>() < 0 || value.get<double>() > 86400) return false;
             next.transition_seconds = value.get<float>();
         } else if (key == "clouds" && value.is_object()) {
-            for (const auto& [name, parameter] : value.items()) {
-                if (name == "enabled") {
-                    if (!parameter.is_boolean()) return false;
-                    next.clouds.enabled = parameter.get<bool>();
-                    continue;
-                }
-                const auto f = std::find_if(cloud_fields.begin(), cloud_fields.end(),
-                    [&](const auto& field) { return name == field.key; });
-                if (f == cloud_fields.end() || !parameter.is_number()) return false;
-                const double x = parameter.get<double>();
-                if (!(x >= f->minimum && x <= f->maximum)) return false;
-                next.clouds.*(f->member) = static_cast<float>(x);
-            }
+            if (!read_weather_fields(value, next.clouds, cloud_fields)) return false;
+        } else if (key == "storm" && value.is_object()) {
+            if (!read_weather_fields(value, next.storm, storm_fields)) return false;
         } else return false;
     }
     if (!valid_weather(next)) return false;

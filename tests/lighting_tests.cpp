@@ -1,5 +1,5 @@
 #include "lighting.hpp"
-#include "weather.hpp"
+#include "thunderstorm.hpp"
 #include "camera_projection.hpp"
 #include <array>
 #include <cmath>
@@ -344,6 +344,40 @@ int main() {
         expect(system.offset_x() == 4097.0, "regional field moves continuously past the old wind period");
         system.advance(1048576.0);
         expect(system.offset_x() == 4097.0, "wind wraps at the common period of all fields");
+    }
+    {
+        WeatherSystem weather;
+        WeatherSettings target;
+        target.storm.rain_buildup = 1;
+        target.transition_seconds = 2;
+        weather.set(target);
+        weather.advance(1);
+        expect(std::abs(weather.storm().rain_buildup - 0.5F) < 0.001F, "rain front blends with the cloud target");
+        target.storm.thunder_duration = 0;
+        expect(!valid_weather(target), "zero duration rejected");
+        Thunderstorm storm;
+        StormSettings s;
+        s.interval_seconds = 12;
+        s.thunder_duration = 6;
+        const glm::vec3 listener{0, 0, 0}, forward{0, 0, -1};
+        storm.set_override(true);
+        storm.advance(0.016, s, listener, forward, 500, 300);
+        expect(storm.running() && storm.light() > 0 && !storm.take_sound(), "discharge precedes thunder");
+        const auto origin = storm.center();
+        storm.advance(glm::length(origin) / 343.0 + 0.01, s, listener, forward, 500, 300);
+        const auto event = storm.take_sound();
+        expect(event && event->position == origin && event->duration == 6 && event->volume == s.thunder_volume,
+               "thunder arrives from its discharge with authored duration and gain");
+        storm.set_override(false);
+        expect(!storm.running() && !storm.light() && storm.take_cancel() && !storm.take_sound(), "stop silences storm");
+        storm.set_override(true);
+        s.interval_seconds = 2;
+        storm.advance(0.016, s, listener, forward, 500, 300);
+        const auto first = storm.sequence();
+        storm.advance(2.41, s, listener, forward, 500, 300);
+        expect(storm.sequence() == first + 1, "short interval schedules the next discharge");
+        storm.reset();
+        expect(!storm.requested(s) && !storm.take_sound(), "reset clears audition and pending thunder");
     }
     std::puts("Lighting invariants passed");
 }

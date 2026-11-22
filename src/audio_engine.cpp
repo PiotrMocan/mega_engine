@@ -1,4 +1,5 @@
 #include "audio_engine.hpp"
+#include "thunder_recordings.hpp"
 
 #define MA_NO_ENGINE
 #define MA_NO_NODE_GRAPH
@@ -314,6 +315,7 @@ enum class MixerCommandKind : std::uint8_t {
     stop_gameplay_voices,
     stop_all_voices,
     start_voice,
+    start_thunder,
     stop_voice,
     fade_voice,
     update_voice,
@@ -340,6 +342,9 @@ struct MixerCommand final {
 };
 
 struct MixerVoice final {
+    std::uint64_t thunder_sequence = 0;
+    std::uint32_t thunder_frames_left = 0;
+    float thunder_release_step = 0;
     std::uint32_t generation = 0U;
     bool active = false;
     bool is_streaming = false;
@@ -550,6 +555,10 @@ struct AudioEngineState {
     AudioEngineOptions options{};
     std::filesystem::path canonical_root{};
     std::uint32_t sample_rate = default_audio_sample_rate;
+    // The device callback only reads PCM. All voices share the same immutable bank.
+    std::vector<float> thunder_pcm;
+    std::uint32_t thunder_pcm_rate = 0;
+    std::uint32_t last_thunder_take = thunder_take_count; // host thread only
 
     // Resident immutable clip pool & main-thread lookup table.
     struct TransparentStringHash {
@@ -605,6 +614,8 @@ struct AudioEngineState {
     // Lock-free command channel to real-time mixer.
     SpscRingQueue<MixerCommand, command_queue_capacity> command_queue{};
     std::uint64_t next_command_seq = 1U;
+    // Stop cannot be dropped even if the normal mixer command queue is full.
+    std::atomic<std::uint64_t> stop_thunder_through{0};
     alignas(64) std::atomic<std::uint64_t> mixer_processed_seq{0U};
 
     // Real-time mixer state (owned exclusively by audio callback — or test runner
@@ -633,19 +644,16 @@ struct AudioEngineState {
     ma_device device{};
     bool hardware_device_initialized = false;
 
-    void push_command(MixerCommand cmd) noexcept {
+    bool push_command(MixerCommand cmd) noexcept {
         cmd.sequence = next_command_seq++;
-        if (!command_queue.try_push(cmd)) {
-            // If the host bursts >512 commands before a single audio callback
-            // runs in headless mode, drain on headless mixer or drop safely.
-            if (!hardware_device_initialized) {
-                drain_commands_on_mixer();
-                (void)command_queue.try_push(cmd);
-            }
-        }
+        if (command_queue.try_push(cmd)) return true;
+        if (hardware_device_initialized) return false;
+        drain_commands_on_mixer();
+        return command_queue.try_push(cmd);
     }
 
     void release_voice_resource_on_mixer(const MixerVoice& voice) noexcept {
+        if (voice.thunder_sequence != 0) return;
         if (voice.is_streaming) {
             if (voice.resource_index < max_stream_slots) {
                 stream_slots[voice.resource_index].active_voices.fetch_sub(
@@ -720,6 +728,7 @@ struct AudioEngineState {
                 }
                 reverb_dsp.clear();
                 break;
+            case MixerCommandKind::start_thunder:
             case MixerCommandKind::start_voice: {
                 if (cmd.handle.slot >= max_voices) {
                     break;
@@ -735,6 +744,11 @@ struct AudioEngineState {
                 v.resource_index = cmd.resource_index;
                 v.base_volume = std::clamp(sanitize_finite(cmd.value_a, 1.0F), 0.0F, 4.0F);
                 v.base_pitch = std::clamp(sanitize_finite(cmd.value_b, 1.0F), 0.25F, 4.0F);
+                if (cmd.kind == MixerCommandKind::start_thunder) {
+                    v.thunder_sequence = cmd.sequence;
+                    v.thunder_frames_left = static_cast<std::uint32_t>(std::lround(sr * cmd.value_b));
+                    v.thunder_release_step = 1.0F / (sr * std::min(2.0F, 0.45F * cmd.value_b));
+                }
                 v.loop = cmd.flag_a;
                 v.spatial = cmd.flag_b;
                 v.is_streaming = cmd.flag_c;
@@ -857,10 +871,16 @@ struct AudioEngineState {
             1.0F - std::exp(-1.0F / std::max(0.004F * sr, 1.0F));
 
         std::uint32_t total_active_voices = 0U;
+        const auto thunder_cutoff = stop_thunder_through.load(std::memory_order_acquire);
 
         for (std::size_t slot = 0U; slot < max_voices; ++slot) {
             MixerVoice& v = mixer_voices[slot];
             if (!v.active) {
+                continue;
+            }
+            const bool is_thunder = v.thunder_sequence != 0;
+            if (is_thunder && v.thunder_sequence <= thunder_cutoff) {
+                deactivate_mixer_voice(slot);
                 continue;
             }
             const auto bus_idx = static_cast<std::size_t>(v.bus);
@@ -928,8 +948,12 @@ struct AudioEngineState {
                     v.spatial_params.doppler_factor * mixer_listener.doppler_scale);
                 effective_pitch = std::clamp(v.base_pitch * doppler, 0.25F, 4.0F);
 
-                if (occ > 1.0e-3F) {
-                    const float cutoff_hz = 18'000.0F * std::pow(0.05F, occ);
+                if (occ > 1.0e-3F || is_thunder) {
+                    float cutoff_hz = 18'000.0F * std::pow(0.05F, occ);
+                    if (is_thunder) {
+                        const float range_km = dist * 0.001F;
+                        cutoff_hz = std::min(cutoff_hz, 11'000.0F / (1.0F + range_km * range_km));
+                    }
                     const float rc = 1.0F / (2.0F * std::numbers::pi_v<float> * cutoff_hz);
                     const float dt = 1.0F / sr;
                     lp_alpha = std::clamp(dt / (rc + dt), 0.01F, 1.0F);
@@ -957,22 +981,35 @@ struct AudioEngineState {
             bool finished = false;
 
             if (!v.is_streaming) {
-                if (v.resource_index >= max_resident_clips ||
-                    !resident_clips[v.resource_index].ready.load(
-                        std::memory_order_acquire)) {
-                    deactivate_mixer_voice(slot);
-                    continue;
-                }
-                const ResidentClipSlot& clip = resident_clips[v.resource_index];
-                const float* const pcm = clip.samples.data();
-                const std::uint64_t total_clip_frames = clip.frame_count;
-                const std::uint32_t ch = clip.channels;
-                if (total_clip_frames == 0U || pcm == nullptr) {
-                    deactivate_mixer_voice(slot);
-                    continue;
+                std::span<const float> pcm;
+                std::uint64_t total_clip_frames = 0;
+                std::uint32_t ch = 1;
+                if (is_thunder) {
+                    const std::size_t take_frames = thunder_pcm_rate * thunder_take_seconds;
+                    pcm = std::span{thunder_pcm}.subspan(v.resource_index * take_frames, take_frames);
+                    total_clip_frames = take_frames;
+                    effective_pitch = static_cast<float>(thunder_pcm_rate) / sr;
+                } else {
+                    if (v.resource_index >= max_resident_clips ||
+                        !resident_clips[v.resource_index].ready.load(std::memory_order_acquire)) {
+                        deactivate_mixer_voice(slot);
+                        continue;
+                    }
+                    const auto& clip = resident_clips[v.resource_index];
+                    pcm = clip.samples;
+                    total_clip_frames = clip.frame_count;
+                    ch = clip.channels;
+                    if (pcm.empty() || total_clip_frames == 0) {
+                        deactivate_mixer_voice(slot);
+                        continue;
+                    }
                 }
 
                 for (std::size_t f = 0U; f < frames; ++f) {
+                    if (is_thunder && v.thunder_frames_left == 0) {
+                        finished = true;
+                        break;
+                    }
                     if (v.cursor >= static_cast<double>(total_clip_frames)) {
                         if (v.loop) {
                             v.cursor = std::fmod(
@@ -1033,7 +1070,13 @@ struct AudioEngineState {
                     v.lp_state_l += lp_alpha * (s_l - v.lp_state_l);
                     v.lp_state_r += lp_alpha * (s_r - v.lp_state_r);
 
-                    const float env = v.envelope_gain;
+                    float env = v.envelope_gain;
+                    if (is_thunder) {
+                        --v.thunder_frames_left;
+                        const float release = std::min(1.0F,
+                            static_cast<float>(v.thunder_frames_left) * v.thunder_release_step);
+                        env *= release * release;
+                    }
                     bus_out[f * 2U] += v.lp_state_l * v.smooth_gain_l * env;
                     bus_out[f * 2U + 1U] += v.lp_state_r * v.smooth_gain_r * env;
 
@@ -1561,6 +1604,12 @@ bool AudioEngine::initialize(
     st->options = options;
     st->canonical_root = std::move(canonical_root);
     st->sample_rate = options.sample_rate;
+    st->thunder_pcm_rate = std::min(st->sample_rate, thunder_recording_rate);
+    st->thunder_pcm.resize(thunder_take_count * thunder_take_seconds * st->thunder_pcm_rate);
+    if (!read_embedded_mono_audio(embedded_thunder_recordings(), st->thunder_pcm_rate, st->thunder_pcm)) {
+        error = "Unable to decode the built-in thunder recordings.";
+        return false;
+    }
     st->reverb_dsp.configure(st->sample_rate);
 
     if (options.enable_hardware_output) {
@@ -1926,6 +1975,35 @@ AudioVoiceHandle AudioEngine::play_pcm_clip(
         .spatial = params.spatial_params,
     });
     return handle;
+}
+
+AudioVoiceHandle AudioEngine::play_thunder(glm::vec3 position, float volume, float duration,
+                                           std::uint32_t seed, bool preview) noexcept {
+    if (!state_ || !(volume > 0 && volume <= 1) || !(duration >= 0.5F && duration <= 15)) return {};
+    const auto handle = state_->allocate_voice_handle();
+    if (!handle) return {};
+    std::uint32_t take = seed % thunder_take_count;
+    if (take == state_->last_thunder_take) {
+        take = (take + 1U + (seed / thunder_take_count) % (thunder_take_count - 1U)) % thunder_take_count;
+    }
+    state_->host_voice_slots[handle->slot].start_command_seq = state_->next_command_seq;
+    state_->mixer_live_generations[handle->slot].store(handle->generation, std::memory_order_release);
+    if (!state_->push_command(MixerCommand{
+        .kind = MixerCommandKind::start_thunder, .handle = *handle, .bus = AudioBusId::sfx,
+        .resource_index = take, .value_a = volume, .value_b = duration,
+        .flag_b = true, .flag_d = preview,
+        .spatial = {.position = position, .min_distance = 1200, .max_distance = 12000,
+                    .rolloff = 0.85F, .doppler_factor = 0, .reverb_send = 0}})) {
+        state_->host_voice_slots[handle->slot].start_command_seq = 0;
+        state_->mixer_live_generations[handle->slot].store(0, std::memory_order_release);
+        return {};
+    }
+    state_->last_thunder_take = take;
+    return *handle;
+}
+
+void AudioEngine::stop_thunder() noexcept {
+    if (state_) state_->stop_thunder_through.store(state_->next_command_seq - 1, std::memory_order_release);
 }
 
 void AudioEngine::stop_voice(

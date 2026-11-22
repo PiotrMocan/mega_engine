@@ -547,11 +547,25 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
     advance_lighting_clock(lighting_settings_, dt, lighting_paused_);
     if (!lighting_paused_) weather_.advance(dt);
     const auto& clouds = weather_.clouds();
-    u.cloud_layer = glm::vec4(clouds.base_height, clouds.thickness,
-        clouds_active() ? clouds.coverage : 0.0F, clouds.density);
-    const float margin = clouds.variation_chance > 0 ? clouds.thickness * clouds.variation_amount : 0.0F;
-    u.cloud_variation = {clouds.variation_chance, clouds.variation_amount,
-        clouds.base_height - margin, clouds.base_height + clouds.thickness + margin};
+    const auto& storm = weather_.storm();
+    const float wet = storm.rain_buildup;
+    const float base = clouds.base_height - 0.24F * clouds.thickness * wet;
+    const float thickness = clouds.thickness * (1.0F + 0.85F * wet);
+    u.cloud_layer = {base, thickness, clouds_active() ? std::lerp(clouds.coverage, 1.0F, 0.82F * wet) : 0.0F,
+                     clouds.density * (1.0F + 0.80F * wet)};
+    const float margin = clouds.variation_chance > 0 ? thickness * clouds.variation_amount : 0.0F;
+    u.cloud_variation = {clouds.variation_chance, clouds.variation_amount, base - margin, base + thickness + margin};
+    if (clouds_active() && thunderstorm_.requested(storm)) {
+        if (!lighting_paused_) {
+            const glm::mat3 rotation = glm::transpose(glm::mat3(view));
+            thunderstorm_.advance(dt, storm, -(rotation * glm::vec3(view[3])), -rotation[2], base, thickness);
+        }
+    } else if (thunderstorm_.running()) {
+        thunderstorm_.stop();
+    }
+    const float glow_radius = 330.0F + thickness * 0.82F;
+    u.cloud_storm = {wet, 1.0F / (glow_radius * glow_radius), 0, 0};
+    u.cloud_flash = glm::vec4(thunderstorm_.center(), thunderstorm_.light());
     u.cloud_wind_shadow = glm::vec4(static_cast<float>(weather_.offset_x()),
         static_cast<float>(weather_.offset_z()), clouds.shadow_strength,
         clouds.enabled && fog_supported_ && mode_ != RunMode::instancing ? 1.0F : 0.0F);

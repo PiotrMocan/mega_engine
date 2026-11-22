@@ -408,6 +408,68 @@ void test_audio_assets_and_sound_cues(const std::filesystem::path& asset_root) {
         "pick_sound_cue_variation avoids immediate clip repeats and honors pitch/volume bounds");
 }
 
+void test_thunder_playback() {
+    vcr::AudioEngine engine;
+    std::string error;
+    if (!engine.initialize({.sample_rate = 24000, .enable_hardware_output = false}, error)) {
+        expect(false, "initialize thunder mixer"); return;
+    }
+    std::vector<float> short_clip(12000U * 2U), quiet(short_clip.size());
+    const auto start = [&](float volume, float seconds) {
+        return engine.play_thunder({0, 300, -400}, volume, seconds, 12345);
+    };
+    const auto first = start(0.6F, 0.5F);
+    engine.render_frames_for_test(short_clip);
+    std::array<float, 256> tail{};
+    engine.render_frames_for_test(tail);
+    expect(first && !engine.is_voice_active(first) &&
+           std::ranges::all_of(tail, [](float x) { return x == 0; }),
+           "thunder ends at the requested duration");
+    const auto variation = start(0.6F, 0.5F);
+    engine.render_frames_for_test(quiet);
+    double dot = 0, energy_a = 0, energy_b = 0;
+    for (std::size_t i = 0; i < quiet.size(); ++i) {
+        dot += short_clip[i] * quiet[i];
+        energy_a += short_clip[i] * short_clip[i];
+        energy_b += quiet[i] * quiet[i];
+    }
+    expect(variation && energy_a > 0.1 && energy_b > 0.1 &&
+           std::abs(dot) < 0.75 * std::sqrt(energy_a * energy_b),
+           "successive thunder events use distinct recordings even with the same seed");
+    // With the original take available again, compare gain on identical source audio.
+    const auto second = start(0.3F, 0.5F);
+    engine.render_frames_for_test(quiet);
+    double loud_energy = 0, quiet_energy = 0;
+    for (std::size_t i = 0; i < quiet.size(); ++i) {
+        loud_energy += short_clip[i] * short_clip[i];
+        quiet_energy += quiet[i] * quiet[i];
+    }
+    expect(second && loud_energy > 0.1 && std::abs(quiet_energy / loud_energy - 0.25) < 0.01,
+           "thunder produces finite audio at the authored gain");
+    const auto long_roll = start(0.8F, 8);
+    engine.render_frames_for_test(short_clip);
+    expect(engine.is_voice_active(long_roll), "long thunder continues past the short clip duration");
+    engine.stop_thunder();
+    engine.render_frames_for_test(tail);
+    expect(!engine.is_voice_active(long_roll) && std::ranges::all_of(tail, [](float x) { return x == 0; }),
+           "stop cuts the current roll on the next mixer block");
+
+    for (std::uint32_t rate : {8'000U, 44'100U, 192'000U}) {
+        if (!engine.initialize({.sample_rate = rate, .enable_hardware_output = false}, error)) {
+            expect(false, "initialize recording bank across supported output rates"); continue;
+        }
+        const auto roll = start(0.8F, 15);
+        std::vector<float> ending(rate * 2U);
+        for (int second_index = 0; second_index < 15; ++second_index)
+            engine.render_frames_for_test(ending);
+        expect(roll && std::ranges::any_of(ending, [](float x) { return std::abs(x) > 0.0001F; }) &&
+               ending.back() == 0, "long roll retains an audible tail and reaches silence at 15 seconds");
+        engine.render_frames_for_test(tail);
+        expect(!engine.is_voice_active(roll) && std::ranges::all_of(tail, [](float x) { return x == 0; }),
+               "resampling preserves authored duration");
+    }
+}
+
 void test_audio_engine_dsp_and_spatial(const std::filesystem::path& asset_root) {
     // Pure spatial math checks.
     expect(
@@ -768,6 +830,7 @@ int main() {
 
     test_input_action_system(scratch_root);
     test_audio_assets_and_sound_cues(scratch_root);
+    test_thunder_playback();
     test_audio_engine_dsp_and_spatial(scratch_root);
     test_scene_and_prefab_audio_roundtrip(scratch_root);
 

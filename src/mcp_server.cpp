@@ -43,8 +43,8 @@ using namespace std::chrono_literals;
 
 constexpr std::string_view protocol_version{"2025-11-25"};
 constexpr std::size_t maximum_input_message_bytes = 1024U * 1024U;
-constexpr std::array<std::string_view, 33> runtime_tool_names{
-    "weather.get", "weather.set",
+constexpr std::array<std::string_view, 34> runtime_tool_names{
+    "weather.get", "weather.set", "weather.simulate",
     "debug.get_capabilities",
     "debug.get_state",
     "debug.get_metrics",
@@ -78,8 +78,8 @@ constexpr std::array<std::string_view, 33> runtime_tool_names{
     "engine.quit",
 };
 
-constexpr std::array<std::string_view, 64> editor_tool_names{
-    "weather.get", "weather.set",
+constexpr std::array<std::string_view, 65> editor_tool_names{
+    "weather.get", "weather.set", "weather.simulate",
     "render.set_exposure",
     "render.set_color_grading",
     "render.set_subsurface",
@@ -392,13 +392,19 @@ private:
 void append_weather_tools(Json& tools) {
     tools.push_back(tool_definition("weather.get", "Read weather",
         "Read target and current clouds, daylight clock and rendering state.", object_schema(), true, false, true));
+    tools.push_back(tool_definition("weather.simulate", "Start or stop thunderstorm",
+        "Override storm playback for this session without editing the scene.",
+        object_schema(Json{{"enabled", {{"type","boolean"}}}}, Json::array({"enabled"})), false, false, true));
+    Json storm{{"enabled", {{"type","boolean"}}}};
+    for (const auto& f : storm_fields)
+        storm[f.key] = {{"type","number"}, {"minimum",f.minimum}, {"maximum",f.maximum}};
     Json fields{{"enabled", {{"type","boolean"}}}};
     for (const auto& f : cloud_fields)
         fields[f.key] = {{"type","number"}, {"minimum",f.minimum}, {"maximum",f.maximum}};
     tools.push_back(tool_definition("weather.set", "Change weather",
         "Change cloud properties or the daylight clock. Transition duration is in seconds, altitude in metres, "
         "wind speed in m/s and heading in degrees from +X toward +Z. Omitted fields keep their values.",
-        object_schema(Json{{"clouds", object_schema(std::move(fields))},
+        object_schema(Json{{"clouds", object_schema(std::move(fields))}, {"storm", object_schema(std::move(storm))},
             {"transition_seconds", {{"type","number"},{"minimum",0},{"maximum",86400}}},
             {"hour", {{"type","number"},{"minimum",0},{"exclusiveMaximum",24}}},
             {"cycle", {{"type","boolean"}}},
@@ -4921,6 +4927,14 @@ void append_weather_tools(Json& tools) {
     command = {};
     command.token = token;
 
+    if (name == "weather.simulate") {
+        if (arguments.size() != 1 || !arguments.contains("enabled") || !arguments["enabled"].is_boolean()) {
+            error = "weather.simulate requires a boolean enabled"; return false;
+        }
+        command.type = McpCommandType::weather_simulate;
+        command.enabled = arguments["enabled"].get<bool>();
+        return true;
+    }
     if (name == "weather.get") {
         if (!arguments.empty()) { error = "weather.get takes no arguments"; return false; }
         command.type = McpCommandType::weather_get;

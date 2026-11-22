@@ -1,0 +1,17 @@
+The recordings in resources/audio/thunder.flac are derived from these field recordings.
+All three authors released their recordings under CC0 1.0 Universal.
+https://creativecommons.org/publicdomain/zero/1.0/
+
+seth-m, "big thunder clap"
+https://freesound.org/people/seth-m/sounds/458015/
+
+Fission9, "Thunder, Close"
+https://freesound.org/people/Fission9/sounds/505113/
+
+BlueDelta, "THUNDER long rumbling - no Rain - 4-CHANNEL-44kHz.wav"
+https://freesound.org/people/BlueDelta/sounds/367702/
+
+The engine bank contains three 16-second mono takes at 24 kHz. The first two use
+the seth-m and Fission9 strikes, respectively, with different sections of the
+BlueDelta recording for the trailing rumble. The third uses the BlueDelta roll.
+The edits include trimming, filtering, mono downmix, level adjustment and fades.

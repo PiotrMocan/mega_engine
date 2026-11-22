@@ -183,6 +183,10 @@ public:
         const AudioPlayParams& params,
         std::string& error);
 
+    AudioVoiceHandle play_thunder(glm::vec3 position, float volume, float duration_seconds,
+                                  std::uint32_t seed, bool preview = false) noexcept;
+    void stop_thunder() noexcept;
+
     void stop_voice(
         AudioVoiceHandle handle,
         float fade_out_seconds = 0.01F) noexcept;

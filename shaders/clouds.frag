@@ -46,6 +46,20 @@ void main() {
         float fill = mix(0.30, 0.80, h) + 0.22 * exp(-2.5 * blocker);
         vec3 source = ambient * fill
             + sunlight * (0.07 + (0.67 + silver * 0.56) * sunLight);
+        // A rain-bearing bank keeps a cool, dark underside and lighter crests.
+        if (lighting.cloudStorm.x > 0.0) {
+            vec3 wetTint = mix(vec3(0.095, 0.13, 0.19), vec3(0.53, 0.57, 0.63), h * h);
+            source *= mix(vec3(1.0), wetTint, lighting.cloudStorm.x);
+        }
+        // Emit only from occupied cloud samples; optical depth in front of
+        // the discharge attenuates it through the normal volume integration.
+        if (lighting.cloudFlash.w > 0.001) {
+            vec3 d = p - lighting.cloudFlash.xyz;
+            float r2 = dot(d, d) * lighting.cloudStorm.y;
+            float glow = 0.72 * exp2(-3.5 * r2) + 0.28 * exp2(-0.95 * r2);
+            float diffuse = 0.40 + 0.60 * exp(-1.3 * blocker);
+            source += vec3(1.8, 1.95, 2.65) * (lighting.cloudFlash.w * glow * diffuse);
+        }
         float slice = 1.0 - exp(-density * extinction * stepLength);
         scattered += transmission * slice * source;
         transmission *= 1.0 - slice;

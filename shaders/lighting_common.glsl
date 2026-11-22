@@ -25,6 +25,8 @@ layout(set=LIGHTING_SET,binding=LIGHTING_BINDING,std140) uniform Lighting {
     vec4 cloudLayer;
     vec4 cloudWindShadow;
     vec4 cloudVariation;
+    vec4 cloudStorm;
+    vec4 cloudFlash;
 } lighting;
 vec3 dynamicSkyBackground(vec3 direction) {
     float elevation=sqrt(clamp(direction.y,0.0,1.0));

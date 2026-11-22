@@ -1,5 +1,6 @@
 #include "application.hpp"
 #include "weather_control.hpp"
+#include "weather_audio.hpp"
 
 #include "crash_log.hpp"
 #include "icon_system.hpp"
@@ -965,6 +966,7 @@ void Application::main_loop() {
             const glm::mat4 view = camera_.view_matrix();
             renderer_.set_weather(scene_.weather);
             const bool rendered = renderer_.draw_frame(timings, view);
+            update_storm_audio(renderer_.thunderstorm(), audio_engine_, false);
             if (options_.mcp_stdio) {
                 complete_mcp_screenshot();
             }
@@ -1932,6 +1934,11 @@ void Application::execute_mcp_command(const McpCommand& command) {
         });
         return;
     }
+    case McpCommandType::weather_simulate:
+        renderer_.thunderstorm().set_override(command.enabled);
+        if (!command.enabled) audio_engine_.stop_thunder();
+        succeed("Weather simulation updated", weather_state(scene_, renderer_));
+        return;
     case McpCommandType::weather_get:
         succeed("Weather", weather_state(scene_, renderer_));
         return;

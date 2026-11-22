@@ -11,6 +11,9 @@
 
 namespace vcr {
 
+[[nodiscard]] bool read_embedded_mono_audio(std::span<const unsigned char> bytes, std::uint32_t rate,
+                                           std::span<float> output) noexcept;
+
 inline constexpr std::uint32_t default_audio_sample_rate = 48'000U;
 inline constexpr std::uintmax_t maximum_audio_metadata_bytes =
     1ULL * 1024ULL * 1024ULL;

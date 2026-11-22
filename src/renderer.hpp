@@ -10,7 +10,7 @@
 #include "fsr3_upscaler.hpp"
 #include "exposure.hpp"
 #include "fog.hpp"
-#include "weather.hpp"
+#include "thunderstorm.hpp"
 #include "color_grading.hpp"
 #include "subsurface.hpp"
 #include "gpu_buffer.hpp"
@@ -320,7 +320,10 @@ public:
         bloom_enabled_ = enabled;
         return true;
     }
-    void reset_weather(const WeatherSettings& weather) noexcept { weather_.reset(weather); }
+    void reset_weather(const WeatherSettings& weather) noexcept { weather_.reset(weather); thunderstorm_.reset(); }
+    Thunderstorm& thunderstorm() noexcept { return thunderstorm_; }
+    const Thunderstorm& thunderstorm() const noexcept { return thunderstorm_; }
+    const StormSettings& current_storm() const noexcept { return weather_.storm(); }
     void set_weather(const WeatherSettings& weather) noexcept { weather_.set(weather); }
     [[nodiscard]] const CloudSettings& current_clouds() const noexcept { return weather_.clouds(); }
     [[nodiscard]] bool clouds_active() const noexcept {
@@ -924,6 +927,7 @@ private:
     static_assert(sizeof(GiJob) == 80);
     glm::vec4 gi_last_cloud_layer_{}, gi_last_cloud_wind_{}, gi_last_cloud_variation_{};
     WeatherSystem weather_{};
+    Thunderstorm thunderstorm_{};
     GpuTexture cloud_noise_{};
     DeviceObject<VkPipeline> cloud_pipeline_{};
     LightingSettings lighting_settings_{};
