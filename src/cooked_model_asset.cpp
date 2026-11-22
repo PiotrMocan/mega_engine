@@ -1030,6 +1030,27 @@ parse_material(
             .message = "GPU grass requires opaque coverage and no tessellation settings.",
             .path = material_diag_path};
     }
+    std::optional<std::filesystem::path> landscape_detail;
+    if (auto error = read_texture_reference("landscape_detail", landscape_detail)) return error;
+    glm::vec4 landscape_parameters{};
+    if (landscape_detail || metadata.contains("landscape")) {
+        const auto settings = metadata.find("landscape");
+        if (!base_color_texture || !landscape_detail || emissive_texture ||
+            emissive_factor != glm::vec4(0.0F) || has_tessellation ||
+            normal_texture || metallic_roughness_texture || factors.model != MaterialModel::standard ||
+            (coverage & (material_coverage_alpha_mask_bit | material_coverage_transparent_mask)) != 0 ||
+            settings == metadata.end() || !settings->is_object() ||
+            !json_float_in_range(*settings, "detail_repeats_x", 0.000001F, 1000000.F, landscape_parameters.x) ||
+            !json_float_in_range(*settings, "detail_repeats_z", 0.000001F, 1000000.F, landscape_parameters.w) ||
+            !json_float_in_range(*settings, "fade_start_m", 0.F, 100000.F, landscape_parameters.y) ||
+            !json_float_in_range(*settings, "fade_end_m", 0.F, 100000.F, landscape_parameters.z) ||
+            landscape_parameters.z <= landscape_parameters.y) {
+            return CookedModelLoadError{.code = CookedModelLoadErrorCode::invalid_material,
+                .message = "Landscape requires opaque standard shading, overview and detail maps, and an ordered fade range.",
+                .path = material_diag_path};
+        }
+        coverage |= material_landscape_detail_bit;
+    }
     output = CookedModelMaterial{
         .relative_path = std::move(material_normalized),
         .name = std::move(name),
@@ -1040,6 +1061,8 @@ parse_material(
         .displacement_texture = std::move(displacement_texture),
         .emissive_factor = emissive_factor,
         .emissive_texture = std::move(emissive_texture),
+        .landscape_detail_texture = std::move(landscape_detail),
+        .landscape_parameters = landscape_parameters,
         .tessellation = tessellation,
         .coverage = coverage,
     };

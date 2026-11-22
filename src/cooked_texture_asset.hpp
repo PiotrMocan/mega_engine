@@ -83,6 +83,7 @@ struct CookedTextureAsset {
     std::vector<std::size_t> mip_byte_offsets{};
     std::optional<std::array<float, 3U>> average_linear{};
     std::vector<std::uint8_t> pixels{};
+    bool clamp_to_edge = false;
 };
 
 enum class CookedTextureLoadErrorCode : std::uint8_t {

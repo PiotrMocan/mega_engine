@@ -122,6 +122,42 @@ vec3 sampleWorldNormal(vec2 uvDx, vec2 uvDy, bool foliage, out float mapVariance
 
 void main()
 {
+#ifndef VCR_TRANSPARENT_PASS
+    // The opaque landscape and emission paths are mutually exclusive. Binding 4
+    // holds the detail tile. Binding 5 holds U repeats, fade start/end and V repeats.
+    const uint landscapeDetailBit = 128u;
+    if ((pushConstants.padding & landscapeDetailBit) != 0u) {
+        vec2 dx = dFdx(inUv);
+        vec2 dy = dFdy(inUv);
+#ifndef VCR_OPAQUE_EARLY_Z
+        if (!lodKeep(inLodToken, uvec2(gl_FragCoord.xy))) discard;
+#endif
+        vec3 albedo = textureGrad(materialBaseColorTexture, inUv, dx, dy).rgb * inBaseColor.rgb;
+        vec3 settings = materialEmission.emissiveFactor;
+        float range = distance(inWorldPosition, frame.cameraPosition.xyz);
+        if (range < settings.z) {
+            vec2 repeats = vec2(settings.x, materialEmission.normalXYEncoding);
+            vec3 detail = textureGrad(materialEmissiveTexture, inUv * repeats,
+                                      dx * repeats, dy * repeats).rgb;
+            float weight = 1.0 - smoothstep(settings.y, settings.z, range);
+            albedo *= mix(vec3(1.0), 2.0 * detail, weight);
+        }
+        vec3 normal = materialFaceNormal(pushConstants.padding, safeNormalize(inWorldNormal, vec3(0,1,0)));
+        PbrLightingComponents light = evaluateLitSurfaceComponents(
+            clamp(albedo, 0.0, 1.0), inMaterialParameters.xyz, normal, normal,
+            inWorldPosition, inDielectricF0, 0u, 0u, 0.0);
+        vec3 shaded = light.diffuse + light.specular;
+        applySurfaceWorkloadModulation(inInstanceIndex, shaded, light);
+        float alpha = (pushConstants.padding & kMaterialLocalResolveBit) != 0u ? -1.0 : 1.0;
+        writeLitSurface(light.diffuse, light.specular, shaded, alpha, 0u, 0u, 0.0);
+#ifdef VCR_SSS_TEMPORAL
+        writeTemporalSurfaceOutputs(inCurrentClip, inPreviousClip);
+#else
+        writeNonTemporalSurfaceOutputs();
+#endif
+        return;
+    }
+#endif
     // Derivatives after nonuniform discard are undefined. All material maps
     // share authored UVs and surface/tangent variance gradients must execute
     // before any coverage discard so helper invocations remain valid.

@@ -420,8 +420,10 @@ set(VCR_ENGINE_CORE_SOURCES
     src/cooked_texture_asset.cpp
     src/texture_compression.cpp
     src/png_encoder.cpp
+    src/open_level.cpp
     src/icon_system.cpp
     src/model_lod.cpp
+    src/foliage_proxy_tile.cpp
     src/asset_preparation.cpp
     src/job_system.cpp
     src/content_manifest.cpp
@@ -602,6 +604,11 @@ else()
 endif()
 
 # Project preparation scripts use this tool from a normal Windows build.
+add_executable(vcr_open_level tools/open_level_generator.cpp)
+target_link_libraries(vcr_open_level PRIVATE vcr_engine)
+set_target_properties(vcr_open_level PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+vcr_apply_cxx_warning_flags(vcr_open_level)
+
 add_executable(vcr_asset_lod_cooker
     tools/asset_lod_cooker.cpp
 )
@@ -646,6 +653,9 @@ set(VCR_VULKAN_RENDERER_SOURCES
     src/gpu_texture.cpp
     src/renderer.cpp
     src/renderer_scene.cpp
+    src/renderer_foliage_proxy.cpp
+    src/foliage_proxy_input.cpp
+    src/foliage_proxy_compute.cpp
     src/renderer_lighting.cpp
     src/renderer_ray_tracing.cpp
     src/renderer_gpu_visibility.cpp
@@ -967,6 +977,12 @@ if(BUILD_TESTING)
     )
     vcr_apply_cxx_warning_flags(vcr_exposure_tests)
     add_test(NAME vcr_exposure_tests COMMAND vcr_exposure_tests)
+
+    add_executable(vcr_foliage_proxy_tests tests/foliage_proxy_tests.cpp)
+    target_link_libraries(vcr_foliage_proxy_tests PRIVATE vcr_engine)
+    set_target_properties(vcr_foliage_proxy_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    vcr_apply_cxx_warning_flags(vcr_foliage_proxy_tests)
+    add_test(NAME vcr_foliage_proxy_tests COMMAND vcr_foliage_proxy_tests)
 
     add_executable(vcr_lod_transition_tests tests/lod_transition_tests.cpp)
     target_include_directories(vcr_lod_transition_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")

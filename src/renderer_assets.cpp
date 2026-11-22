@@ -438,6 +438,7 @@ void Renderer::preload_editor_models_batch(
                 add_tex_ref(material.metallic_roughness_texture);
                 add_tex_ref(material.displacement_texture);
                 add_tex_ref(material.emissive_texture);
+                add_tex_ref(material.landscape_detail_texture);
             }
 
             std::unordered_set<std::size_t> local_alpha_seen;

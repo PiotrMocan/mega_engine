@@ -78,17 +78,17 @@ void append_chunk(
 [[nodiscard]] bool checked_raw_size(
     const std::uint32_t width,
     const std::uint32_t height,
+    const std::size_t bytes_per_pixel,
     std::size_t& row_bytes,
     std::size_t& filtered_bytes) noexcept {
     if (width == 0U || height == 0U) {
         return false;
     }
-    constexpr std::size_t channels = 4U;
     if (static_cast<std::uint64_t>(width) >
-        std::numeric_limits<std::size_t>::max() / channels) {
+        std::numeric_limits<std::size_t>::max() / bytes_per_pixel) {
         return false;
     }
-    row_bytes = static_cast<std::size_t>(width) * channels;
+    row_bytes = static_cast<std::size_t>(width) * bytes_per_pixel;
     if (row_bytes > std::numeric_limits<std::size_t>::max() - 1U) {
         return false;
     }
@@ -108,23 +108,21 @@ void append_chunk(
     return raw_bytes <= maximum_raw_bytes;
 }
 
-} // namespace
-
-PngEncodeResult encode_png_rgba(
-    const std::span<const std::uint8_t> rgba,
+PngEncodeResult encode_png(
+    const std::span<const std::uint8_t> pixels,
     const std::uint32_t width,
-    const std::uint32_t height) {
+    const std::uint32_t height, bool gray16) {
     PngEncodeResult result{};
     std::size_t row_bytes = 0;
     std::size_t filtered_size = 0;
-    if (!checked_raw_size(width, height, row_bytes, filtered_size)) {
+    if (!checked_raw_size(width, height, gray16 ? 2U : 4U, row_bytes, filtered_size)) {
         result.error = "invalid or excessively large PNG dimensions";
         return result;
     }
     const std::size_t expected_pixels =
         row_bytes * static_cast<std::size_t>(height);
-    if (rgba.size() != expected_pixels) {
-        result.error = "RGBA byte count does not match PNG dimensions";
+    if (pixels.size() != expected_pixels) {
+        result.error = "Pixel byte count does not match PNG dimensions";
         return result;
     }
 
@@ -135,7 +133,7 @@ PngEncodeResult encode_png_rgba(
         const std::size_t destination = row * filtered_row_bytes;
         filtered[destination] = 0U;
         std::copy_n(
-            rgba.data() + row * row_bytes,
+            pixels.data() + row * row_bytes,
             row_bytes,
             filtered.data() + destination + 1U);
     }
@@ -184,8 +182,8 @@ PngEncodeResult encode_png_rgba(
     ihdr[5] = static_cast<std::uint8_t>(height >> 16U);
     ihdr[6] = static_cast<std::uint8_t>(height >> 8U);
     ihdr[7] = static_cast<std::uint8_t>(height);
-    ihdr[8] = 8U;
-    ihdr[9] = 6U;
+    ihdr[8] = gray16 ? 16U : 8U;
+    ihdr[9] = gray16 ? 0U : 6U;
 
     result.bytes.reserve(
         png_signature.size() + 12U + ihdr.size() + 12U + zlib.size() + 12U);
@@ -197,4 +195,13 @@ PngEncodeResult encode_png_rgba(
     return result;
 }
 
+} // namespace
+
+PngEncodeResult encode_png_rgba(std::span<const std::uint8_t> rgba, std::uint32_t width, std::uint32_t height) {
+    return encode_png(rgba, width, height, false);
+}
+
+PngEncodeResult encode_png_gray16(std::span<const std::uint8_t> bytes, std::uint32_t width, std::uint32_t height) {
+    return encode_png(bytes, width, height, true);
+}
 } // namespace vcr

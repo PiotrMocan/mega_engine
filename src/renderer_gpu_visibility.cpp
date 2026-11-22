@@ -871,7 +871,7 @@ void Renderer::build_gpu_visibility_scene(std::uint32_t plane_count, std::uint32
         visibility_groups_.push_back(data);
         for (auto i = first; i < first + instances; ++i) {
             const auto &bounds = scene_metadata_[i].local_bounds;
-            visibility_sources_[i] = {{bounds.center, float(g)}, {bounds.extent, 0}};
+            visibility_sources_[i] = {{bounds.center, float(g)}, {bounds.extent, scene_metadata_[i].foliage_proxy_member ? 1.F : 0.F}};
         }
         for (std::size_t lod = 0; lod < model_lod_count; ++lod) {
             visibility_commands_.push_back({data.counts[lod], 0U, data.firsts[lod], vertex_offset,
@@ -1168,7 +1168,7 @@ void Renderer::prepare_gpu_scene_packet(const glm::mat4 &vp, glm::vec3 camera, V
                       : 0.0F},
         {static_cast<float>(active_mip0_w), static_cast<float>(active_mip0_h),
          static_cast<float>(active_max_mip), use_hiz ? effective_hiz_step : 0.0F},
-        {static_cast<unsigned>(scene_metadata_.size()), visibility_settings_.frustum ? 1U : 0U,
+        {static_cast<unsigned>(scene_metadata_.size()), (visibility_settings_.frustum ? 1U : 0U) | (foliage_proxy_.phase << 1U),
          occlusion_flags,
          unsigned(visibility_settings_.lod) |
              (fade_enabled ? (unsigned(lod_fade_pattern_) << 1U) : 0U) |
@@ -1376,7 +1376,8 @@ void Renderer::record_gpu_visibility(VkCommandBuffer command, FrameContext &fram
             VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT,
             VK_ACCESS_2_HOST_READ_BIT);
     f.statistics_valid = true;
-    f.statistics_sources = static_cast<unsigned>(scene_metadata_.size());
+    f.statistics_sources = static_cast<unsigned>(scene_metadata_.size()) -
+        (foliage_proxy_.phase == 4095U ? foliage_proxy_.source_records : 0U);
     f.statistics_groups = static_cast<unsigned>(visibility_groups_.size());
     f.view_revision = gpu_visibility_revision_;
 }

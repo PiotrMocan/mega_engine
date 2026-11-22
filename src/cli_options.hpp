@@ -125,6 +125,7 @@ struct CliOptions {
     std::string project_path{};
     std::string scene_asset{};
     std::string stream_asset{};
+    std::string foliage_proxy_manifest{};
     std::string startup_cutscene{};
     bool start_in_main_menu = false;
     std::string locale{};

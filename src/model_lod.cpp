@@ -145,7 +145,8 @@ struct MicroCardComponent {
     float scale,
     float epsilon,
     std::size_t max_indices,
-    std::vector<unsigned>& scratch, const std::filesystem::path& asset_root, bool blade_strips) {
+    std::vector<unsigned>& scratch, const std::filesystem::path& asset_root, bool blade_strips,
+    bool local_coverage) {
     const std::uint32_t first = static_cast<std::uint32_t>(mesh.first_index);
     const std::uint32_t count = static_cast<std::uint32_t>(mesh.index_count);
     const std::uint32_t tri_count = count / 3U;
@@ -336,11 +337,22 @@ struct MicroCardComponent {
     }
 
     constexpr std::array microcard_ratios{1.0F, 0.32F, 0.14F, 0.065F, 0.028F, 0.012F};
+    constexpr std::array local_ratios{1.0F, 0.32F, 0.14F, 0.075F, 0.045F, 0.025F};
+    // A retained card represents the area of its own Morton subtree. When
+    // both children have retained representatives they split that area.
+    std::vector<double> subtree_area;
+    std::vector<double> represented;
+    if (local_coverage && !blade_strips) {
+        subtree_area.resize(2U * leaf_base);
+        represented.resize(component_count);
+        for (std::size_t i = 0; i < component_count; ++i) subtree_area[leaf_base + i] = components[i].area;
+        for (auto i = leaf_base; --i > 0;) subtree_area[i] = subtree_area[2*i] + subtree_area[2*i+1];
+    }
     constexpr std::array microcard_max_scale{1.0F, 2.2F, 3.4F, 5.0F, 7.5F, 11.0F};
     constexpr std::array microcard_visual_error_caps{0.0F, 0.00060F, 0.0013F, 0.0028F, 0.006F, 0.014F};
     constexpr std::array blade_ratios{1.0F, 0.82F, 0.63F, 0.44F, 0.29F, 0.18F};
     constexpr std::array blade_visual_errors{0.0F, 0.012F, 0.032F, 0.065F, 0.12F, 0.22F};
-    const auto& ratios = blade_strips ? blade_ratios : microcard_ratios;
+    const auto& ratios = blade_strips ? blade_ratios : local_coverage ? local_ratios : microcard_ratios;
     const auto& visual_errors = blade_strips ? blade_visual_errors : microcard_visual_error_caps;
     constexpr std::size_t max_vertices = 32'000'000U;
 
@@ -378,7 +390,7 @@ struct MicroCardComponent {
         }
         std::ranges::sort(kept_ranks);
         const double area_ratio = total_area / std::max(kept_area, 1.0e-6);
-        const float card_scale = std::clamp(
+        const float global_scale = std::clamp(
             static_cast<float>(blade_strips ? area_ratio : std::sqrt(area_ratio)),
             1.0F,
             microcard_max_scale[level]);
@@ -392,10 +404,34 @@ struct MicroCardComponent {
             continue;
         }
 
+        if (!represented.empty()) {
+            std::ranges::fill(represented, -1.0);
+            for (auto rank : kept_ranks) represented[rank] = 0;
+            const auto distribute = [&](auto&& visit, std::size_t node) -> void {
+                const auto winner = winners[node];
+                if (node < leaf_base) {
+                    const auto left = winners[2 * node], right = winners[2 * node + 1];
+                    if (right == unmapped) {
+                        visit(visit, 2 * node);
+                        return;
+                    }
+                    if (represented[left] >= 0 && represented[right] >= 0) {
+                        visit(visit, 2 * node);
+                        visit(visit, 2 * node + 1);
+                        return;
+                    }
+                }
+                represented[winner] = subtree_area[node];
+            };
+            distribute(distribute, 1);
+        }
         scratch.clear();
         scratch.reserve(kept_indices);
         for (const std::uint32_t rank : kept_ranks) {
             const auto& comp = components[rank];
+            const float card_scale = represented.empty() ? global_scale :
+                std::clamp(static_cast<float>(std::sqrt(represented[rank] / std::max(comp.area, 1.0e-9))),
+                           1.0F, std::min(microcard_max_scale[level], 3.5F));
             if (++current_stamp == 0U) {
                 std::ranges::fill(vertex_stamp, 0U);
                 current_stamp = 1U;
@@ -844,6 +880,11 @@ void prepare_authored_model_lods(CookedModelAsset &model,
 
 void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& asset_root,
                         const ModelLodUvPolicy uv_policy) {
+    prepare_model_lods(model, asset_root, uv_policy, false);
+}
+
+void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& asset_root,
+                        const ModelLodUvPolicy uv_policy, bool local_foliage_coverage) {
     if (model.vertices.empty() || model.indices.empty()) {
         return;
     }
@@ -918,7 +959,7 @@ void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& as
             }
             if (try_prepare_microcard_foliage_lods(
                     model, mesh, original_vertex_count, position_ids,
-                    scale, epsilon, max_indices, scratch, asset_root, blade_strips)) {
+                    scale, epsilon, max_indices, scratch, asset_root, blade_strips, local_foliage_coverage && has_foliage)) {
                 continue;
             }
         }
@@ -954,8 +995,9 @@ void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& as
             const auto target = std::max<std::size_t>(12, (raw_target / 3) * 3);
             const auto &weights = preserve_mapping ? uv_preserving_weights
                 : alpha_masked ? foliage_weights : opaque_weights;
-            const float error_limit = preserve_mapping ? 0.001F
-                : alpha_masked ? foliage_error_limits[level] : opaque_error_limits[level];
+            const bool preserve_branches = local_foliage_coverage && has_foliage && !alpha_masked;
+            const float error_limit = preserve_mapping ? 0.001F : alpha_masked ? foliage_error_limits[level]
+                : preserve_branches ? std::min(opaque_error_limits[level], .008F) : opaque_error_limits[level];
             const unsigned options = alpha_masked && !preserve_mapping
                 ? static_cast<unsigned>(meshopt_SimplifyPermissive |
                     (level >= 4U ? meshopt_SimplifyLockBorder : 0))
@@ -976,7 +1018,7 @@ void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& as
                     sizeof(CookedModelVertex), opaque_seam_weights.data(),
                     opaque_seam_weights.size(), locks, target, error_limit,
                     meshopt_SimplifyPermissive | (has_foliage
-                        ? (level >= 4U ? meshopt_SimplifyPrune : 0) : meshopt_SimplifyLockBorder), &error);
+                        ? (level >= 4U && !preserve_branches ? meshopt_SimplifyPrune : 0) : meshopt_SimplifyLockBorder), &error);
             }
             if (reduced >= previous_count || reduced == 0 ||
                 model.indices.size() > max_indices - reduced) {

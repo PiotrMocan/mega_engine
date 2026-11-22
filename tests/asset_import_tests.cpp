@@ -1,4 +1,8 @@
 #include "world_surface.hpp"
+#include "open_level.hpp"
+#include "png_encoder.hpp"
+#include "scene_io.hpp"
+#include "cooked_model_asset.hpp"
 #include "asset_importer.hpp"
 #include "cooked_texture_asset.hpp"
 
@@ -214,6 +218,80 @@ int main() {
         source_root, filesystem_error);
     std::filesystem::create_directories(
         import_root, filesystem_error);
+    {
+        // A partial tile across the 64-cell boundary and two heights one R16 unit apart.
+        constexpr unsigned width = 67, height = 3;
+        std::vector<std::uint8_t> gray(width * height * 2);
+        for (unsigned i = 0; i < width * height; ++i) {
+            gray[i * 2] = 128;
+            gray[i * 2 + 1] = static_cast<std::uint8_t>(i % width);
+        }
+        const auto png = vcr::encode_png_gray16(gray, width, height);
+        vcr::OpenLevelSettings settings{.name = "precision",
+                                        .heightmap = source_root / "heights.png",
+                                        .width_m = 660.F,
+                                        .relief_m = 1000.F};
+        expect(png && write_binary(settings.heightmap, std::as_bytes(std::span(png.bytes))),
+               "write grayscale PNG");
+        std::filesystem::path scene_path;
+        std::string error;
+        const bool generated = vcr::generate_open_level(asset_root, settings, scene_path, error);
+        expect(generated, "generate level from 16-bit heightmap: " + error);
+        if (generated) {
+            const std::filesystem::path package = "landscapes/level_precision";
+            vcr::SceneDocument scene;
+            expect(vcr::load_scene_file(asset_root / scene_path, scene, error) &&
+                       scene.startup_camera_pose() && scene.colliders().size() == 2,
+                   "reopen generated scene and per-tile colliders");
+            expect(read_bytes(asset_root / package / "heightmap.png") == read_bytes(settings.heightmap),
+                   "heightmap round trip preserves all 16 bits");
+            const auto a = vcr::load_cooked_model_asset(asset_root, package / "tile_0_0.vcrasset.json");
+            const auto b = vcr::load_cooked_model_asset(asset_root, package / "tile_1_0.vcrasset.json");
+            expect(a && b, "both tiles load through runtime asset path");
+            if (a && b) {
+                expect(a->prebaked_lods && a->collision.triangle_indices.size() == 64 * 2 * 6 &&
+                           b->collision.triangle_indices.size() == 2 * 2 * 6,
+                       "full collision coverage on partial tiles");
+                const auto& material = a->materials.at(0);
+                expect(material.landscape_detail_texture && material.base_color_texture &&
+                           (material.coverage & vcr::material_landscape_detail_bit), "landscape material loads");
+                if (material.landscape_detail_texture && material.base_color_texture) {
+                    const auto detail = vcr::load_cooked_texture_asset(asset_root, *material.landscape_detail_texture);
+                    const auto overview = vcr::load_cooked_texture_asset(asset_root, *material.base_color_texture);
+                    expect(detail && overview && !detail->clamp_to_edge && overview->clamp_to_edge &&
+                           overview->pixel_format == vcr::CookedTexturePixelFormat::bc7_unorm &&
+                           overview->mip_levels > 1, "tiled detail and non-repeating BC7 overview with mips");
+                }
+                unsigned seam_vertices = 0;
+                for (const auto& vertex : b->vertices) {
+                    if (vertex.position[0] != 310.F)
+                        continue;
+                    ++seam_vertices;
+                    expect(std::ranges::any_of(a->vertices,
+                                               [&](const auto& other) {
+                                                   return other.position == vertex.position &&
+                                                          other.normal == vertex.normal &&
+                                                          other.texcoord == vertex.texcoord;
+                                               }),
+                           "shared tile position, normal and atlas UV");
+                }
+                expect(seam_vertices == 3, "three shared edge samples");
+            }
+            expect(!vcr::generate_open_level(asset_root, settings, scene_path, error),
+                   "existing level is preserved");
+        }
+        settings.name = "bad_fade";
+        settings.fade_end_m = settings.fade_start_m;
+        expect(!vcr::generate_open_level(asset_root, settings, scene_path, error) &&
+                   !std::filesystem::exists(asset_root / "scenes/level_bad_fade.scene.json"),
+               "reject empty fade interval");
+        settings.name = "bad_texture";
+        settings.fade_end_m += 100;
+        settings.overview = source_root / "missing.png";
+        expect(!vcr::generate_open_level(asset_root, settings, scene_path, error) &&
+                   !std::filesystem::exists(asset_root / "landscapes/level_bad_texture"),
+               "failed bake rolls back assets");
+    }
     {
         const std::array<std::uint8_t,12> magic{0xab,'K','T','X',' ','2','0',0xbb,13,10,26,10};
         std::array<std::uint8_t,160> bytes{};

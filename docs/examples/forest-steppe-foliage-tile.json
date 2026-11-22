@@ -1,0 +1,15 @@
+{
+  "tile": [0, -2],
+  "resolution": 128,
+  "max_cell_pixels": 1.25,
+  "models": [
+    "meadow_environment/SM_grass_meadow_01.vcrasset.json",
+    "meadow_environment/SM_grass_meadow_02.vcrasset.json",
+    "meadow_environment/SM_grass_meadow_03.vcrasset.json",
+    "meadow_environment/SM_grass_meadow_04.vcrasset.json",
+    "meadow_environment/SM_grass_meadow_05.vcrasset.json",
+    "meadow_environment/SM_grass_meadow_06.vcrasset.json",
+    "meadow_environment/SM_grass_meadow_07.vcrasset.json",
+    "meadow_environment/SM_grass_meadow_08.vcrasset.json"
+  ]
+}

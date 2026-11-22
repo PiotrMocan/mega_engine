@@ -51,11 +51,11 @@ Json describe(const vcr::CookedModelAsset &model, const std::filesystem::path &p
             {"geometry_bytes",model.vertices.size()*48+model.indices.size()*4}};
 }
 void cook(const std::filesystem::path &root, const std::filesystem::path &path,
-          vcr::CookedModelAsset model, const vcr::ModelLodUvPolicy uv_policy) {
+          vcr::CookedModelAsset model, const vcr::ModelLodUvPolicy uv_policy, bool local_foliage_coverage) {
     if (model.is_skinned() || model.prebaked_lods)
         throw std::runtime_error("Offline LOD cooking requires a static source mesh: " + path.string());
     model.generate_lods = true;
-    vcr::prepare_model_lods(model, root, uv_policy);
+    vcr::prepare_model_lods(model, root, uv_policy, local_foliage_coverage);
     auto metadata = read_json(root/path);
     auto name = path.filename().string();
     name.resize(name.size()-std::string_view(".vcrasset.json").size());
@@ -169,8 +169,8 @@ int main(int argc,char **argv) {
     try {
         const std::string_view command = argc >= 2 ? argv[1] : "";
         if (argc < 4 || (command != "cook" && command != "cook-preserve-uv" &&
-                        command != "inspect" && command != "cook-vegetation"))
-            throw std::runtime_error("Usage: vcr_asset_lod_cooker cook|cook-preserve-uv|inspect|cook-vegetation ASSET_ROOT MODEL...");
+                        command != "cook-foliage-local" && command != "inspect" && command != "cook-vegetation"))
+            throw std::runtime_error("Usage: vcr_asset_lod_cooker cook|cook-preserve-uv|cook-foliage-local|inspect|cook-vegetation ASSET_ROOT MODEL...");
         const auto uv_policy = command == "cook-preserve-uv" ? vcr::ModelLodUvPolicy::preserve_mapping
                                                              : vcr::ModelLodUvPolicy::standard;
         const std::filesystem::path root(argv[2]);
@@ -183,7 +183,7 @@ int main(int argc,char **argv) {
             auto model = load(root, path);
             if (command == "cook-vegetation" && (!model.vegetation || !model.generate_lods ||
                 model.is_skinned() || model.prebaked_lods || !generated_chain(root, path, model))) continue;
-            cook(root, path, std::move(model), uv_policy);
+            cook(root, path, std::move(model), uv_policy, command == "cook-foliage-local");
             if (command == "cook-vegetation") inspect(root, path);
         }
         return 0;

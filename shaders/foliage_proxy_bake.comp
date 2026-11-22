@@ -1,0 +1,123 @@
+#version 450
+layout(local_size_x = 64) in;
+struct Vertex {
+    vec4 positionU;
+    vec4 normalV;
+};
+struct Draw {
+    vec4 row0, row1, row2, color;
+    uvec4 colorTex, ormTex;
+    vec4 surface;
+    uvec4 range;
+};
+layout(set = 0, binding = 0, std430) readonly buffer Vertices { Vertex vertices[]; };
+layout(set = 0, binding = 1, std430) readonly buffer Indices { uint indices[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Pixels { uint pixels[]; };
+layout(set = 0, binding = 3, std430) readonly buffer Draws { Draw draws[]; };
+struct Accum {
+    uint weight, r, g, b, nx, ny, nz, rough, leaf;
+    uint optical[12];
+};
+layout(set = 0, binding = 4, std430) buffer Accumulators { Accum accum[]; };
+layout(push_constant) uniform Params {
+    vec4 originCell;
+    uvec4 gridJob;
+}
+pc;
+
+vec4 fetchTex(uvec4 desc, ivec2 p) {
+    ivec2 extent = ivec2(desc.yz);
+    p = (p % extent + extent) % extent;
+    return unpackUnorm4x8(pixels[desc.x + uint(p.x) + desc.y * uint(p.y)]);
+}
+vec4 sampleTex(uvec4 desc, vec2 uv) {
+    vec2 p = fract(uv) * vec2(desc.yz) - 0.5;
+    ivec2 base = ivec2(floor(p));
+    vec2 f = fract(p);
+    return mix(mix(fetchTex(desc, base), fetchTex(desc, base + ivec2(1, 0)), f.x),
+               mix(fetchTex(desc, base + ivec2(0, 1)), fetchTex(desc, base + ivec2(1)), f.x), f.y);
+}
+vec3 toLinear(vec3 srgb) {
+    return mix(srgb / 12.92, pow((srgb + 0.055) / 1.055, vec3(2.4)), greaterThan(srgb, vec3(0.04045)));
+}
+void main() {
+    Draw draw = draws[pc.gridJob.y];
+    uint local = gl_GlobalInvocationID.x + pc.gridJob.z;
+    if (local >= draw.range.y)
+        return;
+    mat3 linear = transpose(mat3(draw.row0.xyz, draw.row1.xyz, draw.row2.xyz));
+    vec3 translation = vec3(draw.row0.w, draw.row1.w, draw.row2.w);
+    Vertex v[3];
+    vec3 p[3];
+    for (uint i = 0; i < 3; ++i) {
+        v[i] = vertices[indices[draw.range.x + local * 3 + i]];
+        p[i] = (linear * v[i].positionU.xyz + translation - pc.originCell.xyz) / pc.originCell.w;
+    }
+    vec3 crossN = cross(p[1] - p[0], p[2] - p[0]);
+    float area = 0.5 * length(crossN);
+    if (!(area > 1e-9))
+        return;
+    vec3 normal = crossN / (2.0 * area);
+    // Texel coverage and projected surface area enter independently. A thin
+    // triangle contributes a fraction of a cell even when it hits many samples.
+    float longest = max(length(p[1] - p[0]), max(length(p[2] - p[1]), length(p[0] - p[2])));
+    uint side = uint(clamp(ceil(longest * 1.5), draw.surface.y >= 0.0 ? 4.0 : 1.0, 64.0));
+    float units = area * 16384.0 / float(side * side);
+    mat3 cofactor =
+        mat3(cross(linear[1], linear[2]), cross(linear[2], linear[0]), cross(linear[0], linear[1]));
+    cofactor *= determinant(linear) < 0.0 ? -1.0 : 1.0;
+    uint grid = pc.gridJob.x;
+    for (uint y = 0; y < side; ++y)
+        for (uint x = 0; x < side; ++x) {
+            float s = sqrt((float(y) + 0.5) / float(side)), t = (float(x) + 0.5) / float(side);
+            vec3 bary = vec3(1.0 - s, s * (1.0 - t), s * t);
+            vec2 uv = vec2(dot(bary, vec3(v[0].positionU.w, v[1].positionU.w, v[2].positionU.w)),
+                           dot(bary, vec3(v[0].normalV.w, v[1].normalV.w, v[2].normalV.w)));
+            vec4 color = sampleTex(draw.colorTex, uv);
+            if (color.a * draw.color.a < draw.surface.y)
+                continue;
+            vec3 point = p[0] * bary.x + p[1] * bary.y + p[2] * bary.z;
+            ivec3 cell = ivec3(floor(point));
+            if (any(lessThan(cell, ivec3(0))) || any(greaterThanEqual(cell, ivec3(grid))))
+                continue;
+            uint id = uint(cell.x) + grid * (uint(cell.y) + grid * uint(cell.z));
+            // Cumulative rounding preserves tiny triangles without a minimum area
+            // per quadrature sample. Bound the sum before multiplying by UNORM8.
+            float sampleIndex = float(x + side * y);
+            uint w = uint(round((sampleIndex + 1) * units) - round(sampleIndex * units));
+            if (w == 0)
+                continue;
+            uint prev = atomicAdd(accum[id].weight, 0u), accepted = 0u;
+            while (prev < 0xffffffu) {
+                accepted = min(0xffffffu - prev, w);
+                uint actual = atomicCompSwap(accum[id].weight, prev, prev + accepted);
+                if (actual == prev)
+                    break;
+                prev = actual;
+                accepted = 0u;
+            }
+            if (accepted == 0u)
+                continue;
+            vec3 n = cofactor *
+                     (v[0].normalV.xyz * bary.x + v[1].normalV.xyz * bary.y + v[2].normalV.xyz * bary.z);
+            n = dot(n, n) > 1e-14 ? normalize(n) : normal;
+            vec3 albedo = clamp(toLinear(color.rgb) * draw.color.rgb, 0, 1);
+            uvec3 c = uvec3(round(albedo * 255)), nn = uvec3(round((n * .5 + .5) * 255));
+            uvec3 ax = uvec3(round(abs(normal) * 255));
+            atomicAdd(accum[id].r, c.r * accepted);
+            atomicAdd(accum[id].g, c.g * accepted);
+            atomicAdd(accum[id].b, c.b * accepted);
+            atomicAdd(accum[id].nx, nn.x * accepted);
+            atomicAdd(accum[id].ny, nn.y * accepted);
+            atomicAdd(accum[id].nz, nn.z * accepted);
+            float rough = draw.surface.x * sampleTex(draw.ormTex, uv).g;
+            atomicAdd(accum[id].rough, uint(round(clamp(rough, 0, 1) * 255)) * accepted);
+            atomicAdd(accum[id].leaf, uint(round(clamp(draw.surface.z, 0, 1) * 255)) * accepted);
+            // Overlapping surfaces inside the same quarter of a face occlude one
+            // another. Keep neighboring empty columns transparent during resolve.
+            uvec3 halfCell = uvec3(greaterThanEqual(fract(point), vec3(0.5)));
+            atomicAdd(accum[id].optical[halfCell.y + 2u * halfCell.z], ax.x * accepted);
+            atomicAdd(accum[id].optical[4u + halfCell.x + 2u * halfCell.z], ax.y * accepted);
+            atomicAdd(accum[id].optical[8u + halfCell.x + 2u * halfCell.y], ax.z * accepted);
+        }
+}

@@ -8,6 +8,7 @@
 #include "editor_scene_tools.hpp"
 #include "gameplay_framework.hpp"
 #include "navigation.hpp"
+#include "open_level.hpp"
 #include "npc_ai.hpp"
 #include "project_system.hpp"
 #include "renderer.hpp"
@@ -52,6 +53,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <commdlg.h>
 #else
 #include <cerrno>
 #include <fcntl.h>
@@ -69,7 +71,13 @@ struct AssetImportUiState {
         std::filesystem::path source{};
         std::optional<AssetImportResult> result{};
         std::optional<AssetImportError> error{};
+        std::optional<std::filesystem::path> generated_scene{};
     };
+    OpenLevelSettings level{};
+    std::string heightmap_file, overview_file, detail_file;
+    std::array<char,65> level_name{"highlands"};
+    std::string level_status;
+    std::filesystem::path generated_scene;
 
     std::vector<std::filesystem::path> sources{};
     std::filesystem::path destination_directory{};
@@ -346,6 +354,7 @@ public:
     struct Batch {
         std::vector<std::filesystem::path> sources{};
         ImportAssetOptions options{};
+        std::optional<OpenLevelSettings> open_level{};
     };
 
     AssetImportWorker()
@@ -472,6 +481,14 @@ private:
             std::vector<AssetImportUiState::Completion>
                 batch_completions;
             batch_completions.reserve(batch.sources.size());
+            if (batch.open_level) {
+                AssetImportUiState::Completion completion;
+                auto& scene = completion.generated_scene.emplace();
+                std::string error;
+                if (!generate_open_level(batch.options.asset_root,*batch.open_level,scene,error))
+                    completion.error = AssetImportError{.message=std::move(error)};
+                batch_completions.push_back(std::move(completion));
+            }
             for (const std::filesystem::path& source :
                  batch.sources) {
                 if (stop_token.stop_requested()) {
@@ -1362,6 +1379,12 @@ write_exclusive_material_file(
     error.clear();
     if (!state.loaded || state.absolute_path.empty()) {
         error = "No material is loaded.";
+        return false;
+    }
+    if (state.document.contains("landscape") &&
+        (state.material.model != MaterialModel::standard || state.alpha_mode != MaterialAlphaMode::opaque ||
+         state.glass || state.tessellation.enabled())) {
+        error = "Landscape detail requires an opaque standard material.";
         return false;
     }
     std::filesystem::path revalidated_path;
@@ -7861,6 +7884,82 @@ void EditorUi::draw_surface_tools(SceneDocument& scene, Renderer& renderer, FlyC
     } else asset_error_ = "Scene node capacity exceeded.";
 }
 
+void EditorUi::draw_open_level_tool() {
+    if (!ImGui::CollapsingHeader("Open level generator") || !import_ui_)
+        return;
+    auto& ui = *import_ui_;
+    auto& level = ui.level;
+    ImGui::PushID("OpenLevel");
+    ImGui::PushItemWidth(std::max(65.F, ImGui::GetContentRegionAvail().x * 0.44F));
+    ImGui::InputText("Level name", ui.level_name.data(), ui.level_name.size());
+    auto image_input = [&](const char* label, const char* fallback, std::string& file,
+                           bool height) {
+        ImGui::PushID(label);
+        ImGui::TextUnformatted(label);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Browse...")) {
+#ifdef _WIN32
+            std::vector<wchar_t> path(32768);
+            OPENFILENAMEW dialog{};
+            dialog.lStructSize = sizeof(dialog);
+            dialog.hwndOwner = static_cast<HWND>(SDL_GetPointerProperty(
+                SDL_GetWindowProperties(main_window_), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+            dialog.lpstrFilter = height ? L"Grayscale PNG\0*.png\0" : L"Color image\0*.png;*.jpg;*.jpeg\0";
+            dialog.lpstrFile = path.data();
+            dialog.nMaxFile = static_cast<DWORD>(path.size());
+            dialog.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST;
+            if (GetOpenFileNameW(&dialog))
+                file = path_to_utf8(path.data());
+#endif
+        }
+        if (!file.empty()) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Clear"))
+                file.clear();
+        }
+        if (file.empty())
+            ImGui::TextDisabled("%s", fallback);
+        else
+            ImGui::TextWrapped("%s", file.c_str());
+        ImGui::PopID();
+    };
+    image_input("Heightmap", "Generated mountain range", ui.heightmap_file, true);
+    if (ui.heightmap_file.empty())
+        ImGui::InputInt("Seed", &level.seed);
+    image_input("Distant landscape color", "Generated from elevation and slope", ui.overview_file, false);
+    image_input("Near detail tile", "Generated neutral grain", ui.detail_file, false);
+    ImGui::InputInt("Max samples per side", &level.samples);
+    ImGui::InputFloat("Longest side (m)", &level.width_m);
+    ImGui::InputFloat("Relief (m)", &level.relief_m);
+    ImGui::InputFloat("Detail tile size (m)", &level.detail_period_m);
+    ImGui::InputFloat("Fade starts (m)", &level.fade_start_m);
+    ImGui::InputFloat("Overview only (m)", &level.fade_end_m);
+    ImGui::BeginDisabled(!asset_import_enabled_ || !import_worker_ || import_worker_->busy() ||
+                         import_worker_->failed());
+    if (ImGui::Button("Generate new level")) {
+        level.name = ui.level_name.data();
+        level.heightmap = path_from_utf8(ui.heightmap_file);
+        level.overview = path_from_utf8(ui.overview_file);
+        level.detail = path_from_utf8(ui.detail_file);
+        AssetImportWorker::Batch batch{.options = {.asset_root = asset_browser_.root()}, .open_level = level};
+        if (import_worker_->submit(std::move(batch))) {
+            ui.generated_scene.clear();
+            ui.level_status = "Generating terrain and collision...";
+        }
+    }
+    ImGui::EndDisabled();
+    if (!asset_import_enabled_)
+        ImGui::TextWrapped("Open a writable project to generate a level.");
+    if (!ui.level_status.empty())
+        ImGui::TextWrapped("%s", ui.level_status.c_str());
+    if (!ui.generated_scene.empty() && ImGui::Button("Open generated level")) {
+        pending_open_scene_path_ = asset_browser_.root() / ui.generated_scene;
+        open_requested_ = true;
+    }
+    ImGui::PopItemWidth();
+    ImGui::PopID();
+}
+
 void EditorUi::build_landscape(
     SceneDocument& scene,
     Renderer& renderer,
@@ -7874,10 +7973,11 @@ void EditorUi::build_landscape(
     ui_kit_.panel_header(
         EditorIcon::terrain,
         "LANDSCAPE",
-        "Flat terrain and deterministic vegetation scatter");
+        "Open levels, terrain and vegetation");
     const bool editable = play_state_ == EditorPlayState::edit;
     ImGui::BeginDisabled(!editable);
 
+    draw_open_level_tool();
     if (ImGui::CollapsingHeader("Streaming sublevels")) {
         for (std::size_t i = 0; i < scene.sublevels.size(); ++i) {
             const auto& level = scene.sublevels[i];
@@ -8519,6 +8619,17 @@ void EditorUi::process_import_pipeline() {
         return;
     }
 
+    std::erase_if(completed,[&](const auto& item) {
+        if (!item.generated_scene) return false;
+        import_ui_->generated_scene=*item.generated_scene;
+        import_ui_->level_status=item.error ? item.error->message :
+            "Created " + path_to_utf8(*item.generated_scene);
+        return true;
+    });
+    if (completed.empty()) {
+        static_cast<void>(asset_browser_.refresh(asset_error_));
+        return;
+    }
     import_ui_->completions = std::move(completed);
     import_ui_->results_window_open = true;
     std::size_t succeeded = 0U;

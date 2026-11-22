@@ -67,7 +67,7 @@ void GpuTexture::create_mipmapped(
     const std::uint32_t height,
     const std::uint32_t mip_levels,
     const VkFormat format,
-    const std::string_view debug_name) {
+    const std::string_view debug_name, const VkSamplerAddressMode address_mode) {
     create_impl(
         context,
         width,
@@ -79,7 +79,7 @@ void GpuTexture::create_mipmapped(
             VK_IMAGE_USAGE_SAMPLED_BIT,
         VK_IMAGE_ASPECT_COLOR_BIT,
         VK_FILTER_LINEAR,
-        VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        address_mode,
         VK_FALSE,
         VK_COMPARE_OP_ALWAYS,
         VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK,
@@ -92,7 +92,7 @@ void GpuTexture::create_precomputed_mipmapped(
     const std::uint32_t height,
     const std::uint32_t mip_levels,
     const VkFormat format,
-    const std::string_view debug_name) {
+    const std::string_view debug_name, const VkSamplerAddressMode address_mode) {
     create_impl(
         context,
         width,
@@ -103,7 +103,7 @@ void GpuTexture::create_precomputed_mipmapped(
             VK_IMAGE_USAGE_SAMPLED_BIT,
         VK_IMAGE_ASPECT_COLOR_BIT,
         VK_FILTER_LINEAR,
-        VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        address_mode,
         VK_FALSE,
         VK_COMPARE_OP_ALWAYS,
         VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK,

@@ -882,6 +882,9 @@ void Renderer::shutdown() noexcept {
     }
     asset_preparation_.stop();
     asset_upload_.stop();
+#if VCR_EDITOR_ENABLED
+    foliage_proxy_ = {};
+#endif
     destroy_gpu_visibility();
     destroy_ray_tracing();
 #if VCR_EDITOR_ENABLED
@@ -1430,12 +1433,17 @@ std::optional<std::uint32_t> Renderer::find_or_load_editor_texture(const Prepare
     gpu_texture.average_linear = prepared.average_linear;
     gpu_texture.color_space = texture.color_space;
     gpu_texture.gpu_bytes = gpu_bytes;
+    const auto address_mode = texture.clamp_to_edge ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE :
+                                                      VK_SAMPLER_ADDRESS_MODE_REPEAT;
     if (mip_levels == 1) {
-        gpu_texture.texture.create(*context_, width, height, format, "Material texture");
+        gpu_texture.texture.create_sampled(*context_, width, height, format, VK_FILTER_LINEAR,
+                                           address_mode, "Material texture");
     } else if (block_compressed) {
-        gpu_texture.texture.create_precomputed_mipmapped(*context_, width, height, mip_levels, format, "BC material texture");
+        gpu_texture.texture.create_precomputed_mipmapped(*context_, width, height, mip_levels, format,
+                                                        "BC material texture", address_mode);
     } else {
-        gpu_texture.texture.create_mipmapped(*context_, width, height, mip_levels, format, "Material mip chain");
+        gpu_texture.texture.create_mipmapped(*context_, width, height, mip_levels, format,
+                                             "Material mip chain", address_mode);
     }
     const std::uint32_t upload_element_bytes = block_compressed
         ? texture_block_byte_size(texture.pixel_format)
@@ -1486,7 +1494,8 @@ Renderer::create_editor_material_descriptor(
     float normal_xy_encoding = 0.0F;
     if (normal.format() == VK_FORMAT_BC5_UNORM_BLOCK) normal_xy_encoding = 1.0F;
     if (normal.format() == VK_FORMAT_BC5_SNORM_BLOCK) normal_xy_encoding = -1.0F;
-    const glm::vec4 material_factors{glm::vec3(emissive_factor), normal_xy_encoding};
+    const glm::vec4 material_factors{glm::vec3(emissive_factor),
+        emissive_factor.w > 0.F ? emissive_factor.w : normal_xy_encoding};
     editor_material_emissive_factors_.write(
         std::as_bytes(std::span{&material_factors, 1U}), factor_offset);
     const VkDescriptorBufferInfo emission_info{
@@ -2729,6 +2738,7 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
         std::optional<std::uint32_t> metallic_roughness_index;
         std::optional<std::uint32_t> displacement_index;
         std::optional<std::uint32_t> emissive_index;
+        std::optional<std::uint32_t> landscape_detail_index;
         const auto load_slot =
             [this, &prepared, &relative_path](const std::optional<std::filesystem::path> &reference,
                                               const CookedTextureSemantic expected_semantic,
@@ -2805,6 +2815,8 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
                 CookedTextureSemantic::emissive,
                 CookedTextureColorSpace::srgb,
                 emissive_index);
+            load_slot(material->landscape_detail_texture, CookedTextureSemantic::base_color,
+                      CookedTextureColorSpace::srgb, landscape_detail_index);
         }
         const GpuTexture& base_color =
             base_color_index
@@ -2822,14 +2834,20 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
             displacement_index
             ? editor_texture_assets_[*displacement_index].texture
             : editor_default_displacement_texture_;
+        const auto auxiliary_texture = landscape_detail_index ? landscape_detail_index : emissive_index;
+        glm::vec4 auxiliary_factors(0.0F);
+        if (material && material->landscape_detail_texture) {
+            // A zero fade end disables the detail sample when texture residency falls back.
+            if (landscape_detail_index) auxiliary_factors = material->landscape_parameters;
+        } else if (material && (!material->emissive_texture || emissive_index)) {
+            auxiliary_factors = material->emissive_factor;
+        }
         const auto descriptor =
             create_editor_material_descriptor(
                 base_color, normal, metallic_roughness, displacement,
-                emissive_index ? editor_texture_assets_[*emissive_index].texture
+                auxiliary_texture ? editor_texture_assets_[*auxiliary_texture].texture
                     : editor_default_base_color_texture_,
-                material != nullptr &&
-                        (!material->emissive_texture || emissive_index)
-                    ? material->emissive_factor : glm::vec4(0.0F), error);
+                auxiliary_factors, error);
         if (!descriptor) {
             if (material_index > 0U) {
                 const std::uint32_t allocated_count =
@@ -3475,6 +3493,15 @@ bool Renderer::update_editor_scene(
         }
     }
     editor_scene_revision_ = view.revision;
+    foliage_proxy_.source_records = 0;
+    if (foliage_proxy_.scene_revision && foliage_proxy_.scene_revision == view.revision) {
+        const auto& members = foliage_proxy_.member_generations;
+        for (auto& metadata : scene_metadata_) {
+            const auto id = metadata.id;
+            metadata.foliage_proxy_member = id && id.index < members.size() && members[id.index] == id.generation;
+            foliage_proxy_.source_records += static_cast<unsigned>(metadata.foliage_proxy_member);
+        }
+    }
     prev_committed_runtime_revision_ = 0U;
     runtime_transforms_.begin_snapshot();
     for (std::size_t i = 0; i < scene_metadata_.size(); ++i) {
@@ -3525,6 +3552,11 @@ bool Renderer::apply_editor_material(
     for (const auto& asset : editor_model_assets_) {
         for (const auto& submesh : asset.submeshes) {
             if (submesh.material_relative_path == material_relative_path &&
+                (submesh.coverage & material_landscape_detail_bit) &&
+                (material.model != MaterialModel::standard || tessellation.enabled() ||
+                 (coverage.value_or(0U) & (material_coverage_transparent_mask | material_coverage_alpha_mask_bit))))
+                return false;
+            if (submesh.material_relative_path == material_relative_path &&
                 ((submesh.material.model == MaterialModel::gpu_grass) !=
                      (material.model == MaterialModel::gpu_grass) ||
                  (material.model == MaterialModel::gpu_grass &&
@@ -3567,13 +3599,15 @@ bool Renderer::apply_editor_material(
                         displacement_bound(submesh.tessellation));
                 submesh.material = material;
                 submesh.tessellation = tessellation;
-                if (coverage.has_value() && submesh.coverage != *coverage) {
-                    const std::uint32_t diff = submesh.coverage ^ *coverage;
+                const auto updated_coverage = coverage.value_or(submesh.coverage) |
+                    (submesh.coverage & material_landscape_detail_bit);
+                if (submesh.coverage != updated_coverage) {
+                    const std::uint32_t diff = submesh.coverage ^ updated_coverage;
                     const bool transparency_changed =
                         (diff & material_coverage_transparent_mask) != 0U;
                     const bool alpha_mask_changed =
                         (diff & material_coverage_alpha_mask_bit) != 0U;
-                    submesh.coverage = *coverage;
+                    submesh.coverage = updated_coverage;
                     shadow_dirty_ = true;
                     if (transparency_changed) {
                         gi_scene_revision_ = 0U;
@@ -3601,6 +3635,9 @@ bool Renderer::apply_editor_material(
 }
 
 void Renderer::invalidate_editor_scene() noexcept {
+#if VCR_EDITOR_ENABLED
+    foliage_proxy_.scene_revision = 0;
+#endif
     editor_scene_revision_ = 0U;
     total_model_instances_ = 0U;
     alpha_masked_model_instances_ = 0U;
@@ -6863,6 +6900,7 @@ void Renderer::update_frame_uniform(
 #if VCR_EDITOR_ENABLED
     if (authored_scene_enabled_ && mode_ != RunMode::instancing) {
         const auto rotation = glm::transpose(glm::mat3(view_matrix));
+        if (foliage_proxy_.pipeline.get()) update_foliage_proxy(unjittered_view_projection, extent);
         prepare_scene_packet(unjittered_view_projection, -(rotation * glm::vec3(view_matrix[3])),
                              extent);
     }
@@ -11056,6 +11094,15 @@ void Renderer::record_commands(
                 vkCmdDraw(command_buffer, 3, 1, 0, 0);
             }
 #if VCR_EDITOR_ENABLED
+            if (!depth_only && mode_ != RunMode::instancing && foliage_proxy_.phase) {
+                draw_foliage_proxy(command_buffer, frame, extent);
+                vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_,
+                    0, 1, &descriptor_set, 0, nullptr);
+                vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_,
+                    2, 1, &frame.lighting_descriptor_set, 0, nullptr);
+                vkCmdPushConstants(command_buffer, pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT,
+                    0, sizeof(push_constants), &push_constants);
+            }
             if (!depth_only && mode_ != RunMode::instancing &&
                 authored_scene_enabled_ && editor_ocean_visible_) {
                 vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -11600,6 +11647,9 @@ void Renderer::record_commands(
 #endif
 
     if (anti_aliasing_.method == AntiAliasingMethod::off &&
+#if VCR_EDITOR_ENABLED
+        !foliage_proxy_.phase &&
+#endif
         (!lighting_settings_.dynamic || mode_ == RunMode::instancing) &&
         !subsurface_active && !motion_blur_active && !sample_scene_depth && (!has_local_aa_draws_ || mode_ == RunMode::instancing)) {
 #if VCR_EDITOR_ENABLED

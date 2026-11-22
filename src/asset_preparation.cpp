@@ -178,6 +178,7 @@ void for_each_material_texture_request(const CookedModelMaterial &material, Fn &
     fn(material.metallic_roughness_texture, false, false, 0.0F);
     fn(material.displacement_texture, false, false, 0.0F);
     fn(material.emissive_texture, false, false, 0.0F);
+    fn(material.landscape_detail_texture, false, false, 0.0F);
 }
 
 } // namespace

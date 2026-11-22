@@ -955,6 +955,10 @@ parse_color_space(const std::string_view value) {
 
     const std::filesystem::path authored_source =
         path_from_utf8(source_reference);
+    const auto clamp = metadata.find("clamp_to_edge");
+    if (clamp != metadata.end() && !clamp->is_boolean())
+        return fail(CookedTextureLoadErrorCode::invalid_json, "clamp_to_edge must be boolean.", metadata_diag_path);
+    const bool clamp_to_edge = clamp != metadata.end() && clamp->get<bool>();
     if (path_escapes_root(authored_source)) {
         return fail(
             CookedTextureLoadErrorCode::invalid_path,
@@ -998,6 +1002,7 @@ parse_color_space(const std::string_view value) {
             .name = std::move(name),
             .semantic = *semantic,
             .color_space = *parsed_color_space,
+            .clamp_to_edge = clamp_to_edge,
         };
         return decode_exr(
             std::move(asset), source_file, options);
@@ -1022,6 +1027,7 @@ parse_color_space(const std::string_view value) {
         .name = std::move(name),
         .semantic = *semantic,
         .color_space = *parsed_color_space,
+        .clamp_to_edge = clamp_to_edge,
     };
     if (ktx2) {
         std::string error;

@@ -6,6 +6,7 @@
 #include "device_object.hpp"
 #include "depth_prepass.hpp"
 #include "lod_transition.hpp"
+#include "foliage_proxy_render.hpp"
 #include "frame_context.hpp"
 #include "fsr3_upscaler.hpp"
 #include "exposure.hpp"
@@ -178,6 +179,7 @@ public:
     [[nodiscard]] float lod_fade_seconds() const noexcept { return lod_fade_seconds_; }
     [[nodiscard]] LodFadePattern lod_fade_actual() const noexcept {
 #if VCR_EDITOR_ENABLED
+        if (foliage_proxy_.phase && foliage_proxy_.phase < 4095U) return LodFadePattern::bayer8;
         return authored_scene_enabled_ && mode_ != RunMode::instancing && visibility_settings_.lod
             ? lod_fade_pattern_ : LodFadePattern::off;
 #else
@@ -454,6 +456,9 @@ public:
         std::string& error);
     [[nodiscard]] bool set_runtime_transform(SceneNodeId id, TransformRows transform) noexcept;
     void set_visibility_settings(VisibilitySettings settings) noexcept;
+    void configure_foliage_proxy(const std::filesystem::path& manifest, const SceneRenderView& view,
+                                const std::filesystem::path& asset_root);
+    [[nodiscard]] unsigned foliage_proxy_phase() const noexcept { return foliage_proxy_.phase; }
     [[nodiscard]] const VisibilitySettings &visibility_settings() const noexcept {
         return visibility_settings_;
     }
@@ -1176,9 +1181,13 @@ private:
         SceneNodeId id{};
         Bounds local_bounds{};
         bool occluder = false;
+        bool foliage_proxy_member = false;
     };
     RuntimeTransforms runtime_transforms_{};
     std::vector<SceneInstanceMetadata> scene_metadata_{};
+    FoliageProxyRender foliage_proxy_{};
+    void update_foliage_proxy(const glm::mat4& vp, VkExtent2D extent);
+    void draw_foliage_proxy(VkCommandBuffer cmd, FrameContext& frame, VkExtent2D extent);
     std::vector<RuntimeGpuInstance> scene_packet_{};
     std::vector<EditorModelDraw> visible_model_draws_{};
     std::vector<std::uint32_t> visible_indices_{}, visibility_scratch_{};

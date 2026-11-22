@@ -377,6 +377,11 @@ CliParseResult parse_cli_options(int argc, const char* const* argv) {
             result.options.depth_prepass_override = true;
             continue;
         }
+        if (argument.name == "--foliage-proxy") {
+            if (!take_value(argument, index, argc, argv, value, result.error)) return result;
+            result.options.foliage_proxy_manifest = value;
+            continue;
+        }
         if (argument.name == "--lod-fade") {
             if (!take_value(argument, index, argc, argv, value, result.error)) return result;
             const auto pattern = parse_lod_fade_pattern(value);
@@ -1197,6 +1202,7 @@ std::string cli_usage(std::string_view executable_name) {
                   "  --front-to-back MODE    off, coarse (CPU visibility only; default: off)\n"
                   "  --cpu-culling MODE      linear, hierarchy (CPU frustum; default: linear)\n"
                   "  --lod on|off            Screen-error mesh/terrain LOD (default: on)\n"
+                  "  --foliage-proxy FILE    Override the project's assets/config/foliage_proxy.json tile\n"
                   "  --dynamic-shadows on|off  Authored casters and invalidation (default: on)\n"
                   "  --animate-scene         Animate one runtime object (game executable)\n"
                   "  --animate-camera        Repeatable moving-camera benchmark path\n"

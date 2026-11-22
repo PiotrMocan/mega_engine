@@ -118,7 +118,9 @@ uint classify(uint id,out uint groupIndex,out uint lod,out uint depthBin) {
     vec3 center=vec3(dot(instance.row0,local),dot(instance.row1,local),dot(instance.row2,local));
     vec3 extent=vec3(dot(abs(instance.row0.xyz),source.extent.xyz),
         dot(abs(instance.row1.xyz),source.extent.xyz),dot(abs(instance.row2.xyz),source.extent.xyz));
-    if (config.flags.y!=0) {
+    // The tile draw owns this source. Exclude it from polygon submissions and culling statistics.
+    if (source.extent.w > 0.0 && (config.flags.y >> 1u) == 4095u) {depthBin=0u;return 3u;}
+    if ((config.flags.y&1u)!=0u) {
         for (uint i=0;i<6;++i) {
             vec4 plane=config.planes[i];
             if (dot(plane.xyz,center)+plane.w+dot(abs(plane.xyz),extent)<-1e-4) {
@@ -203,7 +205,7 @@ void main() {
     bool fading = false;
     if (result==0) {
         uint pattern = (config.flags.w >> 1u) & 3u;
-        if (pattern != 0u) {
+        if (pattern != 0u && ((config.flags.y>>1)==0u || sources[id].extent.w==0.0)) {
             history = loadHistory(id);
             fading = history.x != history.y && uintBitsToFloat(history.z) < 1.0;
         }
@@ -277,6 +279,8 @@ void main() {
             }
             indices[scratchOffset + 0u] = header;
             indices[scratchOffset + 1u] = binOffset;
+            if ((config.flags.y>>1)!=0u && sources[id].extent.w>0.0)
+                token=id|(3u<<29u)|((config.flags.y>>1)<<17u);
             indices[scratchOffset + 2u] = token;
             indices[scratchOffset + 3u] = oldBinOffset;
         } else {
@@ -290,6 +294,8 @@ void main() {
         uint pattern = (config.flags.w >> 1u) & 3u;
         indices[draws[commandIndex].firstInstance+offset]=fading
             ? lodToken(id,uintBitsToFloat(history.z),false,pattern) : id;
+        if ((config.flags.y>>1)!=0u && sources[id].extent.w>0.0)
+            indices[draws[commandIndex].firstInstance+offset]=id|(3u<<29u)|((config.flags.y>>1)<<17u);
         if (fading) {
             uint oldCommand=groupIndex*kModelLods+history.x;
             oldOffset=homogeneous ? reservations[history.x]+oldOffset : atomicAdd(draws[oldCommand].instanceCount,1);

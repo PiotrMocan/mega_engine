@@ -28,6 +28,7 @@ inline constexpr std::uint32_t material_coverage_alpha_blend_bit = 8U;
 inline constexpr std::uint32_t material_coverage_glass_bit = 16U;
 inline constexpr std::uint32_t material_coverage_detail_aa_bit = 32U;
 inline constexpr std::uint32_t material_coverage_local_resolve_bit = 64U;
+inline constexpr std::uint32_t material_landscape_detail_bit = 128U;
 inline constexpr std::uint32_t material_coverage_transparent_mask =
     material_coverage_alpha_blend_bit | material_coverage_glass_bit;
 
@@ -85,6 +86,9 @@ struct CookedModelMaterial {
     // Linear emitted radiance, independent of the surface's reflected color.
     glm::vec4 emissive_factor{0.0F};
     std::optional<std::filesystem::path> emissive_texture{};
+    // Opaque landscapes reuse the emission descriptor for a tiled sRGB detail map.
+    std::optional<std::filesystem::path> landscape_detail_texture{};
+    glm::vec4 landscape_parameters{}; // U repeats, fade start/end in metres, V repeats
     MaterialTessellation tessellation{};
     // Bits 0/1 select alpha masking/two-sided shading, bit 2 packed occlusion;
     // high 16 bits hold cutoff.

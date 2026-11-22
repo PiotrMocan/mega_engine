@@ -484,6 +484,7 @@ void Application::load_canonical_scene() {
             fatal(error);
         }
     }
+    renderer_.configure_foliage_proxy(options_.foliage_proxy_manifest, view, asset_root->path);
     if (!view.cubes.empty()) {
         animated_node_ = view.cube_ids.front();
         const auto &instance = view.cubes.front();
@@ -1574,6 +1575,7 @@ void Application::execute_mcp_command(const McpCommand& command) {
                       {"depth_prepass_actual", to_token(renderer_.depth_prepass_actual())},
                      {"lod_fade_requested", to_token(renderer_.lod_fade_pattern())},
                      {"lod_fade_actual", to_token(renderer_.lod_fade_actual())},
+                     {"foliage_proxy_phase", renderer_.foliage_proxy_phase()},
                      {"lod_fade_seconds_requested", renderer_.lod_fade_seconds()},
                      {"lod_fade_seconds_actual", renderer_.lod_fade_seconds()},
                      {"front_to_back_requested",

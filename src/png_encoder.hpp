@@ -25,4 +25,8 @@ struct PngEncodeResult {
     std::uint32_t width,
     std::uint32_t height);
 
+// Top-to-bottom grayscale samples in PNG's big-endian byte order.
+[[nodiscard]] PngEncodeResult encode_png_gray16(std::span<const std::uint8_t> big_endian,
+    std::uint32_t width, std::uint32_t height);
+
 } // namespace vcr
