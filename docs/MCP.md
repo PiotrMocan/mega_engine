@@ -38,7 +38,11 @@ handle нужно считать недействительным и снова 
 также доступны `base_color`, `metallic`, `roughness` и `ambient_occlusion`.
 `scatter_model` принимает cooked `*.vcrasset.json`, count до 10 000, seed,
 центр/размер XZ-области и scale range. Повторный вызов с теми же параметрами
-создаёт те же transforms, но новые nodes.
+создаёт те же transforms, но новые nodes. С параметром `"procedural": true`
+команда возвращает один узел `vegetation_layer`. В этом режиме `count`
+задаёт до 100 000 кандидатов, а необязательный `mask_path` указывает на PNG
+относительно каталога assets проекта. Маска встраивается в сцену. При
+отсутствии PNG используется полная плотность.
 `selection.set` принимает generational handle либо `null`, раскрывает родителей
 выбранного node в UI и отражается в `editor.get_state`. `duplicate_node`
 копирует весь subtree одной Undo-транзакцией и выбирает новую root-копию;

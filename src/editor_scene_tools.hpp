@@ -14,6 +14,10 @@ namespace vcr {
 
 inline constexpr std::uint32_t maximum_scatter_instances = 10'000U;
 
+[[nodiscard]] SceneNodeId create_vegetation_layer(
+    SceneDocument& scene, std::string name, std::string asset_path, SceneNodeId parent,
+    glm::vec3 center, VegetationLayer layer, std::string& error);
+
 struct FlatGroundOptions {
     std::string name{"Flat Terrain"};
     SceneNodeId parent{};

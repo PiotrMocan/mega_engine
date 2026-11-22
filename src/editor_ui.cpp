@@ -6,6 +6,7 @@
 #include "cooked_model_asset.hpp"
 #include "cutscene_sequencer.hpp"
 #include "editor_scene_tools.hpp"
+#include "vegetation_layer.hpp"
 #include "gameplay_framework.hpp"
 #include "navigation.hpp"
 #include "open_level.hpp"
@@ -74,6 +75,14 @@ struct AssetImportUiState {
         std::optional<std::filesystem::path> generated_scene{};
     };
     OpenLevelSettings level{};
+    int scatter_mode = 0;
+    SceneNodeId layer_id{};
+    std::shared_ptr<const VegetationLayer> applied_layer{};
+    VegetationLayer layer_draft{};
+    int brush_density = 0;
+    float brush_radius = 0.08F;
+    bool layer_dirty = false;
+    std::string mask_error;
     std::string heightmap_file, overview_file, detail_file;
     std::array<char,65> level_name{"highlands"};
     std::string level_status;
@@ -673,6 +682,7 @@ struct EditorViewportRay {
     switch (kind) {
     case SceneNodeKind::folder: return EditorIcon::folder;
     case SceneNodeKind::cube: return EditorIcon::cube;
+    case SceneNodeKind::vegetation_layer:
     case SceneNodeKind::model: return EditorIcon::model;
     case SceneNodeKind::ground: return EditorIcon::ground;
     case SceneNodeKind::particle_emitter:
@@ -3484,7 +3494,7 @@ void EditorUi::build_inspector(
         ImGui::SameLine();
         ImGui::TextDisabled(
             node.visible ? "Rendered" : "Hidden");
-        if (node.kind == SceneNodeKind::model) {
+        if (uses_model_asset(node.kind)) {
             ui_kit_.property_row("Asset");
             ImGui::TextWrapped("%s", node.asset_path.c_str());
             ui_kit_.property_row("Detail AA");
@@ -3496,6 +3506,9 @@ void EditorUi::build_inspector(
         }
         ui_kit_.end_property_grid();
     }
+
+    if (node.vegetation && node.kind == SceneNodeKind::vegetation_layer)
+        changed |= draw_vegetation_layer(node);
 
     const bool has_transform = true;
     if (has_transform) {
@@ -7812,6 +7825,80 @@ void EditorUi::build_assets(
     ImGui::End();
 }
 
+bool EditorUi::draw_vegetation_layer(SceneNode& node) {
+    auto& ui = *import_ui_;
+    if (ui.layer_id != selected_node_ || ui.applied_layer != node.vegetation) {
+        ui.layer_id = selected_node_;
+        ui.applied_layer = node.vegetation;
+        ui.layer_draft = *node.vegetation;
+        ui.layer_dirty = false;
+        ui.mask_error.clear();
+    }
+    auto& draft = ui.layer_draft;
+    auto& mask = draft.mask;
+    ui_kit_.section_header(EditorIcon::terrain, "Vegetation density");
+    ui.layer_dirty |= ImGui::InputScalar("Candidates", ImGuiDataType_U32, &draft.candidates);
+    ui.layer_dirty |= ImGui::InputScalar("Seed", ImGuiDataType_U32, &draft.seed);
+    ui.layer_dirty |= ImGui::DragFloat("Width (m)", &draft.width, 0.25F, 0.001F, 8192.F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+    ui.layer_dirty |= ImGui::DragFloat("Depth (m)", &draft.depth, 0.25F, 0.001F, 8192.F, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+    ui.layer_dirty |= ImGui::DragFloat("Minimum plant scale", &draft.minimum_scale, 0.01F, 0.001F, 100.F, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+    ui.layer_dirty |= ImGui::DragFloat("Maximum plant scale", &draft.maximum_scale, 0.01F, 0.001F, 100.F, "%.3f", ImGuiSliderFlags_AlwaysClamp);
+    ImGui::Text("Density mask  %u x %u", mask.width, mask.height);
+    if (const auto& field = draft.heightfield)
+        ImGui::Text("Terrain heights  %u x %u", field->width, field->height);
+    if (ImGui::Button("Import PNG...")) {
+#ifdef _WIN32
+        std::vector<wchar_t> path(32768);
+        OPENFILENAMEW dialog{};
+        dialog.lStructSize = sizeof(dialog);
+        dialog.hwndOwner = static_cast<HWND>(SDL_GetPointerProperty(
+            SDL_GetWindowProperties(main_window_), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+        dialog.lpstrFilter = L"Density mask (*.png)\0*.png\0";
+        dialog.lpstrFile = path.data();
+        dialog.nMaxFile = static_cast<DWORD>(path.size());
+        dialog.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST;
+        if (GetOpenFileNameW(&dialog))
+            ui.layer_dirty |= import_density_mask(path.data(), mask, ui.mask_error);
+#endif
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Fill mask")) {
+        std::ranges::fill(mask.pixels, static_cast<std::uint8_t>(ui.brush_density));
+        ui.layer_dirty = true;
+    }
+    if (!ui.mask_error.empty()) ImGui::TextWrapped("%s", ui.mask_error.c_str());
+    ImGui::SliderInt("Brush density", &ui.brush_density, 0, 255);
+    ImGui::SliderFloat("Brush radius", &ui.brush_radius, 0.01F, 0.5F, "%.2f");
+    const float side = std::clamp(ImGui::GetContentRegionAvail().x, 48.F, 240.F);
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("Paint density mask", {side, side});
+    const auto mouse = ImGui::GetIO().MousePos;
+    if (ImGui::IsItemActive() && ImGui::IsItemHovered()) {
+        ui.layer_dirty |= mask.paint((mouse.x - origin.x) / side, (mouse.y - origin.y) / side,
+                                    ui.brush_radius, static_cast<std::uint8_t>(ui.brush_density));
+    }
+    auto* draw = ImGui::GetWindowDrawList();
+    const unsigned columns = std::min(64U, mask.width), rows = std::min(64U, mask.height);
+    if (ImGui::IsItemVisible()) {
+        for (unsigned y = 0; y < rows; ++y) {
+            for (unsigned x = 0; x < columns; ++x) {
+                const auto value = mask.pixels[(y * mask.height / rows) * mask.width + x * mask.width / columns];
+                draw->AddRectFilled({origin.x + x*side/columns, origin.y + y*side/rows},
+                    {origin.x + (x+1)*side/columns, origin.y + (y+1)*side/rows}, IM_COL32(value, value, value, 255));
+            }
+        }
+        if (ImGui::IsItemHovered()) draw->AddCircle(mouse, side*ui.brush_radius, IM_COL32(255, 125, 35, 255));
+    }
+    ImGui::TextWrapped("Black excludes plants. White uses full density. Right is +X, down is +Z.");
+    const bool valid = valid_vegetation_layer(draft);
+    if (!valid) ImGui::TextWrapped("Use 1 to 100,000 candidates and a minimum scale at or below the maximum.");
+    ImGui::BeginDisabled(!ui.layer_dirty || !valid);
+    const bool apply = ImGui::Button("Apply layer");
+    ImGui::EndDisabled();
+    if (apply) node.vegetation = std::make_shared<const VegetationLayer>(draft);
+    return apply;
+}
+
 void EditorUi::draw_surface_tools(SceneDocument& scene, Renderer& renderer, FlyCamera& camera) {
     if (!ImGui::CollapsingHeader("Terrain brushes and spline meshes")) return;
     if (ImGui::Button("New terrain")) { terrain_edit_target_ = {}; terrain_canvas_ = {}; }
@@ -8076,13 +8163,15 @@ void EditorUi::build_landscape(
             "Select an imported *.vcrasset.json model in Assets.",
             EditorTone::neutral);
     }
+    ImGui::Combo("Placement", &import_ui_->scatter_mode, "Procedural layer\0Individual objects\0");
+    const bool procedural = import_ui_->scatter_mode == 0;
     if (ui_kit_.begin_property_grid("ScatterProperties")) {
-        ui_kit_.property_row("Name prefix");
+        ui_kit_.property_row(procedural ? "Layer name" : "Name prefix");
         static_cast<void>(ImGui::InputText(
             "##ScatterName",
             scatter_name_prefix_.data(),
             scatter_name_prefix_.size()));
-        ui_kit_.property_row("Count");
+        ui_kit_.property_row(procedural ? "Candidates" : "Count");
         static_cast<void>(ImGui::DragScalar(
             "##ScatterCount",
             ImGuiDataType_U32,
@@ -8092,7 +8181,7 @@ void EditorUi::build_landscape(
             nullptr,
             "%u"));
         scatter_count_ = std::clamp(
-            scatter_count_, 1U, maximum_scatter_instances);
+            scatter_count_, 1U, procedural ? max_vegetation_candidates : maximum_scatter_instances);
         ui_kit_.property_row("Seed");
         static_cast<void>(ImGui::InputScalar(
             "##ScatterSeed", ImGuiDataType_U32, &scatter_seed_));
@@ -8122,13 +8211,13 @@ void EditorUi::build_landscape(
     if (ui_kit_.action_button(
             "ScatterVegetation",
             EditorIcon::add,
-            "Scatter selected model",
+            procedural ? "Create vegetation layer" : "Scatter selected model",
             EditorButtonStyle::secondary,
             can_scatter) &&
         selected_asset_) {
         SceneTransform base_transform{};
         std::string error;
-        if (!renderer.prepare_editor_model(
+        if (!procedural && !renderer.prepare_editor_model(
                 asset_browser_.root(),
                 selected_asset_->relative_display,
                 base_transform,
@@ -8144,33 +8233,45 @@ void EditorUi::build_landscape(
                 parent = selected_node_;
             }
             SceneDocument before = scene;
-            const bool scattered = scatter_model_instances(
-                scene,
-                ModelScatterOptions{
-                    .asset_path = selected_asset_->relative_display,
-                    .name_prefix = scatter_name_prefix_.data(),
-                    .parent = parent,
-                    .base_transform = base_transform,
-                    .center_x = scatter_center_[0],
-                    .height = scatter_center_[1],
-                    .center_z = scatter_center_[2],
-                    .width = scatter_size_[0],
-                    .depth = scatter_size_[1],
-                    .minimum_scale = scatter_scale_[0],
-                    .maximum_scale = scatter_scale_[1],
-                    .count = scatter_count_,
-                    .seed = scatter_seed_,
-                },
-                scatter_created_,
-                error);
-            if (scattered) {
-                push_undo_snapshot(std::move(before));
-                hierarchy_revision_ = 0U;
-                scene_file_status_ =
-                    "Scattered " + std::to_string(scatter_created_.size()) +
-                    " model instances.";
+            if (procedural) {
+                const auto id = create_vegetation_layer(scene, scatter_name_prefix_.data(), selected_asset_->relative_display,
+                    parent, {scatter_center_[0], scatter_center_[1], scatter_center_[2]},
+                    {.candidates = scatter_count_, .seed = scatter_seed_, .width = scatter_size_[0],
+                     .depth = scatter_size_[1], .minimum_scale = scatter_scale_[0], .maximum_scale = scatter_scale_[1]}, error);
+                if (id) {
+                    push_undo_snapshot(std::move(before));
+                    static_cast<void>(select_node(scene, id));
+                    scene_file_status_ = "Vegetation layer created. Edit the density mask in Inspector.";
+                } else asset_error_ = std::move(error);
             } else {
-                asset_error_ = std::move(error);
+                const bool scattered = scatter_model_instances(
+                    scene,
+                    ModelScatterOptions{
+                        .asset_path = selected_asset_->relative_display,
+                        .name_prefix = scatter_name_prefix_.data(),
+                        .parent = parent,
+                        .base_transform = base_transform,
+                        .center_x = scatter_center_[0],
+                        .height = scatter_center_[1],
+                        .center_z = scatter_center_[2],
+                        .width = scatter_size_[0],
+                        .depth = scatter_size_[1],
+                        .minimum_scale = scatter_scale_[0],
+                        .maximum_scale = scatter_scale_[1],
+                        .count = scatter_count_,
+                        .seed = scatter_seed_,
+                    },
+                    scatter_created_,
+                    error);
+                if (scattered) {
+                    push_undo_snapshot(std::move(before));
+                    hierarchy_revision_ = 0U;
+                    scene_file_status_ =
+                        "Scattered " + std::to_string(scatter_created_.size()) +
+                        " model instances.";
+                } else {
+                    asset_error_ = std::move(error);
+                }
             }
         }
     }

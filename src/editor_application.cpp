@@ -2,6 +2,7 @@
 
 #include "asset_browser.hpp"
 #include "editor_scene_tools.hpp"
+#include "vegetation_layer.hpp"
 #include "game_module_loader.hpp"
 #include "icon_system.hpp"
 #include "prefab_io.hpp"
@@ -59,6 +60,7 @@ using Json = nlohmann::json;
     case SceneNodeKind::projected_decal: return "projected_decal";
     case SceneNodeKind::ocean: return "ocean";
     case SceneNodeKind::model: return "model";
+    case SceneNodeKind::vegetation_layer: return "vegetation_layer";
     }
     return "unknown";
 }
@@ -325,6 +327,12 @@ using Json = nlohmann::json;
         }
     } else {
         result["skeleton"] = nullptr;
+    }
+    if (value.vegetation) {
+        const auto& layer = *value.vegetation;
+        result["vegetation"] = {{"seed", layer.seed}, {"candidates", layer.candidates}, {"width", layer.width},
+            {"depth", layer.depth}, {"minimum_scale", layer.minimum_scale}, {"maximum_scale", layer.maximum_scale},
+            {"mask_width", layer.mask.width}, {"mask_height", layer.mask.height}};
     }
     if (depth) {
         result["depth"] = *depth;
@@ -1817,6 +1825,7 @@ void EditorApplication::execute_mcp_command(
                     {"max_scene_nodes", max_scene_nodes},
                     {"max_local_lights", maximum_local_lights},
                     {"max_scatter_instances", maximum_scatter_instances},
+                    {"max_vegetation_candidates_per_layer", max_vegetation_candidates},
                     {"history_entries", 32},
                 }},
             });
@@ -3355,9 +3364,9 @@ void EditorApplication::execute_mcp_command(
         }
         const std::string_view asset_path(command.text.data());
         if ((command.edit_mask & McpCommand::edit_asset_path) != 0U &&
-            (node->get().kind != SceneNodeKind::model ||
+            (!uses_model_asset(node->get().kind) ||
              !valid_scene_asset_path(asset_path))) {
-            fail("asset_path can patch only a model node with a .vcrasset.json path");
+            fail("asset_path requires a model or vegetation layer and a .vcrasset.json path");
             return;
         }
         if ((command.edit_mask & material_edit_mask) != 0U &&
@@ -3683,6 +3692,29 @@ void EditorApplication::execute_mcp_command(
             fail(error.empty()
                 ? "model preparation started; retry scatter after assets_pending clears"
                 : std::move(error));
+            return;
+        }
+        if (command.node_kind == SceneNodeKind::vegetation_layer) {
+            VegetationLayer layer{.candidates = command.count, .seed = command.seed, .width = command.extent_x,
+                .depth = command.extent_z, .minimum_scale = command.minimum_scale, .maximum_scale = command.maximum_scale};
+            if (command.secondary_text.front()) {
+                const auto relative = path_from_utf8(command.secondary_text.data());
+                const auto& root = ui_.asset_root();
+                std::error_code ec;
+                const auto file = std::filesystem::canonical(root / relative, ec);
+                const auto within = file.lexically_relative(root);
+                if (ec || relative.has_root_path() || within.empty() || *within.begin() == "..") {
+                    fail("mask_path must name a PNG under the project assets directory");
+                    return;
+                }
+                if (!import_density_mask(file, layer.mask, error)) { fail(std::move(error)); return; }
+            }
+            ui_.checkpoint_scene(scene_);
+            const auto id = create_vegetation_layer(scene_, command.name.data(), command.text.data(),
+                command.parent_id, command.transform.translation, std::move(layer), error);
+            if (!id) { fail(std::move(error)); return; }
+            static_cast<void>(ui_.select_node(scene_, id));
+            succeed("vegetation layer created", Json{{"node", scene_node_json(scene_, id)}});
             return;
         }
         ui_.checkpoint_scene(scene_);

@@ -1,4 +1,5 @@
 #include "editor_scene_tools.hpp"
+#include "vegetation_layer.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -413,6 +414,28 @@ SceneNodeId create_flat_ground(
     node->get().material = sanitize_pbr_material(options.material);
     scene.mark_content_changed();
     return ground;
+}
+
+SceneNodeId create_vegetation_layer(
+    SceneDocument& scene, std::string name, std::string asset_path, SceneNodeId parent,
+    glm::vec3 center, VegetationLayer layer, std::string& error) {
+    error.clear();
+    if (name.empty() || !valid_scene_asset_path(asset_path) || !valid_vegetation_layer(layer) ||
+        !std::isfinite(center.x) || !std::isfinite(center.y) || !std::isfinite(center.z)) {
+        error = "Check the layer name, model, placement settings and density mask.";
+        return {};
+    }
+    auto settings = std::make_shared<const VegetationLayer>(std::move(layer));
+    const auto id = scene.create_node(std::move(name), SceneNodeKind::vegetation_layer, parent);
+    if (!id) {
+        error = "Cannot create vegetation layer. Check the name, parent and scene capacity.";
+        return {};
+    }
+    auto& node = scene.node(id)->get();
+    node.asset_path = std::move(asset_path);
+    node.transform.translation = center;
+    node.vegetation = std::move(settings);
+    return id;
 }
 
 bool scatter_model_instances(

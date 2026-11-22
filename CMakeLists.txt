@@ -470,6 +470,7 @@ set(VCR_ENGINE_CORE_SOURCES
     src/character_wardrobe_mesh.cpp
     src/character_wardrobe_textures.cpp
     src/character_ai_bridge.cpp
+    src/vegetation_layer.cpp
     src/vegetation_generator.cpp
     src/vegetation_surface_picker.cpp
     src/asset_pak.cpp

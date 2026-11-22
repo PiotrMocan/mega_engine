@@ -2,6 +2,7 @@
 #include "project_system.hpp"
 #include "scene_io.hpp"
 #include "scene_component_json.hpp"
+#include "vegetation_layer.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -36,6 +37,7 @@ using Json = nlohmann::json;
     case SceneNodeKind::folder: return "folder";
     case SceneNodeKind::cube: return "cube";
     case SceneNodeKind::model: return "model";
+    case SceneNodeKind::vegetation_layer: return "vegetation_layer";
     case SceneNodeKind::ground: return "ground";
     case SceneNodeKind::terrain: return "terrain";
     case SceneNodeKind::camera: return "camera";
@@ -56,6 +58,7 @@ using Json = nlohmann::json;
     if (value == "folder") return SceneNodeKind::folder;
     if (value == "cube") return SceneNodeKind::cube;
     if (value == "model") return SceneNodeKind::model;
+    if (value == "vegetation_layer") return SceneNodeKind::vegetation_layer;
     if (value == "ground") return SceneNodeKind::ground;
     if (value == "particle_emitter") return SceneNodeKind::particle_emitter;
     if (value == "projected_decal") return SceneNodeKind::projected_decal;
@@ -810,9 +813,9 @@ bool save_scene_file(
             error = "Scene subsurface material values are invalid.";
             return false;
         }
-        if ((node.kind == SceneNodeKind::model &&
+        if ((uses_model_asset(node.kind) &&
              !valid_scene_asset_path(node.asset_path)) ||
-            (node.kind != SceneNodeKind::model &&
+            (!uses_model_asset(node.kind) &&
              !node.asset_path.empty())) {
             error =
                 "Scene model asset path is invalid or assigned to "
@@ -975,7 +978,14 @@ bool save_scene_file(
                     invalid_scene_node_index
             ? Json(nullptr)
             : Json(record.parent_record_index);
-        if (node.kind == SceneNodeKind::model) {
+        if (node.kind == SceneNodeKind::vegetation_layer) {
+            if (!node.vegetation || !valid_vegetation_layer(*node.vegetation)) {
+                error = "Invalid vegetation layer settings or density mask.";
+                return false;
+            }
+            encoded["vegetation"] = encode_vegetation_layer(*node.vegetation);
+        }
+        if (uses_model_asset(node.kind)) {
             encoded["asset_path"] = node.asset_path;
             if (node.detail_aa != ObjectAntiAliasing::asset)
                 encoded["detail_aa"] = node.detail_aa == ObjectAntiAliasing::coverage ? "coverage" : "off";
@@ -1208,9 +1218,16 @@ bool load_scene_file(
                 error = "Scene node kind is unknown.";
                 return false;
             }
+            std::shared_ptr<const VegetationLayer> vegetation;
+            if (*kind == SceneNodeKind::vegetation_layer) {
+                if (!encoded.contains("vegetation") || !(vegetation = decode_vegetation_layer(encoded["vegetation"]))) {
+                    error = "Invalid vegetation layer settings or density mask.";
+                    return false;
+                }
+            }
             ObjectAntiAliasing detail_aa = ObjectAntiAliasing::asset;
             if (const auto aa = encoded.find("detail_aa"); aa != encoded.end()) {
-                if (*kind != SceneNodeKind::model || !aa->is_string() || (*aa != "off" && *aa != "coverage" && *aa != "asset")) {
+                if (!uses_model_asset(*kind) || !aa->is_string() || (*aa != "off" && *aa != "coverage" && *aa != "asset")) {
                     error = "Unknown object detail_aa setting.";
                     return false;
                 }
@@ -1218,7 +1235,7 @@ bool load_scene_file(
                 if (*aa == "coverage") detail_aa = ObjectAntiAliasing::coverage;
             }
             std::string asset_path;
-            if (*kind == SceneNodeKind::model) {
+            if (uses_model_asset(*kind)) {
                 if (!encoded.contains("asset_path") ||
                     !encoded["asset_path"].is_string()) {
                     error =
@@ -1716,6 +1733,7 @@ bool load_scene_file(
             node->get().ocean = ocean;
             node->get().vfx = vfx;
             node->get().asset_path = std::move(asset_path);
+            node->get().vegetation = std::move(vegetation);
             node->get().detail_aa = detail_aa;
             ids.push_back(id);
         }

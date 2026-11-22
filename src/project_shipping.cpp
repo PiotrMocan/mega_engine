@@ -729,7 +729,7 @@ template <typename Fn>
         std::vector<SceneNodeRecord> nodes;
         loaded.build_node_records(nodes);
         for (const auto& node : nodes) {
-            if (node.value.kind == SceneNodeKind::model && !node.value.asset_path.empty()) {
+            if (uses_model_asset(node.value.kind) && !node.value.asset_path.empty()) {
                 const std::filesystem::path asset_rel = from_utf8(node.value.asset_path);
                 if (is_safe_relative_asset_path(asset_rel)) {
                     directly_used_models.insert(utf8(asset_rel.lexically_normal()));
@@ -969,7 +969,7 @@ template <typename Fn>
         std::vector<SceneNodeRecord> nodes;
         loaded.build_node_records(nodes);
         for (const auto& node : nodes) {
-            if (node.value.kind == SceneNodeKind::model) {
+            if (uses_model_asset(node.value.kind)) {
                 const std::filesystem::path asset_rel = from_utf8(node.value.asset_path);
                 const std::string normalized_asset_path =
                     utf8(asset_rel.lexically_normal());

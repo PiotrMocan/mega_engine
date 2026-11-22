@@ -2,6 +2,7 @@
 #include "native_asset_path.hpp"
 #include "prefab_io.hpp"
 #include "scene_component_json.hpp"
+#include "vegetation_layer.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -34,6 +35,7 @@ using Json = nlohmann::json;
     case SceneNodeKind::folder: return "folder";
     case SceneNodeKind::cube: return "cube";
     case SceneNodeKind::model: return "model";
+    case SceneNodeKind::vegetation_layer: return "vegetation_layer";
     case SceneNodeKind::ground: return "ground";
     case SceneNodeKind::terrain: return "terrain";
     case SceneNodeKind::camera: return "camera";
@@ -53,6 +55,7 @@ using Json = nlohmann::json;
     if (value == "folder") return SceneNodeKind::folder;
     if (value == "cube") return SceneNodeKind::cube;
     if (value == "model") return SceneNodeKind::model;
+    if (value == "vegetation_layer") return SceneNodeKind::vegetation_layer;
     if (value == "ground") return SceneNodeKind::ground;
     if (value == "particle_emitter") return SceneNodeKind::particle_emitter;
     if (value == "projected_decal") return SceneNodeKind::projected_decal;
@@ -820,9 +823,9 @@ bool save_prefab_file(
                 error = "Prefab node transform contains invalid values.";
                 return false;
             }
-            if ((node.kind == SceneNodeKind::model &&
+            if ((uses_model_asset(node.kind) &&
                  !valid_scene_asset_path(node.asset_path)) ||
-                (node.kind != SceneNodeKind::model && !node.asset_path.empty())) {
+                (!uses_model_asset(node.kind) && !node.asset_path.empty())) {
                 error = "Prefab model asset path is invalid.";
                 return false;
             }
@@ -895,7 +898,14 @@ bool save_prefab_file(
                 encoded["parent"] =
                     static_cast<std::uint32_t>(record.parent_record_index - begin);
             }
-            if (node.kind == SceneNodeKind::model) {
+            if (node.kind == SceneNodeKind::vegetation_layer) {
+                if (!node.vegetation || !valid_vegetation_layer(*node.vegetation)) {
+                    error = "Invalid vegetation layer settings or density mask.";
+                    return false;
+                }
+                encoded["vegetation"] = encode_vegetation_layer(*node.vegetation);
+            }
+            if (uses_model_asset(node.kind)) {
                 encoded["asset_path"] = node.asset_path;
                 if (node.detail_aa != ObjectAntiAliasing::asset)
                     encoded["detail_aa"] = node.detail_aa == ObjectAntiAliasing::coverage ? "coverage" : "off";
@@ -1160,9 +1170,16 @@ bool instantiate_prefab_file(
                 parent_index = static_cast<std::uint32_t>(p);
             }
 
+            std::shared_ptr<const VegetationLayer> vegetation;
+            if (*kind == SceneNodeKind::vegetation_layer) {
+                if (!encoded.contains("vegetation") || !(vegetation = decode_vegetation_layer(encoded["vegetation"]))) {
+                    error = "Invalid vegetation layer settings or density mask.";
+                    return false;
+                }
+            }
             ObjectAntiAliasing detail_aa = ObjectAntiAliasing::asset;
             if (const auto aa = encoded.find("detail_aa"); aa != encoded.end()) {
-                if (*kind != SceneNodeKind::model || !aa->is_string() || (*aa != "off" && *aa != "coverage" && *aa != "asset")) {
+                if (!uses_model_asset(*kind) || !aa->is_string() || (*aa != "off" && *aa != "coverage" && *aa != "asset")) {
                     error = "Unknown object detail_aa setting.";
                     return false;
                 }
@@ -1170,7 +1187,7 @@ bool instantiate_prefab_file(
                 if (*aa == "coverage") detail_aa = ObjectAntiAliasing::coverage;
             }
             std::string asset_path;
-            if (*kind == SceneNodeKind::model) {
+            if (uses_model_asset(*kind)) {
                 if (!encoded.contains("asset_path") ||
                     !encoded["asset_path"].is_string()) {
                     error = "Prefab model asset_path is missing.";
@@ -1490,6 +1507,7 @@ bool instantiate_prefab_file(
                 .value = SceneNode{
                     .name = name,
                     .asset_path = std::move(asset_path),
+                    .vegetation = std::move(vegetation),
                     .detail_aa = detail_aa,
                     .transform = SceneTransform{
                         .translation = {

@@ -1,6 +1,7 @@
 #include "asset_browser.hpp"
 #include "crash_log.hpp"
 #include "editor_scene_tools.hpp"
+#include "vegetation_layer.hpp"
 #include "cli_options.hpp"
 #include "coarse_depth_order.hpp"
 #include "fly_camera.hpp"
@@ -20,6 +21,7 @@
 #include "camera_projection.hpp"
 
 #include <algorithm>
+#include <ranges>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -2957,6 +2959,110 @@ int main() {
         const auto asset_root = prefab_dir / "assets";
         std::filesystem::create_directories(asset_root, fs_err);
         std::string error;
+
+        {
+            vcr::SceneDocument meadow;
+            const auto parent = meadow.create_node("Meadow", vcr::SceneNodeKind::folder);
+            meadow.node(parent)->get().transform.translation = {10, 3, 20};
+            vcr::VegetationLayer recipe{.candidates = 4096, .seed = 42, .width = 24, .depth = 20};
+            const auto anchor = vcr::vegetation_placement(recipe, 0);
+            expect(anchor && std::abs((*anchor)[3].x - (-9.376727F)) < 0.00001F &&
+                   std::abs((*anchor)[3].z - (-9.015719F)) < 0.00001F &&
+                   std::abs((*anchor)[1].y - 1.137146F) < 0.00001F,
+                   "version one seed 42 retains its authored position and scale");
+            {
+                auto hillside = recipe;
+                hillside.heightfield = vcr::VegetationHeightfield{2, 2, {-100, 0, 200, 800}};
+                auto encoded = vcr::encode_vegetation_layer(hillside);
+                const auto restored = vcr::decode_vegetation_layer(encoded);
+                bool lower = false, upper = false, matches = true;
+                for (unsigned i = 0; restored && i < 64; ++i) {
+                    const auto root = (*vcr::vegetation_placement(*restored, i))[3];
+                    const float u = root.x / hillside.width + 0.5F, v = root.z / hillside.depth + 0.5F;
+                    const float height = u + v <= 1 ? -1 + u + 3 * v : 8 * (u + v - 1) + 2 * (1 - u);
+                    lower |= u + v <= 1;
+                    upper |= u + v > 1;
+                    matches &= std::abs(root.y - height) < 0.00001F;
+                }
+                expect(lower && upper && matches, "terrain layers round-trip and ground both triangles in local space");
+                encoded["heightfield"]["samples_cm"][0] = 65536U;
+                expect(!vcr::decode_vegetation_layer(encoded), "reject out-of-range terrain heights");
+                encoded["heightfield"]["samples_cm"] = {0, 0};
+                expect(!vcr::decode_vegetation_layer(encoded), "reject truncated terrain grids");
+            }
+            const auto layer_root = asset_root / "vegetation_fixture";
+            std::filesystem::create_directories(layer_root, fs_err);
+            const auto png_file = layer_root / "density.png";
+            const auto png = vcr::encode_png_rgba(std::array<std::uint8_t, 8>{0,0,0,255, 255,255,255,255}, 2, 1);
+            {
+                std::ofstream file(png_file, std::ios::binary);
+                file.write(reinterpret_cast<const char*>(png.bytes.data()), static_cast<std::streamsize>(png.bytes.size()));
+            }
+            expect(vcr::import_density_mask(png_file, recipe.mask, error) &&
+                   recipe.mask.pixels == std::vector<std::uint8_t>{0, 255}, "import PNG luminance in authored order");
+            auto painted = recipe.mask;
+            expect(painted.paint(0.001F, 0.999F, 0.01F, 128) && painted.pixels == std::vector<std::uint8_t>{128, 255} &&
+                   !painted.paint(0.001F, 0.999F, 0.01F, 128), "small brush paints the indicated imported texel");
+            vcr::VegetationDensityMask uniform;
+            expect(uniform.paint(1, 0, 0.05F, 0) && uniform.width == 64 && uniform.pixels[63] == 0 &&
+                   uniform.pixels.back() == 255, "painting a uniform mask allocates an editable grid at the edge");
+            const auto layer = vcr::create_vegetation_layer(meadow, "Grass", "plants/grass.vcrasset.json",
+                parent, {}, recipe, error);
+            std::vector<vcr::SceneGpuInstance> cubes;
+            std::vector<vcr::SceneModelInstance> models;
+            std::vector<vcr::ScenePunctualLight> lights;
+            const auto build = [&](vcr::SceneDocument& scene) { return scene.build_render_view(cubes, models, lights); };
+            const auto first = build(meadow);
+            expect(layer && meadow.size() == 2 && models.size() > 1900 && models.size() < 2200 &&
+                   !first.vegetation_overflow && std::ranges::all_of(models, [&](const auto& m) {
+                       return m.layer_id == layer && !m.id && m.model_row_0.w >= 10 && m.model_row_0.w < 22 &&
+                              m.model_row_1.w == 3 && m.model_row_2.w >= 10 && m.model_row_2.w < 30;
+                   }), "one masked layer expands on the correct side of its parent without registering plant nodes");
+            const auto expected = models;
+            const auto same_rows = [](const auto& a, const auto& b) {
+                return a.model_row_0 == b.model_row_0 && a.model_row_1 == b.model_row_1 && a.model_row_2 == b.model_row_2;
+            };
+            const auto scene_file = layer_root / "meadow.json";
+            vcr::SceneDocument loaded;
+            expect(vcr::save_scene_file(meadow, scene_file, error) && vcr::load_scene_file(scene_file, loaded, error) &&
+                   loaded.size() == 2 && std::ranges::equal(build(loaded).models, expected, same_rows),
+                   "scene round trip reconstructs every masked transform exactly");
+            vcr::PrefabInstantiateResult copy;
+            vcr::SceneDocument prefab;
+            const std::string path = "prefabs/meadow.vcrprefab.json";
+            expect(vcr::save_prefab_file(meadow, parent, layer_root, path, error, {.zero_root_translation = false}) &&
+                   vcr::instantiate_prefab_file(prefab, layer_root, path, {}, copy, error) &&
+                   copy.instantiated_nodes == 2 && std::ranges::equal(build(prefab).models, expected, same_rows),
+                   "prefabs retain the layer and its embedded mask");
+            const auto old = meadow;
+            recipe.mask.pixels.front() = 128;
+            meadow.node(layer)->get().vegetation = std::make_shared<const vcr::VegetationLayer>(recipe);
+            build(meadow);
+            expect(models.size() > expected.size() + 800 && models.size() < expected.size() + 1200 &&
+                   std::ranges::equal(models | std::views::filter([](const auto& m) { return m.model_row_0.w >= 10; }),
+                                      expected, same_rows), "painting gray adds stable density only to edited texels");
+            auto restored = vcr::SceneHistoryDelta(old, meadow).restore(meadow);
+            expect(std::ranges::equal(build(restored).models, expected, same_rows), "undo restores the exact layout");
+            ++recipe.seed;
+            meadow.node(layer)->get().vegetation = std::make_shared<const vcr::VegetationLayer>(recipe);
+            build(meadow);
+            expect(!models.empty() && !expected.empty() && !same_rows(models.front(), expected.front()), "seed changes layout");
+            meadow.node(parent)->get().visible = false;
+            expect(build(meadow).models.empty(), "hidden layer parent suppresses all instances");
+            meadow.node(parent)->get().visible = true;
+            recipe.mask.pixels = {0, 0};
+            meadow.node(layer)->get().vegetation = std::make_shared<const vcr::VegetationLayer>(recipe);
+            expect(build(meadow).models.empty(), "black mask excludes every candidate");
+            recipe.mask.pixels = {255, 255};
+            recipe.candidates = 60'000;
+            meadow.node(layer)->get().vegetation = std::make_shared<const vcr::VegetationLayer>(recipe);
+            const auto extra = vcr::create_vegetation_layer(meadow, "Other", "plants/grass.vcrasset.json", {}, {}, recipe, error);
+            expect(extra && build(meadow).vegetation_overflow && models.size() == vcr::max_scene_nodes,
+                   "combined layers signal instance overflow before GPU submission");
+            recipe.mask.width = 0;
+            expect(!vcr::create_vegetation_layer(meadow, "Invalid", "plants/grass.vcrasset.json", {}, {}, recipe, error) &&
+                   meadow.size() == 3, "invalid masks leave the scene intact");
+        }
 
         vcr::SceneDocument source_scene;
         const auto crate_root = source_scene.create_node(

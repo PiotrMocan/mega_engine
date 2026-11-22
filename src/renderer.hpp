@@ -1176,6 +1176,8 @@ private:
         SceneNodeId id{};
         Bounds local_bounds{};
         bool occluder = false;
+        SceneNodeId layer_id{};
+        [[nodiscard]] SceneNodeId selection_id() const noexcept { return layer_id ? layer_id : id; }
     };
     RuntimeTransforms runtime_transforms_{};
     std::vector<SceneInstanceMetadata> scene_metadata_{};

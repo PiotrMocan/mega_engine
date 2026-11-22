@@ -575,6 +575,7 @@ private:
     SceneUuid terrain_edit_target_{};
     int terrain_brush_mode_ = 0, terrain_layer_ = 0;
     float terrain_radius_ = 3.F, terrain_strength_ = 4.F, ribbon_width_ = 4.F;
+    bool draw_vegetation_layer(SceneNode& node);
     void draw_surface_tools(SceneDocument& scene, Renderer& renderer, FlyCamera& camera);
     void draw_open_level_tool();
     float flat_ground_size_[2]{64.0F, 64.0F};

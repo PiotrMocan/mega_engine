@@ -3121,14 +3121,14 @@ std::optional<SceneNodeId> Renderer::pick_editor_scene(
     for (std::size_t index = 0U;
          index < scene_metadata_.size();
          ++index) {
-        if (!scene_metadata_[index].id) {
+        if (!scene_metadata_[index].selection_id()) {
             continue;
         }
         const auto distance = ray_bounds_intersection(
             ray_origin, direction, world_bounds_[index]);
         if (distance && *distance < nearest) {
             nearest = *distance;
-            selected = scene_metadata_[index].id;
+            selected = scene_metadata_[index].selection_id();
         }
     }
     return selected
@@ -3147,7 +3147,7 @@ std::optional<Bounds> Renderer::editor_node_bounds(
     for (std::size_t index = 0U;
          index < scene_metadata_.size();
          ++index) {
-        if (scene_metadata_[index].id != id) {
+        if (scene_metadata_[index].selection_id() != id) {
             continue;
         }
         minimum = glm::min(
@@ -3185,6 +3185,10 @@ bool Renderer::update_editor_scene(
     if (!authored_scene_enabled_ ||
         (view.revision != 0U && view.revision == editor_scene_revision_)) {
         return true;
+    }
+    if (view.vegetation_overflow) {
+        error = "Vegetation exceeds the scene budget of 1,000,000 visible candidates or 100,000 model instances.";
+        return false;
     }
     if (view.local_lights_overflow ||
         view.local_lights.size() > maximum_local_lights) {
@@ -3384,7 +3388,7 @@ bool Renderer::update_editor_scene(
                     .model_row_2 = model.model_row_2,
                     .material = submesh.material,
                 });
-                scene_metadata_.push_back({model.id, asset.bounds, false});
+                scene_metadata_.push_back({model.id, asset.bounds, false, model.layer_id});
             }
             const bool is_transparent_or_hair =
                 (submesh.coverage & material_coverage_transparent_mask) != 0U ||

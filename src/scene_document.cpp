@@ -1,4 +1,5 @@
 #include "scene_document.hpp"
+#include "vegetation_layer.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1309,6 +1310,9 @@ SceneRenderView SceneDocument::build_render_view(
     float ocean_height = 0.0F;
     OceanSettings ocean{};
     bool local_lights_overflow = false;
+    bool vegetation_overflow = false;
+    // Bound even sparse/black masks across many visible layers at one scene sync.
+    unsigned remaining_candidates = 10 * max_vegetation_candidates;
     std::uint32_t index = first_root_;
     std::uint32_t depth = 0U;
     while (index != invalid_scene_node_index) {
@@ -1411,18 +1415,31 @@ SceneRenderView SceneDocument::build_render_view(
                     local_lights_overflow = true;
                 }
             }
-        } else if (world_visible &&
-                   slot.value.kind == SceneNodeKind::model &&
-                   valid_scene_asset_path(slot.value.asset_path) &&
-                   model_output.size() < max_scene_nodes) {
-            model_output.push_back(SceneModelInstance{
-                .model_row_0 = matrix_row(world_matrix, 0),
-                .model_row_1 = matrix_row(world_matrix, 1),
-                .model_row_2 = matrix_row(world_matrix, 2),
-                .asset_path = slot.value.asset_path,
-                .id = id_for_index(index),
-                .detail_aa = slot.value.detail_aa,
-            });
+        } else if (world_visible && uses_model_asset(slot.value.kind) && valid_scene_asset_path(slot.value.asset_path)) {
+            const auto id = id_for_index(index);
+            const auto append = [&](const glm::mat4& matrix, SceneNodeId transform_id, SceneNodeId layer_id) {
+                if (model_output.size() >= max_scene_nodes) {
+                    vegetation_overflow = true;
+                    return;
+                }
+                model_output.push_back({matrix_row(matrix, 0), matrix_row(matrix, 1), matrix_row(matrix, 2),
+                    slot.value.asset_path, transform_id, slot.value.detail_aa, layer_id});
+            };
+            if (slot.value.kind == SceneNodeKind::model) {
+                append(world_matrix, id, {});
+            } else if (const auto& layer = slot.value.vegetation; layer && valid_vegetation_layer(*layer)) {
+                if (layer->candidates > remaining_candidates) {
+                    vegetation_overflow = true;
+                } else {
+                    remaining_candidates -= layer->candidates;
+                    for (unsigned i = 0; i < layer->candidates && !vegetation_overflow; ++i) {
+                        if (const auto placement = vegetation_placement(*layer, i)) {
+                            const auto matrix = world_matrix * *placement;
+                            if (finite_matrix(matrix)) append(matrix, {}, id);
+                        }
+                    }
+                }
+            }
         }
         index = traversal_next(index, depth, true);
     }
@@ -1441,6 +1458,7 @@ SceneRenderView SceneDocument::build_render_view(
         .ocean = ocean,
         .effects = render_effects_,
         .local_lights_overflow = local_lights_overflow,
+        .vegetation_overflow = vegetation_overflow,
         .ground_id = ground_id,
         .cube_ids = render_cube_ids_,
     };
@@ -1753,6 +1771,7 @@ std::string_view to_string(const SceneNodeKind kind) noexcept {
     case SceneNodeKind::folder: return "Folder";
     case SceneNodeKind::cube: return "Cube";
     case SceneNodeKind::model: return "Model";
+    case SceneNodeKind::vegetation_layer: return "Vegetation layer";
     case SceneNodeKind::ground: return "Ground";
     case SceneNodeKind::terrain: return "Terrain";
     case SceneNodeKind::camera: return "Camera";

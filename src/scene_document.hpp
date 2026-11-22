@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -60,7 +61,14 @@ enum class SceneNodeKind : std::uint8_t {
     ocean,
     particle_emitter,
     projected_decal,
+    vegetation_layer,
 };
+
+[[nodiscard]] constexpr bool uses_model_asset(SceneNodeKind kind) noexcept {
+    return kind == SceneNodeKind::model || kind == SceneNodeKind::vegetation_layer;
+}
+
+struct VegetationLayer;
 
 struct SceneTransform {
     glm::vec3 translation{0.0F};
@@ -92,8 +100,10 @@ struct SceneEffect {
 struct SceneNode {
     std::string name;
     // UTF-8 generic path to a .vcrasset.json file, relative to the
-    // editor's assets root. Required only for model nodes.
+    // editor's assets root. Also supplies the species for a vegetation layer.
     std::string asset_path;
+    // Scene snapshots and duplicate layers share immutable mask data until edited.
+    std::shared_ptr<const VegetationLayer> vegetation{};
     ObjectAntiAliasing detail_aa = ObjectAntiAliasing::asset;
     SceneTransform transform{};
     PbrMaterial material{};
@@ -165,6 +175,8 @@ struct SceneModelInstance {
     std::string_view asset_path{};
     SceneNodeId id{};
     ObjectAntiAliasing detail_aa = ObjectAntiAliasing::asset;
+    // Static scatter instances can be picked as a layer without sharing a runtime transform.
+    SceneNodeId layer_id{};
 };
 
 struct ScenePunctualLight {
@@ -189,6 +201,7 @@ struct SceneRenderView {
     OceanSettings ocean{};
     std::span<const SceneEffect> effects{};
     bool local_lights_overflow = false;
+    bool vegetation_overflow = false;
     SceneNodeId ground_id{};
     std::span<const SceneNodeId> cube_ids{};
 };

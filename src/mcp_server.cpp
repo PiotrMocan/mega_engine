@@ -1,4 +1,5 @@
 #include "mcp_server.hpp"
+#include "vegetation_layer.hpp"
 
 #include "png_encoder.hpp"
 #include "scene_component_json.hpp"
@@ -1205,11 +1206,13 @@ private:
         false, false, false));
     tools.push_back(tool_definition(
         "editor.landscape.scatter_model", "Scatter model instances",
-        "Deterministically scatter an imported model over a flat XZ area using a seed.",
+        "Scatter a model on a local XZ area. Procedural mode creates one layer with an optional PNG density mask.",
         object_schema(
             Json{
                 {"asset_path", Json{{"type", "string"}, {"minLength", 1},
                                      {"maxLength", max_scene_asset_path_bytes}}},
+                {"procedural", Json{{"type", "boolean"}}},
+                {"mask_path", Json{{"type", "string"}, {"description", "PNG under project assets. Requires procedural mode."}}},
                 {"name_prefix", Json{{"type", "string"}, {"minLength", 1},
                                      {"maxLength", max_scene_node_name_bytes - 11U}}},
                 {"parent", optional_parent_schema},
@@ -1218,7 +1221,7 @@ private:
                 {"depth", Json{{"type", "number"}, {"exclusiveMinimum", 0}}},
                 {"minimum_scale", Json{{"type", "number"}, {"exclusiveMinimum", 0}}},
                 {"maximum_scale", Json{{"type", "number"}, {"exclusiveMinimum", 0}}},
-                {"count", Json{{"type", "integer"}, {"minimum", 1}, {"maximum", 10000}}},
+                {"count", Json{{"type", "integer"}, {"minimum", 1}, {"maximum", max_vegetation_candidates}}},
                 {"seed", Json{{"type", "integer"}, {"minimum", 0},
                                {"maximum", std::numeric_limits<std::uint32_t>::max()}}},
             },
@@ -4804,13 +4807,27 @@ private:
     if (name == "editor.landscape.scatter_model") {
         if (!only_keys(arguments, {
                 "asset_path", "name_prefix", "parent", "center", "width",
-                "depth", "minimum_scale", "maximum_scale", "count", "seed"}) ||
+                "depth", "minimum_scale", "maximum_scale", "count", "seed", "procedural", "mask_path"}) ||
             !parse_optional_parent(arguments, command, false, error)) {
             if (error.empty()) error = "scatter arguments are invalid";
             return false;
         }
         const auto asset_path = get_string(arguments, "asset_path");
-        const auto count = get_u32(arguments, "count", 1U, 10'000U);
+        if (arguments.contains("procedural")) {
+            const auto enabled = get_bool(arguments, "procedural");
+            if (!enabled) { error = "procedural must be a boolean"; return false; }
+            if (*enabled) command.node_kind = SceneNodeKind::vegetation_layer;
+        }
+        const bool procedural = command.node_kind == SceneNodeKind::vegetation_layer;
+        if (arguments.contains("mask_path")) {
+            const auto mask = get_string(arguments, "mask_path");
+            if (!procedural || !mask || mask->empty() ||
+                !copy_command_text(*mask, command.secondary_text, error, "mask_path")) {
+                error = "mask_path requires procedural mode and a relative PNG path";
+                return false;
+            }
+        }
+        const auto count = get_u32(arguments, "count", 1U, procedural ? max_vegetation_candidates : 10'000U);
         const auto seed = get_u32(
             arguments, "seed", 0U, std::numeric_limits<std::uint32_t>::max());
         const auto width = get_finite_float(arguments, "width", 0.001F, 8192.0F);
