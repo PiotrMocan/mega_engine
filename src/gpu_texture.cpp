@@ -243,14 +243,15 @@ void GpuTexture::create_sampled_volume(
     const std::uint32_t size,
     const VkFormat format,
     const VkFilter filter,
-    const std::string_view debug_name) {
+    const std::string_view debug_name,
+    const VkSamplerAddressMode address_mode) {
     if (size < 2U || size > context.properties().limits.maxImageDimension3D) {
         fatal("Invalid sampled volume extent");
     }
     create_impl(
         context, size, size, 1U, format,
         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-        VK_IMAGE_ASPECT_COLOR_BIT, filter, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        VK_IMAGE_ASPECT_COLOR_BIT, filter, address_mode,
         VK_FALSE, VK_COMPARE_OP_ALWAYS, VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
         debug_name, size);
 }

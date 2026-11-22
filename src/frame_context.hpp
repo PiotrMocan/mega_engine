@@ -31,7 +31,7 @@ struct FrameContext {
     bool local_lights_night = false;
     bool local_light_culling_was_updated = false;
     bool exposure_was_updated = false;
-    bool lighting_was_dynamic = false;
+    bool lighting_needs_static_reset = false;
     bool voxel_geometry_was_updated = false, voxel_light_was_updated = false;
     AccelerationStructure tlas{};
     GpuBuffer tlas_instance_buffer{};

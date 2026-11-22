@@ -2328,6 +2328,9 @@ int main() {
         }
         source_scene.tone_mapper = vcr::ToneMapper::gt7;
         source_scene.exposure = vcr::ExposureSettings{.compensation_ev = 4.830075F};
+        source_scene.weather = {.clouds = {.enabled = true, .coverage = 0.73F, .density = 1.25F,
+            .base_height = 370, .thickness = 180, .wind_direction = 283, .wind_speed = 18,
+            .shadow_strength = 0.8F, .variation_chance = 0.1F, .variation_amount = 0.65F}, .transition_seconds = 6};
         source_scene.fog = vcr::FogSettings{
             .enabled = true,
             .color = {1.5F, 0.4F, 0.2F},
@@ -2394,6 +2397,7 @@ int main() {
                 loaded_records[4].value.light.outer_cone_degrees == 27.0F &&
                 loaded_scene.tone_mapper == vcr::ToneMapper::gt7 &&
                 loaded_scene.exposure == source_scene.exposure &&
+                loaded_scene.weather == source_scene.weather &&
                 loaded_scene.fog && loaded_scene.fog->enabled &&
                 loaded_scene.fog->color == std::array{1.5F, 0.4F, 0.2F} &&
                 loaded_scene.fog->density == 0.015F &&
@@ -2691,6 +2695,7 @@ int main() {
         legacy_scene.build_node_records(legacy_records);
         expect(
             legacy_records.size() == 1U &&
+                legacy_scene.weather == vcr::WeatherSettings{} &&
                 !legacy_scene.tone_mapper && !legacy_scene.fog &&
                 close_to(
                     legacy_records[0].value.material.base_color.b,

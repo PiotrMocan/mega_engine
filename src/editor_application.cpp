@@ -1,4 +1,5 @@
 #include "editor_application.hpp"
+#include "weather_control.hpp"
 
 #include "asset_browser.hpp"
 #include "editor_scene_tools.hpp"
@@ -772,6 +773,7 @@ void EditorApplication::initialize(const CliOptions& options) {
     }
     static_cast<void>(renderer_.set_tone_mapper(
         resolve_scene_tone_mapper(options, scene_.tone_mapper)));
+    renderer_.reset_weather(scene_.weather);
     if (!renderer_.set_fog_settings(resolve_scene_fog(options, scene_.fog))) {
         fatal("Invalid fog settings or unsupported sampled depth/HDR blending");
     }
@@ -956,6 +958,7 @@ void EditorApplication::main_loop() {
             if (!renderer_.set_subsurface_mode(
                     resolve_scene_subsurface(options_, scene_.subsurface)))
                 fatal("Scene subsurface mode is invalid.");
+            renderer_.reset_weather(scene_.weather);
             if (!renderer_.set_fog_settings(resolve_scene_fog(options_, scene_.fog)))
                 fatal("Scene fog is unavailable on this GPU or invalid.");
             submitted_scene_revision_ = 0U;
@@ -1061,6 +1064,7 @@ void EditorApplication::main_loop() {
         FrameTimings timings{};
         const std::uint64_t viewport_generation_before =
             renderer_.editor_viewport_generation();
+        renderer_.set_weather(scene_.weather);
         const bool rendered = renderer_.draw_frame(
             timings, camera_.view_matrix(), draw_data);
         if (options_.mcp_stdio) {
@@ -3820,6 +3824,24 @@ void EditorApplication::execute_mcp_command(
             {"provisioned", renderer_.subsurface_resources_provisioned()},
             {"resident_bytes", renderer_.subsurface_resident_bytes()},
         });
+        return;
+    }
+    case McpCommandType::weather_get:
+        succeed("Weather", weather_state(scene_, renderer_));
+        return;
+    case McpCommandType::weather_set: {
+        std::string error;
+        const auto patch = Json::parse(command.text.data());
+        if (!apply_weather_command(patch, scene_, renderer_, [&] {
+                if (ui_.play_state() == EditorPlayState::edit) {
+                    ui_.checkpoint_scene(scene_);
+                    scene_.mark_content_changed();
+                }
+            }, error)) {
+            fail(std::move(error));
+            return;
+        }
+        succeed("Weather updated", weather_state(scene_, renderer_));
         return;
     }
     case McpCommandType::render_set_ray_tracing: {

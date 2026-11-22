@@ -1,6 +1,7 @@
 #include "image_barrier.hpp"
 #include "renderer.hpp"
 #include "camera_projection.hpp"
+#include "cloud_noise.hpp"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -127,6 +128,11 @@ void Renderer::create_lighting_resources() {
         || (editor_output_enabled_ && gi_supported)
 #endif
         ;
+    // RGBA8_UNORM is a mandatory filterable sampled format in Vulkan 1.3.
+    cloud_noise_.create_sampled_volume(*context_, cloud_noise_size, VK_FORMAT_R8G8B8A8_UNORM,
+        VK_FILTER_LINEAR, "Cloud density noise", VK_SAMPLER_ADDRESS_MODE_REPEAT);
+    const auto noise = make_cloud_noise();
+    upload_to_device_texture(cloud_noise_, std::as_bytes(std::span{noise}), 4, "Cloud density");
     rt_provisioned_ = false;
     rt_provision_pending_ = false;
     if (lighting_settings_.ray_tracing != RayTracingMode::off) {
@@ -170,7 +176,7 @@ void Renderer::create_lighting_resources() {
             VMA_MEMORY_USAGE_AUTO, host, "lighting frame uniforms");
         const LightingUniforms initial{};
         frame.lighting_uniform_buffer.write(std::as_bytes(std::span{&initial, std::size_t{1}}));
-        frame.lighting_was_dynamic = false;
+        frame.lighting_needs_static_reset = false;
         frame.local_light_buffer.create(
             *context_, local_light_buffer_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             VMA_MEMORY_USAGE_AUTO, host, "local punctual lights");
@@ -223,6 +229,8 @@ void Renderer::create_lighting_descriptor_layout() {
         VkDescriptorSetLayoutBinding{8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
                                      VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
                                      nullptr},
+        VkDescriptorSetLayoutBinding{12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
         VkDescriptorSetLayoutBinding{9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
                                      VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
                                      nullptr},
@@ -233,7 +241,7 @@ void Renderer::create_lighting_descriptor_layout() {
                                      VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
                                      nullptr},
     };
-    const std::uint32_t binding_count = rt_provisioned_ ? 12U : 9U;
+    const std::uint32_t binding_count = rt_provisioned_ ? 13U : 10U;
     const VkDescriptorSetLayoutCreateInfo layout{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0,
         binding_count, bindings.data()};
@@ -247,7 +255,7 @@ void Renderer::create_lighting_descriptor_layout() {
 void Renderer::create_lighting_pipelines() {
     const std::array sizes{
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rt_provisioned_ ? 16U : 12U},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 2},
@@ -298,7 +306,13 @@ void Renderer::create_lighting_pipelines() {
             .accelerationStructureCount = 1U,
             .pAccelerationStructures = &tlas_handle,
         };
-        std::array<VkWriteDescriptorSet, 12> writes{};
+        std::array<VkWriteDescriptorSet, 13> writes{};
+        const VkDescriptorImageInfo noise_info{cloud_noise_.sampler(), cloud_noise_.view(),
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        writes[9] = VkWriteDescriptorSet{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = frame.lighting_descriptor_set,
+            .dstBinding = 12U, .descriptorCount = 1U,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &noise_info};
         for (unsigned i = 0; i < 9U; ++i) {
             auto &w = writes[i];
             w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -318,7 +332,7 @@ void Renderer::create_lighting_pipelines() {
             }
         }
         if (rt_provisioned_) {
-            writes[9] = VkWriteDescriptorSet{
+            writes[10] = VkWriteDescriptorSet{
                 .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                 .dstSet = frame.lighting_descriptor_set,
                 .dstBinding = 9U,
@@ -326,7 +340,7 @@ void Renderer::create_lighting_pipelines() {
                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                 .pBufferInfo = &buffers[7],
             };
-            writes[10] = VkWriteDescriptorSet{
+            writes[11] = VkWriteDescriptorSet{
                 .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                 .pNext = &tlas_write,
                 .dstSet = frame.lighting_descriptor_set,
@@ -334,7 +348,7 @@ void Renderer::create_lighting_pipelines() {
                 .descriptorCount = 1U,
                 .descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
             };
-            writes[11] = VkWriteDescriptorSet{
+            writes[12] = VkWriteDescriptorSet{
                 .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                 .dstSet = frame.lighting_descriptor_set, .dstBinding = 11U,
                 .descriptorCount = 1U, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -342,7 +356,7 @@ void Renderer::create_lighting_pipelines() {
             };
         }
         vkUpdateDescriptorSets(
-            context_->device(), rt_provisioned_ ? 12U : 9U,
+            context_->device(), rt_provisioned_ ? 13U : 10U,
             writes.data(), 0, nullptr);
     }
     const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
@@ -531,6 +545,16 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
     auto &u = lighting_uniforms_;
     const double dt = std::max(0.0, static_cast<double>(fsr_frame_time_ms_) * 0.001);
     advance_lighting_clock(lighting_settings_, dt, lighting_paused_);
+    if (!lighting_paused_) weather_.advance(dt);
+    const auto& clouds = weather_.clouds();
+    u.cloud_layer = glm::vec4(clouds.base_height, clouds.thickness,
+        clouds_active() ? clouds.coverage : 0.0F, clouds.density);
+    const float margin = clouds.variation_chance > 0 ? clouds.thickness * clouds.variation_amount : 0.0F;
+    u.cloud_variation = {clouds.variation_chance, clouds.variation_amount,
+        clouds.base_height - margin, clouds.base_height + clouds.thickness + margin};
+    u.cloud_wind_shadow = glm::vec4(static_cast<float>(weather_.offset_x()),
+        static_cast<float>(weather_.offset_z()), clouds.shadow_strength,
+        clouds.enabled && fog_supported_ && mode_ != RunMode::instancing ? 1.0F : 0.0F);
     const double hour = wrap_day_hour(lighting_settings_.hour);
     const bool night = hour < 6.0 || hour >= 18.0;
     const bool local_lights_changed =
@@ -590,18 +614,27 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
         voxel_light_due_ = false;
         voxel_job_finishes_ = false;
         rt_tlas_build_due_ = false;
-        if (frame.lighting_was_dynamic || local_lights_changed ||
+        const bool procedural_sky = u.cloud_wind_shadow.w > 0;
+        if (procedural_sky) {
+            u.sun_direction_intensity = glm::vec4(glm::normalize(glm::vec3(
+                sun_direction_x, sun_direction_y, sun_direction_z)), 1.0F);
+            if (authored_scene_enabled_ && !editor_sun_visible_) u.sun_direction_intensity.w = 0;
+            u.sun_color = glm::vec4(1.0F, 0.91F, 0.74F, 1.0F);
+            u.sky_horizon = glm::vec4(0.52F, 0.67F, 0.82F, 1.0F);
+            u.sky_zenith = glm::vec4(0.12F, 0.32F, 0.72F, lighting_settings_.sky_intensity);
+        }
+        if (procedural_sky || frame.lighting_needs_static_reset || local_lights_changed ||
             local_backend == LocalLightBackend::clustered) {
             lighting_uniforms_.options = {};
             lighting_uniforms_.volume_parameters.z = 0.0F;
             lighting_uniforms_.volume_parameters.w = 0.0F;
             frame.lighting_uniform_buffer.write(
                 std::as_bytes(std::span{&lighting_uniforms_, std::size_t{1}}));
-            frame.lighting_was_dynamic = false;
+            frame.lighting_needs_static_reset = procedural_sky;
         }
         return;
     }
-    frame.lighting_was_dynamic = true;
+    frame.lighting_needs_static_reset = true;
     const auto sun = evaluate_sun(lighting_settings_.hour);
     u.sun_direction_intensity = sun.direction_intensity;
     u.sun_color = sun.color;
@@ -712,11 +745,14 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
             gi_last_sun_.w != u.sun_direction_intensity.w ||
             (u.sun_direction_intensity.w > 0 &&
              (gi_last_sun_ != u.sun_direction_intensity || gi_last_sun_color_ != u.sun_color));
+        const bool clouds_changed = gi_last_cloud_layer_ != u.cloud_layer ||
+            (u.cloud_layer.z > 0.0F && (gi_last_cloud_wind_ != u.cloud_wind_shadow ||
+                                       gi_last_cloud_variation_ != u.cloud_variation));
         voxel_light_due_ =
             voxel_job_finishes_ ||
             (!voxel_job_active_ &&
              (!voxel_ready_ || rt_gi != gi_last_rt_active_ ||
-              ((sun_changed || (rt_gi && rt_tlas_build_due_)) &&
+              ((sun_changed || clouds_changed || (rt_gi && rt_tlas_build_due_)) &&
                gi_light_elapsed_ >= 1.0 / lighting_settings_.gi_update_hz)));
         lighting_statistics_.pending_bricks = static_cast<std::uint32_t>(voxel_dirty_.count());
         if (voxel_job_active_)
@@ -889,6 +925,9 @@ void Renderer::record_voxel_light(VkCommandBuffer command, FrameContext &frame) 
                      VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
                      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
                      0, 7);
+    gi_last_cloud_layer_ = lighting_uniforms_.cloud_layer;
+    gi_last_cloud_wind_ = lighting_uniforms_.cloud_wind_shadow;
+    gi_last_cloud_variation_ = lighting_uniforms_.cloud_variation;
     gi_last_sun_ = lighting_uniforms_.sun_direction_intensity;
     gi_last_sun_color_ = lighting_uniforms_.sun_color;
     gi_last_rt_active_ = ray_tracing_uses_gi(ray_tracing_mode_actual());
@@ -905,6 +944,7 @@ void Renderer::destroy_lighting() noexcept {
     lighting_layout_.reset();
     lighting_layout_has_rt_ = false;
     voxel_storage_view_.reset();
+    cloud_noise_.destroy();
     voxel_radiance_.destroy();
     voxel_geometry_.destroy();
     voxel_triangles_.destroy();

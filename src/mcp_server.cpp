@@ -1,4 +1,5 @@
 #include "mcp_server.hpp"
+#include "weather_json.hpp"
 #include "vegetation_layer.hpp"
 
 #include "png_encoder.hpp"
@@ -42,7 +43,8 @@ using namespace std::chrono_literals;
 
 constexpr std::string_view protocol_version{"2025-11-25"};
 constexpr std::size_t maximum_input_message_bytes = 1024U * 1024U;
-constexpr std::array<std::string_view, 31> runtime_tool_names{
+constexpr std::array<std::string_view, 33> runtime_tool_names{
+    "weather.get", "weather.set",
     "debug.get_capabilities",
     "debug.get_state",
     "debug.get_metrics",
@@ -76,7 +78,8 @@ constexpr std::array<std::string_view, 31> runtime_tool_names{
     "engine.quit",
 };
 
-constexpr std::array<std::string_view, 62> editor_tool_names{
+constexpr std::array<std::string_view, 64> editor_tool_names{
+    "weather.get", "weather.set",
     "render.set_exposure",
     "render.set_color_grading",
     "render.set_subsurface",
@@ -386,6 +389,22 @@ private:
     };
 }
 
+void append_weather_tools(Json& tools) {
+    tools.push_back(tool_definition("weather.get", "Read weather",
+        "Read target and current clouds, daylight clock and rendering state.", object_schema(), true, false, true));
+    Json fields{{"enabled", {{"type","boolean"}}}};
+    for (const auto& f : cloud_fields)
+        fields[f.key] = {{"type","number"}, {"minimum",f.minimum}, {"maximum",f.maximum}};
+    tools.push_back(tool_definition("weather.set", "Change weather",
+        "Change cloud properties or the daylight clock. Transition duration is in seconds, altitude in metres, "
+        "wind speed in m/s and heading in degrees from +X toward +Z. Omitted fields keep their values.",
+        object_schema(Json{{"clouds", object_schema(std::move(fields))},
+            {"transition_seconds", {{"type","number"},{"minimum",0},{"maximum",86400}}},
+            {"hour", {{"type","number"},{"minimum",0},{"exclusiveMaximum",24}}},
+            {"cycle", {{"type","boolean"}}},
+            {"day_seconds", {{"type","number"},{"minimum",1},{"maximum",864000}}}}), false, false, true));
+}
+
 [[nodiscard]] Json make_runtime_tools() {
     const Json action_schema{
         {"type", "string"},
@@ -393,6 +412,7 @@ private:
     };
     const Json enabled_schema{{"type", "boolean"}};
     Json tools = Json::array();
+    append_weather_tools(tools);
 
     tools.push_back(tool_definition(
         "debug.get_capabilities",
@@ -758,6 +778,7 @@ private:
         })},
     };
     Json tools = Json::array();
+    append_weather_tools(tools);
     tools.push_back(tool_definition(
         "render.set_exposure", "Set scene exposure",
         "Atomically set fixed or histogram exposure, metering, percentile rejection, EV limits and adaptation constants.",
@@ -4900,6 +4921,16 @@ private:
     command = {};
     command.token = token;
 
+    if (name == "weather.get") {
+        if (!arguments.empty()) { error = "weather.get takes no arguments"; return false; }
+        command.type = McpCommandType::weather_get;
+        return true;
+    }
+    if (name == "weather.set") {
+        if (arguments.empty()) { error = "Supply at least one weather parameter"; return false; }
+        command.type = McpCommandType::weather_set;
+        return copy_command_text(arguments.dump(), command.text, error, "weather");
+    }
     if (profile == McpServerProfile::editor) {
         return command_from_editor_tool(name, arguments, command, error);
     }

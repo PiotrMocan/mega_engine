@@ -184,7 +184,8 @@ PbrLightingComponents evaluateHairSurfaceComponents(
     {
         const float sunVis = sunVisibilityAt(worldPosition, cylinderNormal, lightDirection);
         const float softVis = mix(sunVis, 1.0, 0.16 * ao);
-        const vec3 sunRadiance = frame.sunColorSkyYaw.rgb * frame.sunDirectionIntensity.w;
+        const vec3 sunRadiance = frame.sunColorSkyYaw.rgb * frame.sunDirectionIntensity.w
+            * cloudSunVisibility(worldPosition, lightDirection);
         const PbrLightingComponents sunHair = evaluateHairDirectLight(
             clampedBaseColor, roughness, ao, fiberTangent, cylinderNormal,
             viewDirection, lightDirection, sunRadiance, softVis, tanVar);

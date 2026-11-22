@@ -9,6 +9,10 @@
 #include <glm/vec4.hpp>
 
 namespace vcr {
+inline constexpr float sun_direction_x = 0.447F;
+inline constexpr float sun_direction_y = 0.707F;
+inline constexpr float sun_direction_z = -0.548F;
+
 struct SunState {
     glm::vec4 direction_intensity{};
     glm::vec4 color{};
@@ -61,8 +65,11 @@ struct alignas(16) LightingUniforms {
     glm::vec4 cluster_viewport{};
     // xyz: cluster dimensions, w: fixed per-cluster list capacity.
     glm::uvec4 cluster_dimensions{};
+    glm::vec4 cloud_layer{}; // base, thickness, coverage, density
+    glm::vec4 cloud_wind_shadow{}; // advected world X/Z, shadow strength
+    glm::vec4 cloud_variation{}; // affected fraction, signed deviation range, vertical bounds in metres (min/max)
 };
-static_assert(sizeof(LightingUniforms) == 528);
+static_assert(sizeof(LightingUniforms) == 576);
 static_assert(sizeof(GiTriangle) == 48);
 struct LightingStatistics {
     std::uint64_t shadow_passes = 0, shadow_tiles = 0;

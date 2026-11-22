@@ -100,9 +100,6 @@ inline constexpr std::size_t maximum_editor_scene_instances =
     static_cast<std::size_t>(max_scene_nodes) + 1U;
 #endif
 
-inline constexpr float sun_direction_x = 0.447F;
-inline constexpr float sun_direction_y = 0.707F;
-inline constexpr float sun_direction_z = -0.548F;
 
 struct alignas(16) FrameUniforms {
     glm::mat4 view_projection{1.0F};
@@ -5380,7 +5377,7 @@ void Renderer::create_anti_aliasing_descriptors() {
     const std::array pool_sizes{
         VkDescriptorPoolSize{
             .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .descriptorCount = max_frames_in_flight * 14U,
+            .descriptorCount = max_frames_in_flight * 15U,
         },
         VkDescriptorPoolSize{
             .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -5392,7 +5389,7 @@ void Renderer::create_anti_aliasing_descriptors() {
         },
         VkDescriptorPoolSize{
             .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-            .descriptorCount = max_frames_in_flight,
+            .descriptorCount = max_frames_in_flight * 2U,
         },
     };
     const VkDescriptorPoolCreateInfo pool_info{
@@ -5468,7 +5465,7 @@ void Renderer::create_anti_aliasing_descriptors() {
                 .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             },
         };
-        std::array<VkWriteDescriptorSet, 19> writes{};
+        std::array<VkWriteDescriptorSet, 21> writes{};
         for (std::size_t source = 0; source < image_infos.size(); ++source) {
             const std::uint32_t binding = source < 6U
                 ? static_cast<std::uint32_t>(source)
@@ -5617,6 +5614,14 @@ void Renderer::create_anti_aliasing_descriptors() {
             .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
             .pImageInfo = &fog_depth_info,
         };
+        const VkDescriptorBufferInfo cloud_uniforms{frames_[index].lighting_uniform_buffer.handle(), 0, sizeof(LightingUniforms)};
+        const VkDescriptorImageInfo noise{cloud_noise_.sampler(), cloud_noise_.view(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        writes[19] = VkWriteDescriptorSet{.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = resources.descriptor_set, .dstBinding = 19U, .descriptorCount = 1U,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &cloud_uniforms};
+        writes[20] = VkWriteDescriptorSet{.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = resources.descriptor_set, .dstBinding = 20U, .descriptorCount = 1U,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &noise};
         vkUpdateDescriptorSets(
             context_->device(),
             static_cast<std::uint32_t>(writes.size()),
@@ -6312,7 +6317,7 @@ void Renderer::upload_to_device_texture(
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         VK_PIPELINE_STAGE_2_TRANSFER_BIT,
         VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
             VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT,
         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
         final_level,
@@ -7281,7 +7286,7 @@ void Renderer::create_pipeline() {
     VK_CHECK(vkCreatePipelineLayout(
         context_->device(), &layout_info, nullptr, &pipeline_layout_));
 
-    std::array<VkDescriptorSetLayoutBinding, 19>
+    std::array<VkDescriptorSetLayoutBinding, 21>
         anti_aliasing_bindings{};
     for (std::size_t binding = 0; binding < 6U; ++binding) {
         anti_aliasing_bindings[binding] =
@@ -7360,6 +7365,8 @@ void Renderer::create_pipeline() {
         .descriptorCount = 1U,
         .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
     };
+    anti_aliasing_bindings[19] = {19U, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    anti_aliasing_bindings[20] = {20U, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     const VkDescriptorSetLayoutCreateInfo
         anti_aliasing_descriptor_info{
             .sType =
@@ -9344,6 +9351,9 @@ void Renderer::create_pipeline() {
             create_fullscreen_pipeline("projected_decal.frag.spv", aa_color_format, effect_layout_.get(), fog_blend_attachment,
                 VK_FORMAT_UNDEFINED, "Projected decals"), vkDestroyPipeline);
 #endif
+        cloud_pipeline_ = DeviceObject<VkPipeline>(context_->device(),
+            create_fullscreen_pipeline("clouds.frag.spv", aa_color_format, post_process_pipeline_layout_,
+                fog_blend_attachment, VK_FORMAT_UNDEFINED, "Volumetric clouds"), vkDestroyPipeline);
         fog_pipeline_ = DeviceObject<VkPipeline>(
             context_->device(),
             create_fullscreen_pipeline(
@@ -9691,6 +9701,7 @@ void Renderer::destroy_pipeline() noexcept {
     effect_layout_.reset();
 #endif
     lens_pipeline_.reset();
+    cloud_pipeline_.reset();
     fog_pipeline_.reset();
     for (std::size_t index = 0U; index < msaa_geometry_.size(); ++index) {
         msaa_geometry_[index] = {};
@@ -11370,7 +11381,7 @@ void Renderer::record_commands(
         !is_temporal_smaa(anti_aliasing_) && motion_blur_mode_actual() == MotionBlurMode::off &&
         subsurface_mode_actual() != SubsurfaceMode::full_resolution;
 #endif
-    const bool sample_scene_depth = fog_active() || lens_active || scene_effects_active || weighted_transparency;
+    const bool sample_scene_depth = clouds_active() || fog_active() || lens_active || scene_effects_active || weighted_transparency;
     const bool motion_blur_active =
         motion_blur_mode_actual() != MotionBlurMode::off;
     const bool motion_blur_before_smaa =
@@ -12124,6 +12135,9 @@ void Renderer::record_commands(
 #endif
         if (scene_effects_active) {
             record_depth_effect(command_buffer, aa_resources, current_render_extent_, VK_NULL_HANDLE, {}, false);
+        }
+        if (clouds_active()) {
+            record_depth_effect(command_buffer, aa_resources, current_render_extent_, cloud_pipeline_.get(), {}, false);
         }
         if (fog_active()) {
             const FogPushConstants push{

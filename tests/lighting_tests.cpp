@@ -1,4 +1,5 @@
 #include "lighting.hpp"
+#include "weather.hpp"
 #include "camera_projection.hpp"
 #include <array>
 #include <cmath>
@@ -296,6 +297,53 @@ int main() {
                 }
             }
         }
+    }
+    {
+        WeatherSystem system;
+        WeatherSettings weather;
+        expect(!system.clouds().enabled, "old scenes default to clear weather");
+        weather.clouds.enabled = true;
+        weather.clouds.wind_direction = 350;
+        weather.clouds.wind_speed = 20;
+        system.reset(weather);
+        system.advance(1.0);
+        const double x = system.offset_x(), z = system.offset_z();
+        weather.clouds.wind_direction = 10;
+        weather.clouds.coverage = 1;
+        weather.clouds.variation_chance = 0.80F;
+        weather.clouds.variation_amount = 0.95F;
+        weather.transition_seconds = 4;
+        system.set(weather);
+        expect(system.offset_x() == x && system.offset_z() == z, "wind edits preserve position");
+        system.advance(2);
+        expect(std::abs(system.clouds().wind_direction) < 0.001F &&
+               std::abs(system.clouds().coverage - 0.775F) < 0.001F, "shortest heading and smooth cloud blend");
+        expect(std::abs(system.clouds().variation_chance - 0.40F) < 1e-5F &&
+               std::abs(system.clouds().variation_amount - 0.70F) < 1e-5F, "variation controls blend independently");
+        system.set(weather);
+        system.advance(2);
+        expect(system.clouds() == weather.clouds, "repeated target does not restart transition");
+        weather.clouds.enabled = false;
+        system.set(weather);
+        system.advance(2);
+        expect(system.clouds().enabled && system.clouds().coverage == 0.5F, "fade out before disabling");
+        weather.clouds.coverage = std::numeric_limits<float>::quiet_NaN();
+        expect(!valid_weather(weather), "NaN weather rejected");
+        system.set(weather);
+        system.advance(2);
+        expect(!system.clouds().enabled, "invalid target leaves previous transition intact");
+    }
+    {
+        WeatherSystem system;
+        WeatherSettings weather;
+        weather.clouds.enabled = true;
+        weather.clouds.wind_direction = 0;
+        weather.clouds.wind_speed = 1;
+        system.reset(weather);
+        system.advance(4097.0);
+        expect(system.offset_x() == 4097.0, "regional field moves continuously past the old wind period");
+        system.advance(1048576.0);
+        expect(system.offset_x() == 4097.0, "wind wraps at the common period of all fields");
     }
     std::puts("Lighting invariants passed");
 }

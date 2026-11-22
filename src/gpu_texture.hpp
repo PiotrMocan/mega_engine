@@ -69,7 +69,8 @@ public:
         std::uint32_t size,
         VkFormat format,
         VkFilter filter,
-        std::string_view debug_name);
+        std::string_view debug_name,
+        VkSamplerAddressMode address_mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
     void create_multisampled_render_target(
         VulkanContext& context,
         std::uint32_t width,

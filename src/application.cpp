@@ -1,4 +1,5 @@
 #include "application.hpp"
+#include "weather_control.hpp"
 
 #include "crash_log.hpp"
 #include "icon_system.hpp"
@@ -231,6 +232,7 @@ void Application::initialize(const CliOptions& options) {
     }
     static_cast<void>(renderer_.set_tone_mapper(
         resolve_scene_tone_mapper(options, scene_.tone_mapper)));
+    renderer_.reset_weather(scene_.weather);
     if (!renderer_.set_fog_settings(resolve_scene_fog(options, scene_.fog))) {
         fatal("Invalid fog settings or unsupported sampled depth/HDR blending");
     }
@@ -961,6 +963,7 @@ void Application::main_loop() {
         if (pixel_width > 0 && pixel_height > 0) {
             FrameTimings timings{};
             const glm::mat4 view = camera_.view_matrix();
+            renderer_.set_weather(scene_.weather);
             const bool rendered = renderer_.draw_frame(timings, view);
             if (options_.mcp_stdio) {
                 complete_mcp_screenshot();
@@ -1927,6 +1930,19 @@ void Application::execute_mcp_command(const McpCommand& command) {
             {"provisioned", renderer_.subsurface_resources_provisioned()},
             {"resident_bytes", renderer_.subsurface_resident_bytes()},
         });
+        return;
+    }
+    case McpCommandType::weather_get:
+        succeed("Weather", weather_state(scene_, renderer_));
+        return;
+    case McpCommandType::weather_set: {
+        std::string error;
+        const auto patch = Json::parse(command.text.data());
+        if (!apply_weather_command(patch, scene_, renderer_, [] {}, error)) {
+            fail(std::move(error));
+            return;
+        }
+        succeed("Weather updated", weather_state(scene_, renderer_));
         return;
     }
     case McpCommandType::render_set_ray_tracing: {

@@ -3,7 +3,10 @@
 #ifndef LIGHTING_SET
 #define LIGHTING_SET 2
 #endif
-layout(set=LIGHTING_SET,binding=0,std140) uniform Lighting {
+#ifndef LIGHTING_BINDING
+#define LIGHTING_BINDING 0
+#endif
+layout(set=LIGHTING_SET,binding=LIGHTING_BINDING,std140) uniform Lighting {
     mat4 shadowMatrices[4];
     mat4 cameraView;
     vec4 shadowSplits;
@@ -19,6 +22,9 @@ layout(set=LIGHTING_SET,binding=0,std140) uniform Lighting {
     vec4 clusterProjection;
     vec4 clusterViewport;
     uvec4 clusterDimensions;
+    vec4 cloudLayer;
+    vec4 cloudWindShadow;
+    vec4 cloudVariation;
 } lighting;
 vec3 dynamicSkyBackground(vec3 direction) {
     float elevation=sqrt(clamp(direction.y,0.0,1.0));

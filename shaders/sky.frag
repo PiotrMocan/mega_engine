@@ -34,7 +34,7 @@ void main()
         normalize(worldPosition - frame.cameraPosition.xyz);
 
     vec3 outputSky;
-    if(lighting.options.x>0.5) {
+    if(lighting.options.x>0.5 || lighting.cloudWindShadow.w>0.5) {
         outputSky=addNightStars(
             dynamicSky(viewDirection),viewDirection,lighting.sunDirectionIntensity.y);
     } else {

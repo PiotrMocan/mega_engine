@@ -1,6 +1,7 @@
 #version 450
 #extension GL_GOOGLE_include_directive:require
 #include "lighting_common.glsl"
+#include "cloud_density.glsl"
 #include "subsurface_output.glsl"
 
 layout(location = 0) in vec2 inNdc;
@@ -138,7 +139,7 @@ void main()
     float visibility = (nDotV / (nDotV * (1.0 - k) + k))
         * (nDotL / (nDotL * (1.0 - k) + k));
     float sunFresnel = 0.0204 + 0.9796 * pow(1.0 - vDotH, 5.0);
-    vec3 sun = frame.sunColorSkyYaw.rgb * frame.sunDirectionIntensity.w;
+    vec3 sun = frame.sunColorSkyYaw.rgb * frame.sunDirectionIntensity.w * cloudSunVisibility(position, light);
     vec3 glint = sun * distribution * visibility * sunFresnel
         / max(4.0 * nDotV, 0.001);
     vec3 ambient = lighting.options.x > 0.5

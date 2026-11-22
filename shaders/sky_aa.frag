@@ -42,7 +42,7 @@ void main()
     const vec4 previousClip =
         frame.previousUnjitteredViewProjection * vec4(viewDirection, 0.0);
     vec3 outputSky;
-    if(lighting.options.x>0.5) {
+    if(lighting.options.x>0.5 || lighting.cloudWindShadow.w>0.5) {
         outputSky=addNightStars(
             dynamicSky(viewDirection),viewDirection,lighting.sunDirectionIntensity.y);
     } else {

@@ -4,6 +4,7 @@
 #include "pbr_lighting.glsl"
 #include "voxel_sampling.glsl"
 #include "punctual_lighting.glsl"
+#include "cloud_density.glsl"
 #include "subsurface_output.glsl"
 
 layout(set = 0, binding = 0, std140) uniform FrameUniforms
@@ -134,7 +135,7 @@ vec3 sampleEnvironment(
     const vec3 reflectionDirection =
         reflect(-viewDirection, normal);
     // The solar disk is represented by the shadowed direct BRDF, not unoccluded IBL.
-    if (lighting.options.x > 0.5) {
+    if (lighting.options.x > 0.5 || lighting.cloudWindShadow.w > 0.5) {
         return mix(
             dynamicSkyBackground(reflectionDirection),
             lighting.skyZenith.rgb * 0.5 + lighting.skyHorizon.rgb * 0.5,
@@ -203,7 +204,7 @@ PbrLightingComponents evaluateLitSurfaceComponents(
     }
     const vec3 directRadiance =
         frame.sunColorSkyYaw.rgb
-        * frame.sunDirectionIntensity.w;
+        * frame.sunDirectionIntensity.w * cloudSunVisibility(worldPosition, lightDirection);
     const float roughness =
         clamp(
             materialParameters.y,

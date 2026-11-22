@@ -2434,6 +2434,7 @@ void EditorUi::begin_frame(
     build_audio_input_panel();
     build_animation_gameplay_panel(scene, renderer);
     build_ui_localization_panel(scene, renderer);
+    build_weather_panel(scene, renderer);
     build_sequencer_panel(scene, renderer, camera);
     build_navigation_ai_panel(scene, renderer, camera);
     build_performance(scene, renderer, performance);
@@ -2933,6 +2934,7 @@ void EditorUi::build_main_menu(
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Window")) {
+        ImGui::MenuItem("Weather", nullptr, &weather_panel_open_);
         bool material_open =
             material_editor_ != nullptr &&
             material_editor_->open;
@@ -10823,6 +10825,74 @@ bool EditorUi::mcp_sequencer_set_playback(
     return true;
 }
 
+void EditorUi::build_weather_panel(SceneDocument& scene, Renderer& renderer) {
+    if (!weather_panel_open_) return;
+    ImGui::SetNextWindowSize(ImVec2(400, 510), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Weather", &weather_panel_open_)) {
+        auto lighting = renderer.lighting_settings();
+        auto weather = scene.weather;
+        auto& c = weather.clouds;
+        bool clock_changed = false;
+        ImGui::SeparatorText("Time of day");
+        float hour = static_cast<float>(lighting.hour);
+        float day = static_cast<float>(lighting.day_seconds);
+        if (ImGui::SliderFloat("Hour", &hour, 0, 23.999F, "%.2f h", ImGuiSliderFlags_AlwaysClamp)) {
+            lighting.hour = hour;
+            clock_changed = true;
+        }
+        clock_changed |= ImGui::Checkbox("Advance time", &lighting.cycle);
+        if (ImGui::DragFloat("Day length", &day, 1, 1, 864000, "%.0f s", ImGuiSliderFlags_AlwaysClamp)) {
+            lighting.day_seconds = day;
+            clock_changed = true;
+        }
+        ImGui::SeparatorText("Volumetric clouds");
+        ImGui::BeginDisabled(!renderer.fog_supported());
+        bool changed = ImGui::Checkbox("Enable cloud layer", &c.enabled);
+        if (ImGui::Button("Clear")) { c.enabled = true; c.coverage = 0; changed = true; }
+        ImGui::SameLine();
+        if (ImGui::Button("Scattered")) { c.enabled = true; c.coverage = 0.48F; c.density = 0.85F; changed = true; }
+        ImGui::SameLine();
+        if (ImGui::Button("Overcast")) { c.enabled = true; c.coverage = 1; c.density = 2; c.shadow_strength = 1; changed = true; }
+        constexpr auto clamp = ImGuiSliderFlags_AlwaysClamp;
+        changed |= ImGui::SliderFloat("Coverage", &c.coverage, 0, 1, "%.2f", clamp);
+        changed |= ImGui::SliderFloat("Density", &c.density, 0, 4, "%.2f", clamp);
+        float chance = c.variation_chance * 100.0F;
+        if (ImGui::SliderFloat("Varied formations", &chance, 0, 100, "%.0f%%", clamp)) {
+            c.variation_chance = chance * 0.01F;
+            changed = true;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Share of cloud formations with individual variations.");
+        float amount = c.variation_amount * 100.0F;
+        if (ImGui::SliderFloat("Variation range", &amount, 0, 100, "+/- %.0f%%", clamp)) {
+            c.variation_amount = amount * 0.01F;
+            changed = true;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Varies width, thickness, height and density around their base values.");
+        changed |= ImGui::DragFloat("Base altitude", &c.base_height, 2, -10000, 20000, "%.0f m", clamp);
+        changed |= ImGui::DragFloat("Layer thickness", &c.thickness, 2, 10, 10000, "%.0f m", clamp);
+        changed |= ImGui::SliderFloat("Wind heading", &c.wind_direction, 0, 360, "%.0f deg", clamp);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("0 degrees moves toward +X, 90 toward +Z.");
+        changed |= ImGui::DragFloat("Wind speed", &c.wind_speed, 0.25F, 0, 200, "%.1f m/s", clamp);
+        changed |= ImGui::SliderFloat("Shadow strength", &c.shadow_strength, 0, 1, "%.2f", clamp);
+        changed |= ImGui::DragFloat("Transition", &weather.transition_seconds, 0.1F, 0, 86400, "%.1f s", clamp);
+        ImGui::EndDisabled();
+        if (!renderer.fog_supported()) ImGui::TextWrapped("Clouds require sampled scene depth and HDR blending.");
+        if (clock_changed && !lighting.dynamic) {
+            lighting.dynamic = true;
+            clock_changed = true;
+        }
+        if ((changed || clock_changed) && (!clock_changed || renderer.set_lighting_settings(lighting))) {
+            if (play_state_ == EditorPlayState::edit && !weather_editing_) checkpoint_scene(scene);
+            if (clock_changed) scene.lighting = lighting;
+            if (changed) scene.weather = weather;
+            if (play_state_ == EditorPlayState::edit) scene.mark_content_changed();
+            weather_editing_ = true;
+        }
+    }
+    if (!ImGui::IsAnyItemActive()) weather_editing_ = false;
+    ImGui::End();
+}
+
 void EditorUi::build_sequencer_panel(
     SceneDocument& scene,
     Renderer& renderer,
@@ -12674,16 +12744,7 @@ void EditorUi::build_performance(
     if (lighting.dynamic)
         ImGui::TextDisabled("4 cascades, %u x %u each", lighting.shadow_resolution / 2,
                             lighting.shadow_resolution / 2);
-    lighting_changed |= ImGui::Checkbox("Advance time", &lighting.cycle);
-    float hour = static_cast<float>(lighting.hour), day = static_cast<float>(lighting.day_seconds);
-    if (ImGui::SliderFloat("Time of day", &hour, 0, 23.999F, "%.2f h")) {
-        lighting.hour = hour;
-        lighting_changed = true;
-    }
-    if (ImGui::SliderFloat("Day duration", &day, 10, 3600, "%.0f s")) {
-        lighting.day_seconds = day;
-        lighting_changed = true;
-    }
+    if (ImGui::Button("Weather and time of day")) weather_panel_open_ = true;
     lighting_changed |=
         ImGui::SliderFloat("Sky light intensity", &lighting.sky_intensity, 0, 8, "%.2f");
     ImGui::BeginDisabled(!renderer.gi_provisioned() || !lighting.dynamic);

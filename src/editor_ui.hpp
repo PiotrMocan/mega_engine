@@ -387,6 +387,7 @@ private:
     void build_ui_localization_panel(
         SceneDocument& scene,
         Renderer& renderer);
+    void build_weather_panel(SceneDocument& scene, Renderer& renderer);
     void build_sequencer_panel(
         SceneDocument& scene,
         Renderer& renderer,
@@ -443,6 +444,8 @@ private:
     bool show_navigation_debug_ = true;
     bool animation_gameplay_panel_open_ = true;
     bool ui_localization_panel_open_ = true;
+    bool weather_panel_open_ = false;
+    bool weather_editing_ = false;
     bool sequencer_panel_open_ = true;
     bool navigation_ai_panel_open_ = true;
     std::array<char, 64U> ui_test_speaker_buf_{"Narrator"};

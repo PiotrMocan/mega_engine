@@ -1,6 +1,7 @@
 #pragma once
 
 #include "fog.hpp"
+#include "weather.hpp"
 #include "exposure.hpp"
 #include "lighting_settings.hpp"
 #include "lod_transition.hpp"
@@ -232,6 +233,7 @@ public:
     std::optional<ExposureSettings> exposure{};
     std::optional<SubsurfaceMode> subsurface{};
     std::optional<FogSettings> fog{};
+    WeatherSettings weather{};
     [[nodiscard]] std::optional<SceneCameraPose> startup_camera_pose() const noexcept;
 
     [[nodiscard]] SceneNodeId create_node(

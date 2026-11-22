@@ -20,6 +20,7 @@ SceneHistoryDelta::SceneHistoryDelta(const SceneDocument& before, const SceneDoc
     remember(&Doc::exposure);
     remember(&Doc::subsurface);
     remember(&Doc::fog);
+    if (before.weather != after.weather) remember(&Doc::weather);
     remember(&Doc::content_revision_);
     remember(&Doc::structure_revision_);
     remember(&Doc::first_root_);

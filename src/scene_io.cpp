@@ -1,4 +1,5 @@
 #include "vfx_json.hpp"
+#include "weather_json.hpp"
 #include "project_system.hpp"
 #include "scene_io.hpp"
 #include "scene_component_json.hpp"
@@ -848,6 +849,11 @@ bool save_scene_file(
                 if (records[index].id == scene.startup_camera) metadata["startup_camera"] = index;
         }
     }
+    if (!valid_weather(scene.weather)) {
+        error = "Invalid scene weather settings.";
+        return false;
+    }
+    if (scene.weather != WeatherSettings{}) metadata["weather"] = weather_json(scene.weather);
     if (scene.lighting) {
         if (!valid_lighting_settings(*scene.lighting) || scene.lighting->hour < 0 ||
             scene.lighting->hour >= 24) {
@@ -1759,6 +1765,10 @@ bool load_scene_file(
                 error = "Scene startup_camera must reference a camera with a finite world pose.";
                 return false;
             }
+        }
+        if (root.contains("weather") && !read_weather(root["weather"], loaded.weather)) {
+            error = "Invalid scene weather settings.";
+            return false;
         }
         if (root.contains("lighting")) {
             LightingSettings settings;
