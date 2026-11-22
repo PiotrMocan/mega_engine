@@ -5240,6 +5240,7 @@ bool generate_vegetation_asset(
             out_asset.has_bark_textures = true;
         }
 
+        Bounds canopy_bounds{};
         for (std::uint32_t lod = 0U; lod < model_lod_count; ++lod) {
             CookedModelAsset& model = out_asset.lod_models[lod];
             model.generate_lods = false;
@@ -5269,15 +5270,16 @@ bool generate_vegetation_asset(
                         const float actual_keep =
                             static_cast<float>(lod_clusters[lod].size()) /
                             static_cast<float>(std::max<std::size_t>(1U, lod_clusters[0].size()));
-                        constexpr std::array<float, model_lod_count> kTargetArea{1.0F, 0.96F, 0.90F, 0.82F, 0.80F, 0.78F};
+                        constexpr std::array<float, model_lod_count> kTargetArea{1.0F, 1.06F, 1.15F, 1.25F, 1.38F, 1.50F};
                         size_boost = std::clamp(
                             std::sqrt(kTargetArea[lod] / std::max(0.012F, actual_keep)),
                             1.12F,
-                            lod <= 3U ? 2.25F : 5.0F);
+                            lod <= 3U ? 3.0F : 6.5F);
                     } else {
                         size_boost = (lod == 1U) ? 1.35F : ((lod == 2U) ? 1.75F : 2.20F);
                     }
                 }
+                const auto first_leaf_vertex = combined.vertices.size();
                 for (const auto& c : lod_clusters[lod]) {
                     append_foliage_cluster_geometry(
                         combined,
@@ -5285,6 +5287,19 @@ bool generate_vegetation_asset(
                         lod,
                         recipe.atlas_resolution,
                         size_boost);
+                }
+                if (canopy_card_archetype) {
+                    auto leaves = std::span{combined.vertices}.subspan(first_leaf_vertex);
+                    if (lod == 0U) {
+                        canopy_bounds = compute_vertex_bounds(leaves);
+                    } else {
+                        for (auto& vertex : leaves) {
+                            auto& p = vertex.position;
+                            const auto bounded = glm::clamp(glm::vec3(p[0], p[1], p[2]),
+                                canopy_bounds.center - canopy_bounds.extent, canopy_bounds.center + canopy_bounds.extent);
+                            p = {bounded.x, bounded.y, bounded.z};
+                        }
+                    }
                 }
                 model.submeshes.push_back(CookedModelSubmesh{
                     .first_index = first_idx,

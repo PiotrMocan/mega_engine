@@ -87,7 +87,7 @@ void main()
     const uint token = frame.globalRotation.x > 0.5
         ? visibleIndices[gl_InstanceIndex] : gl_InstanceIndex;
     const uint sourceIndex = lodSource(token);
-    outLodToken = lodPixelToken(token);
+    outLodToken = token;
     const EditorInstanceData instance = instances[sourceIndex];
     const bool isGpuGrass = VCR_ENABLE_GPU_GRASS;
     vec3 sourcePosition = inPosition;

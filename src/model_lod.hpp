@@ -8,8 +8,6 @@ enum class ModelLodUvPolicy { standard, preserve_mapping };
 // normal/UV seams and submesh borders are preserved; vertices are shared.
 void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& asset_root = {},
                         ModelLodUvPolicy uv_policy = ModelLodUvPolicy::standard);
-void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& asset_root,
-                        ModelLodUvPolicy uv_policy, bool local_foliage_coverage);
 // Lossless cold-path indexing/cache preparation. Coarse LOD vertices are packed
 // first so the frequently drawn distant instances fetch a compact working set.
 void optimize_model_geometry(CookedModelAsset &model);

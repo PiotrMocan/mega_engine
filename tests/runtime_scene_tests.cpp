@@ -794,6 +794,42 @@ int main() {
         });
         const auto micro_lod0_indices = micro_crown.indices;
         const auto micro_lod0_vertices = micro_crown.vertices;
+        auto dense_crown = micro_crown;
+        dense_crown.vegetation = true;
+        dense_crown.materials[0].coverage |= 32768U << 16U;
+        for (unsigned i = 0; i < dense_crown.vertices.size(); ++i) {
+            auto& p = dense_crown.vertices[i].position;
+            // Two leafy lobes with open sky in the middle.
+            p[0] = p[0] * 0.35F + (p[0] < 0 ? -1.0F : 1.0F);
+            p[1] = p[1] * 0.22F + ((i % 4) < 2 ? -0.20F : 0.20F);
+            p[2] *= 0.2F;
+        }
+        auto transparent_crown = dense_crown;
+        transparent_crown.materials[0].factors.base_color.a = 0;
+        vcr::prepare_model_lods(transparent_crown);
+        vcr::prepare_model_lods(dense_crown);
+        const auto& dense = dense_crown.submeshes.front();
+        expect(dense.lod_count.back() > transparent_crown.submeshes.front().lod_count.back(),
+               "coarse foliage clumps require opaque source leaves");
+        float previous_area = 0;
+        for (unsigned level = 2; level < vcr::model_lod_count; ++level) {
+            float core_area = 0;
+            for (unsigned i = 0; i < dense.lod_count[level]; i += 3) {
+                const auto first = dense.lod_first[level] + i;
+                const auto& a = dense_crown.vertices[dense_crown.indices[first]];
+                const auto& b = dense_crown.vertices[dense_crown.indices[first+1]];
+                const auto& c = dense_crown.vertices[dense_crown.indices[first+2]];
+                if (a.texcoord != b.texcoord || a.texcoord != c.texcoord) continue;
+                expect((a.position[0] < 0) == (b.position[0] < 0) &&
+                       (a.position[0] < 0) == (c.position[0] < 0),
+                       "coarse crown retains the gap between separate lobes");
+                core_area += std::abs((b.position[0]-a.position[0])*(c.position[1]-a.position[1]) -
+                                      (b.position[1]-a.position[1])*(c.position[0]-a.position[0]));
+            }
+            expect(core_area > previous_area && dense.lod_count[level] < dense.lod_count[level-1],
+                   "projected leaf clumps grow as crown triangle count falls");
+            previous_area = core_area;
+        }
         std::array<float, 3U> crown_min{
             std::numeric_limits<float>::max(),
             std::numeric_limits<float>::max(),

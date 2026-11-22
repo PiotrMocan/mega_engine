@@ -16,11 +16,6 @@ uint lodToken(uint source, float phase, bool previous, uint pattern) {
     return source | (quantized << 17u) | (previous ? (1u << 29u) : 0u) |
         (pattern == 2u ? (1u << 30u) : 0u) | (1u << 31u);
 }
-// A tile transition retains the instance index for vertex fetch and shares one
-// Bayer seed among every polygon fragment of the tile.
-uint lodPixelToken(uint token) {
-    return (token >> 30u) == 1u ? (token & ~0x1ffffu) | (1u << 31u) : token;
-}
 bool lodKeep(uint token, uvec2 pixel) {
     if ((token & (1u << 31u)) == 0u) return true;
     uint bits = (token & (1u << 30u)) != 0u ? 3u : 2u;

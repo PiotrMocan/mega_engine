@@ -882,9 +882,6 @@ void Renderer::shutdown() noexcept {
     }
     asset_preparation_.stop();
     asset_upload_.stop();
-#if VCR_EDITOR_ENABLED
-    foliage_proxy_ = {};
-#endif
     destroy_gpu_visibility();
     destroy_ray_tracing();
 #if VCR_EDITOR_ENABLED
@@ -3493,15 +3490,6 @@ bool Renderer::update_editor_scene(
         }
     }
     editor_scene_revision_ = view.revision;
-    foliage_proxy_.source_records = 0;
-    if (foliage_proxy_.scene_revision && foliage_proxy_.scene_revision == view.revision) {
-        const auto& members = foliage_proxy_.member_generations;
-        for (auto& metadata : scene_metadata_) {
-            const auto id = metadata.id;
-            metadata.foliage_proxy_member = id && id.index < members.size() && members[id.index] == id.generation;
-            foliage_proxy_.source_records += static_cast<unsigned>(metadata.foliage_proxy_member);
-        }
-    }
     prev_committed_runtime_revision_ = 0U;
     runtime_transforms_.begin_snapshot();
     for (std::size_t i = 0; i < scene_metadata_.size(); ++i) {
@@ -3635,9 +3623,6 @@ bool Renderer::apply_editor_material(
 }
 
 void Renderer::invalidate_editor_scene() noexcept {
-#if VCR_EDITOR_ENABLED
-    foliage_proxy_.scene_revision = 0;
-#endif
     editor_scene_revision_ = 0U;
     total_model_instances_ = 0U;
     alpha_masked_model_instances_ = 0U;
@@ -6900,7 +6885,6 @@ void Renderer::update_frame_uniform(
 #if VCR_EDITOR_ENABLED
     if (authored_scene_enabled_ && mode_ != RunMode::instancing) {
         const auto rotation = glm::transpose(glm::mat3(view_matrix));
-        if (foliage_proxy_.pipeline.get()) update_foliage_proxy(unjittered_view_projection, extent);
         prepare_scene_packet(unjittered_view_projection, -(rotation * glm::vec3(view_matrix[3])),
                              extent);
     }
@@ -11094,15 +11078,6 @@ void Renderer::record_commands(
                 vkCmdDraw(command_buffer, 3, 1, 0, 0);
             }
 #if VCR_EDITOR_ENABLED
-            if (!depth_only && mode_ != RunMode::instancing && foliage_proxy_.phase) {
-                draw_foliage_proxy(command_buffer, frame, extent);
-                vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_,
-                    0, 1, &descriptor_set, 0, nullptr);
-                vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_,
-                    2, 1, &frame.lighting_descriptor_set, 0, nullptr);
-                vkCmdPushConstants(command_buffer, pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT,
-                    0, sizeof(push_constants), &push_constants);
-            }
             if (!depth_only && mode_ != RunMode::instancing &&
                 authored_scene_enabled_ && editor_ocean_visible_) {
                 vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -11647,9 +11622,6 @@ void Renderer::record_commands(
 #endif
 
     if (anti_aliasing_.method == AntiAliasingMethod::off &&
-#if VCR_EDITOR_ENABLED
-        !foliage_proxy_.phase &&
-#endif
         (!lighting_settings_.dynamic || mode_ == RunMode::instancing) &&
         !subsurface_active && !motion_blur_active && !sample_scene_depth && (!has_local_aa_draws_ || mode_ == RunMode::instancing)) {
 #if VCR_EDITOR_ENABLED

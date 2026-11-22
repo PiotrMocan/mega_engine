@@ -61,6 +61,6 @@ void main()
     outBaseColor = instance.baseColor;
     outUv = surfaceUv;
 #endif
-    outLodToken = lodPixelToken(token);
+    outLodToken = token;
     gl_Position = frame.viewProjection * vec4(worldPosition, 1.0);
 }

@@ -3966,8 +3966,6 @@ void EditorApplication::update_scene_snapshot() {
     if (!renderer_.update_editor_scene(
             view, ui_.asset_root(), asset_error)) {
         ui_.report_asset_error(std::move(asset_error));
-    } else if (submitted_scene_instance_id_ == 0U) {
-        renderer_.configure_foliage_proxy(options_.foliage_proxy_manifest, view, ui_.asset_root());
     }
     submitted_scene_instance_id_ = scene_.instance_id();
     submitted_scene_revision_ = view.revision;

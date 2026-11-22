@@ -33,9 +33,6 @@ bool Renderer::set_runtime_transform(SceneNodeId id, TransformRows transform) no
     const auto revision = runtime_transforms_.revision();
     const bool result = runtime_transforms_.set(id, transform);
     if (revision != runtime_transforms_.revision()) {
-        const auto& members = foliage_proxy_.member_generations;
-        if (id && id.index < members.size() && members[id.index] == id.generation)
-            foliage_proxy_.scene_revision = 0;
         shadow_dirty_ = true;
         if (gi_provisioned_)
             voxel_scene_.set_transform(id, transform, voxel_dirty_);
@@ -157,8 +154,8 @@ void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExt
         const auto &b = world_bounds_[i];
         const bool visible = bounds_hierarchy_active_ ? instance_visibility_[i] != 0 :
             (!visibility_settings_.frustum || frustum.intersects(b));
-        instance_visibility_[i] = visible && !(metadata.foliage_proxy_member && foliage_proxy_.phase == 4095U) ? 1U : 0U;
-        if (use_occlusion && instance_visibility_[i] && metadata.occluder) {
+        instance_visibility_[i] = visible ? 1U : 0U;
+        if (use_occlusion && visible && metadata.occluder) {
             const float distance = glm::length(b.center - camera);
             const float score = glm::length(b.extent) / std::max(distance, 0.01F);
             if (score > 0.05F) {
@@ -190,10 +187,6 @@ void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExt
     visibility_statistics_.submitted = count;
     for (std::uint32_t i = 0; i < count; ++i) {
         if (!instance_visibility_[i]) {
-            if (foliage_proxy_.phase == 4095U && scene_metadata_[i].foliage_proxy_member) {
-                --visibility_statistics_.submitted;
-                continue;
-            }
             ++visibility_statistics_.frustum_rejected;
         } else if (test_occlusion && occlusion.occluded(world_bounds_[i], padded_vp, guard)) {
             instance_visibility_[i] = 0;
@@ -277,8 +270,7 @@ void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExt
             visible.index_count = lod == 0 ? draw.index_count : submesh.lod_count[lod];
             for (auto i = draw.first_instance; i < draw.first_instance + draw.instance_count; ++i) {
                 const auto &fade = instance_lod_fades_[i];
-                const bool tile_transition = foliage_proxy_.phase && scene_metadata_[i].foliage_proxy_member;
-                const bool transitioning = !tile_transition && fade_enabled && fade.previous != fade.current && fade.progress < 1.0F;
+                const bool transitioning = fade_enabled && fade.previous != fade.current && fade.progress < 1.0F;
                 const auto current_lod = fade_enabled ? fade.current : instance_lods_[i];
                 if (instance_visibility_[i] && (current_lod == lod ||
                     (transitioning && fade.previous == lod))) {
@@ -286,8 +278,7 @@ void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExt
                         ? encode_lod_visibility(i, fade.progress, fade.previous == lod, lod_fade_pattern_)
                         : std::optional<std::uint32_t>{i};
                     assert(token.has_value());
-                    visibility_scratch_.push_back(tile_transition
-                        ? i | (3U << 29U) | (foliage_proxy_.phase << 17U) : *token);
+                    visibility_scratch_.push_back(*token);
                     ++visible.instance_count;
                 }
             }
@@ -318,7 +309,7 @@ void Renderer::prepare_scene_packet(const glm::mat4 &vp, glm::vec3 camera, VkExt
         }
     }
     // Draw emission counts include both LODs; visibility counts unique sources.
-    visibility_statistics_.visible = visibility_statistics_.submitted - visibility_statistics_.frustum_rejected -
+    visibility_statistics_.visible = count - visibility_statistics_.frustum_rejected -
                                       visibility_statistics_.occlusion_rejected;
     reset_lod_fades_ = false;
     if (data_changed) {

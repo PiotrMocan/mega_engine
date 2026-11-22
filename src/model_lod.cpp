@@ -137,6 +137,177 @@ struct MicroCardComponent {
     return true;
 }
 
+[[nodiscard]] std::optional<CookedTextureAsset> foliage_opacity(
+    const CookedModelMaterial& material, const std::filesystem::path& asset_root) {
+    std::optional<CookedTextureAsset> opacity;
+    if (!asset_root.empty() && material.base_color_texture) {
+        auto texture = load_cooked_texture_asset(asset_root, *material.base_color_texture);
+        if (texture && texture->pixel_format == CookedTexturePixelFormat::rgba8_unorm) {
+            opacity = std::move(texture).value();
+        } else if (texture && is_block_compressed_format(texture->pixel_format)) {
+            CookedTextureAsset decoded;
+            std::string error;
+            if (decode_bc_mip0_to_rgba8(*texture, decoded.pixels, error)) {
+                decoded.width = texture->width;
+                decoded.height = texture->height;
+                decoded.row_stride_bytes = decoded.width * 4U;
+                opacity = std::move(decoded);
+            }
+        }
+    }
+    return opacity;
+}
+
+// Inner clumps use the same leaf material in color, depth and shadow passes.
+// Their support points come from visible LOD0 leaves. The surviving cutout
+// cards still provide the fine contour outside each clump.
+void add_crown_interiors(CookedModelAsset& model, CookedModelSubmesh& mesh,
+                         const std::optional<CookedTextureAsset>& opacity, std::size_t max_indices) {
+    const auto& material = model.materials[mesh.material_index];
+    if (material.base_color_texture && !opacity) return;
+    const auto source = std::span{model.indices}.subspan(mesh.first_index, mesh.index_count);
+    const auto position = [&](unsigned i) {
+        const auto& p = model.vertices[i].position;
+        return glm::vec3(p[0], p[1], p[2]);
+    };
+    glm::vec3 low = position(source.front()), high = low;
+    for (const auto i : source) {
+        low = glm::min(low, position(i));
+        high = glm::max(high, position(i));
+    }
+    const glm::vec3 extent = high - low;
+    if (source.size() % 3U ||
+        std::min({extent.x, extent.y, extent.z}) <= std::max({extent.x, extent.y, extent.z}) * 0.001F)
+        return;
+
+    constexpr float phi = 1.618034F;
+    constexpr std::array<glm::vec3, 12> directions{{{-1, phi, 0},
+                                                    {1, phi, 0},
+                                                    {-1, -phi, 0},
+                                                    {1, -phi, 0},
+                                                    {0, -1, phi},
+                                                    {0, 1, phi},
+                                                    {0, -1, -phi},
+                                                    {0, 1, -phi},
+                                                    {phi, 0, -1},
+                                                    {phi, 0, 1},
+                                                    {-phi, 0, -1},
+                                                    {-phi, 0, 1}}};
+    constexpr std::array<unsigned, 60> faces{
+        0, 11, 5, 0, 5, 1, 0, 1, 7, 0, 7, 10, 0, 10, 11, 1, 5, 9, 5, 11, 4,  11, 10, 2,  10, 7, 6, 7, 1, 8,
+        3, 9,  4, 3, 4, 2, 3, 2, 6, 3, 6, 8,  3, 8,  9,  4, 9, 5, 2, 4,  11, 6,  2,  10, 8,  6, 7, 9, 8, 1};
+    struct Clump {
+        std::array<float, directions.size()> furthest{};
+        std::array<glm::vec3, directions.size()> support{};
+        std::array<std::uint32_t, directions.size()> source_vertices{};
+        glm::vec3 centroid{0.0F};
+        glm::vec2 uv{};
+        std::array<glm::vec2, 3> chart{};
+        float best_alpha = -1.0F;
+        float leaf_area = 0.0F;
+    };
+    const unsigned nx = source.size() >= 30'000 ? 5 : 3;
+    const unsigned ny = source.size() >= 30'000 ? 8 : 5;
+    const unsigned nz = nx;
+    std::vector<Clump> clumps(nx * ny * nz);
+    const glm::vec3 cell_size = extent / glm::vec3(nx, ny, nz);
+    const float face_area =
+        std::max({cell_size.x * cell_size.y, cell_size.z * cell_size.y, cell_size.x * cell_size.z});
+    const float cutoff = static_cast<float>(material.coverage >> 16U) / 65535.0F;
+    // Four equal-area subtriangles, including small leaf charts near the edges.
+    constexpr std::array<glm::vec3, 4> weights{{{4, 1, 1}, {1, 4, 1}, {1, 1, 4}, {2, 2, 2}}};
+    for (std::size_t tri = 0; tri < source.size(); tri += 3) {
+        const auto a = position(source[tri]), b = position(source[tri + 1]), c = position(source[tri + 2]);
+        const float area = glm::length(glm::cross(b - a, c - a)) * 0.125F;
+        if (area <= 0.0F) continue;
+        const auto uv = [&](unsigned corner) {
+            const auto& t = model.vertices[source[tri + corner]].texcoord;
+            return glm::vec2(t[0], t[1]);
+        };
+        const auto ta = uv(0), tb = uv(1), tc = uv(2);
+        for (auto w : weights) {
+            w /= 6.0F;
+            const auto texcoord = ta * w.x + tb * w.y + tc * w.z;
+            const float alpha =
+                material.factors.base_color.a *
+                (opacity ? sample_rgba8_alpha_repeat_bilinear(*opacity, texcoord.x, 1.0F - texcoord.y)
+                         : 1.0F);
+            if (alpha < cutoff || alpha <= 0.0F) continue;
+            const auto p = a * w.x + b * w.y + c * w.z;
+            const auto grid = glm::clamp((p - low) / cell_size, glm::vec3(0), glm::vec3(nx, ny, nz));
+            const auto x = std::min(static_cast<unsigned>(grid.x), nx - 1);
+            const auto y = std::min(static_cast<unsigned>(grid.y), ny - 1);
+            const auto z = std::min(static_cast<unsigned>(grid.z), nz - 1);
+            auto& clump = clumps[(y * nz + z) * nx + x];
+            for (std::size_t k = 0; k < directions.size(); ++k) {
+                const float projection = glm::dot(directions[k], grid);
+                if (clump.leaf_area == 0 || projection > clump.furthest[k]) {
+                    clump.support[k] = p;
+                    clump.furthest[k] = projection;
+                    clump.source_vertices[k] = source[tri + (w.y > w.x ? 1 : w.z > w.x ? 2 : 0)];
+                }
+            }
+            clump.centroid += p * area;
+            clump.leaf_area += area;
+            if (alpha > clump.best_alpha) {
+                clump.best_alpha = alpha;
+                clump.uv = texcoord;
+                clump.chart = {ta, tb, tc};
+            }
+        }
+    }
+    std::ranges::sort(clumps, std::greater{}, &Clump::leaf_area);
+    const auto clump_budget = source.size() / (faces.size() * 10);
+    const auto occupied = static_cast<std::size_t>(
+        std::ranges::count_if(clumps, [&](const Clump& c) { return c.leaf_area > face_area * 0.25F; }));
+    constexpr std::array<float, model_lod_count> radius{0, 0, 0.40F, 0.70F, 0.86F, 0.97F};
+    for (std::size_t level = 2; level < model_lod_count; ++level) {
+        const auto first = mesh.lod_first[level], count = mesh.lod_count[level];
+        const auto previous = mesh.lod_count[level - 1];
+        if (first == mesh.lod_first[level - 1]) {
+            mesh.lod_count[level] = previous;
+            continue;
+        }
+        if (count >= previous) continue;
+        // Small plants should not spend their entire coarse mesh budget on interior faces.
+        const auto n = std::min({occupied, (previous - count - 1) / faces.size(), clump_budget});
+        const auto added = n * faces.size();
+        if (!n || model.indices.size() > max_indices - added ||
+            model.vertices.size() > 32'000'000U - n * directions.size())
+            continue;
+        // Seed depth with the crown interior before shading the surrounding cutouts.
+        // Only this submesh's generated ranges follow this one in the index buffer.
+        model.indices.insert(model.indices.begin() + first, added, 0U);
+        for (auto& offset : mesh.lod_first) {
+            if (offset > first) offset += static_cast<unsigned>(added);
+        }
+        auto cursor = first;
+        for (std::size_t i = 0; i < n; ++i) {
+            const auto& clump = clumps[i];
+            const auto center = clump.centroid / clump.leaf_area;
+            const auto base = static_cast<unsigned>(model.vertices.size());
+            for (std::size_t k = 0; k < directions.size(); ++k) {
+                const auto p = glm::clamp(glm::mix(center, clump.support[k], radius[level]), low, high);
+                auto vertex = model.vertices[clump.source_vertices[k]];
+                vertex.position = {p.x, p.y, p.z};
+                auto uv = clump.uv;
+                if (opacity) {
+                    // Stay inside a single leaf's UV chart and keep its texture and tangent basis.
+                    const glm::vec3 dir = glm::normalize(directions[k]);
+                    const auto edge = glm::mix(clump.chart[1], clump.chart[2], 0.5F + 0.5F * dir.x);
+                    const auto chart_uv = glm::mix(clump.chart[0], edge, 0.55F + 0.4F * dir.y);
+                    uv = glm::mix(uv, chart_uv, 0.9F - 0.5F * radius[level]);
+                }
+                vertex.texcoord = {uv.x, uv.y};
+                model.vertices.push_back(vertex);
+            }
+            for (const auto corner : faces)
+                model.indices[cursor++] = base + corner;
+        }
+        mesh.lod_count[level] += static_cast<unsigned>(added);
+    }
+}
+
 [[nodiscard]] bool try_prepare_microcard_foliage_lods(
     CookedModelAsset& model,
     CookedModelSubmesh& mesh,
@@ -145,8 +316,7 @@ struct MicroCardComponent {
     float scale,
     float epsilon,
     std::size_t max_indices,
-    std::vector<unsigned>& scratch, const std::filesystem::path& asset_root, bool blade_strips,
-    bool local_coverage) {
+    std::vector<unsigned>& scratch, const std::optional<CookedTextureAsset>& opacity, bool blade_strips) {
     const std::uint32_t first = static_cast<std::uint32_t>(mesh.first_index);
     const std::uint32_t count = static_cast<std::uint32_t>(mesh.index_count);
     const std::uint32_t tri_count = count / 3U;
@@ -216,22 +386,6 @@ struct MicroCardComponent {
         std::numeric_limits<float>::lowest(),
     };
     const auto& material = model.materials[mesh.material_index];
-    std::optional<CookedTextureAsset> opacity;
-    if (!blade_strips && !asset_root.empty() && material.base_color_texture) {
-        auto texture = load_cooked_texture_asset(asset_root, *material.base_color_texture);
-        if (texture && texture->pixel_format == CookedTexturePixelFormat::rgba8_unorm) {
-            opacity = std::move(texture).value();
-        } else if (texture && is_block_compressed_format(texture->pixel_format)) {
-            CookedTextureAsset decoded;
-            std::string error;
-            if (decode_bc_mip0_to_rgba8(*texture, decoded.pixels, error)) {
-                decoded.width = texture->width;
-                decoded.height = texture->height;
-                decoded.row_stride_bytes = decoded.width * 4U;
-                opacity = std::move(decoded);
-            }
-        }
-    }
     const float cutoff = static_cast<float>(material.coverage >> 16U) / 65535.0F;
     // Equal-area strata on the UV triangle. Origins and UV seams stay in the
     // source chart, including the authoring-to-texture V flip used in the shader.
@@ -337,22 +491,11 @@ struct MicroCardComponent {
     }
 
     constexpr std::array microcard_ratios{1.0F, 0.32F, 0.14F, 0.065F, 0.028F, 0.012F};
-    constexpr std::array local_ratios{1.0F, 0.32F, 0.14F, 0.075F, 0.045F, 0.025F};
-    // A retained card represents the area of its own Morton subtree. When
-    // both children have retained representatives they split that area.
-    std::vector<double> subtree_area;
-    std::vector<double> represented;
-    if (local_coverage && !blade_strips) {
-        subtree_area.resize(2U * leaf_base);
-        represented.resize(component_count);
-        for (std::size_t i = 0; i < component_count; ++i) subtree_area[leaf_base + i] = components[i].area;
-        for (auto i = leaf_base; --i > 0;) subtree_area[i] = subtree_area[2*i] + subtree_area[2*i+1];
-    }
     constexpr std::array microcard_max_scale{1.0F, 2.2F, 3.4F, 5.0F, 7.5F, 11.0F};
     constexpr std::array microcard_visual_error_caps{0.0F, 0.00060F, 0.0013F, 0.0028F, 0.006F, 0.014F};
     constexpr std::array blade_ratios{1.0F, 0.82F, 0.63F, 0.44F, 0.29F, 0.18F};
     constexpr std::array blade_visual_errors{0.0F, 0.012F, 0.032F, 0.065F, 0.12F, 0.22F};
-    const auto& ratios = blade_strips ? blade_ratios : local_coverage ? local_ratios : microcard_ratios;
+    const auto& ratios = blade_strips ? blade_ratios : microcard_ratios;
     const auto& visual_errors = blade_strips ? blade_visual_errors : microcard_visual_error_caps;
     constexpr std::size_t max_vertices = 32'000'000U;
 
@@ -390,7 +533,7 @@ struct MicroCardComponent {
         }
         std::ranges::sort(kept_ranks);
         const double area_ratio = total_area / std::max(kept_area, 1.0e-6);
-        const float global_scale = std::clamp(
+        const float card_scale = std::clamp(
             static_cast<float>(blade_strips ? area_ratio : std::sqrt(area_ratio)),
             1.0F,
             microcard_max_scale[level]);
@@ -404,34 +547,10 @@ struct MicroCardComponent {
             continue;
         }
 
-        if (!represented.empty()) {
-            std::ranges::fill(represented, -1.0);
-            for (auto rank : kept_ranks) represented[rank] = 0;
-            const auto distribute = [&](auto&& visit, std::size_t node) -> void {
-                const auto winner = winners[node];
-                if (node < leaf_base) {
-                    const auto left = winners[2 * node], right = winners[2 * node + 1];
-                    if (right == unmapped) {
-                        visit(visit, 2 * node);
-                        return;
-                    }
-                    if (represented[left] >= 0 && represented[right] >= 0) {
-                        visit(visit, 2 * node);
-                        visit(visit, 2 * node + 1);
-                        return;
-                    }
-                }
-                represented[winner] = subtree_area[node];
-            };
-            distribute(distribute, 1);
-        }
         scratch.clear();
         scratch.reserve(kept_indices);
         for (const std::uint32_t rank : kept_ranks) {
             const auto& comp = components[rank];
-            const float card_scale = represented.empty() ? global_scale :
-                std::clamp(static_cast<float>(std::sqrt(represented[rank] / std::max(comp.area, 1.0e-9))),
-                           1.0F, std::min(microcard_max_scale[level], 3.5F));
             if (++current_stamp == 0U) {
                 std::ranges::fill(vertex_stamp, 0U);
                 current_stamp = 1U;
@@ -880,11 +999,6 @@ void prepare_authored_model_lods(CookedModelAsset &model,
 
 void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& asset_root,
                         const ModelLodUvPolicy uv_policy) {
-    prepare_model_lods(model, asset_root, uv_policy, false);
-}
-
-void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& asset_root,
-                        const ModelLodUvPolicy uv_policy, bool local_foliage_coverage) {
     if (model.vertices.empty() || model.indices.empty()) {
         return;
     }
@@ -952,6 +1066,10 @@ void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& as
             has_foliage &&
             (model.materials[mesh.material_index].coverage & (material_coverage_alpha_mask_bit | material_coverage_transparent_mask)) == 0U &&
             count >= 16U * 9U && count <= 512U * 3U && count % 9U == 0U;
+        const bool crown = has_foliage && alpha_masked && !preserve_mapping &&
+            model.skin_vertices.empty() && !model.skinned_lods;
+        const auto opacity = alpha_masked && !preserve_mapping && (crown || count >= 512U * 3U)
+            ? foliage_opacity(model.materials[mesh.material_index], asset_root) : std::nullopt;
         if (!preserve_mapping && ((alpha_masked && count >= 512U * 3U) || blade_strips)) {
             if (position_ids.empty()) {
                 position_ids = build_position_ids(
@@ -959,7 +1077,8 @@ void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& as
             }
             if (try_prepare_microcard_foliage_lods(
                     model, mesh, original_vertex_count, position_ids,
-                    scale, epsilon, max_indices, scratch, asset_root, blade_strips, local_foliage_coverage && has_foliage)) {
+                    scale, epsilon, max_indices, scratch, opacity, blade_strips)) {
+                if (crown) add_crown_interiors(model, mesh, opacity, max_indices);
                 continue;
             }
         }
@@ -995,9 +1114,13 @@ void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& as
             const auto target = std::max<std::size_t>(12, (raw_target / 3) * 3);
             const auto &weights = preserve_mapping ? uv_preserving_weights
                 : alpha_masked ? foliage_weights : opaque_weights;
-            const bool preserve_branches = local_foliage_coverage && has_foliage && !alpha_masked;
+            // Bark is often split into disconnected UV islands. Removing an
+            // island can erase a full section of trunk beneath a surviving crown.
+            const bool keep_wood = has_foliage && model.skin_vertices.empty() && !alpha_masked &&
+                mesh.material_index < model.materials.size() &&
+                (model.materials[mesh.material_index].coverage & material_coverage_transparent_mask) == 0U;
             const float error_limit = preserve_mapping ? 0.001F : alpha_masked ? foliage_error_limits[level]
-                : preserve_branches ? std::min(opaque_error_limits[level], .008F) : opaque_error_limits[level];
+                : opaque_error_limits[level];
             const unsigned options = alpha_masked && !preserve_mapping
                 ? static_cast<unsigned>(meshopt_SimplifyPermissive |
                     (level >= 4U ? meshopt_SimplifyLockBorder : 0))
@@ -1011,14 +1134,22 @@ void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& as
             // Repeating pavement and atlas surfaces show visible phase shifts if
             // collapses cross UV seams or UV error is ignored to reach the target.
             if (!preserve_mapping && !alpha_masked && (reduced == 0 || reduced > target + 3U)) {
-                reduced = meshopt_simplifyWithAttributes(
-                    scratch.data(), model.indices.data() + first, count,
-                    model.vertices.front().position.data(), model.vertices.size(),
-                    sizeof(CookedModelVertex), model.vertices.front().normal.data(),
-                    sizeof(CookedModelVertex), opaque_seam_weights.data(),
-                    opaque_seam_weights.size(), locks, target, error_limit,
-                    meshopt_SimplifyPermissive | (has_foliage
-                        ? (level >= 4U && !preserve_branches ? meshopt_SimplifyPrune : 0) : meshopt_SimplifyLockBorder), &error);
+                if (keep_wood && level >= 4U) {
+                    // Position clustering joins disconnected bark seams, allowing a
+                    // continuous trunk to fit the far LOD budget.
+                    reduced = meshopt_simplifySloppy(scratch.data(), model.indices.data() + first, count,
+                        model.vertices.front().position.data(), model.vertices.size(), sizeof(CookedModelVertex),
+                        nullptr, target, std::min(error_limit, 0.012F), &error);
+                } else {
+                    reduced = meshopt_simplifyWithAttributes(
+                        scratch.data(), model.indices.data() + first, count,
+                        model.vertices.front().position.data(), model.vertices.size(),
+                        sizeof(CookedModelVertex), model.vertices.front().normal.data(),
+                        sizeof(CookedModelVertex), opaque_seam_weights.data(),
+                        opaque_seam_weights.size(), locks, target, error_limit,
+                        meshopt_SimplifyPermissive | (has_foliage
+                            ? (level >= 4U ? meshopt_SimplifyPrune : 0) : meshopt_SimplifyLockBorder), &error);
+                }
             }
             if (reduced >= previous_count || reduced == 0 ||
                 model.indices.size() > max_indices - reduced) {
@@ -1042,6 +1173,7 @@ void prepare_model_lods(CookedModelAsset &model, const std::filesystem::path& as
             previous_count = static_cast<std::uint32_t>(reduced);
             previous_error = level_error;
         }
+        if (crown) add_crown_interiors(model, mesh, opacity, max_indices);
     }
 }
 } // namespace vcr
