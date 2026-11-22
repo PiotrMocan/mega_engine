@@ -739,6 +739,8 @@ void build_flat_plane_geometry(
         "    include(\"${CMAKE_CURRENT_SOURCE_DIR}/engine/cmake/VcrEngineSdk.cmake\")\n"
         "elseif(DEFINED VCR_ENGINE_ROOT AND EXISTS \"${VCR_ENGINE_ROOT}/cmake/VcrEngineSdk.cmake\")\n"
         "    include(\"${VCR_ENGINE_ROOT}/cmake/VcrEngineSdk.cmake\")\n"
+        "elseif(EXISTS \"${CMAKE_CURRENT_SOURCE_DIR}/../../mega_engine/cmake/VcrEngineSdk.cmake\")\n"
+        "    include(\"${CMAKE_CURRENT_SOURCE_DIR}/../../mega_engine/cmake/VcrEngineSdk.cmake\")\n"
         "elseif(EXISTS \"${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/VcrEngineSdk.cmake\")\n"
         "    include(\"${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/VcrEngineSdk.cmake\")\n"
         "else()\n"
@@ -2015,13 +2017,15 @@ bool initialize_manifest_for_existing_directory(
 }
 
 std::filesystem::path default_projects_root_directory() {
-    if (const auto workspace = discover_workspace_root()) {
-        return *workspace / "projects";
-    }
     if (const auto exe_dir = executable_parent_directory()) {
-        return *exe_dir / "projects";
+        if (const auto workspace = find_workspace_root_from(*exe_dir)) {
+            return workspace->parent_path() / "projects";
+        }
+        const auto engine_dir = exe_dir->filename() == "bin"
+            ? exe_dir->parent_path() : *exe_dir;
+        return engine_dir.parent_path() / "projects";
     }
-    return std::filesystem::path("projects");
+    return {};
 }
 
 std::filesystem::path default_project_registry_path(
@@ -2040,7 +2044,10 @@ std::filesystem::path default_project_registry_path(
             std::filesystem::path(std::wstring_view(env_buf.data(), env_len)));
     }
 #endif
-    return default_projects_root_directory() / project_registry_filename;
+    if (const auto exe_dir = executable_parent_directory()) {
+        return *exe_dir / project_registry_filename;
+    }
+    return {};
 }
 
 std::optional<std::filesystem::path> find_sibling_executable(

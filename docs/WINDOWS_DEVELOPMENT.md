@@ -94,7 +94,7 @@ build/windows-release/bin/vcr_asset_lod_cooker.exe inspect assets pine_environme
 У небольших пучков из вертикальных пятивершинных травинок сохраняются
 целые стебли. На расстоянии они становятся шире, сохраняя высоту и точки роста.
 Для пересборки растительности всех сцен проекта выполните
-`python scripts/prepare_vegetation_lods.py projects/forest_steppe`. Можно передать другой
+`python scripts/prepare_vegetation_lods.py ../projects/forest_steppe`. Можно передать другой
 каталог проекта или ограничить выбор параметром `--scene scenes/editor_scene.json`.
 `cook-vegetation` распознаёт профиль `foliage`, материал `gpu_grass` и старые
 импорты с маской и названием растительности. Поле модели `vegetation` явно

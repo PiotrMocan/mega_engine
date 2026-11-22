@@ -27,6 +27,6 @@
 Параметр `--assets` указывает на каталог ассетов целевого проекта. Путь с пробелами заключите в кавычки.
 
 ```powershell
-.\build\windows-release\bin\vcr_open_level.exe --assets .\projects\my_game\assets --name highlands --seed 17
-.\build\windows-release\bin\vcr_open_level.exe --assets .\projects\my_game\assets --name valley --heightmap D:\Maps\valley16.png --overview D:\Maps\valley-color.jpg --detail D:\Maps\ground.png --samples 513 --size 4096 --relief 750 --tile-size 6 --fade-start 400 --fade-end 1200
+.\build\windows-release\bin\vcr_open_level.exe --assets ..\projects\my_game\assets --name highlands --seed 17
+.\build\windows-release\bin\vcr_open_level.exe --assets ..\projects\my_game\assets --name valley --heightmap D:\Maps\valley16.png --overview D:\Maps\valley-color.jpg --detail D:\Maps\ground.png --samples 513 --size 4096 --relief 750 --tile-size 6 --fade-start 400 --fade-end 1200
 ```

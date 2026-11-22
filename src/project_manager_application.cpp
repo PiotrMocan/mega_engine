@@ -115,10 +115,10 @@ void print_pm_usage() {
         << "  --no-validation         Disable validation layer\n"
         << "  --smoke-frames N        Render N UI frames and exit cleanly\n\n"
         << "Registry & Headless CLI Commands:\n"
-        << "  --registry PATH         Override project_registry.json path\n"
+        << "  --registry PATH         Override project_registry.json beside the Project Manager EXE\n"
         << "  --list                  Print JSON list of registered projects\n"
         << "  --create NAME           Create a new project and register it\n"
-        << "    --location DIR        Parent folder (default: <engine>/projects)\n"
+        << "    --location DIR        Parent folder (default: projects beside the engine directory)\n"
         << "    --folder SLUG         Override project directory name\n"
         << "    --template KIND       standard | empty | cpp_module (default: standard)\n"
         << "    --description TEXT    Optional project description\n"
@@ -1257,7 +1257,7 @@ void ProjectManagerApplication::reload_registry_and_cache(
                 save_registry();
                 status_message_ =
                     "Discovered " + std::to_string(found) +
-                    " project(s) in projects/.";
+                    " project(s) in " + path_to_utf8_str(default_dir);
                 status_tone_ = EditorTone::success;
             }
         }

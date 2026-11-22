@@ -108,6 +108,19 @@ void test_slug_and_scene_path_validation() {
     REQUIRE(!vcr::valid_project_icon_relative_path("icon.png"));
 }
 
+void test_default_project_locations() {
+#if defined(_WIN32)
+    const std::filesystem::path engine_root{VCR_TEST_ENGINE_ROOT};
+    REQUIRE(vcr::default_projects_root_directory() == engine_root.parent_path() / "projects");
+    if (GetEnvironmentVariableW(L"VCR_PROJECT_REGISTRY", nullptr, 0) == 0U) {
+        const auto executable = vcr::find_sibling_executable("vcr_project_tests.exe");
+        REQUIRE(executable.has_value());
+        REQUIRE(vcr::default_project_registry_path() ==
+                executable->parent_path() / vcr::project_registry_filename);
+    }
+#endif
+}
+
 void test_standard_template_creation_and_assets() {
     const ScopedTempDir temp;
     vcr::CreateProjectResult created{};
@@ -982,8 +995,7 @@ void test_cpp_module_project_and_manifest_round_trip() {
     REQUIRE(loaded.game_module == "bin/my_cpp_game_game.dll");
 
 #if defined(_WIN32)
-    const std::filesystem::path workspace_root =
-        vcr::default_projects_root_directory().parent_path();
+    const std::filesystem::path workspace_root{VCR_TEST_ENGINE_ROOT};
     const std::filesystem::path sdk_src =
         workspace_root / "cmake" / "VcrEngineSdk.cmake";
     std::error_code fs_ec;
@@ -997,6 +1009,9 @@ void test_cpp_module_project_and_manifest_round_trip() {
             std::filesystem::copy_options::overwrite_existing,
             fs_ec);
         REQUIRE_MSG(!fs_ec, fs_ec.message());
+        write_text_file(
+            created.project_directory / "engine/include/game_module_api.hpp",
+            "#error Project-local SDK headers were used with a checkout DLL\n");
 
         const std::filesystem::path debug_build_dir =
             workspace_root / "build" / "windows-debug";
@@ -1120,6 +1135,7 @@ void test_game_module_loader_hardening() {
 } // namespace
 
 int main() {
+    test_default_project_locations();
     test_slug_and_scene_path_validation();
     test_standard_template_creation_and_assets();
     test_empty_template_and_registry_lifecycle();

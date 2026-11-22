@@ -1093,7 +1093,10 @@ if(BUILD_TESTING)
     endif()
 
     add_executable(vcr_project_tests tests/project_tests.cpp)
-    target_compile_definitions(vcr_project_tests PRIVATE VCR_VALIDATION_DEFAULT=0)
+    target_compile_definitions(vcr_project_tests PRIVATE
+        VCR_VALIDATION_DEFAULT=0
+        "VCR_TEST_ENGINE_ROOT=\"${CMAKE_CURRENT_SOURCE_DIR}\""
+    )
     target_link_libraries(
         vcr_project_tests PRIVATE
         vcr_engine
