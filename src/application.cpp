@@ -965,8 +965,11 @@ void Application::main_loop() {
             FrameTimings timings{};
             const glm::mat4 view = camera_.view_matrix();
             renderer_.set_weather(scene_.weather);
+            renderer_.update_rain_shelters(scene_, camera_.position());
             const bool rendered = renderer_.draw_frame(timings, view);
             update_storm_audio(renderer_.thunderstorm(), audio_engine_, false);
+            audio_engine_.set_rain(renderer_.rain_active() ? renderer_.weather().rainfall() : 0,
+                renderer_.weather().rain().volume, renderer_.rain_sheltered(), false);
             if (options_.mcp_stdio) {
                 complete_mcp_screenshot();
             }

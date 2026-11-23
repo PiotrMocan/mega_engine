@@ -2,6 +2,7 @@
 #include "renderer.hpp"
 #include "camera_projection.hpp"
 #include "cloud_noise.hpp"
+#include "editor_scene_tools.hpp"
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -541,6 +542,68 @@ void Renderer::start_voxel_job() {
     voxel_job_start_ = true;
     voxel_job_active_ = true;
 }
+void Renderer::update_rain_shelters(const SceneDocument& scene, glm::vec3 camera) {
+    auto& u = lighting_uniforms_;
+    rain_sheltered_ = false;
+    if ((!scene.weather.rain.enabled && weather_.rainfall() == 0 && weather_.wetness() == 0) ||
+        scene.colliders().owners().empty()) {
+        u.rain_motion.w = 0;
+        shelter_refresh_ = 0;
+        return;
+    }
+    shelter_refresh_ -= fsr_frame_time_ms_ * 0.001F;
+    const glm::vec3 travel = camera - shelter_origin_;
+    if (shelter_refresh_ <= 0 || glm::dot(travel, travel) > 16 || scene.instance_id() != shelter_scene_) {
+        shelter_refresh_ = 0.15F;
+        shelter_origin_ = camera;
+        shelter_scene_ = scene.instance_id();
+        std::array<float, 8> distances;
+        distances.fill(std::numeric_limits<float>::max());
+        std::size_t count = 0;
+        for (auto id : scene.colliders().owners()) {
+            const auto& box = scene.collider(id)->get();
+            if (!box.enabled || box.is_trigger || box.shape != ColliderShape::box ||
+                glm::any(glm::lessThanEqual(box.half_extents, glm::vec3(0)))) continue;
+            glm::mat4 world;
+            if (runtime_transforms_.contains(id)) {
+                const auto rows = runtime_transforms_.current(id);
+                world = glm::transpose(glm::mat4(rows.x, rows.y, rows.z, glm::vec4(0,0,0,1)));
+            } else {
+                const auto transform = scene_world_matrix(scene, id);
+                if (!transform) continue;
+                world = *transform;
+            }
+            const auto unit_box = glm::scale(glm::translate(world, box.center_offset), box.half_extents);
+            const glm::vec3 extent = glm::abs(glm::vec3(unit_box[0])) + glm::abs(glm::vec3(unit_box[1])) +
+                                     glm::abs(glm::vec3(unit_box[2]));
+            const glm::vec3 delta = glm::max(glm::abs(camera - glm::vec3(unit_box[3])) - extent, glm::vec3(0));
+            const float score = delta.x * delta.x + delta.z * delta.z + 0.001F * delta.y * delta.y;
+            if (score > 40 * 40 || std::abs(glm::determinant(glm::mat3(unit_box))) < 1e-8F) continue;
+            const auto slot = static_cast<std::size_t>(std::max_element(distances.begin(), distances.end()) - distances.begin());
+            if (score >= distances[slot]) continue;
+            distances[slot] = score;
+            const auto rows = glm::transpose(glm::inverse(unit_box));
+            u.rain_shelters[slot] = {rows[0], rows[1], rows[2]};
+            count = std::min(count + 1, distances.size());
+        }
+        u.rain_motion.w = static_cast<float>(count);
+    }
+    for (std::size_t i = 0; i < static_cast<std::size_t>(u.rain_motion.w); ++i) {
+        const auto& r = u.rain_shelters[i];
+        const glm::vec4 p(camera, 1);
+        const glm::vec3 local(glm::dot(r.x, p), glm::dot(r.y, p), glm::dot(r.z, p));
+        glm::vec3 dir(r.x.y, r.y.y, r.z.y);
+        for (int axis = 0; axis < 3; ++axis)
+            if (std::abs(dir[axis]) < 1e-7F) dir[axis] = 1e-7F;
+        const glm::vec3 a = (-1.0F - local) / dir, b = (1.0F - local) / dir;
+        const auto near = glm::min(a,b), far = glm::max(a,b);
+        if (std::min({far.x, far.y, far.z}) > std::max({near.x, near.y, near.z, 0.04F})) {
+            rain_sheltered_ = true;
+            break;
+        }
+    }
+}
+
 void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkExtent2D extent) {
     auto &u = lighting_uniforms_;
     const double dt = std::max(0.0, static_cast<double>(fsr_frame_time_ms_) * 0.001);
@@ -548,6 +611,14 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
     if (!lighting_paused_) weather_.advance(dt);
     const auto& clouds = weather_.clouds();
     const auto& storm = weather_.storm();
+    const float heading = glm::radians(clouds.wind_direction);
+    const float drift = std::min(16.0F, clouds.wind_speed * 0.32F);
+    u.rain = {rain_active() ? weather_.rainfall() : 0.0F,
+              fog_supported_ && mode_ != RunMode::instancing ? weather_.wetness() : 0.0F,
+              weather_.rain().splashes, static_cast<float>(weather_.rain_clock())};
+    u.rain_motion = {static_cast<float>(weather_.rain_x()), static_cast<float>(weather_.rain_fall()),
+                     static_cast<float>(weather_.rain_z()), u.rain_motion.w};
+    u.rain_velocity = {std::cos(heading)*drift, -weather_.rain().fall_speed, std::sin(heading)*drift, 0};
     const float wet = storm.rain_buildup;
     const float base = clouds.base_height - 0.24F * clouds.thickness * wet;
     const float thickness = clouds.thickness * (1.0F + 0.85F * wet);
@@ -628,8 +699,8 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
         voxel_light_due_ = false;
         voxel_job_finishes_ = false;
         rt_tlas_build_due_ = false;
-        const bool procedural_sky = u.cloud_wind_shadow.w > 0;
-        if (procedural_sky) {
+        const bool weather_lighting = u.cloud_wind_shadow.w > 0 || u.rain.x > 0 || u.rain.y > 0;
+        if (weather_lighting) {
             u.sun_direction_intensity = glm::vec4(glm::normalize(glm::vec3(
                 sun_direction_x, sun_direction_y, sun_direction_z)), 1.0F);
             if (authored_scene_enabled_ && !editor_sun_visible_) u.sun_direction_intensity.w = 0;
@@ -637,14 +708,14 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
             u.sky_horizon = glm::vec4(0.52F, 0.67F, 0.82F, 1.0F);
             u.sky_zenith = glm::vec4(0.12F, 0.32F, 0.72F, lighting_settings_.sky_intensity);
         }
-        if (procedural_sky || frame.lighting_needs_static_reset || local_lights_changed ||
+        if (weather_lighting || frame.lighting_needs_static_reset || local_lights_changed ||
             local_backend == LocalLightBackend::clustered) {
             lighting_uniforms_.options = {};
             lighting_uniforms_.volume_parameters.z = 0.0F;
             lighting_uniforms_.volume_parameters.w = 0.0F;
             frame.lighting_uniform_buffer.write(
                 std::as_bytes(std::span{&lighting_uniforms_, std::size_t{1}}));
-            frame.lighting_needs_static_reset = procedural_sky;
+            frame.lighting_needs_static_reset = weather_lighting;
         }
         return;
     }

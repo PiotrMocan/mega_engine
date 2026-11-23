@@ -316,6 +316,7 @@ enum class MixerCommandKind : std::uint8_t {
     stop_all_voices,
     start_voice,
     start_thunder,
+    set_rain,
     stop_voice,
     fade_voice,
     update_voice,
@@ -339,6 +340,12 @@ struct MixerCommand final {
     AudioListenerState listener{};
     AudioSpatialParams spatial{};
     AudioReverbState reverb{};
+};
+
+struct RainMix {
+    float intensity = 0, volume = 0;
+    bool sheltered = false, preview = false;
+    friend bool operator==(const RainMix&, const RainMix&) = default;
 };
 
 struct MixerVoice final {
@@ -559,6 +566,11 @@ struct AudioEngineState {
     std::vector<float> thunder_pcm;
     std::uint32_t thunder_pcm_rate = 0;
     std::uint32_t last_thunder_take = thunder_take_count; // host thread only
+    std::vector<float> rain_pcm; // two immutable interleaved stereo loops
+    RainMix host_rain{}, mixer_rain{};
+    double rain_cursor = 0;
+    float drizzle_gain = 0, downpour_gain = 0, rain_cover = 0;
+    std::array<float, 2> rain_low{};
 
     // Resident immutable clip pool & main-thread lookup table.
     struct TransparentStringHash {
@@ -699,7 +711,11 @@ struct AudioEngineState {
             case MixerCommandKind::set_gameplay_paused:
                 mixer_gameplay_paused = cmd.flag_a;
                 break;
+            case MixerCommandKind::set_rain:
+                mixer_rain = {cmd.value_a, cmd.value_b, cmd.flag_a, cmd.flag_b};
+                break;
             case MixerCommandKind::stop_gameplay_voices: {
+                if (!mixer_rain.preview) mixer_rain = {};
                 const float fade_frames = std::max(cmd.fade_seconds * sr, 0.0F);
                 for (std::size_t i = 0U; i < max_voices; ++i) {
                     MixerVoice& v = mixer_voices[i];
@@ -721,6 +737,9 @@ struct AudioEngineState {
                 break;
             }
             case MixerCommandKind::stop_all_voices:
+                mixer_rain = {};
+                drizzle_gain = downpour_gain = rain_cover = 0;
+                rain_low = {};
                 for (std::size_t i = 0U; i < max_voices; ++i) {
                     if (mixer_voices[i].active) {
                         deactivate_mixer_voice(i);
@@ -1201,6 +1220,38 @@ struct AudioEngineState {
             }
         }
 
+        if ((!mixer_gameplay_paused || mixer_rain.preview) &&
+            (mixer_rain.intensity * mixer_rain.volume > 0 || drizzle_gain + downpour_gain > 1e-5F)) {
+            auto& sfx = bus_buffers[static_cast<std::size_t>(AudioBusId::sfx)];
+            const float level = mixer_rain.intensity;
+            const float gain = mixer_rain.volume * listener_vol;
+            const float light = gain * std::sqrt(level) * (1.0F - .85F * level);
+            const float heavy = gain * level * level;
+            const float cover = mixer_rain.sheltered ? 1.0F : 0.0F;
+            const float smooth = 1.0F - std::exp(-1.0F / (.065F * sr));
+            const float lowpass = 1.0F - std::exp(-2.0F * std::numbers::pi_v<float> * 900.0F / sr);
+            const std::size_t loop_frames = rain_pcm.size() / 4;
+            const double step = static_cast<double>(thunder_pcm_rate) / sample_rate;
+            for (std::size_t f = 0; f < frames; ++f) {
+                drizzle_gain += smooth * (light - drizzle_gain);
+                downpour_gain += smooth * (heavy - downpour_gain);
+                rain_cover += smooth * (cover - rain_cover);
+                const auto a = static_cast<std::size_t>(rain_cursor);
+                const auto b = a+1 < loop_frames ? a+1 : 0;
+                const float frac = static_cast<float>(rain_cursor - static_cast<double>(a));
+                for (std::size_t ch = 0; ch < 2; ++ch) {
+                    const auto i = 2*a+ch, j = 2*b+ch, second = loop_frames*2;
+                    const float direct = drizzle_gain * std::lerp(rain_pcm[i], rain_pcm[j], frac) +
+                        downpour_gain * std::lerp(rain_pcm[second+i], rain_pcm[second+j], frac);
+                    rain_low[ch] += lowpass * (direct - rain_low[ch]);
+                    sfx[2*f+ch] += std::lerp(direct, .26F*rain_low[ch], rain_cover);
+                }
+                rain_cursor += step;
+                if (rain_cursor >= static_cast<double>(loop_frames)) rain_cursor -= static_cast<double>(loop_frames);
+            }
+            ++bus_voice_counts[static_cast<std::size_t>(AudioBusId::sfx)];
+            ++total_active_voices;
+        }
         // Mix stereo reverb return into the SFX bus when gameplay is unpaused.
         if (!mixer_gameplay_paused && mixer_reverb.enabled &&
             mixer_reverb.wet_level > 1.0e-4F) {
@@ -1611,6 +1662,11 @@ bool AudioEngine::initialize(
         return false;
     }
     st->reverb_dsp.configure(st->sample_rate);
+    st->rain_pcm.resize(rain_loop_seconds * 4 * st->thunder_pcm_rate);
+    if (!read_embedded_audio(embedded_rain_recordings(), st->thunder_pcm_rate, 2, st->rain_pcm)) {
+        error = "Unable to decode the built-in rain recordings.";
+        return false;
+    }
 
     if (options.enable_hardware_output) {
         ma_device_config cfg = ma_device_config_init(ma_device_type_playback);
@@ -1757,10 +1813,10 @@ void AudioEngine::stop_gameplay_audio(const float fade_out_seconds) noexcept {
         .kind = MixerCommandKind::set_gameplay_paused,
         .flag_a = false,
     });
-    state_->push_command(MixerCommand{
+    if (state_->push_command(MixerCommand{
         .kind = MixerCommandKind::stop_gameplay_voices,
         .fade_seconds = std::clamp(sanitize_finite(fade_out_seconds, 0.03F), 0.0F, 5.0F),
-    });
+    }) && !state_->host_rain.preview) state_->host_rain = {};
 }
 
 void AudioEngine::stop_all_audio() noexcept {
@@ -1773,9 +1829,9 @@ void AudioEngine::stop_all_audio() noexcept {
     state_->active_music_path.clear();
     state_->preview_voice = {};
     state_->preview_path.clear();
-    state_->push_command(MixerCommand{
+    if (state_->push_command(MixerCommand{
         .kind = MixerCommandKind::stop_all_voices,
-    });
+    })) state_->host_rain = {};
 }
 
 AudioVoiceHandle AudioEngine::play_asset(
@@ -2000,6 +2056,16 @@ AudioVoiceHandle AudioEngine::play_thunder(glm::vec3 position, float volume, flo
     }
     state_->last_thunder_take = take;
     return *handle;
+}
+
+void AudioEngine::set_rain(float intensity, float volume, bool sheltered, bool preview) noexcept {
+    if (!state_) return;
+    const RainMix next{std::clamp(sanitize_finite(intensity), 0.0F, 1.0F),
+                       std::clamp(sanitize_finite(volume), 0.0F, 1.0F), sheltered, preview};
+    if (next == state_->host_rain) return;
+    if (state_->push_command({.kind = MixerCommandKind::set_rain, .value_a = next.intensity,
+                             .value_b = next.volume, .flag_a = sheltered, .flag_b = preview}))
+        state_->host_rain = next;
 }
 
 void AudioEngine::stop_thunder() noexcept {

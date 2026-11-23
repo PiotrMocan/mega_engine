@@ -1,0 +1,12 @@
+resources/audio/rain.flac contains excerpts of two stereo field recordings from Freesound.
+Both recordings were released under CC0 1.0 Universal.
+https://creativecommons.org/publicdomain/zero/1.0/
+
+soundrecorder7, "Light Rain"
+https://freesound.org/people/soundrecorder7/sounds/167034/
+
+rifualk, "Forest Rainstorm 01"
+https://freesound.org/people/rifualk/sounds/648474/
+
+The excerpts were trimmed to 16-second loops, crossfaded, filtered,
+level-adjusted and resampled to 24 kHz stereo.

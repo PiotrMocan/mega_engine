@@ -24,7 +24,7 @@ inline constexpr const char* vcr_game_module_entry_symbol =
 
 [[nodiscard]] constexpr std::uint32_t vcr_current_module_abi_stamp() noexcept {
     // The public SceneDocument/SceneNode layout is part of the C++ module ABI.
-    std::uint32_t stamp = 4U << 24U;
+    std::uint32_t stamp = 5U << 24U;
 #if defined(_DEBUG)
     stamp |= 1U << 0U;
 #endif

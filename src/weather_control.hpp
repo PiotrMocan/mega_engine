@@ -39,8 +39,8 @@ bool apply_weather_command(const nlohmann::json& request, SceneDocument& scene,
         patch.erase(it);
     }
     if (!read_weather(patch, next)) { error = "Invalid weather parameters"; return false; }
-    if (next.clouds.enabled && !renderer.fog_supported()) {
-        error = "Clouds require sampled depth and HDR blending";
+    if ((next.clouds.enabled || next.rain.enabled) && !renderer.fog_supported()) {
+        error = "Clouds and rain require sampled depth and HDR blending";
         return false;
     }
     if (change_clock) clock.dynamic = true;
@@ -66,6 +66,9 @@ inline nlohmann::json weather_state(const SceneDocument& scene, const Renderer& 
     result["current_clouds"] = weather_json({renderer.current_clouds()})["clouds"];
     result["active"] = renderer.clouds_active();
     result["current_storm"] = storm_json(renderer.current_storm());
+    result["current_rain"] = rain_json(renderer.weather().rain());
+    result["rain_active"] = renderer.rain_active();
+    result["surface_wetness"] = renderer.weather().wetness();
     result["storm_running"] = renderer.thunderstorm().running();
     result["discharges"] = renderer.thunderstorm().sequence();
     result["flash"] = renderer.thunderstorm().light();

@@ -1066,9 +1066,12 @@ void EditorApplication::main_loop() {
         const std::uint64_t viewport_generation_before =
             renderer_.editor_viewport_generation();
         renderer_.set_weather(scene_.weather);
+        renderer_.update_rain_shelters(scene_, camera_.position());
         const bool rendered = renderer_.draw_frame(
             timings, camera_.view_matrix(), draw_data);
         update_storm_audio(renderer_.thunderstorm(), audio_engine_, ui_.play_state() == EditorPlayState::edit);
+        audio_engine_.set_rain(renderer_.rain_active() ? renderer_.weather().rainfall() : 0,
+            renderer_.weather().rain().volume, renderer_.rain_sheltered(), ui_.play_state() == EditorPlayState::edit);
         if (options_.mcp_stdio) {
             complete_mcp_screenshot();
         }

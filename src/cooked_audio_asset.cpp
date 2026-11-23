@@ -147,12 +147,19 @@ private:
 
 bool read_embedded_mono_audio(std::span<const unsigned char> bytes, std::uint32_t rate,
                               std::span<float> output) noexcept {
-    const auto config = ma_decoder_config_init(ma_format_f32, 1, rate);
+    return read_embedded_audio(bytes, rate, 1, output);
+}
+
+bool read_embedded_audio(std::span<const unsigned char> bytes, std::uint32_t rate,
+                         std::uint32_t channels, std::span<float> output) noexcept {
+    if ((channels != 1 && channels != 2) || output.size() % channels != 0) return false;
+    const auto frames = output.size() / channels;
+    const auto config = ma_decoder_config_init(ma_format_f32, channels, rate);
     ScopedMaDecoder decoder;
     if (!decoder.open(bytes, config)) return false;
     ma_uint64 read = 0;
-    return ma_decoder_read_pcm_frames(decoder.get(), output.data(), output.size(), &read) == MA_SUCCESS &&
-           read == output.size();
+    return ma_decoder_read_pcm_frames(decoder.get(), output.data(), frames, &read) == MA_SUCCESS &&
+           read == frames;
 }
 
 bool inspect_audio_source_file(

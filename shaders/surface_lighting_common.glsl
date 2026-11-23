@@ -5,6 +5,7 @@
 #include "voxel_sampling.glsl"
 #include "punctual_lighting.glsl"
 #include "cloud_density.glsl"
+#include "rain_common.glsl"
 #include "subsurface_output.glsl"
 
 layout(set = 0, binding = 0, std140) uniform FrameUniforms
@@ -168,6 +169,18 @@ PbrLightingComponents evaluateLitSurfaceComponents(
 {
     const vec3 viewDirection =
         normalize(frame.cameraPosition.xyz - worldPosition);
+    float splash = 0.0;
+    float wet = lighting.rain.y;
+    if ((wet > 0.0 || lighting.rain.x > 0.0) && rainExposed(worldPosition)) {
+        float facing = smoothstep(-.15,.75,geomNormal.y);
+        wet *= facing;
+        clampedBaseColor *= 1.0-.27*wet*(1.0-materialParameters.x);
+        materialParameters.y = mix(materialParameters.y,min(materialParameters.y,.19),wet*.82);
+        float nearby = 1.0-smoothstep(5.0,16.0,length(frame.cameraPosition.xyz-worldPosition));
+        if (nearby * facing * lighting.rain.x * lighting.rain.z > .001) {
+            splash = rainImpact(worldPosition.xz, nearby*facing*lighting.rain.z, normal);
+        }
+    }
     const vec3 lightDirection =
         normalize(frame.sunDirectionIntensity.xyz);
     float rawVisibility = 0.0;
@@ -241,6 +254,7 @@ PbrLightingComponents evaluateLitSurfaceComponents(
         subsurfaceStrength);
     lightingComponents.diffuse += punctual.diffuse;
     lightingComponents.specular += punctual.specular;
+    lightingComponents.specular += splash * (diffuseAmbient*.36 + directRadiance*.055);
     return lightingComponents;
 }
 

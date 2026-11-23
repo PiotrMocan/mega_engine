@@ -2,6 +2,7 @@
 #extension GL_GOOGLE_include_directive:require
 #include "lighting_common.glsl"
 #include "cloud_density.glsl"
+#include "rain_common.glsl"
 #include "subsurface_output.glsl"
 
 layout(location = 0) in vec2 inNdc;
@@ -118,6 +119,10 @@ void main()
 
     vec3 surface = oceanSurface(position.xz, footprint, horizonFade);
     vec3 normal = normalize(vec3(-surface.y, 1.0, -surface.z));
+    if (lighting.rain.x * lighting.rain.z > 0.0 && distanceToWater < 20.0 && rainExposed(position)) {
+        float nearby = 1.0 - smoothstep(6.0,20.0,distanceToWater);
+        rainImpact(position.xz, nearby*lighting.rain.z, normal);
+    }
     vec3 view = -ray;
     float nDotV = max(dot(normal, view), 0.001);
     float fresnel = 0.0204 + 0.9796 * pow(1.0 - nDotV, 5.0);

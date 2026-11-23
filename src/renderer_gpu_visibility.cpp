@@ -687,7 +687,7 @@ bool Renderer::should_use_hiz_occlusion() const noexcept {
         scene_metadata_.size() < visibility_settings_.occlusion_threshold) {
         return false;
     }
-    const bool sampled_effect_depth = clouds_active() || fog_active() || !scene_effects_.empty() || (lens_supported_ &&
+    const bool sampled_effect_depth = clouds_active() || rain_active() || fog_active() || !scene_effects_.empty() || (lens_supported_ &&
         (bloom_enabled_ || camera_focus_state_.active || (authored_scene_enabled_ && editor_ocean_visible_ &&
             frames_[frame_index_].rendered_camera_position.y < editor_ocean_height_)));
     if (is_msaa(anti_aliasing_.method) && (!hiz_msaa_min_resolve_ || sampled_effect_depth)) {

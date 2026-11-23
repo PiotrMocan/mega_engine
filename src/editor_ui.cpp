@@ -10858,6 +10858,7 @@ void EditorUi::build_weather_panel(SceneDocument& scene, Renderer& renderer) {
             c.enabled = true;
             weather.storm.enabled = false;
             weather.storm.rain_buildup = 0;
+            weather.rain.enabled = false;
             renderer.thunderstorm().set_override(std::nullopt);
             changed = true;
         }
@@ -10908,6 +10909,16 @@ void EditorUi::build_weather_panel(SceneDocument& scene, Renderer& renderer) {
         if (ImGui::Button("Stop simulation")) renderer.thunderstorm().set_override(false);
         ImGui::SameLine();
         ImGui::TextDisabled("%s", renderer.thunderstorm().running() ? "Running" : "Stopped");
+        ImGui::SeparatorText("Rain");
+        auto& rain = weather.rain;
+        changed |= ImGui::Checkbox("Rain enabled", &rain.enabled);
+        if (ImGui::Button("Drizzle")) { rain.enabled = true; rain.intensity = .18F; changed = true; }
+        ImGui::SameLine();
+        if (ImGui::Button("Downpour")) { rain.enabled = true; rain.intensity = 1; changed = true; }
+        changed |= ImGui::SliderFloat("Rain intensity", &rain.intensity, 0, 1, "%.2f", clamp);
+        changed |= ImGui::DragFloat("Drop speed", &rain.fall_speed, .1F, 1, 20, "%.1f m/s", clamp);
+        changed |= ImGui::SliderFloat("Surface splashes", &rain.splashes, 0, 1, "%.2f", clamp);
+        changed |= ImGui::SliderFloat("Rain volume", &rain.volume, 0, 1, "%.2f", clamp);
         ImGui::Separator();
         changed |= ImGui::DragFloat("Transition", &weather.transition_seconds, 0.1F, 0, 86400, "%.1f s", clamp);
         ImGui::EndDisabled();

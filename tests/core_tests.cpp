@@ -2332,7 +2332,8 @@ int main() {
             .base_height = 370, .thickness = 180, .wind_direction = 283, .wind_speed = 18,
             .shadow_strength = 0.8F, .variation_chance = 0.1F, .variation_amount = 0.65F}, .transition_seconds = 6,
             .storm = {.rain_buildup = 0.75F, .enabled = true, .interval_seconds = 11.0F,
-                      .flash_strength = 0.4F, .thunder_volume = 0.6F, .thunder_duration = 7.0F}};
+                      .flash_strength = 0.4F, .thunder_volume = 0.6F, .thunder_duration = 7.0F},
+            .rain = {.enabled = true, .intensity = .43F, .fall_speed = 12, .splashes = .3F, .volume = .8F}};
         source_scene.fog = vcr::FogSettings{
             .enabled = true,
             .color = {1.5F, 0.4F, 0.2F},

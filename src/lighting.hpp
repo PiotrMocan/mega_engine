@@ -70,8 +70,12 @@ struct alignas(16) LightingUniforms {
     glm::vec4 cloud_variation{}; // affected fraction, signed deviation range, vertical bounds in metres (min/max)
     glm::vec4 cloud_storm{}; // rain buildup, inverse square of glow radius
     glm::vec4 cloud_flash{}; // world-space discharge center, radiant strength
+    glm::vec4 rain{}; // intensity, accumulated wetness, splash gain, seconds
+    glm::vec4 rain_motion{}; // displacement in the wrapping local volume, shelter count
+    glm::vec4 rain_velocity{};
+    std::array<TransformRows, 8> rain_shelters{}; // world to unit box
 };
-static_assert(sizeof(LightingUniforms) == 608);
+static_assert(sizeof(LightingUniforms) == 1040);
 static_assert(sizeof(GiTriangle) == 48);
 struct LightingStatistics {
     std::uint64_t shadow_passes = 0, shadow_tiles = 0;

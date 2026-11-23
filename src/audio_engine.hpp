@@ -186,6 +186,7 @@ public:
     AudioVoiceHandle play_thunder(glm::vec3 position, float volume, float duration_seconds,
                                   std::uint32_t seed, bool preview = false) noexcept;
     void stop_thunder() noexcept;
+    void set_rain(float intensity, float volume, bool sheltered, bool preview = false) noexcept;
 
     void stop_voice(
         AudioVoiceHandle handle,

@@ -379,5 +379,25 @@ int main() {
         storm.reset();
         expect(!storm.requested(s) && !storm.take_sound(), "reset clears audition and pending thunder");
     }
+    {
+        vcr::WeatherSystem rain;
+        vcr::WeatherSettings w;
+        rain.reset(w);
+        w.transition_seconds = 4;
+        w.rain.enabled = true;
+        w.rain.intensity = 1;
+        rain.set(w);
+        rain.advance(2);
+        expect(std::abs(rain.rainfall()-.5F) < 1e-5F && rain.rain_fall() != 0 && rain.wetness() > 0,
+               "rain ramps up and wets surfaces without storm or clouds");
+        w.rain.enabled = false;
+        rain.set(w);
+        rain.advance(2);
+        expect(std::abs(rain.rainfall()-.25F) < 1e-5F, "rain reversal starts from current intensity");
+        rain.advance(2);
+        expect(rain.rainfall() == 0 && rain.wetness() > 0, "surfaces remain wet after drops stop");
+        rain.advance(400);
+        expect(rain.wetness() == 0, "dry surfaces eventually leave the weather shader path");
+    }
     std::puts("Lighting invariants passed");
 }

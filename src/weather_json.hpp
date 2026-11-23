@@ -41,10 +41,28 @@ inline nlohmann::json storm_json(const StormSettings& settings) {
     return storm;
 }
 
+struct RainField {
+    const char* key;
+    float RainSettings::*member;
+    float minimum, maximum;
+};
+inline constexpr std::array rain_fields{
+    RainField{"intensity", &RainSettings::intensity, 0, 1},
+    RainField{"fall_speed", &RainSettings::fall_speed, 1, 20},
+    RainField{"splashes", &RainSettings::splashes, 0, 1},
+    RainField{"volume", &RainSettings::volume, 0, 1}
+};
+inline nlohmann::json rain_json(const RainSettings& settings) {
+    nlohmann::json rain{{"enabled", settings.enabled}};
+    for (const auto& f : rain_fields) rain[f.key] = settings.*f.member;
+    return rain;
+}
+
 inline nlohmann::json weather_json(const WeatherSettings& settings) {
     nlohmann::json clouds{{"enabled", settings.clouds.enabled}};
     for (const auto& f : cloud_fields) clouds[f.key] = settings.clouds.*f.member;
-    return {{"clouds", std::move(clouds)}, {"transition_seconds", settings.transition_seconds}, {"storm", storm_json(settings.storm)}};
+    return {{"clouds", std::move(clouds)}, {"transition_seconds", settings.transition_seconds},
+            {"storm", storm_json(settings.storm)}, {"rain", rain_json(settings.rain)}};
 }
 
 template<class Settings, class Fields>
@@ -76,6 +94,8 @@ inline bool read_weather(const nlohmann::json& source, WeatherSettings& target) 
             if (!read_weather_fields(value, next.clouds, cloud_fields)) return false;
         } else if (key == "storm" && value.is_object()) {
             if (!read_weather_fields(value, next.storm, storm_fields)) return false;
+        } else if (key == "rain" && value.is_object()) {
+            if (!read_weather_fields(value, next.rain, rain_fields)) return false;
         } else return false;
     }
     if (!valid_weather(next)) return false;

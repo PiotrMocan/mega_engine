@@ -477,14 +477,17 @@ set(VCR_ENGINE_CORE_SOURCES
     src/crash_log.cpp
 )
 
-set(VCR_THUNDER_BANK "${CMAKE_CURRENT_SOURCE_DIR}/resources/audio/thunder.flac")
-set(VCR_THUNDER_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/generated/thunder_recordings.cpp")
-add_custom_command(OUTPUT "${VCR_THUNDER_SOURCE}"
-    COMMAND "${CMAKE_COMMAND}" "-DINPUT=${VCR_THUNDER_BANK}" "-DOUTPUT=${VCR_THUNDER_SOURCE}"
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_thunder.cmake"
-    DEPENDS "${VCR_THUNDER_BANK}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_thunder.cmake"
-    VERBATIM)
-add_library(vcr_engine SHARED ${VCR_ENGINE_CORE_SOURCES} "${VCR_THUNDER_SOURCE}")
+foreach(effect IN ITEMS thunder rain)
+    set(bank "${CMAKE_CURRENT_SOURCE_DIR}/resources/audio/${effect}.flac")
+    set(source "${CMAKE_CURRENT_BINARY_DIR}/generated/${effect}_recordings.cpp")
+    add_custom_command(OUTPUT "${source}"
+        COMMAND "${CMAKE_COMMAND}" "-DINPUT=${bank}" "-DOUTPUT=${source}" "-DEFFECT=${effect}"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_weather_audio.cmake"
+        DEPENDS "${bank}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_weather_audio.cmake"
+        VERBATIM)
+    list(APPEND VCR_ENGINE_CORE_SOURCES "${source}")
+endforeach()
+add_library(vcr_engine SHARED ${VCR_ENGINE_CORE_SOURCES})
 add_library(vcr::engine ALIAS vcr_engine)
 set_source_files_properties(src/miniaudio_impl.c PROPERTIES
     COMPILE_OPTIONS "$<IF:$<C_COMPILER_ID:MSVC>,/W0,-w>"

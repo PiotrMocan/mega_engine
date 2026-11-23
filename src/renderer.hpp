@@ -324,6 +324,10 @@ public:
     Thunderstorm& thunderstorm() noexcept { return thunderstorm_; }
     const Thunderstorm& thunderstorm() const noexcept { return thunderstorm_; }
     const StormSettings& current_storm() const noexcept { return weather_.storm(); }
+    const WeatherSystem& weather() const noexcept { return weather_; }
+    bool rain_active() const noexcept { return fog_supported_ && mode_ != RunMode::instancing && weather_.rainfall() > 0; }
+    bool rain_sheltered() const noexcept { return rain_sheltered_; }
+    void update_rain_shelters(const SceneDocument& scene, glm::vec3 camera);
     void set_weather(const WeatherSettings& weather) noexcept { weather_.set(weather); }
     [[nodiscard]] const CloudSettings& current_clouds() const noexcept { return weather_.clouds(); }
     [[nodiscard]] bool clouds_active() const noexcept {
@@ -813,7 +817,8 @@ private:
     void create_display_mapping_resources();
     void destroy_display_mapping_resources() noexcept;
     void record_depth_effect(VkCommandBuffer command_buffer, AntiAliasingFrameResources& resources,
-        VkExtent2D extent, VkPipeline pipeline, std::span<const std::byte> constants, bool sample_color);
+        VkExtent2D extent, VkPipeline pipeline, std::span<const std::byte> constants, bool sample_color,
+        std::uint32_t vertices = 3, std::uint32_t instances = 1);
     void record_auto_exposure(
         VkCommandBuffer command_buffer,
         FrameContext& frame,
@@ -930,6 +935,11 @@ private:
     Thunderstorm thunderstorm_{};
     GpuTexture cloud_noise_{};
     DeviceObject<VkPipeline> cloud_pipeline_{};
+    DeviceObject<VkPipeline> rain_pipeline_{};
+    bool rain_sheltered_ = false;
+    float shelter_refresh_ = 0;
+    glm::vec3 shelter_origin_{};
+    std::uint64_t shelter_scene_ = 0;
     LightingSettings lighting_settings_{};
     ToneMapper tone_mapper_ = ToneMapper::reinhard;
     ExposureSettings exposure_settings_{};

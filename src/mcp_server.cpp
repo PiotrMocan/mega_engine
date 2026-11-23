@@ -399,12 +399,16 @@ void append_weather_tools(Json& tools) {
     for (const auto& f : storm_fields)
         storm[f.key] = {{"type","number"}, {"minimum",f.minimum}, {"maximum",f.maximum}};
     Json fields{{"enabled", {{"type","boolean"}}}};
+    Json rain{{"enabled", {{"type","boolean"}}}};
+    for (const auto& f : rain_fields)
+        rain[f.key] = {{"type","number"}, {"minimum",f.minimum}, {"maximum",f.maximum}};
     for (const auto& f : cloud_fields)
         fields[f.key] = {{"type","number"}, {"minimum",f.minimum}, {"maximum",f.maximum}};
     tools.push_back(tool_definition("weather.set", "Change weather",
         "Change cloud properties or the daylight clock. Transition duration is in seconds, altitude in metres, "
         "wind speed in m/s and heading in degrees from +X toward +Z. Omitted fields keep their values.",
         object_schema(Json{{"clouds", object_schema(std::move(fields))}, {"storm", object_schema(std::move(storm))},
+            {"rain", object_schema(std::move(rain))},
             {"transition_seconds", {{"type","number"},{"minimum",0},{"maximum",86400}}},
             {"hour", {{"type","number"},{"minimum",0},{"exclusiveMaximum",24}}},
             {"cycle", {{"type","boolean"}}},

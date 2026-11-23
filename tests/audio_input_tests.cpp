@@ -408,6 +408,39 @@ void test_audio_assets_and_sound_cues(const std::filesystem::path& asset_root) {
         "pick_sound_cue_variation avoids immediate clip repeats and honors pitch/volume bounds");
 }
 
+void test_rain_playback() {
+    vcr::AudioEngine engine;
+    std::string error;
+    if (!engine.initialize({.sample_rate = 8000, .enable_hardware_output = false}, error)) {
+        expect(false, "initialize rain mixer"); return;
+    }
+    std::vector<float> block(8000 * 2);
+    auto energy = [&] {
+        engine.render_frames_for_test(block);
+        double sum = 0;
+        for (float x : block) sum += x*x;
+        return sum;
+    };
+    expect(energy() == 0, "dry weather is silent");
+    engine.set_rain(.16F, .8F, false);
+    const double drizzle = energy();
+    engine.set_rain(1, .8F, false);
+    const double downpour = energy();
+    expect(drizzle > .01 && downpour > 2*drizzle, "two rain recordings follow intensity");
+    engine.set_rain(1, .8F, true);
+    energy();
+    expect(energy() < downpour*.15, "roof muffles rain");
+    engine.set_gameplay_paused(true);
+    expect(energy() == 0, "gameplay pause silences rain");
+    engine.set_rain(1, .8F, false, true);
+    for (int i = 0; i < 17; ++i) energy();
+    expect(energy() > 1, "editor rain plays across a stereo loop boundary");
+    engine.set_rain(0, .8F, false, true);
+    energy();
+    energy();
+    expect(energy() == 0, "rain fades to silence");
+}
+
 void test_thunder_playback() {
     vcr::AudioEngine engine;
     std::string error;
@@ -831,6 +864,7 @@ int main() {
     test_input_action_system(scratch_root);
     test_audio_assets_and_sound_cues(scratch_root);
     test_thunder_playback();
+    test_rain_playback();
     test_audio_engine_dsp_and_spatial(scratch_root);
     test_scene_and_prefab_audio_roundtrip(scratch_root);
 

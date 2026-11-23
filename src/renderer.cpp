@@ -6580,7 +6580,8 @@ void Renderer::record_depth_effect(
     const VkCommandBuffer command_buffer,
     AntiAliasingFrameResources& resources,
     const VkExtent2D extent, const VkPipeline pipeline,
-    const std::span<const std::byte> constants, const bool sample_color) {
+    const std::span<const std::byte> constants, const bool sample_color,
+    const std::uint32_t vertices, const std::uint32_t instances) {
     constexpr auto sampled_stages = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     if (sample_color) {
         // The current slot's reconstruction target is scratch until SMAA/FSR writes
@@ -6651,7 +6652,7 @@ void Renderer::record_depth_effect(
             post_process_pipeline_layout_, 0U, 1U, &resources.descriptor_set, 0U, nullptr);
         if (!constants.empty()) vkCmdPushConstants(command_buffer, post_process_pipeline_layout_,
             VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, 0U, static_cast<std::uint32_t>(constants.size()), constants.data());
-        vkCmdDraw(command_buffer, 3U, 1U, 0U, 0U);
+        vkCmdDraw(command_buffer, vertices, instances, 0U, 0U);
     }
     vkCmdEndRendering(command_buffer);
     transition_tracked_image(
@@ -7365,7 +7366,8 @@ void Renderer::create_pipeline() {
         .descriptorCount = 1U,
         .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
     };
-    anti_aliasing_bindings[19] = {19U, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    anti_aliasing_bindings[19] = {19U, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     anti_aliasing_bindings[20] = {20U, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     const VkDescriptorSetLayoutCreateInfo
         anti_aliasing_descriptor_info{
@@ -9354,6 +9356,9 @@ void Renderer::create_pipeline() {
         cloud_pipeline_ = DeviceObject<VkPipeline>(context_->device(),
             create_fullscreen_pipeline("clouds.frag.spv", aa_color_format, post_process_pipeline_layout_,
                 fog_blend_attachment, VK_FORMAT_UNDEFINED, "Volumetric clouds"), vkDestroyPipeline);
+        rain_pipeline_ = DeviceObject<VkPipeline>(context_->device(),
+            create_fullscreen_pipeline("rain.frag.spv", aa_color_format, post_process_pipeline_layout_,
+                fog_blend_attachment, VK_FORMAT_UNDEFINED, "Wind-driven rain", cached_shader("rain.vert.spv")), vkDestroyPipeline);
         fog_pipeline_ = DeviceObject<VkPipeline>(
             context_->device(),
             create_fullscreen_pipeline(
@@ -9702,6 +9707,7 @@ void Renderer::destroy_pipeline() noexcept {
 #endif
     lens_pipeline_.reset();
     cloud_pipeline_.reset();
+    rain_pipeline_.reset();
     fog_pipeline_.reset();
     for (std::size_t index = 0U; index < msaa_geometry_.size(); ++index) {
         msaa_geometry_[index] = {};
@@ -11381,7 +11387,7 @@ void Renderer::record_commands(
         !is_temporal_smaa(anti_aliasing_) && motion_blur_mode_actual() == MotionBlurMode::off &&
         subsurface_mode_actual() != SubsurfaceMode::full_resolution;
 #endif
-    const bool sample_scene_depth = clouds_active() || fog_active() || lens_active || scene_effects_active || weighted_transparency;
+    const bool sample_scene_depth = clouds_active() || rain_active() || fog_active() || lens_active || scene_effects_active || weighted_transparency;
     const bool motion_blur_active =
         motion_blur_mode_actual() != MotionBlurMode::off;
     const bool motion_blur_before_smaa =
@@ -12153,6 +12159,10 @@ void Renderer::record_commands(
             };
             record_depth_effect(command_buffer, aa_resources, current_render_extent_, fog_pipeline_.get(),
                 std::as_bytes(std::span{&push, 1U}), false);
+        }
+        if (rain_active()) {
+            const auto drops = static_cast<std::uint32_t>(18'000.0F * weather_.rainfall());
+            record_depth_effect(command_buffer, aa_resources, current_render_extent_, rain_pipeline_.get(), {}, false, 6, drops + 1);
         }
         if (lens_active) {
             const float focal_length = 0.012F / std::tan(glm::radians(vertical_fov_degrees_) * 0.5F);
