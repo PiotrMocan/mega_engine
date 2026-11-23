@@ -225,6 +225,15 @@ void GpuTexture::create_storage_pyramid(
         debug_name, 1U, VK_SAMPLE_COUNT_1_BIT, false);
 }
 
+void GpuTexture::create_storage_volume(VulkanContext& context, VkExtent3D extent,
+                                       VkFormat format, std::string_view name) {
+    create_impl(context, extent.width, extent.height, 1, format,
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                VK_IMAGE_ASPECT_COLOR_BIT, VK_FILTER_LINEAR,
+                VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_FALSE, VK_COMPARE_OP_ALWAYS,
+                VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK, name, extent.depth);
+}
+
 void GpuTexture::create_volume(VulkanContext &context, std::uint32_t size, std::uint32_t mips,
                                VkFormat format, std::string_view name) {
     // Use depth >= 2 so the view remains 3D even for the disabled dummy volume.

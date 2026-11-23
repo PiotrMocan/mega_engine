@@ -1,0 +1,25 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#define LIGHTING_SET 0
+#define CLOUD_BAKE
+#include "lighting_common.glsl"
+#include "cloud_density.glsl"
+
+layout(local_size_x=8, local_size_y=8) in;
+layout(set=0, binding=14, rgba16f) uniform writeonly image3D densityVolume;
+
+void main() {
+    ivec2 cell = ivec2(gl_GlobalInvocationID.xy);
+    ivec3 size = imageSize(densityVolume);
+    vec2 xz = lighting.cloudCache.xy + ((vec2(cell) + 0.5) / vec2(size.xy) - 0.5) * lighting.cloudCache.z;
+    CloudFormation formation = cloudFormation(xz);
+    for (int z = 0; z < size.z; ++z) {
+        float y = mix(lighting.cloudVariation.z, lighting.cloudVariation.w, (float(z) + 0.5) / float(size.z));
+        vec3 p = vec3(xz.x, y, xz.y);
+        float unused, h;
+        float coarse = cloudDensity(p, vec2(0), formation, unused);
+        float medium = cloudDensity(p, vec2(1,0), formation, h);
+        float fine = cloudDensity(p, vec2(1), formation, unused);
+        imageStore(densityVolume, ivec3(cell,z), vec4(coarse, medium, fine, h));
+    }
+}

@@ -74,13 +74,15 @@ struct alignas(16) LightingUniforms {
     glm::vec4 rain_motion{}; // displacement in the wrapping local volume, shelter count
     glm::vec4 rain_velocity{};
     std::array<TransformRows, 8> rain_shelters{}; // world to unit box
+    glm::vec4 cloud_cache{}; // world X/Z center, tile width, reference height for shadows
 };
-static_assert(sizeof(LightingUniforms) == 1040);
+static_assert(sizeof(LightingUniforms) == 1056);
 static_assert(sizeof(GiTriangle) == 48);
 struct LightingStatistics {
     std::uint64_t shadow_passes = 0, shadow_tiles = 0;
     std::uint32_t last_shadow_mask = 0;
     std::uint64_t geometry_updates = 0, radiance_updates = 0;
+    std::uint64_t cloud_density_bakes = 0, cloud_shadow_bakes = 0;
     std::uint32_t pending_bricks = 0, processed_triangles = 0;
     double oldest_geometry_ms = 0.0;
     std::uint64_t mesh_bytes = 0;

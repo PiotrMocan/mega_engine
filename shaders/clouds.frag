@@ -3,6 +3,7 @@
 #define LIGHTING_SET 0
 #define LIGHTING_BINDING 19
 #define CLOUD_NOISE_BINDING 20
+#define CLOUD_VIEW
 #include "lighting_common.glsl"
 #include "cloud_density.glsl"
 
@@ -15,6 +16,28 @@ layout(set=0, binding=13, std140) uniform Frame {
     vec4 cameraPosition;
 } frame;
 
+layout(set=0,binding=21) uniform sampler3D bakedCloudDensity;
+
+float viewCloudDensity(vec3 p, vec2 weights, out float h) {
+    float z = (p.y - lighting.cloudVariation.z) / (lighting.cloudVariation.w - lighting.cloudVariation.z);
+    if (z <= 0.0 || z >= 1.0) { h = 0.0; return 0.0; }
+    float blend = 0.0;
+    vec2 cached = vec2(0.0);
+    if (lighting.cloudCache.z > 0.0) {
+        vec2 uv = (p.xz - lighting.cloudCache.xy) / lighting.cloudCache.z + 0.5;
+        float edge = (0.5 - max(abs(uv.x - 0.5), abs(uv.y - 0.5))) * float(textureSize(bakedCloudDensity,0).x);
+        if (edge > 0.5) {
+            vec4 band = textureLod(bakedCloudDensity, vec3(uv,z), 0);
+            cached = vec2(band.x + dot(weights, band.yz - band.xy), band.w);
+            if (edge >= 3.0) { h = cached.y; return cached.x; }
+            blend = smoothstep(0.5, 3.0, edge);
+        }
+    }
+    float density = cloudDensity(p, weights, cloudFormation(p.xz), h);
+    h = mix(h, cached.y, blend);
+    return mix(density, cached.x, blend);
+}
+
 void main() {
     vec2 uv = gl_FragCoord.xy * lighting.clusterViewport.zw;
     float depth = texelFetch(sceneDepth, ivec2(gl_FragCoord.xy), 0).r;
@@ -25,23 +48,37 @@ void main() {
     vec2 interval = cloudInterval(frame.cameraPosition.xyz, ray, limit);
     if (interval.y <= interval.x) discard;
 
-    const int steps = 32;
-    float stepLength = (interval.y - interval.x) / float(steps);
-    vec3 p = frame.cameraPosition.xyz + ray * (interval.x + 0.5 * stepLength);
+    float distance = interval.y - interval.x;
+    // March in metres from the entry point. Uniform subdivisions of the slab
+    // sample identical horizontal planes in every pixel below the clouds.
+    float phase = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+    float lateral = length(ray.xz);
+    // The geometric series covers even a horizontal ray inside a ten-metre
+    // layer in at most 64 segments. Clip the last segment to opaque geometry.
+    const float growth = 1.08;
+    float stepLength = max(lighting.cloudLayer.y * 0.021, distance * (growth - 1.0) / (pow(growth, 64.0) - 1.0));
+    float t = interval.x;
     vec3 sun = lighting.sunDirectionIntensity.xyz;
     float extinction = 12.0 * lighting.cloudLayer.w / lighting.cloudLayer.y;
     vec3 sunlight = lighting.sunColor.rgb * lighting.sunDirectionIntensity.w;
     vec3 ambient = lighting.skyHorizon.rgb;
     float silver = pow(max(dot(ray, sun), 0.0), 12.0);
-    vec2 weights = cloudDetailWeights(max(stepLength * length(ray.xz), interval.x * lighting.clusterViewport.w));
+    float lightStep = lighting.cloudLayer.y * 0.14;
+    vec3 lightOffset = sun * (1.5 * lightStep);
+    vec2 lightWeights = cloudDetailWeights(lightStep * length(sun.xz));
     float transmission = 1.0;
     vec3 scattered = vec3(0.0);
-    for (int i = 0; i < steps; ++i, p += ray * stepLength) {
+    for (int i = 0; i < 64 && t < interval.y; ++i, t += stepLength, stepLength *= growth) {
+        stepLength = min(stepLength, interval.y - t);
+        float sampleDistance = t + (0.40 + 0.20 * phase) * stepLength;
+        vec3 p = frame.cameraPosition.xyz + ray * sampleDistance;
+        float footprint = max(stepLength * lateral, t * lighting.clusterViewport.w);
+        vec2 weights = cloudDetailWeights(footprint);
         float h;
-        float density = cloudDensity(p, weights, cloudFormation(p.xz), h);
+        float density = viewCloudDensity(p, weights, h);
         if (density <= 0.0) continue;
-        float lightStep = lighting.cloudLayer.y * 0.18;
-        float blocker = cloudDensity(p + sun * lightStep, weights) + cloudDensity(p + sun * (lightStep * 2.0), weights);
+        float lightH;
+        float blocker = 2.0 * viewCloudDensity(p + lightOffset, lightWeights, lightH);
         float sunLight = exp(-extinction * lightStep * (0.45 * density + blocker));
         float fill = mix(0.30, 0.80, h) + 0.22 * exp(-2.5 * blocker);
         vec3 source = ambient * fill
@@ -60,6 +97,7 @@ void main() {
             float diffuse = 0.40 + 0.60 * exp(-1.3 * blocker);
             source += vec3(1.8, 1.95, 2.65) * (lighting.cloudFlash.w * glow * diffuse);
         }
+        source = mix(source, ambient, 0.90 * smoothstep(4500.0, 80000.0, sampleDistance));
         float slice = 1.0 - exp(-density * extinction * stepLength);
         scattered += transmission * slice * source;
         transmission *= 1.0 - slice;
@@ -73,6 +111,5 @@ void main() {
     float opacity = 1.0 - transmission;
     if (opacity <= 0.0001) discard;
     vec3 color = scattered / opacity;
-    color = mix(color, ambient, smoothstep(4500.0, 80000.0, interval.x) * 0.9);
     outColor = vec4(color, opacity);
 }

@@ -1,0 +1,28 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#define LIGHTING_SET 0
+#define CLOUD_BAKE
+#include "lighting_common.glsl"
+#include "cloud_density.glsl"
+
+layout(local_size_x=8, local_size_y=8) in;
+layout(set=0,binding=15,rgba16f) uniform writeonly image2D shadowMap;
+
+void main() {
+    ivec2 cell = ivec2(gl_GlobalInvocationID.xy);
+    vec2 xz = lighting.cloudCache.xy + ((vec2(cell) + 0.5) / vec2(imageSize(shadowMap)) - 0.5) * lighting.cloudCache.z;
+    vec3 sun = lighting.sunDirectionIntensity.xyz;
+    vec3 origin = vec3(xz.x, lighting.cloudCache.w, xz.y);
+    float bottom = lighting.cloudVariation.z;
+    float stepY = cloudShadowHeightStep();
+    // All four receivers lie on the same sun ray. Below the bottom of the
+    // layer their optical depth is identical, irrespective of terrain height.
+    float full = cloudSunTransmission(origin + sun * ((bottom - origin.y) / sun.y), sun);
+    vec4 result = vec4(full);
+    for (int i = 0; i < 3; ++i) {
+        float dy = float(i-1) * stepY;
+        if (origin.y + dy > bottom)
+            result[i] = cloudSunTransmission(origin + sun * (dy / sun.y), sun);
+    }
+    imageStore(shadowMap, cell, result);
+}

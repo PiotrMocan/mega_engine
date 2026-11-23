@@ -64,6 +64,8 @@ public:
         std::string_view debug_name);
     void create_volume(VulkanContext &context, std::uint32_t size, std::uint32_t mips,
                        VkFormat format, std::string_view debug_name);
+    void create_storage_volume(VulkanContext& context, VkExtent3D extent,
+                               VkFormat format, std::string_view debug_name);
     void create_sampled_volume(
         VulkanContext& context,
         std::uint32_t size,

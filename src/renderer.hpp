@@ -885,6 +885,14 @@ private:
     WeatherSystem weather_{};
     Thunderstorm thunderstorm_{};
     GpuTexture cloud_noise_{};
+    GpuTexture cloud_density_cache_{}, cloud_shadow_cache_{};
+    DeviceObject<VkPipeline> cloud_density_bake_{}, cloud_shadow_bake_{};
+    bool cloud_cache_layout_ready_ = false;
+    glm::vec2 cloud_tile_origin_{};
+    std::array<glm::vec4, 2> baked_cloud_shape_{};
+    glm::vec4 baked_shadow_layer_{}, baked_shadow_sun_{};
+    bool cloud_shadow_valid_ = false;
+    void record_cloud_cache(VkCommandBuffer command, FrameContext& frame);
     DeviceObject<VkPipeline> cloud_pipeline_{};
     DeviceObject<VkPipeline> rain_pipeline_{};
     bool rain_sheltered_ = false;

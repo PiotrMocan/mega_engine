@@ -5252,7 +5252,7 @@ void Renderer::create_anti_aliasing_descriptors() {
     const std::array pool_sizes{
         VkDescriptorPoolSize{
             .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .descriptorCount = max_frames_in_flight * 15U,
+            .descriptorCount = max_frames_in_flight * 16U,
         },
         VkDescriptorPoolSize{
             .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -5340,7 +5340,7 @@ void Renderer::create_anti_aliasing_descriptors() {
                 .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             },
         };
-        std::array<VkWriteDescriptorSet, 21> writes{};
+        std::array<VkWriteDescriptorSet, 22> writes{};
         for (std::size_t source = 0; source < image_infos.size(); ++source) {
             const std::uint32_t binding = source < 6U
                 ? static_cast<std::uint32_t>(source)
@@ -5497,6 +5497,11 @@ void Renderer::create_anti_aliasing_descriptors() {
         writes[20] = VkWriteDescriptorSet{.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .dstSet = resources.descriptor_set, .dstBinding = 20U, .descriptorCount = 1U,
             .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &noise};
+        const VkDescriptorImageInfo density{cloud_density_cache_.sampler(), cloud_density_cache_.view(),
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        writes[21] = VkWriteDescriptorSet{.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = resources.descriptor_set, .dstBinding = 21U, .descriptorCount = 1U,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &density};
         vkUpdateDescriptorSets(
             context_->device(),
             static_cast<std::uint32_t>(writes.size()),
@@ -7159,7 +7164,7 @@ void Renderer::create_pipeline() {
     VK_CHECK(vkCreatePipelineLayout(
         context_->device(), &layout_info, nullptr, &pipeline_layout_));
 
-    std::array<VkDescriptorSetLayoutBinding, 21>
+    std::array<VkDescriptorSetLayoutBinding, 22>
         anti_aliasing_bindings{};
     for (std::size_t binding = 0; binding < 6U; ++binding) {
         anti_aliasing_bindings[binding] =
@@ -7241,6 +7246,7 @@ void Renderer::create_pipeline() {
     anti_aliasing_bindings[19] = {19U, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     anti_aliasing_bindings[20] = {20U, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    anti_aliasing_bindings[21] = {21U, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     const VkDescriptorSetLayoutCreateInfo
         anti_aliasing_descriptor_info{
             .sType =
@@ -10409,6 +10415,7 @@ void Renderer::record_commands(
         }
     }
 #endif
+    record_cloud_cache(command_buffer, frame);
     const bool geometry_update = gi_provisioned_ && voxel_job_active_ &&
                                  lighting_settings_.voxel_gi && mode_ != RunMode::instancing;
     const bool light_update = gi_provisioned_ && voxel_light_due_ && lighting_settings_.voxel_gi &&

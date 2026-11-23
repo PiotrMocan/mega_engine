@@ -1615,6 +1615,8 @@ void Application::execute_mcp_command(const McpCommand& command) {
                            {"shadow_resolution_requested", renderer_.lighting_settings().shadow_resolution},
                            {"geometry_updates", renderer_.lighting_statistics().geometry_updates},
                            {"radiance_updates", renderer_.lighting_statistics().radiance_updates},
+                           {"cloud_density_bakes", renderer_.lighting_statistics().cloud_density_bakes},
+                           {"cloud_shadow_bakes", renderer_.lighting_statistics().cloud_shadow_bakes},
                            {"pending_bricks", renderer_.lighting_statistics().pending_bricks},
                            {"oldest_geometry_ms",
                             renderer_.lighting_statistics().oldest_geometry_ms}}},

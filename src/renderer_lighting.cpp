@@ -12,6 +12,8 @@
 namespace vcr {
 namespace {
 constexpr VkFormat radiance_format = VK_FORMAT_R16G16B16A16_SFLOAT;
+constexpr VkExtent3D cloud_volume_extent{160, 160, 40};
+constexpr unsigned cloud_shadow_size = 512;
 constexpr VkPipelineStageFlags2 compute = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
 constexpr VkAccessFlags2 storage_rw =
     VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
@@ -94,6 +96,11 @@ void Renderer::create_lighting_resources() {
         VK_CHECK(support);
     if (support != VK_SUCCESS || (properties.optimalTilingFeatures & features) != features)
         fatal("Lighting requires filterable RGBA16F 3D storage images");
+    if (image_properties.maxExtent.width < cloud_volume_extent.width ||
+        image_properties.maxExtent.height < cloud_volume_extent.height ||
+        image_properties.maxExtent.depth < cloud_volume_extent.depth ||
+        limits.maxComputeWorkGroupSize[1] < 8)
+        fatal("Cloud cache exceeds storage volume or workgroup limits");
     const bool gi_supported =
         limits.maxStorageBufferRange >= sizeof(GiTriangle) * gi_max_triangles &&
         limits.maxComputeWorkGroupInvocations >= 64U &&
@@ -113,6 +120,10 @@ void Renderer::create_lighting_resources() {
         VK_FILTER_LINEAR, "Cloud density noise", VK_SAMPLER_ADDRESS_MODE_REPEAT);
     const auto noise = make_cloud_noise();
     upload_to_device_texture(cloud_noise_, std::as_bytes(std::span{noise}), 4, "Cloud density");
+    cloud_density_cache_.create_storage_volume(*context_, cloud_volume_extent, radiance_format, "Baked cloud density");
+    cloud_shadow_cache_.create_render_target(*context_, cloud_shadow_size, cloud_shadow_size, radiance_format,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT,
+        VK_FILTER_LINEAR, "Baked cloud sun visibility");
     constexpr auto host =
         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
     voxel_geometry_.create(
@@ -199,6 +210,10 @@ void Renderer::create_lighting_descriptor_layout() {
                                      nullptr},
         VkDescriptorSetLayoutBinding{12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
                                      VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        VkDescriptorSetLayoutBinding{13, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                     VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        VkDescriptorSetLayoutBinding{14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        VkDescriptorSetLayoutBinding{15, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
     };
     const VkDescriptorSetLayoutCreateInfo layout{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0,
@@ -212,9 +227,9 @@ void Renderer::create_lighting_descriptor_layout() {
 void Renderer::create_lighting_pipelines() {
     const std::array sizes{
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 12U},
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 6},
     };
     const VkDescriptorPoolCreateInfo pool{
         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, 2,
@@ -253,7 +268,17 @@ void Renderer::create_lighting_pipelines() {
             VkDescriptorImageInfo{VK_NULL_HANDLE, voxel_storage_view_.get(),
                                   VK_IMAGE_LAYOUT_GENERAL},
         };
-        std::array<VkWriteDescriptorSet, 10> writes{};
+        std::array<VkWriteDescriptorSet, 13> writes{};
+        const std::array cache_images{
+            VkDescriptorImageInfo{cloud_shadow_cache_.sampler(), cloud_shadow_cache_.view(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+            VkDescriptorImageInfo{VK_NULL_HANDLE, cloud_density_cache_.view(), VK_IMAGE_LAYOUT_GENERAL},
+            VkDescriptorImageInfo{VK_NULL_HANDLE, cloud_shadow_cache_.view(), VK_IMAGE_LAYOUT_GENERAL}};
+        for (unsigned i = 0; i < cache_images.size(); ++i) {
+            writes[10 + i] = VkWriteDescriptorSet{.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = frame.lighting_descriptor_set, .dstBinding = 13 + i, .descriptorCount = 1,
+                .descriptorType = i == 0 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                .pImageInfo = &cache_images[i]};
+        }
         const VkDescriptorImageInfo noise_info{cloud_noise_.sampler(), cloud_noise_.view(),
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         writes[9] = VkWriteDescriptorSet{
@@ -310,19 +335,20 @@ void Renderer::create_lighting_pipelines() {
         context_->set_debug_name(VK_OBJECT_TYPE_PIPELINE, handle_value(destination.get()),
                                  i == 0 ? "GI voxelize triangles" : "GI relight voxels");
     }
-    {
-        const auto shader = load_shader("cluster_lights.comp.spv");
+    const auto make_compute = [&](const char* file, DeviceObject<VkPipeline>& destination, const char* name) {
+        const auto shader = load_shader(file);
         VkComputePipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pipeline.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                           nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, shader.get(), "main", nullptr};
         pipeline.layout = lighting_compute_layout_.get();
         VK_CHECK(vkCreateComputePipelines(
             context_->device(), pipeline_cache_, 1, &pipeline, nullptr,
-            local_light_cluster_pipeline_.put(context_->device(), vkDestroyPipeline)));
-        context_->set_debug_name(
-            VK_OBJECT_TYPE_PIPELINE, handle_value(local_light_cluster_pipeline_.get()),
-            "cluster local lights");
-    }
+            destination.put(context_->device(), vkDestroyPipeline)));
+        context_->set_debug_name(VK_OBJECT_TYPE_PIPELINE, handle_value(destination.get()), name);
+    };
+    make_compute("cluster_lights.comp.spv", local_light_cluster_pipeline_, "cluster local lights");
+    make_compute("cloud_density_bake.comp.spv", cloud_density_bake_, "Bake cloud volume");
+    make_compute("cloud_shadow_bake.comp.spv", cloud_shadow_bake_, "Bake cloud shadows");
 }
 void Renderer::ensure_gi_triangle_capacity(const std::uint64_t required) {
     if (!gi_provisioned_ || required <= voxel_triangle_capacity_) return;
@@ -561,6 +587,16 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
     u.cloud_wind_shadow = glm::vec4(static_cast<float>(weather_.offset_x()),
         static_cast<float>(weather_.offset_z()), clouds.shadow_strength,
         clouds.enabled && fog_supported_ && mode_ != RunMode::instancing ? 1.0F : 0.0F);
+    if (u.cloud_layer.z > 0.0F) {
+        const glm::vec3 eye = -(glm::transpose(glm::mat3(view)) * glm::vec3(view[3]));
+        const glm::vec2 wind{u.cloud_wind_shadow.x, u.cloud_wind_shadow.y};
+        const float width = glm::mix(6400.0F, 25600.0F, glm::smoothstep(550.0F, 3800.0F, thickness));
+        // Snap in advected space by an integer number of texels in both caches.
+        // A wind change therefore translates the existing samples continuously.
+        const float grid = width / 8.0F;
+        cloud_tile_origin_ = glm::round((glm::vec2(eye.x, eye.z) - wind) / grid) * grid;
+        u.cloud_cache = {cloud_tile_origin_ + wind, width, std::round(eye.y / 16.0F) * 16.0F};
+    }
     const double hour = wrap_day_hour(lighting_settings_.hour);
     const bool night = hour < 6.0 || hour >= 18.0;
     const bool local_lights_changed =
@@ -772,6 +808,62 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
     frame.lighting_uniform_buffer.write(std::as_bytes(std::span{&u, std::size_t{1}}));
 }
 
+void Renderer::record_cloud_cache(VkCommandBuffer command, FrameContext& frame) {
+    constexpr auto readers = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    constexpr auto sampled = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    constexpr auto read_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    if (!cloud_cache_layout_ready_) {
+        for (auto image : {cloud_density_cache_.image(), cloud_shadow_cache_.image()})
+            transition_image(command, image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                read_layout, VK_PIPELINE_STAGE_2_NONE, 0, readers, sampled);
+        cloud_cache_layout_ready_ = true;
+    }
+    const auto& u = lighting_uniforms_;
+    if (u.cloud_layer.z <= 0 || u.cloud_cache.z <= 0) return;
+    const std::array shape{
+        glm::vec4(cloud_tile_origin_, u.cloud_cache.z, u.cloud_layer.z),
+        glm::vec4(glm::vec2(u.cloud_variation), 0.0F, 0.0F)};
+    const bool density_dirty = shape != baked_cloud_shape_;
+    // The normalized density grid is independent of base height, sun, density
+    // multiplier and lightning. Ground transmittance additionally depends on
+    // layer and receiver heights, optical density and the sun direction.
+    const glm::vec4 layer{u.cloud_layer.x, u.cloud_layer.y, u.cloud_layer.w, u.cloud_cache.w};
+    const glm::vec3 sun{u.sun_direction_intensity};
+    bool shadow_dirty = false;
+    if (u.cloud_wind_shadow.z > 0 && sun.y > 0.001F) {
+        const glm::vec2 slope{sun.x / sun.y, sun.z / sun.y};
+        const float height = std::max(u.cloud_layer.y, std::abs(u.cloud_variation.w - u.cloud_cache.w));
+        shadow_dirty = !cloud_shadow_valid_ || density_dirty || layer != baked_shadow_layer_ ||
+            glm::length(slope - glm::vec2(baked_shadow_sun_)) * height > 0.25F * u.cloud_cache.z / cloud_shadow_size;
+        if (shadow_dirty) baked_shadow_sun_ = {slope, 0, 0};
+    }
+    if (!density_dirty && !shadow_dirty) return;
+    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, lighting_compute_layout_.get(),
+        0, 1, &frame.lighting_descriptor_set, 0, nullptr);
+    // Both frame slots submit to the same graphics queue. These barriers
+    // retire earlier readers and publish the new contents without a CPU wait.
+    const auto bake = [&](GpuTexture& texture, VkPipeline pipeline) {
+        transition_image(command, texture.image(), VK_IMAGE_ASPECT_COLOR_BIT, read_layout, VK_IMAGE_LAYOUT_GENERAL,
+            readers, sampled, compute, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        vkCmdDispatch(command, (texture.width() + 7) / 8, (texture.height() + 7) / 8, 1);
+        transition_image(command, texture.image(), VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, read_layout,
+            compute, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, readers, sampled);
+    };
+    if (density_dirty) {
+        bake(cloud_density_cache_, cloud_density_bake_.get());
+        baked_cloud_shape_ = shape;
+        cloud_shadow_valid_ = false;
+        ++lighting_statistics_.cloud_density_bakes;
+    }
+    if (shadow_dirty) {
+        bake(cloud_shadow_cache_, cloud_shadow_bake_.get());
+        baked_shadow_layer_ = layer;
+        cloud_shadow_valid_ = true;
+        ++lighting_statistics_.cloud_shadow_bakes;
+    }
+}
+
 void Renderer::record_clustered_lights(
     const VkCommandBuffer command_buffer,
     FrameContext& frame) {
@@ -926,6 +1018,8 @@ void Renderer::record_voxel_light(VkCommandBuffer command, FrameContext &frame) 
     ++lighting_statistics_.radiance_updates;
 }
 void Renderer::destroy_lighting() noexcept {
+    cloud_density_bake_.reset();
+    cloud_shadow_bake_.reset();
     local_light_cluster_pipeline_.reset();
     voxel_geometry_pipeline_.reset();
     voxel_light_pipeline_.reset();
@@ -934,6 +1028,11 @@ void Renderer::destroy_lighting() noexcept {
     lighting_layout_.reset();
     voxel_storage_view_.reset();
     cloud_noise_.destroy();
+    cloud_density_cache_.destroy();
+    cloud_shadow_cache_.destroy();
+    cloud_cache_layout_ready_ = false;
+    cloud_shadow_valid_ = false;
+    baked_cloud_shape_ = {};
     voxel_radiance_.destroy();
     voxel_geometry_.destroy();
     voxel_triangles_.destroy();

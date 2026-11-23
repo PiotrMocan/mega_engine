@@ -684,6 +684,8 @@ std::string benchmark_result_to_json(const BenchmarkResult& result) {
     integer("gi_triangle_budget", result.lighting.triangle_budget);
     integer("gi_geometry_updates_total", result.lighting_statistics.geometry_updates);
     integer("gi_radiance_updates_total", result.lighting_statistics.radiance_updates);
+    integer("cloud_density_bakes_total", result.lighting_statistics.cloud_density_bakes);
+    integer("cloud_shadow_bakes_total", result.lighting_statistics.cloud_shadow_bakes);
     integer("gi_pending_bricks", result.lighting_statistics.pending_bricks);
     timing("gi_oldest_geometry_ms", result.lighting_statistics.oldest_geometry_ms);
     integer("gi_mesh_bytes", result.lighting_statistics.mesh_bytes);
