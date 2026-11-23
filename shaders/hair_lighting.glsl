@@ -245,11 +245,7 @@ PbrLightingComponents evaluateHairSurfaceComponents(
     }
     if (voxelGiCompiled && lighting.options.y > 0.5)
     {
-#ifdef VCR_SURFACE_SHADOW_EXPLICIT_LOD
-        diffuseAmbient = voxelDiffuseSurface(worldPosition, cylinderNormal, cylinderNormal);
-#else
         diffuseAmbient = voxelDiffuse(worldPosition, cylinderNormal);
-#endif
     }
 
     const vec3 tanBinorm = viewDirection - fiberTangent * dot(viewDirection, fiberTangent);

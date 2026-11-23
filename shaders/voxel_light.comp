@@ -1,8 +1,5 @@
 #version 460
 #extension GL_GOOGLE_include_directive:require
-#ifdef VCR_RAY_QUERY
-#extension GL_EXT_ray_query:require
-#endif
 #define LIGHTING_SET 0
 #include "lighting_common.glsl"
 #include "cloud_density.glsl"
@@ -39,16 +36,7 @@ void main() {
     vec3 sun=lighting.sunDirectionIntensity.xyz;
     float visibility=0.0;
     if(dot(normal,sun)>0 && lighting.sunDirectionIntensity.w>0) {
-#ifdef VCR_RAY_QUERY
-        if(lighting.volumeParameters.w>0.5) {
-            vec3 worldPos=lighting.volumeOriginCell.xyz
-                +(vec3(p)+0.5+normal*0.35)*lighting.volumeOriginCell.w;
-            visibility=rayTracedSunVisibilityWorld(worldPos,normal,sun,200.0);
-        } else
-#endif
-        {
-            visibility=sunVisibility(p,normal,sun);
-        }
+        visibility=sunVisibility(p,normal,sun);
     }
     if (visibility > 0.0) {
         vec3 world = lighting.volumeOriginCell.xyz + (vec3(p) + 0.5) * lighting.volumeOriginCell.w;

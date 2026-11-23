@@ -60,7 +60,6 @@ struct LightingOverrides {
     bool shadow_resolution = false;
     bool shadow_depth = false;
     bool cascade_cache = false;
-    bool ray_tracing = false;
 };
 
 struct FogOverrides {

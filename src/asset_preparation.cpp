@@ -3,7 +3,6 @@
 #include "texture_compression.hpp"
 #include "model_lod.hpp"
 #include "gpu_grass.hpp"
-#include "opacity_micromap.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -171,14 +170,13 @@ void for_each_material_texture_request(const CookedModelMaterial &material, Fn &
                : 0.5F)
         : 0.0F;
     fn(material.base_color_texture,
-       is_alpha_masked,
        is_alpha_masked || is_alpha_transparent,
        alpha_cutoff);
-    fn(material.normal_texture, false, false, 0.0F);
-    fn(material.metallic_roughness_texture, false, false, 0.0F);
-    fn(material.displacement_texture, false, false, 0.0F);
-    fn(material.emissive_texture, false, false, 0.0F);
-    fn(material.landscape_detail_texture, false, false, 0.0F);
+    fn(material.normal_texture, false, 0.0F);
+    fn(material.metallic_roughness_texture, false, 0.0F);
+    fn(material.displacement_texture, false, 0.0F);
+    fn(material.emissive_texture, false, 0.0F);
+    fn(material.landscape_detail_texture, false, 0.0F);
 }
 
 } // namespace
@@ -284,7 +282,6 @@ PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,
         }
         std::vector<float> texture_mip_cutoffs;
         const auto texture = [&](const std::optional<std::filesystem::path> &reference,
-                                 const bool needs_opacity_pixels = false,
                                  const bool build_mips_if_partial_alpha = false,
                                  const float alpha_cutoff = 0.0F) {
             if (!reference) {
@@ -293,7 +290,7 @@ PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,
             const auto key = reference->lexically_normal().generic_string();
             const bool is_resident =
                 std::ranges::find(resident_textures, key) != resident_textures.end();
-            if (!needs_opacity_pixels && is_resident) {
+            if (is_resident) {
                 return;
             }
             const auto existing = std::ranges::find_if(
@@ -305,7 +302,7 @@ PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,
                     build_mips_if_partial_alpha &&
                     (texture_mip_cutoffs[existing_index] < 0.0F ||
                      (alpha_cutoff > 0.0F && texture_mip_cutoffs[existing_index] <= 0.0F));
-                if (!is_resident && existing->texture.has_value() && needs_upgrade) {
+                if (existing->texture.has_value() && needs_upgrade) {
                     build_texture_mip_chain(
                         *existing->texture, alpha_cutoff, *existing, result.upload_bytes);
                     texture_mip_cutoffs[existing_index] = alpha_cutoff;
@@ -327,7 +324,7 @@ PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,
                 result.upload_bytes += decoded->pixels.size() + 256;
                 entry.average_linear = compute_texture_average_linear(*decoded);
                 entry.texture = std::move(decoded).value();
-                if (!is_resident && build_mips_if_partial_alpha &&
+                if (build_mips_if_partial_alpha &&
                     entry.texture->pixel_format == CookedTexturePixelFormat::rgba8_unorm) {
                     build_texture_mip_chain(
                         *entry.texture, alpha_cutoff, entry, result.upload_bytes);
@@ -338,84 +335,7 @@ PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,
             texture_mip_cutoffs.push_back(applied_cutoff);
         };
         for (const auto &material : model.materials) {
-            for_each_material_texture_request(
-                material,
-                [&texture](const std::optional<std::filesystem::path> &reference,
-                           const bool needs_opacity_pixels,
-                           const bool build_mips_if_partial_alpha,
-                           const float alpha_cutoff) {
-                    texture(reference, needs_opacity_pixels, build_mips_if_partial_alpha,
-                            alpha_cutoff);
-                });
-        }
-        result.submesh_rt_alpha_paths.resize(model.submeshes.size());
-        result.submesh_rt_triangles.resize(model.submeshes.size());
-        for (std::size_t submesh_index = 0U; submesh_index < model.submeshes.size();
-             ++submesh_index) {
-            const auto &submesh = model.submeshes[submesh_index];
-            if (submesh.material_index >= model.materials.size()) {
-                continue;
-            }
-            const auto &material = model.materials[submesh.material_index];
-            if ((material.coverage & 1U) == 0U) {
-                continue;
-            }
-            std::string alpha_path{};
-            bool has_alpha_texture = false;
-            if (material.base_color_texture) {
-                const auto key =
-                    material.base_color_texture->lexically_normal().generic_string();
-                const auto existing_alpha = std::ranges::find_if(
-                    result.alpha_maps, [&](const auto &m) { return m.path == key; });
-                if (existing_alpha != result.alpha_maps.end()) {
-                    alpha_path = key;
-                    has_alpha_texture = true;
-                } else {
-                    const auto found = std::ranges::find_if(
-                        result.textures, [&](const auto &t) { return t.path == key; });
-                    if (found != result.textures.end() && found->texture &&
-                        found->texture->semantic == CookedTextureSemantic::base_color &&
-                        found->texture->color_space == CookedTextureColorSpace::srgb) {
-                        auto words = pack_alpha_r8_1024_words(*found->texture);
-                        if (!words.empty()) {
-                            const std::size_t alpha_bytes =
-                                words.size() * sizeof(std::uint32_t) + 256U;
-                            if (alpha_bytes > maximum_prepared_asset_bytes - result.upload_bytes) {
-                                result.error =
-                                    "Prepared RT alpha maps exceed the 512 MiB upload budget";
-                                return result;
-                            }
-                            result.upload_bytes += alpha_bytes;
-                            result.alpha_maps.push_back(PreparedAlphaMap{
-                                .path = key,
-                                .words = std::move(words),
-                            });
-                            alpha_path = key;
-                            has_alpha_texture = true;
-                        }
-                    }
-                }
-            }
-            auto triangles = bake_rt_masked_triangles(
-                model.vertices,
-                model.indices,
-                static_cast<std::size_t>(submesh.first_index),
-                static_cast<std::size_t>(submesh.index_count),
-                has_alpha_texture,
-                material.factors.base_color.a,
-                material.coverage);
-            if (!triangles.empty()) {
-                const std::size_t tri_bytes =
-                    triangles.size() * sizeof(RtMaskedTriangle) + 256U;
-                if (tri_bytes > maximum_prepared_asset_bytes - result.upload_bytes) {
-                    result.error =
-                        "Prepared RT masked triangles exceed the 512 MiB upload budget";
-                    return result;
-                }
-                result.upload_bytes += tri_bytes;
-                result.submesh_rt_alpha_paths[submesh_index] = std::move(alpha_path);
-                result.submesh_rt_triangles[submesh_index] = std::move(triangles);
-            }
+            for_each_material_texture_request(material, texture);
         }
         result.model = std::move(model);
     } catch (const std::exception &e) {
@@ -427,8 +347,7 @@ PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,
 BatchPreparedAssets prepare_model_assets_batch(
     const std::filesystem::path &root,
     const std::span<const std::string> model_paths,
-    const std::span<const std::string> resident_textures,
-    const std::span<const std::string> resident_rt_alpha_maps) {
+    const std::span<const std::string> resident_textures) {
     BatchPreparedAssets batch{};
     if (model_paths.empty()) {
         return batch;
@@ -438,7 +357,6 @@ BatchPreparedAssets prepare_model_assets_batch(
         std::filesystem::path reference{};
         std::string key{};
         bool needs_mips = false;
-        bool needs_rt_alpha = false;
         float alpha_cutoff = 0.0F;
     };
 
@@ -461,7 +379,6 @@ BatchPreparedAssets prepare_model_assets_batch(
                 for_each_material_texture_request(
                     material,
                     [&reqs](const std::optional<std::filesystem::path> &reference,
-                            const bool needs_rt_alpha,
                             const bool needs_mips,
                             const float alpha_cutoff) {
                         if (!reference) {
@@ -471,7 +388,6 @@ BatchPreparedAssets prepare_model_assets_batch(
                             .reference = *reference,
                             .key = reference->lexically_normal().generic_string(),
                             .needs_mips = needs_mips,
-                            .needs_rt_alpha = needs_rt_alpha,
                             .alpha_cutoff = alpha_cutoff,
                         });
                     });
@@ -489,18 +405,11 @@ BatchPreparedAssets prepare_model_assets_batch(
     for (const auto &tex_path : resident_textures) {
         resident_tex_set.insert(tex_path);
     }
-    TransparentStringSet resident_rt_alpha_set;
-    resident_rt_alpha_set.reserve(resident_rt_alpha_maps.size());
-    for (const auto &alpha_path : resident_rt_alpha_maps) {
-        resident_rt_alpha_set.insert(alpha_path);
-    }
 
     struct UniqueTextureJob {
         std::filesystem::path reference{};
         std::string key{};
-        bool already_resident = false;
         bool needs_mips = false;
-        bool needs_rt_alpha = false;
         float alpha_cutoff = 0.0F;
     };
     std::vector<UniqueTextureJob> unique_jobs;
@@ -511,9 +420,7 @@ BatchPreparedAssets prepare_model_assets_batch(
         }
         for (const auto &req : per_model_tex_reqs[i]) {
             const bool already_resident = resident_tex_set.contains(req.key);
-            const bool already_rt_alpha = resident_rt_alpha_set.contains(req.key);
-            const bool needs_rt_alpha = req.needs_rt_alpha && !already_rt_alpha;
-            if (already_resident && !needs_rt_alpha) {
+            if (already_resident) {
                 continue;
             }
             const auto [it, inserted] = unique_job_map.emplace(req.key, unique_jobs.size());
@@ -521,15 +428,12 @@ BatchPreparedAssets prepare_model_assets_batch(
                 unique_jobs.push_back(UniqueTextureJob{
                     .reference = req.reference,
                     .key = req.key,
-                    .already_resident = already_resident,
                     .needs_mips = req.needs_mips,
-                    .needs_rt_alpha = needs_rt_alpha,
                     .alpha_cutoff = req.alpha_cutoff > 0.0F ? req.alpha_cutoff : 0.0F,
                 });
             } else {
                 UniqueTextureJob &job = unique_jobs[it->second];
                 job.needs_mips = job.needs_mips || req.needs_mips;
-                job.needs_rt_alpha = job.needs_rt_alpha || needs_rt_alpha;
                 if (req.alpha_cutoff > 0.0F &&
                     (job.alpha_cutoff <= 0.0F || req.alpha_cutoff < job.alpha_cutoff)) {
                     job.alpha_cutoff = req.alpha_cutoff;
@@ -538,9 +442,8 @@ BatchPreparedAssets prepare_model_assets_batch(
         }
     }
 
-    // Pass 3: Parallel Unique Texture Decode, Mipgen & Alpha Pack.
+    // Decode each missing texture and prepare its filtered mip chain.
     std::vector<std::optional<PreparedTexture>> tex_results(unique_jobs.size());
-    std::vector<std::optional<PreparedAlphaMap>> alpha_results(unique_jobs.size());
     parallel_for_jobs(unique_jobs.size(), [&](const std::size_t j) {
         const UniqueTextureJob &job = unique_jobs[j];
         try {
@@ -548,138 +451,31 @@ BatchPreparedAssets prepare_model_assets_batch(
             texture_options.maximum_decoded_bytes =
                 std::min<std::size_t>(128ULL * 1024 * 1024, maximum_prepared_asset_bytes);
             auto decoded = load_cooked_texture_asset(root, job.reference, texture_options);
+            PreparedTexture entry{.path = job.key};
             if (!decoded) {
-                if (!job.already_resident) {
-                    PreparedTexture entry{.path = job.key};
-                    entry.error = decoded.error().message;
-                    tex_results[j] = std::move(entry);
-                }
-                return;
-            }
-            if (decoded->pixels.size() > maximum_prepared_asset_bytes ||
-                256U > maximum_prepared_asset_bytes - decoded->pixels.size()) {
-                if (!job.already_resident) {
-                    PreparedTexture entry{.path = job.key};
-                    entry.error = "Prepared textures exceed the 512 MiB upload budget";
-                    tex_results[j] = std::move(entry);
-                }
-                return;
-            }
-            if (job.needs_rt_alpha &&
-                decoded->semantic == CookedTextureSemantic::base_color &&
-                decoded->color_space == CookedTextureColorSpace::srgb) {
-                auto words = pack_alpha_r8_1024_words(*decoded);
-                if (!words.empty() &&
-                    words.size() <= (maximum_prepared_asset_bytes - 256U) / sizeof(std::uint32_t)) {
-                    alpha_results[j] = PreparedAlphaMap{
-                        .path = job.key,
-                        .words = std::move(words),
-                    };
-                }
-            }
-            if (!job.already_resident) {
-                PreparedTexture entry{.path = job.key};
+                entry.error = decoded.error().message;
+            } else if (decoded->pixels.size() > maximum_prepared_asset_bytes - 256U) {
+                entry.error = "Prepared textures exceed the 512 MiB upload budget";
+            } else {
                 std::size_t tex_upload_bytes = decoded->pixels.size() + 256U;
                 entry.average_linear = compute_texture_average_linear(*decoded);
                 entry.texture = std::move(decoded).value();
                 if (job.needs_mips &&
                     entry.texture->pixel_format == CookedTexturePixelFormat::rgba8_unorm) {
-                    build_texture_mip_chain(
-                        *entry.texture, job.alpha_cutoff, entry, tex_upload_bytes);
+                    build_texture_mip_chain(*entry.texture, job.alpha_cutoff, entry, tex_upload_bytes);
                 }
-                tex_results[j] = std::move(entry);
             }
+            tex_results[j] = std::move(entry);
         } catch (const std::exception &e) {
-            if (!job.already_resident) {
-                PreparedTexture entry{.path = job.key};
-                entry.error = e.what();
-                tex_results[j] = std::move(entry);
-            }
+            tex_results[j] = PreparedTexture{.path = job.key, .error = e.what()};
         }
     }, model_paths.size());
 
-    TransparentStringSet packed_alpha_keys;
     for (std::size_t j = 0U; j < unique_jobs.size(); ++j) {
         if (tex_results[j].has_value()) {
             batch.shared_textures.push_back(std::move(*tex_results[j]));
         }
-        if (alpha_results[j].has_value()) {
-            packed_alpha_keys.insert(alpha_results[j]->path);
-            batch.shared_alpha_maps.push_back(std::move(*alpha_results[j]));
-        }
     }
-
-    // Pass 4: Parallel RT Masked Triangle Bake.
-    parallel_for_jobs(batch.models.size(), [&](const std::size_t i) {
-        PreparedModel &entry = batch.models[i];
-        if (!entry.model) {
-            return;
-        }
-        try {
-            const CookedModelAsset &model = *entry.model;
-            entry.submesh_rt_alpha_paths.resize(model.submeshes.size());
-            entry.submesh_rt_triangles.resize(model.submeshes.size());
-            for (std::size_t submesh_index = 0U; submesh_index < model.submeshes.size();
-                 ++submesh_index) {
-                const auto &submesh = model.submeshes[submesh_index];
-                if (submesh.material_index >= model.materials.size()) {
-                    continue;
-                }
-                const auto &material = model.materials[submesh.material_index];
-                if ((material.coverage & material_coverage_alpha_mask_bit) == 0U) {
-                    continue;
-                }
-                std::string alpha_path{};
-                bool has_alpha_texture = false;
-                if (material.base_color_texture) {
-                    const auto key =
-                        material.base_color_texture->lexically_normal().generic_string();
-                    if (packed_alpha_keys.contains(key) ||
-                        resident_rt_alpha_set.contains(key)) {
-                        alpha_path = key;
-                        has_alpha_texture = true;
-                    }
-                }
-                auto triangles = bake_rt_masked_triangles(
-                    model.vertices,
-                    model.indices,
-                    static_cast<std::size_t>(submesh.first_index),
-                    static_cast<std::size_t>(submesh.index_count),
-                    has_alpha_texture,
-                    material.factors.base_color.a,
-                    material.coverage);
-                if (!triangles.empty()) {
-                    if (triangles.size() >
-                            (maximum_prepared_asset_bytes - 256U) / sizeof(RtMaskedTriangle)) {
-                        entry.error =
-                            "Prepared RT masked triangles exceed the 512 MiB upload budget";
-                        entry.model.reset();
-                        entry.submesh_rt_alpha_paths.clear();
-                        entry.submesh_rt_triangles.clear();
-                        return;
-                    }
-                    const std::size_t tri_bytes =
-                        triangles.size() * sizeof(RtMaskedTriangle) + 256U;
-                    if (tri_bytes > maximum_prepared_asset_bytes - entry.upload_bytes) {
-                        entry.error =
-                            "Prepared RT masked triangles exceed the 512 MiB upload budget";
-                        entry.model.reset();
-                        entry.submesh_rt_alpha_paths.clear();
-                        entry.submesh_rt_triangles.clear();
-                        return;
-                    }
-                    entry.upload_bytes += tri_bytes;
-                    entry.submesh_rt_alpha_paths[submesh_index] = std::move(alpha_path);
-                    entry.submesh_rt_triangles[submesh_index] = std::move(triangles);
-                }
-            }
-        } catch (const std::exception &e) {
-            entry.error = e.what();
-            entry.model.reset();
-            entry.submesh_rt_alpha_paths.clear();
-            entry.submesh_rt_triangles.clear();
-        }
-    }, model_paths.size());
 
     return batch;
 }

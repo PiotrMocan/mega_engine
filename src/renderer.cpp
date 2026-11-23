@@ -379,8 +379,6 @@ enum TimestampQuery : std::uint32_t {
     timestamp_exposure_end,
     timestamp_motion_blur_begin,
     timestamp_motion_blur_end,
-    timestamp_tlas_begin,
-    timestamp_tlas_end,
     timestamp_query_count,
 };
 
@@ -880,12 +878,7 @@ void Renderer::shutdown() noexcept {
     asset_preparation_.stop();
     asset_upload_.stop();
     destroy_gpu_visibility();
-    destroy_ray_tracing();
-#if VCR_EDITOR_ENABLED
-    rt_alpha_maps_.clear();
-#endif
     destroy_lighting();
-    demo_rt_transforms_.clear();
     asset_requests_.clear();
     asset_requests_pending_ = 0;
     async_assets_ = false;
@@ -2424,10 +2417,7 @@ void Renderer::record_model_skinning(
     std::uint32_t shadow_frustum_count = 0U;
     if (frustum_culling_enabled) {
         camera_frustum.emplace(frame.rendered_view_projection);
-        const bool rt_shadows_active =
-            ray_tracing_uses_shadows(ray_tracing_mode_actual());
         const bool sun_shadows_inactive =
-            rt_shadows_active ||
             (lighting_settings_.dynamic &&
              lighting_uniforms_.sun_direction_intensity.w <= 0.0F);
         const bool directional_shadows_updated =
@@ -2866,9 +2856,6 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
         material_descriptors[material_index] = *descriptor;
     }
 
-    for (const auto& alpha_map : prepared.alpha_maps) {
-        static_cast<void>(find_or_upload_rt_alpha_map(alpha_map.path, &alpha_map.words));
-    }
 
     for (std::size_t submesh_index = 0; submesh_index < model.submeshes.size(); ++submesh_index) {
         const CookedModelSubmesh& source = model.submeshes[submesh_index];
@@ -2931,31 +2918,6 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
             minimum_uv = glm::min(minimum_uv, coordinate);
             maximum_uv = glm::max(maximum_uv, coordinate);
         }
-        std::uint32_t rt_opacity_first = 0U;
-        std::uint32_t rt_opacity_count = 0U;
-        std::string rt_alpha_texture_path{};
-        std::vector<RtMaskedTriangle> cpu_rt_triangles{};
-        if (submesh_index < prepared.submesh_rt_triangles.size() &&
-            !prepared.submesh_rt_triangles[submesh_index].empty()) {
-            cpu_rt_triangles = prepared.submesh_rt_triangles[submesh_index];
-            if (submesh_index < prepared.submesh_rt_alpha_paths.size()) {
-                rt_alpha_texture_path = prepared.submesh_rt_alpha_paths[submesh_index];
-            }
-            if (rt_provisioned_) {
-                const std::uint32_t alpha_word_offset = rt_alpha_texture_path.empty()
-                    ? 0U
-                    : find_or_upload_rt_alpha_map(rt_alpha_texture_path, nullptr);
-                if (!rt_alpha_texture_path.empty()) {
-                    for (auto& tri : cpu_rt_triangles) {
-                        if (tri.effective_cutoff <= 1.0F) {
-                            tri.texel_word_offset = alpha_word_offset;
-                        }
-                    }
-                }
-                rt_opacity_first = append_rt_masked_triangles(cpu_rt_triangles);
-                rt_opacity_count = static_cast<std::uint32_t>(cpu_rt_triangles.size());
-            }
-        }
         gpu_asset.submeshes.push_back(EditorModelSubmesh{
             .coverage = coverage,
             .material_relative_path = std::move(material_relative_path),
@@ -2968,10 +2930,6 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
             .gi_first = gi_first,
             .gi_count = gi_count,
             .gi_albedo = gi_albedo,
-            .rt_opacity_first = rt_opacity_first,
-            .rt_opacity_count = rt_opacity_count,
-            .rt_alpha_texture_path = std::move(rt_alpha_texture_path),
-            .cpu_rt_triangles = std::move(cpu_rt_triangles),
             .lod_first = source.lod_first,
             .lod_count = source.lod_count,
             .lod_error = source.lod_error,
@@ -3010,10 +2968,6 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
         gpu_asset.bounds = enlarge_gpu_grass_local_bounds(gpu_asset.bounds);
     }
 
-    const VkBufferUsageFlags rt_geometry_usage = context_->ray_query_supported()
-        ? (VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-           VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR)
-        : 0U;
     const VkBufferUsageFlags skin_source_usage = model.is_skinned()
         ? VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
         : 0U;
@@ -3022,8 +2976,7 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
         static_cast<VkDeviceSize>(vertex_bytes),
         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
             VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-            skin_source_usage |
-            rt_geometry_usage,
+            skin_source_usage,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
         "editor imported model vertex buffer");
@@ -3031,8 +2984,7 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
         *context_,
         static_cast<VkDeviceSize>(index_bytes),
         VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-            VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-            rt_geometry_usage,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
         "editor imported model index buffer");
@@ -3070,9 +3022,6 @@ std::optional<std::uint32_t> Renderer::publish_editor_model(const PreparedModel 
     upload_to_device_buffer(
         gpu_asset.index_buffer,
         std::as_bytes(std::span{model.indices}));
-    if (rt_provisioned_) {
-        build_model_blas_on_upload(gpu_asset);
-    }
 
     const auto asset_index =
         static_cast<std::uint32_t>(editor_model_assets_.size());
@@ -3276,7 +3225,7 @@ bool Renderer::update_editor_scene(
             return a.asset_path == b.asset_path ? a.detail_aa < b.detail_aa : a.asset_path < b.asset_path;
         });
 
-    // Material descriptors, BLAS alpha tables and textures form one residency group.
+    // Material descriptors and textures form one residency group.
     // Rebuild that group only at a scene boundary when previous assets can be reclaimed.
     if ((texture_budget_pressure_ || editor_texture_gpu_bytes_ >= texture_budget_ - texture_budget_ / 4) &&
         std::ranges::any_of(editor_model_assets_, [&](const auto& asset) {
@@ -3594,23 +3543,10 @@ bool Renderer::apply_editor_material(
                     const std::uint32_t diff = submesh.coverage ^ updated_coverage;
                     const bool transparency_changed =
                         (diff & material_coverage_transparent_mask) != 0U;
-                    const bool alpha_mask_changed =
-                        (diff & material_coverage_alpha_mask_bit) != 0U;
                     submesh.coverage = updated_coverage;
                     shadow_dirty_ = true;
                     if (transparency_changed) {
                         gi_scene_revision_ = 0U;
-                    }
-                    if ((transparency_changed || alpha_mask_changed) && rt_provisioned_) {
-                        if ((*coverage & material_coverage_transparent_mask) == 0U &&
-                            (!submesh.blas || alpha_mask_changed)) {
-                            submesh.blas_dirty = true;
-                            rt_blas_refresh_pending_ = true;
-                        }
-                        for (FrameContext& frame_ctx : frames_) {
-                            frame_ctx.tlas_built_once = false;
-                        }
-                        rt_tlas_build_due_ = true;
                     }
                 }
                 updated = true;
@@ -3667,7 +3603,6 @@ void Renderer::reset_editor_asset_cache() {
     transparent_model_draw_indices_.clear();
     visible_model_draws_.clear();
     editor_scene_instances_.clear();
-    rt_alpha_maps_.clear();
     editor_model_assets_.clear();
     editor_model_asset_lookup_.clear();
     prev_committed_runtime_revision_ = 0U;
@@ -3723,40 +3658,6 @@ void Renderer::reset_editor_asset_cache() {
                 .pBufferInfo = &visibility_info,
             };
             vkUpdateDescriptorSets(context_->device(), 1U, &write, 0U, nullptr);
-        }
-    }
-    const bool had_rt = rt_provisioned_;
-    destroy_ray_tracing();
-    if (had_rt) {
-        rt_provisioned_ = true;
-        create_ray_tracing_resources();
-        const VkDescriptorBufferInfo micromap_info{
-            rt_opacity_micromaps_.handle(), 0, rt_opacity_micromaps_.size()};
-        const VkDescriptorBufferInfo alpha_info{
-            rt_alpha_texels_.handle(), 0, rt_alpha_texels_.size()};
-        for (const auto& frame : frames_) {
-            if (frame.lighting_descriptor_set == VK_NULL_HANDLE || !lighting_layout_has_rt_) {
-                continue;
-            }
-            const std::array<VkWriteDescriptorSet, 2> writes{{
-                VkWriteDescriptorSet{
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .dstSet = frame.lighting_descriptor_set,
-                    .dstBinding = 9U,
-                    .descriptorCount = 1U,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    .pBufferInfo = &micromap_info,
-                },
-                VkWriteDescriptorSet{
-                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .dstSet = frame.lighting_descriptor_set,
-                    .dstBinding = 11U,
-                    .descriptorCount = 1U,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    .pBufferInfo = &alpha_info,
-                },
-            }};
-            vkUpdateDescriptorSets(context_->device(), 2U, writes.data(), 0U, nullptr);
         }
     }
     if (gi_provisioned_) {
@@ -3895,23 +3796,17 @@ void Renderer::create_scene_resources() {
         context_->properties().limits.maxDrawIndexedIndexValue) {
         fatal("Terrain vertex count exceeds maxDrawIndexedIndexValue.");
     }
-    const VkBufferUsageFlags rt_geometry_usage = context_->ray_query_supported()
-        ? (VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-           VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR)
-        : 0U;
     vertex_buffer_.create(
         *context_,
         sizeof(kGeometryVertices),
-        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-            rt_geometry_usage,
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
         "scene vertex buffer");
     index_buffer_.create(
         *context_,
         sizeof(kGeometryIndices),
-        VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-            rt_geometry_usage,
+        VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
         "scene index buffer");
@@ -4072,20 +3967,6 @@ void Renderer::create_scene_resources() {
                 };
             }
         }
-    }
-    demo_rt_transforms_.resize(demo_instances.size());
-    for (std::size_t i = 0ULL; i < demo_instances.size(); ++i) {
-        const PbrInstanceData& inst = demo_instances[i];
-        const glm::quat q(inst.rotation.w, inst.rotation.x, inst.rotation.y, inst.rotation.z);
-        const glm::mat4 m =
-            glm::translate(glm::mat4(1.0F), glm::vec3(inst.translation)) *
-            glm::mat4_cast(q) *
-            glm::scale(glm::mat4(1.0F), glm::vec3(inst.scale));
-        demo_rt_transforms_[i] = TransformRows{
-            .x = glm::vec4(m[0][0], m[1][0], m[2][0], m[3][0]),
-            .y = glm::vec4(m[0][1], m[1][1], m[2][1], m[3][1]),
-            .z = glm::vec4(m[0][2], m[1][2], m[2][2], m[3][2]),
-        };
     }
     const PbrSampleMesh sample_mesh = create_pbr_sample_mesh();
 
@@ -4270,8 +4151,7 @@ void Renderer::create_scene_resources() {
         static_cast<VkDeviceSize>(sample_mesh.vertices.size()) *
             sizeof(Vertex),
         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-            VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-            rt_geometry_usage,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
         "PBR sample sphere vertex buffer");
@@ -4280,8 +4160,7 @@ void Renderer::create_scene_resources() {
         static_cast<VkDeviceSize>(sample_mesh.indices.size()) *
             sizeof(std::uint16_t),
         VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-            VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-            rt_geometry_usage,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
         "PBR sample sphere index buffer");
@@ -4290,8 +4169,7 @@ void Renderer::create_scene_resources() {
         static_cast<VkDeviceSize>(terrain_vertices.size()) *
             sizeof(TerrainVertex),
         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-            VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-            rt_geometry_usage,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0,
         "simplified heightfield vertex buffer");
@@ -4332,9 +4210,6 @@ void Renderer::create_scene_resources() {
         create_editor_material_resources();
     }
 #endif
-    if (rt_provisioned_) {
-        create_ray_tracing_resources();
-    }
 }
 
 void Renderer::create_sky_texture() {
@@ -6901,13 +6776,10 @@ void Renderer::update_frame_uniform(
 #endif
     const bool grass_frozen = gpu_grass_instances_ == 0 ||
         !authored_scene_enabled_ || mode_ == RunMode::instancing ||
-        ray_tracing_mode_actual() != RayTracingMode::off ||
         (lighting_settings_.dynamic && gi_provisioned_ && lighting_settings_.voxel_gi);
     const float wind = wrap_gpu_grass_wind_seconds(gpu_grass_elapsed_seconds_, grass_frozen);
     if (wind != gpu_grass_wind_seconds_) {
         shadow_dirty_ = true;
-        // RT/GI use the uploaded reference geometry. A mode switch must not
-        // produce temporal motion between a live blade and its static BLAS.
         if ((wind == 0.0F) != (gpu_grass_wind_seconds_ == 0.0F))
             invalidate_temporal_history();
     }
@@ -7499,40 +7371,29 @@ void Renderer::create_pipeline() {
             cached_shader("editor_model_depth_coverage.vert.spv"),
             cached_shader("editor_model_shadow.vert.spv")};
         const VkShaderModule masked_direct =
-            cached_shader(rt_provisioned_ ? "editor_model_rt.frag.spv" : "editor_model.frag.spv");
+            cached_shader("editor_model.frag.spv");
         const VkShaderModule masked_aa =
-            cached_shader(rt_provisioned_ ? "editor_model_aa_rt.frag.spv"
-                                          : "editor_model_aa.frag.spv");
+            cached_shader("editor_model_aa.frag.spv");
         const VkShaderModule masked_sss =
-            cached_shader(rt_provisioned_ ? "editor_model_sss_rt.frag.spv"
-                                          : "editor_model_sss.frag.spv");
+            cached_shader("editor_model_sss.frag.spv");
         const VkShaderModule masked_aa_sss =
-            cached_shader(rt_provisioned_ ? "editor_model_aa_sss_rt.frag.spv"
-                                          : "editor_model_aa_sss.frag.spv");
+            cached_shader("editor_model_aa_sss.frag.spv");
         const VkShaderModule equal_direct =
-            cached_shader(rt_provisioned_ ? "editor_model_equal_rt.frag.spv"
-                                          : "editor_model_equal.frag.spv");
+            cached_shader("editor_model_equal.frag.spv");
         const VkShaderModule equal_aa =
-            cached_shader(rt_provisioned_ ? "editor_model_aa_equal_rt.frag.spv"
-                                          : "editor_model_aa_equal.frag.spv");
+            cached_shader("editor_model_aa_equal.frag.spv");
         const VkShaderModule equal_sss =
-            cached_shader(rt_provisioned_ ? "editor_model_equal_sss_rt.frag.spv"
-                                          : "editor_model_equal_sss.frag.spv");
+            cached_shader("editor_model_equal_sss.frag.spv");
         const VkShaderModule equal_aa_sss =
-            cached_shader(rt_provisioned_ ? "editor_model_aa_equal_sss_rt.frag.spv"
-                                          : "editor_model_aa_equal_sss.frag.spv");
+            cached_shader("editor_model_aa_equal_sss.frag.spv");
         const VkShaderModule opaque_direct =
-            cached_shader(rt_provisioned_ ? "editor_model_opaque_rt.frag.spv"
-                                          : "editor_model_opaque.frag.spv");
+            cached_shader("editor_model_opaque.frag.spv");
         const VkShaderModule opaque_aa =
-            cached_shader(rt_provisioned_ ? "editor_model_aa_opaque_rt.frag.spv"
-                                          : "editor_model_aa_opaque.frag.spv");
+            cached_shader("editor_model_aa_opaque.frag.spv");
         const VkShaderModule opaque_sss =
-            cached_shader(rt_provisioned_ ? "editor_model_opaque_sss_rt.frag.spv"
-                                          : "editor_model_opaque_sss.frag.spv");
+            cached_shader("editor_model_opaque_sss.frag.spv");
         const VkShaderModule opaque_aa_sss =
-            cached_shader(rt_provisioned_ ? "editor_model_aa_opaque_sss_rt.frag.spv"
-                                          : "editor_model_aa_opaque_sss.frag.spv");
+            cached_shader("editor_model_aa_opaque_sss.frag.spv");
         equal_fragment_modules = {{
             {masked_direct, equal_direct},
             {masked_aa, equal_aa},
@@ -8041,22 +7902,22 @@ void Renderer::create_pipeline() {
     }
 #endif
     const char* const scene_frag_spv =
-        rt_provisioned_ ? "scene_rt.frag.spv" : "scene.frag.spv";
+        "scene.frag.spv";
     const char* const scene_aa_frag_spv =
-        rt_provisioned_ ? "scene_aa_rt.frag.spv" : "scene_aa.frag.spv";
+        "scene_aa.frag.spv";
     const char* const scene_sss_frag_spv =
-        rt_provisioned_ ? "scene_sss_rt.frag.spv" : "scene_sss.frag.spv";
+        "scene_sss.frag.spv";
     const char* const scene_aa_sss_frag_spv =
-        rt_provisioned_ ? "scene_aa_sss_rt.frag.spv" : "scene_aa_sss.frag.spv";
+        "scene_aa_sss.frag.spv";
 #if VCR_EDITOR_ENABLED
     const char* const editor_model_frag_spv =
-        rt_provisioned_ ? "editor_model_rt.frag.spv" : "editor_model.frag.spv";
+        "editor_model.frag.spv";
     const char* const editor_model_aa_frag_spv =
-        rt_provisioned_ ? "editor_model_aa_rt.frag.spv" : "editor_model_aa.frag.spv";
+        "editor_model_aa.frag.spv";
     const char* const editor_model_sss_frag_spv =
-        rt_provisioned_ ? "editor_model_sss_rt.frag.spv" : "editor_model_sss.frag.spv";
+        "editor_model_sss.frag.spv";
     const char* const editor_model_aa_sss_frag_spv =
-        rt_provisioned_ ? "editor_model_aa_sss_rt.frag.spv" : "editor_model_aa_sss.frag.spv";
+        "editor_model_aa_sss.frag.spv";
 #endif
     const VkShaderModule scene_vertex_module =
         cached_shader(scene_vertex_shader);
@@ -8832,21 +8693,13 @@ void Renderer::create_pipeline() {
         }
 
         const char* const transparent_frag_spv =
-            rt_provisioned_
-                ? "editor_model_transparent_rt.frag.spv"
-                : "editor_model_transparent.frag.spv";
+            "editor_model_transparent.frag.spv";
         const char* const transparent_aa_frag_spv =
-            rt_provisioned_
-                ? "editor_model_aa_transparent_rt.frag.spv"
-                : "editor_model_aa_transparent.frag.spv";
+            "editor_model_aa_transparent.frag.spv";
         const char* const transparent_sss_frag_spv =
-            rt_provisioned_
-                ? "editor_model_transparent_sss_rt.frag.spv"
-                : "editor_model_transparent_sss.frag.spv";
+            "editor_model_transparent_sss.frag.spv";
         const char* const transparent_aa_sss_frag_spv =
-            rt_provisioned_
-                ? "editor_model_aa_transparent_sss_rt.frag.spv"
-                : "editor_model_aa_transparent_sss.frag.spv";
+            "editor_model_aa_transparent_sss.frag.spv";
         std::array<VkVertexInputBindingDescription, 2U> transparent_aa_bindings{};
         std::array<VkVertexInputAttributeDescription, 5U> transparent_aa_attributes{};
         const VkPipelineVertexInputStateCreateInfo transparent_aa_vertex_input =
@@ -9024,7 +8877,7 @@ void Renderer::create_pipeline() {
             blend.pAttachments = attachments.data();
             info.pColorBlendState = &blend;
             create_transparent_pair(transparent_wboit_, info,
-                rt_provisioned_ ? "editor_model_wboit_rt.frag.spv" : "editor_model_wboit.frag.spv",
+                "editor_model_wboit.frag.spv",
                 "Weighted blended", false, false);
         }
         create_transparent_pair(
@@ -9995,11 +9848,7 @@ bool Renderer::draw_frame(
         apply_shadow_resolution();
     prepare_msaa_targets_for_frame(frame_index_);
     if (subsurface_provision_pending_) provision_subsurface_resources();
-    if (rt_provision_pending_) provision_ray_tracing_resources();
 #if VCR_EDITOR_ENABLED
-    if (rt_blas_refresh_pending_) {
-        refresh_dirty_model_blas();
-    }
     prepare_skinning_resources_for_frame(frame);
 #endif
 
@@ -10301,20 +10150,6 @@ void Renderer::read_gpu_timestamps(
                 VK_CHECK(query_result);
         }
     }
-    timings.gpu_tlas_ms = 0.0;
-    if (frame.tlas_was_updated) {
-        const auto tlas_result = vkGetQueryPoolResults(
-            context_->device(), frame.timestamp_queries, timestamp_tlas_begin, 2U,
-            2U * sizeof(std::uint64_t), timestamps.data() + timestamp_tlas_begin,
-            sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
-        if (tlas_result == VK_SUCCESS) {
-            timings.gpu_tlas_ms = elapsed(timestamp_tlas_begin, timestamp_tlas_end);
-        } else if (tlas_result == VK_NOT_READY) {
-            timings.gpu_tlas_ms = unavailable_timing_ms;
-        } else {
-            VK_CHECK(tlas_result);
-        }
-    }
     frame.timestamps_valid = false;
 }
 
@@ -10540,28 +10375,8 @@ void Renderer::record_commands(
         vkCmdPipelineBarrier2(command_buffer, &dependency);
     }
 
-    const bool tlas_update =
-        rt_provisioned_ && rt_tlas_build_due_ && mode_ != RunMode::instancing;
-    if (tlas_update && frame.timestamp_queries != VK_NULL_HANDLE) {
-        vkCmdWriteTimestamp2(
-            command_buffer,
-            VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-            frame.timestamp_queries,
-            timestamp_tlas_begin);
-    }
-    record_ray_tracing_tlas(command_buffer, frame);
-    if (tlas_update && frame.timestamp_queries != VK_NULL_HANDLE) {
-        vkCmdWriteTimestamp2(
-            command_buffer,
-            VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-            frame.timestamp_queries,
-            timestamp_tlas_end);
-    }
-
 #if VCR_EDITOR_ENABLED
-    const bool rt_shadows_active = ray_tracing_uses_shadows(ray_tracing_mode_actual());
     const bool sun_shadows_inactive =
-        rt_shadows_active ||
         (lighting_settings_.dynamic && lighting_uniforms_.sun_direction_intensity.w <= 0.0F);
     if (sun_shadows_inactive) {
         frame.shadow_was_updated = false;
@@ -13180,8 +12995,6 @@ void Renderer::print_metrics() const {
               << "  anti-aliasing: "
               << to_string(anti_aliasing_) << ' '
               << anti_aliasing_quality_name() << '\n'
-              << "  ray tracing: " << to_token(ray_tracing_mode_actual())
-              << " (requested " << to_token(lighting_settings_.ray_tracing) << ")\n"
               << "  frames: " << stats.frames_rendered << '\n'
               << "  FPS (1 s): " << stats.one_second_average_fps << '\n'
               << "  FPS (average): " << stats.average_fps << '\n'
@@ -13203,7 +13016,6 @@ void Renderer::print_metrics() const {
               << "  GPU subsurface: " << stats.average.gpu_subsurface_ms << " ms\n"
               << "  GPU motion blur: " << stats.average.gpu_motion_blur_ms << " ms\n"
               << "  GPU depth prepass: " << stats.average.gpu_depth_prepass_ms << " ms\n"
-              << "  GPU TLAS build: " << stats.average.gpu_tlas_ms << " ms\n"
               << "  GPU workload: " << stats.average.gpu_workload_ms << " ms\n"
               << "  instances: " << instance_count() << '\n'
               << "  max instance capacity: " << max_instance_capacity_ << '\n'

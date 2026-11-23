@@ -61,27 +61,6 @@ bool Renderer::set_lighting_settings(LightingSettings settings) noexcept {
     if (settings.dynamic != lighting_settings_.dynamic) {
         exposure_reset_pending_ = true;
     }
-    if (settings.ray_tracing != lighting_settings_.ray_tracing) {
-        if (ray_tracing_uses_shadows(lighting_settings_.ray_tracing) &&
-            !ray_tracing_uses_shadows(settings.ray_tracing)) {
-            shadow_dirty_ = true;
-        }
-        if (ray_tracing_uses_gi(lighting_settings_.ray_tracing) !=
-            ray_tracing_uses_gi(settings.ray_tracing)) {
-            voxel_ready_ = false;
-        }
-        if (settings.ray_tracing != RayTracingMode::off && !rt_provisioned_) {
-            if (context_ != nullptr && context_->ray_query_supported() &&
-                context_->properties().limits.maxPerStageDescriptorStorageBuffers >= 8U &&
-                context_->properties().limits.maxDescriptorSetStorageBuffers >= 11U) {
-                if (rt_masked_triangle_capacity(0, resident_rt_masked_triangle_count(),
-                        context_->properties().limits.maxStorageBufferRange) == 0)
-                    return false;
-                rt_provision_pending_ = true;
-            }
-        }
-        invalidate_temporal_history();
-    }
     if (settings.gi_extent != lighting_settings_.gi_extent)
         gi_scene_revision_ = 0;
     gi_light_elapsed_ = 1000;
@@ -134,18 +113,6 @@ void Renderer::create_lighting_resources() {
         VK_FILTER_LINEAR, "Cloud density noise", VK_SAMPLER_ADDRESS_MODE_REPEAT);
     const auto noise = make_cloud_noise();
     upload_to_device_texture(cloud_noise_, std::as_bytes(std::span{noise}), 4, "Cloud density");
-    rt_provisioned_ = false;
-    rt_provision_pending_ = false;
-    if (lighting_settings_.ray_tracing != RayTracingMode::off) {
-        if (context_->ray_query_supported() &&
-            limits.maxPerStageDescriptorStorageBuffers >= 8U &&
-            limits.maxDescriptorSetStorageBuffers >= 11U) {
-            rt_provisioned_ = true;
-        } else {
-            std::cerr << "warning: hardware ray query is unavailable on this GPU; "
-                         "falling back to rasterized shadows and voxel GI\n";
-        }
-    }
     constexpr auto host =
         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
     voxel_geometry_.create(
@@ -232,24 +199,13 @@ void Renderer::create_lighting_descriptor_layout() {
                                      nullptr},
         VkDescriptorSetLayoutBinding{12, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
                                      VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-        VkDescriptorSetLayoutBinding{9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
-                                     VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
-                                     nullptr},
-        VkDescriptorSetLayoutBinding{10, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1,
-                                     VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
-                                     nullptr},
-        VkDescriptorSetLayoutBinding{11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
-                                     VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
-                                     nullptr},
     };
-    const std::uint32_t binding_count = rt_provisioned_ ? 13U : 10U;
     const VkDescriptorSetLayoutCreateInfo layout{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0,
-        binding_count, bindings.data()};
+        static_cast<std::uint32_t>(bindings.size()), bindings.data()};
     VK_CHECK(vkCreateDescriptorSetLayout(
         context_->device(), &layout, nullptr,
         lighting_layout_.put(context_->device(), vkDestroyDescriptorSetLayout)));
-    lighting_layout_has_rt_ = rt_provisioned_;
     context_->set_debug_name(VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT,
                              handle_value(lighting_layout_.get()), "lighting descriptors");
 }
@@ -257,13 +213,12 @@ void Renderer::create_lighting_pipelines() {
     const std::array sizes{
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4},
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, rt_provisioned_ ? 16U : 12U},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 12U},
         VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2},
-        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 2},
     };
     const VkDescriptorPoolCreateInfo pool{
         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, 2,
-        rt_provisioned_ ? 5U : 4U, sizes.data()};
+        static_cast<std::uint32_t>(sizes.size()), sizes.data()};
     VK_CHECK(
         vkCreateDescriptorPool(context_->device(), &pool, nullptr,
                                lighting_pool_.put(context_->device(), vkDestroyDescriptorPool)));
@@ -291,9 +246,6 @@ void Renderer::create_lighting_pipelines() {
                                    frame.local_light_buffer.size()},
             VkDescriptorBufferInfo{frame.local_light_cluster_buffer.handle(), 0,
                                    frame.local_light_cluster_buffer.size()},
-            VkDescriptorBufferInfo{rt_opacity_micromaps_.handle(), 0,
-                                   rt_opacity_micromaps_.size()},
-            VkDescriptorBufferInfo{rt_alpha_texels_.handle(), 0, rt_alpha_texels_.size()},
         };
         const std::array images{
             VkDescriptorImageInfo{voxel_radiance_.sampler(), voxel_radiance_.view(),
@@ -301,13 +253,7 @@ void Renderer::create_lighting_pipelines() {
             VkDescriptorImageInfo{VK_NULL_HANDLE, voxel_storage_view_.get(),
                                   VK_IMAGE_LAYOUT_GENERAL},
         };
-        const VkAccelerationStructureKHR tlas_handle = frame.tlas.handle();
-        const VkWriteDescriptorSetAccelerationStructureKHR tlas_write{
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,
-            .accelerationStructureCount = 1U,
-            .pAccelerationStructures = &tlas_handle,
-        };
-        std::array<VkWriteDescriptorSet, 13> writes{};
+        std::array<VkWriteDescriptorSet, 10> writes{};
         const VkDescriptorImageInfo noise_info{cloud_noise_.sampler(), cloud_noise_.view(),
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         writes[9] = VkWriteDescriptorSet{
@@ -332,32 +278,8 @@ void Renderer::create_lighting_pipelines() {
                 w.pBufferInfo = &buffers[buffer_index];
             }
         }
-        if (rt_provisioned_) {
-            writes[10] = VkWriteDescriptorSet{
-                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .dstSet = frame.lighting_descriptor_set,
-                .dstBinding = 9U,
-                .descriptorCount = 1U,
-                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                .pBufferInfo = &buffers[7],
-            };
-            writes[11] = VkWriteDescriptorSet{
-                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .pNext = &tlas_write,
-                .dstSet = frame.lighting_descriptor_set,
-                .dstBinding = 10U,
-                .descriptorCount = 1U,
-                .descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
-            };
-            writes[12] = VkWriteDescriptorSet{
-                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .dstSet = frame.lighting_descriptor_set, .dstBinding = 11U,
-                .descriptorCount = 1U, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                .pBufferInfo = &buffers[8],
-            };
-        }
         vkUpdateDescriptorSets(
-            context_->device(), rt_provisioned_ ? 13U : 10U,
+            context_->device(), static_cast<std::uint32_t>(writes.size()),
             writes.data(), 0, nullptr);
     }
     const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
@@ -371,8 +293,7 @@ void Renderer::create_lighting_pipelines() {
     if (gi_provisioned_) for (unsigned i = 0; i < 2; ++i) {
         const auto shader =
             load_shader(i == 0 ? "voxel_geometry.comp.spv"
-                               : (rt_provisioned_ ? "voxel_light_rt.comp.spv"
-                                                  : "voxel_light.comp.spv"));
+                               : "voxel_light.comp.spv");
         VkComputePipelineCreateInfo pipeline{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pipeline.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                           nullptr,
@@ -698,7 +619,6 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
     if (!lighting_settings_.dynamic) {
         voxel_light_due_ = false;
         voxel_job_finishes_ = false;
-        rt_tlas_build_due_ = false;
         const bool weather_lighting = u.cloud_wind_shadow.w > 0 || u.rain.x > 0 || u.rain.y > 0;
         if (weather_lighting) {
             u.sun_direction_intensity = glm::vec4(glm::normalize(glm::vec3(
@@ -711,8 +631,6 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
         if (weather_lighting || frame.lighting_needs_static_reset || local_lights_changed ||
             local_backend == LocalLightBackend::clustered) {
             lighting_uniforms_.options = {};
-            lighting_uniforms_.volume_parameters.z = 0.0F;
-            lighting_uniforms_.volume_parameters.w = 0.0F;
             frame.lighting_uniform_buffer.write(
                 std::as_bytes(std::span{&lighting_uniforms_, std::size_t{1}}));
             frame.lighting_needs_static_reset = weather_lighting;
@@ -759,14 +677,6 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
         lighting_shadow_hour_ = shadow_hour;
         lighting_shadow_aspect_ = aspect;
         lighting_shadow_fov_ = vertical_fov_degrees_;
-    }
-    const RayTracingMode rt_actual = ray_tracing_mode_actual();
-    const bool rt_shadows = ray_tracing_uses_shadows(rt_actual);
-    const bool rt_gi = ray_tracing_uses_gi(rt_actual);
-    if (rt_actual != RayTracingMode::off) {
-        prepare_ray_tracing(frame);
-    } else {
-        rt_tlas_build_due_ = false;
     }
     gi_light_elapsed_ += dt;
     gi_geometry_elapsed_ += dt;
@@ -836,8 +746,8 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
         voxel_light_due_ =
             voxel_job_finishes_ ||
             (!voxel_job_active_ &&
-             (!voxel_ready_ || rt_gi != gi_last_rt_active_ ||
-              ((sun_changed || clouds_changed || (rt_gi && rt_tlas_build_due_)) &&
+             (!voxel_ready_ ||
+              ((sun_changed || clouds_changed) &&
                gi_light_elapsed_ >= 1.0 / lighting_settings_.gi_update_hz)));
         lighting_statistics_.pending_bricks = static_cast<std::uint32_t>(voxel_dirty_.count());
         if (voxel_job_active_)
@@ -852,11 +762,7 @@ void Renderer::prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkEx
                       .count();
     }
     u.volume_origin_cell = glm::vec4(voxel_dirty_.origin(), voxel_dirty_.cell());
-    u.volume_parameters = glm::vec4(
-        lighting_settings_.gi_extent,
-        gi_resolution,
-        rt_shadows ? 1.0F : 0.0F,
-        rt_gi ? 1.0F : 0.0F);
+    u.volume_parameters = glm::vec4(lighting_settings_.gi_extent, gi_resolution, 0, 0);
     u.options = glm::vec4(lighting_settings_.dynamic ? 1 : 0,
                           lighting_settings_.voxel_gi && (voxel_ready_ || voxel_job_finishes_) &&
                                   mode_ != RunMode::instancing
@@ -1015,7 +921,6 @@ void Renderer::record_voxel_light(VkCommandBuffer command, FrameContext &frame) 
     gi_last_cloud_variation_ = lighting_uniforms_.cloud_variation;
     gi_last_sun_ = lighting_uniforms_.sun_direction_intensity;
     gi_last_sun_color_ = lighting_uniforms_.sun_color;
-    gi_last_rt_active_ = ray_tracing_uses_gi(ray_tracing_mode_actual());
     voxel_ready_ = true;
     gi_light_elapsed_ = 0;
     ++lighting_statistics_.radiance_updates;
@@ -1027,7 +932,6 @@ void Renderer::destroy_lighting() noexcept {
     lighting_compute_layout_.reset();
     lighting_pool_.reset();
     lighting_layout_.reset();
-    lighting_layout_has_rt_ = false;
     voxel_storage_view_.reset();
     cloud_noise_.destroy();
     voxel_radiance_.destroy();
@@ -1049,10 +953,6 @@ void Renderer::destroy_lighting() noexcept {
     voxel_batch_.clear();
     voxel_scene_.clear();
     gi_provisioned_ = false;
-    rt_provisioned_ = false;
-    rt_provision_pending_ = false;
-    rt_tlas_build_due_ = false;
-    gi_last_rt_active_ = false;
     voxel_ready_ = false;
     voxel_job_active_ = false;
     voxel_radiance_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;

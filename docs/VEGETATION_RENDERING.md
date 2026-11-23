@@ -30,8 +30,7 @@ request fails with a diagnostic. Positions and UVs stay binary32. Normal and
 tangent directions use signed 10-bit components; tangent handedness remains
 exact. Unit tests measure less than 0.11 degree direction error. This is a lossy
 direction encoding: lighting and normal-based tessellation displacement can
-change slightly. Ray-tracing BLAS uses the selected stride and the original
-binary32 positions. The cooked file format stays unchanged.
+change slightly. The cooked file format stays unchanged.
 
 Triangle order can change the result at exactly overlapping surfaces. On the
 pine scene, 493 of 2,073,600 pixels changed after geometry reordering; mean

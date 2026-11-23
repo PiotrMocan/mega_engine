@@ -338,7 +338,6 @@ document = {
         'gi_update_hz': 30.0,
         'shadow_resolution': 2048,
         'shadow_depth': 'auto',
-        'ray_tracing': 'off',
     },
     'fog': {
         'enabled': True,

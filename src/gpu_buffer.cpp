@@ -133,16 +133,4 @@ std::span<const std::byte> GpuBuffer::read_completed_bytes(VkDeviceSize size) {
     return {static_cast<const std::byte *>(mapped_data_), static_cast<std::size_t>(size)};
 }
 
-VkDeviceAddress GpuBuffer::device_address() const noexcept {
-    if (buffer_ == VK_NULL_HANDLE || context_ == nullptr ||
-        !context_->buffer_device_address_enabled()) {
-        return 0;
-    }
-    const VkBufferDeviceAddressInfo info{
-        .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
-        .buffer = buffer_,
-    };
-    return vkGetBufferDeviceAddress(context_->device(), &info);
-}
-
 } // namespace vcr

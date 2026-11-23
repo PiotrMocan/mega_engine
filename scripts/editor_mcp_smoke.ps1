@@ -77,7 +77,6 @@ try {
         "render.set_exposure",
         "render.set_color_grading",
         "render.set_subsurface",
-        "render.set_ray_tracing",
         "render.set_motion_blur",
         "render.set_anti_aliasing",
         "editor.scene.list_nodes",

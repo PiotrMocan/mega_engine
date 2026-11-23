@@ -61,7 +61,7 @@ Headers: [`src/animated_character.hpp`](../src/animated_character.hpp), [`src/sk
   - Data-driven `CharacterClipBinding` slots for `idle`, `walk`, `run`, `stop`, `turn_left`, `turn_right`, `jump`, `fall`, `land`, plus explicit `root_motion_bone` and `set_override_clip`.
   - Root-motion deltas are extracted via `extract_root_motion_delta(skeleton, bone_idx, ...)` and resolved against `CollisionWorld::resolve_capsule`.
 - `AnimatorRuntimeSystem::set_root_motion_bone(SceneNodeId, std::string_view)`: specifies the root-motion bone per animator node; root-motion translation is reconciled against `CollisionWorld` capsules during `update`.
-- Renderer skeletal draws lock skinned assets to LOD0 with expanded bounds and skip static TLAS inclusion to prevent bone/LOD popping artifacts.
+- Renderer skeletal draws lock skinned assets to LOD0 with expanded bounds to prevent bone/LOD popping artifacts.
 
 ---
 
@@ -77,7 +77,7 @@ Headers: [`src/physics_world.hpp`](../src/physics_world.hpp), [`src/input_action
 ## 6. Materials & 2D/Projected UI Overlay
 
 - **Glass Materials** ([`src/cooked_model_asset.hpp`](../src/cooked_model_asset.hpp)):
-  - `material_coverage_glass_bit` marks architectural/prop dielectric glass for physical specular reflection/transmission rendering and non-opaque ray-tracing BLAS handling.
+  - `material_coverage_glass_bit` marks architectural/prop dielectric glass for physical specular reflection/transmission rendering.
 - **UI Overlay Canvas** ([`src/game_overlay.hpp`](../src/game_overlay.hpp)):
   - `GameOverlayCanvas`: zero steady-state allocation 2D HUD renderer with `512x512` R8 SDF font atlas (`GameUiFontAtlas`, ASCII + Cyrillic + UI glyphs, `.vcrfont.json` + PNG I/O), `draw_rect`, `draw_rect_outline`, `draw_rounded_panel`, `draw_line`, `draw_progress_bar`, `draw_arc`, `draw_crosshair`, `draw_text_px`, `draw_text_shadowed`, `draw_text_wrapped`, `measure_text_px`, `measure_text_wrapped`, and `project_world_indicator`.
   - Submitted automatically at the end of Stage 5 via `Renderer::set_game_overlay_vertices` with `VK_FILTER_LINEAR` and `GameUiPushConstants` SDF antialiasing (`shaders/game_ui.vert`, `shaders/game_ui.frag`).

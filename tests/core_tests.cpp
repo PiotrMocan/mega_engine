@@ -774,37 +774,6 @@ int main() {
         expect(!vcr::parse_cli_options(3, invalid), "unknown shadow cache policy rejected");
     }
     {
-        using Rt = vcr::RayTracingMode;
-        const std::array<const char*, 5> tokens{"off", "on", "shadows", "gi", "full"};
-        const std::array<Rt, 5> modes{Rt::off, Rt::full, Rt::shadows, Rt::gi, Rt::full};
-        for (std::size_t i = 0; i < tokens.size(); ++i) {
-            const char* args[]{"vcr", "--rt", tokens[i]};
-            const auto parsed = vcr::parse_cli_options(3, args);
-            expect(parsed && parsed.options.lighting.ray_tracing == modes[i] &&
-                       parsed.options.lighting_overrides.ray_tracing,
-                   "ray tracing CLI tokens and on alias parse");
-        }
-        const char* eq_args[]{"vcr", "--rt=shadows"};
-        const auto eq_parsed = vcr::parse_cli_options(2, eq_args);
-        expect(eq_parsed && eq_parsed.options.lighting.ray_tracing == Rt::shadows,
-               "equals-form --rt=shadows parses");
-        const char* legacy_conflict[]{"vcr", "--lighting", "legacy", "--rt", "shadows"};
-        expect(!vcr::parse_cli_options(5, legacy_conflict),
-               "--rt rejects --lighting legacy");
-        const char* rt_then_legacy[]{"vcr", "--rt", "full", "--lighting", "legacy"};
-        const auto reset_legacy = vcr::parse_cli_options(5, rt_then_legacy);
-        expect(reset_legacy && !reset_legacy.options.lighting.dynamic &&
-                   reset_legacy.options.lighting.ray_tracing == Rt::off,
-               "--lighting legacy resets prior --rt flag cleanly");
-        for (const char* bad : {"", "ON", "bvh", "path", "1"}) {
-            const char* bad_args[]{"vcr", "--rt", bad};
-            expect(!vcr::parse_cli_options(3, bad_args), "unknown --rt mode rejected");
-        }
-        expect(vcr::CliOptions{}.lighting.ray_tracing == Rt::off &&
-                   vcr::cli_usage("vcr").find("--rt") != std::string::npos,
-               "ray tracing stays default-off and is documented in CLI usage");
-    }
-    {
         const char* mapper_args[]{"vcr", "--tone-mapper", "gt7"};
         const auto parsed = vcr::parse_cli_options(3, mapper_args);
         expect(parsed && parsed.options.tone_mapper == vcr::ToneMapper::gt7,
@@ -1320,34 +1289,6 @@ int main() {
                    vcr::benchmark_result_to_json(disabled_result).find(
                        "\"average_gpu_depth_prepass_ms\": 0,") != std::string::npos,
                "disabled prepass timing remains an available zero in benchmark JSON");
-        vcr::PerformanceMetrics rt_metrics;
-        vcr::FrameTimings rt_timings{};
-        rt_timings.gpu_tlas_ms = 0.0625;
-        rt_metrics.record_frame(rt_timings);
-        auto rt_result = vcr::make_benchmark_result(
-            "GPU", "driver", "640x360", "640x360", "IMMEDIATE", "off", "off",
-            1, 0, rt_metrics.snapshot());
-        rt_result.lighting.ray_tracing = vcr::RayTracingMode::full;
-        rt_result.ray_tracing_supported = true;
-        rt_result.ray_tracing_provisioned = true;
-        rt_result.ray_tracing_actual = "shadows";
-        rt_result.lighting_statistics.blas_count = 4U;
-        rt_result.lighting_statistics.tlas_instances = 19U;
-        rt_result.lighting_statistics.tlas_builds = 2U;
-        rt_result.lighting_statistics.acceleration_structure_bytes = 65536ULL;
-        rt_result.lighting_statistics.opacity_micromap_bytes = 1024ULL;
-        const auto rt_json = nlohmann::json::parse(vcr::benchmark_result_to_json(rt_result));
-        expect(close_to(rt_json["average_gpu_tlas_ms"].get<double>(), 0.0625, 1e-6) &&
-                   rt_json["ray_tracing_supported"] == true &&
-                   rt_json["ray_tracing_provisioned"] == true &&
-                   rt_json["ray_tracing_requested"] == "full" &&
-                   rt_json["ray_tracing_actual"] == "shadows" &&
-                   rt_json["blas_count"] == 4U &&
-                   rt_json["tlas_instances"] == 19U &&
-                   rt_json["tlas_builds_total"] == 2U &&
-                   rt_json["acceleration_structure_bytes"] == 65536ULL &&
-                   rt_json["opacity_micromap_bytes"] == 1024ULL,
-               "benchmark JSON serializes TLAS timing and hardware ray tracing telemetry");
     }
 
     {
@@ -2527,15 +2468,6 @@ int main() {
                        loaded_scene.lighting && loaded_scene.lighting->shadow_depth == depth,
                    "each shadow depth profile survives scene JSON round trip");
         }
-        for (const auto rt_mode : {vcr::RayTracingMode::off, vcr::RayTracingMode::shadows,
-                                   vcr::RayTracingMode::gi, vcr::RayTracingMode::full}) {
-            source_scene.lighting->ray_tracing = rt_mode;
-            expect(vcr::save_scene_file(source_scene, startup_file, error) &&
-                       vcr::load_scene_file(startup_file, loaded_scene, error) &&
-                       loaded_scene.lighting && loaded_scene.lighting->ray_tracing == rt_mode,
-                   "each canonical ray tracing mode survives scene JSON round trip");
-        }
-        source_scene.lighting->ray_tracing = vcr::RayTracingMode::off;
         source_scene.lighting->shadow_depth = static_cast<vcr::ShadowDepthFormat>(255);
         expect(!vcr::save_scene_file(source_scene, startup_file, error),
                "scene writer rejects an invalid shadow depth enum");
@@ -2566,13 +2498,6 @@ int main() {
         const auto legacy_lighting = vcr::resolve_scene_lighting(legacy_options.options, source_scene.lighting);
         expect(!legacy_lighting.dynamic && !legacy_lighting.voxel_gi && !legacy_lighting.cycle,
                "CLI legacy lighting disables dependent GI and clock");
-        auto scene_without_gi = *source_scene.lighting;
-        scene_without_gi.voxel_gi = false;
-        const char *rt_full_args[]{"test", "--rt", "full"};
-        const auto rt_full_options = vcr::parse_cli_options(3, rt_full_args);
-        const auto rt_full_lighting = vcr::resolve_scene_lighting(rt_full_options.options, scene_without_gi);
-        expect(rt_full_lighting.ray_tracing == vcr::RayTracingMode::full && rt_full_lighting.voxel_gi,
-               "--rt full auto-enables voxel_gi on scenes authored with voxel_gi=false");
         nlohmann::json startup_json;
         { std::ifstream input(startup_file); input >> startup_json; }
         expect(startup_json["lighting"]["shadow_depth"] == "d16",
@@ -2599,7 +2524,17 @@ int main() {
                        loaded_scene.size() == previous_size && loaded_scene.lighting->hour == 17.2,
                    "invalid startup camera rejects transaction without changing document");
         }
-        for (const auto &bad : std::array<nlohmann::json, 18>{
+        expect(!original_json["lighting"].contains("ray_tracing"), "saved scenes omit retired settings");
+        for (const auto* legacy_mode : {"off", "shadows", "gi", "full"}) {
+            startup_json = original_json;
+            startup_json["lighting"]["ray_tracing"] = legacy_mode;
+            write_startup();
+            expect(vcr::load_scene_file(startup_file, loaded_scene, error) &&
+                       loaded_scene.lighting && loaded_scene.lighting->shadow_depth == vcr::ShadowDepthFormat::d16 &&
+                       loaded_scene.lighting->voxel_gi == source_scene.lighting->voxel_gi,
+                   "legacy lighting loads with authored shadow and GI settings");
+        }
+        for (const auto &bad : std::array<nlohmann::json, 15>{
                  nlohmann::json{{"hour", 24}}, nlohmann::json{{"cycle", "off"}},
                  nlohmann::json{{"triangle_budget", 2048.5}},
                  nlohmann::json{{"shadow_resolution", 3072}},
@@ -2613,9 +2548,6 @@ int main() {
                  nlohmann::json{{"shadow_depth", nlohmann::json::array({"d16"})}},
                  nlohmann::json{{"shadow_depth", nlohmann::json{{"format", "d16"}}}},
                  nlohmann::json{{"dynamic", false}, {"voxel_gi", true}},
-                 nlohmann::json{{"dynamic", false}, {"voxel_gi", false}, {"ray_tracing", "shadows"}},
-                 nlohmann::json{{"ray_tracing", "on"}},
-                 nlohmann::json{{"ray_tracing", true}},
                  nlohmann::json{{"gi_extent", 1e100}}}) {
             startup_json = original_json;
             startup_json["lighting"] = bad;

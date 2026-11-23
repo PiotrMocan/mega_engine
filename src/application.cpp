@@ -85,7 +85,6 @@ using Json = nlohmann::json;
         {"gpu_depth_prepass_ms", timings.gpu_depth_prepass_ms},
         {"gpu_voxel_geometry_ms", timings.gpu_voxel_geometry_ms},
         {"gpu_voxel_light_ms", timings.gpu_voxel_light_ms},
-        {"gpu_tlas_ms", timings.gpu_tlas_ms},
         {"gpu_visibility_ms", timings.gpu_visibility_ms},
         {"scene_prepare_ms", timings.scene_prepare_ms},
     };
@@ -1458,10 +1457,6 @@ void Application::execute_mcp_command(const McpCommand& command) {
                     {"maximum_factor",
                      context_.properties().limits.maxTessellationGenerationLevel},
                 }},
-                {"ray_tracing", Json{
-                    {"supported", renderer_.ray_tracing_supported()},
-                    {"modes", Json::array({"off", "shadows", "gi", "full"})},
-                }},
                 {"anti_aliasing", Json{
                     {"methods", Json::array({
                         "off", "smaa", "fsr3", "msaa2x", "msaa4x"})},
@@ -1622,20 +1617,7 @@ void Application::execute_mcp_command(const McpCommand& command) {
                            {"radiance_updates", renderer_.lighting_statistics().radiance_updates},
                            {"pending_bricks", renderer_.lighting_statistics().pending_bricks},
                            {"oldest_geometry_ms",
-                            renderer_.lighting_statistics().oldest_geometry_ms},
-                           {"ray_tracing_requested",
-                            to_token(renderer_.lighting_settings().ray_tracing)},
-                           {"ray_tracing_actual",
-                            to_token(renderer_.ray_tracing_mode_actual())},
-                           {"ray_tracing_supported", renderer_.ray_tracing_supported()},
-                           {"ray_tracing_provisioned", renderer_.ray_tracing_provisioned()},
-                           {"blas_count", renderer_.lighting_statistics().blas_count},
-                           {"tlas_instances", renderer_.lighting_statistics().tlas_instances},
-                           {"tlas_builds", renderer_.lighting_statistics().tlas_builds},
-                           {"acceleration_structure_bytes",
-                            renderer_.lighting_statistics().acceleration_structure_bytes},
-                           {"opacity_micromap_bytes",
-                            renderer_.lighting_statistics().opacity_micromap_bytes}}},
+                            renderer_.lighting_statistics().oldest_geometry_ms}}},
                      {"assets_pending", renderer_.assets_pending()},
                      {"weighted_transparency_active", renderer_.weighted_transparency_active()},
                      {"texture_budget_bytes", renderer_.texture_budget()},
@@ -1953,27 +1935,6 @@ void Application::execute_mcp_command(const McpCommand& command) {
             return;
         }
         succeed("Weather updated", weather_state(scene_, renderer_));
-        return;
-    }
-    case McpCommandType::render_set_ray_tracing: {
-        auto settings = renderer_.lighting_settings();
-        settings.ray_tracing = command.ray_tracing;
-        if (ray_tracing_uses_gi(command.ray_tracing) && renderer_.gi_provisioned()) {
-            settings.voxel_gi = true;
-        }
-        if (!renderer_.set_lighting_settings(settings)) {
-            fail("Ray tracing requires dynamic lighting (and provisioned Voxel GI for gi/full)");
-            return;
-        }
-        renderer_.reset_metrics();
-        succeed(
-            "Ray tracing mode requested; lazy acceleration structures apply at the next rendered frame",
-            Json{
-                {"mode_requested", to_token(renderer_.lighting_settings().ray_tracing)},
-                {"mode_actual", to_token(renderer_.ray_tracing_mode_actual())},
-                {"supported", renderer_.ray_tracing_supported()},
-                {"provisioned", renderer_.ray_tracing_provisioned()},
-            });
         return;
     }
     case McpCommandType::render_set_motion_blur: {
@@ -2377,9 +2338,6 @@ void Application::finish_benchmark() {
     result.gpu_grass_instances = renderer_.gpu_grass_instances();
     result.gpu_grass_wind_seconds = renderer_.gpu_grass_wind_seconds();
     result.lighting = renderer_.lighting_settings();
-    result.ray_tracing_supported = renderer_.ray_tracing_supported();
-    result.ray_tracing_provisioned = renderer_.ray_tracing_provisioned();
-    result.ray_tracing_actual = to_token(renderer_.ray_tracing_mode_actual());
     result.shadow_depth_actual = renderer_.shadow_depth_format();
     result.shadow_linear_filter = renderer_.shadow_linear_filter();
     result.tone_mapper = renderer_.tone_mapper();

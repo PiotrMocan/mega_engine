@@ -10,8 +10,7 @@
 
 namespace vcr {
 
-// Positions and UVs stay binary32; imported triangle positions and RT geometry
-// are unchanged. Unit directions are quantized to A2B10G10R10_SNORM_PACK32,
+// Positions and UVs use binary32. Unit directions are quantized to A2B10G10R10_SNORM_PACK32,
 // which can slightly affect lighting and normal-based tessellation displacement.
 struct PackedModelVertex {
     std::array<float, 3> position{};

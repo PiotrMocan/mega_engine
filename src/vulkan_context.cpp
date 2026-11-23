@@ -143,8 +143,6 @@ void VulkanContext::shutdown() noexcept {
         vkDestroyInstance(instance_, nullptr);
         instance_ = VK_NULL_HANDLE;
     }
-    buffer_device_address_enabled_ = false;
-    ray_query_supported_ = false;
     sampler_anisotropy_enabled_ = false;
     max_sampler_anisotropy_ = 1.0F;
 }
@@ -412,16 +410,8 @@ void VulkanContext::create_device() {
         });
     }
 
-    VkPhysicalDeviceRayQueryFeaturesKHR supported_ray_query{
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
-    };
-    VkPhysicalDeviceAccelerationStructureFeaturesKHR supported_accel{
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
-        .pNext = &supported_ray_query,
-    };
     VkPhysicalDeviceVulkan13Features supported13{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-        .pNext = &supported_accel,
     };
     VkPhysicalDeviceVulkan12Features supported12{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
@@ -488,35 +478,6 @@ void VulkanContext::create_device() {
             VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME);
     }
 
-    acceleration_structure_properties_ = VkPhysicalDeviceAccelerationStructurePropertiesKHR{
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR,
-    };
-    const bool has_ray_query_extensions =
-        graphics_queue_supports_compute &&
-        has_extension(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) &&
-        has_extension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
-        has_extension(VK_KHR_RAY_QUERY_EXTENSION_NAME);
-    if (has_ray_query_extensions) {
-        VkPhysicalDeviceProperties2 props2{
-            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-            .pNext = &acceleration_structure_properties_,
-        };
-        vkGetPhysicalDeviceProperties2(physical_device_, &props2);
-    }
-    ray_query_supported_ =
-        has_ray_query_extensions &&
-        supported12.bufferDeviceAddress == VK_TRUE &&
-        supported_accel.accelerationStructure == VK_TRUE &&
-        supported_ray_query.rayQuery == VK_TRUE &&
-        acceleration_structure_properties_.maxDescriptorSetAccelerationStructures >= 1U &&
-        acceleration_structure_properties_.maxPerStageDescriptorAccelerationStructures >= 1U;
-    buffer_device_address_enabled_ = ray_query_supported_;
-    if (ray_query_supported_) {
-        enabled_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
-        enabled_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
-        enabled_extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
-    }
-
     // FidelityFX selects FP16 permutations from physical-device support.
     // Enable both parts required by AMD's Vulkan integration guide, or keep
     // the backend on its FP32 path. A device exposing shaderFloat16 without
@@ -535,18 +496,8 @@ void VulkanContext::create_device() {
         (supported12.shaderFloat16 != VK_TRUE ||
          supported11.storageBuffer16BitAccess == VK_TRUE);
 
-    VkPhysicalDeviceRayQueryFeaturesKHR ray_query_features{
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR,
-        .rayQuery = ray_query_supported_ ? VK_TRUE : VK_FALSE,
-    };
-    VkPhysicalDeviceAccelerationStructureFeaturesKHR accel_features{
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
-        .pNext = &ray_query_features,
-        .accelerationStructure = ray_query_supported_ ? VK_TRUE : VK_FALSE,
-    };
     VkPhysicalDeviceVulkan13Features features13{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-        .pNext = ray_query_supported_ ? &accel_features : nullptr,
     };
     features13.subgroupSizeControl = fsr3_device_compatible_
         ? supported13.subgroupSizeControl
@@ -561,8 +512,6 @@ void VulkanContext::create_device() {
         .pNext = &features13,
         .shaderFloat16 =
             fsr3_fp16_enabled_ ? VK_TRUE : VK_FALSE,
-        .bufferDeviceAddress =
-            buffer_device_address_enabled_ ? VK_TRUE : VK_FALSE,
     };
     VkPhysicalDeviceVulkan11Features features11{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
@@ -617,9 +566,6 @@ void VulkanContext::create_device() {
               << "  tessellation shader: "
               << (tessellation_shader_enabled_ ? "enabled" : "unavailable")
               << '\n'
-              << "  hardware ray query: "
-              << (ray_query_supported_ ? "enabled" : "unavailable")
-              << '\n'
               << "  BC texture compression: "
               << (texture_compression_bc_enabled_ ? "enabled" : "unavailable")
               << '\n'
@@ -637,9 +583,6 @@ void VulkanContext::create_allocator() {
         .vkGetDeviceProcAddr = vkGetDeviceProcAddr,
     };
     const VmaAllocatorCreateInfo info{
-        .flags = buffer_device_address_enabled_
-            ? VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT
-            : VmaAllocatorCreateFlags{0},
         .physicalDevice = physical_device_,
         .device = device_,
         .pVulkanFunctions = &functions,

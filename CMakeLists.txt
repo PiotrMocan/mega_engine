@@ -664,7 +664,6 @@ set(VCR_VULKAN_RENDERER_SOURCES
     src/renderer.cpp
     src/renderer_scene.cpp
     src/renderer_lighting.cpp
-    src/renderer_ray_tracing.cpp
     src/renderer_gpu_visibility.cpp
     src/upload_batch.cpp
     src/renderer_assets.cpp
@@ -894,6 +893,13 @@ target_link_libraries(
 # prevents parallel post-build copy_directory commands from racing over the
 # same shader and asset files.
 set(VCR_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+# copy_directory preserves retired binaries in existing build trees.
+file(GLOB VCR_RETIRED_SHADOW_SHADERS LIST_DIRECTORIES false
+    "${VCR_RUNTIME_OUTPUT_DIRECTORY}/shaders/*_rt.frag.spv"
+    "${VCR_RUNTIME_OUTPUT_DIRECTORY}/shaders/voxel_light_rt.comp.spv")
+if(VCR_RETIRED_SHADOW_SHADERS)
+    file(REMOVE ${VCR_RETIRED_SHADOW_SHADERS})
+endif()
 add_custom_target(vcr_runtime_assets
     COMMAND "${CMAKE_COMMAND}" -E make_directory
             "${VCR_RUNTIME_OUTPUT_DIRECTORY}/shaders"

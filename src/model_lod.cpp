@@ -1,5 +1,6 @@
 #include "model_lod.hpp"
-#include "opacity_micromap.hpp"
+#include "texture_alpha_sampling.hpp"
+#include "texture_compression.hpp"
 #include <meshoptimizer.h>
 #include <algorithm>
 #include <array>

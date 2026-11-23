@@ -420,7 +420,6 @@ void run() {
         .voxel_gi = false,
         .cycle = false,
         .hour = 14.0,
-        .ray_tracing = vcr::RayTracingMode::off,
     };
     renderer.initialize(
         context,

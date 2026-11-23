@@ -693,7 +693,6 @@ def build_meadow_scene(grid_x: int, grid_z: int, patch_spacing: float) -> dict[s
             "shadow_resolution": 2048,
             "shadow_depth": "auto",
             "cascade_cache": False,
-            "ray_tracing": "off",
         },
         "nodes": nodes,
     }

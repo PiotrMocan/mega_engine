@@ -132,30 +132,12 @@ public:
     [[nodiscard]] bool gi_provisioned() const noexcept { return gi_provisioned_; }
     [[nodiscard]] std::uint32_t gpu_grass_instances() const noexcept { return gpu_grass_instances_; }
     [[nodiscard]] float gpu_grass_wind_seconds() const noexcept { return gpu_grass_wind_seconds_; }
-    [[nodiscard]] bool ray_tracing_supported() const noexcept {
-        return context_ != nullptr && context_->ray_query_supported();
-    }
-    [[nodiscard]] bool ray_tracing_provisioned() const noexcept { return rt_provisioned_; }
-    [[nodiscard]] RayTracingMode ray_tracing_mode_actual() const noexcept {
-        return resolve_ray_tracing_mode(
-            lighting_settings_.ray_tracing,
-            rt_provisioned_,
-            lighting_settings_.dynamic && mode_ != RunMode::instancing,
-            gi_provisioned_ && lighting_settings_.voxel_gi
-#if VCR_EDITOR_ENABLED
-                && authored_scene_enabled_
-#endif
-        );
-    }
     [[nodiscard]] bool set_lighting_settings(LightingSettings settings) noexcept;
     [[nodiscard]] ToneMapper tone_mapper() const noexcept { return tone_mapper_; }
     [[nodiscard]] DepthPrepass depth_prepass() const noexcept { return depth_prepass_; }
     [[nodiscard]] DepthPrepass depth_prepass_actual() const noexcept {
         if (depth_prepass_ != DepthPrepass::off) {
             return depth_prepass_;
-        }
-        if (ray_tracing_mode_actual() != RayTracingMode::off) {
-            return DepthPrepass::full;
         }
         if (depth_prepass_override_) {
             return DepthPrepass::off;
@@ -651,15 +633,9 @@ private:
         std::uint32_t index_count = 0U;
         std::uint32_t gi_first = 0, gi_count = 0;
         glm::vec3 gi_albedo{1};
-        AccelerationStructure blas{};
-        std::uint32_t rt_opacity_first = 0U;
-        std::uint32_t rt_opacity_count = 0U;
-        std::string rt_alpha_texture_path{};
-        std::vector<RtMaskedTriangle> cpu_rt_triangles{};
         std::array<std::uint32_t, model_lod_count> lod_first{};
         std::array<std::uint32_t, model_lod_count> lod_count{};
         std::array<float, model_lod_count> lod_error{};
-        bool blas_dirty = false;
     };
 
     struct EditorModelAsset {
@@ -740,30 +716,6 @@ private:
     void create_lighting_descriptor_layout();
     void create_lighting_pipelines();
     void destroy_lighting() noexcept;
-    void create_ray_tracing_resources();
-    void provision_ray_tracing_resources();
-    [[nodiscard]] std::uint64_t resident_rt_masked_triangle_count() const noexcept;
-    void ensure_rt_masked_triangle_capacity(std::uint64_t required);
-    [[nodiscard]] bool reserve_rt_model_metadata(const PreparedModel &model, std::string &error);
-    void destroy_ray_tracing() noexcept;
-    void prepare_ray_tracing(FrameContext &frame);
-    void record_ray_tracing_tlas(VkCommandBuffer command, FrameContext &frame);
-    void ensure_frame_tlas_capacity(FrameContext &frame, std::uint32_t required_instances);
-    void refresh_ray_tracing_statistics() noexcept;
-#if VCR_EDITOR_ENABLED
-    struct RtAlphaMapEntry {
-        std::string relative_path{};
-        std::uint32_t gpu_word_offset = 0U;
-        std::vector<std::uint32_t> cpu_words{};
-    };
-    void build_model_blas_on_upload(EditorModelAsset &asset);
-    void compact_model_blas(EditorModelAsset &asset);
-    [[nodiscard]] std::uint32_t find_or_upload_rt_alpha_map(
-        std::string_view path,
-        const std::vector<std::uint32_t> *words_if_new);
-    [[nodiscard]] std::uint32_t append_rt_masked_triangles(
-        std::span<const RtMaskedTriangle> triangles);
-#endif
     void prepare_lighting(FrameContext &frame, const glm::mat4 &view, VkExtent2D extent);
     void record_voxel_geometry(VkCommandBuffer command, FrameContext &frame);
     void record_voxel_light(VkCommandBuffer command, FrameContext &frame);
@@ -920,7 +872,6 @@ private:
     void compact_skinned_node_slots() noexcept;
     void invalidate_skinned_draws() noexcept;
     void sync_gpu_visibility_skinned_draws() noexcept;
-    void refresh_dirty_model_blas();
 #endif
     [[nodiscard]] VkExtent2D scene_output_extent() const noexcept;
 
@@ -1007,20 +958,6 @@ private:
     std::uint64_t gi_scene_revision_ = 0;
     bool gi_provisioned_ = false, voxel_job_active_ = false, voxel_job_start_ = false;
     bool voxel_ready_ = false, voxel_light_due_ = false, voxel_job_finishes_ = false;
-    bool rt_provisioned_ = false, rt_provision_pending_ = false;
-    bool lighting_layout_has_rt_ = false;
-    bool rt_tlas_build_due_ = false, gi_last_rt_active_ = false;
-    bool rt_blas_refresh_pending_ = false;
-    AccelerationStructure blas_cube_{}, blas_plane_{}, blas_sphere_{}, blas_terrain_{};
-    GpuBuffer rt_opacity_micromaps_{}, rt_alpha_texels_{}, rt_upload_scratch_{};
-    std::uint32_t rt_opacity_triangle_count_ = 0U;
-    std::uint32_t rt_opacity_triangle_capacity_ = 0U;
-    std::uint32_t rt_alpha_texel_words_used_ = 0U;
-#if VCR_EDITOR_ENABLED
-    std::vector<RtAlphaMapEntry> rt_alpha_maps_{};
-#endif
-    std::vector<VkAccelerationStructureInstanceKHR> rt_tlas_instances_{};
-    std::vector<TransformRows> demo_rt_transforms_{};
     bool lighting_shadow_initialized_ = false;
     glm::mat4 lighting_shadow_view_{1};
     double lighting_shadow_hour_ = 0;

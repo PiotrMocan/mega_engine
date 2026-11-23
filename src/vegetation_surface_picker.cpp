@@ -1,7 +1,7 @@
 #include "vegetation_surface_picker.hpp"
 
 #include "gpu_grass.hpp"
-#include "opacity_micromap.hpp"
+#include "texture_alpha_sampling.hpp"
 
 #include <algorithm>
 #include <cmath>

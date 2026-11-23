@@ -6,7 +6,6 @@
 #include "asset_preparation.hpp"
 #include <filesystem>
 #include <fstream>
-#include "opacity_micromap.hpp"
 #include <glm/gtc/matrix_transform.hpp>
 #include <cstdio>
 #include <cstdlib>
@@ -917,73 +916,6 @@ int main() {
         }
     }
     {
-        std::array<vcr::CookedModelVertex, 3> tri_vertices{};
-        constexpr auto range = 4ULL * 1024 * 1024 * 1024 - 1;
-        expect(vcr::rt_masked_triangle_capacity(0, 1, range) == vcr::rt_initial_masked_triangle_capacity,
-               "small RT scenes retain the original metadata allocation");
-        expect(vcr::rt_masked_triangle_capacity(0, 6'000'001, range) == 8'388'608 &&
-                   vcr::rt_masked_triangle_capacity(524'288, 600'000, range) == 1'048'576,
-               "resident foliage and streaming RT geometry grow past the former triangle limit");
-        const auto limited = 700'000ULL * sizeof(vcr::RtMaskedTriangle) + 17;
-        expect(vcr::rt_masked_triangle_capacity(524'288, 650'000, limited) == 700'000 &&
-                   vcr::rt_masked_triangle_capacity(524'288, 700'001, limited) == 0 &&
-                   vcr::rt_masked_triangle_capacity(0, UINT64_MAX, range) == 0 &&
-                   vcr::rt_masked_triangle_capacity(0, 16'000'001, range) == 0,
-               "RT metadata obeys whole-record device bounds and the 24-bit custom index budget");
-        tri_vertices[0].texcoord = {0.0F, 0.0F};
-        tri_vertices[1].texcoord = {1.0F, 0.0F};
-        tri_vertices[2].texcoord = {0.0F, 1.0F};
-        const std::array<std::uint32_t, 3> tri_indices{0U, 1U, 2U};
-        constexpr std::uint32_t masked_half = (32768U << 16U) | 1U;
-        expect(vcr::bake_opacity_micromap(tri_vertices, tri_indices, 0U, 3U, nullptr, 1.0F, 0U).empty(),
-               "opaque coverage skips software opacity micromap allocation");
-        const auto transparent_masks =
-            vcr::bake_opacity_micromap(tri_vertices, tri_indices, 0U, 3U, nullptr, 0.1F, masked_half);
-        expect(transparent_masks.size() == 1U && transparent_masks[0] == glm::uvec2{0U, 0U},
-               "alpha factor below cutoff produces an all-transparent 8x8 micromap");
-        const auto fallback_masks =
-            vcr::bake_opacity_micromap(tri_vertices, tri_indices, 0U, 3U, nullptr, 1.0F, masked_half);
-        expect(fallback_masks.size() == 1U &&
-                   fallback_masks[0] == glm::uvec2{0xFFFFFFFFU, 0xFFFFFFFFU},
-               "masked material without texture bakes an all-opaque 8x8 micromap");
-        vcr::CookedTextureAsset alpha_tex{};
-        alpha_tex.width = 1U;
-        alpha_tex.height = 4U;
-        alpha_tex.row_stride_bytes = 4U;
-        // Top rows (v < 0.5 => authoring uv.y > 0.5 after 1-v flip) opaque, bottom rows transparent.
-        alpha_tex.pixels = {
-            255U, 255U, 255U, 255U,
-            255U, 255U, 255U, 255U,
-            255U, 255U, 255U, 0U,
-            255U, 255U, 255U, 0U,
-        };
-        const auto split_masks = vcr::bake_opacity_micromap(
-            tri_vertices, tri_indices, 0U, 3U, &alpha_tex, 1.0F, masked_half);
-        // At (ix=0, iy=0): s=0.0625, t=0.0625 => uv.y = b2 = s*t ~= 0.0039 => v ~= 0.996 => alpha=0 (bit 0 clear).
-        // At (ix=7, iy=7): s=0.9375, t=0.9375 => uv.y = b2 = s*t ~= 0.8789 => v ~= 0.121 => alpha=1 (bit 63 set).
-        expect(split_masks.size() == 1U &&
-                   (split_masks[0].x & 1U) == 0U &&
-                   (split_masks[0].y & 0x80000000U) != 0U,
-               "8x8 software opacity micromap respects authoring V-flip and alpha cutoff");
-
-        const auto packed_alpha = vcr::pack_alpha_r8_1024_words(alpha_tex);
-        expect(packed_alpha.size() == vcr::rt_alpha_map_word_count &&
-                   (packed_alpha[256U * 256U] & 0xFFU) == 255U &&
-                   (packed_alpha[768U * 256U] & 0xFFU) == 0U,
-               "1024x1024 R8 alpha table preserves top-to-bottom alpha polarity");
-        const auto masked_tris =
-            vcr::bake_rt_masked_triangles(tri_vertices, tri_indices, 0U, 3U, true, 1.0F, masked_half);
-        expect(masked_tris.size() == 1U &&
-                   std::abs(masked_tris[0].uv0[1] - 1.0F) < 1e-6F &&
-                   std::abs(masked_tris[0].uv2[1] - 0.0F) < 1e-6F &&
-                   masked_tris[0].effective_cutoff > 0.49F &&
-                   masked_tris[0].effective_cutoff < 0.51F,
-               "RT masked triangle baker V-flips UVs and computes effective alpha cutoff");
-    }
-    {
-        // A missing image proves the second model does not even reopen/decode
-        // an opaque texture that is already resident. Alpha pixels remain
-        // necessary for opacity micromaps, including on cache hits.
         const auto root = std::filesystem::temp_directory_path() /
             ("vcr-resident-texture-" + std::to_string(
                 std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -1023,8 +955,7 @@ int main() {
         expect(reused.model && reused.textures.empty(), "resident opaque texture is not decoded twice");
         write_material(true);
         const auto alpha = vcr::prepare_model_asset(root, "triangle.vcrasset.json", resident);
-        expect(alpha.model && alpha.textures.size() == 1 && !alpha.textures[0].error.empty(),
-               "masked resident texture still obtains alpha pixels for OMM");
+        expect(alpha.model && alpha.textures.empty(), "resident masked texture reuses uploaded coverage");
         write_material(false);
         vcr::AssetPreparation resident_worker;
         resident_worker.start();

@@ -50,11 +50,6 @@ uint mixBits(uint value)
 
 float sunVisibilityAt(vec3 worldPos, vec3 normal, vec3 lightDirection)
 {
-#ifdef VCR_RAY_QUERY
-    if (lighting.options.x > 0.5 && lighting.volumeParameters.z > 0.5) {
-        return rayTracedSunVisibility(worldPos, normal, lightDirection);
-    }
-#endif
     if (lighting.options.x > 0.5) {
         return cascadedVisibility(shadowMap, worldPos, normal, lightDirection);
     }
@@ -102,12 +97,6 @@ float sunSubsurfaceTransmittanceAt(
         dot(geomNormal, lightDirection) >= 0.0 ? geomNormal : -geomNormal;
     if (subsurfaceProfile == 4u)
     {
-#ifdef VCR_RAY_QUERY
-        if (lighting.options.x > 0.5 && lighting.volumeParameters.z > 0.5) {
-            return rayTracedFoliageTransmittance(
-                worldPos, sunFacingNormal, lightDirection);
-        }
-#endif
         if (directVis >= 0.999)
         {
             return 1.0;
@@ -204,11 +193,7 @@ PbrLightingComponents evaluateLitSurfaceComponents(
             : diffuseAmbient;
     }
     if (voxelGiCompiled && lighting.options.y > 0.5) {
-#ifdef VCR_SURFACE_SHADOW_EXPLICIT_LOD
-        diffuseAmbient = voxelDiffuseSurface(worldPosition, normal, geomNormal);
-#else
         diffuseAmbient = voxelDiffuse(worldPosition, normal);
-#endif
         if (materialModel == 2u && subsurfaceProfile == 4u && subsurfaceStrength > 0.0) {
             backDiffuseAmbient = voxelBackTranslucency(worldPosition, -normal);
         } else {

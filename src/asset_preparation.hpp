@@ -1,7 +1,6 @@
 #pragma once
 #include "cooked_model_asset.hpp"
 #include "cooked_texture_asset.hpp"
-#include "opacity_micromap.hpp"
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -22,40 +21,29 @@ struct PreparedTexture {
     std::vector<std::uint8_t> mip_chain_rgba{};
     std::vector<std::size_t> mip_byte_offsets{};
 };
-struct PreparedAlphaMap {
-    std::string path;
-    std::vector<std::uint32_t> words;
-};
 struct PreparedModel {
     std::filesystem::path root;
     std::string path, error;
     std::optional<CookedModelAsset> model;
     std::vector<PreparedTexture> textures;
-    std::vector<PreparedAlphaMap> alpha_maps;
-    std::vector<std::string> submesh_rt_alpha_paths;
-    std::vector<std::vector<RtMaskedTriangle>> submesh_rt_triangles;
     std::size_t upload_bytes = 0;
 };
-// Resident paths are an owned snapshot at the queue boundary. GPU texture cache
-// entries live until renderer shutdown; masked base colors still decode for OMM.
+// Resident paths are an owned snapshot at the queue boundary.
 [[nodiscard]] PreparedModel prepare_model_asset(std::filesystem::path root, std::string path,
     std::span<const std::string> resident_textures = {});
 
 struct BatchPreparedAssets {
     std::vector<PreparedTexture> shared_textures{};
-    std::vector<PreparedAlphaMap> shared_alpha_maps{};
     std::vector<PreparedModel> models{};
 };
 
 // Prepares a batch of models for cold scene loading using the shared Windows
 // worker pool (running inline on the caller when model_paths.size() == 1).
-// Deduplicates shared textures and RT alpha maps across valid models in the
-// batch so each unique texture decodes at most once.
+// Each shared texture is decoded at most once per batch.
 [[nodiscard]] BatchPreparedAssets prepare_model_assets_batch(
     const std::filesystem::path& root,
     std::span<const std::string> model_paths,
-    std::span<const std::string> resident_textures = {},
-    std::span<const std::string> resident_rt_alpha_maps = {});
+    std::span<const std::string> resident_textures = {});
 
 // Precomputes CPU RGBA8 mipmap levels into `entry.mip_chain_rgba` and
 // `entry.mip_byte_offsets` when `base` has partial/cutout alpha (leaving fully

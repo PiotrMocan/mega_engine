@@ -51,7 +51,6 @@ struct FrameTimings {
     double gpu_voxel_geometry_ms = unavailable_timing_ms;
     double gpu_voxel_light_ms = unavailable_timing_ms;
     double gpu_visibility_ms = unavailable_timing_ms;
-    double gpu_tlas_ms = unavailable_timing_ms;
     double scene_prepare_ms = unavailable_timing_ms;
 };
 
@@ -109,7 +108,6 @@ private:
       gpu_voxel_geometry,
       gpu_voxel_light,
       gpu_visibility,
-      gpu_tlas,
       scene_prepare,
       count,
   };
@@ -286,10 +284,6 @@ struct BenchmarkResult {
     double average_gpu_voxel_geometry_ms = unavailable_timing_ms;
     double average_gpu_voxel_light_ms = unavailable_timing_ms;
     double average_gpu_visibility_ms = unavailable_timing_ms;
-    double average_gpu_tlas_ms = unavailable_timing_ms;
-    bool ray_tracing_supported = false;
-    bool ray_tracing_provisioned = false;
-    std::string ray_tracing_actual = "off";
     std::string visibility_backend = "cpu";
     double average_scene_prepare_ms = unavailable_timing_ms;
     std::string local_light_backend_requested = "auto";

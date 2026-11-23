@@ -176,16 +176,9 @@ Tradeoff under `select_lod` (`error * scale * pixels / distance <= threshold`):
   density policy is future work; lowering geometric errors to force a better
   FPS result would misrepresent the current error contract.
 
-## Ray tracing and Voxel GI coherence
+## Voxel GI and wind
 
-Hardware ray-tracing BLAS geometry and voxel GI scene representations consume
-the cooked static vertex positions (`wind_seconds == 0.0`) rather than re-running
-vertex-shader wind every frame across thousands of patches. Whenever ray tracing
-(`--rt shadows|gi|full`) or voxel GI (`--gi voxel`) is active, grass wind
-freezes at `wind_seconds == 0.0` (`wrap_gpu_grass_wind_seconds(elapsed, true)`).
-Rasterized grass, ray-traced shadows/GI, and voxelized lighting then match the
-same static vertex positions. This avoids geometry disagreement caused by wind;
-it does not eliminate unrelated shadow bias or ray-tracing artifacts.
+Voxel GI uses the cooked reference geometry. With voxel GI active, the renderer freezes blade wind at its reference pose so rasterized grass, its shadow, and indirect lighting agree.
 
 ## Fixture generator and schema
 
@@ -304,7 +297,7 @@ Scene (`assets/scenes/editor_scene.json`):
 - `"format": "vulkan_cube_scene"`, `"version": 1`, `"startup_camera": 4`,
   `"subsurface": "full"`, `"tone_mapper": "gt7"`
 - `"lighting"`: dynamic sun + sky enabled (`"dynamic": true`, `"hour": 15.5`),
-  `"voxel_gi": false`, `"ray_tracing": "off"` so wind animates out of the box
+  `"voxel_gi": false` so wind animates out of the box
 - Nodes: `"World"` folder, `"Sky"` (`environment`), `"Sun"`
   (`directional_light`), `"Meadow Ground"` (`ground` at `y = 0`),
   `"Close Meadow Camera"` (`camera` at `[0.0, 1.05, 1.8]`, pitch `-15°` looking
@@ -322,7 +315,7 @@ project scenes:
 $previousRoot = [Environment]::GetEnvironmentVariable('VCR_ASSET_ROOT', 'Process')
 try {
     $env:VCR_ASSET_ROOT = (Resolve-Path 'build/windows-release/gpu-grass-fixture/assets').Path
-    & '.\build\windows-release\bin\vulkan_cube.exe' --no-validation --present immediate --lighting dynamic --gi off --rt off --subsurface full --visibility-backend gpu
+    & '.\build\windows-release\bin\vulkan_cube.exe' --no-validation --present immediate --lighting dynamic --gi off --subsurface full --visibility-backend gpu
 } finally {
     [Environment]::SetEnvironmentVariable('VCR_ASSET_ROOT', $previousRoot, 'Process')
 }

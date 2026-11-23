@@ -39,7 +39,6 @@ public:
     [[nodiscard]] VmaAllocation allocation() const noexcept { return allocation_; }
     [[nodiscard]] VkDeviceSize size() const noexcept { return size_; }
     [[nodiscard]] void* mapped_data() const noexcept { return mapped_data_; }
-    [[nodiscard]] VkDeviceAddress device_address() const noexcept;
     [[nodiscard]] explicit operator bool() const noexcept {
         return buffer_ != VK_NULL_HANDLE;
     }

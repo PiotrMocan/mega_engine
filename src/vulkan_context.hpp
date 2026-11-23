@@ -87,16 +87,6 @@ public:
     [[nodiscard]] float max_sampler_anisotropy() const noexcept {
         return max_sampler_anisotropy_;
     }
-    [[nodiscard]] bool buffer_device_address_enabled() const noexcept {
-        return buffer_device_address_enabled_;
-    }
-    [[nodiscard]] bool ray_query_supported() const noexcept {
-        return ray_query_supported_;
-    }
-    [[nodiscard]] const VkPhysicalDeviceAccelerationStructurePropertiesKHR&
-    acceleration_structure_properties() const noexcept {
-        return acceleration_structure_properties_;
-    }
 
 private:
   bool indirect_first_instance_ = false;
@@ -106,11 +96,6 @@ private:
   bool sampler_anisotropy_enabled_ = false;
   bool texture_compression_bc_enabled_ = false;
   float max_sampler_anisotropy_ = 1.0F;
-  bool buffer_device_address_enabled_ = false;
-  bool ray_query_supported_ = false;
-  VkPhysicalDeviceAccelerationStructurePropertiesKHR acceleration_structure_properties_{
-      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR,
-  };
   void create_instance(SDL_Window *window, bool validation_requested);
   void create_debug_messenger();
   void create_surface(SDL_Window *window);
